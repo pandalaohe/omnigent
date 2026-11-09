@@ -7,7 +7,7 @@ const {pathToFileURL} = require("node:url");
 const support = require("./native_support.cjs");
 const {createChildNativeGate} = require("./omnigent_pi_child_extension.js");
 
-async function fixture(t, {origin = "parent", tier = "auto", duplicate = false, definition = {name:"reader"}, noEvaluator = false, refuseNativeAdmission = false, settings, projectSettings, projectTrusted=false, definitionSource="user", missingRequired=false, scopedClient, asyncDescriptor=false, missingExport, startupRegistration=false, packageVersion="0.80.0"} = {}) {
+async function fixture(t, {origin = "parent", tier = "auto", duplicate = false, definition = {name:"reader"}, noEvaluator = false, refuseNativeAdmission = false, settings, projectSettings, projectTrusted=false, definitionSource="user", missingRequired=false, scopedClient, asyncDescriptor=false, missingExport, startupRegistration=false, packageVersion="0.80.0", brokenImport=false, sdkPeers=false} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "native-support-"));
   t.after(() => fs.rmSync(root, {recursive:true, force:true}));
   const workspace = path.join(root, "workspace");
@@ -47,7 +47,33 @@ export async function resolveSubagentLaunchContract(input) {
     fs.writeFileSync(manifestPath,JSON.stringify(manifest));
   }
   globalThis[Symbol.for("fixture.native-lifecycles")] ||= new WeakMap();
-  const api = await support.loadPackageApi(packageRoot, {parseFrontmatter:text=>({frontmatter:JSON.parse(text)}),getAgentDir:()=>root,CONFIG_DIR_NAME:".pi"});
+  let sdkEntry, peer;
+  if (sdkPeers) {
+    sdkEntry=path.join(root,"sdk","index.mjs");
+    const peerRoot=path.join(root,"sdk","node_modules","fixture-peer");
+    fs.mkdirSync(peerRoot,{recursive:true});
+    fs.writeFileSync(sdkEntry,"export {};\n");
+    fs.writeFileSync(path.join(peerRoot,"package.json"),JSON.stringify({name:"fixture-peer",type:"module",exports:"./index.js"}));
+    fs.writeFileSync(path.join(peerRoot,"index.js"),"export const identity={};\n");
+    peer=await import(pathToFileURL(path.join(peerRoot,"index.js")).href);
+    const manifestPath=path.join(packageRoot,"package.json");
+    const manifest=JSON.parse(fs.readFileSync(manifestPath));
+    manifest.peerDependencies={"fixture-peer":"*"};
+    fs.writeFileSync(manifestPath,JSON.stringify(manifest));
+    fs.appendFileSync(path.join(packageRoot,"preflight.js"),"\nexport {identity} from 'fixture-peer'; export const lazyPeer=()=>import('fixture-peer');\n");
+  }
+  if (brokenImport) fs.appendFileSync(path.join(packageRoot,"preflight.js"),"\nimport 'fixture-unreachable';\n");
+  const api = await support.loadPackageApi(packageRoot, {parseFrontmatter:text=>({frontmatter:JSON.parse(text)}),getAgentDir:()=>root,CONFIG_DIR_NAME:".pi"},sdkEntry);
+  if (sdkPeers && typeof require("node:module").registerHooks === "function") {
+    assert.equal(api.unavailable,undefined);
+    assert.equal(api.identity,peer.identity);
+    assert.equal((await api.lazyPeer()).identity,peer.identity);
+    const again=await support.loadPackageApi(packageRoot,{parseFrontmatter(){},getAgentDir:()=>root,CONFIG_DIR_NAME:".pi"},sdkEntry);
+    assert.equal(again.identity,peer.identity);
+    const outside=path.join(root,"outside.mjs");
+    fs.writeFileSync(outside,"import 'fixture-peer';\n");
+    await assert.rejects(import(pathToFileURL(outside).href),{code:"ERR_MODULE_NOT_FOUND"});
+  }
   const state = {tier,revision:3,status:"ready",workspace};
   let backendStarts = 0, policyCalls = 0;
   const facts = [], notices = [];
@@ -170,6 +196,30 @@ test("missing package APIs leave ordinary tools gated and helper tools denied",a
       assert.equal(f.backendStarts(),1);
     });
   }
+});
+
+test("public exports resolve declared peers from the launcher's SDK",async t=>{
+  await fixture(t,{sdkPeers:true});
+});
+
+test("unloadable public exports disable helpers without failing session binding",async t=>{
+  const f=await fixture(t,{brokenImport:true});
+  await f.loader.getExtensions().extensions.at(-1).handlers.get("session_start")[0]({},f.ctx);
+  assert.equal(f.notices.length,1);
+  assert.match(f.notices[0].content,/missing \.\/preflight/);
+  assert.equal(await f.run("read",{path:"notes.txt"}),undefined);
+  assert.equal((await f.run("subagent",{agent:"reader",task:"read"})).block,true);
+});
+
+test("runtimes without resolve hooks disable helpers without failing session binding",async t=>{
+  const nodeModule=require("node:module"), registerHooks=nodeModule.registerHooks;
+  nodeModule.registerHooks=undefined;
+  try {
+    const f=await fixture(t,{sdkPeers:true});
+    await f.loader.getExtensions().extensions.at(-1).handlers.get("session_start")[0]({},f.ctx);
+    assert.match(f.notices[0].content,/Node module.registerHooks/);
+    assert.equal((await f.run("subagent",{agent:"reader",task:"read"})).block,true);
+  } finally { nodeModule.registerHooks=registerHooks; }
 });
 
 test("verified native source still requires admitted sync/async and action semantics", async t => {

@@ -40,7 +40,7 @@ export function installScopedSdk(sdk, {connection, bridgeDir, statePath}, {sdkVe
           if (path.dirname(directory) === directory) throw new Error("Native package manifest unavailable");
           directory = path.dirname(directory);
         }
-        const api = await support.loadPackageApi(directory, sdk);
+        const api = await support.loadPackageApi(directory, sdk, sdkEntry);
         return api;
       })();
     }

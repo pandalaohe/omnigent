@@ -1,13 +1,15 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
-const { pathToFileURL } = require("node:url");
+const { pathToFileURL, fileURLToPath } = require("node:url");
+const nodeModule = require("node:module");
 
 // Generated parent/child extensions share actual SDK-object keys, not names or payload flags.
 const key = Symbol.for("omnigent.pi.native-support.v2");
 const store = globalThis[key] ||= { bindings: new WeakMap(), loaders: new WeakMap(), sessions: new WeakMap() };
 store.apiRecords ||= new WeakMap();
 store.definitionOwners ||= new WeakMap();
+store.peerHooks ||= new Map();
 const plain = value => value && typeof value === "object" && !Array.isArray(value);
 const text = value => typeof value === "string" && value.trim().length > 0;
 const integer = (value, minimum = 1) => Number.isSafeInteger(value) && value >= minimum;
@@ -554,7 +556,7 @@ function prepareNativeSession(ctx) {
   const loader = store.loaders.get(session.resourceLoader);
   if (loader.profile.getState().tier !== "full") return loader.bind(session);
 }
-async function loadPackageApi(directory, sdk) {
+async function loadPackageApi(directory, sdk, sdkEntry) {
   const manifest = snapshot(path.join(directory, "package.json"));
   const pkg = JSON.parse(manifest.bytes.toString("utf8"));
   if (pkg.name !== "pi-subagents" || typeof sdk?.parseFrontmatter !== "function" || typeof sdk.getAgentDir !== "function" || sdk.CONFIG_DIR_NAME!==".pi")
@@ -570,6 +572,23 @@ async function loadPackageApi(directory, sdk) {
     const file = typeof target === "string" ? target : target?.import || target?.default;
     if (!text(file) || !file.startsWith("./")) return unavailable(subpath);
   }
+  if (sdkEntry) {
+    if (typeof nodeModule.registerHooks !== "function") return unavailable("Node module.registerHooks");
+    const root = fs.realpathSync(directory);
+    const sdkUrl = pathToFileURL(sdkEntry).href;
+    const registered = store.peerHooks.get(root);
+    if (registered && registered.sdkUrl !== sdkUrl) throw new Error("Native package SDK identity changed");
+    if (!registered) {
+      const peers = new Set(Object.keys(pkg.peerDependencies || {}));
+      const hook = nodeModule.registerHooks({resolve(specifier, context, nextResolve) {
+        const peer = specifier.startsWith("@") ? specifier.split("/").slice(0,2).join("/") : specifier.split("/")[0];
+        if (peers.has(peer) && context.parentURL?.startsWith("file:") && inside(fileURLToPath(context.parentURL), root))
+          return nextResolve(specifier, {...context, parentURL:sdkUrl});
+        return nextResolve(specifier, context);
+      }});
+      store.peerHooks.set(root, {sdkUrl, hook});
+    }
+  }
   for (const subpath of exports) {
     const target = pkg.exports[subpath];
     const file = typeof target === "string" ? target : target.import || target.default;
@@ -577,7 +596,11 @@ async function loadPackageApi(directory, sdk) {
     inputs.push(entry);
     if (entry.sha256 === null) return unavailable(subpath);
     if (!inside(entry.resolved_path, fs.realpathSync(directory))) throw new Error("Native public export escapes its package");
-    modules.push(await import(pathToFileURL(entry.resolved_path).href));
+    try { modules.push(await import(pathToFileURL(entry.resolved_path).href)); }
+    catch (_error) {
+      if (inputs.some(input => digest(snapshot(input.path)) !== digest(input))) throw new Error("Native public export changed while loading");
+      return unavailable(subpath);
+    }
   }
   if (inputs.some(input => digest(snapshot(input.path)) !== digest(input))) throw new Error("Native public export changed while loading");
   for (const [index, name] of [[0,"resolveSubagentLaunchContract"],[1,"getNativeChildLifecycle"],[2,"registerRequiredChildExtensions"]])
