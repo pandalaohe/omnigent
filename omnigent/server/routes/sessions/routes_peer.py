@@ -1231,6 +1231,8 @@ def register_peer_routes(
                 **kwargs,
             )
         except OmnigentError as exc:
+            if exc.code == ErrorCode.QUOTA_STOPPED:
+                return "rejected", exc.message
             if require_init_success and exc.message in (
                 "The recovered runner did not finish session initialization.",
                 "The runner did not accept this session's saved inference configuration",

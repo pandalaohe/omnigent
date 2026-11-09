@@ -905,6 +905,18 @@ class ManagedStartupInputs:
             raise
         except Exception as exc:
             _logger.exception("Unable to deliver saved message for session %s", session_id)
+            from omnigent.errors import ErrorCode, OmnigentError
+
+            if isinstance(exc, OmnigentError) and exc.code == ErrorCode.QUOTA_STOPPED:
+                await asyncio.to_thread(
+                    self.conversations.transition_pending_input,
+                    session_id,
+                    item.id,
+                    expected="in_progress",
+                    status="failed",
+                )
+                await self._report_failure(session_id, item.id, exc.message)
+                return "not_dispatched"
             if context is not None and context.recovery_id is not None:
                 return "unconfirmed" if context.submitted else "not_dispatched"
             if annotation:

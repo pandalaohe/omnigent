@@ -128,10 +128,10 @@ def create_session_choice_router(
                 reading = readings.get(body.tile)
                 windows = (
                     {
-                        window.id: (window.resets_at, window.percent_used)
+                        window.id: (window.resets_at, 100 - window.remaining_pct)
                         for window in reading.windows
                         if window.resets_at is not None
-                        and window.percent_used is not None
+                        and window.remaining_pct is not None
                         and not window.past_reset
                     }
                     if reading and reading.freshness == "fresh"

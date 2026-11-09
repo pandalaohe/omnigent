@@ -1312,6 +1312,31 @@ class AgentQuotaService:
                     )
         return issues
 
+    def tile_lines(self, owner: str, *, now: float | None = None) -> dict:
+        from dataclasses import asdict
+
+        from omnigent.server.session_choice import TileLimits, tile_line
+
+        now = time.time() if now is None else now
+        settings = read_collab_settings(self.preferences, owner).session_choice
+        readings = self.pool_readings(QuotaContext(owner, None), now=now)
+        floors = self.preferences.choice_floor_off(owner) if self.preferences else {}
+        return {
+            "schema": 1,
+            "generated_at": now,
+            "tiles": {
+                tile: asdict(
+                    tile_line(
+                        settings.limits.get(tile, TileLimits()),
+                        readings.get(tile),
+                        floors.get(tile),
+                        now,
+                    )
+                )
+                for tile in sorted(readings.keys() | settings.limits.keys())
+            },
+        }
+
     def pool_readings(
         self, context: QuotaContext, *, now: float | None = None
     ) -> dict[str, UsageAccountView]:

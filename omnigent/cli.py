@@ -7650,7 +7650,8 @@ def _render_usage(report: dict[str, Any], limit: int) -> None:  # type: ignore[e
     default=False,
     help="Emit the raw usage report as JSON instead of the table.",
 )
-def usage(limit: int, server: str | None, as_json: bool) -> None:
+@click.option("--lines", is_flag=True, help="Show current quota warning and stop lines.")
+def usage(limit: int, server: str | None, as_json: bool, lines: bool = False) -> None:
     """Show your Omnigent usage and costs.
 
     The summary is sourced from the per-user daily cost rollup, which
@@ -7679,6 +7680,8 @@ def usage(limit: int, server: str | None, as_json: bool) -> None:
     cfg = _load_effective_config()
     base_url = _resolve_attach_server(server, cfg.get("server"))
     if base_url is None:
+        if lines:
+            raise click.ClickException("no server configured")
         startup = ensure_local_omnigent_server()
         base_url = startup.url
     base_url = base_url.rstrip("/")
@@ -7689,7 +7692,7 @@ def usage(limit: int, server: str | None, as_json: bool) -> None:
         timeout=60.0,
         trust_env=_trust_env_for(base_url),
     ) as client:
-        resp = client.get("/v1/usage")
+        resp = client.get("/v1/me/usage/lines" if lines else "/v1/usage")
         resp.raise_for_status()
         report = resp.json()
 
@@ -7697,6 +7700,10 @@ def usage(limit: int, server: str | None, as_json: bool) -> None:
         click.echo(json.dumps(report, indent=2))
         return
 
+    if lines:
+        for tile, line in report["tiles"].items():
+            click.echo(f"{tile}: {line['state']}")
+        return
     _render_usage(report, limit)
 
 

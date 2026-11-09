@@ -188,6 +188,34 @@ def create_agent_quota_router(
     router = APIRouter()
     otlp_receiver = OtlpReceiver(service)
 
+    @router.get("/me/usage/lines")
+    async def usage_lines(request: Request, running: bool = False) -> dict[str, Any]:
+        from omnigent.server.agent_quota import QuotaContext
+        from omnigent.server.session_choice_runtime import session_products, stop_targets
+        from omnigent.server.user_preferences_store import read_collab_settings
+
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        result = await asyncio.to_thread(service.tile_lines, owner)
+        if running:
+            settings = (
+                await asyncio.to_thread(read_collab_settings, service.preferences, owner)
+            ).session_choice
+            readings = await asyncio.to_thread(service.pool_readings, QuotaContext(owner, None))
+            products = await asyncio.to_thread(session_products, request.app, settings)
+            targets = await asyncio.to_thread(
+                stop_targets,
+                request.app,
+                owner,
+                settings,
+                readings,
+                products,
+                result["tiles"],
+                result["generated_at"],
+            )
+            for tile, line in result["tiles"].items():
+                line["running"] = list(targets.get(tile, ()))
+        return result
+
     @router.post("/me/usage/otlp/v1/metrics", response_class=Response, openapi_extra=_OTLP_OPENAPI)
     async def report_otlp_metrics(request: Request) -> Response:
         return await report_otlp(request, "metrics")

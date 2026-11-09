@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -131,3 +132,28 @@ def test_usage_command_json() -> None:
     payload = json.loads(result.output)
     assert payload["cost_today"] == 1.5
     assert payload["sessions"][0]["models"] == {"claude-opus-4-8": 1.5}
+
+
+def test_usage_lines_without_server_never_starts_one() -> None:
+    with (
+        patch("omnigent.cli._load_effective_config", return_value={}),
+        patch("omnigent.cli._resolve_attach_server", return_value=None),
+        patch("omnigent.cli.ensure_local_omnigent_server") as start,
+    ):
+        result = CliRunner().invoke(cli, ["usage", "--lines", "--json"])
+    assert result.exit_code == 1
+    assert "no server configured" in result.output
+    start.assert_not_called()
+
+
+@pytest.mark.usefixtures("_stub_usage_fetch")
+def test_usage_lines_json_preserves_contract() -> None:
+    report = {"schema": 1, "generated_at": 123.0, "tiles": {"a": {"state": "stop"}}}
+    with (
+        patch.object(_FakeResponse, "json", return_value=report),
+        patch.object(_FakeClient, "get", return_value=_FakeResponse()) as get,
+    ):
+        result = CliRunner().invoke(cli, ["usage", "--server", "http://x", "--lines", "--json"])
+    assert result.exit_code == 0, result.output
+    get.assert_called_once_with("/v1/me/usage/lines")
+    assert json.loads(result.output) == report

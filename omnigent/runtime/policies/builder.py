@@ -513,6 +513,7 @@ def any_policies_apply(
             "sys_instruction_layer_update",
             "sys_project_settings_update",
             "sys_session_choice_update",
+            "sys_quota_floor",
             "sys_standing_approval",
             "sys_standing_pass",
             "sys_host_restart",

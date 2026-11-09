@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, replace
+from datetime import UTC
 from typing import Any
 
 from fastapi import HTTPException
@@ -37,6 +39,235 @@ from omnigent.server.user_preferences_store import read_collab_settings
 
 CHOICE_PROTOCOL_HEADER = "x-omnigent-session-choice"
 _logger = logging.getLogger(__name__)
+
+
+def session_products(app, settings):
+    from omnigent.server.routes._sessions.helpers import _resolve_harness_impl
+
+    return {
+        link.agent_id: agent_key_for_harness(
+            _resolve_harness_impl(
+                Conversation(
+                    id="",
+                    root_conversation_id="",
+                    created_at=0,
+                    updated_at=0,
+                    agent_id=link.agent_id,
+                ),
+                agent_store=app.state.agent_store,
+                agent_cache=app.state.agent_cache,
+            )
+        )
+        for link in ordered_links(settings)
+    }
+
+
+def tile_of_session(session, settings, readings, products, *, agent_store=None, agent_cache=None):
+    from omnigent.server.routes._sessions.helpers import _resolve_harness_impl, _resolve_llm_model
+
+    product = agent_key_for_harness(
+        _resolve_harness_impl(session, agent_store=agent_store, agent_cache=agent_cache)
+    )
+    pool = pool_of_session(
+        session,
+        settings,
+        product=product,
+        model=session.reported_model
+        or session.model_override
+        or _resolve_llm_model(session, agent_store=agent_store, agent_cache=agent_cache),
+        products=products,
+    )
+    if pool in readings:
+        return pool
+    if product is None:
+        return None
+    matches = [key for key, reading in readings.items() if reading.product == product]
+    return matches[0] if len(matches) == 1 else None
+
+
+def stop_targets(app, owner, settings, readings, products, tiles, now):
+    from omnigent.server.session_collab import collab_owner_for
+
+    store = app.state.conversation_store
+    result = {tile: [] for tile in tiles}
+    after = None
+    while True:
+        page = store.list_conversations(
+            kind=None,
+            live_only=True,
+            include_archived=False,
+            limit=200,
+            after=after,
+        )
+        for session in page.data:
+            if (
+                session.live_status != "running"
+                or session.runner_last_seen is None
+                or now - session.runner_last_seen > 300
+                or session.labels.get("omnigent.wrapper") == "claude-code-native-ui-subagent"
+                or collab_owner_for(session, store, app.state.permission_store) != owner
+            ):
+                continue
+            tile = tile_of_session(
+                session,
+                settings,
+                readings,
+                products,
+                agent_store=getattr(app.state, "agent_store", None),
+                agent_cache=getattr(app.state, "agent_cache", None),
+            )
+            if tile in result:
+                result[tile].append(session.id)
+        if not page.has_more or page.last_id is None:
+            return {tile: tuple(ids) for tile, ids in result.items()}
+        after = page.last_id
+
+
+def _stopped_tile(app, conv):
+    from omnigent.server.session_collab import collab_owner_for
+
+    def read():
+        owner = collab_owner_for(conv, app.state.conversation_store, app.state.permission_store)
+        settings = read_collab_settings(app.state.user_preferences_store, owner).session_choice
+        if not any(
+            cap.reserve and cap.reserve.stop_pct is not None for cap in settings.limits.values()
+        ):
+            return None
+        now = time.time()
+        readings = app.state.agent_quota_service.pool_readings(QuotaContext(owner, None), now=now)
+        tile = tile_of_session(
+            conv,
+            settings,
+            readings,
+            session_products(app, settings),
+            agent_store=app.state.agent_store,
+            agent_cache=app.state.agent_cache,
+        )
+        if tile is None:
+            return None
+        floors = app.state.user_preferences_store.choice_floor_off(owner)
+        line = tile_line(
+            settings.limits.get(tile, TileLimits()), readings[tile], floors.get(tile), now
+        )
+        return (tile, line) if line.state == "stop" else None
+
+    return _read(app, conv.id, "stop line", read, None)
+
+
+def stopped_line(app, conv):
+    stopped = _stopped_tile(app, conv)
+    return stopped[1] if stopped else None
+
+
+def stop_line_text(tile, line):
+    return (
+        f"Stopped: {tile} {line.window} has {line.remaining_pct}% left, at or below "
+        f"the stop line {line.stop_line_pct}%. Release it in Settings → Session choice, "
+        f"or wait until {line.clears_at}."
+    )
+
+
+def refuse_if_stopped(app, conv):
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    stopped = _stopped_tile(app, conv)
+    if stopped is not None:
+        raise OmnigentError(stop_line_text(*stopped), code=ErrorCode.QUOTA_STOPPED)
+
+
+async def enforce_stop_lines(app):
+    from datetime import datetime
+
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.server.peer_sweeper import PeerSweeper
+    from omnigent.server.routes._sessions.helpers import _publish_external_conversation_item
+    from omnigent.server.schemas import SessionEventInput
+
+    prefs = app.state.user_preferences_store
+    if prefs is None:
+        return
+    owners = await asyncio.to_thread(prefs.stop_line_owners)
+    semaphore = asyncio.Semaphore(8)
+
+    async def cut(owner, sid):
+        async with semaphore:
+            try:
+                conv = await asyncio.to_thread(app.state.conversation_store.get_conversation, sid)
+                if conv is None:
+                    return
+                if (
+                    conv.live_status != "running"
+                    or conv.runner_last_seen is None
+                    or time.time() - conv.runner_last_seen > 300
+                ):
+                    return
+                stopped = await asyncio.to_thread(_stopped_tile, app, conv)
+                if stopped is None:
+                    return
+                tile, line = stopped
+                result = await app.state.quota_stop_post_event(
+                    PeerSweeper._synthetic_request(sid, app),
+                    sid,
+                    SessionEventInput(type="stop_session", data={}),
+                    acting_user_id=owner,
+                )
+                if (
+                    not isinstance(result, dict)
+                    or result.get("queued") is not False
+                    or result.get("stopped") is False
+                ):
+                    _logger.warning("Quota stop did not stop session %s", sid)
+                    return
+                day = datetime.now(UTC).strftime("%Y%m%d")
+                items = await asyncio.to_thread(
+                    app.state.conversation_store.append,
+                    sid,
+                    [
+                        NewConversationItem(
+                            type="message",
+                            response_id=f"quota-stop-{sid}",
+                            stable_id=hashlib.sha256(
+                                f"quota-stop-{sid}-{tile}-{day}".encode()
+                            ).hexdigest()[:32],
+                            data=MessageData(
+                                role="assistant",
+                                agent="system",
+                                content=[
+                                    {"type": "output_text", "text": stop_line_text(tile, line)}
+                                ],
+                            ),
+                        )
+                    ],
+                )
+                for item in items:
+                    if not item.deduplicated:
+                        _publish_external_conversation_item(sid, item)
+            except Exception:
+                _logger.exception("Quota stop failed for session %s", sid)
+
+    for workspace, owner, settings in owners:
+        with workspace_scope(workspace):
+            try:
+                now = time.time()
+                readings = await asyncio.to_thread(
+                    app.state.agent_quota_service.pool_readings, QuotaContext(owner, None), now=now
+                )
+                floors = await asyncio.to_thread(prefs.choice_floor_off, owner)
+                stopped = {
+                    tile
+                    for tile, limits in settings.limits.items()
+                    if tile_line(limits, readings.get(tile), floors.get(tile), now).state == "stop"
+                }
+                if not stopped:
+                    continue
+                products = await asyncio.to_thread(session_products, app, settings)
+                targets = await asyncio.to_thread(
+                    stop_targets, app, owner, settings, readings, products, stopped, now
+                )
+                await asyncio.gather(*(cut(owner, sid) for ids in targets.values() for sid in ids))
+            except Exception:
+                _logger.exception("Quota stop round failed for owner %s", owner)
 
 
 def choice_labels(choice: Choice) -> dict[str, str]:

@@ -140,3 +140,55 @@ async def test_inline_send_default_path_unchanged(env: dict[str, Any]) -> None:
         )
     assert resp.status_code == 200, resp.text
     assert resp.json()["disposition"] == "delivered"
+
+
+async def test_stopped_receiver_is_rejected_without_uncertain_retry(env, db_uri):
+    from omnigent.server.session_choice import CHOICE_LABEL
+    from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
+    from tests.server.test_agent_quota import usage_report
+    from tests.server.test_session_choice import document
+
+    app = env["app"]
+    prefs = SqlAlchemyUserPreferencesStore(db_uri)
+    app.state.user_preferences_store = prefs
+    app.state.agent_quota_service.preferences = prefs
+    value = document()
+    value["limits"] = {"a": {"reserve": {"mode": "total", "window": "weekly", "stopPct": 5}}}
+    prefs.replace_session_choice(ALICE, value, prefs.session_choice(ALICE)["revision"])
+    now = now_epoch()
+    app.state.agent_quota_service.report_account(
+        ALICE,
+        "a",
+        usage_report(
+            observed_at=now,
+            windows=[
+                {
+                    "id": "weekly",
+                    "kind": "weekly",
+                    "percent_used": 96,
+                    "window_minutes": 10080,
+                    "resets_at": now + 86400,
+                }
+            ],
+        ),
+        now=now,
+    )
+    env["conv_store"].set_labels(env["receiver"].id, {CHOICE_LABEL: '{"pool":"a"}'})
+    sweeper = app.state.peer_sweeper
+    sweeper._app = app
+    record = env["peer_store"].create(
+        SessionPeerMessage(
+            id="b" * 32,
+            sender_session_id=env["sender"].id,
+            receiver_session_id=env["receiver"].id,
+            ref="ref-stopped",
+            text="must not run",
+            state="pending",
+            created_at=now,
+            expires_at=now + 3600,
+        )
+    )
+    await sweeper._tick()
+    updated = env["peer_store"].get(record.id)
+    assert updated.state == "failed"
+    assert "Stopped:" in updated.reason

@@ -2537,6 +2537,16 @@ def register_hooks_routes(
                 f"Session {session_id!r} not found.",
                 code=ErrorCode.NOT_FOUND,
             )
+        if phase == Phase.REQUEST and not is_read_only:
+            from omnigent.server.session_choice_runtime import stopped_line
+
+            if await asyncio.to_thread(stopped_line, request.app, conv) is not None:
+                return Response(
+                    content=json.dumps(
+                        {"result": "POLICY_ACTION_DENY", "reason": "quota_stopped"}
+                    ),
+                    media_type="application/json",
+                )
         if phase == Phase.REQUEST and conv.host_id and not is_read_only:
             from omnigent.server.routes.usage import _resolve_session_harness
             from omnigent.server.usage_cutover import admit_turn

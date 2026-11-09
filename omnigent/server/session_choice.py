@@ -267,7 +267,7 @@ def floor_off_active(entry: FloorOff, reading: UsageAccountView | None, now: flo
         if (
             current is None
             or current.past_reset
-            or (current.percent_used is not None and current.percent_used <= used - 5)
+            or (current.remaining_pct is not None and 100 - current.remaining_pct <= used - 5)
             or (current.resets_at is not None and abs(current.resets_at - reset) > 3600)
         ):
             return False

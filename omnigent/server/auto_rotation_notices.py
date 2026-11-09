@@ -204,7 +204,12 @@ class AutoRotationNotices:
                     self._store.mutate_label_group, session_id, "omnigent.", mark
                 )
                 self._forget_due(key, marker)
-        except Exception:
+        except Exception as exc:
+            from omnigent.errors import ErrorCode, OmnigentError
+
+            if isinstance(exc, OmnigentError) and exc.code == ErrorCode.QUOTA_STOPPED:
+                self._forget_due(key, marker)
+                return
             _logger.exception("Context notice delivery failed for %s", session_id)
         finally:
             self._deliveries.pop(key, None)
