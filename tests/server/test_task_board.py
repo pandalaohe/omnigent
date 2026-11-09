@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import httpx
+import jsonschema
 import pytest
 from fastapi import FastAPI
 from sqlalchemy import select, update
@@ -745,3 +748,131 @@ async def test_time_window_queries_keep_fractional_precision(board_client, store
         "/v1/me/tasks", params={"changed_after": "2026-11-06T07:00:00.0000001Z"}
     )
     assert response.json()["entries"] == []
+
+
+async def test_sources_doc_example_and_report_json_schema(board_client):
+    root = Path(__file__).resolve().parents[2]
+    doc_text = (root / "docs" / "task-board-sources.md").read_text(encoding="utf-8")
+    schema = json.loads(
+        (root / "docs" / "schemas" / "task-board-report.schema.json").read_text(encoding="utf-8")
+    )
+    jsonschema.Draft202012Validator.check_schema(schema)
+    validator = jsonschema.Draft202012Validator(schema)
+
+    json_blocks = [
+        json.loads(block)
+        for block in re.findall(r"```json\n(.*?)\n```", doc_text, flags=re.DOTALL)
+    ]
+    report_example = next(block for block in json_blocks if block.get("@type") == "Group")
+    for valid_body in (
+        report_example,
+        task(recurrenceRules=[{"@type": "RecurrenceRule", "frequency": "daily"}]),
+        task(
+            participants={
+                "alice": {
+                    "@type": "Participant",
+                    "roles": {"owner": True},
+                    "sendTo": {"imip": "mailto:alice@example.com"},
+                }
+            }
+        ),
+        group(task(), {"@type": "Event", "uid": "ev-1", "updated": "2026-11-06T07:00:00Z"}),
+    ):
+        validator.validate(valid_body)
+        parse(valid_body)
+
+    for invalid in (
+        {"@type": "Group", "updated": STAMP, "entries": []},
+        {"@type": "Group", "uid": "g", "entries": []},
+        {"@type": "Group", "uid": "g", "updated": STAMP},
+        {"@type": "Group", "uid": "g", "updated": STAMP, "entries": [{"@type": "Task"}]},
+        {"@type": "Task", "updated": STAMP},
+        {"@type": "Task", "uid": "eng-1"},
+        task(updated="2026-11-06T06:30:00.000Z"),
+        task(updated="2026-99-99T99:99:99Z"),
+        task(updated="2026-02-31T06:30:00Z"),
+        task(updated="0000-11-06T06:30:00Z"),
+        task(updated="2026-11-06T06:30:00Z\n"),
+        task(due="2026-11-10T18:00:00Z"),
+        task(due="2026-13-40T25:00:00"),
+        task(due="2026-02-29T18:00:00"),
+        task(progress="done"),
+        task(title=None),
+        task(participants={"alice": {"@type": "Participant", "name": "Alice"}}),
+        task(participants={"alice": {"name": "Alice", "roles": {"owner": True}}}),
+        task(links={"page": {"@type": "Link", "rel": "alternate"}}),
+        task(links={"page": {"@type": "Link", "href": "/relative"}}),
+        task(**{"omnigent.ai:source": "example"}),
+        task(**{"omnigent.ai:gone": STAMP}),
+        task(**{"omnigent.ai:closedSeen": STAMP}),
+        task(**{"omnigent.ai:unresolved": ["eng-2"]}),
+    ):
+        with pytest.raises(jsonschema.ValidationError):
+            validator.validate(invalid)
+        with pytest.raises(ReportError):
+            parse(invalid)
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate(
+            task(participants={"alice": {"@type": "Participant", "name": "Alice", "roles": {}}})
+        )
+
+    response = await board_client.put(
+        "/v1/me/tasks/sources/example-eng",
+        content=json.dumps(report_example),
+        headers={"Content-Type": "application/jscalendar+json"},
+    )
+    assert response.status_code == 200
+    expected_summary = {
+        "applied": 1,
+        "unchanged": 0,
+        "held": [],
+        "returned": 0,
+        "gone": 0,
+        "complete": "applied",
+        "history_added": 2,
+    }
+    assert response.json() == expected_summary
+    assert expected_summary in json_blocks
+    stored = (
+        await board_client.get(
+            "/v1/me/tasks/item", params={"source": "example-eng", "uid": "eng-123"}
+        )
+    ).json()
+    assert stored["omnigent.ai:key"] == "ENG-123"
+    assert stored["omnigent.ai:group"] == {"id": "transfer-v2", "name": "Transfer reliability"}
+    assert stored["omnigent.ai:waiting"]["on"] == "dependency"
+    assert stored["omnigent.ai:unresolved"] == ["eng-100", "eng-120"]
+    assert [event["id"] for event in stored["omnigent.ai:history"]] == ["evt-1", "evt-2"]
+
+    for prop in (
+        "omnigent.ai:complete",
+        "omnigent.ai:depends-on",
+        "omnigent.ai:key",
+        "omnigent.ai:sourceState",
+        "omnigent.ai:resolution",
+        "omnigent.ai:waiting",
+        "omnigent.ai:group",
+        "omnigent.ai:next",
+        "omnigent.ai:workedBy",
+        "omnigent.ai:sourceFields",
+        "omnigent.ai:history",
+        "omnigent.ai:source",
+        "omnigent.ai:gone",
+        "omnigent.ai:closedSeen",
+        "omnigent.ai:unresolved",
+        "omnigent.ai:cursor",
+        "omnigent.ai:changedThrough",
+    ):
+        assert re.search(
+            rf"^\| `{re.escape(prop)}` \| \*\*Omnigent-defined\*\* \|",
+            doc_text,
+            flags=re.MULTILINE,
+        ), f"Missing Omnigent-defined table row for {prop}"
+    for fragment in (
+        "scopes: [usage, tasks]",
+        "OMNIGENT_USAGE_READ_TOKEN",
+        "OMNIGENT_AUTH_ENABLED=0",
+        "changed_after",
+        "DELETE",
+    ):
+        assert fragment in doc_text
