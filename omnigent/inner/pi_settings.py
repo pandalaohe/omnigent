@@ -73,7 +73,8 @@ const scopedHandoff = __OMNIGENT_SCOPED_HANDOFF__;
     const sdk = await load("index.js");
     const bootstrapUrl = pathToFileURL(__OMNIGENT_SCOPED_BOOTSTRAP__).href;
     const { installScopedSdk } = await import(bootstrapUrl);
-    installScopedSdk(sdk, handoff, {sdkVersion:"1.3.0", sdkEntry:path.join(dist,"index.js")});
+    installScopedSdk(sdk, handoff, {
+      sdkVersion:__PI_SDK_VERSION__, sdkEntry:path.join(dist,"index.js")});
   }
   if (!scopedHandoff) DefaultResourceLoader.prototype.getExtensions = function () {
     const result = getExtensions.call(this);
@@ -134,9 +135,11 @@ def ordered_pi_launch(
     )
     if dist is None:
         raise PiSdkLoaderUnavailableError
+    sdk_version = None
     if scoped_handoff is not None:
         try:
-            if json.loads((dist.parent / "package.json").read_text()).get("version") != "1.3.0":
+            sdk_version = json.loads((dist.parent / "package.json").read_text()).get("version")
+            if sdk_version not in ("1.3.0", "1.5.0"):
                 raise PiSdkLoaderUnavailableError
         except (OSError, ValueError, AttributeError):
             raise PiSdkLoaderUnavailableError from None
@@ -156,6 +159,7 @@ def ordered_pi_launch(
     source = (
         _INLINE_LAUNCHER_JS.lstrip()
         .replace("__PI_SDK_DIR__", json.dumps(str(dist)))
+        .replace("__PI_SDK_VERSION__", json.dumps(sdk_version))
         .replace("__OMNIGENT_EXTENSION__", json.dumps(str(extension)))
         .replace(
             "__OMNIGENT_SCOPED_CLIENT__",

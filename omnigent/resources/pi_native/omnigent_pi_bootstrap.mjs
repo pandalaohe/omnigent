@@ -7,7 +7,7 @@ export function installNativeSupportBootstrap(sdk, {prepareLoader, describeSessi
   const loader = sdk?.DefaultResourceLoader?.prototype;
   const session = sdk?.AgentSession?.prototype;
   const required = ["reload", "loadExtensionPaths", "resolveExtensionLoadPath", "loadExtensionFactories", "getExtensions", "loadCurrentExtensionSet"];
-  if (sdkVersion !== "1.3.0" || !loader || !session || required.some(name => typeof loader[name] !== "function") || typeof session.bindExtensions !== "function" ||
+  if (!["1.3.0", "1.5.0"].includes(sdkVersion) || !loader || !session || required.some(name => typeof loader[name] !== "function") || typeof session.bindExtensions !== "function" ||
       typeof prepareLoader !== "function" || typeof describeSession !== "function") {
     if (typeof getRootState === "function" && getRootState()?.tier === "full") return () => {};
     throw new Error("Unsupported native SDK bootstrap contract");

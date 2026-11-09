@@ -206,9 +206,13 @@ async def test_real_pi_adds_workspace_context_after_inline_prompt(
         < system.index(_REQUEST_MARKER)
         < system.index(_FRAMEWORK_MARKER)
     )
-    assert ("You are an expert coding assistant operating inside pi" in system) is (
-        system_prompt_mode == "append"
-    )
+    assert any(
+        default_prompt in system
+        for default_prompt in (
+            "You are an expert coding assistant operating inside pi",
+            "You are a coding assistant running inside pi",
+        )
+    ) is (system_prompt_mode == "append")
     assert (_GLOBAL_MARKER in system) is context_files
     assert (_WORKSPACE_MARKER in system) is (expect_context and context_files)
     if expect_context and context_files:

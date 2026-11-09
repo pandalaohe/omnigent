@@ -536,6 +536,33 @@ def test_inline_launch_refuses_unsupported_sdk(tmp_path):
         ordered_pi_launch("/opt/bin/standalone-pi", [], extension=tmp_path / "guard.js")
 
 
+@pytest.mark.parametrize("version", ["1.3.0", "1.5.0", "1.4.0", "1.5.1", "unknown"])
+def test_scoped_inline_launch_admits_only_reviewed_versions(tmp_path, monkeypatch, version):
+    from omnigent.inner import pi_settings
+
+    dist = tmp_path / "sdk" / "dist"
+    for name in (
+        "cli/setup.js",
+        "main.js",
+        "core/resource-loader.js",
+        "core/package-manager.js",
+        "core/settings-manager.js",
+        "utils/paths.js",
+    ):
+        file = dist / name
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.touch()
+    (dist.parent / "package.json").write_text(json.dumps({"version": version}))
+    monkeypatch.setattr(pi_settings, "pi_cli_argv", lambda _: [str(dist / "cli.js")])
+    kwargs = {"extension": tmp_path / "guard.js", "scoped_handoff": tmp_path / "handoff"}
+    if version not in ("1.3.0", "1.5.0"):
+        with pytest.raises(pi_settings.PiSdkLoaderUnavailableError):
+            pi_settings.ordered_pi_launch("pi", [], **kwargs)
+    else:
+        launcher, _ = pi_settings.ordered_pi_launch("pi", [], **kwargs)
+        assert f'sdkVersion:"{version}"' in Path(launcher).read_text()
+
+
 def test_prepare_managed_pi_agent_dir_links_only_supported_resources(tmp_path: Path) -> None:
     """Supported resources are linked; instructions and session state stay isolated."""
     global_agent = tmp_path / "global-agent"
