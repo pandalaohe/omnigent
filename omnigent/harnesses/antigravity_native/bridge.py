@@ -337,6 +337,7 @@ _MCP_SERVER_NAME = "omnigent"
 _AGY_ENABLED_TOOLS = [
     "ask_user_async",
     "browser_click",
+    "browser_fill_saved_login",
     "browser_navigate",
     "browser_screenshot",
     "browser_snapshot",
