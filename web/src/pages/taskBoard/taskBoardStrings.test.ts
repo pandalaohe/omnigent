@@ -182,7 +182,7 @@ it("builds the production bundle without and with a complete override.json and c
 
   const overrideBundle = await buildProductionTextBundle(completeOverride);
   const secondView = renderBoardSlices(overrideBundle);
-  expect(secondView.container.textContent).toContain("[PACK:sources.connectOne]");
+  expect(secondView.container.textContent).toContain("[PACK:sources.connect]");
   expect(secondView.container.textContent).toContain("[PACK:settings.show]");
   for (const label of staticEnglish) {
     expect(secondView.container.textContent).not.toContain(label);
