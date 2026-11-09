@@ -8035,6 +8035,17 @@ describe("chatStore — delivered-but-unacked send", () => {
 });
 
 describe("chatStore — stop", () => {
+  it("interrupts the browser's owning session while another chat is visible", async () => {
+    const target = bindConversationForTest("conv_target", { blocks: [], status: "streaming" });
+    bindConversationForTest("conv_visible", { blocks: [], status: "streaming" });
+    await useChatStore.getState().stop("conv_target");
+    const posts = fetchMock.mock.calls.filter(([, init]) => init?.method === "POST");
+    expect(posts).toHaveLength(1);
+    expect(String(posts[0]![0])).toBe("/v1/sessions/conv_target/events");
+    expect(JSON.parse(String(posts[0]![1]?.body))).toEqual({ type: "interrupt", data: {} });
+    expect(useChatStore.getState().conversationId).toBe("conv_visible");
+    expect(target.get().status).toBe("streaming");
+  });
   it("posts {type: 'interrupt'} to the events endpoint without aborting the local stream", async () => {
     const controller = new AbortController();
     useChatStore.setState({

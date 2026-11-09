@@ -1392,7 +1392,7 @@ export interface ChatActions {
     agentId: string,
     opts?: SendOptions,
   ) => Promise<void>;
-  stop: () => Promise<void>;
+  stop: (conversationId?: string) => Promise<void>;
   declineAndInterrupt: (elicitationId: string, conversationId?: string) => Promise<void>;
   switchTo: (conversationId: string | null) => Promise<void>;
   submitApproval: (
@@ -3359,18 +3359,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  stop: async () => {
-    const state = get();
-    const sessionId = state.conversationId;
+  stop: async (conversationId) => {
+    const sessionId = conversationId ?? get().conversationId;
     if (!sessionId) return;
+    const state = sessionId === get().conversationId ? get() : setterForState(sessionId);
     // Upstream #8039: a first message still held locally (model selection or
     // native startup pending) is cancelled here and handed back to the
     // composer; it never reached the runner, so nothing is interrupted for it.
-    const initialDraft = state.pendingUserMessages.find((p) => p.initialDraft)?.initialDraft;
-    if (initialDraft) {
+    const initialDraft = state?.pendingUserMessages.find((p) => p.initialDraft)?.initialDraft;
+    if (initialDraft && state) {
       const draft = getSessionDraft(sessionId) ?? initialDraft;
       setSessionDraft(sessionId, draft);
-      setActive({
+      setterFor(sessionId)({
         pendingUserMessages: [],
         status: "idle",
         sendLatchedAt: null,
