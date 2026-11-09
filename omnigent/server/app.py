@@ -2322,7 +2322,6 @@ def create_app(
             )
         )
 
-        usage_flush_task: asyncio.Task[None] | None = None
         usage_price_task: asyncio.Task[None] | None = None
         if agent_quota_service.usage_enabled:
             await asyncio.to_thread(usage_price_source.load)
@@ -2330,14 +2329,12 @@ def create_app(
                 usage_price_source.run(), name="usage-price-source"
             )
 
-            async def _usage_flush_loop() -> None:
-                while True:
-                    await asyncio.sleep(60.0)
-                    await asyncio.to_thread(agent_quota_service.flush)
+        async def _usage_flush_loop() -> None:
+            while True:
+                await asyncio.sleep(60.0)
+                await asyncio.to_thread(agent_quota_service.flush)
 
-            usage_flush_task = asyncio.create_task(
-                _usage_flush_loop(), name="usage-snapshot-flush"
-            )
+        usage_flush_task = asyncio.create_task(_usage_flush_loop(), name="usage-snapshot-flush")
 
         # System status: one tick loop rolls up host points, trims history and
         # evaluates findings; a second loop renews the fast-sampling lease for

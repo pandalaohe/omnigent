@@ -400,7 +400,6 @@ def create_agent_quota_router(
         },
     )
     async def report_usage_account(request: Request, account_id: str) -> Response:
-        require_usage()
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         if _ACCOUNT_ID.fullmatch(account_id) is None:
             raise HTTPException(422, "Invalid usage account id")
@@ -458,7 +457,6 @@ def create_agent_quota_router(
 
     @router.delete("/me/usage/accounts/{account_id}", status_code=204)
     async def delete_usage_account(request: Request, account_id: str) -> Response:
-        require_usage()
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         if _ACCOUNT_ID.fullmatch(account_id) is None:
             raise HTTPException(422, "Invalid usage account id")

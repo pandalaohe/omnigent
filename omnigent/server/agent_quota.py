@@ -242,7 +242,7 @@ class AgentQuotaService:
     ) -> bool:
         now = time.time() if now is None else now
         accepted = self._store_snapshot(owner, host_id, product, snapshot, now=now)
-        if accepted and self.usage_enabled:
+        if accepted:
             self._note_display(owner, host_id, product, snapshot, now=now, project=True)
         return accepted
 
@@ -269,15 +269,6 @@ class AgentQuotaService:
         if snapshot is None or str(snapshot.get("provider", "")).lower() != "claude":
             return
         context = self.context(conversation)
-        if not self.usage_enabled:
-            legacy = [
-                window
-                for window in snapshot.get("windows", [])
-                if isinstance(window, dict) and window.get("label") in {"5h", "w"}
-            ]
-            if not legacy and snapshot.get("windows") != []:
-                return
-            snapshot = {**snapshot, "windows": legacy}
         self.report(context.owner_id, context.host_id, "claude", snapshot)
 
     def report_pi(self, conversation: Conversation, snapshot: dict[str, Any] | None) -> None:
@@ -301,8 +292,6 @@ class AgentQuotaService:
         now: float | None = None,
     ) -> None:
         """Retain a native reading for display without extending routing after disconnect."""
-        if not self.usage_enabled:
-            return
         now = time.time() if now is None else now
         if accept_snapshot(snapshot.get("captured_at"), now=now):
             self._note_display(owner, host_id, product, snapshot, now=now, project=False)
@@ -416,11 +405,7 @@ class AgentQuotaService:
                         self._append_log(record, "cloudevent", float(report.observed_at), **event)
                         record["source"] = event["source"][:64]
                         record["source_at"] = report.observed_at
-            if (
-                report.activity is not None
-                and self.snapshot_store is not None
-                and self.usage_enabled
-            ):
+            if report.activity is not None and self.snapshot_store is not None:
                 key = (current_workspace_id(), owner, account_id)
                 with self._lock:
                     record = deepcopy(self._accounts[key])
@@ -539,8 +524,6 @@ class AgentQuotaService:
     ) -> WriteOutcome:
         outcome = WriteOutcome()
         now = time.time() if now is None else now
-        if not self.usage_enabled:
-            return outcome
         self._hydrate(owner)
         key = (current_workspace_id(), owner, account_id)
         observed = float(report.observed_at)
@@ -702,8 +685,6 @@ class AgentQuotaService:
         *,
         now: float | None = None,
     ) -> None:
-        if not self.usage_enabled:
-            return
         now = time.time() if now is None else now
         self._hydrate(owner)
         from omnigent.harness_plugins import native_agents
@@ -854,8 +835,6 @@ class AgentQuotaService:
         now: float | None,
         format: str | None,
     ) -> None:
-        if not self.usage_enabled:
-            return
         now = time.time() if now is None else now
         self._hydrate(owner, required=True)
         key = (current_workspace_id(), owner, account_id)
@@ -890,8 +869,6 @@ class AgentQuotaService:
             return self._delete_account(owner, account_id)
 
     def _delete_account(self, owner: str, account_id: str) -> bool:
-        if not self.usage_enabled:
-            return False
         self._hydrate(owner)
         key = (current_workspace_id(), owner, account_id)
         if self.hours_store is not None:
@@ -1340,48 +1317,7 @@ class AgentQuotaService:
     ) -> dict[str, UsageAccountView]:
         """Read the same tiles as the board, including reset data for selection."""
         now = time.time() if now is None else now
-        if self.usage_enabled:
-            return {tile.id: tile for tile in self.overview(context.owner_id, now=now).accounts}
-        tiers, quotas = self._quotas(context, now=now, all_hosts=context.host_id is None)
-        settings = read_collab_settings(self.preferences, context.owner_id)
-        workspace = current_workspace_id()
-        with self._lock:
-            snapshots = {
-                product: max(
-                    (
-                        record
-                        for (ws, owner, host, item), record in self._snapshots.items()
-                        if ws == workspace
-                        and owner == context.owner_id
-                        and (context.host_id is None or host in {None, context.host_id})
-                        and item == product
-                    ),
-                    key=lambda record: record["captured_at"],
-                    default=None,
-                )
-                for product in quotas
-            }
-        result = {}
-        for product, snapshot in snapshots.items():
-            if snapshot is not None:
-                record = {
-                    "read_at": snapshot["captured_at"],
-                    "fresh_until": snapshot.get("fresh_until"),
-                    "last_attempt_status": "available",
-                    "pinned_window": snapshot.get("pinned_period"),
-                }
-                result[product] = self._account_view(
-                    account_id=product,
-                    kind="native",
-                    record=record,
-                    windows=_native_windows(snapshot, product),
-                    tiers=tiers,
-                    settings=settings,
-                    now=now,
-                    product=product,
-                    display_name=product,
-                )
-        return result
+        return {tile.id: tile for tile in self.overview(context.owner_id, now=now).accounts}
 
     def _native_account(
         self,
@@ -1710,7 +1646,7 @@ class AgentQuotaService:
             self._hydrate_locked(owner, required=required)
 
     def _hydrate_locked(self, owner: str, *, required: bool) -> None:
-        if not self.usage_enabled or self.snapshot_store is None:
+        if self.snapshot_store is None:
             return
         scope = (current_workspace_id(), owner)
         with self._lock:
@@ -1787,7 +1723,7 @@ class AgentQuotaService:
             return self._flush(now=now, force=force)
 
     def _flush(self, *, now: float | None, force: bool) -> int:
-        if not self.usage_enabled or self.snapshot_store is None:
+        if self.snapshot_store is None:
             return 0
         now = time.time() if now is None else now
         with self._lock:

@@ -70,8 +70,10 @@ def service_with_store(db_uri, store=None):
     )
 
 
-def test_pool_readings_use_tile_not_latest_product_projection(db_uri):
+@pytest.mark.parametrize("usage_enabled", [True, False])
+def test_pool_readings_use_tile_not_latest_product_projection(db_uri, usage_enabled):
     service = service_with_store(db_uri)
+    service.usage_enabled = usage_enabled
     service.report_account(OWNER, "a", usage_report(account_product="codex"), now=NOW)
     service.report_account(
         OWNER,
@@ -106,9 +108,12 @@ def test_pool_readings_with_board_disabled_use_reported_products(service, report
     service.usage_enabled = False
     service.report(OWNER, report_host, "claude", snapshot(), now=NOW)
     readings = service.pool_readings(QuotaContext(OWNER, read_host), now=NOW)
-    assert set(readings) == {"claude"}
+    assert "claude" in readings
     assert readings["claude"].windows[0].remaining_pct == 15
-    assert service.pool_readings(QuotaContext("other", read_host), now=NOW) == {}
+    assert (
+        service.pool_readings(QuotaContext("other", read_host), now=NOW)["claude"].freshness
+        == "none"
+    )
 
 
 def test_discovery_lists_pools_for_exclusion_without_duplicate_or_extra_prompt(service):
@@ -787,9 +792,11 @@ def test_fresh_until_and_past_reset_are_distinct(service):
     assert window.remaining_pct is None
 
 
-def test_restart_hydrates_accounts_and_native_readings(db_uri):
+@pytest.mark.parametrize("usage_enabled", [True, False])
+def test_restart_hydrates_accounts_and_native_readings(db_uri, usage_enabled):
     store = UsageSnapshotStore(db_uri)
     first = service_with_store(db_uri, store)
+    first.usage_enabled = usage_enabled
     first.report_account(OWNER, "gw", usage_report(), now=NOW)
     first.report(OWNER, None, "claude", snapshot(), now=NOW)
     native = {
@@ -812,6 +819,7 @@ def test_restart_hydrates_accounts_and_native_readings(db_uri):
     assert first.flush(now=NOW, force=True) == 3
 
     second = service_with_store(db_uri, store)
+    second.usage_enabled = usage_enabled
     overview = second.overview(OWNER, now=NOW)
     assert account(overview, "gw").read_at == NOW
     assert account(overview, "claude").windows[0].percent_used == 85
@@ -975,9 +983,11 @@ def test_rejected_reports_also_respect_account_bound(service):
 
 
 @pytest.mark.asyncio
-async def test_usage_routes_auth_isolation_validation_and_delete(request, db_uri):
+@pytest.mark.parametrize("usage_enabled", [True, False])
+async def test_usage_routes_auth_isolation_validation_and_delete(request, db_uri, usage_enabled):
     app = request.getfixturevalue("auth_app")
     service = app.state.agent_quota_service
+    service.usage_enabled = usage_enabled
     other = "other@example.test"
     _make_user(db_uri, OWNER, is_admin=False)
     _make_user(db_uri, other, is_admin=False)
@@ -1000,13 +1010,17 @@ async def test_usage_routes_auth_isolation_validation_and_delete(request, db_uri
         path = "/v1/me/usage/accounts/gw"
         assert (await client.put(path, json=body)).status_code == 401
         assert (await client.put(path, json=body, headers=_headers(OWNER))).status_code == 204
-        owned = await client.get("/v1/me/usage", headers=_headers(OWNER))
-        assert owned.status_code == 200
-        gw = next(item for item in owned.json()["accounts"] if item["id"] == "gw")
-        assert gw["windows"][0]["used_value"] == 41
-        assert "future" not in gw["windows"][0]
-        foreign = await client.get("/v1/me/usage", headers=_headers(other))
-        assert "gw" not in {item["id"] for item in foreign.json()["accounts"]}
+        readings = service.pool_readings(QuotaContext(OWNER, None))
+        assert readings["gw"].windows[0].used_value == 41
+        assert "future" not in readings["gw"].windows[0].model_dump()
+        assert "gw" not in service.pool_readings(QuotaContext(other, None))
+        if usage_enabled:
+            owned = await client.get("/v1/me/usage", headers=_headers(OWNER))
+            assert owned.status_code == 200
+            assert any(item["id"] == "gw" for item in owned.json()["accounts"])
+            foreign = await client.get("/v1/me/usage", headers=_headers(other))
+            assert "gw" not in {item["id"] for item in foreign.json()["accounts"]}
+        assert (await client.delete(path, headers=_headers(other))).status_code == 404
 
         rejected = await client.put(path, json={"bad": True}, headers=_headers(OWNER))
         assert rejected.status_code == 422
@@ -1019,7 +1033,8 @@ async def test_usage_routes_auth_isolation_validation_and_delete(request, db_uri
 
 
 @pytest.mark.asyncio
-async def test_deployment_off_hides_only_new_usage_routes(db_uri):
+@pytest.mark.parametrize("version", [1, 2])
+async def test_deployment_off_keeps_quota_ingest_and_hides_usage_display(db_uri, version):
     service = service_with_store(db_uri)
     service.usage_enabled = False
     app = FastAPI()
@@ -1030,7 +1045,34 @@ async def test_deployment_off_hides_only_new_usage_routes(db_uri):
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         assert (await client.get("/v1/me/usage")).status_code == 404
-        assert (await client.put("/v1/me/usage/accounts/gw", json={})).status_code == 404
+        for route in ("activity", "issues", "models?account=gw", "price-source"):
+            assert (await client.get(f"/v1/me/usage/{route}")).status_code == 404
+        path = "/v1/me/usage/accounts/gw"
+        now = time.time()
+        body = usage_report(
+            observed_at=now,
+            windows=[
+                {
+                    "id": "weekly",
+                    "kind": "weekly",
+                    "percent_used": 40,
+                    "window_minutes": 10080,
+                    "resets_at": now + 4 * 86400,
+                }
+            ],
+        ).model_dump(mode="json")
+        body["schema_version"] = version
+        response = await client.put(path, json=body)
+        assert response.status_code == (204 if version == 1 else 200), response.text
+        service.flush(force=True)
+        restarted = service_with_store(db_uri)
+        restarted.usage_enabled = False
+        reading = restarted.pool_readings(QuotaContext(RESERVED_USER_LOCAL, None))["gw"]
+        assert reading.windows[0].remaining_pct == 60
+        assert restarted.delete_account(RESERVED_USER_LOCAL, "gw")
+        restarted.flush(force=True)
+        assert "usage.account.gw" not in restarted.snapshot_store.read(RESERVED_USER_LOCAL)
+        assert (await client.delete(path)).status_code == 204
         old = {"captured_at": time.time(), "windows": []}
         assert (await client.put("/v1/me/agent-quota/codex", json=old)).status_code == 204
 

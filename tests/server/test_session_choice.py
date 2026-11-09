@@ -281,7 +281,10 @@ async def test_floor_controls_and_preview_use_owner_tiles_without_changing_docum
 
 
 @pytest.mark.asyncio
-async def test_floor_until_reset_with_board_disabled_reads_host_scoped_report(db_uri, tmp_path):
+@pytest.mark.parametrize("tile", ["claude", "claude-pro"])
+async def test_floor_until_reset_with_board_disabled_reads_host_scoped_report(
+    db_uri, tmp_path, tile
+):
     import time
 
     app = _preferences_app(db_uri, tmp_path)
@@ -305,16 +308,35 @@ async def test_floor_until_reset_with_board_disabled_reads_host_scoped_report(db
         },
         now=now,
     )
+    if tile != "claude":
+        from omnigent.usage.contract import UsageReport
+
+        service.report_account(
+            OWNER,
+            tile,
+            UsageReport.model_validate(
+                {
+                    "observed_at": now,
+                    "windows": [
+                        {
+                            "id": "7d",
+                            "percent_used": 90,
+                            "window_minutes": 10080,
+                            "resets_at": now + 86400,
+                        }
+                    ],
+                }
+            ),
+            now=now,
+        )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="http://test",
         headers={"X-Test-User": OWNER},
     ) as client:
-        floor = await client.post(
-            "/v1/me/session-choice/floor", json={"tile": "claude", "off": True}
-        )
+        floor = await client.post("/v1/me/session-choice/floor", json={"tile": tile, "off": True})
     assert floor.status_code == 200, floor.text
-    assert floor.json()["claude"]["windows"]["7d"] == [now + 86400, 90]
+    assert floor.json()[tile]["windows"]["7d"] == [now + 86400, 90]
 
 
 NOW = 2_000_000
