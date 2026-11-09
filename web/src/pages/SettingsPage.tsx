@@ -1,3 +1,5 @@
+import { BrowserPlacesSettings } from "@/components/BrowserPane/BrowserPlacesSettings";
+import { browserPlacesBridge } from "@/lib/browserPlacesBridge";
 /**
  * Settings page (``/settings``).
  *
@@ -2348,6 +2350,11 @@ function GeneralSection() {
             </div>
           )}
         </SettingsGroup>
+        {browserPlacesBridge() && (
+          <SettingsGroup title="Bookmarks and history">
+            <BrowserPlacesSettings />
+          </SettingsGroup>
+        )}
         {browserLoginBridge() && (
           <SettingsGroup title="In-app browser" testId="settings-group-browser-login">
             <BrowserLoginControl />

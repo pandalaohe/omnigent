@@ -22,8 +22,10 @@ import {
   RotateCwIcon,
   SquareDashedMousePointerIcon,
   WrenchIcon,
+  StarIcon,
+  BookOpenIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
@@ -43,6 +45,7 @@ import {
 } from "@/components/ui/select";
 import type { ChromeCookieImportResult, ChromeCookiePreviewResult } from "@/lib/nativeBridge";
 import { getDesktopFeatures, supportsBrowser } from "@/lib/nativeBridge";
+import { browserPlacesBridge } from "@/lib/browserPlacesBridge";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
 import { cn } from "@/lib/utils";
 
@@ -158,6 +161,34 @@ export function BrowserPane({
   agentBrowser = true,
   active = true,
 }: BrowserPaneProps) {
+  const places = useMemo(browserPlacesBridge, []);
+  const addressRef = useRef<HTMLInputElement>(null);
+  const [bookmarked, setBookmarked] = useState(false);
+  const actualUrlRef = useRef("");
+  const suggestGeneration = useRef(0);
+  const blurTimer = useRef<number | undefined>(undefined);
+  const suggest = useCallback(
+    (query: string, bookmarksOnly = false) => {
+      window.clearTimeout(blurTimer.current);
+      const bounds = addressRef.current?.getBoundingClientRect();
+      if (!places || !bounds) return;
+      void places
+        .browserPlaces({
+          action: "suggest",
+          viewId: conversationId,
+          query,
+          bookmarksOnly,
+          bounds: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height },
+        })
+        .then((result) => {
+          if (!result.ok) toast.error(result.error || "Could not load saved pages.");
+          else if (result.empty && bookmarksOnly)
+            toast.info("No bookmarks yet. Use the star to save a page.");
+        })
+        .catch(() => toast.error("Could not load saved pages."));
+    },
+    [places, conversationId],
+  );
   const containerRef = useRef<HTMLDivElement | null>(null);
   const lastBoundsRef = useRef<Bounds | null>(null);
   const browserSupported = supportsBrowser();
@@ -187,6 +218,32 @@ export function BrowserPane({
   const [cookieProfileId, setCookieProfileId] = useState("");
   const [cookieScope, setCookieScope] = useState("");
   const [cookieBusy, setCookieBusy] = useState(false);
+
+  useEffect(() => {
+    if (!places || !active) return;
+    const generation = ++suggestGeneration.current;
+    const timer = window.setTimeout(() => {
+      if (urlEditingRef.current && generation === suggestGeneration.current) suggest(currentUrl);
+    }, 120);
+    if (!urlEditingRef.current) {
+      actualUrlRef.current = currentUrl;
+      void places
+        .browserPlaces({ action: "list" })
+        .then((result) => {
+          setBookmarked(!!result.bookmarks?.some((row) => row.url === currentUrl));
+        })
+        .catch(() => {});
+    }
+    return () => window.clearTimeout(timer);
+  }, [currentUrl, active, suggest, places]);
+  useEffect(
+    () => () => {
+      window.clearTimeout(blurTimer.current);
+      suggestGeneration.current++;
+      void places?.browserPlaces({ action: "dismiss" });
+    },
+    [places],
+  );
 
   // Switching profiles can drop the scope the previous one offered; keep the
   // state (and therefore the import request) on a scope that is still offered.
@@ -262,21 +319,39 @@ export function BrowserPane({
   // Submit the URL bar. Normalize the typed value (add scheme) and reuse the
   // relay's own navigate path with force:true so it reloads even if the typed
   // URL matches the current one (explicit "go there" intent).
+  const navigate = useCallback(
+    (navUrl: string, restoreOnFailure = false) => {
+      const bridge = getBridge();
+      if (!bridge?.browserOpenOrNavigate) return;
+      setNavigationError(null);
+      void bridge
+        .browserOpenOrNavigate(conversationId, navUrl, undefined, { force: true })
+        .then((result) => {
+          if (result.ok) setCurrentUrl(navUrl);
+          else {
+            setNavigationError(result.error ?? "Unable to open this page.");
+            if (restoreOnFailure) setCurrentUrl(actualUrlRef.current);
+          }
+        })
+        .catch(() => {
+          setNavigationError("Unable to open this page.");
+          if (restoreOnFailure) setCurrentUrl(actualUrlRef.current);
+        });
+    },
+    [conversationId],
+  );
   const submitUrl = useCallback(() => {
-    const bridge = getBridge();
-    if (!bridge?.browserOpenOrNavigate) return;
-    const raw = currentUrl.trim();
-    if (!raw) return;
-    const navUrl = normalizeTypedUrl(raw);
-    setNavigationError(null);
-    void bridge
-      .browserOpenOrNavigate(conversationId, navUrl, undefined, { force: true })
-      .then((result) => {
-        if (result.ok) setCurrentUrl(navUrl);
-        else setNavigationError(result.error ?? "Unable to open this page.");
-      })
-      .catch(() => setNavigationError("Unable to open this page."));
-  }, [conversationId, currentUrl]);
+    if (currentUrl.trim()) navigate(normalizeTypedUrl(currentUrl.trim()));
+  }, [currentUrl, navigate]);
+  useEffect(() => {
+    if (!places || !active) return;
+    return places.onBrowserPlaceChosen((value) => {
+      if (value.viewId !== conversationId) return;
+      suggestGeneration.current++;
+      urlEditingRef.current = false;
+      navigate(value.url, true);
+    });
+  }, [places, conversationId, active, navigate]);
 
   const handleBack = useCallback(() => {
     const bridge = getBridge();
@@ -615,6 +690,7 @@ export function BrowserPane({
           <RotateCwIcon className="size-4" />
         </button>
         <input
+          ref={addressRef}
           type="text"
           value={currentUrl}
           spellCheck={false}
@@ -624,20 +700,80 @@ export function BrowserPane({
           aria-label="Address bar"
           onChange={(e) => setCurrentUrl(e.target.value)}
           onFocus={() => {
+            window.clearTimeout(blurTimer.current);
             urlEditingRef.current = true;
+            suggest(currentUrl);
           }}
           onBlur={() => {
             urlEditingRef.current = false;
+            suggestGeneration.current++;
+            blurTimer.current = window.setTimeout(() => {
+              void places?.browserPlaces({ action: "dismiss" });
+            }, 180);
           }}
           onKeyDown={(e) => {
+            if (places && ["ArrowDown", "ArrowUp", "Escape"].includes(e.key)) {
+              e.preventDefault();
+              if (e.key === "Escape") suggestGeneration.current++;
+              void places.browserPlaces({ action: "key", key: e.key });
+              return;
+            }
             if (e.key === "Enter") {
               e.preventDefault();
-              submitUrl();
-              e.currentTarget.blur();
+              const input = e.currentTarget;
+              if (places) {
+                void places.browserPlaces({ action: "key", key: "Enter" }).then((result) => {
+                  if (!result.empty) {
+                    submitUrl();
+                    input.blur();
+                  }
+                });
+              } else {
+                submitUrl();
+                input.blur();
+              }
             }
           }}
           className="h-6 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 text-foreground text-sm outline-none placeholder:text-muted-foreground focus-visible:border-ring dark:bg-input"
         />
+        {places && (
+          <>
+            <button
+              type="button"
+              aria-label={bookmarked ? "Remove bookmark" : "Bookmark page"}
+              title={bookmarked ? "Remove bookmark" : "Bookmark page"}
+              disabled={!hasView}
+              className="flex size-6 items-center justify-center rounded hover:bg-muted disabled:opacity-40"
+              onClick={() => {
+                void places
+                  .browserPlaces({
+                    action: "update",
+                    url: actualUrlRef.current,
+                    viewId: conversationId,
+                    remove: bookmarked,
+                  })
+                  .then((result) => {
+                    if (result.ok) {
+                      setBookmarked(!bookmarked);
+                      toast.success(bookmarked ? "Bookmark removed" : "Page bookmarked");
+                    } else toast.error(result.error || "Could not save bookmark.");
+                  })
+                  .catch(() => toast.error("Could not save bookmark."));
+              }}
+            >
+              <StarIcon className={cn("size-4", bookmarked && "fill-current text-primary")} />
+            </button>
+            <button
+              type="button"
+              aria-label="Show bookmarks"
+              title="Bookmarks"
+              className="flex size-6 items-center justify-center rounded hover:bg-muted"
+              onClick={() => suggest("", true)}
+            >
+              <BookOpenIcon className="size-4" />
+            </button>
+          </>
+        )}
         <button
           type="button"
           onClick={handleDevTools}

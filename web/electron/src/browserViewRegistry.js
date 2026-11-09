@@ -107,6 +107,7 @@ function createBrowserViewRegistry({
   partitionScope = `w${++registrySeq}`,
   partitionForView = (_viewId, defaultPartition) => defaultPartition(),
   isPartitionUnavailable = () => false,
+  onPageVisit = () => {},
 } = {}) {
   const entries = new Map(); // conversationId -> BrowserViewEntry
   const pendingNavigations = new Map();
@@ -245,6 +246,7 @@ function createBrowserViewRegistry({
     wc.on("did-navigate", () => {
       entry.layoutReady = true;
       syncHiddenLayout(entry);
+      onPageVisit(wc.getURL?.(), wc.getTitle?.());
     });
     wc.on("render-process-gone", () => {
       entry.layoutReady = false;
@@ -284,6 +286,11 @@ function createBrowserViewRegistry({
     attachAgentNavGuard(conversationId, entry);
     attachRecentSessionInput(entry);
     attachHiddenLayoutTracking(entry);
+    const recordVisit = () =>
+      onPageVisit(view.webContents.getURL?.(), view.webContents.getTitle?.());
+    view.webContents.on("did-navigate-in-page", (_event, _url, isMainFrame) => {
+      if (isMainFrame) recordVisit();
+    });
     return { ok: true, entry, created: true };
   }
 
