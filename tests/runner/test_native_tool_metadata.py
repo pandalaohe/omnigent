@@ -103,6 +103,7 @@ def test_metadata_survives_deleted_cwd(
         assert set(schema_names) >= tool_dispatch._OS_ENV_TOOLS
         for tool_name in ("sys_call_async", "sys_session_create", "sys_terminal_launch"):
             assert (tool_name in schema_names) is enabled
+        assert {"sys_timer_set", "sys_timer_cancel"} <= set(schema_names)
 
         for harness in ("claude-sdk", "claude-native", "codex-native", "pi-native"):
             native = harness.endswith("-native")
@@ -111,8 +112,9 @@ def test_metadata_survives_deleted_cwd(
             assert granted == registered | {"read_skill_file"} | (
                 tool_dispatch._OS_ENV_TOOLS if native else set()
             )
-            for tool_name in ("sys_call_async", "sys_timer_set", "sys_session_create"):
+            for tool_name in ("sys_call_async", "sys_session_create"):
                 assert (tool_name in granted) is enabled
+            assert {"sys_timer_set", "sys_timer_cancel"} <= granted
             for tool_name in tool_dispatch._OS_ENV_TOOLS:
                 reason = tool_dispatch._ungranted_tool_reason(tool_name, spec, harness)
                 assert (reason is None) is (os_env is not None or native)
