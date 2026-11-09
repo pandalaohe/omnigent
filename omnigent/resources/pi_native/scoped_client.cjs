@@ -15,9 +15,21 @@ function publicValue(value) {
 const denied = () => ({block:true,reason:"Scoped Pi authority is unavailable"});
 const failedResult = () => ({isError:true,content:[{type:"text",text:"Scoped Pi execution is unavailable"}]});
 const fingerprint = event => JSON.stringify([event.toolName,event.input]);
+// Only fixed codes and elapsed time cross this boundary; never pass an event,
+// state, scope, response or exception (even through publicValue) to diagnostics.
+const diagnostic = () => {};
+function fileDiagnostic(directory) {
+  const destination=path.join(directory,"scoped-pi.log");
+  return record=>{
+    fs.appendFileSync(destination,"[scoped-pi] "+JSON.stringify({time:new Date().toISOString(),...record})+"\n",{mode:0o600});
+  };
+}
+function reportDiagnostic(report, record) {
+  try {report(record);} catch (_) { /* Diagnostics must not affect authority. */ }
+}
 
 /** The injected transport is private bootstrap code, never a model-facing API. */
-function createScopedClient({scope, transport, readState, recheck}) {
+function createScopedClient({scope, transport, readState, recheck, report=diagnostic}) {
   const calls = new Map(), finished = new Set(), evaluating = new Set();
   let closed = false;
   const current = revision => {
@@ -31,28 +43,37 @@ function createScopedClient({scope, transport, readState, recheck}) {
       name:call.event.toolName,arguments:call.event.input,operation_id:call.operation,step:"initial"};
   }
   async function evaluate(event, _ctx, support) {
+    const started=performance.now();
+    let stage="initial";
+    const refuse=branch=>{
+      reportDiagnostic(report,{event:"evaluate_denied",branch,stage,elapsed_ms:Math.round(performance.now()-started)});
+      return denied();
+    };
     const state=readState();
-    if(!event || typeof event.toolCallId!=="string" || !event.toolCallId || !current(state?.revision)) return denied();
+    if(!event || typeof event.toolCallId!=="string" || !event.toolCallId) return refuse("invalid_event");
+    if(!current(state?.revision)) return refuse("not_current");
     const id=event.toolCallId, signature=fingerprint(event), old=calls.get(id);
-    if(finished.has(id) || evaluating.has(id) || calls.size+finished.size>=32768) return denied();
-    if(old) return old.signature===signature && old.phase==="allowed" ? {block:false} : denied();
+    if(finished.has(id) || evaluating.has(id) || calls.size+finished.size>=32768) return refuse("replay_or_capacity");
+    if(old) return old.signature===signature && old.phase==="allowed" ? {block:false} : refuse("call_changed");
     evaluating.add(id);
     try {
+      stage="attest";
       await transport.attest(event,support,state.revision);
-      if(!current(state.revision)) return denied();
+      if(!current(state.revision)) return refuse("not_current");
+      stage="policy";
       const response=await transport.evaluate(event,state.revision);
-      if(!current(state.revision)) return denied();
+      if(!current(state.revision)) return refuse("not_current");
       if(!["POLICY_ACTION_ALLOW","POLICY_ACTION_UNSPECIFIED"].includes(response?.result))
         return {block:true,reason:publicValue(typeof response?.reason==="string"?response.reason:"Scoped Pi policy denied")};
       const binding=response.permission_tier_binding;
       const canonical="pi:"+crypto.createHash("sha256").update(scope.scope_id+"\0"+id).digest("hex");
       if(!binding || binding.call_id!==canonical || binding.revision!==state.revision ||
-        !/^[0-9a-f]{64}$/.test(binding.arguments_digest||"") || !/^pi_receipt_[A-Za-z0-9_-]{32,256}$/.test(binding.pi_origin_receipt||"")) return denied();
+        !/^[0-9a-f]{64}$/.test(binding.arguments_digest||"") || !/^pi_receipt_[A-Za-z0-9_-]{32,256}$/.test(binding.pi_origin_receipt||"")) return refuse("invalid_binding");
       calls.set(id,{event:JSON.parse(JSON.stringify(event)),signature,revision:state.revision,
         binding:{call_id:canonical,arguments_digest:binding.arguments_digest},receipt:binding.pi_origin_receipt,
         support:JSON.stringify(support),operation:crypto.randomUUID(),phase:"allowed"});
       return {block:false};
-    } catch (_) { return denied(); } finally {evaluating.delete(id);}
+    } catch (_) { return refuse("transport_exception"); } finally {evaluating.delete(id);}
   }
   async function execute(event, ctx, start) {
     const call=calls.get(event.toolCallId);
@@ -102,7 +123,7 @@ function createScopedClient({scope, transport, readState, recheck}) {
 }
 
 /** A pinned, loopback-only control/continuity channel; capabilities stay in this closure. */
-async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoch}) {
+async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoch,report=diagnostic}) {
   const url=new URL(endpoint);
   if(url.protocol!=="http:" || !["127.0.0.1","[::1]"].includes(url.hostname) || !url.port ||
     url.username || url.password || url.search || url.hash || !["","/"].includes(url.pathname))
@@ -110,19 +131,29 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
   let live=true, ready=false, sequence=0, queue=Promise.resolve();
   const listeners=new Set(), scopeListeners=new Map(), revoked=new Set();
   const lose=()=>{live=false;ready=false;for(const callback of listeners)callback();};
-  function request(route,body,token,onResponse) {
+  function request(route,body,token,onResponse,signal) {
     return new Promise((resolve,reject)=>{
+      const started=performance.now();
+      let reported=false;
+      const failure=outcome=>{
+        if(reported)return;
+        reported=true;
+        reportDiagnostic(report,{event:"request_failed",route,outcome,elapsed_ms:Math.round(performance.now()-started)});
+      };
       const bytes=JSON.stringify(body);
-      const req=http.request(new URL(route,url),{method:"POST",headers:{authorization:`Bearer ${token}`,"content-type":"application/json","content-length":Buffer.byteLength(bytes)}},res=>{
-        if(res.statusCode!==200) {res.resume();reject(new Error("Scoped Pi transport rejected"));return;}
+      const req=http.request(new URL(route,url),{method:"POST",signal,headers:{authorization:`Bearer ${token}`,"content-type":"application/json","content-length":Buffer.byteLength(bytes)}},res=>{
+        if(res.statusCode!==200) {failure("http_rejected");res.resume();reject(new Error("Scoped Pi transport rejected"));return;}
         let text="";
         res.on("data",chunk=>{text+=chunk;if(text.length>1024*1024)res.destroy();});
-        res.on("end",()=>{try {const reply=JSON.parse(text);if(onResponse)onResponse(reply);resolve(reply);}catch(_){reject(new Error("Scoped Pi transport response unavailable"));}});
-        res.on("error",()=>reject(new Error("Scoped Pi transport response unavailable")));
+        res.on("end",()=>{try {const reply=JSON.parse(text);if(onResponse)onResponse(reply);resolve(reply);}catch(_){failure("response_invalid");reject(new Error("Scoped Pi transport response unavailable"));}});
+        res.on("error",()=>{failure("response_error");reject(new Error("Scoped Pi transport response unavailable"));});
       });
       req.setTimeout(2000,()=>req.destroy());
       req.on("error",()=>reject(new Error("Scoped Pi transport unavailable")));
       req.end(bytes);
+      if(signal)req.setTimeout(15000);
+      req.on("timeout",()=>failure("timeout"));
+      req.on("error",()=>failure(signal?.aborted?"deadline":"request_error"));
     });
   }
   const watch=http.get(new URL("/pi/bootstrap/watch",url),{headers:{authorization:`Bearer ${credential}`}},res=>{
@@ -151,17 +182,28 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
   for(let count=0;count<100&&!ready&&live;count++)await new Promise(resolve=>setTimeout(resolve,10));
   if(!ready||!live){watch.destroy();throw new Error("Scoped Pi continuity unavailable");}
   async function control(op,values) {
+    // The bridge allows 5s for authentication and 5s for the operation.
+    // Allow scheduling slack, but cap the entire attest (including queue wait)
+    // at 15s, well below the RPC caller's 120s idle budget. Bind/revoke stay short.
+    const signal=op==="attest"?AbortSignal.timeout(15000):undefined;
     const task=queue.then(async()=>{
+      signal?.throwIfAborted();
       if(!live||!ready)throw new Error("Scoped Pi continuity unavailable");
-      const reply=await request("/pi/bootstrap",{protocol:1,sequence:++sequence,op,...values},credential);
+      const reply=await request("/pi/bootstrap",{protocol:1,sequence:++sequence,op,...values},credential,undefined,signal);
       if(reply.broker_incarnation!==undefined&&reply.broker_incarnation!==brokerIncarnation){lose();throw new Error("Scoped Pi broker changed");}
       return reply;
     });
-    queue=task.catch(()=>{});return task;
+    queue=task.catch(()=>{});
+    if(!signal)return task;
+    return new Promise((resolve,reject)=>{
+      const abort=()=>reject(new Error("Scoped Pi attestation deadline"));
+      signal.addEventListener("abort",abort,{once:true});
+      task.then(resolve,reject).finally(()=>signal.removeEventListener("abort",abort));
+    });
   }
   function client(binding,handle,readState,recheck) {
     const scope=binding.scope, scopeCredential=binding.credential;
-    return createScopedClient({scope,readState,recheck,transport:{
+    return createScopedClient({scope,readState,recheck,report,transport:{
       isCurrent:value=>live&&ready&&!revoked.has(value.scope_id)&&value.runner_epoch===scope.runner_epoch&&value.launch_epoch===launchEpoch,
       onLoss:callback=>{listeners.add(callback);const set=scopeListeners.get(scope.scope_id)||new Set();set.add(callback);scopeListeners.set(scope.scope_id,set);if(revoked.has(scope.scope_id))callback();},
       attest:(event,support,revision)=>control("attest",{handle,call_id:event.toolCallId,name:event.toolName,arguments:event.input,revision,support}),
@@ -221,8 +263,8 @@ async function connectFromHandoff(locator, {timeoutMs=8000}={}) {
     !/^pi_attestor_[A-Za-z0-9_-]{43}$/.test(descriptor.credential||"") ||
     descriptor.bridgeDir!==path.dirname(directory) || !path.isAbsolute(descriptor.statePath||""))
     throw new Error("Scoped Pi handoff binding unavailable");
-  const connection=await connectAttestor(descriptor);
+  const connection=await connectAttestor({...descriptor,report:fileDiagnostic(descriptor.bridgeDir)});
   return Object.freeze({connection,bridgeDir:descriptor.bridgeDir,statePath:descriptor.statePath});
 }
 
-module.exports={createScopedClient,connectAttestor,connectFromHandoff,publicValue};
+module.exports={createScopedClient,connectAttestor,connectFromHandoff,publicValue,fileDiagnostic};
