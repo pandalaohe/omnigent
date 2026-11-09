@@ -51,10 +51,12 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from pathlib import Path
 
 import httpx
 import pytest
+import yaml
 
 from tests.e2e.conftest import (
     configure_mock_llm,
@@ -93,9 +95,8 @@ pytestmark = [
 _FIXTURES_DIR = Path(__file__).resolve().parents[1] / "_fixtures" / "agents"
 _NAMED_FIXTURE = _FIXTURES_DIR / "named-sub-agent-test"
 
-# Mock queue keys — must match the model names in named-sub-agent-test.yaml.
-# Each agent has its own key so their LLM calls consume from separate queues
-# and cannot race when researcher and summarizer run in parallel.
+# Base model names match named-sub-agent-test.yaml. Mock parent models get a
+# per-test suffix so late auto-wakes cannot consume the next test's queue.
 _PARENT_MODEL = "gpt-5.4"
 _RESEARCHER_MODEL = "gpt-5.4-named-researcher"
 _SUMMARIZER_MODEL = "gpt-5.4-named-summarizer"
@@ -108,40 +109,55 @@ def _wait_for_autowake_settled(
     http_client: httpx.Client,
     session_id: str,
     timeout_s: float = 60.0,
+    *,
+    expected_children: int = 1,
 ) -> None:
-    """Wait for the auto-wake continuation to finish.
-
-    After ``_wait_for_markers`` confirms the child's marker appeared,
-    the parent's auto-wake continuation may not have started yet (the
-    session is idle from the dispatch turn). This helper waits for the
-    session to leave idle (auto-wake starts) then return to idle
-    (auto-wake completes), ensuring the auto-wake consumes its queued
-    response before the next user message races for the same queue slot.
-
-    If the session is already running when first polled, just waits for
-    idle — the auto-wake is already in flight.
-    """
+    """Wait for all child sessions and parent auto-wake continuations to settle."""
     deadline = time.monotonic() + timeout_s
-    saw_non_idle = False
+    stable_polls = 0
     while time.monotonic() < deadline:
+        children_resp = http_client.get(f"/v1/sessions/{session_id}/child_sessions")
+        children_resp.raise_for_status()
+        children = children_resp.json().get("data", [])
+        children_settled = len(children) >= expected_children
+        if children_settled:
+            for child in children:
+                if child.get("busy") or child.get("current_task_status") not in (
+                    "completed",
+                    "failed",
+                    "cancelled",
+                    "stopped",
+                    "killed",
+                ):
+                    children_settled = False
+                    break
+                child_resp = http_client.get(f"/v1/sessions/{child['id']}")
+                child_resp.raise_for_status()
+                child_body = child_resp.json()
+                if child_body.get("status") != "idle" or "PHASE4_OK" not in json.dumps(
+                    child_body.get("items", [])
+                ):
+                    children_settled = False
+                    break
         resp = http_client.get(f"/v1/sessions/{session_id}")
         resp.raise_for_status()
-        status = resp.json().get("status")
-        if status != "idle":
-            saw_non_idle = True
-        elif saw_non_idle:
-            # Was running, now idle again — auto-wake finished.
-            return
+        parent_body = resp.json()
+        items = parent_body.get("items", [])
+        unanswered_wake = bool(items) and "[System: sub-agent " in json.dumps(items[-1])
+        if (
+            children_settled
+            and parent_body.get("status") == "idle"
+            and not parent_body.get("busy")
+            and not unanswered_wake
+        ):
+            stable_polls += 1
+            if stable_polls >= 2:
+                return
+        else:
+            stable_polls = 0
         time.sleep(POLL_INTERVAL_S)
-    if not saw_non_idle:
-        # Auto-wake never started within the timeout. This is fine in
-        # some flows — the auto-wake may have completed extremely fast
-        # between polls, or the marker appeared from the child items
-        # before the wake notice was posted. Return rather than fail.
-        return
     raise AssertionError(
-        f"Session {session_id} did not return to idle within {timeout_s:.0f}s "
-        f"after auto-wake started"
+        f"Session {session_id} and its children did not settle within {timeout_s:.0f}s"
     )
 
 
@@ -164,6 +180,7 @@ def _configure_spawn_flow(
     mock_url: str | None,
     *,
     agent: str = "researcher",
+    parent_model: str,
     child_model: str = _RESEARCHER_MODEL,
     title: str = "auth",
     child_args: str = "What are common auth patterns?",
@@ -175,7 +192,7 @@ def _configure_spawn_flow(
     Queues responses on per-model keys so the parent and child never
     race for the same queue slot:
 
-    Parent key (``_PARENT_MODEL``):
+    Parent key (``parent_model``):
       1. Dispatch: ``sys_session_send`` tool call.
       2. After tool result: text acknowledging dispatch.
       3. Auto-wake continuation: text quoting the marker.
@@ -200,7 +217,7 @@ def _configure_spawn_flow(
             {"text": f"Dispatched {agent}, waiting for result."},
             {"text": parent_reply},
         ],
-        key=_PARENT_MODEL,
+        key=parent_model,
     )
     configure_mock_llm(
         mock_url,
@@ -209,11 +226,19 @@ def _configure_spawn_flow(
     )
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
+def parent_model(mock_llm_server_url: str | None) -> str:
+    """Late auto-wakes must never consume another test's parent responses."""
+    return f"{_PARENT_MODEL}-{uuid.uuid4().hex[:12]}" if mock_llm_server_url else _PARENT_MODEL
+
+
+@pytest.fixture
 def named_sub_agent_test_agent(
     http_client: httpx.Client,
     databricks_workspace_host: str | None,
     databricks_profile_or_none: str | None,
+    parent_model: str,
+    tmp_path: Path,
 ) -> str:
     """
     Upload the named-sub-agent-test fixture (parent + 2 sub-agents).
@@ -228,11 +253,17 @@ def named_sub_agent_test_agent(
         ``--profile`` is set, else ``None``.
     :param databricks_profile_or_none: Active ``--profile`` value,
         stamped onto the native executors so they authenticate.
-    :returns: Agent name ``"named-sub-agent-test"``.
+    :returns: The registered fixture's unique agent name.
     """
+    config = yaml.safe_load((_NAMED_FIXTURE / "named-sub-agent-test.yaml").read_text())
+    config["executor"]["model"] = parent_model
+    config["name"] = f"named-sub-agent-{uuid.uuid4().hex[:12]}"
+    agent_dir = tmp_path / config["name"]
+    agent_dir.mkdir()
+    (agent_dir / "omnigent.yaml").write_text(yaml.safe_dump(config))
     return upload_agent(
         http_client,
-        _NAMED_FIXTURE,
+        agent_dir,
         rewrite_model_for_databricks=databricks_workspace_host is not None,
         databricks_profile=databricks_profile_or_none,
     )
@@ -345,6 +376,7 @@ def _function_call_names(items: list[dict]) -> list[str]:
 def test_spawn_named_sub_agent_e2e(
     http_client: httpx.Client,
     named_sub_agent_test_agent: str,
+    parent_model: str,
     live_runner_id: str,
     mock_llm_server_url: str,
 ) -> None:
@@ -358,6 +390,7 @@ def test_spawn_named_sub_agent_e2e(
     reset_mock_llm(mock_llm_server_url)
     _configure_spawn_flow(
         mock_llm_server_url,
+        parent_model=parent_model,
         agent="researcher",
         title="auth",
         child_args="What are common auth patterns?",
@@ -396,11 +429,13 @@ def test_spawn_named_sub_agent_e2e(
     assert '"title"' in first_spawn_args and "auth" in first_spawn_args, (
         f"Spawn call arguments missing title='auth'; got {first_spawn_args!r}"
     )
+    _wait_for_autowake_settled(http_client, session_id)
 
 
 def test_ambient_hint_steers_followup_to_send_e2e(
     http_client: httpx.Client,
     named_sub_agent_test_agent: str,
+    parent_model: str,
     live_runner_id: str,
     mock_llm_server_url: str,
 ) -> None:
@@ -454,7 +489,7 @@ def test_ambient_hint_steers_followup_to_send_e2e(
             # Turn 2: parent auto-wake
             {"text": "Continuation result: RESEARCHER_PHASE4_OK"},
         ],
-        key=_PARENT_MODEL,
+        key=parent_model,
     )
     # Researcher child LLM calls on the researcher model key (2 total across 2 turns).
     configure_mock_llm(
@@ -512,11 +547,14 @@ def test_ambient_hint_steers_followup_to_send_e2e(
         f"persistence is useless because the LLM forgets across "
         f"turns."
     )
+    _wait_for_markers(http_client, session_id, "Continuation result: RESEARCHER_PHASE4_OK")
+    _wait_for_autowake_settled(http_client, session_id)
 
 
 def test_parallel_named_sub_agents_e2e(
     http_client: httpx.Client,
     named_sub_agent_test_agent: str,
+    parent_model: str,
     live_runner_id: str,
     mock_llm_server_url: str,
 ) -> None:
@@ -546,8 +584,14 @@ def test_parallel_named_sub_agents_e2e(
                     "Both sub-agents finished. RESEARCHER_PHASE4_OK and SUMMARIZER_PHASE4_OK"
                 ),
             },
+            # Second auto-wake fallback when parallel children complete in separate wakes
+            {
+                "text": (
+                    "Both sub-agents finished. RESEARCHER_PHASE4_OK and SUMMARIZER_PHASE4_OK"
+                ),
+            },
         ],
-        key=_PARENT_MODEL,
+        key=parent_model,
     )
     configure_mock_llm(
         mock_llm_server_url,
@@ -575,11 +619,13 @@ def test_parallel_named_sub_agents_e2e(
     )
     # Both sub-agent results arrive via auto-wake; poll until both land.
     _wait_for_markers(http_client, session_id, "RESEARCHER_PHASE4_OK", "SUMMARIZER_PHASE4_OK")
+    _wait_for_autowake_settled(http_client, session_id, expected_children=2)
 
 
 def test_cross_parent_named_isolation_e2e(
     http_client: httpx.Client,
     named_sub_agent_test_agent: str,
+    parent_model: str,
     live_runner_id: str,
     mock_llm_server_url: str,
 ) -> None:
@@ -623,7 +669,7 @@ def test_cross_parent_named_isolation_e2e(
             # Conv B: parent auto-wake
             {"text": "Researcher returned: RESEARCHER_PHASE4_OK"},
         ],
-        key=_PARENT_MODEL,
+        key=parent_model,
     )
     configure_mock_llm(
         mock_llm_server_url,
@@ -648,6 +694,7 @@ def test_cross_parent_named_isolation_e2e(
         ),
     )
     _wait_for_markers(http_client, conv_a, "RESEARCHER_PHASE4_OK")
+    _wait_for_autowake_settled(http_client, conv_a)
 
     # Conversation B (a second fresh session — independent parent).
     # Must succeed even though conversation A already has a
@@ -663,6 +710,7 @@ def test_cross_parent_named_isolation_e2e(
         ),
     )
     _wait_for_markers(http_client, conv_b, "RESEARCHER_PHASE4_OK")
+    _wait_for_autowake_settled(http_client, conv_b)
 
     # The two parent conversations must be distinct.
     assert conv_a != conv_b, "Conversations A and B should be distinct"

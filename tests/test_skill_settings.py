@@ -141,7 +141,7 @@ def test_host_skill_settings_invalid_value_returns_empty(
 
 @pytest.mark.parametrize(
     "bad_config",
-    [b"skills: [unclosed", b"\xff\xfe skills:", b"x: " + b"[" * 1200 + b"]" * 1200],
+    [b"skills: [unclosed", b"\xff\xfe skills:", b"x: " + b"[" * 2500 + b"]" * 2500],
     ids=["invalid-yaml", "invalid-utf8", "nested-yaml"],
 )
 def test_host_skill_settings_bad_config_returns_empty_and_tool_still_refuses(

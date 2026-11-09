@@ -786,6 +786,29 @@ def _isolate_databricks_org_pin(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(PINNED_DATABRICKS_ORG_ENV_VAR)
 
 
+@pytest.fixture(autouse=True)
+def _restore_process_globals() -> Generator[None, None, None]:
+    """Restore process-wide recursion limit, logger level, and OpenAI env vars after each test."""
+    import logging
+
+    recursion_limit = sys.getrecursionlimit()
+    omnigent_logger = logging.getLogger("omnigent")
+    omnigent_logger_level = omnigent_logger.level
+    openai_env = {k: os.environ.get(k) for k in ("OPENAI_API_KEY", "OPENAI_BASE_URL")}
+    try:
+        yield
+    finally:
+        if sys.getrecursionlimit() != recursion_limit:
+            sys.setrecursionlimit(recursion_limit)
+        if omnigent_logger.level != omnigent_logger_level:
+            omnigent_logger.setLevel(omnigent_logger_level)
+        for key, value in openai_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 @pytest.fixture
 def origin_identity_probe() -> None:
     """Opt in to the real workspace-id probe (see ``_isolate_origin_identity``)."""

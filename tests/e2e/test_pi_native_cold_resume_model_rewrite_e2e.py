@@ -244,6 +244,8 @@ def test_cold_resume_preserves_model_and_prompt_settings(
         config=config,
         env={
             "OMNIGENT_PI_PATH": os.environ.get("OMNIGENT_PI_PATH"),
+            "OPENAI_API_KEY": None,
+            "OPENAI_BASE_URL": None,
             "PI_CODING_AGENT_DIR": "../custom-pi-agent" if provider_managed else None,
             "OMNIGENT_RUNNER_ENV_PASSTHROUGH": (
                 "PI_CODING_AGENT_DIR,NODE_OPTIONS" if provider_managed else "NODE_OPTIONS"

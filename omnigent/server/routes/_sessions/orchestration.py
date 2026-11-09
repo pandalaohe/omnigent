@@ -14381,6 +14381,31 @@ async def _create_session_from_existing_agent(
         )
 
 
+async def _retry_host_admission_lease(
+    fn: Callable[..., Any],
+    *args: Any,
+    timeout_s: float = 5.0,
+    interval_s: float = 0.05,
+    run_in_thread: bool = True,
+    **kwargs: Any,
+) -> Any:
+    """Retry a store operation while another writer holds its host admission lease."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            if not run_in_thread:
+                return fn(*args, **kwargs)
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        except OmnigentError as exc:
+            if (
+                exc.code != ErrorCode.CONFLICT
+                or "Host admission lease is busy" not in exc.message
+                or time.monotonic() >= deadline
+            ):
+                raise
+        await asyncio.sleep(interval_s)
+
+
 async def _create_session_from_existing_agent_impl(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -15681,7 +15706,10 @@ async def _create_session_from_existing_agent_impl(
             project_owner_kwargs: dict[str, Any] = (
                 {"project_owner_user_id": user_id} if "omni_project" in initial_labels else {}
             )
-            conv = conversation_store.create_conversation(
+            conv = await _retry_host_admission_lease(
+                conversation_store.create_conversation,
+                # Keep persistence synchronous inside the child-cap admission lock.
+                run_in_thread=False,
                 conversation_id=conversation_id,
                 agent_id=agent.id,
                 title=body.title,

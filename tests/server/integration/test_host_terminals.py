@@ -230,7 +230,12 @@ def setup(runtime_init, db_uri, tmp_path):
                 port = held.getsockname()[1]
         return Server(app, port)
 
-    return make_server, headers(owner), headers(other), owner
+    from omnigent.server.routes._host_launch import configure_host_sharding
+
+    try:
+        yield make_server, headers(owner), headers(other), owner
+    finally:
+        configure_host_sharding(False)
 
 
 async def assert_shell(server: Server, headers: dict[str, str], terminal: dict):

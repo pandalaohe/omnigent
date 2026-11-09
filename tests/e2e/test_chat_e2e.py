@@ -12,7 +12,6 @@ Runs entirely against the mock LLM server — no real API key needed::
 
 from __future__ import annotations
 
-import os
 import uuid
 from pathlib import Path
 
@@ -132,6 +131,7 @@ def _make_inline_agent_yaml(
 def test_chat_local_starts_server_and_agent_responds(
     mock_llm_server_url: str | None,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     ``omnigent chat ./agent-dir/`` starts a local server with the agent
@@ -167,8 +167,8 @@ def test_chat_local_starts_server_and_agent_responds(
 
     # Set env vars before _start_local_server so the spawned server
     # subprocess inherits them through child_env = {**os.environ, ...}.
-    os.environ["OPENAI_API_KEY"] = "mock-key"
-    os.environ["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
+    monkeypatch.setenv("OPENAI_API_KEY", "mock-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", f"{mock_llm_server_url}/v1")
 
     reset_mock_llm(mock_llm_server_url)
     configure_mock_llm(mock_llm_server_url, [{"text": marker}], key=model)
@@ -212,6 +212,7 @@ def test_chat_local_starts_server_and_agent_responds(
 def test_chat_local_accepts_omnigent_yaml_file(
     mock_llm_server_url: str | None,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     ``omnigent chat examples/coding_supervisor.yaml`` (or any
@@ -270,8 +271,8 @@ def test_chat_local_accepts_omnigent_yaml_file(
 
     # Set env vars before _start_local_server so the spawned server
     # subprocess inherits them through child_env = {**os.environ, ...}.
-    os.environ["OPENAI_API_KEY"] = "mock-key"
-    os.environ["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
+    monkeypatch.setenv("OPENAI_API_KEY", "mock-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", f"{mock_llm_server_url}/v1")
 
     reset_mock_llm(mock_llm_server_url)
     configure_mock_llm(mock_llm_server_url, [{"text": marker}], key=model)
