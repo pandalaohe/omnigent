@@ -6187,6 +6187,10 @@ async def _forward_available_status_events(
     superseded_failures = _superseded_failure_cursors(result.records, parent_claude_session_ids)
     durable = state
     for record in result.records:
+        # A clear may arrive after this poll's rotation check. Leave it and
+        # subsequent hooks for the rotation owner before advancing the cursor.
+        if record.event_name == "SessionStart" and record.source == "clear":
+            return durable
         status = _HOOK_EVENT_TO_STATUS.get(record.event_name or "")
         next_durable = HookForwardState(
             event_cursor=record.event_cursor,

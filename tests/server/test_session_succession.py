@@ -10,8 +10,10 @@ the receipt through ``rekeyed → opened → released → cards_closed → archi
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Iterator
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
@@ -400,6 +402,115 @@ async def test_agy_handover_reparents_children_and_wakes_successor_once(
     wake.assert_awaited_once()
     assert wake.call_args.args[0] == new
     assert "Finish the remaining check." in wake.call_args.args[1]
+
+
+async def test_late_claude_clear_delivers_note_and_resets_rotation(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    wake: AsyncMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.entities import CompactionData
+    from omnigent.harnesses.claude_native import forwarder
+    from omnigent.harnesses.claude_native.bridge import prepare_bridge_dir, record_hook_event
+    from omnigent.server.auto_rotation import auto_rotation_for
+
+    old = store.create_conversation(
+        agent_id="a" * 32,
+        runner_id=RUNNER_ID,
+        harness_override="claude-native",
+        labels={"omnigent.auto_rotation": "on"},
+    ).id
+    child = _create(store, parent=old, title="worker")
+    for _ in range(4):
+        store.append(
+            old,
+            [
+                NewConversationItem(
+                    type="compaction",
+                    response_id=generate_task_id(),
+                    data=CompactionData(
+                        summary="Summary",
+                        last_item_id="a" * 32,
+                        model="example/model",
+                        token_count=10,
+                    ),
+                )
+            ],
+        )
+    note = await client.post(
+        f"/v1/sessions/{old}/handover",
+        json={"handover": "Finish the remaining check.", "rotate": True},
+    )
+    assert note.status_code == 200, note.text
+    assert auto_rotation_for(store.get_conversation(old), store).rotation_pending
+    assert auto_rotation_for(store.get_conversation(old), store).compactions == 4
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
+    bridge_dir = prepare_bridge_dir(old, bridge_id="bridge_shared", workspace=tmp_path)
+    state = await forwarder._ensure_hook_state(bridge_dir, start_at_end=False, session_id=old)
+    assert (
+        await forwarder._maybe_rotate_session_on_clear(
+            client=client, session_id=old, bridge_dir=bridge_dir, state=state
+        )
+        is None
+    )
+    record_hook_event(bridge_dir, {"hook_event_name": "SessionStart", "source": "clear"})
+
+    async def route(request: httpx.Request) -> httpx.Response:
+        if "/resources/terminals/" in request.url.path:
+            return httpx.Response(200, json={})
+        if request.method == "PATCH":
+            body = json.loads(request.content)
+            if "runner_id" in body:
+                # Runtime binding is simulated alongside the terminal transfer.
+                session_id = request.url.path.rsplit("/", 1)[-1]
+                if body["runner_id"]:
+                    store.set_runner_id(session_id, body["runner_id"])
+                else:
+                    store.clear_runner_id(session_id)
+                if "labels" in body:
+                    store.set_labels(session_id, body["labels"])
+                return httpx.Response(200, json={"id": session_id})
+        response = await client.request(
+            request.method,
+            str(request.url),
+            content=request.content,
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code < 400, response.text
+        return response
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(route), base_url="http://test"
+    ) as native:
+        state = await forwarder._forward_available_status_events(
+            client=native,
+            session_id=old,
+            bridge_dir=bridge_dir,
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+        )
+        new = await forwarder._maybe_rotate_session_on_clear(
+            client=native, session_id=old, bridge_dir=bridge_dir, state=state
+        )
+        assert new is not None
+        await forwarder.post_session_succession(native, old_session_id=old, new_session_id=new)
+    wake.assert_awaited_once()
+    assert wake.call_args.args[0] == new
+    assert "Finish the remaining check." in wake.call_args.args[1]
+    assert store.get_conversation(child).parent_conversation_id == new
+    status = auto_rotation_for(store.get_conversation(new), store)
+    assert not status.rotation_pending
+    assert status.compactions == 0
+    assert store.get_conversation(old).archived
 
 
 async def test_succession_reports_dropped_configuration_without_values(

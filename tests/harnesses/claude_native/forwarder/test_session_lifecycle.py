@@ -34,10 +34,12 @@ from tests.harnesses.claude_native.forwarder._support import (
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("lost_reply", [False, "transport", "proxy"])
+@pytest.mark.parametrize("status_reads_first", [False, True])
 async def test_clear_hook_rotates_active_session_without_reprocessing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     lost_reply: bool | str,
+    status_reads_first: bool,
 ) -> None:
     """
     Claude ``/clear`` creates a fresh Omnigent session and consumes the hook.
@@ -135,6 +137,19 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
             start_at_end=False,
             session_id="conv_old",
         )
+        if status_reads_first:
+            # A clear can arrive after the rotation check but before status forwarding.
+            hook_state = await forwarder._forward_available_status_events(
+                client=client,
+                session_id="conv_old",
+                bridge_dir=bridge_dir,
+                state=hook_state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=forwarder._ForwardDedupeState(),
+                task_subjects={},
+                task_statuses={},
+                task_order=[],
+            )
         rotated_to = await forwarder._maybe_rotate_session_on_clear(
             client=client,
             session_id="conv_old",
