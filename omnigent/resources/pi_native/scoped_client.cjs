@@ -120,7 +120,7 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
         res.on("end",()=>{try {const reply=JSON.parse(text);if(onResponse)onResponse(reply);resolve(reply);}catch(_){reject(new Error("Scoped Pi transport response unavailable"));}});
         res.on("error",()=>reject(new Error("Scoped Pi transport response unavailable")));
       });
-      req.setTimeout(2000,()=>req.destroy());
+      req.setTimeout(route==="/policies/evaluate" || route==="/pi/rpc" ? 86400000 : 2000,()=>req.destroy());
       req.on("error",()=>reject(new Error("Scoped Pi transport unavailable")));
       req.end(bytes);
     });
