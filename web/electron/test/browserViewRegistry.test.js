@@ -685,6 +685,24 @@ function makeNetworkGuardRegistry({ proxy = "DIRECT", ...extra } = {}) {
 }
 
 describe("browserViewRegistry — network-layer agent guard (DNS + connected address)", () => {
+  it("keeps an address-based localhost allowance through every navigation guard", async () => {
+    const { registry, idOf } = makeNetworkGuardRegistry({
+      resolveHost: async () => ["127.0.0.1"],
+      getBrowserAccess: () => ({ level: "agent", allowed: ["127.0.0.0/8"] }),
+    });
+    const url = "http://localhost:8080/";
+    assert.equal((await registry.checkAgentNavigation("conv_1", url, {})).ok, true);
+    assert.equal(
+      registry.openOrNavigate("conv_1", url, undefined, { agent: true, agentContext: {} }).ok,
+      true,
+    );
+    const webContentsId = idOf("conv_1");
+    assert.equal(await registry.shouldCancelAgentRequest({ webContentsId, url }), false);
+    assert.equal(
+      await registry.shouldCancelAgentResponse({ webContentsId, url, ip: "127.0.0.1" }),
+      false,
+    );
+  });
   for (const once of [false, true]) {
     it(`keeps a ${once ? "once" : "configured"} grant through DNS and response guards`, async () => {
       const grant = "lvh.me:8899";

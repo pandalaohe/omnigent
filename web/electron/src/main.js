@@ -82,6 +82,12 @@ const { registerBrowserIpc } = require("./browserIpc");
 const { createBrowserExtensions } = require("./browserExtensions");
 const { createExtensionPackages } = require("./browserExtensionPackages");
 const { refreshExtensionHosts } = require("./browserExtensionLifecycle");
+const {
+  normalizeBrowserAccess,
+  trackBrowserNavigationInput,
+  consumeBrowserNavigationInput,
+  registerBrowserAccessSettings,
+} = require("./browserAccessSettings");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
@@ -2506,6 +2512,7 @@ function createWindow(targetUrl, opts = {}) {
       spellcheck: true,
     },
   });
+  trackBrowserNavigationInput(win.webContents);
   registerWindowDiagnostics(win);
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
@@ -4019,6 +4026,7 @@ function createBrowserRegistryForWindow(win) {
         serverTarget: target,
       });
     },
+    getBrowserAccess: () => normalizeBrowserAccess(loadSettings().browser_access),
     getAgentAllowlist: (context) => agentBrowserAllowlist(context?.serverOrigin),
     getFillAllowlist: () => agentBrowserAllowlist(pinnedOrigin(win)),
     createBoundsController: createBrowserViewBoundsController,
@@ -4092,11 +4100,11 @@ async function confirmAgentNavigation(event, { url, grant }) {
     type: "warning",
     icon: icon.isEmpty() ? undefined : icon,
     title: "Omnigent",
-    message: "Allow the agent to open " + grant + "?",
+    message: "Allow opening " + grant + "?",
     detail:
       `${host} is asking to let its agent open ${url} in the embedded browser. ` +
-      `This address is on this computer or the local network, and the agent will ` +
-      `be able to read its pages. Only allow addresses you trust.`,
+      `Your browser access settings require confirmation for this address. Agents can read ` +
+      `pages opened in the embedded browser. Only allow addresses you trust.`,
     buttons: ["Don't Allow", "Allow Once", "Always Allow"],
     defaultId: 0, // deny is the safe default (Esc / Enter both decline)
     cancelId: 0,
@@ -5422,7 +5430,28 @@ function registerIpc() {
       return { ok: false, error: "Could not open Bitwarden." };
     }
   });
+  registerBrowserAccessSettings({
+    ipcMain,
+    isTrusted: isPinnedOriginSender,
+    loadSettings,
+    saveSettings,
+    confirmWidening: async (event, access) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      if (!win || win.isDestroyed()) return false;
+      const { response } = await dialog.showMessageBox(win, {
+        type: "warning",
+        buttons: ["Cancel", "Allow change"],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+        message: "Allow broader browser access on this desktop?",
+        detail: `All connected servers use these settings. Agents can read opened pages.\n\nInternal addresses: ${{ none: "Never ask", agent: "Ask for agent navigation", all: "Ask for all navigation" }[access.level]}\nNever open: ${access.blocked.join(", ") || "None"}\nAlways ask: ${access.ask.join(", ") || "None"}\nOpen without asking: ${access.allowed.join(", ") || "None"}`,
+      });
+      return response === 1;
+    },
+  });
   registerBrowserIpc({
+    consumeUserNavigation: (event) => consumeBrowserNavigationInput(event.sender),
     ipcMain,
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,

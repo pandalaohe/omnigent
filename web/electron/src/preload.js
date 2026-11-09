@@ -330,6 +330,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   browserClose: (conversationId, reason) =>
     ipcRenderer.invoke("omnigent:browser-close", { conversationId, reason }),
+  getBrowserAccess: () => ipcRenderer.invoke("omnigent:browser-access:get"),
+  setBrowserAccess: (access) => ipcRenderer.invoke("omnigent:browser-access:set", access),
   getBrowserLoginSetting: () => ipcRenderer.invoke("omnigent:browser-login-setting:get"),
   browserExtensionsList: () => ipcRenderer.invoke("omnigent:browser-extensions:list"),
   browserExtensionsAdd: () => ipcRenderer.invoke("omnigent:browser-extensions:add"),

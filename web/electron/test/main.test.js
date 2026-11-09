@@ -2976,6 +2976,49 @@ describe("agent browser allowlist wiring", () => {
     assert.deepEqual(plain(get({ serverOrigin: "https://host.example" })), []);
   });
 
+  it("reads desktop-wide access live and requires native confirmation for widening", async (t) => {
+    const h = harness(t);
+    h.api.createBrowserRegistryForWindow(h.win);
+    const getAccess = h.browserRegistryDeps().getBrowserAccess;
+    assert.equal(getAccess().level, "agent");
+    const event = { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } };
+    const get = h.ipc.get("omnigent:browser-access:get");
+    const save = h.ipc.get("omnigent:browser-access:set");
+    assert.equal(get({ sender: h.webContents }).ok, false);
+    let confirms = 0;
+    h.electron.dialog.showMessageBox = async () => {
+      confirms++;
+      return { response: 0 };
+    };
+    const access = { level: "none", blocked: [], ask: [], allowed: [] };
+    assert.equal((await save(event, access)).ok, false);
+    assert.equal(getAccess().level, "agent");
+    h.electron.dialog.showMessageBox = async () => {
+      confirms++;
+      return { response: 1 };
+    };
+    assert.equal((await save(event, access)).ok, true);
+    assert.equal(getAccess().level, "none");
+    assert.equal((await save(event, { ...access, level: "all" })).ok, true);
+    assert.equal(confirms, 2, "narrowing does not ask");
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({ browser_access: { ...access, level: "agent" } }),
+    );
+    assert.equal(getAccess().level, "agent", "hand edits apply on the next policy read");
+  });
+
+  it("wires app-window native Enter to a single navigation credential", (t) => {
+    const h = harness(t);
+    h.api.createWindow();
+    const consume = h.browserIpcDeps().consumeUserNavigation;
+    const event = { sender: h.webContents };
+    assert.equal(consume(event), false);
+    h.webContents.emitWith("before-input-event", {}, { type: "keyDown", key: "Enter" });
+    assert.equal(consume(event), true);
+    assert.equal(consume(event), false);
+  });
+
   it("remembers an always-allow grant without disturbing other settings", async (t) => {
     const h = harness(t);
     fs.writeFileSync(
@@ -3012,7 +3055,7 @@ describe("agent browser allowlist wiring", () => {
     // The prompt is modal to the shell window with the safe-default options.
     assert.equal(dialogs.length, 2);
     assert.equal(dialogs[0].win, h.win);
-    assert.equal(dialogs[0].options.message, `Allow the agent to open ${ip(192, 168, 1, 20)}:80?`);
+    assert.equal(dialogs[0].options.message, `Allow opening ${ip(192, 168, 1, 20)}:80?`);
     assert.deepEqual(plain(dialogs[0].options.buttons), [
       "Don't Allow",
       "Allow Once",

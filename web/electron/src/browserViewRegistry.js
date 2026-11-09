@@ -100,6 +100,7 @@ function createBrowserViewRegistry({
   // answer means "no entries" — never a policy error.
   getAgentAllowlist = () => [],
   getFillAllowlist = () => [],
+  getBrowserAccess = () => ({}),
   // (hostname, partition) => Promise<string[]> for the agent DNS check, and
   // (url, partition) => Promise<string> ("DIRECT" or a PAC-style proxy list).
   resolveHost = lookupHostAddresses,
@@ -162,8 +163,11 @@ function createBrowserViewRegistry({
     const configured = getAgentAllowlist(context);
     const onceGrants = Array.isArray(context?.allowOnce) ? context.allowOnce : [];
     return {
+      access: getBrowserAccess(),
+      userNavigation: context?.userNavigation === true,
+      allowOnce: onceGrants,
       allowLocalhost: isArcaAgentContext(context),
-      allowlist: [...(Array.isArray(configured) ? configured : []), ...onceGrants],
+      allowlist: [...(Array.isArray(configured) ? configured : [])],
     };
   }
 
@@ -596,7 +600,14 @@ function createBrowserViewRegistry({
       (await isProxyAddress(ip, await resolveProxy(url, partition), (hostname) =>
         resolveHost(hostname, partition),
       ));
-    if (proxied) return false;
+    if (proxied && verdict.grant) {
+      const destination = await checkAgentNavigationFor(
+        entry.conversationId,
+        url,
+        entry.agentContext,
+      );
+      if (destination.ok) return false;
+    }
     sendToRenderer("browser-nav-blocked", {
       conversationId: entry.conversationId,
       url,

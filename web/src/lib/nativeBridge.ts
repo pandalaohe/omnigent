@@ -175,6 +175,18 @@ export interface NativeViewModeParams {
  * server-served and may be newer than the installed shell, whose preload then
  * lacks these methods.
  */
+export interface BrowserAccess {
+  level: "none" | "agent" | "all";
+  blocked: string[];
+  ask: string[];
+  allowed: string[];
+}
+export interface BrowserAccessResult {
+  ok: boolean;
+  access?: BrowserAccess;
+  error?: string;
+}
+
 interface ElectronDesktopApi extends NativeShellApi {
   kind: "electron";
   /** The runner picked during onboarding for this server, returned once. */
@@ -232,6 +244,8 @@ interface ElectronDesktopApi extends NativeShellApi {
       sourceIsArcaHost?: boolean;
     },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+  getBrowserAccess?: () => Promise<BrowserAccessResult>;
+  setBrowserAccess?: (access: BrowserAccess) => Promise<BrowserAccessResult>;
   getBrowserLoginSetting?: () => Promise<{ ok: boolean; enabled?: boolean; error?: string }>;
   browserExtensionsList?: () => Promise<{
     ok: boolean;
@@ -1415,4 +1429,11 @@ export async function droppedFilePath(file: File): Promise<string | null> {
     console.warn("[nativeBridge] electron getPathForFile failed:", err);
     return null;
   }
+}
+
+export function browserAccessBridge() {
+  const desktop = electronApi();
+  return desktop?.getBrowserAccess && desktop?.setBrowserAccess
+    ? { get: desktop.getBrowserAccess, set: desktop.setBrowserAccess }
+    : undefined;
 }
