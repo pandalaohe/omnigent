@@ -1337,7 +1337,9 @@ describe("browserIpc — devtools toggle", () => {
 describe("browserIpc — screenshot surface detection", () => {
   it("reports noSurface when the captured image is empty", async () => {
     const wc = makeWebContents();
-    const frame = { executeJavaScript: async () => "no" };
+    const frame = {
+      executeJavaScript: async () => ({ identity: "doc", counter: "0", showing: false }),
+    };
     frame.framesInSubtree = [frame];
     wc.mainFrame = frame;
     wc.capturePage = async () => ({ isEmpty: () => true, toPNG: () => Buffer.alloc(0) });
@@ -1354,7 +1356,9 @@ describe("browserIpc — screenshot surface detection", () => {
 
   it("flags a capture failure for a non-active view as noSurface", async () => {
     const wc = makeWebContents();
-    const frame = { executeJavaScript: async () => "no" };
+    const frame = {
+      executeJavaScript: async () => ({ identity: "doc", counter: "0", showing: false }),
+    };
     frame.framesInSubtree = [frame];
     wc.mainFrame = frame;
     wc.capturePage = async () => {

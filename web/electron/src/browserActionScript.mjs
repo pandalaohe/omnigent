@@ -5,6 +5,7 @@ function isCredentialField(el) {
   const mask = window.getComputedStyle(el).webkitTextSecurity;
   return (
     el.hasAttribute("data-omnigent-credential") ||
+    !!el.getRootNode()?.host ||
     el.type === "password" ||
     /password|passwd|pwd|current-password|new-password|one-time-code|cc-/i.test(hints) ||
     (!!mask && mask !== "none")
@@ -145,6 +146,9 @@ const REDACTED_SNAPSHOT_JS = SNAPSHOT_JS.replace(
   "function getName(el, depth = 0) {",
   `function getName(el, depth = 0) {
     if ((${CREDENTIAL_FIELD_JS})(el)) return '[redacted]';`,
+).replace(
+  "for (const child of el.children) {",
+  "if (el.shadowRoot) { for (const child of el.shadowRoot.children) walk(child, childDepth); } for (const child of el.children) {",
 );
 
 const GUARDED_SNAPSHOT_JS = REDACTED_SNAPSHOT_JS.replace(
@@ -152,6 +156,9 @@ const GUARDED_SNAPSHOT_JS = REDACTED_SNAPSHOT_JS.replace(
   `(() => {
   if (!window.innerWidth || !window.innerHeight) {
     return JSON.stringify({ error: "the page has no layout size because its browser pane is hidden; open this session's Browser tab and retry" });
+  }
+  if (!document.documentElement?.hasAttribute('data-omnigent-credential-watch')) {
+    return JSON.stringify({ error: 'credential protection is unavailable; reload the page and retry' });
   }
 `,
 );
