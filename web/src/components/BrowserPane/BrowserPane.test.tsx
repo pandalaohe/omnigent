@@ -2,6 +2,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BrowserPane } from "./BrowserPane";
 
+vi.mock("@/store/chatStore", () => ({ useChatStore: { getState: () => ({ stop: vi.fn() }) } }));
+
 // supportsBrowser gates the whole pane. Force it true so the pane renders; the
 // unsupported-shell (returns null) path is covered by reading the early return.
 vi.mock("@/lib/nativeBridge", () => ({

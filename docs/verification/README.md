@@ -18,6 +18,8 @@ app; component checks use their own isolated test environment.
   independent row paging, sticky modifiers and terminal input.
 - [Antigravity delegation](features/antigravity-delegation.md): host proof, child
   permission checks, native tree stops and approval withdrawal.
+- [Browser shared page](features/browser-shared-page.md): per-tab activity,
+  Stop through chat interrupt, and window-owned action claims.
 
 Record the checkout revision, command, result and evidence location for each run.
 An HTML preview with fake data proves the shown component interactions, rather

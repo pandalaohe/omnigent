@@ -17,6 +17,7 @@ import {
 } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { supportsBrowser } from "@/lib/nativeBridge";
+import { beginBrowserActivity } from "@/lib/browserActivity";
 import { authenticatedFetch } from "@/lib/identity";
 import { useQueryClient } from "@tanstack/react-query";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
@@ -438,6 +439,18 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       if (!sourceConversationId) return; // no delivering session — nothing to target
       const desktop = getBrowserDesktop();
       if (!desktop) return; // no browser-capable shell — nothing to claim
+      // Saved soft tabs can be shared by windows; only the native view's window
+      // may claim an explicitly targeted action. A failed probe leaves it alone.
+      if (evt.args.tab_id !== undefined) {
+        const tabId = evt.args.tab_id;
+        if (typeof tabId !== "string" || !validBrowserTabId(tabId)) return;
+        try {
+          const view = await desktop.browserHasView?.(browserViewId(sourceConversationId, tabId));
+          if (cancelled || !view?.exists) return;
+        } catch {
+          return;
+        }
+      }
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
       const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
@@ -562,17 +575,22 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
                 (host) => host.host_id === sourceHostId && isArcaHost(host, rememberedArcaHostId),
               )
           : false;
-      const result = await dispatch(
-        sourceConversationId,
-        target,
-        evt.action,
-        evt.args,
-        desktop,
-        sourceHostId,
-        rememberedArcaHostId,
-        sourceIsArcaHost,
-      );
-      await postResult(sourceConversationId, evt.actionId, claimToken, result);
+      const finishActivity = beginBrowserActivity(target.viewId);
+      try {
+        const result = await dispatch(
+          sourceConversationId,
+          target,
+          evt.action,
+          evt.args,
+          desktop,
+          sourceHostId,
+          rememberedArcaHostId,
+          sourceIsArcaHost,
+        );
+        await postResult(sourceConversationId, evt.actionId, claimToken, result);
+      } finally {
+        finishActivity();
+      }
     };
 
     const unsubscribe = onBrowserActionRequest(handler);

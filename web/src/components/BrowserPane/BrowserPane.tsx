@@ -50,6 +50,7 @@ import { getDesktopFeatures, supportsBrowser } from "@/lib/nativeBridge";
 import { browserPlacesBridge } from "@/lib/browserPlacesBridge";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
 import { cn } from "@/lib/utils";
+import { BrowserActivityStatus } from "./BrowserActivityStatus";
 
 /** Renderer CSS-pixel bounds pushed to the main process (converted to window
  *  DIPs there via the host zoom factor). */
@@ -662,6 +663,7 @@ export function BrowserPane({
       className={cn("flex min-h-0 min-w-0 flex-col", className)}
       data-browser-pane-conversation={conversationId}
     >
+      <BrowserActivityStatus viewId={conversationId} />
       <div className="flex shrink-0 items-center gap-1 border-border border-b bg-card px-2 py-1.5">
         <button
           type="button"

@@ -23,6 +23,7 @@ import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
+import { useBrowserActivity } from "@/lib/browserActivity";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { browserViewId, useBrowserTabs } from "./useBrowserTabs";
 import type { BrowserActionRequestEvent } from "@/lib/events";
@@ -66,7 +67,7 @@ function installBridge(overrides: Record<string, unknown> = {}) {
       .fn()
       .mockResolvedValue({ ok: true, dataUrl: "data:image/png;base64,AAA" }),
     browserExecute: vi.fn().mockResolvedValue({ ok: true, result: "ok" }),
-    browserHasView: vi.fn().mockResolvedValue({ exists: false }),
+    browserHasView: vi.fn().mockResolvedValue({ exists: true }),
     browserClose: vi.fn().mockResolvedValue({ ok: true }),
     browserPerformAction: undefined,
     ...overrides,
@@ -147,6 +148,29 @@ afterEach(() => {
 });
 
 describe("useBrowserAgentRelay — claim-first protocol", () => {
+  it("marks the target active while a claimed action waits for the native page", async () => {
+    let finish!: (result: { ok: boolean; result: string }) => void;
+    installBridge({
+      browserExecute: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+      ),
+    });
+    authenticatedFetch.mockResolvedValue(WON);
+    const activity = renderHook(() => useBrowserActivity("activity-session"));
+    renderRelay();
+    act(() =>
+      emitBrowserActionRequest(actionEvent("click", { selector: "a" }), "activity-session"),
+    );
+    await vi.waitFor(() => expect(activity.result.current).toBe(true));
+    await act(async () => {
+      finish({ ok: false, result: "failed" });
+    });
+    await vi.waitFor(() => expect(resultCount()).toBe(1));
+    expect(activity.result.current).toBe(true);
+  });
   it("navigates the user-selected tab after winning the claim", async () => {
     writeSessionWorkspaceState(CONV, {
       openBrowsers: ["tab-one"],
@@ -427,7 +451,7 @@ describe("useBrowserAgentRelay — session tabs", () => {
       selectedBrowserId: "foreign-tab",
     });
 
-    for (const tabId of ["tab-one", browserViewId(CONV, "tab-one"), "foreign-tab", "bad:tab"]) {
+    for (const tabId of ["tab-one", "foreign-tab"]) {
       // oxlint-disable-next-line no-await-in-loop -- Each action result has its own assertion.
       const outcome = await sendClaimed(
         "navigate",
@@ -440,6 +464,27 @@ describe("useBrowserAgentRelay — session tabs", () => {
     expect(hook.result.current.tabs).toEqual(["tab-two"]);
     expect(hook.result.current.selected).toBe("tab-two");
   });
+
+  it.each([false, "throws", "missing"])(
+    "does not claim a named tab absent from this window (%s)",
+    async (probe) => {
+      writeSessionWorkspaceState(CONV, { openBrowsers: ["tab-one"] });
+      const bridge = installBridge({
+        browserHasView:
+          probe === "missing"
+            ? undefined
+            : probe === "throws"
+              ? vi.fn().mockRejectedValue(new Error("closed"))
+              : vi.fn().mockResolvedValue({ exists: false }),
+      });
+      renderRelay();
+      await act(async () => {
+        emitBrowserActionRequest(actionEvent("click", { tab_id: "tab-one", selector: "a" }), CONV);
+      });
+      expect(authenticatedFetch).not.toHaveBeenCalled();
+      expect(bridge.browserExecute).not.toHaveBeenCalled();
+    },
+  );
 
   it("surfaces an explicitly targeted screenshot tab", async () => {
     const bridge = installBridge();
@@ -577,6 +622,7 @@ describe("useBrowserAgentRelay — session tabs", () => {
 
   it("opens the reserved tab for the first navigation and reports a missing browser view", async () => {
     const bridge = installBridge({
+      browserHasView: vi.fn().mockResolvedValue({ exists: false }),
       browserScreenshot: vi.fn().mockResolvedValue({ ok: false, error: "No browser view" }),
     });
     authenticatedFetch.mockResolvedValue(WON);
