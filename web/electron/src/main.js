@@ -3730,6 +3730,14 @@ function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
 // the registry attribute each request to its view.
 const guardedAgentSessions = new WeakSet();
 const browserExtensions = new Map();
+const { createFillRequest, createFillApprovals } = require("./browserFillRequest");
+let fillApprovals;
+const fillBusyPartitions = new Set();
+function getFillApprovals() {
+  return (fillApprovals ??= createFillApprovals(
+    path.join(app.getPath("userData"), "browser-fill-approvals.json"),
+  ));
+}
 let bitwardenRemoving = false;
 const bitwardenDirectory = () =>
   path.join(app.getPath("userData"), "browser-extensions", "bitwarden", BITWARDEN_VERSION);
@@ -3979,6 +3987,7 @@ function createBrowserRegistryForWindow(win) {
       });
     },
     getAgentAllowlist: (context) => agentBrowserAllowlist(context?.serverOrigin),
+    getFillAllowlist: () => agentBrowserAllowlist(pinnedOrigin(win)),
     createBoundsController: createBrowserViewBoundsController,
     attachToHost: (view) => {
       win.contentView.addChildView(view);
@@ -5274,6 +5283,47 @@ function registerIpc() {
         ok: false,
         error: "Could not set up Bitwarden. Check your connection and try again.",
       };
+    }
+  });
+  ipcMain.handle("omnigent:browser-fill-saved-login", async (event, viewId) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    const registry = browserRegistryForSender(event);
+    const entry = typeof viewId === "string" && registry?.get(viewId);
+    const extensions = entry && browserExtensions.get(entry.partition);
+    if (!extensions) return { ok: false, error: "Set up and unlock Bitwarden first." };
+    return createFillRequest({
+      extensions,
+      registry,
+      approvals: getFillApprovals(),
+      dialog,
+      window: BrowserWindow.fromWebContents(event.sender),
+      busyPartitions: fillBusyPartitions,
+      isAvailable: (partition) => !clearingBrowserPartitions.has(partition) && !bitwardenRemoving,
+    }).fill(viewId);
+  });
+  ipcMain.handle("omnigent:browser-fill-approvals:list", (event) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return {
+      ok: true,
+      sites: getFillApprovals()
+        .list(persistentAgentPartition(pinnedOrigin(win)))
+        .map(({ origin, id, label }) => ({ origin, id, label })),
+    };
+  });
+  ipcMain.handle("omnigent:browser-fill-approvals:revoke", (event, key) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    if (typeof key?.origin !== "string" || typeof key?.id !== "string") return { ok: false };
+    const win = BrowserWindow.fromWebContents(event.sender);
+    try {
+      getFillApprovals().revoke({
+        partition: persistentAgentPartition(pinnedOrigin(win)),
+        origin: key.origin,
+        id: key.id,
+      });
+      return { ok: true };
+    } catch {
+      return { ok: false, error: "Could not revoke approval." };
     }
   });
   ipcMain.handle("omnigent:browser-bitwarden:open", async (event, viewId) => {

@@ -1568,3 +1568,27 @@ describe("useBrowserAgentRelay — result POST resilience", () => {
     expect(authenticatedFetch).not.toHaveBeenCalled();
   });
 });
+
+describe("saved login relay", () => {
+  it("returns only status for a filled login and supports older shells", async () => {
+    const fill = vi
+      .fn()
+      .mockResolvedValue({ ok: true, filled: true, password: "fake-private-value" });
+    installBridge({ browserFillSavedLogin: fill });
+    authenticatedFetch.mockResolvedValue(WON);
+    await runAction(actionEvent("fill_saved_login"));
+    expect(postedResult().result).toEqual({ ok: true, filled: true });
+    expect(fill).toHaveBeenCalledWith(CONV);
+    expect(JSON.stringify(authenticatedFetch.mock.calls)).not.toContain("fake-private-value");
+  });
+  it("does not execute scripts when the shell lacks saved login filling", async () => {
+    const bridge = installBridge();
+    authenticatedFetch.mockResolvedValue(WON);
+    await runAction(actionEvent("fill_saved_login"));
+    expect(postedResult().result).toMatchObject({
+      ok: false,
+      error: "This desktop app version cannot fill saved logins.",
+    });
+    expect(bridge.browserExecute).not.toHaveBeenCalled();
+  });
+});

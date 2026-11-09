@@ -21,6 +21,7 @@
 
 const {
   checkAgentNavigation,
+  isExplicitlyAllowlisted,
   isAgentConnectionAllowed,
   isAgentNavigationAllowed,
   isProxyAddress,
@@ -98,6 +99,7 @@ function createBrowserViewRegistry({
   // resolves the context's server origin against settings.json). A non-array
   // answer means "no entries" — never a policy error.
   getAgentAllowlist = () => [],
+  getFillAllowlist = () => [],
   // (hostname, partition) => Promise<string[]> for the agent DNS check, and
   // (url, partition) => Promise<string> ("DIRECT" or a PAC-style proxy list).
   resolveHost = lookupHostAddresses,
@@ -184,6 +186,7 @@ function createBrowserViewRegistry({
           }
         },
       }),
+      navGeneration: 0,
       layoutReady: false,
       emulated: false,
       layoutSize: null,
@@ -245,7 +248,14 @@ function createBrowserViewRegistry({
   function attachHiddenLayoutTracking(entry) {
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
+    wc.on("did-start-navigation", (_event, _url, _inPlace, isMainFrame) => {
+      if (isMainFrame) entry.navGeneration++;
+    });
+    wc.on("did-navigate-in-page", (_event, _url, isMainFrame) => {
+      if (isMainFrame) entry.navGeneration++;
+    });
     wc.on("did-navigate", () => {
+      entry.navGeneration++;
       entry.layoutReady = true;
       syncHiddenLayout(entry);
     });
@@ -806,6 +816,19 @@ function createBrowserViewRegistry({
     close,
     closeAll,
     closePartition,
+    isFillOriginAllowed(viewId, origin) {
+      const entry = entries.get(viewId);
+      if (!entry) return false;
+      try {
+        const url = new URL(origin);
+        return (
+          url.protocol === "https:" ||
+          (url.protocol === "http:" && isExplicitlyAllowlisted(origin, getFillAllowlist()))
+        );
+      } catch {
+        return false;
+      }
+    },
     // Introspection
     activeConversationId: () => activeConversationId,
     isSuppressed: () => overlaySuppressed,

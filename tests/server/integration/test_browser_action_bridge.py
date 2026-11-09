@@ -579,3 +579,23 @@ async def test_browser_screenshot_reaches_adapters_and_replay_as_image(
     assert replay.blocks is not None
     assert json.loads(replay.blocks[0]["text"]) == metadata
     assert replay.blocks[1]["source"]["data"] == _TINY_PNG_BASE64
+
+
+async def test_saved_login_has_longer_await_budget(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fill waits for desktop approval even after the normal action budget."""
+    monkeypatch.setattr(sessions_routes, "_BROWSER_ACTION_AWAIT_S", 0.01)
+    agent = await create_test_agent(client, "test-browser-fill")
+    session_id = await _create_session(client, agent["id"])
+    task, action_id = await _park_action_request(
+        client, session_id, action="fill_saved_login", args={"tab_id": "demo"}
+    )
+    claim = await client.post(f"/v1/sessions/{session_id}/browser/action_claim/{action_id}")
+    await asyncio.sleep(0.03)
+    assert not task.done()
+    await client.post(
+        f"/v1/sessions/{session_id}/browser/action_result/{action_id}",
+        json={"claim_token": claim.json()["claim_token"], "result": {"ok": True, "filled": True}},
+    )
+    assert (await task).json() == {"ok": True, "filled": True}

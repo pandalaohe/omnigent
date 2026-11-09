@@ -307,6 +307,11 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   browserScreenshot: (conversationId) =>
     ipcRenderer.invoke("omnigent:browser-screenshot", { conversationId }),
   /** Perform a fixed snapshot, click or type action in the conversation's view. */
+  browserFillSavedLogin: (viewId) =>
+    ipcRenderer.invoke("omnigent:browser-fill-saved-login", viewId),
+  browserFillApprovals: () => ipcRenderer.invoke("omnigent:browser-fill-approvals:list"),
+  browserRevokeFillApproval: (key) =>
+    ipcRenderer.invoke("omnigent:browser-fill-approvals:revoke", key),
   browserPerformAction: (conversationId, action, params) =>
     ipcRenderer.invoke("omnigent:browser-perform-action", { conversationId, action, params }),
   /** @deprecated Until v0.21: main translates only recognized v0.18 action templates. */

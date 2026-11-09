@@ -234,6 +234,15 @@ interface ElectronDesktopApi extends NativeShellApi {
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   getBrowserLoginSetting?: () => Promise<{ ok: boolean; enabled?: boolean; error?: string }>;
   browserSetupBitwarden?: () => Promise<{ ok: boolean; error?: string }>;
+  browserFillApprovals?: () => Promise<{
+    ok: boolean;
+    sites?: { origin: string; id: string; label: string }[];
+    error?: string;
+  }>;
+  browserRevokeFillApproval?: (key: {
+    origin: string;
+    id: string;
+  }) => Promise<{ ok: boolean; error?: string }>;
   browserRemoveBitwarden?: () => Promise<{ ok: boolean; error?: string }>;
   browserOpenBitwarden?: (viewId: string) => Promise<{ ok: boolean; error?: string }>;
   setBrowserLoginSetting?: (
@@ -660,6 +669,8 @@ export function browserLoginBridge() {
     clear: desktop.clearBrowserLogin,
     setupBitwarden: desktop.browserSetupBitwarden,
     removeBitwarden: desktop.browserRemoveBitwarden,
+    fillApprovals: desktop.browserFillApprovals,
+    revokeFillApproval: desktop.browserRevokeFillApproval,
   };
 }
 

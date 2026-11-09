@@ -142,7 +142,9 @@ def register_browser_routes(
                     return _BROWSER_ACTION_NO_RENDERER_RESULT
             done, _pending = await asyncio.wait(
                 {future},
-                timeout=_sessions_facade._BROWSER_ACTION_AWAIT_S,
+                timeout=55.0
+                if action == "fill_saved_login"
+                else _sessions_facade._BROWSER_ACTION_AWAIT_S,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if future in done and not future.cancelled():
