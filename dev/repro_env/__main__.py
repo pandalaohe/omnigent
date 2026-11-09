@@ -78,7 +78,9 @@ def main() -> int:
     if args.action == "serve":
         return serve(output, args.lease_seconds)
     if args.action == "stop":
-        (output / "stop").touch()
+        from .shutdown import stop
+
+        stop(output)
         return 0
     if args.action == "status":
         print((output / "environment.json").read_text())

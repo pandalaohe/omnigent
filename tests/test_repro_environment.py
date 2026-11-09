@@ -197,6 +197,191 @@ def test_serve_rejects_previous_attempt_without_discarding_stop(tmp_path):
     assert json.loads(state.read_text()) == {"status": "stopped"}
 
 
+@pytest.mark.parametrize("supervised", [False, True])
+def test_stop_recovers_server_without_supervisor(tmp_path, monkeypatch, supervised):
+    import subprocess
+    import sys
+
+    import psutil
+
+    from dev.repro_env.__main__ import main
+
+    command = "import time; time.sleep(120)"
+    if supervised:
+        command = (
+            "import json,pathlib,sys,time\n"
+            "while not pathlib.Path(sys.argv[1]).exists(): time.sleep(0.01)\n"
+            "state=pathlib.Path(sys.argv[1]).with_name('environment.json'); "
+            "state.write_text(json.dumps({'status':'stopped','cleanup_complete':True}))"
+        )
+    with (tmp_path / "server.log").open("w") as log:
+        server = subprocess.Popen(
+            [sys.executable, "-c", command, str(tmp_path / "stop")],
+            stdout=log,
+            start_new_session=True,
+        )
+    (tmp_path / "processes.json").write_text(
+        json.dumps(
+            [
+                {
+                    "pid": server.pid,
+                    "created": psutil.Process(server.pid).create_time(),
+                    "group": server.pid,
+                    "name": "supervisor" if supervised else "server",
+                }
+            ]
+        )
+    )
+    outsider = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    (tmp_path / "environment.json").write_text('{"status":"ready"}')
+    monkeypatch.setattr(sys, "argv", ["repro_env", "--output", str(tmp_path), "stop"])
+    try:
+        if supervised:
+            assert main() == 0
+        else:
+            with pytest.raises(RuntimeError, match="detached descendant cleanup is unverified"):
+                main()
+        assert server.poll() is not None
+        assert outsider.poll() is None
+        assert json.loads((tmp_path / "environment.json").read_text())["status"] == (
+            "stopped" if supervised else "ready"
+        )
+        if supervised:
+            assert main() == 0
+        else:
+            with pytest.raises(RuntimeError, match="detached descendant cleanup is unverified"):
+                main()
+    finally:
+        for process in (server, outsider):
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+
+
+def test_stop_refuses_success_for_unidentified_listener(tmp_path):
+    import socket
+
+    from dev.repro_env.shutdown import stop
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        state = {"status": "ready", "base_url": f"http://127.0.0.1:{listener.getsockname()[1]}"}
+        (tmp_path / "environment.json").write_text(json.dumps(state))
+        with pytest.raises(RuntimeError, match="still reachable"):
+            stop(tmp_path, timeout=0)
+        assert json.loads((tmp_path / "environment.json").read_text()) == state
+
+
+def test_stop_refuses_uncertain_network_probe(tmp_path, monkeypatch):
+    from dev.repro_env.shutdown import stop
+
+    state = {"status": "ready", "base_url": "http://127.0.0.1:12345"}
+    (tmp_path / "environment.json").write_text(json.dumps(state))
+    monkeypatch.setattr("socket.create_connection", Mock(side_effect=TimeoutError("probe")))
+    with pytest.raises(RuntimeError, match="Cannot verify base_url"):
+        stop(tmp_path, timeout=0)
+    assert json.loads((tmp_path / "environment.json").read_text()) == state
+
+
+def test_stop_without_registered_supervisor_fails(tmp_path):
+    from dev.repro_env.shutdown import stop
+
+    (tmp_path / "environment.json").write_text('{"status":"starting"}')
+    with pytest.raises(RuntimeError, match="Process identities unavailable"):
+        stop(tmp_path, timeout=0)
+    assert (tmp_path / "stop").exists()
+
+
+def test_stop_detects_unidentified_group_member_without_signalling_it(tmp_path):
+    import subprocess
+    import sys
+
+    from dev.repro_env.shutdown import stop
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        stdout=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        (tmp_path / "environment.json").write_text('{"status":"ready"}')
+        # A stale identity cannot authorize killing the current PID, even when
+        # a process still inhabits the attempt's recorded process group.
+        (tmp_path / "processes.json").write_text(
+            json.dumps([{"pid": child.pid, "created": 0, "group": child.pid}])
+        )
+        with pytest.raises(RuntimeError, match="Unverified descendant"):
+            stop(tmp_path, timeout=0)
+        assert child.poll() is None
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+
+
+@pytest.mark.parametrize("supervisor_alive", [False, True])
+def test_stop_refuses_success_for_detached_orphan_in_new_session(tmp_path, supervisor_alive):
+    import subprocess
+    import sys
+
+    import psutil
+
+    from dev.repro_env.shutdown import stop
+
+    parent = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import subprocess,sys; "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(120)'], "
+            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True); "
+            "print(p.pid, flush=True)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert parent.stdout is not None
+    child = psutil.Process(int(parent.stdout.readline()))
+    parent.wait(timeout=5)
+    supervisor = None
+    try:
+        (tmp_path / "environment.json").write_text('{"status":"ready"}')
+        identities = [{"pid": parent.pid, "created": 0, "name": "supervisor"}]
+        if supervisor_alive:
+            supervisor = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import json,pathlib,sys,time\n"
+                    "root=pathlib.Path(sys.argv[1])\n"
+                    "while not (root/'stop').exists(): time.sleep(0.01)\n"
+                    "(root/'environment.json').write_text(json.dumps("
+                    "{'status':'stopped','cleanup_complete':True}))",
+                    str(tmp_path),
+                ]
+            )
+            identities = [
+                {
+                    "pid": supervisor.pid,
+                    "created": psutil.Process(supervisor.pid).create_time(),
+                    "name": "supervisor",
+                },
+                {"pid": parent.pid, "created": 0, "name": "runner"},
+            ]
+        (tmp_path / "processes.json").write_text(json.dumps(identities))
+        with pytest.raises(RuntimeError, match="detached descendant cleanup is unverified"):
+            stop(tmp_path, timeout=2)
+        assert child.is_running()
+        assert not json.loads((tmp_path / "environment.json").read_text()).get("shutdown_verified")
+    finally:
+        child.kill()
+        parent.stdout.close()
+        if supervisor:
+            if supervisor.poll() is None:
+                supervisor.kill()
+            supervisor.wait(timeout=5)
+
+
 def test_stop_during_startup_is_successful_cancellation(tmp_path, monkeypatch):
     import time
 
