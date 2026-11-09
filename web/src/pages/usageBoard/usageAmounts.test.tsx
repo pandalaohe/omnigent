@@ -39,7 +39,22 @@ beforeEach(() => {
           ? activity
           : url.pathname.endsWith("/issues")
             ? usageIssuesFixture(activity)
-            : overview,
+            : url.pathname.endsWith("/models")
+              ? {
+                  account: "litellm",
+                  display_name: "LiteLLM",
+                  range: "d7",
+                  span: null,
+                  models: [
+                    {
+                      id: "model-a",
+                      sources: [],
+                      pricing: null,
+                      usage: sampleTotals(1, 1000),
+                    },
+                  ],
+                }
+              : overview,
       ),
     );
   });
@@ -59,6 +74,10 @@ function mount(path = "/usage/board/cost") {
             <Route
               path="/usage/board/:accountId/issues"
               element={<UsageBoardRoute view="issues" />}
+            />
+            <Route
+              path="/usage/board/:accountId/models"
+              element={<UsageBoardRoute view="models" />}
             />
             <Route path="/usage/board/:accountId" element={<UsageBoardRoute view="account" />} />
           </Routes>
@@ -350,4 +369,32 @@ it("reports a failed activity read and does not fetch while the user switch is o
   mount();
   expect(screen.getByText("Usage board is off")).toBeTruthy();
   expect(fetchMock).not.toHaveBeenCalled();
+  cleanup();
+  mount("/usage/board");
+  expect(screen.getByText("Usage board is off")).toBeTruthy();
+  expect(fetchMock).not.toHaveBeenCalled();
+});
+
+it("loads Issues, account activity and account models while the board switch is off", async () => {
+  patchUsageBoardPreferences({ enabled: false });
+  mount("/usage/board/issues");
+  await screen.findByRole("heading", { name: "Issues", level: 1 });
+  expect((await screen.findByRole("region", { name: "Failures" })).textContent).toContain(
+    "timeout",
+  );
+  cleanup();
+  mount("/usage/board/litellm/issues");
+  await screen.findByRole("heading", { name: "LiteLLM · Issues", level: 1 });
+  expect((await screen.findByRole("region", { name: "Failures" })).textContent).toContain(
+    "timeout",
+  );
+  cleanup();
+  mount("/usage/board/litellm");
+  await screen.findByRole("heading", { name: "LiteLLM", level: 1 });
+  await waitFor(() =>
+    expect(fetchMock.mock.calls.some(([path]) => String(path).includes("/activity"))).toBe(true),
+  );
+  cleanup();
+  mount("/usage/board/litellm/models");
+  await screen.findByText("model-a");
 });

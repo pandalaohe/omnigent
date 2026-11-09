@@ -205,6 +205,26 @@ describe("Connect command", () => {
     expect(document.execCommand).toHaveBeenCalledWith("copy");
     expect(await screen.findByRole("button", { name: "Copied" })).toBeTruthy();
   });
+
+  it("keeps Connect, Price source and the Issues link in Settings when the board switch is off", async () => {
+    mocks.board.current = { ...(mocks.board.current as object), enabled: false };
+    render(
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      >
+        <MemoryRouter>
+          <UsageBoardSettings />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByRole("link", { name: /Issues/ }).getAttribute("href")).toBe(
+      "/usage/board/issues",
+    );
+    expect(screen.getByText("Price source")).toBeTruthy();
+    expect(await screen.findByRole("button", { name: /connect/i })).toBeTruthy();
+    expect(screen.queryByText("Ring colors")).toBeNull();
+    expect(screen.queryByText("On board")).toBeNull();
+  });
 });
 
 describe("arrangement", () => {

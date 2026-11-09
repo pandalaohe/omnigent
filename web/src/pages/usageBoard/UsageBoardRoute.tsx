@@ -43,7 +43,7 @@ export function UsageBoardRoute({
       </div>
     );
   }
-  if (!board.enabled) {
+  if (!board.enabled && (view === "board" || view === "cost")) {
     // Not a silent redirect: the visitor is told where the switch is, and a
     // shared link still explains itself.
     return (

@@ -67,7 +67,7 @@ function useUsageRead<T>(path: string, account: string | undefined, enabled: boo
   return useQuery({
     queryKey: ["usageBoard", path, params.toString()],
     queryFn: () => usageJson<T>(`${path}?${params}`),
-    enabled: enabled && board.enabled,
+    enabled,
     refetchInterval: () => (document.visibilityState === "visible" ? USAGE_BOARD_POLL_MS : false),
     refetchOnWindowFocus: true,
     retry: false,

@@ -116,7 +116,7 @@ export function UsageBoardSettings() {
         </span>
       </div>
 
-      {available && board.enabled ? (
+      {available ? (
         <>
           <Link
             to="/usage/board/issues"
@@ -128,86 +128,90 @@ export function UsageBoardSettings() {
             </span>
           </Link>
           <UsagePriceSourceSettings />
-          <div className="flex flex-col gap-2 border-t border-border py-2.5">
-            <div className="flex items-start justify-between gap-2">
-              <span className="flex flex-wrap items-center gap-1.5 text-sm">
-                Ring colors
-                <HelpTip label="About ring colors">
-                  Compares what is left with the time left: 100 means exactly on track. Below the
-                  amber handle a ring turns amber, below the red handle it turns red. A remaining
-                  floor turns a ring red whatever the pace.
-                </HelpTip>
-              </span>
-              {!defaults ? (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-6 px-2 text-[11px]"
-                  onClick={() =>
-                    writeTiers({
-                      tight: SESSION_COLLAB_DEFAULTS.quotaTightBelowPct,
-                      low: SESSION_COLLAB_DEFAULTS.quotaLowBelowPct,
-                      floor: SESSION_COLLAB_DEFAULTS.quotaFloorPct,
-                    })
-                  }
-                >
-                  Reset
-                </Button>
-              ) : null}
-            </div>
-            <ColourLine tight={tight} low={low} floor={floor} onChange={writeTiers} />
-          </div>
-
-          <div className="flex flex-col gap-1 border-t border-border py-2.5">
-            <div className="flex items-center gap-1.5 text-sm">
-              On board
-              <HelpTip label="About accounts on the board">
-                One switch per account. Off means it is not on the board and not in any total; its
-                reading keeps arriving, so turning it back on needs no new report.
-              </HelpTip>
-            </div>
-            {accounts.length === 0 ? (
-              <p className="text-[11px] text-muted-foreground">
-                No account yet. Claude and Codex need a host that has read them; anything else
-                reports through the usage API.
-              </p>
-            ) : (
-              <div className="grid gap-x-6 sm:grid-cols-2">
-                {accounts.map((account) => {
-                  const on = !board.hidden.includes(account.id);
-                  return (
-                    <label
-                      key={account.id}
-                      className="flex min-h-9 items-center justify-between gap-2 text-sm"
+          {board.enabled ? (
+            <>
+              <div className="flex flex-col gap-2 border-t border-border py-2.5">
+                <div className="flex items-start justify-between gap-2">
+                  <span className="flex flex-wrap items-center gap-1.5 text-sm">
+                    Ring colors
+                    <HelpTip label="About ring colors">
+                      Compares what is left with the time left: 100 means exactly on track. Below
+                      the amber handle a ring turns amber, below the red handle it turns red. A
+                      remaining floor turns a ring red whatever the pace.
+                    </HelpTip>
+                  </span>
+                  {!defaults ? (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 px-2 text-[11px]"
+                      onClick={() =>
+                        writeTiers({
+                          tight: SESSION_COLLAB_DEFAULTS.quotaTightBelowPct,
+                          low: SESSION_COLLAB_DEFAULTS.quotaLowBelowPct,
+                          floor: SESSION_COLLAB_DEFAULTS.quotaFloorPct,
+                        })
+                      }
                     >
-                      <span className="flex min-w-0 items-center gap-1.5">
-                        {account.kind === "native" ? (
-                          <SunIcon
-                            className="size-3.5 shrink-0 text-muted-foreground"
-                            aria-hidden="true"
-                          />
-                        ) : (
-                          <PlugIcon
-                            className="size-3.5 shrink-0 text-muted-foreground"
-                            aria-hidden="true"
-                          />
-                        )}
-                        <span className="truncate">{account.display_name}</span>
-                      </span>
-                      <Switch
-                        checked={on}
-                        aria-label={`Show ${account.display_name} on the board`}
-                        componentId="settings.usage_board.account"
-                        onCheckedChange={(checked) => toggleAccount(account.id, checked)}
-                      />
-                    </label>
-                  );
-                })}
+                      Reset
+                    </Button>
+                  ) : null}
+                </div>
+                <ColourLine tight={tight} low={low} floor={floor} onChange={writeTiers} />
               </div>
-            )}
-            <div className="mt-1">
-              <ConnectDialog />
-            </div>
+
+              <div className="flex flex-col gap-1 border-t border-border py-2.5">
+                <div className="flex items-center gap-1.5 text-sm">
+                  On board
+                  <HelpTip label="About accounts on the board">
+                    One switch per account. Off means it is not on the board and not in any total;
+                    its reading keeps arriving, so turning it back on needs no new report.
+                  </HelpTip>
+                </div>
+                {accounts.length === 0 ? (
+                  <p className="text-[11px] text-muted-foreground">
+                    No account yet. Claude and Codex need a host that has read them; anything else
+                    reports through the usage API.
+                  </p>
+                ) : (
+                  <div className="grid gap-x-6 sm:grid-cols-2">
+                    {accounts.map((account) => {
+                      const on = !board.hidden.includes(account.id);
+                      return (
+                        <label
+                          key={account.id}
+                          className="flex min-h-9 items-center justify-between gap-2 text-sm"
+                        >
+                          <span className="flex min-w-0 items-center gap-1.5">
+                            {account.kind === "native" ? (
+                              <SunIcon
+                                className="size-3.5 shrink-0 text-muted-foreground"
+                                aria-hidden="true"
+                              />
+                            ) : (
+                              <PlugIcon
+                                className="size-3.5 shrink-0 text-muted-foreground"
+                                aria-hidden="true"
+                              />
+                            )}
+                            <span className="truncate">{account.display_name}</span>
+                          </span>
+                          <Switch
+                            checked={on}
+                            aria-label={`Show ${account.display_name} on the board`}
+                            componentId="settings.usage_board.account"
+                            onCheckedChange={(checked) => toggleAccount(account.id, checked)}
+                          />
+                        </label>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </>
+          ) : null}
+          <div className="border-t border-border py-2.5">
+            <ConnectDialog />
           </div>
         </>
       ) : null}

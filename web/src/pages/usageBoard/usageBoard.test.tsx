@@ -221,6 +221,20 @@ describe("board", () => {
     expect(screen.getByText("Turn it on in Settings")).toBeTruthy();
   });
 
+  it("keeps account and account settings sub-routes reachable when the board switch is off", async () => {
+    mocks.overview.current = { ...LOADED, data: usageBoardData() };
+    mocks.board.current = { ...mocks.board.current, enabled: false };
+    renderRoute("/usage/board/codex");
+    expect((await screen.findByRole("heading", { level: 1 })).textContent).toBe("Codex");
+    expect(screen.queryByText("Usage board is off")).toBeNull();
+    cleanup();
+    renderRoute("/usage/board/codex/settings");
+    expect((await screen.findByRole("heading", { level: 1 })).textContent).toBe("Account settings");
+    expect(screen.getByText("Window")).toBeTruthy();
+    expect(screen.getByText("Renews")).toBeTruthy();
+    expect(screen.queryByText("Usage board is off")).toBeNull();
+  });
+
   it("says the deployment turned the module off rather than showing an empty board", () => {
     mocks.info.current = { usage_board_enabled: false } as unknown as ServerInfo;
     renderRoute();
