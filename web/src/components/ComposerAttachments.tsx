@@ -179,20 +179,22 @@ function AttachmentTile({
   if (showThumb) {
     return (
       <div className="relative shrink-0" {...hoverProps}>
-        <div
-          className={cn(
-            "size-14 overflow-hidden rounded-xl border border-border bg-muted",
-            active && "ring-2 ring-ring",
-          )}
-        >
-          <ZoomableImage
-            src={url}
-            alt={name}
-            className="size-14 object-cover"
-            onError={() => setThumbFailed(true)}
-          />
+        <div className="relative w-fit">
+          <div
+            className={cn(
+              "size-14 overflow-hidden rounded-xl border border-border bg-muted",
+              active && "ring-2 ring-ring",
+            )}
+          >
+            <ZoomableImage
+              src={url}
+              alt={name}
+              className="size-14 object-cover"
+              onError={() => setThumbFailed(true)}
+            />
+          </div>
+          <RemoveButton name={name} onRemove={onRemove} />
         </div>
-        <RemoveButton name={name} onRemove={onRemove} />
         <AttachmentBadge badge={badge} onClick={onBadgeClick} />
       </div>
     );
@@ -204,21 +206,23 @@ function AttachmentTile({
   const Icon = iconForFile(file);
   return (
     <div className="relative shrink-0" {...hoverProps}>
-      <div
-        className={cn(
-          "flex h-14 w-[180px] items-center gap-2 rounded-xl border border-border bg-background p-2",
-          active && "ring-2 ring-ring",
-        )}
-      >
-        <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground">
-          <Icon className="size-5" />
-        </span>
-        <span className="flex min-w-0 flex-col">
-          <span className="truncate text-sm font-medium text-foreground">{name}</span>
-          <span className="truncate text-xs text-muted-foreground">{meta}</span>
-        </span>
+      <div className="relative w-fit">
+        <div
+          className={cn(
+            "flex h-14 w-[180px] items-center gap-2 rounded-xl border border-border bg-background p-2",
+            active && "ring-2 ring-ring",
+          )}
+        >
+          <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground">
+            <Icon className="size-5" />
+          </span>
+          <span className="flex min-w-0 flex-col">
+            <span className="truncate text-sm font-medium text-foreground">{name}</span>
+            <span className="truncate text-xs text-muted-foreground">{meta}</span>
+          </span>
+        </div>
+        <RemoveButton name={name} onRemove={onRemove} />
       </div>
-      <RemoveButton name={name} onRemove={onRemove} />
       <AttachmentBadge badge={badge} onClick={onBadgeClick} />
     </div>
   );
@@ -238,7 +242,7 @@ function AttachmentBadge({
     <button
       type="button"
       onClick={onClick}
-      className="absolute -bottom-1 left-1 rounded-full border border-border bg-background px-1.5 py-0 text-sm text-muted-foreground shadow-sm"
+      className="mt-1 block max-w-[180px] rounded-full border border-border bg-background px-1.5 py-0 text-sm text-muted-foreground shadow-sm"
     >
       {badge.label}
       {badge.unreferenced && <span className="text-muted-foreground/70"> · not in text</span>}
