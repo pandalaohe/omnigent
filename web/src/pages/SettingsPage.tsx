@@ -1,3 +1,4 @@
+import { BrowserExtensionsControl } from "@/components/BrowserExtensionsControl";
 /**
  * Settings page (``/settings``).
  *
@@ -2061,6 +2062,26 @@ function BrowserLoginControl() {
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState("");
   const [cleared, setCleared] = useState(false);
+  const [approvedSites, setApprovedSites] = useState<
+    { origin: string; id: string; label: string }[]
+  >([]);
+  useEffect(() => {
+    if (!bridge?.fillApprovals || !bridge.revokeFillApproval) return;
+    let mounted = true;
+    void bridge
+      .fillApprovals()
+      .then((result) => {
+        if (!mounted) return;
+        if (result.ok) setApprovedSites(result.sites ?? []);
+        else setError(result.error || "Could not read approved sites.");
+      })
+      .catch(() => {
+        if (mounted) setError("Could not read approved sites.");
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [bridge]);
   const labelId = useId();
   const descriptionId = useId();
 
@@ -2143,8 +2164,54 @@ function BrowserLoginControl() {
         Clear browser login for this server
       </Button>
       <p className="text-sm text-muted-foreground">
-        This closes open Browser views using this server&apos;s saved login.
+        This closes open Browser views and Bitwarden windows using this server&apos;s saved login.
+        Bitwarden&apos;s local data may also be cleared.
       </p>
+      <BrowserExtensionsControl />
+      {bridge.fillApprovals && bridge.revokeFillApproval && (
+        <div className="space-y-2">
+          <p className="text-sm font-medium">Approved sites</p>
+          <p className="text-sm text-muted-foreground">
+            Sessions may fill these saved logins without asking again on this desktop.
+          </p>
+          {approvedSites.length === 0 && (
+            <p className="text-sm text-muted-foreground">
+              No sites approved. A session asks the first time it fills a saved login.
+            </p>
+          )}
+          {approvedSites.map((site) => (
+            <div
+              key={`${site.origin}:${site.id}`}
+              className="flex items-center justify-between gap-3"
+            >
+              <span className="min-w-0 break-all text-sm">
+                {site.origin} · {site.label}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={busy}
+                onClick={() => {
+                  setBusy(true);
+                  setError("");
+                  void bridge.revokeFillApproval!(site)
+                    .then((result) => {
+                      if (result.ok)
+                        setApprovedSites((rows) =>
+                          rows.filter((row) => row.origin !== site.origin || row.id !== site.id),
+                        );
+                      else setError(result.error || "Could not revoke approval.");
+                    })
+                    .catch(() => setError("Could not revoke approval."))
+                    .finally(() => setBusy(false));
+                }}
+              >
+                Revoke
+              </Button>
+            </div>
+          ))}
+        </div>
+      )}
       {cleared && (
         <p role="status" className="text-sm text-muted-foreground">
           Browser login cleared. Open Browser again to sign in.

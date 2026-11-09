@@ -39,6 +39,9 @@ import {
  *  nativeBridge). All optional — an older shell may predate the feature, so the
  *  relay feature-detects before calling. */
 interface BrowserDesktopBridge {
+  browserFillSavedLogin?: (
+    viewId: string,
+  ) => Promise<{ ok: boolean; filled?: boolean; error?: string }>;
   browserOpenOrNavigate?: (
     conversationId: string,
     url: string,
@@ -98,6 +101,7 @@ interface ActionResult {
   error?: string;
   data?: Record<string, unknown>;
   data_url?: string;
+  filled?: boolean;
 }
 
 // A hidden view cannot be captured; poll while the surfacing action opens the
@@ -234,6 +238,22 @@ async function dispatch(
     delete pageArgs.tab_id;
     delete pageArgs.new_tab;
     switch (action) {
+      case "fill_saved_login": {
+        if (!desktop.browserFillSavedLogin)
+          return { ok: false, error: "This desktop app version cannot fill saved logins." };
+        try {
+          const result = await desktop.browserFillSavedLogin(target.viewId);
+          return result.ok && result.filled === true
+            ? { ok: true, filled: true }
+            : {
+                ok: false,
+                error:
+                  result.error || "Fill was not confirmed. Check the page before trying again.",
+              };
+        } catch {
+          return { ok: false, error: "Could not fill the saved login." };
+        }
+      }
       case "navigate": {
         const url = String(args.url ?? "");
         if (!url) return { ok: false, error: "url is required" };

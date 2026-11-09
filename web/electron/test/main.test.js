@@ -641,6 +641,19 @@ function loadNavigationHarness({
         browserIpcDeps = deps;
       },
     },
+    "electron-chrome-extensions": { ElectronChromeExtensions: function () {} },
+    "./browserExtensions": {
+      BITWARDEN_VERSION: "2026.10.2",
+      createBrowserExtensions: () => ({
+        load: async () => {
+          calls.extensionLoads = (calls.extensionLoads ?? 0) + 1;
+        },
+        addView() {},
+        selectView() {},
+        unload() {},
+        relayWebRequest() {},
+      }),
+    },
     "./session-expiry": require("../src/session-expiry"),
     "./popupPolicy": {
       decideWindowOpen: () => ({ kind: "ignore" }),
@@ -690,7 +703,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
+    "\nmodule.exports.testApi = { activateAppWindow, extensionsForPartition, browserExtensions, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -842,6 +855,7 @@ describe("Arca extend IPC", () => {
         arcaPreviewRecovery: true,
         // Internal-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
+        browserBitwarden: true,
       },
     );
     assert.deepEqual(await extend(event, "overnight"), { ok: true, shutdownAt: null });
@@ -2545,7 +2559,14 @@ describe("browser permission wiring", () => {
           const ses = {
             setPermissionRequestHandler: (handler) => (ses.request = handler),
             setPermissionCheckHandler: (handler) => (ses.check = handler),
-            webRequest: { onBeforeRequest() {}, onBeforeSendHeaders() {}, onHeadersReceived() {} },
+            webRequest: {
+              onBeforeRequest() {},
+              onBeforeSendHeaders() {},
+              onHeadersReceived() {},
+              onCompleted() {},
+              onBeforeRedirect() {},
+              onErrorOccurred() {},
+            },
           };
           sessions.set(partition, ses);
         }
@@ -2612,6 +2633,9 @@ describe("browser permission wiring", () => {
             setPermissionRequestHandler() {},
             setPermissionCheckHandler() {},
             webRequest: {
+              onCompleted() {},
+              onBeforeRedirect() {},
+              onErrorOccurred() {},
               onBeforeRequest: (filter, fn) => ses.installs.push(["request", filter, fn]),
               onBeforeSendHeaders: (filter, fn) => ses.installs.push(["sendHeaders", filter, fn]),
               onHeadersReceived: (filter, fn) => ses.installs.push(["headers", filter, fn]),
@@ -2649,19 +2673,19 @@ describe("browser permission wiring", () => {
       const ses = sessions.get(partitions[0]);
       assert.deepEqual(
         // main.js runs in its own vm realm, so copy its arrays before deepEqual.
-        ses.installs.map(([kind, filter]) => [kind, [...filter.types]]),
+        ses.installs.map(([kind, filter]) => [kind, [...(filter.types ?? [])]]),
         [
-          ["request", ["mainFrame", "subFrame", "object"]],
+          ["request", []],
           ["sendHeaders", ["mainFrame", "subFrame", "object"]],
           ["headers", ["mainFrame", "subFrame", "object"]],
         ],
-        "installed once per partition, for document requests only",
+        "installed once per partition; request dispatch also observes non-document traffic",
       );
       // Round-trip through JSON so objects from main.js's vm realm compare.
       const decide = (kind, details, session = ses, view = agent) =>
         new Promise((resolve) => {
           const [, , fn] = session.installs.find(([k]) => k === kind);
-          fn({ webContentsId: view.id, ...details }, (response) =>
+          fn({ webContentsId: view.id, resourceType: "mainFrame", ...details }, (response) =>
             resolve(JSON.parse(JSON.stringify(response))),
           );
         });
@@ -2691,8 +2715,8 @@ describe("browser permission wiring", () => {
       const otherSession = sessions.get(partitions[2]);
       assert.notEqual(otherSession, ses);
       assert.deepEqual(
-        otherSession.installs.map(([kind, filter]) => [kind, [...filter.types]]),
-        ses.installs.map(([kind, filter]) => [kind, [...filter.types]]),
+        otherSession.installs.map(([kind, filter]) => [kind, [...(filter.types ?? [])]]),
+        ses.installs.map(([kind, filter]) => [kind, [...(filter.types ?? [])]]),
         "each independent session receives all document hooks",
       );
       otherSession.dns["example.com"] = "127.0.0.1";
@@ -2771,6 +2795,21 @@ describe("desktop browser login IPC", () => {
   const eventFor = (h, frameUrl = `${origin}/settings`) => ({
     sender: h.webContents,
     senderFrame: { url: frameUrl },
+  });
+
+  it("extension management refuses a foreign sender, and the renderer supplies no install path", async (t) => {
+    const h = loadNavigationHarness({ registerFallbacks: false });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const foreign = eventFor(h, "https://foreign.example/settings");
+    await Promise.all(
+      ["list", "add", "enable", "remove", "review", "menu"].map(async (action) => {
+        assert.equal(
+          (await h.ipc.get(`omnigent:browser-extensions:${action}`)(foreign, "/renderer/evil")).ok,
+          false,
+        );
+      }),
+    );
   });
 
   it("requires the pinned sender and a boolean, with the setting off by default", async (t) => {
@@ -3054,11 +3093,23 @@ describe("setup clipboard IPC wiring", () => {
 });
 
 describe("macOS activation wiring", () => {
+  it("restores the tracked shell window when the Dock activates a minimized app", (t) => {
+    const h = loadNavigationHarness({ registerFallbacks: false });
+    t.after(h.cleanup);
+    let restored = false;
+    h.win.isMinimized = () => true;
+    h.win.restore = () => {
+      restored = true;
+    };
+    h.api.activateAppWindow();
+    assert.equal(restored, true);
+    assert.equal(h.calls.focused, 1);
+  });
   it("counts tracked shell windows instead of utility windows", () => {
-    assert.match(liveCode, /app\.on\("activate"[\s\S]{0,500}windows\.size === 0/);
+    assert.match(liveCode, /function activateAppWindow[\s\S]{0,900}windows\.size === 0/);
     assert.doesNotMatch(
       liveCode,
-      /app\.on\("activate"[\s\S]{0,500}BrowserWindow\.getAllWindows\(\)\.length === 0/,
+      /function activateAppWindow[\s\S]{0,900}BrowserWindow\.getAllWindows\(\)\.length === 0/,
     );
   });
 });
@@ -4644,6 +4695,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         arcaPreviewRecovery: true,
         // Internal-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
+        browserBitwarden: true,
       },
     );
   });

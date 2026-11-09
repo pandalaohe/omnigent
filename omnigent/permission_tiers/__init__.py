@@ -333,6 +333,7 @@ _OPERATIONAL_TOOLS = frozenset(
         "sys_scheduled_task_update",
         "sys_scheduled_task_delete",
         "browser_navigate",
+        "browser_fill_saved_login",
         "browser_click",
         "browser_type",
         "sys_terminal_close",

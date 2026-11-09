@@ -77,6 +77,9 @@ const { createReconnectOverlay } = require("./reconnect_overlay");
 const { createBrowserViewRegistry, persistentAgentPartition } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
+const { createBrowserExtensions } = require("./browserExtensions");
+const { createExtensionPackages } = require("./browserExtensionPackages");
+const { refreshExtensionHosts } = require("./browserExtensionLifecycle");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
@@ -1542,6 +1545,19 @@ function activeWindow() {
   const focused = BrowserWindow.getFocusedWindow();
   if (focused && windows.has(focused)) return focused;
   return windows.keys().next().value ?? null;
+}
+
+function activateAppWindow() {
+  const win = activeWindow();
+  if (win) {
+    focusAndRestore(win);
+    return;
+  }
+  // macOS: re-create the window when the dock icon is clicked and none
+  // open. Skip while a deep link is being handled (or queued) — it opens
+  // its own window, and racing a default window here would double-open at
+  // cold start (whenReady skipped its own createWindow for the pending link).
+  if (windows.size === 0 && !deepLinkInFlight && pendingDeepLinks.length === 0) createWindow();
 }
 
 /**
@@ -3711,6 +3727,52 @@ function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
 // conversation's tabs share one partition, so install once per session and let
 // the registry attribute each request to its view.
 const guardedAgentSessions = new WeakSet();
+const browserExtensions = new Map();
+const { createFillRequest, createFillApprovals } = require("./browserFillRequest");
+
+let fillApprovals;
+const fillBusyPartitions = new Set();
+function getFillApprovals() {
+  return (fillApprovals ??= createFillApprovals(
+    path.join(app.getPath("userData"), "browser-fill-approvals.json"),
+  ));
+}
+let extensionsChanging = false;
+let extensionPackages;
+function getExtensionPackages() {
+  return (extensionPackages ??= createExtensionPackages({
+    directory: path.join(app.getPath("userData"), "browser-extensions", "packages"),
+    dialog,
+    changed: async ({ remove } = {}) => {
+      extensionsChanging = true;
+      try {
+        await refreshExtensionHosts({
+          hosts: browserExtensions,
+          userData: app.getPath("userData"),
+          createHost: extensionsForPartition,
+          remove,
+        });
+      } finally {
+        extensionsChanging = false;
+      }
+    },
+  }));
+}
+
+function extensionsForPartition(partition) {
+  if (!partition.startsWith("persist:omnigent-agent-shared-")) return null;
+  if (!browserExtensions.has(partition)) {
+    const extensions = createBrowserExtensions({
+      session: session.fromPartition(partition),
+      records: () => getExtensionPackages().records(),
+      BrowserWindow,
+      ElectronChromeExtensions: require("electron-chrome-extensions").ElectronChromeExtensions,
+    });
+    browserExtensions.set(partition, extensions);
+    if (!extensionsChanging) void extensions.load().catch(() => {});
+  }
+  return browserExtensions.get(partition);
+}
 
 /** Enforce the agent navigation policy on document requests at the network layer. */
 function registryForAgentWebContents(webContentsId) {
@@ -3752,10 +3814,26 @@ function guardAgentPartitionRequests(partition) {
       (cancel) => callback({ cancel }),
       () => callback({ cancel: true }),
     );
-  ses.webRequest.onBeforeRequest(filter, (details, callback) => {
+  ses.webRequest.onBeforeRequest({ urls: filter.urls }, (details, callback) => {
     const registry = registryForAgentWebContents(details.webContentsId);
-    answer(registry ? registry.shouldCancelAgentRequest(details) : Promise.resolve(true), callback);
+    const decision = filter.types.includes(details.resourceType)
+      ? registry
+        ? registry.shouldCancelAgentRequest(details)
+        : Promise.resolve(true)
+      : Promise.resolve(false);
+    answer(
+      decision.then((cancel) => {
+        if (!cancel) browserExtensions.get(partition)?.relayWebRequest("onBeforeRequest", details);
+        return cancel;
+      }),
+      callback,
+    );
   });
+  for (const name of ["onCompleted", "onBeforeRedirect", "onErrorOccurred"]) {
+    ses.webRequest[name]({ urls: filter.urls }, (details) =>
+      browserExtensions.get(partition)?.relayWebRequest(name, details),
+    );
+  }
   ses.webRequest.onBeforeSendHeaders(filter, (details, callback) =>
     callback(
       registryForAgentWebContents(details.webContentsId)?.agentRequestHeaders(details) ?? {},
@@ -3883,6 +3961,7 @@ function createBrowserRegistryForWindow(win) {
     registry.get(registry.activeConversationId())?.view.webContents === wc;
   const registry = createBrowserViewRegistry({
     WebContentsViewCtor: (opts) => {
+      extensionsForPartition(opts.webPreferences.partition);
       // Install before construction: Electron otherwise auto-grants requests.
       const policy = hardenAgentPartition(opts.webPreferences.partition, win, canPrompt, () =>
         view.getBounds(),
@@ -3906,6 +3985,10 @@ function createBrowserRegistryForWindow(win) {
         : defaultPartition();
     },
     isPartitionUnavailable: (partition) => clearingBrowserPartitions.has(partition),
+    onViewCreated: (entry) =>
+      extensionsForPartition(entry.partition)?.addView(entry.view.webContents, win),
+    onViewSelected: (entry) =>
+      extensionsForPartition(entry.partition)?.selectView(entry.view.webContents),
     onSuppressionChange: (suppressed) => {
       if (suppressed) browserPermissionPrompt.dismiss(win);
     },
@@ -3920,6 +4003,7 @@ function createBrowserRegistryForWindow(win) {
       });
     },
     getAgentAllowlist: (context) => agentBrowserAllowlist(context?.serverOrigin),
+    getFillAllowlist: () => agentBrowserAllowlist(pinnedOrigin(win)),
     createBoundsController: createBrowserViewBoundsController,
     attachToHost: (view) => {
       win.contentView.addChildView(view);
@@ -4989,6 +5073,7 @@ function registerIpc() {
       // Importing local Chrome cookies is wired for macOS only (Keychain-decrypted
       // v10 values); the SPA hides the toolbar button everywhere else.
       chromeCookieImport: process.platform === "darwin",
+      browserBitwarden: true,
     };
   });
 
@@ -5157,6 +5242,8 @@ function registerIpc() {
     }
     clearingBrowserPartitions.add(partition);
     try {
+      const extensions = browserExtensions.get(partition);
+      if (extensions) await extensions.unload();
       const ses = session.fromPartition(partition);
       // Closed views can leave their registry before Chromium destroys them.
       const closing = electronWebContents
@@ -5173,6 +5260,139 @@ function registerIpc() {
       return { ok: false, error: "could not clear browser login" };
     } finally {
       clearingBrowserPartitions.delete(partition);
+    }
+  });
+  ipcMain.on("omnigent:extension-storage", (event, keys, area) => {
+    for (const extensions of browserExtensions.values())
+      extensions.storageChanged(event, keys, area);
+  });
+  ipcMain.handle("omnigent:browser-extensions:list", (event) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    return { ok: true, extensions: getExtensionPackages().list() };
+  });
+  ipcMain.handle("omnigent:browser-extensions:add", async (event) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    return getExtensionPackages().add(BrowserWindow.fromWebContents(event.sender));
+  });
+  ipcMain.handle("omnigent:browser-extensions:enable", async (event, id, enabled) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    return getExtensionPackages().setEnabled(
+      BrowserWindow.fromWebContents(event.sender),
+      id,
+      enabled,
+    );
+  });
+  ipcMain.handle("omnigent:browser-extensions:review", async (event, id) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    return getExtensionPackages().review(BrowserWindow.fromWebContents(event.sender), id);
+  });
+  ipcMain.handle("omnigent:browser-extensions:remove", async (event, id) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    return getExtensionPackages().remove(BrowserWindow.fromWebContents(event.sender), id);
+  });
+  ipcMain.handle("omnigent:browser-extensions:menu", async (event, viewId) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    const registry = browserRegistryForSender(event);
+    const entry = typeof viewId === "string" && registry?.get(viewId);
+    if (
+      !entry ||
+      registry.activeConversationId() !== viewId ||
+      registry.isSuppressed() ||
+      extensionsChanging ||
+      clearingBrowserPartitions.has(entry.partition)
+    )
+      return { ok: false, error: "Show this tab in Browser first." };
+    try {
+      const host = extensionsForPartition(entry.partition);
+      if (!host)
+        return { ok: false, error: "Turn on Keep in-app browser login, then reopen Browser." };
+      await host.load();
+      const items = host.loaded();
+      if (!items.length)
+        return { ok: false, error: "Add an extension in Settings → General → Browser extensions." };
+      const window = BrowserWindow.fromWebContents(event.sender);
+      Menu.buildFromTemplate(
+        items.map((item) => ({
+          label: item.name,
+          enabled: !!item.manifest?.action?.default_popup,
+          click: () => {
+            if (extensionsChanging || clearingBrowserPartitions.has(entry.partition)) return;
+            void host.openPopup(window, item.id).catch(() =>
+              dialog.showMessageBox(window, {
+                type: "error",
+                message: "Could not open extension.",
+              }),
+            );
+          },
+        })),
+      ).popup({ window });
+      return { ok: true };
+    } catch {
+      return { ok: false, error: "Could not open extensions." };
+    }
+  });
+  ipcMain.handle("omnigent:browser-fill-saved-login", async (event, viewId) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    const registry = browserRegistryForSender(event);
+    const entry = typeof viewId === "string" && registry?.get(viewId);
+    const extensions = entry && browserExtensions.get(entry.partition);
+    if (!extensions) return { ok: false, error: "Set up and unlock Bitwarden first." };
+    return createFillRequest({
+      extensions,
+      registry,
+      approvals: getFillApprovals(),
+      dialog,
+      window: BrowserWindow.fromWebContents(event.sender),
+      busyPartitions: fillBusyPartitions,
+      isAvailable: (partition) => !clearingBrowserPartitions.has(partition) && !extensionsChanging,
+    }).fill(viewId);
+  });
+  ipcMain.handle("omnigent:browser-fill-approvals:list", (event) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return {
+      ok: true,
+      sites: getFillApprovals()
+        .list(persistentAgentPartition(pinnedOrigin(win)))
+        .map(({ origin, id, label }) => ({ origin, id, label })),
+    };
+  });
+  ipcMain.handle("omnigent:browser-fill-approvals:revoke", (event, key) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    if (typeof key?.origin !== "string" || typeof key?.id !== "string") return { ok: false };
+    const win = BrowserWindow.fromWebContents(event.sender);
+    try {
+      getFillApprovals().revoke({
+        partition: persistentAgentPartition(pinnedOrigin(win)),
+        origin: key.origin,
+        id: key.id,
+      });
+      return { ok: true };
+    } catch {
+      return { ok: false, error: "Could not revoke approval." };
+    }
+  });
+  ipcMain.handle("omnigent:browser-bitwarden:open", async (event, viewId) => {
+    if (!isPinnedOriginSender(event)) return { ok: false, error: "untrusted sender" };
+    const registry = browserRegistryForSender(event);
+    const entry = typeof viewId === "string" && registry?.get(viewId);
+    if (!entry || registry.activeConversationId() !== viewId || registry.isSuppressed())
+      return { ok: false, error: "Show this tab in Browser first." };
+    const extensions = extensionsForPartition(entry.partition);
+    if (clearingBrowserPartitions.has(entry.partition) || extensionsChanging)
+      return { ok: false, error: "Browser login is being cleared." };
+    if (!extensions)
+      return {
+        ok: false,
+        error:
+          "Add Bitwarden in Settings → General → Browser extensions first. Close and reopen Browser after turning on saved login.",
+      };
+    try {
+      extensions.selectView(entry.view.webContents);
+      await extensions.openPopup(BrowserWindow.fromWebContents(event.sender));
+      return { ok: true };
+    } catch {
+      return { ok: false, error: "Could not open Bitwarden." };
     }
   });
   registerBrowserIpc({
@@ -5667,13 +5887,7 @@ if (!gotLock) {
     updater.init();
     app.on("browser-window-focus", () => updateSignOutMenuItem());
 
-    app.on("activate", () => {
-      // macOS: re-create the window when the dock icon is clicked and none
-      // open. Skip while a deep link is being handled (or queued) — it opens
-      // its own window, and racing a default window here would double-open at
-      // cold start (whenReady skipped its own createWindow for the pending link).
-      if (windows.size === 0 && !deepLinkInFlight && pendingDeepLinks.length === 0) createWindow();
-    });
+    app.on("activate", activateAppWindow);
   });
 
   app.on("window-all-closed", () => {

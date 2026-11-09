@@ -311,6 +311,7 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "browser_click": None,
     "browser_type": None,
     "browser_screenshot": None,
+    "browser_fill_saved_login": None,
     # ``open_in_panel`` is framework-owned like the browser tools: always
     # auto-registered by ``ToolManager._register_panel_tools`` and reserved
     # here so user specs cannot shadow it. Execution is runner-dispatched.

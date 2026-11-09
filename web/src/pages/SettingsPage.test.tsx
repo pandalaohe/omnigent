@@ -540,20 +540,44 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 }
 
 describe("SettingsPage", () => {
+  it("lists approved login sites and revokes one with visible feedback", async () => {
+    const site = { origin: "https://example.test", id: "demo", label: "Demo account" };
+    const revoke = vi.fn().mockResolvedValue({ ok: true });
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      getBrowserLoginSetting: vi.fn().mockResolvedValue({ ok: true, enabled: true }),
+      setBrowserLoginSetting: vi.fn(),
+      clearBrowserLogin: vi.fn(),
+      browserFillApprovals: vi.fn().mockResolvedValue({ ok: true, sites: [site] }),
+      browserRevokeFillApproval: revoke,
+    };
+    renderPage("/settings");
+    expect(await screen.findByText(/https:\/\/example.test · Demo account/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
+    await waitFor(() => expect(revoke).toHaveBeenCalledWith(site));
+    expect(await screen.findByText(/No sites approved/)).toBeInTheDocument();
+  });
+
   it("saves and clears desktop browser login for the connected server", async () => {
     const getBrowserLoginSetting = vi.fn().mockResolvedValue({ ok: true, enabled: false });
     const setBrowserLoginSetting = vi.fn().mockResolvedValue({ ok: true, enabled: true });
     const clearBrowserLogin = vi.fn().mockResolvedValue({ ok: true });
+    const browserExtensionsAdd = vi.fn().mockResolvedValue({ ok: true });
     (window as unknown as Record<string, unknown>).omnigentDesktop = {
       kind: "electron",
       getBrowserLoginSetting,
       setBrowserLoginSetting,
       clearBrowserLogin,
+      browserExtensionsAdd,
+      browserExtensionsList: vi.fn().mockResolvedValue({ ok: true, extensions: [] }),
+      browserExtensionsEnable: vi.fn(),
+      browserExtensionsRemove: vi.fn(),
     };
     renderPage("/settings");
     const toggle = await screen.findByRole("switch", { name: "Keep in-app browser login" });
     await waitFor(() => expect(toggle).not.toBeDisabled());
     expect(toggle).not.toBeChecked();
+
     expect(screen.getByText("Reuse this server's saved browser login.")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "About Keep in-app browser login" }));
     expect(screen.getByRole("tooltip")).toHaveTextContent(
@@ -562,6 +586,9 @@ describe("SettingsPage", () => {
     fireEvent.click(toggle);
     await waitFor(() => expect(setBrowserLoginSetting).toHaveBeenCalledWith(true));
     await waitFor(() => expect(toggle).toBeChecked());
+    fireEvent.click(screen.getByRole("button", { name: "Add extension" }));
+    await waitFor(() => expect(browserExtensionsAdd).toHaveBeenCalledOnce());
+    expect(await screen.findByText(/Extension added/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Clear browser login for this server" }));
     await waitFor(() => expect(clearBrowserLogin).toHaveBeenCalledOnce());
     expect(await screen.findByText(/Browser login cleared/)).toBeInTheDocument();

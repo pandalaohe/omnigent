@@ -490,7 +490,16 @@ async function isProxyAddress(ip, pacResult, resolveHost) {
   return resolved.flat().some((address) => canonicalAddress(address) === target);
 }
 
+function isExplicitlyAllowlisted(url, allowlist) {
+  try {
+    return allowanceFor(new URL(url), allowlist).allowed;
+  } catch {
+    return false;
+  }
+}
+
 module.exports = {
+  isExplicitlyAllowlisted,
   isAgentNavigationAllowed,
   checkAgentNavigation,
   isAgentConnectionAllowed,

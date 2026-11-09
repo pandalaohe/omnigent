@@ -307,6 +307,11 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   browserScreenshot: (conversationId) =>
     ipcRenderer.invoke("omnigent:browser-screenshot", { conversationId }),
   /** Perform a fixed snapshot, click or type action in the conversation's view. */
+  browserFillSavedLogin: (viewId) =>
+    ipcRenderer.invoke("omnigent:browser-fill-saved-login", viewId),
+  browserFillApprovals: () => ipcRenderer.invoke("omnigent:browser-fill-approvals:list"),
+  browserRevokeFillApproval: (key) =>
+    ipcRenderer.invoke("omnigent:browser-fill-approvals:revoke", key),
   browserPerformAction: (conversationId, action, params) =>
     ipcRenderer.invoke("omnigent:browser-perform-action", { conversationId, action, params }),
   /** @deprecated Until v0.21: main translates only recognized v0.18 action templates. */
@@ -320,6 +325,14 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   browserClose: (conversationId, reason) =>
     ipcRenderer.invoke("omnigent:browser-close", { conversationId, reason }),
   getBrowserLoginSetting: () => ipcRenderer.invoke("omnigent:browser-login-setting:get"),
+  browserExtensionsList: () => ipcRenderer.invoke("omnigent:browser-extensions:list"),
+  browserExtensionsAdd: () => ipcRenderer.invoke("omnigent:browser-extensions:add"),
+  browserExtensionsEnable: (id, enabled) =>
+    ipcRenderer.invoke("omnigent:browser-extensions:enable", id, enabled),
+  browserExtensionsReview: (id) => ipcRenderer.invoke("omnigent:browser-extensions:review", id),
+  browserExtensionsRemove: (id) => ipcRenderer.invoke("omnigent:browser-extensions:remove", id),
+  browserExtensionsMenu: (viewId) => ipcRenderer.invoke("omnigent:browser-extensions:menu", viewId),
+  browserOpenBitwarden: (viewId) => ipcRenderer.invoke("omnigent:browser-bitwarden:open", viewId),
   setBrowserLoginSetting: (enabled) =>
     ipcRenderer.invoke("omnigent:browser-login-setting:set", enabled),
   clearBrowserLogin: () => ipcRenderer.invoke("omnigent:browser-login:clear"),

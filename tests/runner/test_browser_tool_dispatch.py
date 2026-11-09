@@ -134,6 +134,7 @@ async def test_browser_tool_strips_prefix_for_every_action() -> None:
         "browser_click": "click",
         "browser_type": "type",
         "browser_screenshot": "screenshot",
+        "browser_fill_saved_login": "fill_saved_login",
     }
     for tool_name, action in expected.items():
         client = _RecordingClient()
@@ -210,6 +211,7 @@ _EXPECTED_BROWSER_NAMES = {
     "browser_click",
     "browser_type",
     "browser_screenshot",
+    "browser_fill_saved_login",
 }
 
 

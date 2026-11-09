@@ -35,6 +35,7 @@ BROWSER_TOOL_NAMES: frozenset[str] = frozenset(
         "browser_click",
         "browser_type",
         "browser_screenshot",
+        "browser_fill_saved_login",
     }
 )
 
@@ -357,6 +358,36 @@ class BrowserScreenshotTool(Tool):
         }
 
 
+class BrowserFillSavedLoginTool(Tool):
+    """Ask the desktop to fill from Bitwarden without returning credentials."""
+
+    @classmethod
+    def name(cls) -> str:
+        return "browser_fill_saved_login"
+
+    @classmethod
+    def description(cls) -> str:
+        return (
+            "Fill a saved Bitwarden login on the visible browser tab, with the user's "
+            "per-site approval in the desktop app. Unlock Bitwarden first. Returns only "
+            "fill status, never credentials. After filling, use browser_click to click Log in."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name(),
+                "description": self.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"tab_id": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+
 # Ordered tuple of the schema-only browser tool classes, in the same
 # order as ``BROWSER_TOOL_NAMES`` reads. The registration factory in
 # ``builtins/__init__.py`` iterates this to construct instances.
@@ -366,4 +397,5 @@ BROWSER_TOOL_CLASSES: tuple[type[Tool], ...] = (
     BrowserClickTool,
     BrowserTypeTool,
     BrowserScreenshotTool,
+    BrowserFillSavedLoginTool,
 )

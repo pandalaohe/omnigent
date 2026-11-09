@@ -1461,16 +1461,21 @@ describe("useBrowserAgentRelay — hidden pane handling", () => {
     }
   });
 
-  it("snapshot: succeeds when the page has a layout size", async () => {
+  it("snapshot: succeeds when the page has layout and credential protection", async () => {
     const bridge = installBridge({
       browserExecute: vi.fn(async (_id: string, js: string) => ({
         ok: true,
         result: window.eval(js),
       })),
     });
-    await runAction(actionEvent("snapshot"));
-    expect(bridge.browserExecute).toHaveBeenCalled();
-    expect((postedResult().result as { ok: boolean }).ok).toBe(true);
+    document.documentElement.setAttribute("data-omnigent-credential-watch", "fake-document");
+    try {
+      await runAction(actionEvent("snapshot"));
+      expect(bridge.browserExecute).toHaveBeenCalled();
+      expect((postedResult().result as { ok: boolean }).ok).toBe(true);
+    } finally {
+      document.documentElement.removeAttribute("data-omnigent-credential-watch");
+    }
   });
 
   it("screenshot: retries while the pane is hidden and returns the data URL once surfaced", async () => {
@@ -1561,5 +1566,29 @@ describe("useBrowserAgentRelay — result POST resilience", () => {
     await Promise.resolve();
 
     expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("saved login relay", () => {
+  it("returns only status for a filled login and supports older shells", async () => {
+    const fill = vi
+      .fn()
+      .mockResolvedValue({ ok: true, filled: true, password: "fake-private-value" });
+    installBridge({ browserFillSavedLogin: fill });
+    authenticatedFetch.mockResolvedValue(WON);
+    await runAction(actionEvent("fill_saved_login"));
+    expect(postedResult().result).toEqual({ ok: true, filled: true });
+    expect(fill).toHaveBeenCalledWith(CONV);
+    expect(JSON.stringify(authenticatedFetch.mock.calls)).not.toContain("fake-private-value");
+  });
+  it("does not execute scripts when the shell lacks saved login filling", async () => {
+    const bridge = installBridge();
+    authenticatedFetch.mockResolvedValue(WON);
+    await runAction(actionEvent("fill_saved_login"));
+    expect(postedResult().result).toMatchObject({
+      ok: false,
+      error: "This desktop app version cannot fill saved logins.",
+    });
+    expect(bridge.browserExecute).not.toHaveBeenCalled();
   });
 });

@@ -233,6 +233,35 @@ interface ElectronDesktopApi extends NativeShellApi {
     },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   getBrowserLoginSetting?: () => Promise<{ ok: boolean; enabled?: boolean; error?: string }>;
+  browserExtensionsList?: () => Promise<{
+    ok: boolean;
+    error?: string;
+    extensions?: {
+      id: string;
+      name: string;
+      version: string;
+      enabled: boolean;
+      runtimeId?: string;
+    }[];
+  }>;
+  browserExtensionsAdd?: () => Promise<{ ok: boolean; error?: string }>;
+  browserExtensionsEnable?: (
+    id: string,
+    enabled: boolean,
+  ) => Promise<{ ok: boolean; error?: string }>;
+  browserExtensionsReview?: (id: string) => Promise<{ ok: boolean; error?: string }>;
+  browserExtensionsRemove?: (id: string) => Promise<{ ok: boolean; error?: string }>;
+  browserExtensionsMenu?: (viewId: string) => Promise<{ ok: boolean; error?: string }>;
+  browserFillApprovals?: () => Promise<{
+    ok: boolean;
+    sites?: { origin: string; id: string; label: string }[];
+    error?: string;
+  }>;
+  browserRevokeFillApproval?: (key: {
+    origin: string;
+    id: string;
+  }) => Promise<{ ok: boolean; error?: string }>;
+  browserOpenBitwarden?: (viewId: string) => Promise<{ ok: boolean; error?: string }>;
   setBrowserLoginSetting?: (
     enabled: boolean,
   ) => Promise<{ ok: boolean; enabled?: boolean; error?: string }>;
@@ -401,6 +430,7 @@ export interface DesktopFeatures {
   arcaPreviewRecovery?: boolean;
   /** This shell can import the current site's cookies from local Google Chrome. */
   chromeCookieImport?: boolean;
+  browserBitwarden?: boolean;
 }
 
 /** Status of the local `omni` CLI, from the desktop shell. */
@@ -654,6 +684,13 @@ export function browserLoginBridge() {
     get: desktop.getBrowserLoginSetting,
     set: desktop.setBrowserLoginSetting,
     clear: desktop.clearBrowserLogin,
+    extensionsList: desktop.browserExtensionsList,
+    extensionsAdd: desktop.browserExtensionsAdd,
+    extensionsEnable: desktop.browserExtensionsEnable,
+    extensionsReview: desktop.browserExtensionsReview,
+    extensionsRemove: desktop.browserExtensionsRemove,
+    fillApprovals: desktop.browserFillApprovals,
+    revokeFillApproval: desktop.browserRevokeFillApproval,
   };
 }
 

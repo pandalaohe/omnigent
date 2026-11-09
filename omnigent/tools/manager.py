@@ -696,21 +696,9 @@ class ToolManager:
         """
         if not self._spec.tool_groups.browser:
             return
-        from omnigent.tools.builtins.browser import (
-            BrowserClickTool,
-            BrowserNavigateTool,
-            BrowserScreenshotTool,
-            BrowserSnapshotTool,
-            BrowserTypeTool,
-        )
+        from omnigent.tools.builtins.browser import BROWSER_TOOL_CLASSES
 
-        for _cls in (
-            BrowserNavigateTool,
-            BrowserSnapshotTool,
-            BrowserClickTool,
-            BrowserTypeTool,
-            BrowserScreenshotTool,
-        ):
+        for _cls in BROWSER_TOOL_CLASSES:
             self._tools[_cls.name()] = _cls()
 
     def _register_panel_tools(self) -> None:
