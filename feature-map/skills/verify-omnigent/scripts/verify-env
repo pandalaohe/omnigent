@@ -88,13 +88,6 @@ doctor() {
 stop() {
   load
   uv run --frozen python -m dev.repro_env --output "$VERIFY_ENV" stop
-  local pid
-  pid=$(cat "$VERIFY_ROOT/supervisor.pid" 2>/dev/null || true)
-  for _ in $(seq 1 30); do
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 1
-  done
-  kill -0 "$pid" 2>/dev/null && die "supervisor $pid still running after 30s"
   echo "stopped: status $(field status); evidence kept in $VERIFY_EVIDENCE"
 }
 

@@ -20,11 +20,12 @@ import time
 from pathlib import Path
 
 import httpx
+import psutil
 
 from .transport import Relay
 
 
-def write_json(path: Path, value: dict) -> None:
+def write_json(path: Path, value: dict | list) -> None:
     with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as handle:
         json.dump(value, handle, indent=2)
         handle.write("\n")
@@ -142,6 +143,10 @@ def supervise(output: Path) -> None:
     children = []
     logs = []
     relays = []
+    identities = [
+        {"pid": os.getpid(), "created": psutil.Process().create_time(), "name": "supervisor"}
+    ]
+    write_json(output / "processes.json", identities)
     stopping = False
 
     def on_signal(*_args):
@@ -167,6 +172,16 @@ def supervise(output: Path) -> None:
             start_new_session=True,
         )
         children.append(process)
+        with contextlib.suppress(psutil.NoSuchProcess):
+            identities.append(
+                {
+                    "pid": process.pid,
+                    "created": psutil.Process(process.pid).create_time(),
+                    "group": process.pid,
+                    "name": name,
+                }
+            )
+            write_json(output / "processes.json", identities)
         return process
 
     def ready(client, url, predicate, timeout=90):
@@ -330,6 +345,7 @@ def supervise(output: Path) -> None:
             child.wait()
         for handle in logs:
             handle.close()
+        state["cleanup_complete"] = True
         write_json(output / "environment.json", state)
         signal.signal(signal.SIGTERM, old_term)
         signal.signal(signal.SIGINT, old_int)
