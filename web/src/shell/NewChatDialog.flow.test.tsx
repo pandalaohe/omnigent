@@ -345,6 +345,7 @@ function setAgents(agents: AvailableAgent[]): void {
 function renderLanding(
   cachedSessionIds: string[] = [],
   infoOverrides: Partial<ServerInfo> = {},
+  seed?: { project: string; prompt: string },
 ): ReturnType<typeof render> {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -394,7 +395,7 @@ function renderLanding(
       </QueryClientProvider>
     );
   }
-  return render(<NewChatLandingScreen />, { wrapper: Wrapper });
+  return render(<NewChatLandingScreen seed={seed} />, { wrapper: Wrapper });
 }
 
 /**
@@ -550,6 +551,34 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen create flow", () => {
+  it("prefills an embedded task draft without sending or replacing the normal landing draft", async () => {
+    renderLanding();
+    typeMessage("My existing draft");
+    cleanup();
+    renderLanding([], {}, { project: "", prompt: "Review task results" });
+    await waitForWorkspaceSeed();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Review task results");
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    cleanup();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("My existing draft");
+  });
+  it("keeps the ordinary draft after a task composer successfully creates a session", async () => {
+    renderLanding();
+    typeMessage("My existing draft");
+    cleanup();
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding([], {}, { project: "", prompt: "Review task results" });
+    await waitForWorkspaceSeed();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+    cleanup();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("My existing draft");
+  });
   it.each([
     { query: "canvas=main", canvasId: "main", project: undefined },
     {

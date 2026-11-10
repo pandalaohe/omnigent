@@ -44,6 +44,13 @@ a link explains that the source gives no page.
 Repeat through a direct link and at 390 px width. The board should fit the
 viewport and preserve the saved display switch after reloading.
 
+Report a task with `omnigent.ai:actions: [{"kind":"new-session","label":"Continue task","project":"Example project","prompt":"Review the task results."}]`.
+Select it: only its details open. Click Continue task: the composer opens over
+the board with that prompt and the matching project (ID first, then exact name).
+An unknown project leaves the project unselected. No session or message is sent
+until the user submits. Dismiss the composer: the board and details remain.
+Without an alternate link, usable actions replace the no-page message.
+
 For the report and read API, use an isolated instance and a disposable source:
 
 1. Report a Group with two open Tasks and one completed Task without

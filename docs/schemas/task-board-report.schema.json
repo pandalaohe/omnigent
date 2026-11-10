@@ -4,8 +4,12 @@
   "title": "Omnigent Task Board Report",
   "description": "JSCalendar Group of Tasks or single Task report accepted by PUT /v1/me/tasks/sources/{source_id} (RFC 8984 plus omnigent.ai: vendor properties).",
   "oneOf": [
-    { "$ref": "#/$defs/Group" },
-    { "$ref": "#/$defs/Task" }
+    {
+      "$ref": "#/$defs/Group"
+    },
+    {
+      "$ref": "#/$defs/Task"
+    }
   ],
   "$defs": {
     "UTCDateTime": {
@@ -26,13 +30,7 @@
     },
     "Progress": {
       "type": "string",
-      "enum": [
-        "needs-action",
-        "in-process",
-        "completed",
-        "failed",
-        "cancelled"
-      ]
+      "enum": ["needs-action", "in-process", "completed", "failed", "cancelled"]
     },
     "Participant": {
       "type": "object",
@@ -393,6 +391,14 @@
             "$ref": "#/$defs/HistoryEvent"
           },
           "description": "Omnigent-defined append-only timeline events for the task."
+        },
+        "omnigent.ai:actions": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/TaskAction"
+          },
+          "description": "Omnigent-defined explicit detail-card actions; never executed on task selection."
         }
       }
     },
@@ -434,7 +440,9 @@
               "properties": {
                 "@type": {
                   "type": "string",
-                  "not": { "const": "Task" }
+                  "not": {
+                    "const": "Task"
+                  }
                 }
               }
             },
@@ -447,6 +455,30 @@
           }
         }
       }
+    },
+    "TaskAction": {
+      "type": "object",
+      "required": ["kind", "label", "prompt"],
+      "properties": {
+        "kind": {
+          "const": "new-session"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]"
+        },
+        "project": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "prompt": {
+          "type": "string",
+          "maxLength": 2000
+        }
+      },
+      "additionalProperties": true
     }
   }
 }

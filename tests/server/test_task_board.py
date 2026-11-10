@@ -766,6 +766,19 @@ async def test_sources_doc_example_and_report_json_schema(board_client):
     report_example = next(block for block in json_blocks if block.get("@type") == "Group")
     for valid_body in (
         report_example,
+        task(
+            **{
+                "omnigent.ai:actions": [
+                    {
+                        "kind": "new-session",
+                        "label": "Continue",
+                        "prompt": "",
+                        "project": "Example",
+                    }
+                ]
+                * 8
+            }
+        ),
         task(recurrenceRules=[{"@type": "RecurrenceRule", "frequency": "daily"}]),
         task(
             participants={
@@ -782,6 +795,23 @@ async def test_sources_doc_example_and_report_json_schema(board_client):
         parse(valid_body)
 
     for invalid in (
+        *(
+            task(**{"omnigent.ai:actions": value})
+            for value in (
+                None,
+                {},
+                [None],
+                [{"kind": "future", "label": "Go", "prompt": ""}],
+                [{"kind": "new-session", "label": "Go"}],
+                [{"kind": "new-session", "label": "", "prompt": ""}],
+                [{"kind": "new-session", "label": " ", "prompt": ""}],
+                [{"kind": "new-session", "label": "x" * 65, "prompt": ""}],
+                [{"kind": "new-session", "label": "Go", "prompt": "x" * 2001}],
+                [{"kind": "new-session", "label": "Go", "prompt": "", "project": "x" * 129}],
+                [{"kind": "new-session", "label": "Go", "prompt": "", "project": None}],
+                [{"kind": "new-session", "label": "Go", "prompt": ""}] * 9,
+            )
+        ),
         {"@type": "Group", "updated": STAMP, "entries": []},
         {"@type": "Group", "uid": "g", "entries": []},
         {"@type": "Group", "uid": "g", "updated": STAMP},
@@ -839,6 +869,7 @@ async def test_sources_doc_example_and_report_json_schema(board_client):
         )
     ).json()
     assert stored["omnigent.ai:key"] == "ENG-123"
+    assert stored["omnigent.ai:actions"] == report_example["entries"][0]["omnigent.ai:actions"]
     assert stored["omnigent.ai:group"] == {"id": "transfer-v2", "name": "Transfer reliability"}
     assert stored["omnigent.ai:waiting"]["on"] == "dependency"
     assert stored["omnigent.ai:unresolved"] == ["eng-100", "eng-120"]
@@ -853,6 +884,7 @@ async def test_sources_doc_example_and_report_json_schema(board_client):
         "omnigent.ai:waiting",
         "omnigent.ai:group",
         "omnigent.ai:next",
+        "omnigent.ai:actions",
         "omnigent.ai:workedBy",
         "omnigent.ai:sourceFields",
         "omnigent.ai:history",

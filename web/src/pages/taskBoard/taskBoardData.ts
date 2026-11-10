@@ -24,6 +24,7 @@ export interface BoardTask {
   "omnigent.ai:key"?: string;
   "omnigent.ai:group"?: { id: string; name?: string };
   "omnigent.ai:next"?: string;
+  "omnigent.ai:actions"?: unknown;
   "omnigent.ai:sourceState"?: string;
   "omnigent.ai:resolution"?: string;
   "omnigent.ai:closedSeen"?: string;
