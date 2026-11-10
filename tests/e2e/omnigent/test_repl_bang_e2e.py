@@ -22,6 +22,7 @@ from pathlib import Path
 
 import httpx
 
+from tests._helpers.terminal_screen import TerminalScreen
 from tests.e2e.omnigent._pexpect_harness import (
     await_turn_complete,
     clean_exit,
@@ -199,7 +200,7 @@ def test_repl_bang_buffer_dropped_on_new_conversation(
     conversation's first turn.
     """
     reset_mock_llm(mock_llm_server_url)
-    configure_mock_llm(mock_llm_server_url, [{"text": "Ok."}])
+    configure_mock_llm(mock_llm_server_url, [{"text": "FRESH_CONVERSATION_OK"}])
     yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "hello_world.yaml"
 
     child = spawn_omnigent_run(
@@ -211,26 +212,40 @@ def test_repl_bang_buffer_dropped_on_new_conversation(
         cwd=omnigent_repo_root,
         timeout=_SPAWN_TIMEOUT,
     )
+    screen = TerminalScreen(child)
     try:
-        child.expect(_COMPLETION_MARKER, timeout=_BOOT_TIMEOUT)
+        screen.wait_for(
+            lambda text: "❯" in text and "state: sleeping" in text,
+            timeout=_BOOT_TIMEOUT,
+            what="the idle prompt",
+        )
 
         submit_prompt(child, "!echo LEAK_SENTINEL_QQQ")
-        child.expect(r"exit 0", timeout=_BANG_TIMEOUT)
+        screen.wait_for(
+            lambda text: "exit 0" in text and "working" not in text,
+            timeout=_BANG_TIMEOUT,
+            what="the bang command to finish",
+        )
 
         # /clear starts a new conversation — it must drop the buffered output.
-        # Re-sync on the freshly re-rendered prompt before sending the next
-        # line, otherwise it races the /clear redraw and never submits.
         submit_prompt(child, "/clear")
-        child.expect(_COMPLETION_MARKER, timeout=_BOOT_TIMEOUT)
-        drain_for(child, 1.5)
+        screen.wait_for(
+            lambda text: (
+                "New conversation." in text and "state: sleeping" in text and "working" not in text
+            ),
+            timeout=_BOOT_TIMEOUT,
+            what="the cleared conversation and idle prompt",
+        )
 
         submit_prompt(child, "hello fresh conversation")
-        await_turn_complete(
-            child,
-            running_timeout=_RUNNING_TIMEOUT,
-            completion_timeout=_COMPLETION_TIMEOUT,
-            running_marker=_RUNNING_MARKER,
-            completion_pattern=_COMPLETION_MARKER,
+        screen.wait_for(
+            lambda text: (
+                "◆ FRESH_CONVERSATION_OK" in text
+                and "state: sleeping" in text
+                and "working" not in text
+            ),
+            timeout=_COMPLETION_TIMEOUT,
+            what="the fresh conversation response to commit",
         )
         clean_exit(child, timeout=_EXIT_TIMEOUT)
     finally:

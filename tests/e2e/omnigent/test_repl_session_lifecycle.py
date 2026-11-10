@@ -26,6 +26,7 @@ import pytest
 from omnigent_client import OmnigentClient, SessionsChat
 
 from tests._helpers.live_server import find_free_port
+from tests._helpers.terminal_screen import TerminalScreen
 from tests.e2e.omnigent._pexpect_harness import (
     PROMPT_READY,
     STATE_SLEEPING,
@@ -334,6 +335,7 @@ def _drive_turn(
     *,
     base_url: str | None = None,
     agent_name: str | None = None,
+    chunk_delay: float = 0.0,
 ) -> _LifecycleResult:
     """
     Configure a mock response for *marker*, submit a prompt, drive one
@@ -358,11 +360,12 @@ def _drive_turn(
         ``None`` for the local flow.
     :param agent_name: Agent display name used to resolve the session
         in the ``--server`` flow (required when ``base_url`` is set).
+    :param chunk_delay: Mock SSE pacing to keep turn-boundary races observable.
     :returns: Captured session and runner ids.
     """
     configure_mock_llm(
         mock_llm_server_url,
-        [{"text": marker}],
+        [{"text": marker, "chunk_delay": chunk_delay}],
         key=_MODEL,
     )
     submit_prompt(child, "respond with the configured marker")
@@ -812,6 +815,7 @@ def test_repl_recover_after_runner_death(
                 env,
                 server_url=server.base_url,
             )
+            screen = TerminalScreen(child)
             try:
                 _wait_ready(child)
                 first_result = _drive_turn(
@@ -820,18 +824,36 @@ def test_repl_recover_after_runner_death(
                     mock_llm_server_url,
                     base_url=server.base_url,
                     agent_name="repl_session_recover",
+                    chunk_delay=0.5,
+                )
+                # The long agent label clips the toolbar's trailing state badge.
+                screen.wait_for(
+                    lambda text: (
+                        "◆ SESSION_RECOVER_OK" in text
+                        and " · ready " in text
+                        and "working" not in text
+                    ),
+                    timeout=_TURN_TIMEOUT,
+                    what="the first response to commit before killing its runner",
                 )
                 runner_pid = _runner_pid_from_daemon_log(home, first_result.runner_id)
                 os.kill(runner_pid, signal.SIGKILL)
 
                 configure_mock_llm(
                     mock_llm_server_url,
-                    [{"text": "SESSION_RECOVER_OK"}],
+                    [{"text": "SESSION_RECOVERED_OK"}],
                     key=_MODEL,
                 )
                 submit_prompt(child, "respond with the configured marker again")
-                child.expect(re.escape("SESSION_RECOVER_OK"), timeout=_TURN_TIMEOUT)
-                child.expect([STATE_SLEEPING, PROMPT_READY], timeout=60)
+                screen.wait_for(
+                    lambda text: (
+                        "◆ SESSION_RECOVERED_OK" in text
+                        and " · ready " in text
+                        and "working" not in text
+                    ),
+                    timeout=_TURN_TIMEOUT,
+                    what="a new committed response after runner recovery",
+                )
                 recovered_runner_id = _wait_session_runner_online(
                     server.base_url,
                     first_result.session_id,
