@@ -6306,6 +6306,15 @@ describe("artifact.open_request consumer", () => {
     return renderShell("/c/conv_abc");
   }
 
+  it("opens a request received before the session is mounted", () => {
+    emitArtifactOpenRequest(
+      { type: "artifact_open_request", path: "pending.html", base: "workspace" },
+      "conv_abc",
+    );
+    renderArtifactShell();
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "pending.html");
+  });
+
   it("opens the viewer for the shown session and ignores another session's request", () => {
     // The event reaches every SSE client; only the client showing the issuing
     // session may reveal the file. The delivering conversation rides the bus

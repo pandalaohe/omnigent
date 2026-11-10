@@ -2,6 +2,7 @@ import { useCallback, useContext, useEffect, useRef, useSyncExternalStore } from
 import { useViewerId } from "./useViewerId";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { revokePermission } from "@/lib/permissionsApi";
+import { clearArtifactOpenRequest } from "@/lib/artifactOpenBus";
 // TanStack Query wrapper around `GET /v1/sessions`, plus mutation
 // hooks for `PATCH /v1/sessions/{id}` (rename) and
 // `DELETE /v1/sessions/{id}`. Rename and delete are optimistic and patch
@@ -1198,6 +1199,7 @@ export async function archiveConversation(
     }),
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (archived) clearArtifactOpenRequest(id);
   return (await res.json()) as Conversation;
 }
 

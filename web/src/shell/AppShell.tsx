@@ -54,7 +54,7 @@ import {
   updateBridge,
 } from "@/lib/nativeBridge";
 import { onBrowserActionClaimed } from "@/lib/browserActionBus";
-import { onArtifactOpenRequest } from "@/lib/artifactOpenBus";
+import { useArtifactOpenRequest } from "@/hooks/useArtifactOpenRequest";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { shouldQueueSend } from "@/lib/messageQueue";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
@@ -1606,15 +1606,12 @@ function AppShellImpl() {
     [commitFileNavigation],
   );
 
-  // An agent `open_in_panel` call reveals a file in the viewer (and the right
-  // panel, via commitFileNavigation) in rendered preview, not the sticky
-  // source/diff mode. Only the conversation on screen reacts.
-  useEffect(() => {
-    return onArtifactOpenRequest((evt, sourceConversationId) => {
-      if (!sourceConversationId || sourceConversationId !== conversationId) return;
-      openFileViewer(evt.path, { preview: true });
-    });
-  }, [conversationId, openFileViewer]);
+  useArtifactOpenRequest(
+    serverConversationId,
+    showFilesPanel &&
+      !(gridId !== undefined && isFeatureEnabled(serverInfo, "grid_sessions_display_ui")),
+    openFileViewer,
+  );
   useUiOpenFile(serverConversationId, showFilesPanel, openFileViewer);
 
   // Strip the file-viewer URL params (file/diff/comment). Memoized on

@@ -73,7 +73,11 @@ async def test_open_in_panel_posts_relative_path_and_returns_viewer_count() -> N
 
     output = await _dispatch(handler)
 
-    assert output == "Asked the web UI to open out/report.html (2 viewer(s) connected)"
+    result = json.loads(output)
+    assert result["status"] == "sent_unconfirmed"
+    assert result["subscribers"] == 2
+    assert result["path"] == "out/report.html"
+    assert "not confirmed" in result["message"]
     assert len(requests) == 1
     request = requests[0]
     assert request.method == "POST"
@@ -88,9 +92,7 @@ async def test_open_in_panel_posts_absolute_path_with_host_base() -> None:
 
     output = await _dispatch(handler, path="/opt/work/notes/report.html")
 
-    assert output == (
-        "Asked the web UI to open /opt/work/notes/report.html (1 viewer(s) connected)"
-    )
+    assert json.loads(output)["path"] == "/opt/work/notes/report.html"
     assert json.loads(requests[0].content) == {
         "path": "opt/work/notes/report.html",
         "base": "host",
@@ -106,6 +108,16 @@ async def test_open_in_panel_result_carries_no_url() -> None:
 
     assert "/v1/artifacts" not in output
     assert "http" not in output
+
+
+@pytest.mark.asyncio
+async def test_open_in_panel_without_subscribers_is_not_delivered() -> None:
+    _, handler = _ok_handler({"viewers": 0})
+    result = json.loads(await _dispatch(handler))
+    assert result["status"] == "not_delivered"
+    assert result["subscribers"] == 0
+    assert "not queued" in result["message"]
+    assert "retry" in result["message"]
 
 
 @pytest.mark.asyncio

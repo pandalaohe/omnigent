@@ -65,7 +65,7 @@ import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
-import { emitArtifactOpenRequest } from "@/lib/artifactOpenBus";
+import { clearArtifactOpenRequest, emitArtifactOpenRequest } from "@/lib/artifactOpenBus";
 import { emitUiOpenFile } from "@/lib/uiFileRequests";
 import {
   ApiError,
@@ -1536,6 +1536,7 @@ export function chatQueryClient(): QueryClient | null {
 // stale. Heartbeats are filtered before this revision is bumped.
 const streamEventRevisions = new Map<string, number>();
 conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
+conversationRegistry.subscribeDisposed(clearArtifactOpenRequest);
 
 // Reconnects share a binding; only one usage request may hydrate it at a time.
 const sessionUsageHydrations = new WeakSet<AbortController>();
@@ -1552,6 +1553,7 @@ const nativePreviewTombstonesByController = new WeakMap<AbortController, Set<str
  * of its stream.
  */
 export function releaseConversation(id: string): void {
+  clearArtifactOpenRequest(id);
   conversationRegistry.release(id);
   const reports = Object.fromEntries(
     Object.entries(useChatStore.getState().codexPermissionReadbacks).filter(([key]) => key !== id),
@@ -6976,6 +6978,7 @@ export async function startStreamPump(
     if (statusReconcileTimer !== null) window.clearInterval(statusReconcileTimer);
     clearCatchupTimers();
     if (get().abortController === controller) {
+      clearArtifactOpenRequest(id);
       set({ abortController: null });
     }
   }
@@ -9209,9 +9212,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       emitBrowserActionRequest(event, sourceConversationId);
       return;
     case "artifact_open_request":
-      // Agent panel-open: fan out to the shell, which opens the file viewer
-      // only when the delivering conversation is the one on screen. No store
-      // state; no-op without a mounted shell.
+      // The bus retains requests until their session owns a visible workspace.
       emitArtifactOpenRequest(event, sourceConversationId);
       return;
     case "session_status": {

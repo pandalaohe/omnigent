@@ -27,3 +27,4 @@ than a deployed host or a live provider. Clean up only the test processes and
 temporary directories the run created.
 
 - [Browser extensions](features/browser-extensions.md): user packages, native consent, agent fill and local data removal.
+- [Agent file opening](features/open-in-panel.md): deferred workspace requests and unconfirmed delivery reporting.
