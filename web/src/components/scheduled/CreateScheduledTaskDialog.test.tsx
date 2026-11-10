@@ -555,12 +555,9 @@ describe("prompt-first automation setup", () => {
     });
     expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("permissionMode");
   });
-  it.each([
-    [false, null],
-    [true, "bypassPermissions"],
-  ])(
+  it.each([false, true])(
     "on an instructions-only edit, keeps a saved approval-skipping mode only if the server accepts it (%s)",
-    async (accepted, expected) => {
+    async (accepted) => {
       render(
         <CapabilitiesProvider info={serverInfo(accepted)}>
           <CreateScheduledTaskDialog
@@ -578,10 +575,10 @@ describe("prompt-first automation setup", () => {
       });
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-      expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
-        prompt: "Also summarize CI failures",
-        permissionMode: expected,
-      });
+      const { input } = updateMutateAsync.mock.calls[0][0];
+      expect(input.prompt).toBe("Also summarize CI failures");
+      if (accepted) expect(input).not.toHaveProperty("permissionMode");
+      else expect(input.permissionMode).toBeNull();
     },
   );
 
@@ -606,12 +603,13 @@ describe("prompt-first automation setup", () => {
     });
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input).toMatchObject({
       name: "Morning brief",
       prompt: "Also summarize CI failures",
-      modelOverride: "opus",
-      reasoningEffort: "high",
     });
+    expect(input).not.toHaveProperty("modelOverride");
+    expect(input).not.toHaveProperty("reasoningEffort");
   });
 
   it.each(["COUNT=4", "UNTIL=20991231T235959Z"])(
@@ -1076,18 +1074,28 @@ describe("CreateScheduledTaskDialog edit mode", () => {
   });
 
   it("sends agentId when the harness is switched, clearing the old agent's settings", async () => {
-    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />);
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          modelOverride: "sonnet",
+          reasoningEffort: "medium",
+          permissionMode: "plan",
+        })}
+      />,
+    );
     fireEvent.click(screen.getByTestId("pick-harness-claude"));
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
 
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     const { input } = updateMutateAsync.mock.calls[0][0];
-    expect(input.agentId).toBe("ag_claude_native");
-    // The task had no overrides (all at Default) and the user changed none, so
-    // the PATCH omits them; the server clears stale settings on the rebind.
-    expect(input).not.toHaveProperty("modelOverride");
-    expect(input).not.toHaveProperty("reasoningEffort");
-    expect(input).not.toHaveProperty("permissionMode");
+    expect(input).toMatchObject({
+      agentId: "ag_claude_native",
+      modelOverride: null,
+      reasoningEffort: null,
+      permissionMode: null,
+    });
   });
 
   it("round-trips non-quarter-hour edit times through the update payload", async () => {
@@ -2332,11 +2340,16 @@ describe("CreateScheduledTaskDialog project field", () => {
     expect(mutateAsync.mock.calls[0][0]).toMatchObject({ projectId: "proj_alpha" });
   });
 
-  it("omits project_id for 'No project'", async () => {
+  it("omits project_id when opting out of the default automation project", async () => {
     vi.mocked(useProjects).mockReturnValue({
       data: [{ id: "proj_alpha", name: "Alpha" }],
     } as ReturnType<typeof useProjects>);
     renderProjectDialog();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Omnigent Automation");
+    openProjectSelect();
+    fireEvent.click(
+      await screen.findByRole("menuitem", { name: "Remove from Omnigent Automation" }),
+    );
     expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
 
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
@@ -2344,6 +2357,7 @@ describe("CreateScheduledTaskDialog project field", () => {
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("projectId");
+    expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
   });
 
   it("pre-fills an edited task's project and sends a cleared project as null", async () => {
@@ -4869,14 +4883,19 @@ describe("editing template prompts", () => {
       expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Opus");
       expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("High");
       await select("task-worker-agent-trigger", "Polly");
-      expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+      expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Default");
+      expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Default");
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(2));
-      expect(readTriggerWorkerSettings(updateMutateAsync.mock.calls[1][0].input.prompt)).toEqual({
+      const secondInput = updateMutateAsync.mock.calls[1][0].input;
+      expect(readTriggerWorkerSettings(secondInput.prompt)).toEqual({
         agentId: "ag_1",
         model: "",
         effort: "",
       });
+      expect(secondInput).not.toHaveProperty("sessionId");
+      expect(secondInput).not.toHaveProperty("agentId");
+      expect(isTaskSessionTriggerPrompt(secondInput.prompt)).toBe(taskSessionMode === "continue");
     },
   );
 
@@ -5551,7 +5570,7 @@ describe("automation harness settings", () => {
     expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Default");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-    expect(updateMutateAsync.mock.calls[0][0].input.permissionMode).toBeNull();
+    expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("permissionMode");
   });
 
   it.each([
@@ -5842,10 +5861,10 @@ describe("automation harness settings", () => {
   });
 
   it.each([
-    ["codex-native", null],
-    ["claude-native", "default"],
-  ])("normalizes a saved default permission for %s", async (harness, expected) => {
-    const agent = mockHarness(harness!);
+    ["codex-native", "Default"],
+    ["claude-native", "Manual"],
+  ] as const)("preserves the meaning of a saved default for %s", async (harness, label) => {
+    const agent = mockHarness(harness);
     render(
       <CreateScheduledTaskDialog
         open
@@ -5853,9 +5872,12 @@ describe("automation harness settings", () => {
         editingTask={scheduledTask({ agentId: agent.id, permissionMode: "default" })}
       />,
     );
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent(label);
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-    expect(updateMutateAsync.mock.calls[0][0].input.permissionMode).toBe(expected);
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    if (harness === "codex-native") expect(input.permissionMode).toBeNull();
+    else expect(input).not.toHaveProperty("permissionMode");
   });
 
   it.each([false, true])(
