@@ -76,6 +76,10 @@ async def test_notice_waits_retries_then_records_once(db_uri):
         assert "[System: context]" in posts[-1]["content"][0]["text"]
         assert "approximate for this session type" in posts[-1]["content"][0]["text"]
         assert "rotate=true and auto=true" in posts[-1]["content"][0]["text"]
+        assert (
+            "For this rotation, this notice supersedes earlier instructions to hand over "
+            "with rotate=false only or never to clear."
+        ) in posts[-1]["content"][0]["text"]
         await notices.tick()
         assert len(posts) == 2
     finally:
