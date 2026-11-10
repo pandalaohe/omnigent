@@ -115,7 +115,7 @@ _ElicitationHandler: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[bool]
 # Choice-aware elicitation: offers the agent's own permission options and returns
 # the chosen label (``None`` = declined). Optional; falls back to the yes/no form.
 _ElicitationChoiceHandler: TypeAlias = Callable[
-    [str, _AcpJsonObject, Sequence[str]], Awaitable[str | None]
+    [str, _AcpJsonObject, Sequence[str], str | None, bool], Awaitable[str | None]
 ]
 _ToolExecutor: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[_AcpJsonObject]]
 
@@ -570,6 +570,7 @@ class AcpExecutor(Executor):
         # wired (standalone / unit tests) → permission falls back to allow.
         self._policy_evaluator: _PolicyEvaluator | None = None
         self._elicitation_handler: _ElicitationHandler | None = None
+        self._policy_elicitation_handler: _ElicitationHandler | None = None
         self._elicitation_choice_handler: _ElicitationChoiceHandler | None = None
         # Adapter-injected tool-execution bridge (the same ``_tool_executor``
         # attribute the SDK harnesses use); backs the Omnigent MCP relay.
@@ -1301,7 +1302,12 @@ class AcpExecutor(Executor):
         return labeled
 
     async def _ask_user(
-        self, tool_name: str, tool_input: _AcpJsonObject, params: _AcpJsonObject
+        self,
+        tool_name: str,
+        tool_input: _AcpJsonObject,
+        params: _AcpJsonObject,
+        *,
+        policy_ask: bool = False,
     ) -> tuple[bool, str | None]:
         """Route a permission request to the user; return ``(allowed, option_id)``.
 
@@ -1313,7 +1319,10 @@ class AcpExecutor(Executor):
         choice_handler = self._elicitation_choice_handler
         labeled = self._scoped_options(params) if choice_handler is not None else None
         if choice_handler is not None and labeled is not None:
-            chosen = await choice_handler(tool_name, tool_input, [name for name, _ in labeled])
+            allow_once = next((name for name, o in labeled if o.get("kind") == "allow_once"), None)
+            chosen = await choice_handler(
+                tool_name, tool_input, [name for name, _ in labeled], allow_once, policy_ask
+            )
             if chosen is None:
                 return False, None
             picked = next((o for name, o in labeled if name == chosen), None)
@@ -1332,7 +1341,11 @@ class AcpExecutor(Executor):
             )
             return allowed, (option_id if isinstance(option_id, str) else None)
 
-        handler = self._elicitation_handler
+        handler = (
+            self._policy_elicitation_handler or self._elicitation_handler
+            if policy_ask
+            else self._elicitation_handler
+        )
         if handler is None:
             return False, None
         return bool(await handler(tool_name, tool_input)), None
@@ -1386,7 +1399,7 @@ class AcpExecutor(Executor):
                         tool_name,
                     )
                     return False, None
-                return await self._ask_user(tool_name, tool_input, params)
+                return await self._ask_user(tool_name, tool_input, params, policy_ask=True)
             # ALLOW / UNSPECIFIED / unknown → fall through to elicitation.
 
         if can_ask and not self._bypass_permissions:
