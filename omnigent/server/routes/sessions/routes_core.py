@@ -334,7 +334,10 @@ from omnigent.server.session_open_rate import (
     CREATE_ORIGIN_HEADER,
     admit_open,
 )
-from omnigent.server.session_orchestration import require_orchestration_source
+from omnigent.server.session_orchestration import (
+    require_named_source_private,
+    require_orchestration_source,
+)
 from omnigent.session_default_modes import (
     CODEX_NATIVE_PERMISSION_DEFAULT_ARGS,
     SPEED_TIER_LABEL_KEY,
@@ -4743,7 +4746,8 @@ def register_core_routes(
             ``project``, only owned sessions are returned so first-class
             project names resolve within the caller's projects.
             ``"all"`` (default) returns all accessible non-archived
-            sessions, matching the legacy behaviour.
+            sessions, matching the legacy behaviour. ``include_archived``
+            adds archived rows to ``"mine"``, ``"shared"`` and ``"all"``.
         :param include_preview: When ``True`` each row also carries
             ``last_message_preview`` — a single-line excerpt of its
             newest visible message. ``False`` (default) omits it.
@@ -4782,13 +4786,15 @@ def register_core_routes(
             accessible_by_param: str | None = None
             owned_by_param: str | None = user_id
             shared_only_param = False
-            include_archived_param = False
+            # The sidebar tabs never send include_archived; agents listing their
+            # own sessions (sys_session_list) do, to find archived workers.
+            include_archived_param = include_archived
             archived_only_param = False
         elif effective_visibility == "shared":
             accessible_by_param = user_id
             owned_by_param = None
             shared_only_param = True
-            include_archived_param = False
+            include_archived_param = include_archived
             archived_only_param = False
         elif effective_visibility == "archived":
             accessible_by_param = user_id
@@ -6273,6 +6279,16 @@ def register_core_routes(
                     viewer_id=user_id,
                     request=request,
                 )
+        if set_project:
+            # A session shared with edit access must not let collaborators
+            # refile the owner's other sessions through agent tools.
+            await asyncio.to_thread(
+                require_named_source_private,
+                request,
+                user_id,
+                conversation_store,
+                permission_store,
+            )
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store

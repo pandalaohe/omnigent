@@ -114,7 +114,7 @@ import { useLocation, useNavigate } from "@/lib/routing";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
-import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
+import { useArchivePrompt } from "./ArchivePrompt";
 import type { ArchiveWorktreeMode } from "@/lib/archiveWorktreePreferences";
 import { WorktreeDetailsDialog } from "@/components/WorktreeDetailsDialog";
 import { cn } from "@/lib/utils";
@@ -196,7 +196,7 @@ export function HeaderConversationMenu({
   const rename = useRenameConversation();
   const moveToProject = useMoveToProject();
   const archive = useArchiveConversation();
-  const archiveWorktreePrompt = useArchiveWorktreePrompt(conversation.id);
+  const archivePrompt = useArchivePrompt(conversation.id);
   const deleteConversation = useStopAndDeleteConversation();
   const stopSession = useStopSession();
   const { account: soundAccount } = useSoundAlertPreferences();
@@ -424,7 +424,7 @@ export function HeaderConversationMenu({
       archive.mutate({ id: conversation.id, archived: false });
       return;
     }
-    archiveWorktreePrompt.requestArchive([conversation], (keepWorktreeIds, mode) => {
+    archivePrompt.requestArchive([conversation], (keepWorktreeIds, mode) => {
       void archiveNow(keepWorktreeIds.has(conversation.id), mode);
     });
   };
@@ -844,7 +844,7 @@ export function HeaderConversationMenu({
         </DropdownMenuContent>
       </DropdownMenu>
 
-      {archiveWorktreePrompt.dialog}
+      {archivePrompt.dialog}
       {worktreeDetailsOpen && (
         <WorktreeDetailsDialog
           sessionId={conversation.id}

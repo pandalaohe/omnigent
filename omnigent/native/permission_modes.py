@@ -51,9 +51,12 @@ PERMISSION_LAUNCH_ARGS: dict[str, dict[str, list[str]]] = {
 
 # Saved automations retain every registered native and SDK permission choice.
 UNATTENDED_DISALLOWED_PERMISSION_MODES: frozenset[str] = frozenset()
-# Modes that skip the approval prompt (``dontAsk`` denies instead, by rules the server
-# cannot see). An automation runs in one only when the task itself selects it, never
-# through an agent default or a reused session's live mode.
+# Shared by every rejection of an automation's permission_mode.
+AGENT_DEFAULT_PERMISSION_MODE_HINT = "JSON null (not the string 'null') for the agent default"
+
+# Modes that skip the approval prompt (``dontAsk`` denies instead). Registered
+# selections remain valid for task overrides, SDK defaults and continued sessions.
+# Copied history receives fresh permission authority under the creation rules.
 APPROVAL_SKIPPING_PERMISSION_MODES: frozenset[str] = frozenset(
     {
         "bypassPermissions",  # claude-native, claude-sdk, acp

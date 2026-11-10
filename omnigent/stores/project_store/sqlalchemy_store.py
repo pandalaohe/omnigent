@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from typing import Any, Literal
 
 import zstandard
-from sqlalchemy import LargeBinary, asc, select, type_coerce, update
+from sqlalchemy import LargeBinary, asc, select, tuple_, type_coerce, update
 from sqlalchemy.orm import Session
 
 from omnigent.calling_defaults import validate_project_calling_defaults
@@ -524,6 +524,38 @@ class SqlAlchemyProjectStore(ProjectStore):
             return True
 
         return run_write_transaction(self._session_immediate, "finish_project_archive", write)
+
+    def list_page(
+        self,
+        *,
+        user_id: str | None,
+        limit: int,
+        after_id: str | None = None,
+        archived: Literal["exclude", "include", "only"] = "exclude",
+    ) -> tuple[builtins.list[Project], bool]:
+        """Return a ``(created_at, id)`` keyset page served by ``ix_projects_user_id``."""
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        with self._session("list_projects_page") as session:
+            stmt = (
+                select(SqlProject)
+                .where(SqlProject.workspace_id == current_workspace_id())
+                .where(SqlProject.user_id == user_id)
+            )
+            if archived == "only":
+                stmt = stmt.where(SqlProject.archived_at.is_not(None))
+            elif archived == "exclude":
+                stmt = stmt.where(SqlProject.archived_at.is_(None))
+            if after_id is not None:
+                after = session.get(SqlProject, (current_workspace_id(), after_id))
+                if after is None or after.user_id != user_id:
+                    raise ValueError("after must be the id of one of your projects")
+                stmt = stmt.where(
+                    tuple_(SqlProject.created_at, SqlProject.id) > (after.created_at, after.id)
+                )
+            stmt = stmt.order_by(asc(SqlProject.created_at), asc(SqlProject.id)).limit(limit + 1)
+            rows = session.execute(stmt).scalars().all()
+            return [_to_entity(row) for row in rows[:limit]], len(rows) > limit
 
     def update(
         self,

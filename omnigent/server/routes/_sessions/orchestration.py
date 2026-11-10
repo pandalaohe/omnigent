@@ -278,6 +278,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _runner_status_probe_inflight,
     _RunnerStatusProbeBackoff,
     _session_active_response_cache,
+    _session_background_agents_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_blocked_on_cache,
@@ -2899,6 +2900,7 @@ def _build_session_response(
     side_chat_sealed: bool = False,
     conv_store: ConversationStore | None = None,
     cold_after_s: int | None = None,
+    background_agents: list[BackgroundTaskInfo] | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -2918,6 +2920,9 @@ def _build_session_response(
         when none are tracked.
     :param background_tasks: Per-shell detail for that tally, so a reload can
         restore it. ``None`` when none are tracked.
+    :param background_agents: Background agents a finished claude-native turn
+        left running while its session waits on them (the snapshot *status*
+        still reads ``"running"``). ``None`` otherwise.
     :param permission_level: The requesting user's numeric level
         on this session (1=read, 2=edit, 3=manage), or ``None``
         when permissions are disabled.
@@ -3090,6 +3095,7 @@ def _build_session_response(
         ),
         agent_name=agent_name,
         status=status,
+        background_agents=background_agents or None,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
         created_at=conv.created_at,
@@ -12412,6 +12418,9 @@ async def _relay_runner_stream_once(
                                     if isinstance(raw_blocked_on, str) and raw_blocked_on
                                     else None
                                 ),
+                                background_agents=_parse_background_tasks(
+                                    event.get("background_agents")
+                                ),
                             )
                         if status == "running":
                             text_acc.clear()
@@ -18234,6 +18243,15 @@ async def _get_session_snapshot(
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
+    # A claude-native turn waiting on its background agent keeps the collapsed
+    # ``running`` status: released headless ``-p`` clients stop polling on any
+    # other value and would return before the agent's result. The agents ride
+    # alongside, and clients that know the field read the session as waiting.
+    background_agents = (
+        _session_background_agents_cache.get(session_id)
+        if status == "running" and _session_status_cache.get(session_id) == "waiting"
+        else None
+    )
     pending_elicitation_events = await asyncio.to_thread(
         _pending_elicitation_snapshot_for_session,
         conv_store,
@@ -18258,6 +18276,7 @@ async def _get_session_snapshot(
         status,
         permission_level,
         side_chat_sealed=await _codex_side_chat_fork_sealed(conv, conv_store),
+        background_agents=background_agents,
         background_task_count=_session_background_task_count_cache.get(session_id),
         background_tasks=_session_background_tasks_cache.get(session_id),
         llm_model=llm_model,

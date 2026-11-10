@@ -120,8 +120,10 @@ class SysScheduledTaskCreateTool(Tool):
                                 "'full-access', 'read-only'. "
                                 "Runs are unattended, so a prompting mode ('default'/'plan') "
                                 "stalls waiting for approval — prefer an auto-running mode. "
-                                "Set null for the agent default. This field is required so "
-                                "the user can review the effective task setting."
+                                "Send JSON null (not the string 'null') for the agent "
+                                "default, and always for a harness without modes. This "
+                                "field is required so the user can review the effective "
+                                "task setting."
                             ),
                         },
                         "max_cost_usd": {
@@ -307,7 +309,8 @@ class SysScheduledTaskUpdateTool(Tool):
                                 "or Devin (e.g. 'smart'). Claude SDK uses the Claude vocabulary; "
                                 "Codex SDK uses 'ask-for-approval', 'approve-for-me', "
                                 "'full-access', "
-                                "'read-only'. Set null for the agent default. "
+                                "'read-only'. Send JSON null (not the string 'null') "
+                                "for the agent default. "
                                 "Required for approval review; resend the current value "
                                 "when it is unchanged. When switching to a harness "
                                 "without permission-mode support, send null."

@@ -28,7 +28,8 @@ the header menu), and each place is a separate entry point.
   old Pinned slot. Dragging a pinned row into a folder unpins it without one.
 - `pin-reorder`: drag a pinned row onto another pinned row to change the Pinned
   order, which persists across reloads; dropping an unpinned row onto a pinned
-  row pins it into that slot.
+  row pins it above or below that row, by the half it's released over, and
+  releasing it just below the last pin pins it at the bottom.
 - `custom-order`: with `sidebar_grouping_ui` (on by default), drop one of your sessions onto
   another row of the same list, project or group (or use Move up/down) to switch
   Ordering to Custom. Positions are saved on this device and new sessions appear
@@ -48,6 +49,9 @@ the header menu), and each place is a separate entry point.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. Archiving also archives
   active descendants; Undo restores only the generations archived by that action.
+  Archiving a working session, a session waiting on approval, or one with
+  background work first asks to confirm because archiving stops it. Cancel or
+  Escape keeps the session.
 - `archive-worktree-safety`: the account preference chooses never (default),
   green only, or green and yellow. Green has only committed/rebuildable local
   files; yellow also has other ignored local files. Source changes, unknown,
@@ -65,6 +69,10 @@ the header menu), and each place is a separate entry point.
   means confirmed removed. A marker shows its own tree without a number badge.
   Hover names at most two child blockers, including Past; full reasons
   stay in Worktree details. Merge state is information, not a deletion gate.
+- `row-quick-actions`: sidebar rows show hover Pin and Archive buttons beside the
+  "…" menu. Settings → Appearance → Sidebar → Show Pin and Archive buttons on
+  session rows (on by default) turns them off, leaving both actions in the row
+  menu and right-click menu.
 - `stop`: Stop session on a hosted parent ends its runner, including side chats
   and sub-agents sharing that runner. Conversation histories are kept.
 - `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
@@ -102,6 +110,8 @@ the header menu), and each place is a separate entry point.
   in the sidebar.
 - `project`: Add to project (Move session once filed) puts a session in a
   project folder from the row menu, the header menu, or the header's folder tag.
+  Agents file sessions the same way with `sys_session_update` (see
+  [session orchestration](session-orchestration.md)).
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
 - `project-show-more`: an expanded project folder lists its five newest
@@ -333,7 +343,8 @@ use Settings → Appearance → Sidebar.
 
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
-that slot.
+that slot: the line marks whether it lands above or below the row. Release it
+just below the last pin to pin it at the bottom.
 
 **Custom order:** with `sidebar_grouping_ui` on (the default), drag one of your sessions onto
 another row in the same list, project or group and release it; a line like the
@@ -400,6 +411,17 @@ The prompt explains that worktrees inside sandboxes or used by other sessions,
 including archived sessions, are retained.
 Dismissing it cancels the archive. Settings → Git → Worktrees holds the saved
 choice only when the server supports cleanup.
+
+**Archive running-session prompt:** archive a session whose agent is working or
+awaiting approval from the quick button, row menu, right-click menu,
+bulk selection, header menu, or desktop Session → Archive. "Archive running
+session?" (or, for bulk, how many of the selected sessions are running) offers
+Cancel and Archive; Archive continues to the worktree prompt when that applies.
+
+**Row quick actions setting:** Settings → Appearance → Sidebar → Show Pin and
+Archive buttons on session rows. Turning it off removes the hover buttons from
+every sidebar row; the session header never had them. On desktop the row menu's
+Pin item is shown only while the setting is off (mobile always shows it).
 
 **Archived view:** choose Display → Archived sessions in the sidebar filter
 menu, then filter by project.
@@ -699,8 +721,9 @@ plain `uv run pytest`, which starts a private server for the test.
   unpin a pinned session, click Undo on the toast, and expect it back in the
   same Pinned position.
 - **`pin-reorder`:**
-  `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_drag_reorders_pinned_sessions`.
-  Dropping an unpinned row onto a pinned row has web unit coverage only.
+  `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_drag_reorders_pinned_sessions`
+  also pins an unpinned row by releasing it just below the last pin. Dropping
+  an unpinned row onto either half of a pinned row has web unit coverage only.
 - **`custom-order`:**
   `tests/browser_ui/test_sessions_appearance.py::test_custom_order_keeps_the_list_and_commits_on_drop`
   (built SPA, mocked backend) covers the menu, the insertion line,
@@ -740,6 +763,18 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_paginates`
+- **`archive`, running-session prompt:** component coverage in
+  `web/src/shell/Sidebar.archive.test.tsx` (quick button, row menu, bulk
+  selection, chaining into the worktree prompt) and
+  `web/src/shell/HeaderConversationMenu.test.tsx` (header menu and desktop
+  Session → Archive); `web/src/shell/AppShell.test.tsx` covers a session opened
+  outside the loaded sidebar pages. Manually: send a message that keeps the agent busy, hover
+  its row, click Archive, and expect the dialog; Cancel leaves the row.
+- **`row-quick-actions`:** component coverage in
+  `web/src/shell/Sidebar.archive.test.tsx` and `web/src/pages/SettingsPage.test.tsx`
+  (Reset to defaults); export and import in `web/src/lib/settingsPortability.test.ts`.
+  Manually: turn the switch off and hover a row; only the "…" button appears,
+  and its menu lists Pin and Archive.
 - **`archive-worktree-safety`, settings and UI marks:**
   The upstream worktree prompt is also covered by
   `tests/server/integration/test_sessions_archive.py::test_archive_stop_removes_worktree_when_requested`

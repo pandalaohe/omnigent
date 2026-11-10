@@ -922,6 +922,7 @@ async def test_create_rejects_invalid_permission_mode(
     )
     assert resp.status_code == 400, resp.text
     assert "Unsupported permission_mode" in resp.text
+    assert "JSON null (not the string 'null') for the agent default" in resp.text
 
 
 @pytest.mark.parametrize(
@@ -931,7 +932,7 @@ async def test_create_rejects_invalid_permission_mode(
         ("codex", "read-only", 200),
         ("codex", "acceptEdits", 400),
         ("claude-native", "read-only", 400),
-        (None, "read-only", 200),
+        (None, "read-only", 400),
     ],
 )
 async def test_permission_mode_matches_scheduled_agent_harness(
@@ -967,7 +968,10 @@ async def test_permission_mode_matches_scheduled_agent_harness(
         assert resp.json()["model_override"] == "model-one"
         assert resp.json()["reasoning_effort"] == "high"
     else:
-        assert harness is not None and harness in resp.text
+        if harness is None:
+            assert "Cannot resolve the agent's harness" in resp.text
+        else:
+            assert harness in resp.text
 
 
 @pytest.mark.parametrize("permission_mode", ["approve-for-me", "read-only"])

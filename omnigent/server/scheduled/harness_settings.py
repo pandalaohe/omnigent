@@ -8,8 +8,11 @@ from typing import Any
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness, is_native_harness
-from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
-from omnigent.session_default_modes import mode_set, valid_mode
+from omnigent.native.permission_modes import (
+    AGENT_DEFAULT_PERMISSION_MODE_HINT,
+    PERMISSION_LAUNCH_ARGS,
+)
+from omnigent.session_default_modes import mode_set, mode_values, valid_mode
 
 _logger = logging.getLogger(__name__)
 
@@ -26,6 +29,29 @@ def unattended_permission_mode_allowed(mode: str | None) -> bool:
     return True
 
 
+def _permission_mode_choices(harness: str | None) -> str:
+    """Name the values a task may send for ``harness``, or for every harness when unknown."""
+    if harness is None:
+        vocabularies = "; ".join(
+            f"{name}: {', '.join(map(repr, modes))}"
+            for name, modes in PERMISSION_LAUNCH_ARGS.items()
+        )
+        # The null hint leads because the runner truncates the server errors it relays.
+        return (
+            f"Use {AGENT_DEFAULT_PERMISSION_MODE_HINT}. Native harness modes: {vocabularies}. "
+            "Registered SDK and plugin permission modes are also accepted."
+        )
+    modes = sorted(
+        set(PERMISSION_LAUNCH_ARGS.get(harness, {})) | mode_values(harness, "permission", "create")
+    )
+    if not modes:
+        return (
+            f"{harness!r} has no automation permission modes; "
+            f"use {AGENT_DEFAULT_PERMISSION_MODE_HINT}"
+        )
+    return f"Use one of {', '.join(map(repr, modes))}, or {AGENT_DEFAULT_PERMISSION_MODE_HINT}"
+
+
 def validate_scheduled_permission_mode(mode: str | None) -> str | None:
     """Validate the vocabulary before resolving the bound agent's harness."""
     if mode is None:
@@ -38,7 +64,8 @@ def validate_scheduled_permission_mode(mode: str | None) -> str | None:
         validate_session_permission_mode(mode)
     except OmnigentError:
         raise OmnigentError(
-            f"Unsupported permission_mode: {mode!r}", code=ErrorCode.INVALID_INPUT
+            f"Unsupported permission_mode: {mode!r}. {_permission_mode_choices(None)}",
+            code=ErrorCode.INVALID_INPUT,
         ) from None
     return mode
 
@@ -112,9 +139,11 @@ def validate_scheduled_permission_harness_support(
     native_fallback = (
         mode_set(harness, "permission") is None
         or (harness == "codex-native" and permission_mode in {"default", "bypass"})
+        or (harness == "antigravity-native" and permission_mode in {"default", "skip"})
     ) and permission_mode in PERMISSION_LAUNCH_ARGS.get(harness or "", {})
     if not valid_mode(permission_mode, harness, "permission", "create") and not native_fallback:
         raise OmnigentError(
-            f"permission_mode {permission_mode!r} is not supported for {harness!r}",
+            f"permission_mode {permission_mode!r} is not supported for {harness!r}. "
+            f"{_permission_mode_choices(harness)}",
             code=ErrorCode.INVALID_INPUT,
         )

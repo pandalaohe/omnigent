@@ -19,6 +19,7 @@ import {
   useProjectFolderCollapse,
   useProjectFolderPageSize,
 } from "@/lib/projectFolderPaginationPreferences";
+import { useSessionRowQuickActions } from "@/lib/sessionRowQuickActionsPreferences";
 import { useInertRef } from "@/hooks/useInertRef";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
@@ -220,7 +221,7 @@ import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
-import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
+import { useArchivePrompt } from "./ArchivePrompt";
 import type { ArchiveWorktreeMode } from "@/lib/archiveWorktreePreferences";
 import { WorktreeDetailsDialog } from "@/components/WorktreeDetailsDialog";
 import { PermissionsModal } from "@/components/PermissionsModal";
@@ -300,6 +301,7 @@ import {
   isMacElectronShell,
 } from "@/lib/nativeBridge";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
+import { isTextEntry } from "@/lib/hotkeys";
 import {
   type SessionFilter,
   readSessionFilter,
@@ -360,6 +362,7 @@ import {
   groupConversations,
   moveCustomOrder,
   orderByPinnedTimestamp,
+  appendPinWrites,
   pinOrderWrites,
   type PinOrderWrite,
   readCollapsedSidebarSectionIds,
@@ -524,11 +527,13 @@ const SuppressedScrollIdContext = createContext<RefObject<string | null>>({ curr
 // True while a pin, unpin, or reorder is saving; pin controls are disabled then.
 const PinSavingContext = createContext(false);
 // Set only around the Pinned section, so its rows become drag-to-reorder targets.
-// `draggingId` is the session being dragged; `overId` the row it's over.
+// `draggingId` is the session being dragged; `overId` the row it's over, and
+// `below` whether the pointer is in that row's lower half.
 const PinOrderContext = createContext<{
   ids: string[];
   draggingId: string | null;
   overId: string | null;
+  below: boolean;
 } | null>(null);
 // Rows report an in-progress inline-rename edit here so ConversationList can
 // hold the sort order for the edit's whole duration — the pointer often
@@ -1310,6 +1315,25 @@ function SidebarImpl({
   // keyboard inset so every session row can still scroll into view while an
   // inline rename holds the keyboard up. No-op off iOS / keyboard closed.
   const keyboardInset = useIOSNativeKeyboardInset(effectiveOpen);
+  // Opening the overlay drawer by swipe leaves the chat composer focused (a tap
+  // on the header toggle moves focus itself), and on iOS its soft keyboard then
+  // stays up over the drawer. Drop focus held outside the drawer so it goes down.
+  // Only on opening: narrowing the window with the sidebar open keeps focus.
+  const overlayOpen = open && mobileLayout && !sideBySide && !inSettings;
+  const wasOpenRef = useRef(open);
+  useLayoutEffect(() => {
+    const opened = open && !wasOpenRef.current;
+    wasOpenRef.current = open;
+    if (!opened || !overlayOpen) return;
+    const active = document.activeElement;
+    if (
+      active instanceof HTMLElement &&
+      isTextEntry(active) &&
+      !drawerRef.current?.contains(active)
+    ) {
+      active.blur();
+    }
+  }, [open, overlayOpen]);
   // The iOS shell disables WebKit's focus reveal: while that padding shrinks the list,
   // center a focused row (an inline rename) when the keyboard opens and on later focus.
   // Centered rather than nearest so the floating Settings action can't cover it.
@@ -2830,6 +2854,7 @@ function ConversationList({
   const [overProject, setOverProject] = useState<string | null>(null);
   const [overSection, setOverSection] = useState<string | null>(null);
   const [overPin, setOverPin] = useState<string | null>(null);
+  const [pinBelow, setPinBelow] = useState(false);
   const { mutateAsync: pinAt } = useTogglePinnedConversation();
   // Pin writes don't overlap (the hooks refuse one while another saves), so the
   // pinned rows stop taking drops until the current write settles.
@@ -3725,8 +3750,15 @@ function ConversationList({
         expandProject(action.project);
         return;
       }
+      // Which half of the pinned row the pointer is in; only rows not yet in the pin order use it.
+      const below = event.collisions?.[0]?.data?.below === true;
       if (action.kind === "reorder-pin") {
-        if (target?.type === "fav-item") {
+        if (
+          target?.type === "fav-item" &&
+          sections.pinned.some(
+            (conversation) => conversation.id === dragged.id && isPinOrderUnit(conversation),
+          )
+        ) {
           // A mixed reorder across any favorites row (session or project):
           // the helper writes the slot pattern and any needed pin timestamps.
           applyFavoriteReorder(
@@ -3734,16 +3766,18 @@ function ConversationList({
             { type: target.refType, id: target.refId },
           );
         } else {
-          const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId);
+          const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId, below);
           if (writes.length > 0) reorderPins(writes);
         }
         return;
       }
-      if (action.kind === "pin" && action.targetId) {
-        // Pin into the dropped-on slot; the new pin goes through the pin toggle
-        // (cap / ownership checks), and only once it's accepted are any
-        // renumbered neighbours rewritten through the batch.
-        const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId);
+      if (action.kind === "pin" && (action.targetId || pinReorderEnabled)) {
+        // Pin into the dropped-on slot (below a row from its lower half), else at the
+        // bottom when the server stores pin order. The new pin goes through the toggle
+        // (cap / ownership checks); once it's accepted, renumbered neighbours follow.
+        const writes = action.targetId
+          ? pinOrderWrites(sections.pinned, dragged.id, action.targetId, below)
+          : appendPinWrites(sections.pinned, dragged.id);
         const pin = writes.find((w) => w.id === dragged.id);
         const rest = writes.filter((w) => w.id !== dragged.id);
         // Chain on this call's own promise: per-call mutate callbacks are dropped
@@ -3755,8 +3789,9 @@ function ConversationList({
               if (rest.length > 0) reorderPins(rest);
             })
             .catch(() => {});
+          return;
         }
-        return;
+        if (action.targetId) return;
       }
       if (action.kind === "pin") {
         // Dropped on the favorites section: pin through the toggle; a favorites
@@ -3787,6 +3822,7 @@ function ConversationList({
       saveOrder,
       sections.pinned,
       pinAt,
+      pinReorderEnabled,
       reorderPins,
       layout,
       saveLayout,
@@ -4311,7 +4347,7 @@ function ConversationList({
   ]);
 
   const pollingArchive = useArchiveConversation();
-  const pollingArchivePrompt = useArchiveWorktreePrompt(activeId);
+  const pollingArchivePrompt = useArchivePrompt(activeId);
   useSessionPollingHotkeys({
     activeId,
     getConversations: async () => pollingPopulation,
@@ -4419,9 +4455,10 @@ function ConversationList({
             ids: sections.pinned.filter(isPinOrderUnit).map((c) => c.id),
             draggingId: activeDrag?.id ?? null,
             overId: overPin,
+            below: pinBelow,
           }
         : null,
-    [pinReorderEnabled, pinWriting, sections.pinned, activeDrag, overPin],
+    [pinReorderEnabled, pinWriting, sections.pinned, activeDrag, overPin, pinBelow],
   );
 
   // Pinned membership is server-authoritative (the `omnigent.pinned` label),
@@ -4710,7 +4747,19 @@ function ConversationList({
               const row = collisions.find(
                 (hit) => hit.data?.droppableContainer.data.current?.type === "session-order",
               );
-              return row ? [row] : collisions;
+              if (row) return [row];
+              const [first, ...rest] = collisions;
+              const target = first?.data?.droppableContainer.data.current;
+              const rect = first && args.droppableRects.get(first.id);
+              if (
+                rect &&
+                (target?.type === "pin-order" ||
+                  (target?.type === "fav-item" && target.refType === "session"))
+              ) {
+                const below = args.pointerCoordinates.y > rect.top + rect.height / 2;
+                return [{ ...first, data: { ...first.data, below } }, ...rest];
+              }
+              return collisions;
             }
             // Dropping a project onto a favorites section adds it there,
             // whether or not a `projects` section exists.
@@ -4818,9 +4867,11 @@ function ConversationList({
                   : null,
             );
           }}
+          onDragMove={(event) => setPinBelow(event.collisions?.[0]?.data?.below === true)}
           onDragCancel={() => {
             setActiveDrag(null);
             setOverPin(null);
+            setPinBelow(false);
             setDraggedProject(null);
             setOverProject(null);
             setDraggedSection(null);
@@ -5689,8 +5740,10 @@ function PinDropZone({ active, children }: { active: boolean; children: ReactNod
     <div
       ref={setNodeRef}
       data-testid="sidebar-pin-drop-zone"
+      // The padding reaches into the list gap so a drop just below the last pin
+      // still pins it at the bottom; the negative margin keeps the layout unchanged.
       className={cn(
-        "rounded-[var(--radius-otto-sm)] transition-colors duration-200 ease-[var(--ease-otto)]",
+        "-mb-3 rounded-[var(--radius-otto-sm)] pb-3 transition-colors duration-200 ease-[var(--ease-otto)]",
         active && isOver && DROP_TARGET_HIGHLIGHT,
       )}
     >
@@ -6872,6 +6925,7 @@ function ConversationMenuItems({
       )
     : [];
   const { forkDisabledReason } = useSessionActionRestrictions(conversation.id, conversation);
+  const showQuickActions = useSessionRowQuickActions();
   // Mobile lacks the horizontal room for a side-opening submenu, so the
   // project picker replaces the menu body in place instead of flying out
   // to the side. `view` swaps between the main actions and that sub-view;
@@ -6941,9 +6995,6 @@ function ConversationMenuItems({
           <C.Separator />
         </>
       )}
-      {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
-          hover-revealed quick-pin button. Archived rows omit it (archive
-          outranks pin). */}
       {!isArchived && gridOptions.length > 0 && (
         <C.Sub>
           <C.SubTrigger className="mobile-touch-target">Open in grid</C.SubTrigger>
@@ -6960,11 +7011,13 @@ function ConversationMenuItems({
           </C.SubContent>
         </C.Sub>
       )}
+      {/* Desktop pins from the hover button unless Settings hides it; archived
+          rows omit Pin (archive outranks pin). */}
       {!isArchived && (
         <C.Item
           data-testid="pin-conversation"
           disabled={pinSaving || (!isPinned && atPinCap)}
-          className="mobile-touch-target md:hidden"
+          className={cn("mobile-touch-target", showQuickActions && "md:hidden")}
           onSelect={() => onTogglePinned(conversation.id)}
         >
           {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
@@ -7866,7 +7919,9 @@ function ConversationRowImpl({
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
-  const archiveWorktreePrompt = useArchiveWorktreePrompt();
+  const archivePrompt = useArchivePrompt();
+  // Settings → Appearance can keep Pin and Archive in the menus only.
+  const showQuickActions = useSessionRowQuickActions();
   const leave = useLeaveSession();
   const moveToProject = useMoveToProject();
   // The kebab's user-facing "Stop session" action. Archiving does NOT go
@@ -8193,7 +8248,7 @@ function ConversationRowImpl({
           },
           // Favorites reorder writes pins, so it follows the same gate as the
           // pin-order target (off while a write is saving, or pins unsupported).
-          disabled: pinOrder === null,
+          disabled: pinOrder === null || !isPinOrderUnit(conversation),
         }
       : {
           id: `pin-order:${resolvedInstanceKey}`,
@@ -8202,11 +8257,12 @@ function ConversationRowImpl({
             !pinOrder || !isPinned || !pinReorderCopy || !pinOrder.ids.includes(conversation.id),
         },
   );
-  // A pin dragged down lands below this row; one dragged up, or a new pin, above it.
+  // Existing pins follow drag direction; a new pin follows the pointer side.
   let pinInsertion: "before" | "after" | undefined;
   if (pinOrder?.draggingId && pinOrder.overId === conversation.id) {
     const from = pinOrder.ids.indexOf(pinOrder.draggingId);
-    pinInsertion = from >= 0 && from < pinOrder.ids.indexOf(conversation.id) ? "after" : "before";
+    const after = from < 0 ? pinOrder.below : from < pinOrder.ids.indexOf(conversation.id);
+    pinInsertion = after ? "after" : "before";
   }
   const insertion = (pinOrder?.draggingId !== conversation.id && pinInsertion) || reorderInsertion;
   // Merge the drag/drop node refs with the row ref used for scroll-into-view.
@@ -8294,7 +8350,7 @@ function ConversationRowImpl({
       runUnarchive();
       return;
     }
-    archiveWorktreePrompt.requestArchive([conversation], (keepWorktreeIds, mode) =>
+    archivePrompt.requestArchive([conversation], (keepWorktreeIds, mode) =>
       archiveNow(keepWorktreeIds.has(conversation.id), mode),
     );
   }
@@ -8813,7 +8869,7 @@ function ConversationRowImpl({
             >
               {/* Archived rows omit the pin entirely: pinning is meaningless there
               (archive outranks pin), so there's no pin action even on hover. */}
-              {!isArchived && (
+              {showQuickActions && !isArchived && (
                 <Tooltip disableHoverableContent>
                   <TooltipContent
                     shortcut={
@@ -8869,7 +8925,7 @@ function ConversationRowImpl({
               {/* Archive is owner-only, same as the kebab's Archive item; non-owners
               don't get the quick affordance and instead see that item disabled
               with an explanation. */}
-              {isOwner && (
+              {showQuickActions && isOwner && (
                 <Tooltip disableHoverableContent>
                   <TooltipContent
                     shortcut={
@@ -9085,7 +9141,7 @@ function ConversationRowImpl({
           </DialogContent>
         )}
       </Dialog>
-      {archiveWorktreePrompt.dialog}
+      {archivePrompt.dialog}
       <Dialog open={leaveOpen} onOpenChange={setLeaveOpen}>
         {leaveOpen && (
           <DialogContent
@@ -10086,7 +10142,7 @@ function BulkActionBar({
   const queryClient = useQueryClient();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
-  const archiveWorktreePrompt = useArchiveWorktreePrompt();
+  const archivePrompt = useArchivePrompt();
   const bulkDelete = useBulkDeleteConversations();
   const bulkMove = useBulkMoveToProject();
   const { data: projects = [] } = useProjects();
@@ -10229,7 +10285,7 @@ function BulkActionBar({
   function handleArchive() {
     if (nonArchivedSelected.length === 0) return;
     const toArchive = nonArchivedSelected;
-    archiveWorktreePrompt.requestArchive(toArchive, (keepWorktreeIds, mode) =>
+    archivePrompt.requestArchive(toArchive, (keepWorktreeIds, mode) =>
       archiveNow(toArchive, keepWorktreeIds, mode),
     );
   }
@@ -10286,7 +10342,7 @@ function BulkActionBar({
 
   return (
     <>
-      {archiveWorktreePrompt.dialog}
+      {archivePrompt.dialog}
       <div className="mt-1 mb-1 flex flex-col gap-1.5">
         <div className="flex items-center gap-2 rounded-lg border border-border bg-transparent p-1.5">
           <Tooltip>

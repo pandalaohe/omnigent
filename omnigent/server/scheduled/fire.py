@@ -1528,8 +1528,11 @@ async def _permission_mode_launch_options(
             "Restore access to the agent and retry.",
             error_code="permission_harness_unresolved",
         )
-    if valid_mode(task.permission_mode, harness, "permission", "create"):
-        applied = apply_mode(harness, "permission", task.permission_mode)
+    mode = task.permission_mode
+    if harness == "antigravity-native":
+        mode = {"skip": "full", "default": "auto"}.get(mode, mode)
+    if valid_mode(mode, harness, "permission", "create"):
+        applied = apply_mode(harness, "permission", mode)
         return list(applied.args) or None, applied.labels
     args = PERMISSION_LAUNCH_ARGS.get(harness, {}).get(task.permission_mode)
     from omnigent.server.scheduled.harness_settings import (

@@ -1086,10 +1086,10 @@ def _claude_agent_deps(
             "codex-native",
             "ask-for-approval",
             [
-                "--sandbox",
-                "workspace-write",
                 "--ask-for-approval",
                 "on-request",
+                "--sandbox",
+                "workspace-write",
                 "-c",
                 'approvals_reviewer="user"',
             ],
@@ -1098,14 +1098,7 @@ def _claude_agent_deps(
         (
             "codex-native",
             "approve-for-me",
-            [
-                "--sandbox",
-                "workspace-write",
-                "--ask-for-approval",
-                "on-request",
-                "-c",
-                'approvals_reviewer="auto_review"',
-            ],
+            ["--approve-for-me"],
             False,
         ),
         ("codex-native", "default", None, False),
@@ -1278,17 +1271,44 @@ async def test_unset_permission_mode_sends_no_launch_args() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("harness", "permission_mode"),
+    ("harness", "permission_mode", "error_code", "expected"),
     [
-        ("codex-native", "bypassPermissions"),
-        ("codex", "acceptEdits"),
-        ("antigravity-native", "skip"),
+        (
+            "codex-native",
+            "bypassPermissions",
+            "permission_mode_unsupported",
+            ["'bypassPermissions' is not supported by 'codex-native'", "Edit the automation"],
+        ),
+        (
+            "codex",
+            "acceptEdits",
+            "permission_mode_unsupported",
+            ["'acceptEdits' is not supported by 'codex'", "Edit the automation"],
+        ),
+        (
+            "antigravity-native",
+            "bypassPermissions",
+            "permission_mode_unsupported",
+            [
+                "'bypassPermissions' is not supported by 'antigravity-native'",
+                "Edit the automation",
+            ],
+        ),
+        (
+            "codex-native",
+            "unknown-permission-mode",
+            "invalid_input",
+            [
+                "Unsupported permission_mode: 'unknown-permission-mode'",
+                "JSON null (not the string",
+            ],
+        ),
     ],
 )
 async def test_incompatible_permission_mode_fails_without_session(
-    harness: str, permission_mode: str
+    harness: str, permission_mode: str, error_code: str, expected: list[str]
 ) -> None:
-    """Incompatible native and SDK saved modes fail before creating a session."""
+    """Incompatible native and SDK modes fail before creating a session."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode=permission_mode)})
 
@@ -1305,9 +1325,9 @@ async def test_incompatible_permission_mode_fails_without_session(
     assert conv_store.created == []
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
-    assert store.runs[0]["error_code"] == "permission_mode_unsupported"
-    assert f"{permission_mode!r} is not supported by {harness!r}" in store.runs[0]["error"]
-    assert "Edit the automation" in store.runs[0]["error"]
+    assert store.runs[0]["error_code"] == error_code
+    for fragment in expected:
+        assert fragment in store.runs[0]["error"]
     assert store.runs[0]["conversation_id"] is None
 
 
@@ -1503,7 +1523,7 @@ async def test_fire_explicit_speed_wins_over_inherited_fast(
     await on_fire(0, "task_1")
     await _drain()
 
-    labels = conv_store.label_writes.get("conv_1", {})
+    labels = conv_store.created[0]["labels"]
     assert labels.get("omnigent.speed_tier") == expected_speed
     assert store.runs[0]["status"] == "running"
 
@@ -4420,7 +4440,7 @@ async def test_saved_permission_mode_keeps_firing_unless_unknown(
     launch.assert_not_awaited()
     assert conv_store.created == []
     assert store.runs[0]["status"] == "failed"
-    assert store.runs[0]["error_code"] == "permission_mode_not_allowed"
+    assert store.runs[0]["error_code"] == "invalid_input"
     assert repr(mode) in store.runs[0]["error"]
 
 
@@ -4588,6 +4608,8 @@ async def test_a_run_starts_from_a_copy_of_the_source_session() -> None:
         ("pi-native", "pi-native", "plan", "switching", None, "plan"),
         ("pi-native", "pi-native", "full", "ready", "full", "full"),
         ("antigravity-native", "antigravity-native", "full", "ready", None, "auto"),
+        ("antigravity-native", "antigravity-native", "auto", "ready", "skip", "full"),
+        ("antigravity-native", "antigravity-native", "plan", "ready", "default", "auto"),
         ("pi-native", "antigravity-native", "plan", "ready", None, "plan"),
         ("pi-native", "claude-native", "full", "ready", None, None),
     ],

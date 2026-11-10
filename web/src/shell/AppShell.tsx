@@ -30,6 +30,8 @@ import { PROJECT_LABEL_KEY, type Conversation, useProjects } from "@/hooks/useCo
 import { effectiveWorktree } from "@/lib/types";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
+import { useOpenSessionRow } from "@/hooks/useOpenSessionRow";
+import type { Session, SessionStatus } from "@/lib/types";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useDeadKeyShortcutGuard } from "@/hooks/useDeadKeyShortcutGuard";
 import { useFocusQuestionCardHotkey } from "@/hooks/useQuestionCardHotkeys";
@@ -272,6 +274,38 @@ function resolveTerminalViewKey(stored: string | null, agentKey: string): string
 function inheritedOrDefaultRightRailTab(): RightRailTab | null {
   const lastExplicit = readInheritLastRightRailTab() ? readLastExplicitRightRailTabOrNull() : null;
   return lastExplicit ?? readInitialWorkspaceTab();
+}
+
+/**
+ * Working fields for an off-window session's archive confirmation. The streamed
+ * open-session row decides, or the snapshot until it loads; a row fetched by id
+ * lacks the background flag until the stream settles it, so the snapshot's stands
+ * in. The live store only adds work, since a fresh bind starts idle.
+ */
+function offWindowArchiveState(
+  row: Conversation | null,
+  snapshot: Pick<Session, "status" | "pendingElicitations" | "backgroundTaskCount">,
+  boundStatus: SessionStatus | null,
+  boundBackgroundTaskCount: number,
+): Pick<Conversation, "status" | "pending_elicitations_count" | "background_work_running"> {
+  const snapshotBackground =
+    snapshot.status === "waiting" || (snapshot.backgroundTaskCount ?? 0) > 0;
+  const reportedStatus: string | undefined = row ? row.status : snapshot.status;
+  let status: Conversation["status"] = "idle";
+  if (boundStatus === "running" || reportedStatus === "running") status = "running";
+  else if (reportedStatus === "failed") status = "failed";
+  return {
+    status,
+    pending_elicitations_count: row
+      ? (row.pending_elicitations_count ?? 0)
+      : (snapshot.pendingElicitations?.length ?? 0),
+    // `waiting` is the loop parked on background work, which rows report separately.
+    background_work_running:
+      (row?.background_work_running ?? snapshotBackground) ||
+      reportedStatus === "waiting" ||
+      boundStatus === "waiting" ||
+      boundBackgroundTaskCount > 0,
+  };
 }
 
 export function AppShell() {
@@ -863,6 +897,18 @@ function AppShellImpl() {
   const isKnownTopLevel =
     activeConv != null ||
     (activeSessionMatchesRoute && activeSession != null && activeSession.parentSessionId == null);
+  // The off-window archive confirmation's sources; see `offWindowArchiveState`.
+  const openSessionRow = useOpenSessionRow(
+    !conversationsLoading && !activeConv && isKnownTopLevel && isOwnerLevel(permissionLevel)
+      ? (serverConversationId ?? null)
+      : null,
+  );
+  const boundSessionStatus = useChatStore((s) =>
+    s.conversationId === serverConversationId ? s.sessionStatus : null,
+  );
+  const boundBackgroundTaskCount = useChatStore((s) =>
+    s.conversationId === serverConversationId ? s.backgroundTaskCount : 0,
+  );
   const actionConversation = useMemo<Conversation | null>(() => {
     if (!isOwnerLevel(permissionLevel)) return null;
     if (activeConv) return activeConv;
@@ -894,8 +940,23 @@ function AppShellImpl() {
       family: activeSession.family,
       git_branch: activeSession.gitBranch ?? null,
       parent_session_id: activeSession.parentSessionId,
+      // `useArchivePrompt` applies `isSessionWorking` to these.
+      ...offWindowArchiveState(
+        openSessionRow,
+        activeSession,
+        boundSessionStatus,
+        boundBackgroundTaskCount,
+      ),
     };
-  }, [activeConv, activeSession, activeSessionMatchesRoute, permissionLevel]);
+  }, [
+    activeConv,
+    activeSession,
+    activeSessionMatchesRoute,
+    boundBackgroundTaskCount,
+    boundSessionStatus,
+    openSessionRow,
+    permissionLevel,
+  ]);
   // Header action gating, hoisted so the desktop buttons and the mobile
   // three-dot menu render the exact same set (they can't drift apart).
   // Only the owner can manage sharing; top-level only. Sharing a

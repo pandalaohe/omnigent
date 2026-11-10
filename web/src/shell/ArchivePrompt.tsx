@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/dialog";
 import type { Conversation } from "@/hooks/useConversations";
 import { fetchSessionWorktreeStatus, type ArchiveWorktreeEntry } from "@/hooks/useWorktreeStatus";
+import { isSessionWorking } from "@/hooks/useSessionState";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   fetchArchiveWorktreePreference,
@@ -31,8 +32,15 @@ interface PendingPrompt {
   cancel: () => void;
 }
 
+interface PendingRunningPrompt {
+  runningCount: number;
+  sessionCount: number;
+  confirm: () => void;
+  cancel: () => void;
+}
+
 /** Ask for a tier until the account preference disables archive prompts. */
-export function useArchiveWorktreePrompt(scope?: string): {
+export function useArchivePrompt(scope?: string): {
   requestArchive: (
     conversations: readonly Conversation[],
     proceed: ProceedFn,
@@ -46,6 +54,7 @@ export function useArchiveWorktreePrompt(scope?: string): {
   const mounted = useRef(false);
   const cancellation = useRef<(() => void) | null>(null);
   const generation = getOmnigentHostGeneration();
+  const [pendingRunning, setPendingRunning] = useState<PendingRunningPrompt | null>(null);
   const serverInfo = useServerInfo();
   const supported = serverInfo !== "loading" && serverInfo.worktree_status === true;
   useEffect(() => {
@@ -53,6 +62,7 @@ export function useArchiveWorktreePrompt(scope?: string): {
     mounted.current = true;
     checking.current = false;
     setPending(null);
+    setPendingRunning(null);
     return () => {
       mounted.current = false;
       cancellation.current?.();
@@ -60,7 +70,7 @@ export function useArchiveWorktreePrompt(scope?: string): {
     };
   }, [scope, generation]);
 
-  const requestArchive = useCallback(
+  const requestWorktreeChoice = useCallback(
     (conversations: readonly Conversation[], proceed: ProceedFn, cancel?: () => void) => {
       if (checking.current) {
         cancel?.();
@@ -175,7 +185,144 @@ export function useArchiveWorktreePrompt(scope?: string): {
     [supported],
   );
 
-  return { requestArchive, dialog: pending ? <ArchiveWorktreeDialog pending={pending} /> : null };
+  const requestArchive = useCallback(
+    (conversations: readonly Conversation[], proceed: ProceedFn, cancel?: () => void) => {
+      const runningCount = conversations.filter(isSessionWorking).length;
+      if (runningCount === 0) {
+        requestWorktreeChoice(conversations, proceed, cancel);
+        return;
+      }
+      if (checking.current) {
+        cancel?.();
+        return;
+      }
+      checking.current = true;
+      let cancelled = false;
+      const cancelRequest = () => {
+        if (!cancelled) {
+          cancelled = true;
+          cancel?.();
+        }
+      };
+      cancellation.current = cancelRequest;
+      const request = ++epoch.current;
+      const hostGeneration = getOmnigentHostGeneration();
+      const active = () =>
+        mounted.current &&
+        epoch.current === request &&
+        getOmnigentHostGeneration() === hostGeneration;
+      const finish = () => {
+        if (!active()) {
+          cancelRequest();
+          return false;
+        }
+        checking.current = false;
+        cancellation.current = null;
+        setPendingRunning(null);
+        return true;
+      };
+      setPendingRunning({
+        runningCount,
+        sessionCount: conversations.length,
+        confirm: () => {
+          if (finish()) requestWorktreeChoice(conversations, proceed, cancel);
+        },
+        cancel: () => {
+          finish();
+          cancelRequest();
+        },
+      });
+    },
+    [requestWorktreeChoice],
+  );
+  return {
+    requestArchive,
+    dialog: (
+      <>
+        <ArchiveRunningDialog
+          pending={pendingRunning}
+          onConfirm={() => pendingRunning?.confirm()}
+          onCancel={() => pendingRunning?.cancel()}
+        />
+        {pending && <ArchiveWorktreeDialog pending={pending} />}
+      </>
+    ),
+  };
+}
+
+function runningPromptCopy({ runningCount, sessionCount }: PendingRunningPrompt): {
+  title: string;
+  description: string;
+} {
+  if (sessionCount === 1) {
+    return {
+      title: "Archive running session?",
+      description:
+        "This session's agent is still working. Archiving stops it. You can unarchive the session later.",
+    };
+  }
+  const one = runningCount === 1;
+  return {
+    title: one ? "Archive a running session?" : `Archive ${runningCount} running sessions?`,
+    description: `${runningCount} of the ${sessionCount} sessions you're archiving ${
+      one ? "has an agent" : "have agents"
+    } still working. Archiving stops ${one ? "it" : "them"}. You can unarchive sessions later.`,
+  };
+}
+
+function ArchiveRunningDialog({
+  pending,
+  onConfirm,
+  onCancel,
+}: {
+  pending: PendingRunningPrompt | null;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const open = pending !== null;
+  const copy = pending ? runningPromptCopy(pending) : null;
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) onCancel();
+      }}
+    >
+      {copy && (
+        <DialogContent
+          className="sm:max-w-md"
+          // Keep dialog clicks off a surrounding sidebar row Link.
+          onClick={(e) => e.stopPropagation()}
+          data-testid="archive-running-dialog"
+        >
+          <DialogHeader>
+            <DialogTitle>{copy.title}</DialogTitle>
+            <DialogDescription>{copy.description}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="border-t-0 bg-transparent">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={onCancel}
+              data-testid="archive-running-cancel"
+              componentId="archive.running_prompt.cancel"
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={onConfirm}
+              data-testid="archive-running-confirm"
+              componentId="archive.running_prompt.archive"
+            >
+              Archive
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      )}
+    </Dialog>
+  );
 }
 
 function ArchiveWorktreeDialog({ pending }: { pending: PendingPrompt }) {
