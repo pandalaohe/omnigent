@@ -410,12 +410,12 @@ def test_browser_guidance_routes_work_and_review_surfaces(native: bool) -> None:
     result = native_startup_instructions(spec) if native else build_instructions(spec, None, [])
 
     assert result is not None
-    assert "use your own web tooling (a browser CLI, fetch or search tools)." in result
-    assert "open it as a new tab in the user's own browser and leave it open." in result
+    assert "prefer these embedded-browser tools over your own web tooling" in result
+    assert "Fall back to other web tooling only when the embedded browser is unavailable" in result
+    assert "or for non-interactive bulk fetching." in result
     assert "Show files the user should read (HTML reports, Markdown, PDF)" in result
     assert "in Omnigent's right panel." in result
-    assert "The browser_* tools drive the Omnigent desktop app's embedded pane;" in result
-    assert "use them only when the user asks for that pane." in result
+    assert "use them only when the user asks for that pane" not in result
 
 
 def test_subagent_wake_notice_shape_matches_runner_notice() -> None:
