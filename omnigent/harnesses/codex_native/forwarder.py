@@ -3982,6 +3982,15 @@ async def _subscribe_until_ready(
         (bridge_state is not None and bridge_state.helper_stop_pending)
         or (bridge_dir / "active_child_turns.json").exists()
     )
+    if forwarder_state is not None and recover_helpers:
+        await _reconcile_helpers_once(
+            client,
+            ap_client,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            thread_id=thread_id,
+            state=forwarder_state,
+        )
     shell_pending = (
         bridge_state is not None
         and bridge_state.thread_id == thread_id
@@ -4020,15 +4029,6 @@ async def _subscribe_until_ready(
                     response = None
                     timed_out = False
                 if response is not None:
-                    if forwarder_state is not None and recover_helpers:
-                        await _reconcile_helpers_once(
-                            client,
-                            ap_client,
-                            session_id=session_id,
-                            bridge_dir=bridge_dir,
-                            thread_id=thread_id,
-                            state=forwarder_state,
-                        )
                     await _finish_subscription(
                         ap_client,
                         response,

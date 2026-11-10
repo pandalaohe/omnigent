@@ -625,6 +625,88 @@ async def test_subscribe_parked_on_a_not_ready_thread_does_not_block_live_posts(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["read", "control"])
+@pytest.mark.parametrize("replay_owed", [False, True])
+async def test_helper_recovery_does_not_hold_parent_delivery(
+    tmp_path: Path, phase: str, replay_owed: bool
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class _RecoveryClient:
+        def is_subscribed_to_thread(self, _thread_id: str) -> bool:
+            return True
+
+        async def request(self, method: str, params: dict) -> dict:
+            if method == "thread/read":
+                if phase == "control":
+                    raise RuntimeError("helper inventory unavailable")
+                entered.set()
+                await release.wait()
+            return {"result": {"thread": {"id": "thread_1", "turns": []}}}
+
+    class _RecoveryControlClient(_RecordingClient):
+        async def post(
+            self, url: str, *, json: dict, timeout: float | None = None
+        ) -> httpx.Response:
+            if json.get("data", {}).get("helper_action") == "recovery":
+                entered.set()
+                await release.wait()
+            return await super().post(url, json=json, timeout=timeout)
+
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_1",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_1" if replay_owed else None,
+            helper_stop_pending=True,
+        ),
+    )
+    client = _RecoveryControlClient()
+    state = fwd._CodexForwarderState()
+    tracker = fwd._CodexElicitationTaskTracker()
+    usage = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    locks_token = fwd._conversation_item_locks.set({})
+    subscribe = asyncio.create_task(
+        fwd._subscribe_until_ready(
+            _RecoveryClient(),  # type: ignore[arg-type]
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            thread_id="thread_1",
+            usage_coalescer=usage,
+            elicitation_tracker=tracker,
+            forwarder_state=state,
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        await asyncio.wait_for(
+            fwd._handle_completed_item(
+                client,  # type: ignore[arg-type]
+                "conv_x",
+                _live_completion(),
+                forwarder_state=state,
+            ),
+            timeout=0.5,
+        )
+        assert not subscribe.done(), "parent output must arrive while recovery is still stalled"
+        assert any(
+            body.get("data", {}).get("source_id") == "thread_1:turn_1:item_live"
+            for _, body in client.posts
+        )
+    finally:
+        release.set()
+        await asyncio.wait_for(subscribe, timeout=3)
+        fwd._conversation_item_locks.reset(locks_token)
+        await usage.close()
+        await tracker.close()
+
+
+@pytest.mark.asyncio
 async def test_unanswered_subscribe_resume_times_out_and_unblocks_live_posts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
