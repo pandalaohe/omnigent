@@ -4411,13 +4411,18 @@ async def test_sdk_agent_default_mode_gates_the_fire(spec_mode: str | None, fire
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("task_mode", "fires"),
-    [(None, True), ("auto", True), ("bypassPermissions", True)],
+    ("task_mode", "spec_mode", "fires"),
+    [
+        (None, "bypassPermissions", True),
+        ("auto", "bypassPermissions", True),
+        ("bypassPermissions", "bypassPermissions", True),
+        ("bypassPermissions", "not-a-registered-mode", False),
+    ],
 )
 async def test_sdk_agent_default_mode_gates_a_continued_session(
-    task_mode: str | None, fires: bool
+    task_mode: str | None, spec_mode: str, fires: bool
 ) -> None:
-    """A continued session keeps the SDK spec's bypassPermissions default.
+    """A continued session validates the SDK spec's inherited mode.
 
     Registered inherited SDK modes remain valid when a saved automation continues.
     """
@@ -4427,7 +4432,7 @@ async def test_sdk_agent_default_mode_gates_a_continued_session(
         store,
         conversation_store=conv_store,
         agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash")}),
-        agent_cache=FakeAgentCache(harness="claude-sdk", permission_mode="bypassPermissions"),
+        agent_cache=FakeAgentCache(harness="claude-sdk", permission_mode=spec_mode),
     )
 
     launched = await _fire_once(deps)
@@ -4437,27 +4442,42 @@ async def test_sdk_agent_default_mode_gates_a_continued_session(
     else:
         assert launched == []
         assert store.runs[0]["error_code"] == "permission_mode_not_allowed"
-        assert "spec sets permission mode 'bypassPermissions'" in store.runs[0]["error"]
+        assert repr(spec_mode) in store.runs[0]["error"]
 
 
 @pytest.mark.parametrize(
     ("labels", "launch_args", "expected"),
     [
         ({}, None, None),
+        ({"omnigent.claude_native.permission_mode": "not-a-registered-mode"}, None, None),
         ({"omnigent.claude_native.permission_mode": "auto"}, None, None),
-        ({"omnigent.claude_native.permission_mode": "bypassPermissions"}, None, None),
-        ({"omnigent.claude_native.permission_mode": "dontAsk"}, None, None),
         (
-            {"omnigent.claude_native.permission_mode": "not-a-registered-mode"},
+            {"omnigent.claude_native.permission_mode": "bypassPermissions"},
             None,
-            "not-a-registered-mode",
+            "bypassPermissions",
         ),
-        ({}, ["--permission-mode", "bypassPermissions"], None),
-        ({}, ["--dangerously-skip-permissions"], None),
-        ({}, ["--yolo"], None),
-        ({}, ["--dangerously-bypass-approvals-and-sandbox"], None),
-        ({}, ["--sandbox", "read-only", "--ask-for-approval", "never"], None),
-        ({CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"}, None, None),
+        ({"omnigent.claude_native.permission_mode": "dontAsk"}, None, "dontAsk"),
+        # The live label wins over the flags the session was launched with.
+        (
+            {"omnigent.claude_native.permission_mode": "auto"},
+            ["--permission-mode", "bypassPermissions"],
+            None,
+        ),
+        ({}, ["--permission-mode", "bypassPermissions"], "--permission-mode bypassPermissions"),
+        ({}, ["--dangerously-skip-permissions"], "--dangerously-skip-permissions"),
+        ({}, ["--yolo"], "--yolo"),
+        (
+            {},
+            ["--dangerously-bypass-approvals-and-sandbox"],
+            "--dangerously-bypass-approvals-and-sandbox",
+        ),
+        (
+            {},
+            ["--sandbox", "read-only", "--ask-for-approval", "never"],
+            "--ask-for-approval never",
+        ),
+        ({}, ["--sandbox", "read-only", "--ask-for-approval", "on-request"], None),
+        ({CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"}, None, "bypass"),
     ],
 )
 def test_session_approval_skipping_mode(

@@ -460,6 +460,59 @@ describe("focusTokenInComposer", () => {
 });
 
 describe("planComposerSend", () => {
+  it("expands inline mentions after binding upload tokens without binding generated lookalikes", () => {
+    const image = img();
+    const file = pdf();
+    assignLabels([image, file], []);
+    const text = "@notes [image 1] between [file 1] @notes";
+    const marker = "[Attached: notes/[image 1].md]";
+    const plan = planComposerSend({ quotes: [], text }, [image, file], "", text, {
+      transformText: (value) => value.replaceAll("@notes", marker),
+    });
+    expect(plan.parts).toEqual([
+      { type: "text", text: `${marker} ` },
+      { type: "attachment", file: image },
+      { type: "text", text: " between " },
+      { type: "attachment", file },
+      { type: "text", text: ` ${marker}` },
+    ]);
+    expect(composerPartsToText(plan.parts!)).toBe(plan.text);
+  });
+
+  it("expands unbound drafts while keeping quoted source literal and snapshots valid", () => {
+    const draft: ReplyDraft = {
+      quotes: [{ id: "q1", before: "ask @reviewer", text: "literal @reviewer [image 1]" }],
+      text: "then @reviewer",
+    };
+    const plan = planComposerSend(draft, [], "", draft.text, {
+      transformText: (text) => text.replaceAll("@reviewer", "[Session: reviewer]"),
+    });
+    expect(plan.parts).toBeUndefined();
+    expect(plan.replyDraft?.quotes[0]).toMatchObject({
+      before: "ask [Session: reviewer]",
+      text: "literal @reviewer [image 1]",
+    });
+    expect(plan.replyDraft?.text).toBe("then [Session: reviewer]");
+    expect(serializeReplyDraft(plan.replyDraft!)).toBe(plan.text);
+  });
+
+  it("keeps transformed quoted sends aligned with the authored attachment positions", () => {
+    const image = img();
+    assignLabels([image], []);
+    const draft: ReplyDraft = {
+      quotes: [{ id: "q1", before: "@reviewer [image 1]", text: "literal @reviewer" }],
+      text: "@reviewer",
+    };
+    const plan = planComposerSend(draft, [image], "", draft.text, {
+      transformText: (text) => text.replaceAll("@reviewer", "[Session: reviewer]"),
+    });
+    expect(plan.parts?.[0]).toEqual({ type: "text", text: "[Session: reviewer] " });
+    expect(plan.parts?.[1]).toEqual({ type: "attachment", file: image });
+    expect(plan.replyDraft?.quotes[0]?.text).toBe("literal @reviewer");
+    expect(composerPartsToText(plan.parts!)).toBe(plan.text);
+    expect(serializeReplyDraft(plan.replyDraft!)).toBe(plan.text);
+  });
+
   it("T5 — no token bound: upstream's text/files pair, no parts", () => {
     const i1 = img();
     assignLabels([i1], []);

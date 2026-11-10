@@ -23,6 +23,7 @@ vi.mock("@/pages/settings/sessionChoice/NewChatChoiceNotice", () => ({
 
 vi.mock("@/hooks/useSidebarData", () => ({
   useLoadedConversations: () => ({ data: undefined, isLoading: false }),
+  useOptionalLoadedConversations: () => undefined,
 }));
 
 vi.mock("@/hooks/useSkills", () => ({

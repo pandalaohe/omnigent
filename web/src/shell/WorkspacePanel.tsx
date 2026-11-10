@@ -5,16 +5,12 @@ import {
   CheckIcon,
   ChevronDownIcon,
   FileIcon,
-  FolderTreeIcon,
-  FileDiffIcon,
-  GitPullRequestIcon,
   GlobeIcon,
   Loader2Icon,
   MaximizeIcon,
   MessagesSquareIcon,
   MinimizeIcon,
   PlusIcon,
-  SearchIcon,
   TerminalIcon,
   XIcon,
 } from "lucide-react";
@@ -116,19 +112,17 @@ import { SubagentsPanel } from "./SubagentsPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 import { useSessionTerminalAccess } from "@/hooks/useSessionTerminalAccess";
 import { TerminalAgentAccess } from "./TerminalAgentAccess";
-import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
+import type { RightRailTab } from "./railTabs";
+import {
+  WORKSPACE_PANEL_TABS,
+  type WorkspacePanelTab,
+  workspacePanelTabPresentation,
+} from "./workspacePanelTabs";
 import { Button } from "../components/ui/button";
 
 const TerminalView = lazy(() =>
   import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
 );
-const workspacePanels = {
-  "content-search": { label: "Content search", icon: SearchIcon },
-  files: { label: "Files", icon: FolderTreeIcon },
-  changes: { label: "Changes", icon: FileDiffIcon },
-  github: { label: "Pull Requests", icon: GitPullRequestIcon },
-  subagents: { label: "Agents", icon: BotIcon },
-};
 
 function WorkspaceMenuShortcut({
   keys,
@@ -374,7 +368,7 @@ function NewTabMenu({
         <SuppressBrowserView />
         <DropdownMenuLabel>Open new</DropdownMenuLabel>
         {panels.map((tab) => {
-          const { label, icon: Icon } = workspacePanels[tab];
+          const { label, icon: Icon } = WORKSPACE_PANEL_TABS[tab];
           return (
             <DropdownMenuItem
               key={tab}
@@ -1622,7 +1616,7 @@ function WorkspacePanelImpl({
   const panelOptions = [
     ...[...visiblePermanentTabs, ...visibleOpenPanels].map((tab) => ({
       key: tab,
-      label: workspacePanels[tab].label,
+      label: WORKSPACE_PANEL_TABS[tab].label,
       active:
         selectedFilePath === null &&
         selectedTerminalKey === null &&
@@ -1667,103 +1661,38 @@ function WorkspacePanelImpl({
       disabled: false,
     })),
   ];
-  const tabTriggers = {
-    "content-search": showContentSearch && showFilesPanel && (
-      <WorkspaceTabTooltip
-        key="content-search"
-        label="Content search"
-        shortcut={contentSearchShortcut.keys}
-      >
+  const renderTabTrigger = (tab: WorkspacePanelTab) => {
+    const presentation = workspacePanelTabPresentation(WORKSPACE_PANEL_TABS[tab], {
+      contentSearchShortcutKeys: contentSearchShortcut.keys,
+      contentSearchAriaShortcut: contentSearchShortcut.aria,
+      pending,
+      showFilesPanel,
+      showGithubTab,
+      showContentSearch,
+      changedCount,
+      agentCount,
+      subagentsWorking,
+      digit: shortcutFor(tab),
+      digitAriaShortcut: tabAriaShortcut(tab),
+    });
+    if (presentation === null) return null;
+    const { label, icon: Icon, badge } = presentation;
+    return (
+      <WorkspaceTabTooltip key={tab} label={label} shortcut={presentation.tooltipShortcut}>
         <TabsTrigger
-          value="content-search"
-          aria-label="Content search"
-          aria-keyshortcuts={
-            `${contentSearchShortcut.aria ?? ""} ${shortcutFor("content-search") ?? ""}`.trim() ||
-            undefined
-          }
-          data-workspace-tab="content-search"
+          value={tab}
+          aria-label={presentation.ariaLabel}
+          aria-keyshortcuts={presentation.ariaKeyShortcuts}
+          data-workspace-tab={tab}
           disabled={pending}
           className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
         >
-          <SearchIcon />
-          <span className="sr-only">Content search</span>
+          <Icon />
+          <span className="sr-only">{label}</span>
+          {badge && <span className={badge.className}>{badge.text}</span>}
         </TabsTrigger>
       </WorkspaceTabTooltip>
-    ),
-    files: (pending || showFilesPanel) && (
-      <WorkspaceTabTooltip key="files" label="Files" shortcut={shortcutFor("files")}>
-        <TabsTrigger
-          value="files"
-          aria-label="Files"
-          aria-keyshortcuts={tabAriaShortcut("files")}
-          data-workspace-tab="files"
-          disabled={pending}
-          className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
-        >
-          <FolderTreeIcon />
-          <span className="sr-only">Files</span>
-        </TabsTrigger>
-      </WorkspaceTabTooltip>
-    ),
-    changes: (pending || showFilesPanel) && (
-      <WorkspaceTabTooltip key="changes" label="Changes" shortcut={shortcutFor("changes")}>
-        <TabsTrigger
-          value="changes"
-          aria-label={changedCount > 0 ? `Changes ${changedCount} changed` : "Changes"}
-          aria-keyshortcuts={tabAriaShortcut("changes")}
-          data-workspace-tab="changes"
-          disabled={pending}
-          className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
-        >
-          <FileDiffIcon />
-          <span className="sr-only">Changes</span>
-          {changedCount > 0 && <span className="sr-only">{changedCount}</span>}
-        </TabsTrigger>
-      </WorkspaceTabTooltip>
-    ),
-    github: (pending || showGithubTab) && (
-      <WorkspaceTabTooltip key="github" label="Pull Requests" shortcut={shortcutFor("github")}>
-        <TabsTrigger
-          value="github"
-          aria-label="Pull Requests"
-          aria-keyshortcuts={tabAriaShortcut("github")}
-          data-workspace-tab="github"
-          disabled={pending}
-          className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
-        >
-          <GitPullRequestIcon />
-          <span className="sr-only">Pull Requests</span>
-        </TabsTrigger>
-      </WorkspaceTabTooltip>
-    ),
-    subagents: (
-      <WorkspaceTabTooltip key="subagents" label="Agents" shortcut={shortcutFor("subagents")}>
-        <TabsTrigger
-          value="subagents"
-          disabled={pending}
-          aria-keyshortcuts={tabAriaShortcut("subagents")}
-          data-workspace-tab="subagents"
-          aria-label={
-            subagentsWorking > 0
-              ? `Agents ${subagentsWorking}/${agentCount}`
-              : `Agents ${agentCount}`
-          }
-          className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
-        >
-          <BotIcon />
-          <span className="sr-only">Agents</span>
-          <span
-            className={cn(
-              TAB_BADGE_BASE,
-              "sr-only",
-              subagentsWorking > 0 ? "text-success" : "text-muted-foreground",
-            )}
-          >
-            {subagentsWorking > 0 ? `${subagentsWorking}/${agentCount}` : agentCount}
-          </span>
-        </TabsTrigger>
-      </WorkspaceTabTooltip>
-    ),
+    );
   };
   // The selected tab's view, beneath any open file or shell tab.
   const scopeView =
@@ -2048,7 +1977,7 @@ function WorkspacePanelImpl({
             componentId="chat.right_rail.tabs"
           >
             <TabsList variant="pill" className="gap-1">
-              {visiblePermanentTabs.map((tab) => tabTriggers[tab])}
+              {visiblePermanentTabs.map(renderTabTrigger)}
               <WorkspaceTabTooltip label="Archive Library">
                 <TabsTrigger
                   value="archive"
@@ -2076,7 +2005,7 @@ function WorkspacePanelImpl({
               {/* Open tabs fill the space before the pinned trailing controls. */}
               <WorkspaceTabsScroller>
                 {visibleOpenPanels.map((tab) => {
-                  const { label, icon: Icon } = workspacePanels[tab];
+                  const { label, icon: Icon } = WORKSPACE_PANEL_TABS[tab];
                   const active =
                     rightRailTab === tab &&
                     selectedFilePath === null &&

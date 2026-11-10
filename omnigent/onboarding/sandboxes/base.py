@@ -505,8 +505,8 @@ class SandboxLifecycle(ABC):
 
     # Package index URL exported as ``UV_INDEX_URL`` for the local wheel
     # build, or ``None`` to use ambient uv configuration. Providers tied
-    # to networks where public PyPI is unreachable (Lakebox on the
-    # Databricks corp network) override this.
+    # to networks where public PyPI is unreachable (for example, Lakebox on a
+    # corporate network) override this.
     wheel_build_index_url: ClassVar[str | None] = None
 
     # Legacy class vars — kept for backward compat while providers migrate
@@ -558,6 +558,9 @@ class SandboxLifecycle(ABC):
         if base_method is None:
             return False
         return self_method is not base_method
+
+    # Provider ID learned during start; managed launch persists it over the reserved ID.
+    started_sandbox_id: str | None = None
 
     @abstractmethod
     def prepare(self) -> None:

@@ -441,6 +441,8 @@ function spliceAtOffsets(
  *  on the placeholder-stripped field, the coordinate space the matches use. */
 export interface BindDraftOptions {
   generatedPrefixLength?: number;
+  /** Expand authored text after locating upload tokens; quoted source stays literal. */
+  transformText?: (text: string) => string;
 }
 export function bindDraft<D extends DraftShape>(
   draft: D,
@@ -474,6 +476,15 @@ export function bindDraft<D extends DraftShape>(
   const localOffsets = new Map<File, { fieldIndex: number; offset: number }>();
   const generatedPrefixLength = Math.max(0, options?.generatedPrefixLength ?? 0);
   const snapshotFields = getFields(stripped).map((text, fieldIndex) => {
+    const renderFragment = (start: number, end: number): string => {
+      if (!options?.transformText) return text.slice(start, end);
+      const boundary =
+        fieldIndex === 0 ? Math.min(end, Math.max(start, generatedPrefixLength)) : start;
+      return (
+        text.slice(start, boundary) +
+        stripPlaceholders(options.transformText(text.slice(boundary, end)))
+      );
+    };
     let result = "";
     let cursor = 0;
     for (const match of allTokenMatches(text)) {
@@ -484,13 +495,13 @@ export function bindDraft<D extends DraftShape>(
       if (!live.has(match.text)) continue;
       const file = fileByLabel.get(match.text);
       if (!file || seen.has(file)) continue;
-      result += text.slice(cursor, match.start);
+      result += renderFragment(cursor, match.start);
       cursor = match.end;
       seen.add(file);
       ordered.push(file);
       localOffsets.set(file, { fieldIndex, offset: result.length });
     }
-    result += text.slice(cursor);
+    result += renderFragment(cursor, text.length);
     return result;
   });
   const bound = seen.size;
@@ -526,6 +537,7 @@ export function planComposerSend(
   files: readonly File[],
   preamble: string,
   trimmedText: string,
+  options?: Pick<BindDraftOptions, "transformText">,
 ): {
   sendFiles: File[] | undefined;
   text: string;
@@ -546,13 +558,15 @@ export function planComposerSend(
     // are found in the placeholder-stripped field: a U+FFFC inside the
     // generated path would otherwise make it one character too long (F1).
     generatedPrefixLength: stripPlaceholders(preamble).length,
+    transformText: options?.transformText,
   });
   if (bound.bound === 0) {
+    const sentDraft = options?.transformText ? bound.snapshot : withPreamble;
     return {
       sendFiles: files.length > 0 ? [...files] : undefined,
-      text: quoted ? serializeReplyDraft(withPreamble) : preamble + trimmedText,
+      text: quoted ? serializeReplyDraft(sentDraft) : sentDraft.text,
       parts: undefined,
-      replyDraft: quoted ? snapshotReplyDraft(withPreamble) : undefined,
+      replyDraft: quoted ? snapshotReplyDraft(sentDraft) : undefined,
     };
   }
   const parts = composerPartsFromProjection(bound.projection, bound.files);

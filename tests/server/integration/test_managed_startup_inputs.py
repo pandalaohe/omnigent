@@ -395,8 +395,9 @@ async def test_annotation_uses_native_saved_input_dispatch_and_transcript_receip
         await runner.aclose()
 
 
+@pytest.mark.parametrize("with_client_id", [False, True])
 async def test_annotation_native_async_not_received_keeps_explicit_retry(
-    startup_env: _Env, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    startup_env: _Env, db_uri: str, monkeypatch: pytest.MonkeyPatch, with_client_id: bool
 ) -> None:
     from omnigent.server.routes._sessions.orchestration import _settle_undelivered_native_input
     from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
@@ -444,8 +445,20 @@ async def test_annotation_native_async_not_received_keeps_explicit_retry(
             stage="rejected_before_handoff",
             cause_class="rejected_before_handoff",
         )
+        pending_id = pending_inputs.pending_id_for_stable_id(session_id, str(receipt["item_id"]))
+        assert pending_id is not None
         await _settle_undelivered_native_input(
-            env.conv_store, session_id, "resp_not_received", str(receipt["item_id"])
+            env.conv_store,
+            session_id,
+            "resp_not_received",
+            str(receipt["item_id"]) if with_client_id else None,
+            **{
+                key: value
+                for key, value in pending_inputs.delivery_attributes_for(
+                    session_id, pending_id
+                ).items()
+                if key in {"pending_id", "delivery_attempt_id"}
+            },
         )
         after = env.conv_store.get_annotation_receipt("alice", grant_id, batch.batch_id)
         assert after is not None

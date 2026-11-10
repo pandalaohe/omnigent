@@ -59,7 +59,7 @@ import unicodedata
 import urllib.parse
 import uuid
 from collections import deque
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future
 from contextvars import ContextVar
@@ -3252,6 +3252,7 @@ def augment_claude_args(
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
     configured_args: tuple[str, ...] = (),
+    active_harnesses: Collection[str] | None = None,
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -3326,6 +3327,11 @@ def augment_claude_args(
         fast_mode=fast_mode,
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
+    )
+    from omnigent.mcp_disabled_servers import apply_claude_settings
+
+    hook_settings = apply_claude_settings(
+        hook_settings, executor="claude-native", active_harnesses=active_harnesses
     )
     args = _merge_disallowed_tools(
         list(claude_args), (*_OMNIGENT_DISALLOWED_TOOLS, *disallowed_tools)
@@ -7457,13 +7463,15 @@ def _user_prompt_visible(pane: str) -> bool:
     lines = [line for line in pane.splitlines() if line.strip()]
     rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
     region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
+    # Narrow panes wrap the decision footer across captured lines.
+    footer = " ".join(region.split())
     return (
         _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT)
         or "Do you want to " in region
         or "Yes, and don't ask again" in region
         or (
-            any(hint in region for hint in ("Enter to select", "Enter to submit"))
-            and "Esc to cancel" in region
+            any(hint in footer for hint in ("Enter to select", "Enter to submit"))
+            and "Esc to cancel" in footer
         )
     )
 

@@ -298,7 +298,7 @@ export const PALETTES: readonly PaletteMeta[] = [
         warning: "#826022",
         destructive: "#c3314a",
         keepCold: "#2a6cb3",
-        sidebar: "#fafafa",
+        sidebar: "#f9f9f9",
         sidebarPrimary: "var(--link)",
         sidebarRing: "var(--ring)",
         shellBackground: "var(--background)",

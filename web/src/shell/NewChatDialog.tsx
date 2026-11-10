@@ -67,7 +67,7 @@ import {
   ComposerFeedbackRow,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
-import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
+import { useComposerMirrorAlignment } from "@/components/composer/MentionTokenOverlay";
 import {
   SandboxProfilePicker,
   useSandboxProfileCatalog,
@@ -436,8 +436,18 @@ import { CLIENT_CREATE_TOKEN_LABEL, newTempConversation } from "@/lib/tempConver
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import {
-  buildMentionPreamble,
+  MENTION_SEARCH_DEBOUNCE_MS,
+  useSessionMentionEntries,
+} from "@/hooks/useSessionMentionEntries";
+import {
+  composerInlineMentions,
+  expandMentionTokens,
+  findMentionTokens,
+  presentMentions,
+  type TaggedMentions,
+  withSessionMentionHint,
   detectMentionAt,
   type MentionState,
   parseMentionToken,
@@ -2361,6 +2371,8 @@ interface LandingDraft {
   message: string;
   sessionPrompt?: string;
   files: File[];
+  /** Files and sessions tagged with "@" in ``message``. */
+  mentions?: TaggedMentions;
   pickedAgentId: string | null;
   selectedHostId: string | null;
   sandboxSelected: boolean;
@@ -2780,14 +2792,22 @@ function NewChatLandingContent({
   const modelTouchedRef = useRef(restoredDraft?.modelTouched ?? false);
   const effortTouchedRef = useRef(restoredDraft?.effortTouched ?? false);
 
+  // A handoff or prompt link replaces the parked draft's text, and with it the
+  // tags that text's tokens pointed at.
+  const restoresDraftText = !composerSeed && handoff === null && !linkedPrompt?.trim();
   const [message, setMessage] = useState<string>(() => {
     if (composerSeed) return composerSeed.prompt;
     if (handoff !== null) return handoff.text;
     return linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? "");
   });
+  // Filled in once the mention browser below owns the tags.
+  const clearTaggedMentionsRef = useRef<() => void>(() => {});
   useEffect(() => {
     if (composerSeed || (!searchParams.has("prompt") && handoffToken === null)) return;
-    if (linkedPrompt?.trim()) setMessage(linkedPrompt);
+    if (linkedPrompt?.trim()) {
+      setMessage(linkedPrompt);
+      clearTaggedMentionsRef.current();
+    }
     // Consume the link once so returning to the composer preserves edits.
     const remaining = new URLSearchParams(searchParams);
     remaining.delete("prompt");
@@ -3031,7 +3051,7 @@ function NewChatLandingContent({
   // consumed in the menu's onOpenChange) — connecting while the menu is open
   // looks janky. A ref so the close handler sees it synchronously.
   const pendingConnectRef = useRef(false);
-  // Arca (Databricks-internal): the desktop shell reports the MDM flag; when
+  // Arca: the desktop shell reports the MDM flag; when
   // set, the picker offers connecting the user's Arca dev instance as a host.
   const [arcaEnabled, setArcaEnabled] = useState(false);
   const [arcaPreviewRecovery, setArcaPreviewRecovery] = useState(false);
@@ -6352,7 +6372,13 @@ function NewChatLandingContent({
     mentionFilter,
     workspaceRoot,
   ]);
-  const mentionOpen = mentionEntries.length > 0;
+  // Other sessions are taggable for every agent (no session exists yet, so
+  // there are no subagents to list).
+  const sessionEntries = useSessionMentionEntries({
+    mention,
+    debouncedQuery: useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS),
+    currentSessionId: null,
+  });
   // Closed-but-loading window: don't let Enter send the half-typed "@dir/".
   // ``isPlaceholderData`` covers the drill-down window where react-query is
   // still serving the previous directory's rows (``isLoading`` stays false).
@@ -6365,20 +6391,37 @@ function NewChatLandingContent({
   // host-filesystem source + token state above are launcher-specific.
   const {
     mentionIndex,
+    mentionOpen,
+    sessionMenu,
     mentionedItems,
+    setMentionedItems,
     attachMention,
     openMentionDir,
-    removeMentionedItem,
+    mentionedSessions,
+    setMentionedSessions,
+    attachSession,
+    mentionTokens,
+    handleTokenBackspace,
     handleKeyDown: handleMentionKeyDown,
     dismiss: dismissMention,
   } = useMentionBrowser({
     mention,
     setMention,
     mentionEntries,
+    sessionEntries,
     text: message,
     setText: setMessage,
     textareaRef,
+    initialMentions: restoresDraftText ? restoredDraft?.mentions : undefined,
   });
+  clearTaggedMentionsRef.current = () => {
+    setMentionedItems([]);
+    setMentionedSessions([]);
+  };
+  // The draft snapshot is built above the hook; add the tags it owns.
+  draftRef.current.mentions = { files: mentionedItems, sessions: mentionedSessions };
+  const mentionTokensShown = findMentionTokens(message, mentionTokens).length > 0;
+  useComposerMirrorAlignment(backdropRef, textareaRef, mentionTokensShown);
 
   const workspaceTarget = JSON.stringify([projectParam, selectedHostId, sandboxSelected]);
   const [workspaceReadyTarget, setWorkspaceReadyTarget] = useState<string | null>(null);
@@ -6897,7 +6940,7 @@ function NewChatLandingContent({
     }
   }
 
-  // Connect the user's Arca dev instance (Databricks-internal sandbox) as a
+  // Connect the user's Arca dev instance as a
   // host, then select it. The bridge runs `arca ssh … isaac omni host
   // --background` and resolves once the remote daemon started; the daemon then
   // registers over its own tunnel moments later, so we poll the host list
@@ -6990,6 +7033,11 @@ function NewChatLandingContent({
       // The draft's files were validated when the user attached them, so
       // they come back verbatim rather than through a re-validating replace.
       restoreFiles(returnedDraft.files);
+      // Merged tags, so recovered tokens still expand to their own targets.
+      if (returnedDraft.mentions) {
+        setMentionedItems(returnedDraft.mentions.files);
+        setMentionedSessions(returnedDraft.mentions.sessions);
+      }
     } else if (!composerSeed) {
       writeLandingDraft(draftState, { ...returnedDraft, message: reconciledMessage });
     }
@@ -7195,20 +7243,25 @@ function NewChatLandingContent({
       // from the marker; no upload happens. Folders carry a trailing "/".
       // Computed BEFORE the create so `smart_routing_message` classifies the
       // prompt the agent actually receives, not the raw textarea value.
-      const mentionPreamble = buildMentionPreamble(mentionedItems, selectedAgent?.harness ?? null);
-      // Each attachment binds to its token's first occurrence; nothing bound
-      // keeps upstream's payload (the text plus the files as a trailing run).
-      const bound = bindDraft({ quotes: [], text: message }, files, (d) => d.text);
+      const liveMentions = presentMentions(
+        composerInlineMentions(mentionedItems, mentionedSessions, selectedAgent?.harness ?? null),
+        [message],
+      );
+      const bound = bindDraft({ quotes: [], text: message }, files, (d) => d.text, {
+        transformText: (text) => expandMentionTokens(text, liveMentions),
+      });
       const submittedFiles = bound.bound > 0 ? bound.files : files;
       const promptParts =
         bound.bound > 0
           ? composerPartsFromProjection(sanitizeInitialPrompt(bound.projection), submittedFiles)
-          : legacyComposerParts(sanitizeInitialPrompt(message), files);
+          : legacyComposerParts(sanitizeInitialPrompt(bound.snapshot.text), files);
+      const tagsSessions = liveMentions.some((m) => m.marker.startsWith("[Session: "));
+      const hint = tagsSessions ? withSessionMentionHint("", true) : "";
       const orderedPromptParts = normalizeComposerParts([
-        ...(mentionPreamble ? [{ type: "text" as const, text: mentionPreamble }] : []),
         ...promptParts,
+        ...(hint ? [{ type: "text" as const, text: hint }] : []),
       ]);
-      const initialPrompt = mentionPreamble + composerPartsToText(promptParts);
+      const initialPrompt = composerPartsToText(orderedPromptParts);
       // Native terminal agents open terminal-first: `omnigent.ui: terminal`
       // tells the UI to render the terminal wrapper, and `omnigent.wrapper`
       // selects which CLI bridge the runner launches — the values are the
@@ -7843,7 +7896,7 @@ function NewChatLandingContent({
   // Same anchored shape as upstream's command split; the backdrop re-checks
   // it against the value before tinting. A live token also mounts the overlay.
   const commandToken = /^\s*([/$][A-Za-z0-9][\w:-]*)(?=\s|$)/.exec(message)?.[1] ?? null;
-  const backdropActive = commandToken !== null || hasTint(message, files);
+  const backdropActive = commandToken !== null || mentionTokensShown || hasTint(message, files);
   const activeTokenIndex = tailCaret === null ? null : tokenAt(message, tailCaret, files);
 
   const focusToken = (index: number) => {
@@ -8422,7 +8475,12 @@ function NewChatLandingContent({
             </div>
             <ChatComposer
               appearance={isMobileViewport ? "glass" : "default"}
-              hasContent={files.length > 0 || mentionedItems.length > 0 || attachmentError !== null}
+              hasContent={
+                files.length > 0 ||
+                mentionedItems.length > 0 ||
+                mentionedSessions.length > 0 ||
+                attachmentError !== null
+              }
               keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
               className={cn(isDragActive && "ring-2 ring-ring ring-inset")}
               data-testid="new-chat-landing-composer"
@@ -8440,15 +8498,14 @@ function NewChatLandingContent({
                   // remove and nothing else would ever clear this. Left sticky it
                   // reads as a blocker on a composer the user can actually submit.
                   if (attachmentError !== null) clearError();
-                  // Recompute the active "@"-mention from the caret each keystroke
-                  // (native terminal agents with a workspace — ``mentionEnabled``).
+                  // Recompute the active "@"-mention from the caret each keystroke.
+                  // Sessions are taggable for every agent; files need ``mentionEnabled``.
                   setMention(
-                    mentionEnabled
-                      ? detectMentionAt(
-                          e.target.value,
-                          e.target.selectionStart ?? e.target.value.length,
-                        )
-                      : null,
+                    detectMentionAt(
+                      e.target.value,
+                      e.target.selectionStart ?? e.target.value.length,
+                      sessionEntries.map((session) => session.title),
+                    ),
                   );
                 },
                 onFocus: () => {
@@ -8498,6 +8555,7 @@ function NewChatLandingContent({
                   // mutually exclusive with the slash menu (a token can't be both)
                   // and takes priority over submission.
                   if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return;
+                  if (handleTokenBackspace(e)) return;
 
                   // Slash-completion menu keys (shared useSlashCompletion) —
                   // navigate, complete, or dismiss; takes priority over
@@ -8525,6 +8583,7 @@ function NewChatLandingContent({
                   <ComposerTokenBackdrop
                     ref={backdropRef}
                     value={message}
+                    mentionTokens={mentionTokens}
                     files={files}
                     command={commandToken}
                     activeIndex={hoveredFileIndex ?? activeTokenIndex}
@@ -8552,11 +8611,15 @@ function NewChatLandingContent({
                     {(mentionOpen || mentionListingPending) && (
                       <FileMentionMenu
                         currentDir={mentionDir}
+                        query={mention?.query ?? ""}
+                        fileQuery={mentionFilter}
                         activeIndex={mentionIndex}
                         entries={mentionEntries}
                         loading={mentionListingPending}
                         onOpenDir={openMentionDir}
                         onAttach={attachMention}
+                        sessionMenu={sessionMenu}
+                        onAttachSession={attachSession}
                       />
                     )}
                   </>
@@ -8594,10 +8657,6 @@ function NewChatLandingContent({
                         }
                       }}
                     />
-                    {/* "@"-mention chips — one per tagged workspace file/folder. Each is
-                delivered as an "[Attached: <path>]" marker prepended to the
-                first message at create time. */}
-                    <ComposerMentionChips items={mentionedItems} onRemove={removeMentionedItem} />
                     {/* Pending attachments — image thumbnails (click to view) + file rows. */}
                     <ComposerAttachments
                       files={files}

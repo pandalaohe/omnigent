@@ -44,6 +44,7 @@ function renderBackdrop(props: Partial<React.ComponentProps<typeof ComposerToken
         command={props.command ?? null}
         activeIndex={props.activeIndex ?? null}
         anchor={anchor}
+        mentionTokens={props.mentionTokens}
       />
     </>,
   );
@@ -73,6 +74,18 @@ describe("hasTint", () => {
 describe("ComposerTokenBackdrop", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it("paints session mentions and upload tokens together without changing the text", () => {
+    const image = img();
+    assignLabels([image], []);
+    const value = "ask @Reviewer about [image 1]";
+    const node = renderBackdrop({ value, files: [image], mentionTokens: ["@Reviewer"] });
+    expect(node.textContent).toBe(value);
+    expect(node.querySelector('[data-testid="composer-mention-token"]')?.textContent).toBe(
+      "@Reviewer",
+    );
+    expect(node.querySelector(".text-primary")?.textContent).toBe("[image 1]");
   });
 
   it("tints a leading command prefix", () => {

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { onBrowserActionClaimed } from "@/lib/browserActionBus";
+import { browserPageLabel } from "@/lib/browserPageLabel";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import { type BrowserHostOptions, navigationHostOptions } from "@/lib/nativeBridge";
@@ -145,6 +146,8 @@ export function useBrowserTabs(conversationId: string) {
   );
   useEffect(() => {
     setState({ ownerId: conversationId, ...readBrowserTabsState(conversationId) });
+    // Showing the session again (or a remounted rail) counts as a selection, so a reopen
+    // started before it doesn't move the tab shown now.
     noteBrowserSelection(conversationId);
   }, [conversationId]);
   useEffect(() => {
@@ -202,29 +205,8 @@ export function useBrowserTabs(conversationId: string) {
     };
   }, [viewIdsKey]);
 
-  const labelFor = (tabId: string, index: number): string => {
-    const page = pages[browserViewId(conversationId, tabId)];
-    const title = page?.title?.trim();
-    if (page?.url) {
-      try {
-        const hostname = new URL(page.url).hostname;
-        // Chromium supplies the URL as the title for untitled documents.
-        const urlTitle = page.url.replace(/^https?:\/\//, "");
-        if (
-          title &&
-          title !== page.url &&
-          title !== urlTitle &&
-          title !== urlTitle.replace(/\/$/, "")
-        ) {
-          return title;
-        }
-        if (hostname) return hostname;
-      } catch {
-        // Blank or invalid URLs keep the numbered placeholder.
-      }
-    }
-    return title && title !== "about:blank" ? title : `Browser ${index + 1}`;
-  };
+  const labelFor = (tabId: string, index: number): string =>
+    browserPageLabel(pages[browserViewId(conversationId, tabId)], `Browser ${index + 1}`);
 
   const update = useCallback(
     (mutate: (current: BrowserTabsState) => BrowserTabsState) => {
