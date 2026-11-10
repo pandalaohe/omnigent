@@ -30,6 +30,7 @@ import {
 import * as agentsHook from "@/hooks/useAvailableAgents";
 import * as customAgentsApi from "@/lib/customAgentsApi";
 import * as identity from "@/lib/identity";
+import { useHarnessCapabilities } from "@/lib/agentLabels";
 import * as sandboxModelsHook from "@/hooks/useSandboxModelOptions";
 import * as hostsHook from "@/hooks/useHosts";
 import * as scheduledHooks from "@/hooks/useScheduledTasks";
@@ -113,7 +114,7 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof AgentLabelsModule>()),
   useBrainHarnessLabels: () => ({}),
-  useHarnessCapabilities: () => ({}),
+  useHarnessCapabilities: vi.fn(),
 }));
 vi.mock("@/shell/WorkspacePicker", () => ({
   isNavigablePath: (path: string) => path.startsWith("/"),
@@ -306,6 +307,7 @@ function mockCustomAgents(data: customAgentsApi.CustomAgent[] = []) {
 }
 
 beforeEach(() => {
+  vi.mocked(useHarnessCapabilities).mockReturnValue({});
   gitWorkspace.available = true;
   gitWorkspace.checking = false;
   gitWorkspace.path = "/home/me/repo";
@@ -5450,19 +5452,43 @@ describe("automation harness settings", () => {
   });
 
   it.each([
-    ["Full Access", "full-access"],
-    ["Bypass approvals & sandbox", "bypass"],
-  ])("saves Codex's %s mode, which skips approval", async (label, mode) => {
-    mockHarness("codex-native");
-    render(
-      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialName="R" initialPrompt="P" />,
-    );
-    await choose("permission", label);
-    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent(label);
-    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
-    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
-    expect(mutateAsync.mock.calls[0][0].permissionMode).toBe(mode);
-  });
+    ["Full Access", "full-access", false],
+    ["Bypass approvals & sandbox", "bypass", false],
+    ["Bypass approvals & sandbox", "bypass", true],
+  ] as const)(
+    "saves Codex's %s mode (%s, declared catalog: %s)",
+    async (label, mode, declaredCatalog) => {
+      mockHarness("codex-native");
+      if (declaredCatalog) {
+        vi.mocked(useHarnessCapabilities).mockReturnValue({
+          "codex-native": {
+            session_modes: {
+              permission: {
+                handler: "codex-approval-preset",
+                options: [
+                  {
+                    value: "full-access",
+                    label: "Full Access",
+                    concept: "full-access",
+                    contexts: ["create"],
+                  },
+                ],
+              },
+              speed: null,
+            },
+          },
+        });
+      }
+      render(
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialName="R" initialPrompt="P" />,
+      );
+      await choose("permission", label);
+      expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent(label);
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+      expect(mutateAsync.mock.calls[0][0].permissionMode).toBe(mode);
+    },
+  );
 
   it.each([
     ["codex-native", "Approve for me", ["Full Access", "Bypass approvals & sandbox"]],

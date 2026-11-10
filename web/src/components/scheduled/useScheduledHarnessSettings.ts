@@ -16,6 +16,7 @@ import {
 } from "@/lib/nativeCodingAgents";
 import {
   APPROVAL_SKIPPING_PERMISSION_MODES,
+  CODEX_NATIVE_BYPASS_APPROVAL_OPTION,
   nativePermissionOptions,
 } from "@/lib/nativeHarnessModes";
 import { nativeEffortOptions } from "@/components/HarnessConfigControls";
@@ -139,8 +140,11 @@ export function useScheduledHarnessSettings(
     harness === "claude-native" ||
     (info !== "loading" && info.scheduled_task_harness_settings === true);
   const approvalSkippingAccepted = acceptsApprovalSkippingModes(info);
+  const permissionHandler = harness
+    ? sessionModeHandler(harness, "permission", harnessCapabilities)
+    : null;
   const permissions =
-    harness && sessionModeHandler(harness, "permission", harnessCapabilities)
+    harness && permissionHandler
       ? sessionDefaultModeOptions(
           harness,
           "permission",
@@ -152,7 +156,14 @@ export function useScheduledHarnessSettings(
       : supportsHarnessPermissions
         ? nativePermissionOptions(harness)
         : [];
-  const offeredPermissions = permissions.filter(
+  // The scheduler also accepts the native bypass mode, which is not a session preset.
+  const scheduledPermissions =
+    harness === "codex-native" &&
+    permissionHandler === "codex-approval-preset" &&
+    !permissions.some((option) => option.value === CODEX_NATIVE_BYPASS_APPROVAL_OPTION.value)
+      ? [...permissions, CODEX_NATIVE_BYPASS_APPROVAL_OPTION]
+      : permissions;
+  const offeredPermissions = scheduledPermissions.filter(
     (option) => approvalSkippingAccepted || !APPROVAL_SKIPPING_PERMISSION_MODES.has(option.value),
   );
   const speedOptions = harness
