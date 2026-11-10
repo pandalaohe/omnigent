@@ -586,7 +586,10 @@ describe("usage/context preferences", () => {
     // rather than written back.
     expect(isDefaultUsageBoardPreferences(DEFAULT_USAGE_CONTEXT_PREFERENCES.board)).toBe(true);
     expect(
-      isDefaultUsageBoardPreferences({ ...DEFAULT_USAGE_CONTEXT_PREFERENCES.board, enabled: true }),
+      isDefaultUsageBoardPreferences({
+        ...DEFAULT_USAGE_CONTEXT_PREFERENCES.board,
+        enabled: false,
+      }),
     ).toBe(false);
     expect(
       isDefaultUsageBoardPreferences({
@@ -612,6 +615,30 @@ describe("usage/context preferences", () => {
       contextWindowTokens: 100_000,
       autoCompactBufferTokens: null,
     });
+  });
+
+  it("enables the Usage board when no switch was stored", () => {
+    expect(readUsageContextPreferences().board.enabled).toBe(true);
+    localStorage.setItem(
+      "omnigent:usage-context-preferences",
+      JSON.stringify({ version: 6, board: { density: "mini" } }),
+    );
+    expect(readUsageContextPreferences().board.enabled).toBe(true);
+    expect(readUsageContextPreferences().board.density).toBe("mini");
+  });
+
+  it("preserves an explicit Usage board opt-out across writes and reloads", () => {
+    localStorage.setItem(
+      "omnigent:usage-context-preferences",
+      JSON.stringify({ version: 6, board: { enabled: false } }),
+    );
+    expect(readUsageContextPreferences().board.enabled).toBe(false);
+    writeUsageContextPreferences(readUsageContextPreferences());
+    expect(readUsageContextPreferences().board.enabled).toBe(false);
+    expect(queueUserPreferencePatch).toHaveBeenLastCalledWith(
+      "usage_context",
+      expect.objectContaining({ board: expect.objectContaining({ enabled: false }) }),
+    );
   });
 });
 

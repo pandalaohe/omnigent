@@ -22,7 +22,7 @@ export interface SessionNavigationPreferences {
 }
 
 const DEFAULT_PREFERENCES: SessionNavigationPreferences = {
-  showTaskBoard: false,
+  showTaskBoard: true,
   pollingActiveWindowHours: null,
   deprioritizeBackgroundSessions: true,
   showGoalSessionMarkers: true,
@@ -42,7 +42,7 @@ function normalizePreferences(value: unknown): SessionNavigationPreferences {
   if (!value || typeof value !== "object") return { ...DEFAULT_PREFERENCES };
   const candidate = value as Partial<SessionNavigationPreferences>;
   return {
-    showTaskBoard: candidate.showTaskBoard === true,
+    showTaskBoard: candidate.showTaskBoard !== false,
     pollingActiveWindowHours: normalizePollingWindow(candidate.pollingActiveWindowHours),
     deprioritizeBackgroundSessions: candidate.deprioritizeBackgroundSessions !== false,
     showGoalSessionMarkers: candidate.showGoalSessionMarkers !== false,
@@ -68,7 +68,7 @@ export function writeSessionNavigationPreferences(preferences: SessionNavigation
   try {
     if (
       normalized.pollingActiveWindowHours === null &&
-      !normalized.showTaskBoard &&
+      normalized.showTaskBoard === DEFAULT_PREFERENCES.showTaskBoard &&
       normalized.deprioritizeBackgroundSessions &&
       normalized.showGoalSessionMarkers &&
       normalized.scrollToBottomOnSessionOpen &&
@@ -85,7 +85,7 @@ export function writeSessionNavigationPreferences(preferences: SessionNavigation
   queueUserPreferencePatch(
     "session_navigation",
     normalized.pollingActiveWindowHours === null &&
-      !normalized.showTaskBoard &&
+      normalized.showTaskBoard === DEFAULT_PREFERENCES.showTaskBoard &&
       normalized.deprioritizeBackgroundSessions &&
       normalized.showGoalSessionMarkers &&
       normalized.scrollToBottomOnSessionOpen &&

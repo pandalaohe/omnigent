@@ -309,6 +309,9 @@ export function TaskBoardRoutes({
           <h2>{t("board.empty")}</h2>
           <p>{t("board.connect")}</p>
           <code className="mt-3 block break-all text-xs">{t("board.endpoint")}</code>
+          <a href="https://www.rfc-editor.org/rfc/rfc8984.html" target="_blank" rel="noreferrer">
+            {t("sources.docs")}
+          </a>
         </div>
       ) : !mapped.length ? (
         <p className="tb-empty">{t("search.empty")}</p>

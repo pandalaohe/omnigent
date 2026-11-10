@@ -358,14 +358,14 @@ it("shows the task board entry only when deployment and user switches are on", (
   mockConversations([]);
   const info = { ...FALLBACK_SERVER_INFO, task_board_enabled: true };
   const view = renderSidebar(true, "/task-board", undefined, info);
-  expect(screen.queryByTestId("task-board-nav")).toBeNull();
+  expect(screen.getByRole("link", { name: "Task board" }).getAttribute("href")).toBe("/task-board");
   act(() =>
     writeSessionNavigationPreferences({
       ...readSessionNavigationPreferences(),
-      showTaskBoard: true,
+      showTaskBoard: false,
     }),
   );
-  expect(screen.getByRole("link", { name: "Task board" }).getAttribute("href")).toBe("/task-board");
+  expect(screen.queryByTestId("task-board-nav")).toBeNull();
   view.unmount();
   renderSidebar(true, "/", undefined, { ...info, task_board_enabled: false });
   expect(screen.queryByTestId("task-board-nav")).toBeNull();

@@ -19,7 +19,7 @@ describe("sessionNavigationPreferences", () => {
       scrollToBottomOnSessionOpen: true,
       nativeMobileHeaderMode: "server",
       showGoalSessionMarkers: true,
-      showTaskBoard: false,
+      showTaskBoard: true,
     });
     localStorage.setItem(SESSION_NAVIGATION_STORAGE_KEY, "{broken");
     expect(readSessionNavigationPreferences()).toEqual({
@@ -28,7 +28,7 @@ describe("sessionNavigationPreferences", () => {
       scrollToBottomOnSessionOpen: true,
       nativeMobileHeaderMode: "server",
       showGoalSessionMarkers: true,
-      showTaskBoard: false,
+      showTaskBoard: true,
     });
   });
 
@@ -49,7 +49,7 @@ describe("sessionNavigationPreferences", () => {
       scrollToBottomOnSessionOpen: false,
       nativeMobileHeaderMode: "conversation-title",
       showGoalSessionMarkers: false,
-      showTaskBoard: false,
+      showTaskBoard: true,
     });
   });
 
@@ -71,6 +71,15 @@ describe("sessionNavigationPreferences", () => {
       showGoalSessionMarkers: true,
     });
     expect(localStorage.getItem(SESSION_NAVIGATION_STORAGE_KEY)).toBeNull();
+  });
+
+  it("preserves an explicit task board opt-out across writes and reloads", () => {
+    localStorage.setItem(SESSION_NAVIGATION_STORAGE_KEY, JSON.stringify({ showTaskBoard: false }));
+    const preferences = readSessionNavigationPreferences();
+    expect(preferences.showTaskBoard).toBe(false);
+    writeSessionNavigationPreferences(preferences);
+    expect(localStorage.getItem(SESSION_NAVIGATION_STORAGE_KEY)).not.toBeNull();
+    expect(readSessionNavigationPreferences().showTaskBoard).toBe(false);
   });
 });
 

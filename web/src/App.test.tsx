@@ -1,8 +1,9 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { Outlet, MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SESSION_NAVIGATION_STORAGE_KEY } from "@/lib/sessionNavigationPreferences";
 
 vi.mock("@/lib/analytics", () => ({
   useOmnigentPageView: vi.fn(),
@@ -166,6 +167,10 @@ describe("Usage board routes", () => {
 });
 
 describe("Task board route", () => {
+  beforeAll(async () => {
+    await import("./pages/taskBoard/TaskBoardRoute");
+  });
+
   it("keeps a hard-loaded link registered while deployment info is loading", () => {
     renderRoute("/task-board", {}, "loading");
     expect(screen.queryByText("not found")).toBeNull();
@@ -180,6 +185,7 @@ describe("Task board route", () => {
 
   it("points to the user switch when the deployment permits the board", async () => {
     localStorage.clear();
+    localStorage.setItem(SESSION_NAVIGATION_STORAGE_KEY, JSON.stringify({ showTaskBoard: false }));
     renderRoute("/task-board", {}, { ...FALLBACK_SERVER_INFO, task_board_enabled: true });
     expect(await screen.findByRole("link", { name: "Turn it on in Settings" })).toBeTruthy();
   });

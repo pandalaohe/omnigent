@@ -129,11 +129,22 @@ it("keeps deployment and user gates ahead of every read", () => {
   expect(mocks.fetch).not.toHaveBeenCalled();
   view.unmount();
   mocks.info = { task_board_enabled: true };
+  localStorage.setItem(SESSION_NAVIGATION_STORAGE_KEY, JSON.stringify({ showTaskBoard: false }));
   renderBoard();
   expect(screen.getByRole("link", { name: "Turn it on in Settings" }).getAttribute("href")).toBe(
     "/settings/general#task-board-settings",
   );
   expect(mocks.fetch).not.toHaveBeenCalled();
+});
+it("opens by default and tells an empty board how to send tasks", async () => {
+  localStorage.setItem(BOARD_PREFERENCES_KEY, JSON.stringify({ view: "routes" }));
+  renderBoard();
+  expect(await screen.findByRole("heading", { name: "No tasks yet" })).toBeTruthy();
+  expect(screen.getByText("Send a source's tasks as JSCalendar with PUT to:")).toBeTruthy();
+  expect(screen.getByText("/v1/me/tasks/sources/{source_id}")).toBeTruthy();
+  expect(screen.getByRole("link", { name: "JSCalendar reference" }).getAttribute("href")).toBe(
+    "https://www.rfc-editor.org/rfc/rfc8984.html",
+  );
 });
 it("defaults to native parent/child sessions and watches without device activity", async () => {
   enableBoard();
@@ -300,11 +311,11 @@ it("keeps native sessions usable with no source and retries a failed source read
 it("stores the display switch in the existing navigation namespace", async () => {
   render(<TaskBoardSettings />);
   const toggle = screen.getByRole("switch", { name: "Show Task board" });
-  expect(toggle.getAttribute("aria-checked")).toBe("false");
+  expect(toggle.getAttribute("aria-checked")).toBe("true");
   fireEvent.click(toggle);
   await waitFor(() =>
     expect(JSON.parse(localStorage.getItem(SESSION_NAVIGATION_STORAGE_KEY)!)).toMatchObject({
-      showTaskBoard: true,
+      showTaskBoard: false,
     }),
   );
   fireEvent.click(toggle);
