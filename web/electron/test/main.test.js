@@ -137,6 +137,7 @@ function createWorkspaceNetwork(origin, { oauth: oauthOverrides, account = {} } 
 function loadNavigationHarness({
   isPackaged = false,
   omnigentBuild,
+  metadata = {},
   platform,
   env = {},
   serverUrl = "https://host.example/ml/omnigents",
@@ -181,6 +182,7 @@ function loadNavigationHarness({
   }
   const listeners = new Map();
   const calls = {
+    identity: [],
     loadFile: [],
     loadURL: [],
     auth: [],
@@ -343,17 +345,20 @@ function loadNavigationHarness({
       getAppMetrics: () => [
         { pid: 123, memory: { workingSetSize: 1200, peakWorkingSetSize: 2400 } },
       ],
-      setName: () => {},
-      setPath: () => {},
+      setName: (name) => calls.identity.push(["name", name]),
+      setPath: (name, value) => calls.identity.push([name, value]),
       setBadgeCount: () => true,
-      requestSingleInstanceLock: () => true,
+      requestSingleInstanceLock: () => {
+        calls.identity.push(["lock"]);
+        return true;
+      },
       on: (eventName, listener) => appEvents.set(eventName, listener),
       whenReady: () => ({ then: () => {} }),
       quit: () => {},
       exit: () => {},
       isReady: () => false,
       setAsDefaultProtocolClient: () => {},
-      setAppUserModelId: () => {},
+      setAppUserModelId: (id) => calls.identity.push(["appId", id]),
       getVersion: () => "test",
       focus: () => {},
     },
@@ -678,9 +683,7 @@ function loadNavigationHarness({
       startLocalServer: async () => ({ ok: false }),
     },
   };
-  if (omnigentBuild !== undefined) {
-    localRequires["../package.json"] = { ...require("../package.json"), omnigentBuild };
-  }
+  localRequires["../package.json"] = { ...require("../package.json"), ...metadata, omnigentBuild };
 
   if (arcaConsentResult !== undefined) {
     localRequires["./arca_connect_window"] = {
@@ -780,6 +783,44 @@ function loadNavigationHarness({
     },
   };
 }
+
+describe("desktop runtime identity", () => {
+  for (const [productName, appId] of [
+    ["Omnigent", "ai.omnigent.desktop"],
+    ["Example Desktop", "org.example.desktop"],
+  ]) {
+    it(`isolates ${productName} before taking the instance lock`, (t) => {
+      const h = loadNavigationHarness({
+        isPackaged: true,
+        platform: "win32",
+        metadata: { productName, appId },
+      });
+      t.after(h.cleanup);
+      assert.deepEqual(h.calls.identity, [
+        ["name", productName],
+        ["userData", path.join(path.dirname(h.settingsPath), productName)],
+        ["appId", appId],
+        ["lock"],
+      ]);
+    });
+  }
+
+  it("retains the separate development identity for packaged dev builds", (t) => {
+    const h = loadNavigationHarness({
+      isPackaged: true,
+      omnigentBuild: "dev",
+      platform: "win32",
+      metadata: { productName: "Example Desktop", appId: "org.example.desktop" },
+    });
+    t.after(h.cleanup);
+    assert.deepEqual(h.calls.identity, [
+      ["name", "Omnigent Dev"],
+      ["userData", path.join(path.dirname(h.settingsPath), "Omnigent Dev")],
+      ["appId", require("../src/dev_preferences").DEV_DOMAIN],
+      ["lock"],
+    ]);
+  });
+});
 
 describe("desktop diagnostics wiring", () => {
   it("persists main-window renderer and GPU failures in packaged Windows builds", (t) => {
