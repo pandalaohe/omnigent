@@ -9,10 +9,12 @@ import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import type { Session } from "@/lib/types";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { ApiError } from "@/lib/sessionsApi";
+import { emitArtifactOpenRequest, onArtifactOpenRequest } from "@/lib/artifactOpenBus";
 import * as identity from "@/lib/identity";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
   fetchConversationById,
+  archiveConversation,
   deleteConversation,
   fetchArchivedSessionFacets,
   fetchAllArchivedProjectNames,
@@ -982,6 +984,30 @@ describe("useRenameProject", () => {
 });
 
 describe("deleteConversation", () => {
+  it.each(["archive", "delete", "failed archive", "failed delete", "unarchive"])(
+    "%s clears pending artifact requests only after successful removal",
+    async (operation) => {
+      const id = `artifact-lifecycle-${operation}`;
+      const failed = operation.startsWith("failed");
+      emitArtifactOpenRequest(
+        { type: "artifact_open_request", path: "old.html", base: "workspace" },
+        id,
+      );
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({ id }, { ok: !failed, status: failed ? 500 : 200 }),
+      );
+      const mutation = operation.includes("delete")
+        ? deleteConversation(id)
+        : archiveConversation(id, operation !== "unarchive");
+      if (failed) await expect(mutation).rejects.toThrow();
+      else await mutation;
+      const listener = vi.fn();
+      const stop = onArtifactOpenRequest(id, listener);
+      stop();
+      expect(listener).toHaveBeenCalledTimes(failed || operation === "unarchive" ? 1 : 0);
+    },
+  );
+
   it("DELETEs /v1/sessions/{id}", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ deleted: true }));
 

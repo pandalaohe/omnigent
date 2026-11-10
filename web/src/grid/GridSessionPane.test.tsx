@@ -3,6 +3,7 @@ import type * as SessionsApi from "@/lib/sessionsApi";
 import { type ComponentProps, useContext, useState } from "react";
 import { act, cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
 import { emitUiOpenFile } from "@/lib/uiFileRequests";
+import { emitArtifactOpenRequest } from "@/lib/artifactOpenBus";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, onTestFinished, vi } from "vitest";
 import { FileViewerContext } from "@/shell/FileViewerContext";
@@ -163,6 +164,37 @@ it("opens agent-requested files only in the active workspace and respects naviga
   act(() => emitUiOpenFile({ type: "ui_open_file", path: "blocked.md" }, "first"));
   expect(screen.getByTestId("workspace-first")).toHaveTextContent("guide.md");
   expect(screen.getByTestId("workspace-first")).not.toHaveTextContent("blocked.md");
+});
+
+it("defers artifact requests until the grid session is selected and respects its guard", () => {
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid
+          grid={{ id: "artifacts", layout: splitGrid("first", "first", "second", "right")! }}
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  act(() =>
+    emitArtifactOpenRequest(
+      { type: "artifact_open_request", path: "report.html", base: "workspace" },
+      "second",
+    ),
+  );
+  expect(screen.getByTestId("workspace-first")).not.toHaveTextContent("report.html");
+  fireEvent.click(within(screen.getByRole("region", { name: "second" })).getByLabelText("Message"));
+  expect(screen.getByTestId("workspace-second")).toHaveTextContent("report.html");
+  fireEvent.click(
+    within(screen.getByRole("region", { name: "second (active)" })).getByText("Block navigation"),
+  );
+  act(() =>
+    emitArtifactOpenRequest(
+      { type: "artifact_open_request", path: "blocked.html", base: "workspace" },
+      "second",
+    ),
+  );
+  expect(screen.getByTestId("workspace-second")).not.toHaveTextContent("blocked.html");
 });
 
 it("keeps cell views, input, permissions and shortcut targets independent", async () => {

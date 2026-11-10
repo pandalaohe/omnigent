@@ -17,6 +17,7 @@
 
 import type * as IdentityModule from "@/lib/identity";
 import { sideChatSettingsMutationKey } from "@/lib/sideChat";
+import { emitArtifactOpenRequest, onArtifactOpenRequest } from "@/lib/artifactOpenBus";
 
 import {
   type InfiniteData,
@@ -1597,6 +1598,20 @@ describe("chatStore — switchTo", () => {
     sink.close();
   });
 
+  it("clears pending artifact requests when a session is released", async () => {
+    seedSession("artifact-release", []);
+    await useChatStore.getState().switchTo("artifact-release");
+    emitArtifactOpenRequest(
+      { type: "artifact_open_request", path: "old.html", base: "workspace" },
+      "artifact-release",
+    );
+    releaseConversation("artifact-release");
+    const listener = vi.fn();
+    const stop = onArtifactOpenRequest("artifact-release", listener);
+    stop();
+    expect(listener).not.toHaveBeenCalled();
+  });
+
   it("re-binds a retained conversation whose stream ended, instead of painting it stale", async () => {
     // Registry membership alone does not mean "current". A clean server close
     // (`[DONE]`) ends the pump for good and clears `abortController`, but does
@@ -1617,12 +1632,22 @@ describe("chatStore — switchTo", () => {
     await useChatStore.getState().switchTo("conv_dead");
     expect(useChatStore.getState().blocks).toHaveLength(1);
 
+    emitArtifactOpenRequest(
+      { type: "artifact_open_request", path: "old.html", base: "workspace" },
+      "conv_dead",
+    );
+
     // The server closes the stream deliberately; the pump stops for good.
     sink.push("data: [DONE]\n\n");
     sink.close();
     await tick();
     await tick();
     expect(conversationRegistry.peek("conv_dead")!.getState().abortController).toBeNull();
+
+    const listener = vi.fn();
+    const stop = onArtifactOpenRequest("conv_dead", listener);
+    expect(listener).not.toHaveBeenCalled();
+    stop();
 
     await useChatStore.getState().switchTo("conv_away");
     // Meanwhile the conversation gained an item the dead stream never delivered.

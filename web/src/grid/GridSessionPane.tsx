@@ -7,6 +7,7 @@ import { SideChatPane } from "@/components/chat/SideChatPane";
 import { Button } from "@/components/ui/button";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
 import { useUiOpenFile } from "@/hooks/useUiOpenFile";
+import { useArtifactOpenRequest } from "@/hooks/useArtifactOpenRequest";
 import { useChildSessions } from "@/hooks/useChildSessions";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useCanEdit } from "@/hooks/usePermissions";
@@ -249,6 +250,7 @@ export function GridSessionPane({
     [navigateWorkspace, onOpenWorkspace],
   );
   useUiOpenFile(sessionId, selected && canBrowse, openFile);
+  useArtifactOpenRequest(sessionId, selected && canBrowse, openFile);
   const selectTab = useCallback(
     (rightRailTab: RightRailTab | null) => {
       navigateWorkspace("", undefined, () =>

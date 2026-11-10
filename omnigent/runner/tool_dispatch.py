@@ -7372,9 +7372,23 @@ async def _open_in_panel_via_rest(
     if not isinstance(payload, dict):
         return json.dumps({"error": "open_in_panel returned a non-object response"})
     viewers = payload.get("viewers")
-    if not isinstance(viewers, int) or isinstance(viewers, bool):
+    if not isinstance(viewers, int) or isinstance(viewers, bool) or viewers < 0:
         return json.dumps({"error": "open_in_panel response omitted the viewer count"})
-    return f"Asked the web UI to open {path} ({viewers} viewer(s) connected)"
+    return json.dumps(
+        {
+            "status": "sent_unconfirmed" if viewers else "not_delivered",
+            "path": path,
+            "subscribers": viewers,
+            "message": (
+                "Open request sent to subscribed session streams; display is not confirmed. "
+                "A connected stream may be in the background. Select the session to view "
+                "a deferred request; navigation can be declined or file loading can fail."
+                if viewers
+                else "No session streams subscribed: request not delivered and not queued "
+                "on the server. Open the session in the web UI, then retry."
+            ),
+        }
+    )
 
 
 async def _ask_user_async_via_rest(
