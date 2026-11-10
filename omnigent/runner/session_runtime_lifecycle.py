@@ -117,6 +117,7 @@ class SessionRuntimeLock:
 @dataclass
 class _SessionRuntimeState:
     generation: int = 0
+    turn_generation: int = 0
     phase: RuntimePhase = "absent"
     policy_host_id: str | None = None
     policy_revision: int | None = None
@@ -150,6 +151,18 @@ class SessionRuntimeLifecycle:
         """Return whether queued work still targets the current generation."""
         return token == self.runtime_token(session_id)
 
+    def turn_token(self, session_id: str) -> str:
+        """Fence queued turns across archive/reclaim, allowing initialization."""
+        return f"{self._boot_id}:{self._state(session_id).turn_generation}"
+
+    def turn_start_error(self, session_id: str, token: str) -> str | None:
+        """Explain why queued work cannot enter the current runtime."""
+        if not self.runtime_start_allowed(session_id):
+            return "turn blocked because session is archived"
+        if token != self.turn_token(session_id):
+            return "turn superseded by runtime lifecycle change"
+        return None
+
     def observe_archive_state(
         self,
         session_id: str,
@@ -172,6 +185,7 @@ class SessionRuntimeLifecycle:
         if changed:
             # Invalidate work queued before either archive or unarchive won.
             state.generation += 1
+            state.turn_generation += 1
         return True
 
     def runtime_start_allowed(self, session_id: str) -> bool:
@@ -260,6 +274,7 @@ class SessionRuntimeLifecycle:
             return False
         state.phase = "reclaiming"
         state.generation += 1
+        state.turn_generation += 1
         return True
 
     def finish_reclaim(self, session_id: str, *, present: bool = False) -> None:

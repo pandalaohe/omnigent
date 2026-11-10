@@ -313,8 +313,8 @@ async def test_human_buffered_during_retry_admission_executes_on_own_turn(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["accepted", "lost_ack", "replacement"])
-async def test_admission_relay_reconciles_one_id_and_fences_late_replacement(outcome):
+@pytest.mark.parametrize("outcome", ["accepted", "lost_ack", "replacement", "expired"])
+async def test_admission_relay_reconciles_one_id_and_fences_late_replacement(outcome, caplog):
     entered, release = asyncio.Event(), asyncio.Event()
     deadline = time.time() + 30
     input_id, session_id, turn_id = "a" * 32, "child", "resp_multiturn"
@@ -348,7 +348,11 @@ async def test_admission_relay_reconciles_one_id_and_fences_late_replacement(out
                     raise httpx.ReadTimeout("Accepted input response lost")
                 return httpx.Response(
                     200,
-                    json=accepted.model_dump(),
+                    json=(
+                        InputExecutionReceipt(reason="input_expired").model_dump()
+                        if outcome == "expired"
+                        else accepted.model_dump()
+                    ),
                     request=httpx.Request("POST", "http://server" + url),
                 )
             if url.endswith("/input-admission/resolve"):
@@ -401,7 +405,22 @@ async def test_admission_relay_reconciles_one_id_and_fences_late_replacement(out
         event for event in harness.patched_events if event.get("type") == "input_execution_result"
     ]
     assert len(results) == 1
-    assert results[0]["result"]["accepted"] is (outcome != "replacement")
+    assert results[0]["result"]["accepted"] is (outcome not in {"replacement", "expired"})
+    if outcome == "expired":
+        assert results[0]["result"]["reason"] == "input_expired"
+        refused = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "input_execution_admission_refused"
+        ]
+        assert len(refused) == 1
+        assert refused[0].attributes["state"] == "refused"
+        assert refused[0].attributes["reason"] == "input_expired"
+        from omnigent.process_logging import RedactingLogFormatter
+
+        rendered = RedactingLogFormatter(use_colors=False).format(refused[0])
+        assert f"input_id={input_id}" in rendered
+        assert f"deadline_remaining_s={refused[0].attributes['deadline_remaining_s']}" in rendered
     if outcome == "replacement":
         assert results[0]["result"]["reason"] == "superseded"
         assert app.state.turn_identities[session_id] == replacement
