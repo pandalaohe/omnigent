@@ -5171,7 +5171,7 @@ def server(
 
     # Accounts mode: construct the AccountStore (sibling to PermissionStore)
     # here and pass it to create_app explicitly. Any deploy that doesn't run
-    # accounts (the internal hosted product) passes account_store=None and
+    # accounts (a hosted deployment) passes account_store=None and
     # the entire accounts surface stays inactive.
     account_store = None
     from omnigent.server.auth import UnifiedAuthProvider as _UAP
@@ -12858,9 +12858,8 @@ def setup(internal_beta: bool) -> None:
         ui.print_brandmark("setup")
 
     if internal_beta:
-        # The internal-beta workspace defaults are excluded from the public OSS
-        # build. Fail loud with a clear message instead of an ImportError deep
-        # in the onboarding flow when someone passes --internal-beta there.
+        # The --internal-beta defaults are not in every build. Fail loud with a
+        # clear message instead of an ImportError deep in the onboarding flow.
         try:
             import omnigent.onboarding.internal_beta  # noqa: F401 — type: ignore[import-not-found]
         except ImportError:

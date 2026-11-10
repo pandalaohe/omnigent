@@ -7326,7 +7326,7 @@ def _request_claude_repaint(
     without a handler ignores it, so running processes under the pane get it:
     a launcher may run Claude Code as its child. Suspended processes stay paused.
 
-    A launcher may also run Claude Code outside that tree: isaac's fast launch
+    A launcher may also run Claude Code outside that tree: a fast launch
     pumps the pane to a pre-started worker's terminal. Claude Code's session
     registry still names its process, so that process gets the signal too.
 
@@ -7741,7 +7741,7 @@ def _restore_occupied_input(
     uses its guarded dismissal. Both must reveal an uncovered composer.
     Startup dialogs whose Escape quits Claude Code stay for the person to answer.
 
-    Isaac's idle-compaction log can overwrite the rendered input box. Redraw
+    A launcher's idle-compaction log can overwrite the rendered input box. Redraw
     it once with Ctrl+L before any edit keys can erase its identifying prefix,
     then check the actual composer and pending prompts again.
 
