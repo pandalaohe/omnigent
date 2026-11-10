@@ -1236,6 +1236,86 @@ async def test_explicit_recovery_deduplicates_history_heuristic(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_recovery", [False, True], ids=["history", "prompt"])
+@pytest.mark.parametrize(
+    "forward_mode,cleanup_status", [("background", 200), ("stream", 200), ("stream", 503)]
+)
+async def test_forward_during_recovery_admission_runs_only_once(
+    explicit_recovery: bool,
+    forward_mode: str,
+    cleanup_status: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.usage_export import runtime as usage_runtime
+    from omnigent.usage_export.outbox import UsageOutbox
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    ended_admissions: list[str] = []
+    spool = UsageOutbox(tmp_path / "usage")
+    newer_admission = {"admission_id": "newer-admission"}
+
+    class PausedAdmissionServer(_HistoryServerClient):
+        async def post(self, url: str, **kwargs: Any) -> Any:
+            if url == "/v1/usage-cutover/admissions":
+                if kwargs["json"].get("ended") is True:
+                    ended_admissions.append(kwargs["json"]["admission_id"])
+                    return httpx.Response(
+                        cleanup_status,
+                        json={},
+                        request=httpx.Request("POST", "http://server" + url),
+                    )
+                entered.set()
+                await release.wait()
+                return self._Resp({"admission_id": "recovery-admission"})
+            return await super().post(url, **kwargs)
+
+    app, _pm, harness = _build_sdk_app(PausedAdmissionServer())
+    payload = _session_init_payload(suppress_recovery_turn=False)
+    payload["session_init"]["snapshot"]["host_id"] = "recovery-host"
+    payload["session_init"]["snapshot"]["harness_override"] = "claude-sdk"
+    if explicit_recovery:
+        payload["session_init"].update(
+            resume_interrupted_turn=True, recovery_id="interrupted-task"
+        )
+    async with _runner_client(app) as client:
+        recovery = asyncio.create_task(client.post("/v1/sessions", json=payload))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            response = await client.post(
+                f"/v1/sessions/{SESSION_ID}/events",
+                params={"stream": "true"} if forward_mode == "stream" else {},
+                json={
+                    "type": "message",
+                    "agent_id": AGENT_ID,
+                    "content": [{"type": "input_text", "text": "newer instruction"}],
+                },
+            )
+            assert response.status_code == (200 if forward_mode == "stream" else 202), (
+                response.text
+            )
+            forwarded = app.state.active_turns.get(SESSION_ID)
+            if forward_mode == "stream":
+                spool.begin_admission(SESSION_ID, "claude-sdk", newer_admission)
+                monkeypatch.setattr(usage_runtime, "outbox", lambda: spool)
+                monkeypatch.setenv("OMNIGENT_USAGE_EXPORT_CAPTURE", "1")
+        finally:
+            release.set()
+        if cleanup_status == 503:
+            with pytest.raises(httpx.HTTPStatusError):
+                await asyncio.wait_for(recovery, timeout=5)
+        else:
+            initialized = await asyncio.wait_for(recovery, timeout=5)
+            assert initialized.status_code == 201, initialized.text
+        turns = {forwarded, app.state.active_turns.get(SESSION_ID)} - {None}
+        await asyncio.wait_for(asyncio.gather(*turns), timeout=5)
+    assert len(harness.posted_bodies) == 1, "recovery duplicated the forwarded message"
+    assert ended_admissions == ["recovery-admission"], "abandoned recovery admission stayed open"
+    if forward_mode == "stream":
+        assert spool.pending_admission(SESSION_ID, "claude-sdk") == newer_admission
+
+
+@pytest.mark.asyncio
 async def test_newer_turn_finishing_during_initialization_supersedes_recovery() -> None:
     """A completed newer turn must not be followed by a stale recovery prompt."""
     from omnigent.runner.app import _session_histories_ref

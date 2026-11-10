@@ -4786,7 +4786,30 @@ def create_runner_app(
                 return False
             response.raise_for_status()
             recovery_usage_admission = response.json()
-            return True
+            # Admission can yield to a forwarded message or native activity.
+            # Revalidate before either recovery branch binds a turn slot.
+            current = (
+                not initially_active
+                and session_id not in _active_turns
+                and _turn_bind_epoch.get(session_id) == initial_turn_epoch
+                and _ingest_next_seq.get(session_id, 0) == _ingest_now_serving.get(session_id, 0)
+                and not resource_registry.session_turn_is_active(session_id)
+                and resource_registry.session_activity_epoch(session_id) == initial_native_activity
+            )
+            if not current:
+                # This admission never entered the local outbox. End only its
+                # Server record; a newer turn may already own local capture.
+                ended = await server_client.post(
+                    "/v1/usage-cutover/admissions",
+                    json={
+                        "session_id": session_id,
+                        "admission_id": recovery_usage_admission["admission_id"],
+                        "ended": True,
+                    },
+                )
+                ended.raise_for_status()
+                recovery_usage_admission = None
+            return current
 
         recovery_id = (
             init_context.envelope.recovery_id
@@ -4859,7 +4882,7 @@ def create_runner_app(
                     _run_turn_bg(
                         msg_body,
                         session_id,
-                        _cli_runtime_lifecycle.runtime_token(session_id),
+                        _cli_runtime_lifecycle.turn_token(session_id),
                     ),
                     name=f"turn-recover-{session_id}",
                 )
@@ -4920,7 +4943,7 @@ def create_runner_app(
                     _run_turn_bg(
                         recovery_body,
                         session_id,
-                        _cli_runtime_lifecycle.runtime_token(session_id),
+                        _cli_runtime_lifecycle.turn_token(session_id),
                     ),
                     name=f"turn-recover-{session_id}",
                 )
@@ -7485,7 +7508,7 @@ def create_runner_app(
                 _run_turn_bg(
                     next_body,
                     session_id,
-                    _cli_runtime_lifecycle.runtime_token(session_id),
+                    _cli_runtime_lifecycle.turn_token(session_id),
                 ),
                 name=f"turn-cont-{session_id}",
             )
@@ -8745,7 +8768,7 @@ def create_runner_app(
     async def _run_turn_bg(
         msg_body: _JsonObject,
         conv: str,
-        expected_runtime_token: str,
+        expected_turn_token: str,
     ) -> None:
         _subagent_wake_pending.discard(conv)
         # Capture our own task so the finally floor can identity-compare before
@@ -8782,15 +8805,11 @@ def create_runner_app(
                 # cancels first, which is what makes the wait short), while a
                 # handshake arriving mid-turn is answered rather than queued.
                 async with _cli_runtime_lock(conv).shared():
-                    if not _cli_runtime_lifecycle.runtime_start_allowed(
-                        conv
-                    ) or not _cli_runtime_lifecycle.runtime_token_matches(
-                        conv, expected_runtime_token
-                    ):
-                        _on_proxy_stream_end(
-                            conv,
-                            error={"message": "turn superseded by session archive"},
-                        )
+                    start_error = _cli_runtime_lifecycle.turn_start_error(
+                        conv, expected_turn_token
+                    )
+                    if start_error is not None:
+                        _on_proxy_stream_end(conv, error={"message": start_error})
                         return
                     _cli_runtime_lifecycle.mark_starting(conv)
                     _cli_runtime_lifecycle.mark_live(conv)
@@ -11257,25 +11276,23 @@ def create_runner_app(
                 _publish_turn_status(conversation_id, "running")
 
                 if stream:
-                    expected_runtime_token = _cli_runtime_lifecycle.runtime_token(conversation_id)
+                    expected_turn_token = _cli_runtime_lifecycle.turn_token(conversation_id)
                     stream_epoch = _turn_bind_epoch.get(conversation_id)
                     # Shared for the same reason as the background turn above.
                     try:
                         async with _cli_runtime_lock(conversation_id).shared():
-                            if not _cli_runtime_lifecycle.runtime_start_allowed(
-                                conversation_id
-                            ) or not _cli_runtime_lifecycle.runtime_token_matches(
-                                conversation_id, expected_runtime_token
-                            ):
+                            start_error = _cli_runtime_lifecycle.turn_start_error(
+                                conversation_id, expected_turn_token
+                            )
+                            if start_error is not None:
                                 _on_proxy_stream_end(
-                                    conversation_id,
-                                    error={"message": "turn superseded by session archive"},
+                                    conversation_id, error={"message": start_error}
                                 )
                                 return JSONResponse(
                                     status_code=409,
                                     content={
                                         "error": "stale_generation",
-                                        "detail": "session is archiving",
+                                        "detail": start_error,
                                     },
                                 )
                             _cli_runtime_lifecycle.mark_starting(conversation_id)
@@ -11301,7 +11318,7 @@ def create_runner_app(
                     _run_turn_bg(
                         message_body,
                         conversation_id,
-                        _cli_runtime_lifecycle.runtime_token(conversation_id),
+                        _cli_runtime_lifecycle.turn_token(conversation_id),
                     ),
                     name=f"turn-{conversation_id}",
                 )
@@ -13444,7 +13461,7 @@ def create_runner_app(
                         _run_turn_bg(
                             msg_body,
                             session_id,
-                            _cli_runtime_lifecycle.runtime_token(session_id),
+                            _cli_runtime_lifecycle.turn_token(session_id),
                         ),
                         name=f"turn-catchup-{session_id}",
                     )

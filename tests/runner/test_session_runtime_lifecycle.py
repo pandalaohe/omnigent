@@ -178,6 +178,38 @@ def test_runtime_start_invalidates_an_older_idle_snapshot() -> None:
     assert not lifecycle.claim_reclaim("session", expected_runtime_token=old)
 
 
+@pytest.mark.parametrize(
+    "transition", ["initialize", "archive", "unarchive", "reclaim", "other-session", "other-boot"]
+)
+def test_queued_turn_survives_only_non_destructive_runtime_changes(transition: str) -> None:
+    lifecycle = SessionRuntimeLifecycle(boot_id="boot")
+    queued = lifecycle.turn_token("session")
+    if transition == "initialize":
+        lifecycle.mark_starting("session")
+        lifecycle.mark_live("session")
+    elif transition == "reclaim":
+        assert lifecycle.claim_reclaim("session")
+        lifecycle.finish_reclaim("session")
+    elif transition == "other-boot":
+        lifecycle = SessionRuntimeLifecycle(boot_id="new-boot")
+    else:
+        lifecycle.observe_archive_state(
+            "other" if transition == "other-session" else "session",
+            scope_id="root",
+            revision=1,
+            archived=True,
+        )
+        if transition == "unarchive":
+            lifecycle.observe_archive_state("session", scope_id="root", revision=2, archived=False)
+    error = lifecycle.turn_start_error("session", queued)
+    if transition in {"initialize", "other-session"}:
+        assert error is None
+    elif transition == "archive":
+        assert error == "turn blocked because session is archived"
+    else:
+        assert error == "turn superseded by runtime lifecycle change"
+
+
 def test_newer_unarchive_clears_fence_and_stale_archive_cannot_restore_it() -> None:
     lifecycle = SessionRuntimeLifecycle(boot_id="boot")
     before_archive = lifecycle.runtime_token("session")

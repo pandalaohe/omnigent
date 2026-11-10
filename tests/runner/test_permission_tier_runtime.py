@@ -36,7 +36,7 @@ from omnigent.server.permission_tiers import (
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("installed", [True, False])
-@pytest.mark.parametrize("phase", ["bootstrap", "before-fence"])
+@pytest.mark.parametrize("phase", ["bootstrap", "before-fence", "queued"])
 async def test_first_pi_turn_waits_for_permission_bootstrap(monkeypatch, installed, phase, caplog):
     from omnigent.runner import create_runner_app
     from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
@@ -72,10 +72,22 @@ async def test_first_pi_turn_waits_for_permission_bootstrap(monkeypatch, install
 
     monkeypatch.setattr(harness, "post", bootstrap)
     async with _runner_client(app, permission_harness="pi") as client:
+        runtime_lock = app.state.cli_runtime_lifecycle.lock_for("cold-pi")
+        if phase == "queued":
+            await runtime_lock._acquire(exclusive=True)
         init = asyncio.create_task(
             client.post("/v1/sessions", json={"session_id": "cold-pi", "agent_id": "test-agent"})
         )
-        await asyncio.wait_for(entered.wait(), 5)
+        if phase == "queued":
+            for _ in range(200):
+                if runtime_lock._waiters:
+                    break
+                await asyncio.sleep(0)
+            else:
+                runtime_lock._release(exclusive=True)
+                raise AssertionError("session initialization never reached the runtime lock")
+        else:
+            await asyncio.wait_for(entered.wait(), 5)
         try:
             response = await client.post(
                 "/v1/sessions/cold-pi/events",
@@ -92,16 +104,20 @@ async def test_first_pi_turn_waits_for_permission_bootstrap(monkeypatch, install
             done, _ = await asyncio.wait([turn], timeout=0.05)
             assert not done, "first turn failed while permission bootstrap was still running"
             state = app.state.permission_tiers.state("cold-pi")
-            assert state is None if phase == "before-fence" else state.status == "blocked"
+            assert (
+                state is None if phase in {"before-fence", "queued"} else state.status == "blocked"
+            )
             assert not harness.posted_bodies
         finally:
+            if phase == "queued":
+                runtime_lock._release(exclusive=True)
             release.set()
             initialized = await asyncio.wait_for(init, 5)
         await asyncio.wait_for(turn, 5)
     assert initialized.status_code == (201 if installed else 503)
     assert "Permission tier is unavailable: blocked" not in caplog.text
     if installed:
-        assert harness.posted_bodies
+        assert len(harness.posted_bodies) == 1
         assert "turn setup failed" not in caplog.text
     else:
         assert not harness.posted_bodies

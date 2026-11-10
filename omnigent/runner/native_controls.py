@@ -2850,7 +2850,7 @@ def build_native_controls(
                     _run_turn_bg(
                         compact_body,
                         conv_id,
-                        _cli_runtime_lifecycle.runtime_token(conv_id),
+                        _cli_runtime_lifecycle.turn_token(conv_id),
                     ),
                     name=f"compact-{conv_id}",
                 )
