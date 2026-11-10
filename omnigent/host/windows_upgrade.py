@@ -350,7 +350,10 @@ def _release_launcher_zip() -> None:
 
 
 def _remove_trash(paths: list[Path]) -> None:
-    """Delete leftovers that an earlier verified upgrade marked as trash; skip what is in use."""
+    """Delete leftovers that an earlier verified upgrade marked as trash, best effort.
+
+    A file still in use stops its removal; the rest of that leftover may already be gone.
+    """
     for path in paths:
         try:
             siblings = list(path.parent.iterdir())

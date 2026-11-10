@@ -1755,8 +1755,8 @@ def _run_upgrade_command(command: str, console: Console) -> int:
                 if result.returncode and bundled:
                     # A Windows web UI build failure must not block the Host upgrade.
                     console.print(
-                        "[yellow]Retrying without building the web UI; run the upgrade again "
-                        "once the web UI builds to get it back.[/yellow]"
+                        "[yellow]Retrying without building the web UI. Later upgrades keep "
+                        "skipping it; run the command above by hand to get it back.[/yellow]"
                     )
                     result = subprocess.run(argv, check=False, env=skip_web_ui)
                 if result.returncode:
