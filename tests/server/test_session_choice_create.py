@@ -79,6 +79,81 @@ async def create(env, **changes):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["codex-native", "codex"])
+@pytest.mark.parametrize("offered", [True, False, "failed"])
+async def test_create_checks_current_host_catalog_before_skipping_model(
+    choice_env, db_uri, monkeypatch, harness, offered
+):
+    from omnigent.host.frames import CAP_CACHED_MODEL_OPTIONS
+    from omnigent.server.session_choice import parse_session_choice
+    from omnigent.server.session_choice_runtime import context_request
+    from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
+
+    env = choice_env
+    official = "gpt-example"
+    custom = "provider-example/gpt-example"
+    for index, model in enumerate((custom, official)):
+        env.settings["hosts"][HOST]["work"][index][0]["links"][0]["model"] = model
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    catalogs = HostModelCatalogCacheStore(db_uri)
+    catalogs.upsert(HOST, harness, [{"id": official}], 1)
+    env.app.state.host_model_catalog_cache_store = catalogs
+    connection = SimpleNamespace(
+        hello=SimpleNamespace(
+            configured_harnesses={harness: True}, capabilities=[CAP_CACHED_MODEL_OPTIONS]
+        )
+    )
+    monkeypatch.setattr(env.app.state.host_registry, "get", lambda host: connection)
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._resolve_harness_impl", lambda *a, **kw: harness
+    )
+    available = offered is True
+    rows = [{"id": official}, *([{"id": custom}] if available else [])]
+    lookup = AsyncMock(return_value={"status": "ok", "models": rows})
+    if offered == "failed":
+        lookup.side_effect = RuntimeError("host disconnected")
+    monkeypatch.setattr("omnigent.server.routes.calling_defaults._proxy_model_options", lookup)
+
+    response = await create(env)
+    assert response.status_code == 201, response.text
+    assert response.json()["agent_id"] == env.agents[0 if available else 1]["id"]
+    assert response.json()["model_override"] == (custom if available else official)
+    assert catalogs.list([HOST])[0]["models"] == rows
+    lookup.assert_awaited_once()
+    if offered != "failed":
+        await context_request(
+            env.app, RESERVED_USER_LOCAL, HOST, parse_session_choice(env.settings), env.parent
+        )
+        lookup.assert_awaited_once()
+    if available:
+        from fastapi import HTTPException
+
+        catalogs.upsert(HOST, harness, [{"id": official}], 1)
+        lookup.reset_mock()
+        with pytest.raises(HTTPException) as denied:
+            await context_request(
+                env.app,
+                RESERVED_USER_LOCAL,
+                HOST,
+                parse_session_choice(env.settings),
+                env.parent,
+                user_id="other@example.test",
+            )
+        assert denied.value.status_code == 403
+        lookup.assert_not_awaited()
+        connection.hello.capabilities = []
+        legacy = await context_request(
+            env.app, RESERVED_USER_LOCAL, HOST, parse_session_choice(env.settings), env.parent
+        )
+        assert legacy.models[env.agents[0]["id"]] == frozenset({official})
+        lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_creates_select_before_project_defaults_and_admit_in_parallel(choice_env):
     env = choice_env
     one, two = await asyncio.gather(create(env), create(env))

@@ -4460,10 +4460,18 @@ class HostProcess:
 
         :returns: The catalog listing, or ``None`` when unavailable.
         """
-        from omnigent.harnesses.codex_native.app_server import codex_launch_catalog
+        from omnigent.harnesses.codex_native.app_server import (
+            codex_launch_catalog,
+            fresh_codex_launch_catalog,
+            resolve_native_codex_launch,
+        )
 
         try:
-            rows = await codex_launch_catalog(refresh=refresh, preview=True)
+            if refresh == "cached":
+                launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+                rows = await asyncio.to_thread(fresh_codex_launch_catalog, launch=launch)
+            else:
+                rows = await codex_launch_catalog(refresh=refresh, preview=True)
         except Exception:
             _logger.warning("Codex model catalog unavailable", exc_info=True)
             return None
@@ -4522,6 +4530,28 @@ class HostProcess:
         injects_prompt = None
         try:
             source = model_source_for(harness)
+            # Selection runs before startup admission; never execute a source or probe.
+            if frame.refresh == "cached":
+                rows: list[dict[str, object]] | None = None
+                if source is not None:
+                    from omnigent.models.model_catalog_store import catalog_is_stale, read_catalog
+                    from omnigent.models.model_source import _source_catalog
+
+                    if source.lane == "static":
+                        rows = [{"id": value} for value in source.static]
+                    else:
+                        namespace, key, _ = _source_catalog(harness, source)
+                        if not catalog_is_stale(namespace, key):
+                            rows = read_catalog(namespace, key)
+                elif harness in {"codex", "codex-native"}:
+                    cached = await self._probed_codex_model_options("cached")
+                    rows = with_source(cached.models) if cached is not None else None
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="ok" if rows is not None else "failed",
+                    models=rows if rows is not None else [],
+                    error=None if rows is not None else "no current cached model catalog",
+                )
             if source is not None:
                 if harness == "acp" or harness.startswith("acp:"):
                     from omnigent.models.model_source import ModelSource, _source_catalog
