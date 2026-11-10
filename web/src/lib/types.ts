@@ -321,6 +321,16 @@ export interface SessionStartupHold {
 
 export interface Session {
   sandboxProfile?: SandboxProfile | null;
+  /**
+   * The session whose Workspace rail lists this one as a side chat; `null` for
+   * anything else, including side chats from before the rail was server-listed.
+   */
+  sideChatParentId?: string | null;
+  /**
+   * Whether the viewer may start side chats here (only the owner of the
+   * session's root can); `null` when the server didn't say.
+   */
+  sideChatAllowed?: boolean | null;
   id: string;
   /** Server-confirmed tier state; absent on older servers and unrelated harnesses. */
   permissionTier?: string | null;

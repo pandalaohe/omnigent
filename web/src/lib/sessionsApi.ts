@@ -257,6 +257,10 @@ interface SessionResponseWire {
    */
   title?: string | null;
   labels?: Record<string, string>;
+  /** The session whose Workspace rail lists this one as a side chat. */
+  side_chat_parent_id?: string | null;
+  /** Whether the viewer may start side chats here; absent from older servers. */
+  side_chat_allowed?: boolean | null;
   /** Canonical working directory; ``null`` when unbound. */
   workspace?: string | null;
   /**
@@ -482,6 +486,8 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     archivedAt: wire.archived_at ?? null,
     title: wire.title ?? null,
     labels: wire.labels,
+    sideChatParentId: wire.side_chat_parent_id ?? null,
+    sideChatAllowed: wire.side_chat_allowed ?? null,
     workspace: wire.workspace ?? null,
     worktree: wire.worktree ?? null,
     terminalLaunchArgs: wire.terminal_launch_args ?? null,

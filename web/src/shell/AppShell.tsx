@@ -123,6 +123,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { holdsInitialDraft, isTempConvId, useChatStore } from "@/store/chatStore";
+import { useCanStartSideChat } from "@/hooks/usePermissions";
 import { supportsSideChat } from "@/lib/sideChat";
 import { subagentTabId } from "@/lib/subagentTabs";
 import {
@@ -2115,7 +2116,11 @@ function AppShellImpl() {
     // Phones hide the rail, so the side chat opens in its drawer instead.
     if (isMobileViewport()) openSideChatsPanel();
   }, [sideChatToOpen, conversationId, openSideChatsPanel, setRightPanelOpenAnimated]);
-  const showSideChats = supportsSideChat(useChatStore((s) => s.sessionHarness));
+  const canStartSideChat = useCanStartSideChat(serverConversationId, permissionLevel);
+  const showSideChats = supportsSideChat(
+    useChatStore((s) => s.sessionHarness),
+    canStartSideChat,
+  );
   // With the panel setting on, sub-agent links open a rail tab beside this chat,
   // revealing the rail if another panel covers it. Ancestors still navigate.
   const parentSessionId = activeSession?.parentSessionId;
@@ -2150,9 +2155,9 @@ function AppShellImpl() {
       revealRightPanel,
     ],
   );
-  // Sub-agent tabs opened on desktop must stay reachable from a phone's
-  // drawer even when this harness can't start side chats.
-  const [hasSubagentTabs, setHasSubagentTabs] = useState(false);
+  // Side-chat and sub-agent tabs opened elsewhere must stay reachable from a
+  // phone's drawer even where this viewer or harness can't start side chats.
+  const [hasSideChatTabs, setHasSideChatTabs] = useState(false);
 
   const openTerminalsPanel = useCallback(
     (key: string) => {
@@ -2928,7 +2933,7 @@ function AppShellImpl() {
                       githubPanelOpen,
                       contentSearchPanelOpen,
                       sideChatsPanelOpen,
-                      showSideChats: showSideChats || hasSubagentTabs,
+                      showSideChats: showSideChats || hasSideChatTabs,
                       hideTerminalsTab,
                       // Mobile: reachable when a shell exists OR the agent
                       // declares shell access (so the drawer's "+ New shell" row
@@ -3049,7 +3054,7 @@ function AppShellImpl() {
                     onShellCreateFailed={clearShellCreatePending}
                     mobileSideChatsOpen={sideChatsPanelOpen}
                     onMobileSideChatsOpenChange={setSideChatsPanelOpen}
-                    onHasSubagentTabsChange={setHasSubagentTabs}
+                    onHasSideChatTabsChange={setHasSideChatTabs}
                     subagentPanelOpener={openSubagentInPanel}
                     onWideContentChange={setRailShowsWideContent}
                     onBrowserContentChange={setRailBrowser}

@@ -86,6 +86,7 @@ from omnigent.harness_plugins import (
     model_env_keys,
     spawn_env_builders,
 )
+from omnigent.harnesses.codex_native.side_chat import side_chat_text_from_content
 from omnigent.llms.errors import detect_request_size_overflow
 from omnigent.member_snapshot import (
     member_entries_from_labels,
@@ -1566,26 +1567,6 @@ def _rekey_subagent_work_for_succession(
             session_name=meta.session_name,
         )
     _subagent_work.move_peer_copies(old_parent_id, new_parent_id)
-
-
-def _side_chat_text_from_content(content: object) -> str:
-    """
-    Join user text from message content blocks for a Codex ``/side`` follow-up.
-
-    :param content: A message body's ``content`` list, e.g.
-        ``[{"type": "input_text", "text": "and why?"}]``.
-    :returns: The concatenated text with leading indentation preserved, or
-        ``""`` when there is none.
-    """
-    if not isinstance(content, list):
-        return ""
-    parts: list[str] = []
-    for block in content:
-        if isinstance(block, dict) and block.get("type") in {"text", "input_text"}:
-            text = block.get("text")
-            if isinstance(text, str) and text:
-                parts.append(text)
-    return "\n".join(parts).rstrip()
 
 
 async def _fetch_assistant_item_with_text(
@@ -11348,7 +11329,7 @@ def create_runner_app(
                         },
                     )
             else:
-                _side_text = _side_chat_text_from_content(
+                _side_text = side_chat.side_chat_text_from_content(
                     body.get("content") if isinstance(body, dict) else None
                 )
                 if not _side_text:
@@ -11497,13 +11478,12 @@ def create_runner_app(
             # and the chat would sit on "Working…" for good.
             from omnigent.harnesses.codex_native import side_chat as _side_chat
 
-            _side_question = _side_chat.side_chat_question_from_text(
-                _side_chat_text_from_content(body.get("content")).lstrip()
+            _side_question = (
+                _side_chat.side_chat_question_from_content(body.get("content"))
+                if _session_harness_name(conversation_id) == _CODEX_NATIVE_HARNESS
+                else None
             )
-            if (
-                _side_question is not None
-                and _session_harness_name(conversation_id) == _CODEX_NATIVE_HARNESS
-            ):
+            if _side_question is not None:
                 _side_chat.request_side_chat(
                     await _codex_native_bridge_dir_for_session(conversation_id),
                     _side_question,
@@ -11515,13 +11495,13 @@ def create_runner_app(
                 )
                 return Response(status_code=202)
         if body_type in ("message", None) and isinstance(body, dict):
-            if "peer_delivery" not in body and _side_chat_text_from_content(
+            if "peer_delivery" not in body and side_chat_text_from_content(
                 body.get("content")
             ).strip() in {"/clear", "/new"}:
                 pi_harness = _session_harness_name(conversation_id)
                 if (
                     pi_harness == "antigravity-native"
-                    and _side_chat_text_from_content(body.get("content")).strip() == "/clear"
+                    and side_chat_text_from_content(body.get("content")).strip() == "/clear"
                 ):
                     return await _handle_antigravity_native_clear(conversation_id)
                 if pi_harness == "pi-native":
@@ -11631,7 +11611,7 @@ def create_runner_app(
                     try:
                         _peer_delivery = SDKPeerInput.from_metadata(
                             message_body["peer_delivery"],
-                            _side_chat_text_from_content(message_body.get("content")),
+                            side_chat_text_from_content(message_body.get("content")),
                         )
                     except ValueError:
                         return JSONResponse(

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import hashlib
 import itertools
@@ -72,6 +74,7 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
+from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
 from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native_subagent_snapshot import parse_native_subagent_snapshot
@@ -102,6 +105,7 @@ from omnigent.runtime import (
     session_stream,
 )
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.runtime.content_resolver import _resolve_message_content
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.sdk_peer_delivery import (
     SDK_PEER_RECEIPT_EVENT,
@@ -149,6 +153,9 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
+)
+from omnigent.server.routes._auth_helpers import (
+    is_session_owner as _is_session_owner,
 )
 from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
@@ -325,6 +332,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _maybe_relaunch_managed_sandbox,
     _maybe_wake_stale_resumable_managed_sandbox,
     _native_pane_harness,
+    _opens_codex_side_chat,
     _persist_external_antigravity_subagent_start,
     _persist_external_codex_subagent_start,
     _persist_external_conversation_item,
@@ -597,10 +605,12 @@ async def _archive_blocks_external_user_work(
     return False
 
 
-async def _persist_subagent_start_with_archive_fence(factory: Any, *args: Any) -> Any:
+async def _persist_subagent_start_with_archive_fence(
+    factory: Any, *args: Any, **kwargs: Any
+) -> Any:
     """Translate the store's atomic archive-vs-child result to a 409."""
     try:
-        return await factory(*args)
+        return await factory(*args, **kwargs)
     except ConversationArchiveClosingError as exc:
         raise OmnigentError(
             "Session is being archived. Unarchive it before starting new work.",
@@ -1417,6 +1427,60 @@ _TURN_STARTING_EVENT_TYPES = frozenset({"message", "session_message", _SLASH_COM
 _IN_FLIGHT_EVENT_TYPES = _TURN_STARTING_EVENT_TYPES | {_COMPACT_TYPE}
 
 
+def _legacy_side_chat_attachment(
+    content: object,
+    session_id: str,
+    file_store: FileStore | None,
+    artifact_store: ArtifactStore | None,
+) -> bool:
+    """Old Codex executors interpret a lone text attachment as a slash command."""
+    from omnigent.harnesses.codex_native.side_chat import side_chat_question_from_text
+
+    if not isinstance(content, list):
+        return False
+    blocks = [block for block in content if isinstance(block, dict)]
+    if file_store is not None and artifact_store is not None:
+        try:
+            blocks = _resolve_message_content(
+                blocks,
+                file_store,
+                artifact_store,
+                session_id=session_id,
+                defer_filesystem_files=True,
+            )
+        except (ValueError, KeyError) as exc:
+            raise OmnigentError(
+                "Could not read the attachment", code=ErrorCode.INVALID_INPUT
+            ) from exc
+    if any(
+        block.get("type") == "input_image"
+        or (
+            block.get("type") in {"text", "input_text"}
+            and isinstance(block.get("text"), str)
+            and block["text"]
+        )
+        for block in blocks
+    ):
+        return False
+    texts = []
+    for block in blocks:
+        if block.get("type") != "input_file":
+            continue
+        data = block.get("file_data")
+        if not isinstance(data, str):
+            return False
+        try:
+            parsed = parse_data_uri(data)
+            if not parsed.mime_type.startswith("text/"):
+                return False
+            text = base64.b64decode(parsed.base64_payload).decode("utf-8", errors="replace")
+        except (ValueError, binascii.Error):
+            return False
+        if text:
+            texts.append(text)
+    return len(texts) == 1 and side_chat_question_from_text(texts[0]) is not None
+
+
 def register_events_routes(
     router: APIRouter,
     *,
@@ -2148,6 +2212,32 @@ def register_events_routes(
                 request.app.state, "subagent_retry_admission", None
             ) is not None:
                 body.data["_input_admission_required"] = True
+        opens_codex_side_chat = body.type == "message" and await _opens_codex_side_chat(conv, body)
+        if (
+            body.type == "message"
+            and isinstance(request, Request)
+            and await _native_pane_harness(conv) == "codex-native"
+            and not await asyncio.to_thread(
+                _is_session_owner,
+                user_id,
+                conv,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            )
+            and (
+                opens_codex_side_chat
+                or await asyncio.to_thread(
+                    _legacy_side_chat_attachment,
+                    body.data.get("content"),
+                    conv.id,
+                    file_store,
+                    artifact_store,
+                )
+            )
+        ):
+            raise OmnigentError(
+                "Only the session's owner can start a side chat", code=ErrorCode.FORBIDDEN
+            )
         start_fire_stage("input_validation", session_id=session_id)
         peer_message = body.type == "session_message"
         if peer_message:
@@ -4869,6 +4959,14 @@ def register_events_routes(
                 conv,
                 body,
                 conversation_store,
+                lists_side_chat=_has_bound_runner_authority(request, conv)
+                or await asyncio.to_thread(
+                    _is_session_owner,
+                    user_id,
+                    conv,
+                    auth_provider=auth_provider,
+                    permission_store=permission_store,
+                ),
             )
             return {"queued": False, "child_session_id": child_id}
         if body.type == _EXTERNAL_DEVIN_SUBAGENT_START_TYPE:

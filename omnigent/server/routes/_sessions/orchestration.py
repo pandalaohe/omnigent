@@ -3190,6 +3190,7 @@ def _build_session_response(
         warm_state_reason=warm_reason,
         keep_warm=keep_warm_status_from_labels(conv.labels, archived=bool(conv.archived), now=now),
         archive_reason=conv.labels.get(ARCHIVE_REASON_LABEL),
+        side_chat_parent_id=conv.side_chat_parent_id,
     )
 
 
@@ -4944,6 +4945,8 @@ async def _persist_external_codex_subagent_start(
     parent_conv: Conversation,
     body: SessionEventInput,
     conversation_store: ConversationStore,
+    *,
+    lists_side_chat: bool = False,
 ) -> str:
     """
     Mint or update a child Conversation for a Codex AgentControl sub-agent.
@@ -4956,6 +4959,8 @@ async def _persist_external_codex_subagent_start(
     :param parent_conv: Pre-fetched parent row.
     :param body: POST event body with ``data.thread_id`` required.
     :param conversation_store: Store for reading/creating child rows.
+    :param lists_side_chat: Whether a new ``/side`` child joins the parent's
+        side chats on the owner's devices; only for the owner or bound runner.
     :returns: Child conversation id, e.g. ``"conv_child456"``.
     :raises OmnigentError: If ``thread_id`` is missing or parent has
         no bound agent.
@@ -4976,6 +4981,12 @@ async def _persist_external_codex_subagent_start(
         _find_codex_native_subagent_child, conversation_store, parent_id, thread_id
     )
     labels = _codex_subagent_labels_from_body(thread_id, body)
+    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+
+    if is_side_chat_child(labels) and not lists_side_chat:
+        raise OmnigentError(
+            "Only the session's owner can start a side chat", code=ErrorCode.FORBIDDEN
+        )
     if existing is not None:
         await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
         await record_subagent_activity(
@@ -4983,7 +4994,12 @@ async def _persist_external_codex_subagent_start(
         )
         return existing.id
     return await _create_and_publish_codex_child(
-        parent_id, parent_conv, thread_id, labels, conversation_store
+        parent_id,
+        parent_conv,
+        thread_id,
+        labels,
+        conversation_store,
+        lists_side_chat=lists_side_chat,
     )
 
 
@@ -9435,6 +9451,16 @@ def _unavailable_routing_card(reason: str) -> tuple[str, dict[str, Any]]:
     return _UNAVAILABLE_ROUTED_MODEL, {"rationale": reason, "applied": False}
 
 
+async def _opens_codex_side_chat(conv: Conversation, body: SessionEventInput) -> bool:
+    """Whether a message to *conv* is a Codex ``/side`` command, read as the runner reads it."""
+    from omnigent.harnesses.codex_native.side_chat import side_chat_question_from_content
+
+    return (
+        await _native_pane_harness(conv) == "codex-native"
+        and side_chat_question_from_content(body.data.get("content")) is not None
+    )
+
+
 async def _native_pane_harness(
     conv: Conversation,
     *,
@@ -10896,23 +10922,8 @@ async def _dispatch_session_event_to_runner_impl(
         )
         # A codex /side command never reaches the main thread — the executor
         # forks it into a side chat — so the transcript forwarder never mirrors
-        # it back and this bubble would sit in the parent chat forever. The
-        # executor forks text-only content only: any multimodal block
-        # normalizes to several input items, which is not a side chat.
-        # Lazy: importing the executor adapter at server startup would pull the
-        # inner runtime into the server import path.
-        from omnigent.harnesses.codex_native.side_chat import is_side_chat_command
-        from omnigent.runtime.harnesses._executor_adapter import _MULTIMODAL_BLOCK_TYPES
-
-        _has_multimodal_block = isinstance(content, list) and any(
-            isinstance(block, dict) and block.get("type") in _MULTIMODAL_BLOCK_TYPES
-            for block in content
-        )
-        opens_side_chat = (
-            not _has_multimodal_block
-            and is_side_chat_command(_extract_user_text_for_routing(body))
-            and await _native_pane_harness(conv) == "codex-native"
-        )
+        # it back and this bubble would sit in the parent chat forever.
+        opens_side_chat = await _opens_codex_side_chat(conv, body)
         # An older host forwards `/side` to Codex as a plain prompt (no fork), so
         # the web side chat opens and hangs and the question lands on the main
         # thread. Refuse here — before the forward — with a clear reason instead.

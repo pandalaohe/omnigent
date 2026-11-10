@@ -7335,6 +7335,17 @@ function SessionTooltipContent({
 // Browsers pair clicks within ~500ms; the margin absorbs event-loop delay.
 const DOUBLE_CLICK_PAIR_WINDOW_MS = 750;
 
+// Whether the row lies entirely inside its nearest scrolling ancestor (or the viewport).
+function isRowFullyVisible(row: HTMLElement): boolean {
+  let scroller = row.parentElement;
+  while (scroller && !/auto|scroll/.test(getComputedStyle(scroller).overflowY)) {
+    scroller = scroller.parentElement;
+  }
+  const bounds = scroller?.getBoundingClientRect() ?? { top: 0, bottom: window.innerHeight };
+  const rect = row.getBoundingClientRect();
+  return rect.top >= bounds.top && rect.bottom <= bounds.bottom;
+}
+
 function ConversationRowImpl({
   conversation,
   instanceKey,
@@ -7423,12 +7434,16 @@ function ConversationRowImpl({
   // flyout off below the `md` breakpoint (see `projectFlyoutName`).
   const isMobile = useContext(IsMobileContext);
   const suppressedScrollIdRef = useContext(SuppressedScrollIdContext);
-  // Desktop keeps the active row centered; a phone drawer opens at the top.
+  // When this row becomes active (e.g. a new session navigated to via `/c/:id`),
+  // center it if it is offscreen. A row already fully visible stays put, so
+  // clicking it does not slide the list.
   const rowRef = useRef<HTMLLIElement>(null);
   useEffect(() => {
     if (!isActive || !isCanonical || isMobile) return;
     if (suppressedScrollIdRef.current === conversation.id) return;
-    rowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    const row = rowRef.current;
+    if (!row || isRowFullyVisible(row)) return;
+    row.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [isActive, isCanonical, isMobile, conversation.id, suppressedScrollIdRef]);
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
