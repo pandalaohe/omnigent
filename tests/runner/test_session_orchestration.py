@@ -13,10 +13,44 @@ from omnigent.spec.types import AgentSpec
 
 
 @pytest.mark.parametrize("spec", [AgentSpec(spec_version=1), None])
-def test_native_message_schema(spec):
+@pytest.mark.parametrize("runner_features", [None, "peer_session_messaging"])
+def test_native_message_schema(spec, runner_features, monkeypatch):
+    if runner_features is None:
+        monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_FEATURES", runner_features)
     schemas = build_native_relay_tool_schemas(spec)
     schema = next(s for s in schemas if s["name"] == "sys_session_message")
     assert schema["parameters"]["required"] == ["session_id", "message"]
+
+
+@pytest.mark.parametrize("spec", [AgentSpec(spec_version=1), None])
+def test_runner_can_hide_native_message_tool(spec, monkeypatch):
+    monkeypatch.setenv("OMNIGENT_FEATURES", "-peer_session_messaging")
+    names = {s["name"] for s in build_native_relay_tool_schemas(spec)}
+    assert "sys_session_message" not in names
+    assert "sys_session_get_info" in names
+
+
+@pytest.mark.asyncio
+async def test_runner_disabled_message_never_contacts_server(monkeypatch):
+    monkeypatch.setenv("OMNIGENT_FEATURES", "-peer_session_messaging")
+
+    def unexpected(request):
+        pytest.fail("Disabled peer messaging must not send an HTTP request")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(unexpected), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_message",
+                arguments=json.dumps({"session_id": uuid4().hex, "message": "Work"}),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    assert result == {"error": "Messaging other sessions is disabled on this runner"}
 
 
 @pytest.mark.asyncio
@@ -217,6 +251,36 @@ async def test_independent_creation_does_not_fall_back_on_unsupported_server(pla
 
 
 @pytest.mark.asyncio
+async def test_managed_creation_respects_current_host_policy_before_posting():
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "sibling_sessions": True,
+                "sibling_session_destinations": "current_host",
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "worker", "placement": "managed"}),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+
+    assert "only allows Add nested agent on the current host" in result["error"]
+    assert [(request.method, request.url.path) for request in requests] == [("GET", "/v1/info")]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure", ["timeout", "non_json", "null", "list", "empty", "non_bool", 408, 429, 503]
 )
@@ -254,8 +318,10 @@ async def test_message_timeout_is_not_retried(failure, after_routing):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [403, 502, "policy_denied"])
-async def test_same_host_first_task_failure_returns_created_session(status):
+@pytest.mark.parametrize("status", [403, 502, "policy_denied", "runner_disabled"])
+async def test_same_host_first_task_failure_returns_created_session(status, monkeypatch):
+    if status == "runner_disabled":
+        monkeypatch.setenv("OMNIGENT_FEATURES", "-peer_session_messaging")
     session_id = uuid4().hex
     requests = []
 
@@ -266,6 +332,7 @@ async def test_same_host_first_task_failure_returns_created_session(status):
             return httpx.Response(200, json={"parent_session_id": None})
         requests.append(request)
         if request.url.path.endswith("/events"):
+            assert status != "runner_disabled", "Disabled messaging must not contact the server"
             if status == "policy_denied":
                 return httpx.Response(
                     202, json={"queued": False, "denied": True, "reason": "Task needs approval"}
@@ -294,7 +361,9 @@ async def test_same_host_first_task_failure_returns_created_session(status):
     if status == "policy_denied":
         assert "Task needs approval" in result["error"]
         assert result["initial_message"]["denied"] is True
-    assert len(requests) == 2
+    if status == "runner_disabled":
+        assert "disabled on this runner" in result["initial_message"]["error"]
+    assert len(requests) == (1 if status == "runner_disabled" else 2)
 
 
 @pytest.mark.asyncio
@@ -675,9 +744,12 @@ async def test_independent_creation_supports_disabled_or_missing_sibling_capabil
     def handle(request):
         paths.append(request.url.path)
         if request.url.path == "/v1/info":
-            return httpx.Response(
-                200, json={} if capability is None else {"sibling_sessions": capability}
-            )
+            info = {"sibling_session_destinations": "current_host"}
+            if capability is not None:
+                info["sibling_sessions"] = capability
+            if capability is True:
+                info["sibling_session_destinations"] = "any_host"
+            return httpx.Response(200, json=info)
         assert request.url.path == "/v1/sessions/orchestrated"
         assert request.headers[ORCHESTRATION_SOURCE_HEADER] == "manager"
         assert "parent_session_id" not in json.loads(request.content)

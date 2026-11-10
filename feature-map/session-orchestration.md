@@ -25,6 +25,12 @@ MCP independent creation.
   creates, even if an enable is also listed, and hides the Automations page's
   trigger templates (`/v1/info` reports `features.session_orchestration`). Restart every server replica to
   apply it. Already accepted tasks may finish; ordinary reads and child work remain.
+- `messaging-control`: Settings → Sharing → Agent messaging controls new peer
+  sends immediately and persists across restarts. `-peer_session_messaging` in
+  the server's `OMNIGENT_FEATURES` also refuses them and locks the admin switch;
+  in the host/runner environment it hides the tool and refuses calls locally.
+  Neither side can override a disable on the other. Child messaging and already
+  accepted work continue; session creation keeps its separate orchestration gate.
 - `create`: `sys_session_create` retains child creation by default; `same_host`
   and `managed` placements create independent, initially private sessions.
   With `sibling_sessions` enabled they share one sidebar family and do not appear
@@ -33,6 +39,12 @@ MCP independent creation.
   sibling stays in its creator's project; a different requested project or an
   unavailable source project is rejected before creation. Project defaults do
   not override the worker's agent or placement.
+- `destinations`: Settings → Admin → General → **Nested agent destinations** limits new
+  agents to the current host, the current host or a fresh managed sandbox, or
+  any available host. The server enforces the same choice for the composer,
+  uploaded custom agents, direct API calls, MCP, later host launches, and runner reassignment. Failed
+  relaunches retain the prior host so restricted sessions can retry. Any available host is the
+  behavior-preserving default.
 - `sharing`: sharing the sender with edit (or higher) access, including public
   edit, blocks subsequent sends and independent creates. Read-only grants,
   including public read and default-public sessions, do not: viewers cannot add
@@ -53,6 +65,8 @@ MCP independent creation.
 
 ## How to get to it (user POV)
 
+- As an admin on desktop or mobile web, open Settings → Sharing → Agent
+  messaging, or `/settings/sharing`, and toggle **Message other sessions**.
 - In an SDK session's Chat, ask the agent to send a task using
   `sys_session_message`, then inspect the destination's history.
 - In a native session's Chat or agent terminal, ask for the same operation;
@@ -65,6 +79,9 @@ MCP independent creation.
 - Use the existing Share dialog to share the sender or receiver, then repeat.
   A read-only share of the sender keeps both tools working; an edit share
   refuses them.
+- As an admin, open Settings → Admin → General and change **Nested agent destinations**.
+  Open **Add nested agent** from a session and inspect its host picker, then try the
+  same disallowed destination through the API or MCP.
 - Open an independent worker in Chat or Terminal and follow its "Created by"
   link. On mobile web, the same link is in the header. Ask the manager to list
   its sessions and match `created_by_session_id` to its own session ID.
@@ -131,8 +148,21 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   Append `-session_orchestration` to the isolated server's feature settings and
   restart it, then repeat from a private manager: expect a disabled error, no new
   task and no independent worker. Read history/info to confirm reads still work.
+- For `messaging-control`, turn the admin switch off, reload, and confirm a new
+  peer send is refused. Turn it back on and confirm delivery resumes. Check that
+  child work and a task accepted before disabling still finish. With the server
+  flag disabled, the switch stays off and unavailable; with only the runner flag
+  disabled, a new SDK/native session omits `sys_session_message`. Restart the
+  affected server or host/runner after environment changes. Component coverage is
+  in `web/src/pages/SharingPage.test.tsx`, `tests/tools/test_manager.py`,
+  `tests/runner/test_session_orchestration.py`, and
+  `tests/server/integration/test_session_orchestration.py`; persisted settings and
+  storage failures are covered by `tests/server/routes/test_sessions_sharing_mode.py`.
 - Live sandbox provisioning and native terminal-entered prompts require separate
   verification; local process checks do not cover them.
+- Admin/UI component tests cover all three destination modes; server integration
+  tests cover the matching current/other/managed/unbound admission matrix, and
+  runner tests cover MCP refusal before creation.
 
 ## Gotchas
 
@@ -162,6 +192,9 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   the runner; independent creation has no automatic routing fallback.
 - Independent creation uses `/v1/sessions/orchestrated`, which requires a source;
   older servers cannot silently accept the request as ordinary session creation.
+- A fresh managed sandbox is distinct from reusing an existing managed host.
+  Even the most permissive setting offers only the clicked session's existing
+  managed host; another family's managed host remains unavailable.
 - A receiver shared with edit access can continue working but cannot message
   back while shared that way. A read-only share does not stop it.
 - Privacy checks govern these tools. They do not confine arbitrary code holding

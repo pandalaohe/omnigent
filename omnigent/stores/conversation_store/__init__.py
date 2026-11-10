@@ -3225,6 +3225,7 @@ class ConversationStore(ABC):
         :param worktree: Optional working tree when it differs from
             ``workspace``, e.g. a worktree placed inside the project
             entry. ``None`` leaves the column NULL.
+        :param git_branch: Optional branch associated with ``workspace``.
         :param terminal_launch_args: Optional pass-through CLI args
             for a native terminal wrapper (claude / codex), e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves

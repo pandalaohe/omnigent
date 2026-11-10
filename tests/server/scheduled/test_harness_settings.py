@@ -34,10 +34,31 @@ async def test_sdk_agent_without_a_spec_mode_can_be_saved(harness: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_sdk_agent_whose_spec_bypasses_approval_cannot_be_saved() -> None:
-    with pytest.raises(OmnigentError, match="bypassPermissions"):
+async def test_sdk_agent_whose_spec_uses_a_registered_mode_can_be_saved() -> None:
+    await validate_scheduled_permission_support(
+        permission_mode=None,
+        agent=_AGENT,
+        agent_cache=_AgentCache("claude-sdk", "bypassPermissions"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_sdk_agent_with_unknown_default_cannot_be_saved() -> None:
+    with pytest.raises(OmnigentError, match="not-a-registered-mode"):
         await validate_scheduled_permission_support(
             permission_mode=None,
             agent=_AGENT,
-            agent_cache=_AgentCache("claude-sdk", "bypassPermissions"),
+            agent_cache=_AgentCache("claude-sdk", "not-a-registered-mode"),
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "mode"),
+    [("claude-native", "bypassPermissions"), ("codex-native", "full-access")],
+)
+async def test_explicit_approval_skipping_mode_can_be_saved(harness: str, mode: str) -> None:
+    """A mode the task selects itself is shown in its settings, so it may skip approval."""
+    await validate_scheduled_permission_support(
+        permission_mode=mode, agent=_AGENT, agent_cache=_AgentCache(harness, None)
+    )

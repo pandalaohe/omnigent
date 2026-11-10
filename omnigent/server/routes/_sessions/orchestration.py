@@ -56,6 +56,7 @@ from omnigent.entities.subagent_terminal import TurnIdentity
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
+    HARNESS_CLI_UNRESPONSIVE,
     HARNESS_NEEDS_AUTH,
     HARNESS_TMUX_UNAVAILABLE,
     HARNESS_VERSION_TOO_LOW,
@@ -13892,14 +13893,15 @@ def _native_subagent_wrapper_labels(
     return _native_subagent_wrapper_labels_from_spec(sub_spec)
 
 
-# Host readiness values that mean the native CLI cannot launch. A routed
-# session landing on a missing or unauthenticated binary, or on a host without a
-# usable tmux, would fail to open its terminal, so those harnesses are never
-# offered to Smart Routing.
+# Host readiness values that keep a native harness out of Smart Routing. A
+# routed session landing on a missing or unauthenticated binary, or on a host
+# without a usable tmux, would fail to open its terminal. An unresponsive CLI may
+# be stuck at a setup prompt, so routing never picks it either.
 _NATIVE_UNAVAILABLE_READINESS: frozenset[object] = frozenset(
     {
         False,
         HARNESS_BINARY_MISSING,
+        HARNESS_CLI_UNRESPONSIVE,
         HARNESS_NEEDS_AUTH,
         HARNESS_VERSION_TOO_LOW,
         HARNESS_TMUX_UNAVAILABLE,
@@ -16366,9 +16368,9 @@ def _create_session_from_bundle(
     spec: AgentSpec | None = None,
     inference_snapshot: dict[str, Any] | None = None,
     inference_model: str | None = None,
+    git_branch: str | None = None,
     created_by: str | None = None,
     worktree: str | None = None,
-    git_branch: str | None = None,
     agent_store: AgentStore | None = None,
     project_admission: Literal["reject", "inherit"] = "reject",
 ) -> CreatedSessionResponse:
@@ -16522,9 +16524,9 @@ def _create_session_from_bundle(
         runner_id=runner_id,
         inference_snapshot=inference_snapshot,
         inference_model=inference_model,
+        git_branch=git_branch,
         created_by=created_by,
         worktree=worktree,
-        git_branch=git_branch,
         project_admission=project_admission,
     )
 

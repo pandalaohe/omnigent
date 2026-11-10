@@ -1192,6 +1192,7 @@ function SideChatComposer({
                   voiceEditsRef.current.clear();
                   for (const [id, edit] of edits) editText(id, edit.before);
                 }}
+                inputRef={textareaRef}
                 onTranscript={(spoken) => dictation.appendFinal(spoken)}
                 onInterim={(spoken) => dictation.replaceInterim(spoken)}
               />

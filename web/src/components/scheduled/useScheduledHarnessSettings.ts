@@ -14,7 +14,10 @@ import {
   nativeAgentHasModelSettings,
   nativeCodingAgentForAvailableAgent,
 } from "@/lib/nativeCodingAgents";
-import { nativePermissionOptions } from "@/lib/nativeHarnessModes";
+import {
+  APPROVAL_SKIPPING_PERMISSION_MODES,
+  nativePermissionOptions,
+} from "@/lib/nativeHarnessModes";
 import { nativeEffortOptions } from "@/components/HarnessConfigControls";
 import { harnessUnconfiguredOnHost } from "@/lib/harnessSetup";
 import type { NativeModelOption } from "@/lib/types";
@@ -25,6 +28,11 @@ import { startEffortLevelsFor } from "@/lib/modelEffortOptions";
 import { normalizeEffortLabel } from "@/lib/composerModelLabel";
 
 const EMPTY_MODELS: NativeModelOption[] = [];
+
+/** Whether the server accepts automation modes that skip approval; older ones may reject them. */
+export function acceptsApprovalSkippingModes(info: ReturnType<typeof useServerInfo>): boolean {
+  return info !== "loading" && info.scheduled_task_approval_skipping_modes === true;
+}
 
 /** Resolve choices for the automation's execution target without launching it. */
 export function useScheduledHarnessSettings(
@@ -130,6 +138,7 @@ export function useScheduledHarnessSettings(
   const supportsHarnessPermissions =
     harness === "claude-native" ||
     (info !== "loading" && info.scheduled_task_harness_settings === true);
+  const approvalSkippingAccepted = acceptsApprovalSkippingModes(info);
   const permissions =
     harness && sessionModeHandler(harness, "permission", harnessCapabilities)
       ? sessionDefaultModeOptions(
@@ -143,6 +152,9 @@ export function useScheduledHarnessSettings(
       : supportsHarnessPermissions
         ? nativePermissionOptions(harness)
         : [];
+  const offeredPermissions = permissions.filter(
+    (option) => approvalSkippingAccepted || !APPROVAL_SKIPPING_PERMISSION_MODES.has(option.value),
+  );
   const speedOptions = harness
     ? sessionDefaultModeOptions(harness, "speed", models, model, "create", harnessCapabilities)
     : [];
@@ -166,7 +178,7 @@ export function useScheduledHarnessSettings(
     models,
     efforts,
     effortsForModel,
-    permissions,
+    permissions: offeredPermissions,
     speedOptions,
     catalogMessage,
     blockedReason,

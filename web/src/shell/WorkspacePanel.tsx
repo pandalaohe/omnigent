@@ -79,6 +79,7 @@ import { ArchiveLibraryRail } from "@/components/archive/ArchiveLibraryRail";
 import { browserViewId, useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useInertRef } from "@/hooks/useInertRef";
 import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
+import { requestSandboxWake } from "@/hooks/useSandboxAutoWake";
 import { useWorkspaceTabHotkeys } from "@/hooks/useWorkspaceTabHotkeys";
 import { useSideChats } from "@/hooks/useSideChats";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -1558,6 +1559,11 @@ function WorkspacePanelImpl({
     return binding ? shortcutAriaKeys(binding) : undefined;
   };
   const selectPermanentTab = (tab: RightRailTab) => {
+    // Files, Changes and Pull Requests need the session's host, so picking one wakes
+    // an asleep sandbox.
+    if ((tab === "files" || tab === "changes" || tab === "github") && conversationId) {
+      requestSandboxWake(conversationId);
+    }
     onRightRailTabChange(tab);
   };
   useWorkspaceTabHotkeys((tabNumber) => {
@@ -2092,7 +2098,7 @@ function WorkspacePanelImpl({
                         aria-label={label}
                         aria-selected={active}
                         className="flex items-center gap-1"
-                        onClick={() => onRightRailTabChange(tab)}
+                        onClick={() => selectPermanentTab(tab)}
                         onAuxClick={(event) => {
                           if (event.button === 1) {
                             event.preventDefault();

@@ -77,15 +77,12 @@ async def scheduled_agent_default_permission_mode(agent: Any, agent_cache: Any) 
     return None if configured is None else str(configured)
 
 
-async def validate_scheduled_agent_default_permission(*, agent: Any, agent_cache: Any) -> None:
-    """Reject an agent whose own default names an unknown permission mode."""
+async def inherited_approval_skipping_problem(agent: Any, agent_cache: Any) -> str | None:
+    """Return a problem only when the inherited default names an unknown mode."""
     mode = await scheduled_agent_default_permission_mode(agent, agent_cache)
-    if not unattended_permission_mode_allowed(mode):
-        raise OmnigentError(
-            UNATTENDED_PERMISSION_MODE_MESSAGE.format(mode=mode)
-            + " (set by the agent; set permission_mode in the agent spec)",
-            code=ErrorCode.INVALID_INPUT,
-        )
+    if unattended_permission_mode_allowed(mode):
+        return None
+    return UNATTENDED_PERMISSION_MODE_MESSAGE.format(mode=mode)
 
 
 async def validate_scheduled_permission_support(
@@ -93,7 +90,9 @@ async def validate_scheduled_permission_support(
 ) -> None:
     """Reject modes belonging to a different harness or an unknown agent default."""
     if permission_mode is None:
-        await validate_scheduled_agent_default_permission(agent=agent, agent_cache=agent_cache)
+        problem = await inherited_approval_skipping_problem(agent, agent_cache)
+        if problem is not None:
+            raise OmnigentError(problem, code=ErrorCode.INVALID_INPUT)
         return
     harness = await scheduled_agent_harness(agent, agent_cache)
     if harness is None:

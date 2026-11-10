@@ -10,7 +10,13 @@ import pytest
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
-from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
+from omnigent.server.feature_flags import (
+    FEATURES_ENV_VAR,
+    Feature,
+    FeatureFlags,
+    resolve_feature_flags,
+)
+from omnigent.server.sharing_settings import write_peer_session_messaging_override
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
@@ -59,7 +65,8 @@ def collaboration_stores(db_uri, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def orchestration_environment(monkeypatch, request):
+def orchestration_environment(monkeypatch, request, tmp_path):
+    monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "admin-credentials"))
     features = getattr(request, "param", None)
     if features is None:
         monkeypatch.setenv("OMNIGENT_FEATURES", "session_peer_messaging")
@@ -220,7 +227,7 @@ async def test_independent_creation_respects_child_open_restriction(
 @pytest.mark.parametrize("policy_denied", [False, True])
 @pytest.mark.parametrize(
     "orchestration_environment",
-    [None, "", "usage_page", "-session_orchestration"],
+    [None, "", "usage_page", "peer_session_messaging", "-session_orchestration"],
     indirect=True,
 )
 async def test_private_sender_can_message_shared_receiver(
@@ -229,6 +236,8 @@ async def test_private_sender_can_message_shared_receiver(
     from omnigent.server.routes.sessions import routes_events
 
     source, target, captured = peers
+    # The server snapshot is already built; leave the runner at its default.
+    monkeypatch.delenv(FEATURES_ENV_VAR, raising=False)
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("bob")
     permissions.grant("bob", target["id"], LEVEL_READ)
@@ -256,6 +265,42 @@ async def test_private_sender_can_message_shared_receiver(
     store = SqlAlchemyConversationStore(db_uri)
     assert store.get_conversation(target["id"]).parent_conversation_id is None
     assert store.get_conversation(source["id"]).parent_conversation_id is None
+
+
+@pytest.mark.parametrize("runner_features", [None, "peer_session_messaging"])
+async def test_server_can_disable_peer_messaging(
+    auth_client, auth_app, peers, monkeypatch, runner_features
+):
+    source, target, captured = peers
+    auth_app.state.feature_flags = resolve_feature_flags(
+        {FEATURES_ENV_VAR: "-peer_session_messaging"}
+    )
+    if runner_features is not None:
+        monkeypatch.setenv(FEATURES_ENV_VAR, runner_features)
+    result = await _send(auth_client, source, target)
+    assert "Messaging other sessions is disabled" in result["detail"], result
+    assert not captured.get("posts")
+
+
+async def test_admin_can_disable_and_restore_peer_messaging(auth_client, peers, db_uri):
+    source, target, captured = peers
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("admin", is_admin=True)
+    admin_headers = {"X-Forwarded-Email": "admin"}
+    for enabled in (False, True):
+        response = await auth_client.put(
+            "/v1/sharing",
+            headers=admin_headers,
+            json={"peer_session_messaging": enabled},
+        )
+        assert response.status_code == 200, response.text
+        captured.clear()
+        result = await _send(auth_client, source, target)
+        if enabled:
+            assert result.get("queued") is True, result
+        else:
+            assert "Messaging other sessions is disabled" in result["detail"]
+            assert not captured.get("posts")
 
 
 async def test_runner_is_trusted_for_other_owned_sessions_it_hosts(auth_client, peers, db_uri):
@@ -408,8 +453,9 @@ async def test_editor_beyond_first_grant_page_blocks_controls(auth_client, peers
 @pytest.mark.parametrize(
     "orchestration_environment", [None, "-session_peer_messaging"], indirect=True
 )
+@pytest.mark.parametrize("restriction", ["sharing", "admin_messaging"])
 async def test_sharing_during_receiver_startup_blocks_delivery(
-    auth_client, peers, db_uri, monkeypatch, superseded
+    auth_client, peers, db_uri, monkeypatch, superseded, restriction
 ):
     from omnigent.server.routes import sessions
 
@@ -437,7 +483,10 @@ async def test_sharing_during_receiver_startup_blocks_delivery(
     async def share_while_starting(*args, **kwargs):
         nonlocal relay_calls
         relay_calls += 1
-        permissions.grant("bob", source["id"], LEVEL_EDIT)
+        if restriction == "sharing":
+            permissions.grant("bob", source["id"], LEVEL_EDIT)
+        else:
+            write_peer_session_messaging_override(False)
 
     monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", share_while_starting)
     result = await _send(auth_client, source, target)
@@ -445,7 +494,12 @@ async def test_sharing_during_receiver_startup_blocks_delivery(
     # The relay hook runs after the admission check; the recheck behind it
     # refuses the now-shared sender. The inline path answers with that error and
     # the durable path records it on the peer record; neither may deliver.
-    assert "shared with edit access cannot" in json.dumps(result), result
+    refusal = (
+        "shared with edit access cannot"
+        if restriction == "sharing"
+        else "Peer session messaging is disabled"
+    )
+    assert refusal in json.dumps(result), result
     assert result.get("disposition") != "delivered", result
     assert not any("/events" in path for path, _ in captured.get("posts", []))
     items = await auth_client.get(f"/v1/sessions/{receiver_id}/items")
@@ -1167,9 +1221,12 @@ async def test_orchestrated_endpoint_requires_source(auth_client, peers, monkeyp
     assert response.status_code == 403, response.text
 
 
-@pytest.mark.parametrize("share_before_admission", [False, True])
+@pytest.mark.parametrize(
+    "restriction,before_admission",
+    [("sharing", False), ("sharing", True), ("admin_messaging", False)],
+)
 async def test_startup_queue_admission_and_replay(
-    auth_client, auth_app, peers, db_uri, monkeypatch, share_before_admission
+    auth_client, auth_app, peers, db_uri, monkeypatch, restriction, before_admission
 ):
     from omnigent.server.startup_inputs import STARTUP_LABEL
 
@@ -1180,35 +1237,43 @@ async def test_startup_queue_admission_and_replay(
     permissions.ensure_user("bob")
     startup = auth_app.state.startup_inputs
     accepts = startup.accepts
+    refusal = (
+        "shared with edit access cannot"
+        if restriction == "sharing"
+        else "Messaging other sessions is disabled"
+    )
+
+    def restrict_source():
+        if restriction == "sharing":
+            permissions.grant("bob", source["id"], LEVEL_EDIT)
+        else:
+            write_peer_session_messaging_override(False)
 
     async def check_startup(*args):
         result = await accepts(*args)
         assert result is True
-        if share_before_admission:
-            permissions.grant("bob", source["id"], LEVEL_EDIT)
+        if before_admission:
+            restrict_source()
         return result
 
     monkeypatch.setattr(startup, "accepts", check_startup)
     result = await _send(auth_client, source, target)
     pending = store.list_pending_inputs(target["id"])
     assert not captured.get("posts")
-    if share_before_admission:
-        assert result["queued"] is False and "shared with edit access cannot" in result["error"]
+    if before_admission:
+        assert refusal in json.dumps(result), result
         assert pending == []
     else:
         assert result["queued"] is True
         assert len(pending) == 1
-        permissions.grant("bob", source["id"], LEVEL_EDIT)
+        restrict_source()
         await startup._deliver(auth_app, target["id"], pending[0])
         await startup._deliver(auth_app, target["id"], pending[0])
         delivered = [body for path, body in captured.get("posts", []) if path.endswith("/events")]
         assert len(delivered) == 1
         assert f"[Peer message from session {source['id']} msg=" in json.dumps(delivered)
         assert store.list_pending_inputs(target["id"]) == []
-        assert (
-            "shared with edit access cannot"
-            in (await _send(auth_client, source, target))["detail"]
-        )
+        assert refusal in (await _send(auth_client, source, target))["detail"]
 
 
 @pytest.mark.parametrize("two_replica_stack", ["authenticated"], indirect=True)
@@ -1842,6 +1907,171 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
         "/v1/sessions", json={"agent_id": source["agent_id"], **metadata}
     )
     assert response.status_code == 403, response.text
+
+
+@pytest.mark.parametrize(
+    "policy,target,allowed,transport",
+    [
+        (policy, target, allowed, transport)
+        for policy, target, allowed in [
+            ("current_host", "current", True),
+            ("current_host", "other", False),
+            ("current_host", "managed", False),
+            ("current_host", "unbound", False),
+            ("current_host_or_new_sandbox", "current", True),
+            ("current_host_or_new_sandbox", "other", False),
+            ("current_host_or_new_sandbox", "managed", True),
+            ("current_host_or_new_sandbox", "unbound", False),
+            ("any_host", "current", True),
+            ("any_host", "other", True),
+            ("any_host", "managed", True),
+            ("any_host", "unbound", True),
+        ]
+        for transport in ("json", "bundled", "orchestrated")
+        if transport != "orchestrated" or target in {"current", "managed"}
+    ],
+)
+async def test_sibling_destination_policy_is_enforced_before_creation(
+    auth_client, auth_app, peers, db_uri, monkeypatch, policy, target, allowed, transport
+):
+    from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.server.sharing_settings import SiblingSessionDestinations
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    source, _, _ = peers
+    source_host, other_host = uuid4().hex, uuid4().hex
+    for host_id in (source_host, other_host):
+        _register_online_host(auth_app, host_id, "alice")
+        auth_app.state.host_store.upsert_on_connect(host_id, host_id, "alice")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(source["id"], source_host, workspace="/source")
+    auth_app.state.sibling_session_destinations = lambda: SiblingSessionDestinations(policy)
+
+    traffic = []
+
+    def answer_host(connection, payload):
+        traffic.append(payload)
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+        else:
+            pytest.fail(f"Unexpected host frame: {frame}")
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+
+    async def finish_managed_launch(**kwargs):
+        traffic.append(kwargs)
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", finish_managed_launch)
+    body = {"agent_id": source["agent_id"], "sibling_source_id": source["id"]}
+    if target in {"current", "other"}:
+        body.update(
+            {
+                "host_id": source_host if target == "current" else other_host,
+                "workspace": f"/{target}",
+            }
+        )
+    elif target == "managed":
+        body["host_type"] = "managed"
+
+    before = {session.id for session in store.list_conversations().data}
+    if transport == "bundled":
+        from tests.server.integration.test_sessions_permissions import build_agent_bundle
+
+        body.pop("agent_id")
+        response = await auth_client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps(body)},
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    build_agent_bundle(name="policy-worker"),
+                    "application/gzip",
+                )
+            },
+        )
+    elif transport == "orchestrated":
+        from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+
+        # Runners identify the source through the header; the server derives placement.
+        for key in ("sibling_source_id", "host_id", "workspace"):
+            body.pop(key, None)
+        response = await auth_client.post(
+            "/v1/sessions/orchestrated",
+            json=body,
+            headers={
+                ORCHESTRATION_SOURCE_HEADER: source["id"],
+            },
+        )
+    else:
+        response = await auth_client.post("/v1/sessions", json=body)
+    assert response.status_code == (201 if allowed else 403), response.text
+    created = {session.id for session in store.list_conversations().data} - before
+    assert len(created) == int(allowed)
+    if not allowed:
+        assert "server policy" in response.text
+        assert traffic == []
+
+
+@pytest.mark.parametrize(
+    "policy,binding,enabled,allowed",
+    [
+        (policy, binding, True, binding == "same")
+        for policy in ("current_host", "current_host_or_new_sandbox")
+        for binding in ("same", "other", "unbound", "unknown", "ambiguous")
+    ]
+    + [
+        ("any_host", "unbound", True, True),
+        ("current_host", "unbound", False, True),
+    ],
+)
+async def test_sibling_destination_policy_checks_runner_reassignment(
+    auth_client, auth_app, peers, db_uri, policy, binding, enabled, allowed
+):
+    from omnigent.server.sharing_settings import SiblingSessionDestinations
+
+    source, target, captured = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id = uuid4().hex
+    if binding != "unknown":
+        store.set_host_id(source["id"], host_id, workspace="/source")
+    if binding != "unbound":
+        target_host = uuid4().hex if binding == "other" else host_id
+        store.set_host_id(target["id"], target_host, workspace="/target")
+    runner_id = store.get_conversation(source["id"]).runner_id
+    if binding == "ambiguous":
+        store.create_conversation(
+            agent_id=None, host_id=uuid4().hex, workspace="/other", runner_id=runner_id
+        )
+    store.add_new_sibling(source["id"], target["id"], user_id="alice")
+    auth_app.state.sibling_session_destinations = lambda: SiblingSessionDestinations(policy)
+    if not enabled:
+        auth_app.state.feature_flags = resolve_feature_flags(
+            {FEATURES_ENV_VAR: "-sibling_sessions"}
+        )
+    previous = store.get_conversation(target["id"])
+    captured.clear()
+
+    response = await auth_client.patch(
+        f"/v1/sessions/{target['id']}", json={"runner_id": runner_id}
+    )
+
+    assert response.status_code == (200 if allowed else 403), response.text
+    saved = store.get_conversation(target["id"])
+    assert saved.host_id == previous.host_id
+    assert saved.workspace == previous.workspace
+    if allowed:
+        assert saved.runner_id == runner_id
+        assert captured.get("posts")
+    else:
+        assert saved.runner_id == previous.runner_id
+        assert "server policy" in response.text
+        assert not captured.get("posts")
 
 
 async def test_family_project_removal_precedes_archive(auth_client, peers, db_uri):

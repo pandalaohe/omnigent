@@ -67,6 +67,7 @@ const mocks = vi.hoisted(() => ({
   // single_user: explicit single-user marker; false for accounts/OIDC/
   // multi-user-header. Gates the settings-route single-user redirect.
   singleUser: false,
+  nestedAgents: false,
   // Identity from the mode-agnostic `/v1/me` probe (resolveIdentity returns
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
@@ -108,6 +109,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     worktree_status: mocks.worktreeStatusEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
+    sibling_sessions: mocks.nestedAgents,
     enabled_connections: mocks.enabledConnections,
     usage_board_enabled: mocks.usageBoardEnabled,
     task_board_enabled: mocks.taskBoardEnabled,
@@ -303,6 +305,9 @@ vi.mock("@/pages/MembersPage", () => ({
 vi.mock("@/pages/PoliciesPage", () => ({
   PoliciesPage: () => <div>policies-page-stub</div>,
 }));
+vi.mock("@/pages/AdminGeneralPage", () => ({
+  AdminGeneralPage: () => <div>admin-general-page-stub</div>,
+}));
 vi.mock("@/components/McpRegistry", () => ({
   McpRegistryConnections: () => <div>mcp-accounts-stub</div>,
 }));
@@ -410,6 +415,7 @@ beforeEach(() => {
   mocks.isEmbedded = false;
   mocks.accountsEnabled = true;
   mocks.worktreeStatusEnabled = false;
+  mocks.nestedAgents = false;
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
   mocks.realContextUsage = false;
@@ -2006,6 +2012,12 @@ describe("SettingsPage", () => {
     renderPage("/settings/policies");
     expect(await screen.findByText("policies-page-stub")).toBeInTheDocument();
     expect(screen.queryByText("members-page-stub")).toBeNull();
+  });
+
+  it("renders Admin General at /settings/admin", async () => {
+    mocks.nestedAgents = true;
+    renderPage("/settings/admin");
+    expect(await screen.findByText("admin-general-page-stub")).toBeInTheDocument();
   });
 
   it("still renders the admin sections when accounts is off (OIDC)", async () => {

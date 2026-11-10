@@ -297,6 +297,9 @@ class ServerInfoResponse(BaseModel):
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
     public_sharing_max_level: Literal["read", "edit"] = "read"
+    sibling_session_destinations: Literal[
+        "current_host", "current_host_or_new_sandbox", "any_host"
+    ] = "any_host"
     server_version: str
     smart_routing_enabled: bool
     smart_routing_sources: SmartRoutingSourcesInfo
@@ -326,9 +329,14 @@ class ServerInfoResponse(BaseModel):
     automation_trigger_poll_minutes: int = 10
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True
+    # Scheduled tasks accept explicit modes that skip approval; servers that omit
+    # this may reject them, so clients hide those modes.
+    scheduled_task_approval_skipping_modes: bool = True
     scheduled_task_sandbox_workspaces: bool = True
     # Owner-private families and reuse of the source session's sandbox.
     sibling_sessions: bool = False
+    # Uploaded-agent sessions accept repository lists and worktree options.
+    session_bundle_workspaces: bool = True
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
     # older servers reject it.
     request_managed_sandbox_host_id: bool = True
@@ -2068,7 +2076,10 @@ def create_app(
 
     configure_host_sharding(host_sharded)
     # A tunnel this replica retires on purpose is a handoff, not a lost runner.
-    tunnel_registry = TunnelRegistry(on_retire=shutdown_state.note_runner_tunnel_retired)
+    tunnel_registry = TunnelRegistry(
+        on_retire=shutdown_state.note_runner_tunnel_retired,
+        on_work_dispatched=managed_host_keepalive.record_work_dispatched,
+    )
     host_registry = HostRegistry()
     runner_router = RunnerRouter(
         registry=tunnel_registry,
@@ -2527,6 +2538,7 @@ def create_app(
             from omnigent.server.scheduled.fire import (
                 ClaimedRunExecutor,
                 FireDeps,
+                build_busy_until,
                 build_on_fire,
                 build_run_now,
             )
@@ -2584,6 +2596,10 @@ def create_app(
                     owned_hosts=dispatch_hooks.owned_hosts,
                     dispatch_enabled=dispatch_hooks.dispatch_enabled,
                     poll_interval=dispatch_hooks.poll_interval,
+                    # Skipping assumes the built-in executor's continued-session delivery.
+                    busy_until=(
+                        build_busy_until(fire_deps) if dispatch_hooks.on_fire is None else None
+                    ),
                     poll_seconds=dispatch_config.poll_seconds,
                     renewal_seconds=dispatch_config.renewal_seconds,
                     lease_seconds=dispatch_config.lease_seconds,
@@ -3205,6 +3221,15 @@ def create_app(
         _default_public_static = DefaultPublicSessions.coerce(default_public_sessions)
         app.state.default_public_sessions = lambda: _default_public_static
         app.state.default_public_sessions_writable = False
+    from omnigent.server.sharing_settings import (
+        SiblingSessionDestinations,
+        read_sibling_session_destinations_override,
+    )
+
+    def _resolve_sibling_session_destinations() -> SiblingSessionDestinations:
+        return read_sibling_session_destinations_override() or SiblingSessionDestinations.ANY_HOST
+
+    app.state.sibling_session_destinations = _resolve_sibling_session_destinations
     from omnigent.server.server_config import parse_filesystem_attachment_policy
 
     if callable(filesystem_attachment_allowed_extensions):
@@ -4324,6 +4349,7 @@ def create_app(
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
                 "public_sharing_max_level": app.state.public_sharing_max_level().value,
+                "sibling_session_destinations": app.state.sibling_session_destinations().value,
                 "server_version": _server_version(),
                 "smart_routing_enabled": smart_routing_enabled,
                 "smart_routing_sources": smart_routing_sources,

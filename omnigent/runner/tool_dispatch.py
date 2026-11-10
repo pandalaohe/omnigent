@@ -102,7 +102,10 @@ from omnigent.tools.builtins.os_env import (
 from omnigent.tools.builtins.panel import OpenInPanelTool
 from omnigent.tools.builtins.session_archive import SysSessionArchiveTool, SysSessionUnarchiveTool
 from omnigent.tools.builtins.session_handover import SysSessionHandoverTool
-from omnigent.tools.builtins.session_message import SysSessionMessageTool
+from omnigent.tools.builtins.session_message import (
+    SysSessionMessageTool,
+    peer_session_messaging_enabled,
+)
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -796,6 +799,8 @@ def build_native_relay_tool_schemas(
             OpenInPanelTool,
             AskUserAsyncTool,
         ):
+            if _cls is SysSessionMessageTool and not peer_session_messaging_enabled():
+                continue
             fallback_schema = _string_object_dict(_cls().get_schema())
             if fallback_schema is None:
                 continue
@@ -6228,6 +6233,16 @@ async def _execute_session_create_impl(
             info = await server_client.get("/v1/info")
             info.raise_for_status()
             info_data = info.json()
+            if (
+                info_data.get("sibling_sessions") is True
+                and info_data.get("sibling_session_destinations") == "current_host"
+            ):
+                return json.dumps(
+                    {
+                        "error": "Server policy only allows Add nested agent on the current host; "
+                        "no session was created."
+                    }
+                )
             if selection.get("sandbox_profile_id"):
                 features = info_data.get("features") if isinstance(info_data, dict) else None
                 if not isinstance(features, dict) or features.get("sandbox_profiles") is not True:

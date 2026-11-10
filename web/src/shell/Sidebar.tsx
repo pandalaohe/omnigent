@@ -138,7 +138,7 @@ import {
   useRebasePath,
   useSearchParams,
 } from "@/lib/routing";
-import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
+import { SidebarHeaderActions, SidebarSearchButton } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
 import { OmniGlassSurface } from "@/components/OmniGlassSurface";
@@ -277,8 +277,13 @@ import {
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import {
+  isSideBySideSidebarViewport,
+  useIsSideBySideSidebarViewport,
+} from "@/hooks/useIsSideBySideSidebarViewport";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useSidebarSwipeToClose } from "@/hooks/useSidebarSwipeToClose";
+import { useSidebarSwipeToOpen } from "@/hooks/useSidebarSwipeToOpen";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
@@ -286,7 +291,12 @@ import { useSessionPollingHotkeys } from "@/hooks/useSessionPollingHotkeys";
 import { SESSION_HOTKEY_DIGITS } from "@/hooks/useSessionNumberHotkeys";
 import { useCommandHoldStore, useCommandHoldTracking } from "@/hooks/useCommandHold";
 import { type DesktopCommand, useAvailableDesktopCommands } from "@/lib/desktopCommands";
-import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
+import {
+  isAndroidShell,
+  isElectronShell,
+  isIOSShell,
+  isMacElectronShell,
+} from "@/lib/nativeBridge";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
   type SessionFilter,
@@ -1062,7 +1072,7 @@ function SidebarImpl({
     if (e.defaultPrevented) return;
     if (e.button !== 0) return;
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-    if (isMobileViewport()) onClose();
+    if (isMobileViewport() && !isSideBySideSidebarViewport()) onClose();
   });
 
   // Which top-level nav button to highlight for the current route.
@@ -1229,13 +1239,29 @@ function SidebarImpl({
   // full-screen overlay (``fixed inset-0``) and the variable is ignored.
   const { width: sidebarWidth, resizing, handleProps: resizeHandleProps } = useResizableSidebar();
 
-  // On the open mobile drawer, a leftward swipe slides it shut under the
-  // finger, reusing the open swipe's progress rendering below.
+  // On the mobile layout, a leftward swipe on the open drawer slides it shut and
+  // a rightward swipe across the chat slides the closed one open, both under
+  // the finger, reusing the iOS edge swipe's progress rendering below.
   const drawerRef = useRef<HTMLElement>(null);
   const scrimRef = useRef<HTMLButtonElement>(null);
   const [closeSwipeProgress, setCloseSwipeProgress] = useState<number | null>(null);
+  const [openSwipeProgress, setOpenSwipeProgress] = useState<number | null>(null);
   const mobileLayout = useIsMobileViewport();
+  // A wide phone (unfolded foldable, landscape) docks the open sidebar beside
+  // the chat instead of over it. Settings keeps its full-bleed drawer.
+  const sideBySide = useIsSideBySideSidebarViewport() && !inSettings;
   const closeSwipeEnabled = open && mobileLayout && !inSettings && dragProgress == null;
+  const openSwipeEnabled = !open && !peek && mobileLayout && !inSettings && dragProgress == null;
+  useSidebarSwipeToOpen({
+    enabled: openSwipeEnabled,
+    drawerRef,
+    surfaceSelector: ".app-shell",
+    holdMs: SIDEBAR_TOUCH_SENSOR_OPTIONS.activationConstraint.delay,
+    onDragProgress: setOpenSwipeProgress,
+    onSettle: (shouldOpen) => {
+      if (shouldOpen) onOpen?.();
+    },
+  });
   useSidebarSwipeToClose({
     enabled: closeSwipeEnabled,
     drawerRef,
@@ -1246,12 +1272,16 @@ function SidebarImpl({
       if (close) onClose();
     },
   });
-  const liveDragProgress = dragProgress ?? (closeSwipeEnabled ? closeSwipeProgress : null);
+  const liveDragProgress =
+    dragProgress ??
+    (closeSwipeEnabled ? closeSwipeProgress : null) ??
+    (openSwipeEnabled ? openSwipeProgress : null);
 
-  // While the iOS edge-swipe is dragging, the overlay is on-screen and
-  // interactive even though `open` hasn't flipped yet — treat a live drag as
-  // visually open so it isn't `inert`/`aria-hidden` mid-gesture.
-  const dragging = liveDragProgress != null;
+  // While a swipe is dragging, the overlay is on-screen and interactive even
+  // though `open` hasn't flipped yet — treat a live drag as visually open so it
+  // isn't `inert`/`aria-hidden` mid-gesture. The docked side-by-side sidebar
+  // can't be partially slid, so there a swipe only settles on release.
+  const dragging = liveDragProgress != null && !sideBySide;
   const effectiveOpen = open || dragging || peek;
   useLayoutEffect(() => {
     if (!effectiveOpen || !isMobileViewport() || !scrollContainerRef.current) return;
@@ -1349,7 +1379,7 @@ function SidebarImpl({
       pill) and renders after the sidebar, so a same-z peer that ever takes
       pointer events would win the tie inside the exposed strip and swallow the
       dismiss. Strictly between chat chrome and the drawer's z-50. */}
-      {!inSettings && (
+      {!inSettings && !sideBySide && (
         <button
           type="button"
           ref={scrimRef}
@@ -1405,7 +1435,7 @@ function SidebarImpl({
           // The settings nav takes the sidebar over and its "Back" row is the
           // only way out, so there the drawer stays full-bleed (and gets no
           // dismiss scrim) rather than offering a tap that strands the user.
-          !inSettings && "max-md:right-14",
+          !inSettings && !sideBySide && "max-md:right-14",
           // Mobile only: animate the slide so the iOS edge-swipe settles
           // smoothly on release. Suppressed inline while a drag is live (the
           // overlay must track the finger 1:1). Scoped to transform so it can't
@@ -1413,6 +1443,13 @@ function SidebarImpl({
           // and gated to mobile so the desktop floating card is unaffected.
           "max-md:transition-transform max-md:duration-200 max-md:ease-out",
           effectiveOpen ? "translate-x-0" : "-translate-x-full",
+          // Side by side: an in-flow panel that pushes the chat aside, opening
+          // and collapsing by width like the desktop sidebar.
+          sideBySide && [
+            "max-md:relative max-md:inset-auto max-md:z-auto max-md:shrink-0 max-md:translate-x-0 max-md:overflow-hidden",
+            "max-md:transition-[width,opacity] max-md:duration-200 max-md:ease-in-out",
+            effectiveOpen ? "max-md:w-80" : "max-md:w-0 max-md:border-0 max-md:opacity-0",
+          ],
           // Desktop: a full-height panel flush to the window edge, carrying
           // the brand gradient canvas (see html:not(.dark) .conversations-sidebar
           // in index.css) and separated from the white content by a right
@@ -1482,11 +1519,11 @@ function SidebarImpl({
           <SettingsSidebarBody onNavClick={onNavClick} />
         ) : (
           <>
-            {/* sidebar-header-row is the hook for the macOS Electron shell, where
-          this row shares the window's top strip with the traffic lights: the
-          brand mark is dropped and the actions slide left to sit beside the
-          window controls (see the [data-electron-mac] rules in index.css).
-          Inert in a browser and on other platforms, which keep the row below. */}
+            {/* sidebar-header-row is the hook for the macOS Electron shell. It
+          reserves the window's top strip for the traffic lights and title-bar
+          actions, then keeps this brand row directly below it (see the
+          [data-electron-mac] rules in index.css). Browsers and other platforms
+          keep the standard single row. */}
             {/* Mobile Search shares the floating chat controls' 16px edge inset. */}
             <div className="sidebar-header-row flex shrink-0 items-center justify-between p-4 md:h-12 md:py-0 md:pr-3">
               {unreadConversations.length > 0 && !selectionMode && (
@@ -1531,16 +1568,25 @@ function SidebarImpl({
                   />
                 )}
               </Link>
-              {/* On the macOS shell this copy is hidden and an identical cluster
-            renders in the title-bar strip instead (see AppShell), so the icons
-            keep their place when the sidebar collapses or peeks. Everywhere
-            else this is the only copy. */}
+              {isMacElectronShell() && (
+                <SidebarSearchButton
+                  onOpenSearch={onOpenSearch}
+                  className="hidden md:inline-flex"
+                  testId="electron-sidebar-search-button"
+                />
+              )}
+              {/* Hidden on the macOS shell, where Search sits by the wordmark and the
+            toggle and Back/Forward live in AppShell's title strip. */}
               <SidebarHeaderActions
                 expanded={!peek}
+                // Side by side, the chat stays in view with no dismiss strip,
+                // so the collapse toggle is the tap-to-close affordance.
+                showMobileToggle={sideBySide}
                 // onOpen is optional (the sidebar renders standalone in tests), so
                 // fall back to a no-op rather than widening the child's contract.
                 onToggle={peek ? () => onOpen?.() : onClose}
                 onOpenSearch={onOpenSearch}
+                showSettings={false}
               />
             </div>
 
@@ -1746,9 +1792,6 @@ function SidebarImpl({
               <SystemStatusPrimaryNavLink active={isSystemStatusPage} onClick={onNavClick} />
             </div>
 
-            {/* Wrapper (not the `aside`) anchors the floating Settings button:
-          absolute-positioning inside the aside would place it in the native
-          safe-area padding, under the home indicator. */}
             <div className="relative flex min-h-0 flex-1 flex-col">
               <div
                 aria-hidden="true"
@@ -1764,12 +1807,8 @@ function SidebarImpl({
                   setHasScrolled(event.currentTarget.scrollTop > 0);
                   markScrolling();
                 }}
-                // max-md:pb-16 is the floating Settings chip's clearance: the
-                // chip is a non-scrolling sibling pinned bottom-right, so
-                // without a gutter the last row's always-visible kebab parks
-                // underneath it and can't be tapped.
                 className={cn(
-                  "relative flex-1 overflow-y-auto px-2 pt-4 pb-3 max-md:pb-16",
+                  "relative flex-1 overflow-y-auto px-2 pt-4 pb-3",
                   // Reserve the gutter even when the list fits, so neither the thumb
                   // nor a section collapsing out of overflow reflows the rows.
                   "[scrollbar-gutter:stable] [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-track]:bg-transparent",
@@ -1811,22 +1850,12 @@ function SidebarImpl({
                   </p>
                 )}
               </nav>
-              {/* Mobile: Settings floats over the bottom of the session list, with
-          Search floating at the top of the header row — the two icons the
-          drawer keeps once the collapse toggle is gone. */}
-              <SidebarSettingsButton
-                testId="sidebar-settings-float"
-                className="absolute right-4 bottom-4 md:hidden"
-              />
             </div>
-
-            {/* Native-shell server picker, pinned below the scrolling session
-          list. Self-hiding: renders nothing outside a shell with the picker
-          bridge (see SidebarServerPicker), so browsers keep an unchanged
-          sidebar that ends with the list. */}
-            <SidebarServerPicker />
           </>
         )}
+        {/* Profile and Settings stay pinned below either sidebar body. Native
+            shells add their existing server-switching actions to its menu. */}
+        <SidebarServerPicker />
       </aside>
     </>
   );
@@ -2688,11 +2717,13 @@ function ConversationList({
   const { layout, saveLayout } = useSidebarLayout();
   // Host metadata is shared by every row tooltip. Resolve it once at the list
   // owner so ordinary rows do not each create their own polling observer.
-  const { data: hosts = [] } = useHosts({ includeSandbox: true });
+  const { data: hosts = [], isLoading: hostsLoading } = useHosts({ includeSandbox: true });
   const hostsById = useMemo(
     () => new Map(hosts.map((host) => [host.host_id, host] as const)),
     [hosts],
   );
+  const defaultProjectHostId =
+    hosts.find((host) => host.status === "online" && !host.sandbox_provider)?.host_id ?? null;
   // Grouping / ordering / show options from the filter menu, seeded from the
   // persisted per-device preference. With the release flag off the sidebar
   // keeps its default layout and ignores any stored choice.
@@ -5171,6 +5202,8 @@ function ConversationList({
                                       !selectionMode ? (
                                         <>
                                           <ProjectHeaderActions
+                                            hostId={defaultProjectHostId}
+                                            hostsLoading={hostsLoading}
                                             onOrderChange={(manual) => {
                                               const ranks = new Map(
                                                 projectOrder.data?.ordered_project_ids?.map(
@@ -6169,6 +6202,8 @@ function SessionFilterMenu({
 }
 
 function ProjectHeaderActions({
+  hostId,
+  hostsLoading,
   onOrderChange,
   manualOrder,
   orderDisabled,
@@ -6181,6 +6216,8 @@ function ProjectHeaderActions({
   onProjectCreated,
   onEnterSelectionMode,
 }: {
+  hostId: string | null;
+  hostsLoading: boolean;
   onOrderChange: (manual: boolean) => void;
   manualOrder: boolean;
   orderDisabled: boolean;
@@ -6204,7 +6241,7 @@ function ProjectHeaderActions({
 
   return (
     <div className="flex items-center gap-0.5">
-      <NewProjectButton onCreated={onProjectCreated} />
+      <NewProjectButton onCreated={onProjectCreated} hostId={hostId} hostsLoading={hostsLoading} />
       {showMenu && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>

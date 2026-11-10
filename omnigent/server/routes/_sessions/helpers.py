@@ -9507,8 +9507,8 @@ async def _dispatch_skill_slash_command_to_runner(
     response id:
 
     * a visible ``slash_command`` item for the UI transcript;
-    * a hidden ``message`` item with ``is_meta=True`` containing the
-      full skill instructions for runner history replay.
+    * a hidden ``message`` item with ``is_meta=True`` and ``user_authored=True``
+      containing the full skill instructions for runner history replay.
 
     Only the hidden message is sent to the runner as input. The visible
     command is published as ``response.output_item.done`` after the
@@ -9581,6 +9581,7 @@ async def _dispatch_skill_slash_command_to_runner(
             role="user",
             content=meta_content,
             is_meta=True,
+            user_authored=True,
         ),
         created_by=created_by,
     )
@@ -13577,9 +13578,9 @@ def _persist_stored_session_bundle(
     runner_id: str | None = None,
     inference_snapshot: dict[str, Any] | None = None,
     inference_model: str | None = None,
+    git_branch: str | None = None,
     created_by: str | None = None,
     worktree: str | None = None,
-    git_branch: str | None = None,
     project_admission: Literal["reject", "inherit"] = "reject",
 ) -> CreatedSessionResponse:
     """

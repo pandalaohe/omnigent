@@ -316,6 +316,31 @@ describe("Agent setup list", () => {
     expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-host", "h1");
     expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "install");
   });
+
+  it.each(["pi-native", "codex-native"])(
+    "says a CLI that missed its version check did not respond, not that it is outdated (%s)",
+    (harness) => {
+      hosts = [{ ...ONLINE, configured_harnesses: { [harness]: "cli-unresponsive" } }];
+      renderHarnesses();
+
+      expect(within(card(harness)).getByText("CLI did not respond")).toBeTruthy();
+      expect(within(card(harness)).queryByLabelText(/Out of date/)).toBeNull();
+      expect(screen.queryByTestId(`harness-action-${harness}`)).toBeNull();
+      expect(card(harness).getAttribute("href")).toBe(
+        `/settings/harnesses/${harness}?tab=settings`,
+      );
+
+      fireEvent.click(screen.getByTestId(`harness-settings-${harness}`));
+      expect(screen.getByText(/CLI on my-laptop didn’t respond to a version check/)).toBeTruthy();
+      expect(screen.queryByText(/out of date|isn’t set up/)).toBeNull();
+      expect(
+        screen.queryByRole("button", { name: /^(Update|Install|Reconfigure|Set up)$/ }),
+      ).toBeNull();
+      expect(screen.getByText("Not checked")).toBeTruthy();
+      expect(screen.getByRole("heading", { name: "Startup configuration" })).toBeTruthy();
+    },
+  );
+
   it("keeps recovery on the detail page when one-click installation is unsupported", () => {
     hosts = [{ ...ONLINE, configured_harnesses: { "cursor-native": "binary-missing" } }];
     renderHarnesses();

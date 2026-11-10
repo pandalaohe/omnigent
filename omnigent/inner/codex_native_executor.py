@@ -11,7 +11,6 @@ import logging
 import os
 import uuid
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -54,7 +53,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_mcp_startup,
     read_unmirrored_codex_settings,
     reconcile_shell_command_state,
-    update_active_turn_id,
+    record_acknowledged_turn_id,
 )
 from omnigent.harnesses.codex_native.keep_warm import (
     drive_keep_warm_ping,
@@ -665,11 +664,25 @@ async def _start_codex_turn(
 
         input_attributes = current_input_attributes()
         input_id = input_attributes.get("input_stable_id") or input_attributes.get("pending_id")
-        update_active_turn_id(
-            bridge_dir, turn_id, input_id=input_id if isinstance(input_id, str) else None
+        if record_acknowledged_turn_id(
+            bridge_dir, state, turn_id, input_id=input_id if isinstance(input_id, str) else None
+        ):
+            _logger.info("Codex native started turn: turn_id=%s", turn_id)
+        else:
+            _logger.info(
+                "Codex native turn start acknowledged after the active turn changed: turn_id=%s",
+                turn_id,
+            )
+        current = read_bridge_state(bridge_dir)
+        return (
+            current
+            if current is not None
+            and current.active_turn_id == turn_id
+            and current.session_id == state.session_id
+            and current.thread_id == state.thread_id
+            and current.socket_path == state.socket_path
+            else None
         )
-        _logger.info("Codex native started turn: turn_id=%s", turn_id)
-        return replace(state, active_turn_id=turn_id)
     return None
 
 
@@ -700,10 +713,15 @@ async def _steer_codex_turn(
 
         input_attributes = current_input_attributes()
         input_id = input_attributes.get("input_stable_id") or input_attributes.get("pending_id")
-        update_active_turn_id(
-            bridge_dir, turn_id, input_id=input_id if isinstance(input_id, str) else None
-        )
-        _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
+        if record_acknowledged_turn_id(
+            bridge_dir, state, turn_id, input_id=input_id if isinstance(input_id, str) else None
+        ):
+            _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
+        else:
+            _logger.info(
+                "Codex native steer acknowledged after the active turn changed: turn_id=%s",
+                turn_id,
+            )
 
 
 # Bound reconciliation after shell submission before releasing the injection lock.

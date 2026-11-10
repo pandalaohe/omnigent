@@ -434,6 +434,7 @@ def _no_policy_allow_body(
     caps: RuntimeCaps,
     session_id: str,
     policy_store: PolicyStore | None,
+    root_session_id: str | None = None,
     *,
     runtime_checks_apply: bool = True,
 ) -> dict[str, object]:
@@ -450,6 +451,8 @@ def _no_policy_allow_body(
     :param policy_store: The policy store the no-policy answer read.
     :param runtime_checks_apply: Keep native calls on the server while tier,
         session-restriction or required approval gates may apply.
+    :param root_session_id: The session's tree root, e.g. ``"conv_root"``,
+        whose inherited policy list the answer also read.
     :returns: The response body, e.g.
         ``{"result": "POLICY_ACTION_ALLOW", "allow_cache_seconds": 42.5}``.
     """
@@ -469,7 +472,7 @@ def _no_policy_allow_body(
         _logger.warning("native hook allow-cache window %r is not finite; not caching", seconds)
         return body
     seconds = min(seconds, MAX_ALLOW_CACHE_SECONDS)
-    seconds -= policy_specs_cache_age(session_id, policy_store)
+    seconds -= policy_specs_cache_age(session_id, policy_store, root_session_id)
     if seconds > 0:
         body[ALLOW_CACHE_FIELD] = seconds
     return body
@@ -2718,7 +2721,11 @@ def register_hooks_routes(
             conversation=conv,
         ):
             return Response(
-                content=json.dumps(_no_policy_allow_body(_caps, session_id, policy_store)),
+                content=json.dumps(
+                    _no_policy_allow_body(
+                        _caps, session_id, policy_store, conv.root_conversation_id
+                    )
+                ),
                 media_type="application/json",
             )
 

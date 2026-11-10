@@ -9767,15 +9767,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                     previous.runner_id,
                     previous.worktree,
                 )
-            if previous_host is not None and previous_host.deleted_at is not None:
-                return False
-            meta.host_id, meta.workspace, meta.git_branch, meta.worktree = (
-                previous.host_id,
-                previous.workspace,
-                previous.git_branch,
-                previous.worktree,
-            )
-            _bind_runner(meta, previous.runner_id)
+            if previous.host_id is not None and (
+                previous_host is None or previous_host.deleted_at is not None
+            ):
+                # A removed source host cannot be restored; leave the session
+                # unbound so a failed transfer can be retried.
+                meta.host_id = meta.workspace = meta.git_branch = meta.worktree = None
+                _bind_runner(meta, None)
+            else:
+                meta.host_id, meta.workspace, meta.git_branch, meta.worktree = (
+                    previous.host_id,
+                    previous.workspace,
+                    previous.git_branch,
+                    previous.worktree,
+                )
+                _bind_runner(meta, previous.runner_id)
             # Split databases retain the accepted reference if metadata rolls back;
             # deleting it first could leave a live binding without its profile.
             if previous.profile_snapshot is None and self._conv_engine is self._engine:
@@ -10149,6 +10155,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param worktree: Optional working tree when it differs from
             ``workspace``, e.g. a worktree placed inside the project
             entry. ``None`` leaves the column NULL.
+        :param git_branch: Optional branch associated with ``workspace``.
         :param terminal_launch_args: Optional pass-through CLI args
             for a native terminal wrapper (claude / codex), e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves

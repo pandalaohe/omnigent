@@ -5,8 +5,8 @@ import { useScheduleEscape } from "./useScheduleEscape";
 
 import { cn } from "@/lib/utils";
 import { pickerTriggerClass } from "./pickerStyles";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDownIcon, FolderOpenIcon, TriangleAlertIcon } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChevronDownIcon, ClockIcon, FolderOpenIcon, TriangleAlertIcon } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -30,7 +30,10 @@ import { Textarea } from "@/components/ui/textarea";
 import { SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Label } from "@/components/scheduled/Label";
 import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
-import { useScheduledHarnessSettings } from "./useScheduledHarnessSettings";
+import {
+  acceptsApprovalSkippingModes,
+  useScheduledHarnessSettings,
+} from "./useScheduledHarnessSettings";
 import { reconcileSpeed } from "@/lib/speedTiers";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
@@ -46,8 +49,10 @@ import {
   readTriggerWorkerSettings,
   renderTriggerPrompt,
   splitTriggerPrompt,
+  TRIGGER_SOURCES,
   TRIGGER_TEMPLATES,
   triggerFieldsComplete,
+  triggerServiceName,
   updateTriggerWorkerSettings,
   type TriggerFields,
   type TriggerWorkerSettings,
@@ -71,8 +76,8 @@ import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capa
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
 import { partitionPickerEntries, selectableSessionAgents } from "@/lib/agentGrouping";
 import {
+  APPROVAL_SKIPPING_PERMISSION_MODES,
   NEW_AUTOMATION_PERMISSION_MODES,
-  UNATTENDED_DISALLOWED_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
 import {
   isBackdropOverlay,
@@ -102,13 +107,26 @@ const PROVIDER_DEFAULT = "provider-default";
 const DEFAULT_AUTOMATION_PROJECT = "Omnigent Automation";
 
 type AutomationTriggerType = "schedule" | TriggerSource;
-const TRIGGER_TYPE_LABELS: Record<AutomationTriggerType, string> = {
-  schedule: "Schedule",
-  jira: "Jira",
-  slack: "Slack",
-  github: "GitHub",
-  linear: "Linear",
-};
+const AUTOMATION_TRIGGER_TYPES: readonly AutomationTriggerType[] = ["schedule", ...TRIGGER_SOURCES];
+
+/** A Trigger type option: the integration's brand mark, or a clock for a schedule. */
+function TriggerTypeOption({ type }: { type: AutomationTriggerType }) {
+  if (type === "schedule") {
+    return (
+      <>
+        <ClockIcon className="text-muted-foreground" />
+        Schedule
+      </>
+    );
+  }
+  const { icon: Icon, iconClassName } = TRIGGER_TEMPLATES[type];
+  return (
+    <>
+      <Icon className={iconClassName} />
+      {triggerServiceName(type)}
+    </>
+  );
+}
 
 interface AutomationTypeDraft {
   name: string;
@@ -119,14 +137,6 @@ interface AutomationTypeDraft {
   schedule: ScheduleModel;
   timezone: string;
   sessionMode: ScheduledTaskSessionMode;
-}
-
-/**
- * The saved mode to prefill when editing. A stored override may hold a mode
- * automations refuse; it reverts to the harness default so saving sends null.
- */
-function editablePermissionMode(mode: string | null | undefined): string {
-  return mode && !UNATTENDED_DISALLOWED_PERMISSION_MODES.has(mode) ? mode : "";
 }
 
 export function CreateScheduledTaskDialog({
@@ -164,6 +174,14 @@ export function CreateScheduledTaskDialog({
   const { data: hosts, isPending: hostsPending } = useHosts({ enabled: open });
   const { data: allProjects } = useProjectsWithArchived();
   const info = useServerInfo();
+  const approvalSkippingAccepted = acceptsApprovalSkippingModes(info);
+  const editablePermissionMode = useCallback(
+    (mode: string | null | undefined): string =>
+      mode && (approvalSkippingAccepted || !APPROVAL_SKIPPING_PERMISSION_MODES.has(mode))
+        ? mode
+        : "",
+    [approvalSkippingAccepted],
+  );
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
   const subhourSupported = info !== "loading" && info.scheduled_task_subhour === true;
   const triggerPollMinutes = info !== "loading" ? (info.automation_trigger_poll_minutes ?? 10) : 10;
@@ -508,6 +526,7 @@ export function CreateScheduledTaskDialog({
     editingTask,
     savedSchedule,
     savedWorkspace,
+    editablePermissionMode,
   ]);
 
   // A new task starts on a server sandbox when one is offered, so it doesn't
@@ -608,7 +627,7 @@ export function CreateScheduledTaskDialog({
     newAutomationPermission &&
     harnessSettings.permissions.some((option) => option.value === newAutomationPermission)
       ? newAutomationPermission
-      : pickedPermission;
+      : editablePermissionMode(pickedPermission);
   const effectivePermission =
     !["claude-native", "claude-sdk", "codex"].includes(harnessSettings.harness ?? "") &&
     permissionChoice === "default"
@@ -714,7 +733,7 @@ export function CreateScheduledTaskDialog({
     validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
       null;
   const renderedTriggerPrompt =
-    trigger !== null && triggerFieldsComplete(triggerFields)
+    trigger !== null && triggerFieldsComplete(triggerFields, trigger)
       ? renderTriggerPrompt(trigger, triggerFields, {
           // Workers run where the manager runs: beside it on a connected host,
           // or each in its own sandbox.
@@ -903,8 +922,8 @@ export function CreateScheduledTaskDialog({
         resolveProjectId,
       );
       if (editingTask) {
-        // Continued-session edits omit launch settings, except to clear a stored
-        // permission override automations now refuse; new targets clear stale overrides.
+        // Continued-session edits omit launch settings, except to clear a stored mode
+        // the server refuses; new targets clear stale overrides.
         const overrides = reusesExistingSession
           ? editablePermissionMode(editingTask.permissionMode) !==
             (editingTask.permissionMode ?? "")
@@ -1048,13 +1067,14 @@ export function CreateScheduledTaskDialog({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent position="popper" align="start">
-                  {(["schedule", "jira", "slack", "github", "linear"] as const).map((type) => (
+                  {AUTOMATION_TRIGGER_TYPES.map((type) => (
                     <SelectItem
                       key={type}
                       value={type}
                       disabled={type !== "schedule" && !triggersSupported}
+                      data-testid={`task-trigger-type-${type}`}
                     >
-                      {TRIGGER_TYPE_LABELS[type]}
+                      <TriggerTypeOption type={type} />
                     </SelectItem>
                   ))}
                 </SelectContent>

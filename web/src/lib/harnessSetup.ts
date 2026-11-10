@@ -50,6 +50,7 @@ export type HarnessReadinessReason =
   | "host-unavailable"
   | "platform-unsupported"
   | "binary-missing"
+  | "cli-unresponsive"
   | "needs-auth"
   | "unconfigured"
   | "version-too-low"
@@ -167,6 +168,16 @@ export function harnessReadinessOnHost(
       description: "Install this harness on the selected host before using it.",
     });
   }
+  // The host found the CLI but its version check timed out; the host still
+  // launches it, so warn without blocking selection.
+  if (availability === "cli-unresponsive") {
+    return harnessReadinessResult("available", "cli-unresponsive", false, {
+      label: "Harness CLI did not respond",
+      description:
+        "The selected host found this harness's CLI, but it did not answer a version check. " +
+        "Sessions may fail to start until the CLI responds.",
+    });
+  }
   if (availability === "needs-auth") {
     if (isSdkHarness(harness)) {
       // Advisory only for the in-process SDK harnesses: the host daemon
@@ -260,12 +271,12 @@ export function harnessUnavailableReasonOnHost(
     if (isCodexHarness(harness)) return "binary-missing";
     return "unconfigured";
   }
-  // Auth-aware CLI harnesses (codex, claude, opencode) report a structured
-  // string when installed-but-not-ready. "version-too-low" can surface for
-  // any CLI-backed harness whose binary is present but too old, and
-  // "tmux-unavailable" for a native harness on a host without a usable tmux.
+  // Installed-but-not-ready CLI harnesses report a structured string;
+  // "version-too-low" and "cli-unresponsive" can surface for any CLI harness,
+  // and "tmux-unavailable" for a native harness on a host without a usable tmux.
   if (
     availability === "binary-missing" ||
+    availability === "cli-unresponsive" ||
     availability === "needs-auth" ||
     availability === "version-too-low" ||
     availability === "tmux-unavailable"
@@ -325,6 +336,7 @@ export function harnessWarningBadgeText(reason: string | null, collapsed = false
   if (reason === "binary-missing") return "binary missing";
   if (reason === "needs-auth") return "needs auth";
   if (reason === "version-too-low") return "outdated";
+  if (reason === "cli-unresponsive") return "not responding";
   if (reason === "tmux-unavailable") return "needs tmux";
   return "needs setup";
 }

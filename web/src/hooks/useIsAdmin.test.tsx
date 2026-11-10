@@ -30,24 +30,27 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("useIsAdmin", () => {
-  it("fetches on mount and turns true once identity resolves", async () => {
-    // The app mounts before GET /v1/me settles. The seeded false covers first
-    // paint, but it must NOT count as fresh data — with initialData the query
-    // never runs, the seeded false sticks for staleTime, and the admin nav
-    // stays hidden (the bug). The queryFn awaits the memoized identity probe.
-    let resolve!: (value: string | null) => void;
-    identity.resolution = new Promise((finish) => {
-      resolve = finish;
-    });
+  it.each([true, false])(
+    "fetches on mount and resolves pending identity to admin=%s",
+    async (isAdmin) => {
+      // The app mounts before GET /v1/me settles. The seeded false covers first
+      // paint, but it must NOT count as fresh data — with initialData the query
+      // never runs, the seeded false sticks for staleTime, and the admin nav
+      // stays hidden (the bug). The queryFn awaits the memoized identity probe.
+      let resolve!: (value: string | null) => void;
+      identity.resolution = new Promise((finish) => {
+        resolve = finish;
+      });
 
-    const { result } = renderHook(() => useIsAdmin(), { wrapper: wrapper() });
-    expect(result.current).toBe(false);
+      const { result } = renderHook(() => useIsAdmin(), { wrapper: wrapper() });
+      expect(result.current).toBe(false);
 
-    identity.isAdmin = true;
-    resolve("alice");
+      identity.isAdmin = isAdmin;
+      resolve("alice");
 
-    await waitFor(() => expect(result.current).toBe(true));
-  });
+      await waitFor(() => expect(result.current).toBe(isAdmin));
+    },
+  );
 
   it("paints true on the first render when identity already resolved", () => {
     identity.isAdmin = true;

@@ -15,6 +15,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSession } from "@/hooks/useSession";
+import { useSandboxStarting } from "@/hooks/useSessionReconnect";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
@@ -605,6 +606,7 @@ export function FilesPanel({
   // lists can't load. Say so rather than "No files in workspace"; a list
   // cached before it slept still renders.
   const showAsleepHint = sandboxAsleep && !dataReady;
+  const sandboxWaking = useSandboxStarting(conversationId);
 
   return (
     <div
@@ -796,7 +798,7 @@ export function FilesPanel({
         )}
         onScroll={handleScroll}
       >
-        {showAsleepHint && <RunnerAsleepHint sandboxOffline />}
+        {showAsleepHint && <RunnerAsleepHint sandboxOffline waking={sandboxWaking} />}
         {!showAsleepHint && flatView && (
           <FlatFileList
             files={changedQuery.data?.data}

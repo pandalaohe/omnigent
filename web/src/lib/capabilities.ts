@@ -79,9 +79,19 @@ export type FeatureKey =
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
 
+export type SiblingSessionDestinations =
+  "current_host" | "current_host_or_new_sandbox" | "any_host";
+
+export function parseSiblingSessionDestinations(value: unknown): SiblingSessionDestinations {
+  if (value === undefined || value === "any_host") return "any_host";
+  return value === "current_host_or_new_sandbox" ? value : "current_host";
+}
+
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
   sibling_sessions?: boolean;
+  session_bundle_workspaces?: boolean;
+  sibling_session_destinations?: SiblingSessionDestinations;
   accounts_enabled: boolean;
   /** Accounts-mode Chrome annotation routes are configured on a shared database. */
   browser_annotations_available?: boolean;
@@ -308,6 +318,8 @@ export interface ServerInfo {
   scheduled_task_inbox?: boolean;
   /** Scheduled permissions support native harnesses beyond Claude Code. */
   scheduled_task_harness_settings?: boolean;
+  /** Automations accept modes that skip approval; older servers may reject them. */
+  scheduled_task_approval_skipping_modes?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
   /**
@@ -459,6 +471,8 @@ function parseBranding(raw: unknown): Branding | null {
 
 /** Sentinel used when the probe fails — accounts and release features are off. */
 export const FALLBACK_SERVER_INFO: ServerInfo = {
+  sibling_session_destinations: "any_host",
+  session_bundle_workspaces: false,
   accounts_enabled: false,
   browser_annotations_available: false,
   api_keys_available: false,
@@ -613,6 +627,10 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         const harnessInstallEnabled = data.harness_install_enabled === true;
         cachedServerInfo = {
           sibling_sessions: data.sibling_sessions === true,
+          sibling_session_destinations: parseSiblingSessionDestinations(
+            data.sibling_session_destinations,
+          ),
+          session_bundle_workspaces: data.session_bundle_workspaces === true,
           accounts_enabled: data.accounts_enabled === true,
           browser_annotations_available: data.browser_annotations_available === true,
           api_keys_available: data.api_keys_available === true,
@@ -683,6 +701,8 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
+          scheduled_task_approval_skipping_modes:
+            data.scheduled_task_approval_skipping_modes === true,
           branding: parseBranding(data.branding),
           attachment_limits: parseAttachmentLimits(data.attachment_limits),
           picker: parsePicker(data.picker),
