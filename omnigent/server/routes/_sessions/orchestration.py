@@ -1108,6 +1108,9 @@ async def _publish_and_wait_for_harness_elicitation(
         )
         event_payload = event.model_dump()
         offer_ticket = None
+        # Publication can expose the local card before awaiting ancestor delivery.
+        # A cancellation during that await must still arrange its cleanup.
+        published_request = True
         if conversation_store is not None:
             from omnigent.server.child_approvals import publish_request_locked
 
@@ -1116,7 +1119,6 @@ async def _publish_and_wait_for_harness_elicitation(
             )
         else:
             session_stream.publish(session_id, event_payload)
-        published_request = True
         publication_lock.release()
         publication_locked = False
         if offer_ticket is not None:

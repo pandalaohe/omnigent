@@ -428,13 +428,34 @@ async def test_invalid_kiro_delivery_metadata_is_rejected(
     assert eid not in sessions._harness_elicitation_registry
 
 
-@pytest.mark.parametrize("ending", ["disconnect", "sending", "repark", "receipt", "new_attempt"])
+@pytest.mark.parametrize(
+    "ending",
+    ["disconnect", "publishing_disconnect", "sending", "repark", "receipt", "new_attempt"],
+)
 async def test_kiro_abandoned_wait_cleanup(
     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, ending: str
 ) -> None:
     from omnigent.server.routes import sessions
 
     monkeypatch.setattr(sessions, "_HARNESS_ELICITATION_REPARK_GRACE_S", 0.1)
+    publication_paused = asyncio.Event()
+    if ending == "publishing_disconnect":
+        from omnigent.server import child_approvals
+        from omnigent.server.routes._sessions.helpers import (
+            _publish_elicitation_request_to_ancestors,
+        )
+
+        async def paused_to_thread(func, *args, **kwargs):
+            if func is _publish_elicitation_request_to_ancestors:
+                publication_paused.set()
+                await asyncio.Event().wait()
+            return await asyncio.to_thread(func, *args, **kwargs)
+
+        monkeypatch.setattr(
+            child_approvals,
+            "asyncio",
+            SimpleNamespace(**{**vars(asyncio), "to_thread": paused_to_thread}),
+        )
     agent = await create_test_agent(client, "kiro-cleanup")
     sid = await create_session_for_agent(client, agent["id"])
     eid = f"elicit_kiro_{sid}"
@@ -448,6 +469,9 @@ async def test_kiro_abandoned_wait_cleanup(
     retry = None
     try:
         await _wait_for_state(eid, "ready")
+        if ending == "publishing_disconnect":
+            async with asyncio.timeout(5):
+                await publication_paused.wait()
         existing_clears = set(sessions._deferred_elicitation_clear_tasks)
         if ending == "sending":
             response = await client.post(
