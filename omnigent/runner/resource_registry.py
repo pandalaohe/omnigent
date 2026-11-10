@@ -576,6 +576,7 @@ class SessionResourceRegistry:
             ]
             | None
         ) = None
+        self._session_failure_publisher: Callable[[str, str], None] | None = None
         # Latest PTY-derived status (running/idle) per session. Lets
         # :meth:`_handle_terminal_exit` tell a clean shutdown (idle) from a
         # mid-turn crash. Written from the watcher thread and the turn-start
@@ -618,10 +619,14 @@ class SessionResourceRegistry:
                 surface if surface is not None and surface in CLIENT_SURFACES else "unknown"
             )
 
+    def client_surface(self, session_id: str) -> str:
+        """Return the session's creating interface, e.g. ``"web"``, or ``"unknown"``."""
+        with self._lock:
+            return self._client_surfaces.get(session_id, "unknown")
+
     def client_surface_env(self, session_id: str) -> dict[str, str]:
         """Build launch metadata without inheriting another session's client identity."""
-        with self._lock:
-            return {CLIENT_SURFACE_ENV_VAR: self._client_surfaces.get(session_id, "unknown")}
+        return {CLIENT_SURFACE_ENV_VAR: self.client_surface(session_id)}
 
     def set_terminal_activity_publisher(
         self,
@@ -664,6 +669,10 @@ class SessionResourceRegistry:
             it authoritatively.
         """
         self._session_status_publisher = publisher
+
+    def set_session_failure_publisher(self, publisher: Callable[[str, str], None]) -> None:
+        """Publish a native status failure with its available error detail on the event loop."""
+        self._session_failure_publisher = publisher
 
     def set_terminal_exit_publisher(
         self,
@@ -1668,6 +1677,7 @@ class SessionResourceRegistry:
         """
         activity_publisher = self._terminal_activity_publisher
         status_publisher = self._session_status_publisher
+        failure_publisher = self._session_failure_publisher
         exit_publisher = self._terminal_exit_publisher
         # Status edges are derived only from native agent terminals — a
         # generic shell's output must not move the session's working status.
@@ -1702,9 +1712,16 @@ class SessionResourceRegistry:
         last_activity_emit: dict[str, float | None] = {"value": None}
 
         def _publish_status_if_current(
-            status: str, blocked_on: str | None, background_task_count: int | None = None
+            status: str,
+            blocked_on: str | None,
+            background_task_count: int | None = None,
+            failure_detail: str | None = None,
         ) -> None:
-            if status_publisher is not None and _owns_terminal():
+            if not _owns_terminal():
+                return
+            if status == "failed" and failure_detail is not None and failure_publisher is not None:
+                failure_publisher(session_id, failure_detail)
+            elif status_publisher is not None:
                 status_publisher(session_id, status, blocked_on, background_task_count, None)
 
         def _publish_status(
@@ -1714,6 +1731,7 @@ class SessionResourceRegistry:
             *,
             record_activity: bool = False,
             failure_activity_epoch: int | None = None,
+            failure_detail: str | None = None,
         ) -> None:
             if status_publisher is None:
                 return
@@ -1733,6 +1751,7 @@ class SessionResourceRegistry:
                             background_task_count,
                             record_activity=record_activity,
                             failure_activity_epoch=epoch,
+                            failure_detail=failure_detail,
                         )
                     )
                     return
@@ -1763,10 +1782,12 @@ class SessionResourceRegistry:
                     else "pane_activity",
                 )
             if status == "failed":
-                _publish_status_if_current(status, blocked_on, background_task_count)
+                _publish_status_if_current(
+                    status, blocked_on, background_task_count, failure_detail
+                )
             else:
                 loop.call_soon_threadsafe(
-                    _publish_status_if_current, status, blocked_on, background_task_count
+                    _publish_status_if_current, status, blocked_on, background_task_count, None
                 )
 
         def _structured_status_active() -> bool:
@@ -1801,6 +1822,9 @@ class SessionResourceRegistry:
                 session_id=session_id,
                 instance=instance,
                 on_status=_on_file_status,
+                on_failure=lambda detail: _publish_status(
+                    "failed", record_activity=True, failure_detail=detail
+                ),
             )
             if emit_status and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
             else None
@@ -2003,6 +2027,7 @@ class SessionResourceRegistry:
         session_id: str,
         instance: TerminalInstance,
         on_status: Callable[[str, str | None, int | None], None],
+        on_failure: Callable[[str], None],
     ) -> SessionStatusPoller | ClaudeProgramStatusPoller:
         """Prefer opted-in OSC reports, then Claude's PID/session file, then pane activity."""
         from omnigent.harnesses.claude_native.bridge import (
@@ -2051,6 +2076,7 @@ class SessionResourceRegistry:
                 terminal_launch_id=instance.lifecycle_trace.launch_id,
                 turn_is_active=lambda: self.session_turn_is_active(session_id),
                 turn_activity_epoch=lambda: self.session_activity_epoch(session_id),
+                on_failure=on_failure,
             )
         return fallback
 

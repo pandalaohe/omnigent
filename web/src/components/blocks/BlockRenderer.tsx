@@ -903,7 +903,7 @@ function renderItem(
         >
           <FilePathAwareMessageResponse
             breaks
-            className="chat-markdown"
+            className="chat-markdown text-message"
             mode={isTextStreaming ? "streaming" : "static"}
             sendCodeBlocks={!isTextStreaming}
           >

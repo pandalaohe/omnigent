@@ -1,3 +1,4 @@
+import { modelOptionSchema } from "./modelCatalogCache";
 import { z } from "zod";
 import { readRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { readLastAgentId } from "./agentPreferences";
@@ -57,26 +58,6 @@ const pickerAgentSchema = agentSchema.extend({
   // a warm one does, instead of briefly showing each agent twice.
   templateId: z.string().optional(),
   mine: z.literal(true).optional(),
-});
-const modelOptionSchema = z.object({
-  id: z.string(),
-  model: z.string().optional(),
-  displayName: z.string().optional(),
-  isDefault: z.boolean().optional(),
-  defaultReasoningEffort: z.string().optional(),
-  supportedReasoningEfforts: z
-    .array(z.object({ reasoningEffort: z.string(), description: z.string().optional() }))
-    .optional(),
-  serviceTiers: z.array(z.object({ id: z.string(), name: z.string() })).optional(),
-  defaultServiceTier: z.string().nullable().optional(),
-  source: z
-    .object({
-      kind: z.string(),
-      label: z.string(),
-      name: z.string().optional(),
-      host: z.string().optional(),
-    })
-    .optional(),
 });
 const pickerOptionsSchema = z.object({
   agent: pickerAgentSchema,

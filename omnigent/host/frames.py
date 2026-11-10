@@ -31,6 +31,7 @@ from urllib.parse import urlsplit
 from pydantic import TypeAdapter, ValidationError
 
 from omnigent.codex_rate_limits import validate_codex_rate_limits_snapshot
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.harness_accounts import HarnessAccounts, normalize_harness_accounts
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 from omnigent.host.harness_startup import HarnessStartup
@@ -40,6 +41,7 @@ from omnigent.inner.native_attachments import (
     CAP_FILESYSTEM_ATTACHMENTS,
     CAP_PATH_ATTACHMENTS,
 )
+from omnigent.scheduled_context import parse_scheduled_run
 from omnigent.startup_protocol import (
     CONTEXT_INVENTORY_MAX_BYTES,
     CONTEXT_INVENTORY_V2,
@@ -463,6 +465,7 @@ class HostLaunchRunnerFrame:
     startup_required: bool = False
     retain_runner_ids: list[str] | None = None
     superseded_runner_ids: tuple[str, ...] | None = None
+    scheduled_run: ScheduledRunLogContext | None = None
     purpose: Literal["host_terminals"] | None = None
 
 
@@ -2197,6 +2200,8 @@ def encode_host_frame(frame: HostFrame) -> str:
         }
         if frame.retain_runner_ids is not None:
             payload["retain_runner_ids"] = frame.retain_runner_ids
+        if frame.scheduled_run is not None:
+            payload["scheduled_run"] = frame.scheduled_run.model_dump()
         if frame.superseded_runner_ids is not None:
             payload["superseded_runner_ids"] = list(frame.superseded_runner_ids)
         return _encode_payload(payload)
@@ -3778,6 +3783,7 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
             if msg.get("retain_runner_ids") is not None
             else None
         ),
+        scheduled_run=parse_scheduled_run(msg.get("scheduled_run")),
         # Absent (an older server) is distinct from an empty list.
         superseded_runner_ids=(
             tuple(_optional_str_list(msg, "superseded_runner_ids"))

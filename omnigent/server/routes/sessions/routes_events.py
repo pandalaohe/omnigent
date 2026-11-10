@@ -341,6 +341,7 @@ from omnigent.server.routes._sessions.orchestration import (
 )
 from omnigent.server.routes._sessions.subagent_reconciliation import _read_native_subagent_probe
 from omnigent.server.runner_session_init import conversation_archive_lineage
+from omnigent.server.scheduled.telemetry import start_fire_stage
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
     ConversationDeleted,
@@ -2033,6 +2034,7 @@ def register_events_routes(
         if successor_id is None:
             return {"queued": False}
         session_id = successor_id
+        start_fire_stage("owner_authorization", session_id=session_id)
         user_id, conv = await _authorized_conversation(
             request,
             session_id,
@@ -2072,6 +2074,7 @@ def register_events_routes(
                 request.app.state, "subagent_retry_admission", None
             ) is not None:
                 body.data["_input_admission_required"] = True
+        start_fire_stage("input_validation", session_id=session_id)
         peer_message = body.type == "session_message"
         if peer_message:
             if not isinstance(request, Request):
@@ -2739,6 +2742,7 @@ def register_events_routes(
             and conv.agent_id is not None
         ):
             try:
+                start_fire_stage("input_policy", session_id=session_id)
                 _input_verdict = await _evaluate_input_policy(
                     cast("Request", request),
                     session_id,
@@ -2807,7 +2811,9 @@ def register_events_routes(
                 # response body. queued=False signals the event was
                 # handled synchronously (denied, not queued for a turn).
                 return {"queued": False, "denied": True, "reason": reason}
+            start_fire_stage("input_validation", session_id=session_id)
         elif body.type == _SLASH_COMMAND_TYPE and conv.agent_id is not None:
+            start_fire_stage("input_policy", session_id=session_id)
             _input_verdict = await _evaluate_input_policy(
                 cast("Request", request),
                 session_id,
@@ -2835,6 +2841,7 @@ def register_events_routes(
                 _publish_input_deny_terminal(session_id, conv, reason)
                 _publish_status(session_id, "idle")
                 return {"queued": False, "denied": True, "reason": reason}
+            start_fire_stage("input_validation", session_id=session_id)
         elif (
             body.type == "message"
             and body.data.get("role") == "assistant"
@@ -4718,6 +4725,7 @@ def register_events_routes(
                 "item_id": body.data["call_id"],
                 "forwarded": tool_response.status_code < 400,
             }
+        start_fire_stage("runner_start", session_id=session_id)
         # Whether the runner was initially unavailable or was woken below. In
         # that case the session-init handshake may still be racing the first
         # message, even if we reused the original binding instead of launching
@@ -5427,6 +5435,7 @@ def register_events_routes(
                 permission_store,
                 target_id=session_id,
             )
+        start_fire_stage("prompt_prepare", session_id=session_id)
         pending_background_title = prepare_background_session_title(
             coordinator=background_title_coordinator,
             conversation=conv,

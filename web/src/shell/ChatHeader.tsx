@@ -415,7 +415,7 @@ export function ChatHeader({
         {showFilesPanel && (
           <DropdownMenuItem
             onSelect={mobileMenu.onOpenFiles}
-            className="gap-2.5 px-2.5 py-2 text-ui"
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
           >
             <FileIcon className="size-4" />
             Files
@@ -431,7 +431,7 @@ export function ChatHeader({
         {showFilesPanel && (
           <DropdownMenuItem
             onSelect={mobileMenu.onOpenChanges}
-            className="gap-2.5 px-2.5 py-2 text-ui"
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
           >
             <GitCompareIcon className="size-4" />
             Changes
@@ -445,7 +445,7 @@ export function ChatHeader({
         {showFilesPanel && (
           <DropdownMenuItem
             onSelect={mobileMenu.onOpenGithub}
-            className="gap-2.5 px-2.5 py-2 text-ui"
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
           >
             <GitPullRequestIcon className="size-4" />
             Pull Requests
@@ -456,7 +456,7 @@ export function ChatHeader({
             main agent included. */}
         <DropdownMenuItem
           onSelect={mobileMenu.onOpenSubagents}
-          className="gap-2.5 px-2.5 py-2 text-ui"
+          className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
         >
           <BotIcon className="size-4" />
           Agents
@@ -477,7 +477,7 @@ export function ChatHeader({
         {mobileMenu.showSideChats && (
           <DropdownMenuItem
             onSelect={mobileMenu.onOpenSideChats}
-            className="gap-2.5 px-2.5 py-2 text-ui"
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
           >
             <MessagesSquareIcon className="size-4" />
             Side chats
@@ -491,7 +491,7 @@ export function ChatHeader({
         {!mobileMenu.hideTerminalsTab && mobileMenu.showShellsTab && (
           <DropdownMenuItem
             onSelect={mobileMenu.onOpenShells}
-            className="gap-2.5 px-2.5 py-2 text-ui"
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
           >
             <TerminalIcon className="size-4" />
             Shells
@@ -505,7 +505,7 @@ export function ChatHeader({
         {mobileMenu.debugMode && (
           <DropdownMenuItem
             onSelect={mobileMenu.onOpenMainExecutionLog}
-            className="gap-2.5 px-2.5 py-2 text-ui"
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
           >
             <ListIcon className="size-4" />
             Logs
@@ -735,7 +735,11 @@ export function ChatHeader({
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="min-w-44">
-              <SessionActionMenuItem disabledReason={forkDisabledReason} onSelect={onFork}>
+              <SessionActionMenuItem
+                className="mobile-touch-target"
+                disabledReason={forkDisabledReason}
+                onSelect={onFork}
+              >
                 <GitForkIcon className="size-3.5" />
                 Fork
               </SessionActionMenuItem>
@@ -785,6 +789,7 @@ export function ChatHeader({
                 {isMobile && <ViewModeMenuItems />}
                 {canFork && (
                   <SessionActionMenuItem
+                    className="mobile-touch-target"
                     disabledReason={forkDisabledReason}
                     onSelect={onFork}
                     data-testid="fallback-fork-conversation"
@@ -806,7 +811,7 @@ export function ChatHeader({
                     disabled={shareDisabled}
                     data-testid="mobile-share-session"
                     title={shareDisabledReason}
-                    className="gap-2.5 px-2.5 py-2 text-ui"
+                    className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <ShareIcon className="size-4" />
                     Share
@@ -819,7 +824,7 @@ export function ChatHeader({
                       onAgentInfo();
                     }}
                     data-testid="mobile-agent-info"
-                    className="gap-2.5 px-2.5 py-2 text-ui"
+                    className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <InfoIcon className="size-4" />
                     Agent info

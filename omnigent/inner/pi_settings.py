@@ -197,6 +197,7 @@ def ordered_pi_launch(
     return str(launcher), remaining
 
 
+PI_CONTEXT_FILE_NAMES = ("AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD")
 _PI_RESOURCE_SETTINGS = ("extensions", "skills", "prompts", "themes")
 _PI_AGENT_RESOURCE_DIRS = ("npm", "git", *_PI_RESOURCE_SETTINGS)
 _PI_AGENT_RESOURCE_FILES = (

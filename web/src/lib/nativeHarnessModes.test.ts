@@ -9,6 +9,7 @@ import {
   permissionModeConcept,
   canonicalNativeHarness,
   harnessAccountKey,
+  nativePermissionOptions,
 } from "./nativeHarnessModes";
 import { CODEX_APPROVAL_PRESETS, CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS } from "./codexApprovalMode";
 import { sdkPermissionOptions } from "./sdkPermissionModes";
@@ -40,6 +41,22 @@ it("keeps Codex native launch, runtime, SDK and defaults on the four current pre
     "approve-for-me": ["--approve-for-me"],
     "full-access": ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
     "read-only": ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
+  });
+});
+
+describe("nativePermissionOptions", () => {
+  it.each([
+    ["claude-native", ["default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"]],
+    ["codex-native", ["ask-for-approval", "approve-for-me", "full-access", "read-only", "bypass"]],
+    ["cursor-native", ["default", "auto-review", "plan", "ask", "yolo"]],
+    ["antigravity-native", ["ask", "plan", "accept-edits", "auto", "full"]],
+    ["devin-native", ["normal", "accept-edits", "smart", "dangerous"]],
+    ["unknown-harness", []],
+    [null, []],
+    [undefined, []],
+  ] as const)("returns the create-time permission vocabulary for %s", (harness, values) => {
+    const options = nativePermissionOptions(harness);
+    expect(options.map((option) => option.value).sort()).toEqual([...values].sort());
   });
 });
 

@@ -1281,16 +1281,18 @@ describe("mark all as read", () => {
 });
 
 describe("right-click context menu", () => {
-  it("keeps Fork visible but unavailable for a managed source", () => {
+  it("offers Fork for a managed source", () => {
     mockConversations([{ ...CONV, labels: { "omnigent.host_type": "managed" } }]);
     renderSidebar();
     fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
     expect(screen.getByRole("menu")).toHaveClass("menu-surface");
     const fork = screen.getByRole("menuitem", { name: "Fork" });
-    expect(fork).toHaveAttribute("aria-disabled", "true");
+    expect(fork).not.toHaveAttribute("aria-disabled");
     fireEvent.click(fork);
-    fireEvent.keyDown(fork, { key: "Enter" });
-    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
+    expect(screen.getByTestId("fork-session-dialog")).toHaveAttribute(
+      "data-source-session-id",
+      "conv_1",
+    );
   });
 
   it("opens the fork dialog for the selected session", () => {

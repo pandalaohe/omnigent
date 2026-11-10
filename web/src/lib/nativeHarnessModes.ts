@@ -6,7 +6,10 @@
 // native CLI; a mode whose `args` are empty sends no flags (the CLI keeps its
 // own configured default). Keep in sync with each CLI's `--help`.
 
-import { CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE } from "@/lib/claudePermissionMode";
+import {
+  CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+  CLAUDE_NATIVE_PERMISSION_MODES,
+} from "@/lib/claudePermissionMode";
 import { CODEX_APPROVAL_PRESETS } from "@/lib/codexApprovalMode";
 
 /** One selectable mode: value + label + blurb + the CLI flags it maps to. */
@@ -283,8 +286,26 @@ export const CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypa
 // terminal_launch_args, so its `args` are empty and it's handled specially.
 export const CODEX_NATIVE_BYPASS_APPROVAL_VALUE = "bypass";
 export const CODEX_NATIVE_BYPASS_APPROVAL_OPTION: NativeHarnessMode = {
-  value: CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
+  value: "bypass",
   label: "Bypass approvals & sandbox",
   description: "Runs Codex with no approval prompts and no command sandbox",
   args: [],
 };
+
+/** Create-time permission choices shared by New Chat and automations. */
+export function nativePermissionOptions(harness: string | null | undefined) {
+  switch (harness) {
+    case "claude-native":
+      return CLAUDE_NATIVE_PERMISSION_MODES;
+    case "codex-native":
+      return [...CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_BYPASS_APPROVAL_OPTION];
+    case "cursor-native":
+      return CURSOR_NATIVE_EXEC_MODES;
+    case "antigravity-native":
+      return AGY_NATIVE_PERMISSION_TIERS;
+    case "devin-native":
+      return DEVIN_NATIVE_PERMISSION_MODES;
+    default:
+      return [];
+  }
+}

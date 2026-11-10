@@ -8,6 +8,7 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.inner.native_attachments import (
     UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
     reject_authored_framework_notices,
@@ -316,6 +317,7 @@ class StartupInputOptions(BaseModel):
     tools: list[dict[str, Any]] | None = None
     background_titles_enabled: bool = False
     recovery_id: str | None = None
+    scheduled_run: ScheduledRunLogContext | None = None
 
 
 # Longest harness message phase kept, e.g. Codex ``"partial_answer"``.

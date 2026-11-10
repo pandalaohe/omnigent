@@ -2105,9 +2105,7 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
     if mode != "missing":
         executable = tmp_path / "rg"
         body = (
-            "import os, time\n"
-            f"open({str(tmp_path / 'pid')!r}, 'w').write(str(os.getpid()))\n"
-            "time.sleep(60)\n"
+            "import time\ntime.sleep(60)\n"
             if mode == "timeout"
             else "print('x' * (2 * 1024 * 1024))\n"
         )

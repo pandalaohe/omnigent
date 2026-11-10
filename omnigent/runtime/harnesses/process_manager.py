@@ -71,11 +71,34 @@ from omnigent.startup_protocol import (
     harness_context_authority_v2,
     unknown_context_evidence_v2,
 )
+from omnigent.util.json_serialization import json_dumps_transport_safe
 
 _logger = logging.getLogger(__name__)
 _RESIDENT_INVENTORY_DECODER = TypeAdapter(ExecutorResidentInventory)
 _RESIDENT_THREAD_IDS_DECODER = TypeAdapter(tuple[tuple[str, ...] | None, ...] | None)
 _MAX_RESIDENT_THREAD_IDS = 1000
+
+
+class _HarnessHttpClient(httpx.AsyncClient):
+    """Keep retained surrogate text encodable at the harness HTTP boundary."""
+
+    def build_request(self, method: str, url: httpx.URL | str, **kwargs: Any) -> httpx.Request:
+        try:
+            return super().build_request(method, url, **kwargs)
+        except UnicodeEncodeError:
+            payload = kwargs.get("json")
+            if payload is None or any(
+                kwargs.get(name) is not None for name in ("content", "data", "files")
+            ):
+                raise
+            headers = httpx.Headers(kwargs.get("headers"))
+            if "Content-Type" not in self.headers:
+                headers.setdefault("Content-Type", "application/json")
+            kwargs["json"] = None
+            kwargs["content"] = json_dumps_transport_safe(payload).encode("utf-8")
+            kwargs["headers"] = headers
+            return super().build_request(method, url, **kwargs)
+
 
 # Per-AP-instance directory holding all per-conversation Unix
 # sockets (POSIX) and the AP_PID sentinel file. Each Omnigent instance gets a
@@ -2033,7 +2056,7 @@ class HarnessProcessManager:
             # tool dispatch round-trips (action_required → AP
             # call_tool → PATCH → resume); use a generous fixed
             # timeout that still surfaces a genuinely-stuck harness.
-            client = httpx.AsyncClient(
+            client = _HarnessHttpClient(
                 transport=endpoint.make_transport(),
                 base_url=endpoint.base_url,
                 # S1 (security): present the per-spawn bearer token (Windows only)

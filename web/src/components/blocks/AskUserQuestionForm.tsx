@@ -885,7 +885,7 @@ export function AskUserQuestionForm({
           {current.options.map((opt, index) => {
             const inputId = `${currentKey}-${opt.label}`;
             const rowClassName =
-              "flex items-start gap-2 cursor-pointer rounded-sm text-ui text-foreground data-[highlighted=true]:bg-muted data-[highlighted=true]:ring-1 data-[highlighted=true]:ring-ring/60";
+              "flex items-start gap-2 cursor-pointer mobile-touch-target mobile-app:grid mobile-app:grid-cols-[44px_minmax(0,1fr)] mobile-app:items-center rounded-sm text-ui text-foreground data-[highlighted=true]:bg-muted data-[highlighted=true]:ring-1 data-[highlighted=true]:ring-ring/60";
             const rowHighlighted = keyboardActive && highlight === index ? true : undefined;
             if (current.multiSelect) {
               const sel = selections[currentKey];
@@ -903,7 +903,7 @@ export function AskUserQuestionForm({
                     checked={checked}
                     onChange={() => handleMultiToggle(currentKey, opt.label)}
                     onFocus={() => setHighlight(index)}
-                    className="mt-1"
+                    className="mt-1 mobile-app:mt-0 mobile-app:justify-self-center"
                   />
                   <span className="flex flex-col">
                     <span>{opt.label}</span>
@@ -930,7 +930,7 @@ export function AskUserQuestionForm({
                   checked={checked}
                   onChange={() => handleSingleSelect(currentKey, opt.label)}
                   onFocus={() => setHighlight(index)}
-                  className="mt-1"
+                  className="mt-1 mobile-app:mt-0 mobile-app:justify-self-center"
                 />
                 <span className="flex flex-col">
                   <span>{opt.label}</span>
@@ -947,27 +947,32 @@ export function AskUserQuestionForm({
               matching radio/checkbox prefix, so the user picks
               between predefined options and free-form input the
               same way. */}
-              <label
-                htmlFor={customRowId}
+              <div
                 data-highlighted={
                   keyboardActive && highlight === current.options.length ? true : undefined
                 }
-                className="flex items-start gap-2 cursor-pointer rounded-sm text-ui text-foreground data-[highlighted=true]:bg-muted data-[highlighted=true]:ring-1 data-[highlighted=true]:ring-ring/60"
+                className="flex items-start gap-2 mobile-app:grid mobile-app:grid-cols-[44px_minmax(0,1fr)] mobile-app:items-center rounded-sm text-ui text-foreground data-[highlighted=true]:bg-muted data-[highlighted=true]:ring-1 data-[highlighted=true]:ring-ring/60"
               >
-                <input
-                  type={current.multiSelect ? "checkbox" : "radio"}
-                  id={customRowId}
-                  name={current.multiSelect ? undefined : currentKey}
-                  checked={customRowChecked}
-                  onChange={() =>
-                    current.multiSelect
-                      ? handleCustomToggleMulti(currentKey)
-                      : handleCustomToggleSingle(currentKey)
-                  }
-                  onFocus={() => setHighlight(current.options.length)}
-                  className="mt-1"
-                  data-testid="ask-user-question-custom-toggle"
-                />
+                <label
+                  htmlFor={customRowId}
+                  className="flex shrink-0 cursor-pointer mobile-touch-target mobile-app:items-center mobile-app:justify-center"
+                >
+                  <input
+                    type={current.multiSelect ? "checkbox" : "radio"}
+                    id={customRowId}
+                    name={current.multiSelect ? undefined : currentKey}
+                    checked={customRowChecked}
+                    onChange={() =>
+                      current.multiSelect
+                        ? handleCustomToggleMulti(currentKey)
+                        : handleCustomToggleSingle(currentKey)
+                    }
+                    onFocus={() => setHighlight(current.options.length)}
+                    aria-label="Select custom answer"
+                    className="mt-1 mobile-app:mt-0"
+                    data-testid="ask-user-question-custom-toggle"
+                  />
+                </label>
                 {/* ``field-sizing-content`` (Tailwind v4 / CSS) auto-grows
                 the textarea to fit its content, so typing past the
                 first line wraps and expands downward instead of
@@ -1035,9 +1040,10 @@ export function AskUserQuestionForm({
                       : undefined
                   }
                   data-testid="ask-user-question-custom-input"
-                  className="field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
+                  aria-label="Custom answer"
+                  className="mobile-touch-target mobile-app:min-w-0 mobile-app:py-3 field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
                 />
-              </label>
+              </div>
               {asyncTarget && (
                 <div className="flex flex-col gap-2 pl-6">
                   <input
@@ -1122,6 +1128,7 @@ export function AskUserQuestionForm({
           variant="outline"
           onClick={(event) => goToQuestion(currentIndex - 1, event.detail === 0)}
           disabled={isFirst || submitting}
+          className="mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal"
           data-testid="ask-user-question-prev"
           componentId="question.prev"
         >
@@ -1134,6 +1141,7 @@ export function AskUserQuestionForm({
             variant="outline"
             onClick={(event) => goToQuestion(currentIndex + 1, event.detail === 0)}
             disabled={submitting}
+            className="mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal"
             data-testid="ask-user-question-next"
             componentId="question.next"
           >
@@ -1146,6 +1154,7 @@ export function AskUserQuestionForm({
             size="sm"
             onClick={(event) => void (event.detail === 0 ? submitAndLeave() : handleSubmit())}
             disabled={!allAnswered || submitting}
+            className="mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal"
             data-testid="ask-user-question-submit"
             componentId="question.submit"
           >
@@ -1162,7 +1171,7 @@ export function AskUserQuestionForm({
             else void reject();
           }}
           disabled={submitting}
-          className="ml-auto"
+          className="ml-auto mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal"
           componentId="question.cancel"
         >
           <XIcon className="mr-1 size-3.5" />

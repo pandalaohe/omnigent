@@ -20,6 +20,7 @@ export const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
   installable_harnesses: [],
   dictation_available: false,
   dictation_punctuation_available: false,
+  scheduled_task_worktrees: false,
   archive_worktree_cleanup: false,
   worktree_status: false,
   branding: null,

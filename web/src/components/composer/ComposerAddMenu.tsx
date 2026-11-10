@@ -116,7 +116,7 @@ export function ComposerAddMenu({
             type="button"
             size="icon"
             variant="ghost"
-            className="size-8 rounded-lg data-[state=open]:bg-muted data-[state=open]:text-foreground md:size-7"
+            className="size-8 mobile-touch-target rounded-lg data-[state=open]:bg-muted data-[state=open]:text-foreground md:size-7"
             disabled={disabled}
             aria-label="Add"
             title="Add"
@@ -150,7 +150,11 @@ export function ComposerAddMenu({
           <div className="flex flex-col gap-3">
             <div className="flex flex-col gap-0.5">
               <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">Add</div>
-              <DropdownMenuItem onSelect={onAttach} disabled={attachDisabled}>
+              <DropdownMenuItem
+                className="mobile-touch-target"
+                onSelect={onAttach}
+                disabled={attachDisabled}
+              >
                 <span className="flex size-4 shrink-0 items-center justify-center">
                   <PaperclipIcon className="size-3.5" />
                 </span>
@@ -162,7 +166,11 @@ export function ComposerAddMenu({
                 <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">Session</div>
                 <div className="flex flex-col gap-px">
                   {onSideChat && (
-                    <DropdownMenuItem data-testid="composer-side-chat-action" onSelect={onSideChat}>
+                    <DropdownMenuItem
+                      className="mobile-touch-target"
+                      data-testid="composer-side-chat-action"
+                      onSelect={onSideChat}
+                    >
                       <span className="flex size-4 shrink-0 items-center justify-center">
                         <MessagesSquareIcon className="size-3.5" />
                       </span>
@@ -174,6 +182,7 @@ export function ComposerAddMenu({
                   )}
                   {showGoal && (
                     <DropdownMenuItem
+                      className="mobile-touch-target"
                       disabled={!onGoal || goalDisabled}
                       title={!onGoal ? goalDescription : undefined}
                       data-testid="composer-goal-action"
@@ -190,6 +199,7 @@ export function ComposerAddMenu({
                   )}
                   {showPlan && (
                     <DropdownMenuItem
+                      className="mobile-touch-target"
                       data-testid="composer-plan-action"
                       data-active={planActive || undefined}
                       aria-label={planLabel}
@@ -207,7 +217,10 @@ export function ComposerAddMenu({
                     </DropdownMenuItem>
                   )}
                   {onProjectSelect && (
-                    <DropdownMenuItem onSelect={() => setProjectPickerOpen(true)}>
+                    <DropdownMenuItem
+                      className="mobile-touch-target"
+                      onSelect={() => setProjectPickerOpen(true)}
+                    >
                       <span className="flex size-4 shrink-0 items-center justify-center">
                         <FolderIcon className="size-3.5" />
                       </span>

@@ -90,7 +90,7 @@ const {
   registerBrowserAccessSettings,
 } = require("./browserAccessSettings");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
-const { isHostThisMachine, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
+const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
 const {
@@ -144,6 +144,8 @@ const {
   resolveSystemSound,
 } = require("./system_sounds");
 const { diagnostics } = require("./diagnostics");
+
+const isHostThisMachine = createHostThisMachineChecker();
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
@@ -306,6 +308,7 @@ const FIND_BAR_INSET = 16;
  * Electron doesn't export the net error codes as named constants.
  */
 const ERR_ABORTED = -3;
+const ERR_TIMED_OUT = -7;
 const ERR_BLOCKED_BY_CLIENT = -20;
 
 /**
@@ -510,7 +513,16 @@ const onboardingArcaSetups = new Map();
  * @param {string} serverUrl
  * @param {(line: string) => void} log
  * @param {Electron.WebContents} sender The shell-owned setup page.
- * @returns {Promise<{ ok: boolean, canceled?: boolean, alreadyRunning?: boolean, error?: string, authError?: boolean, errorKind?: import("./arca").ArcaErrorKind }>}
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   canceled?: boolean,
+ *   alreadyRunning?: boolean,
+ *   error?: string,
+ *   errorMessage?: string,
+ *   errorAction?: string,
+ *   authError?: boolean,
+ *   errorKind?: import("./arca").ArcaErrorKind,
+ * }>}
  */
 async function connectOnboardingArca(serverUrl, log, sender) {
   const isClosed = () => sender.isDestroyed();
@@ -618,6 +630,9 @@ let reconnectDelaysMs = [...Array(12).fill(5_000), ...Array(6).fill(10_000)];
 // than two minutes to come back after wake (e.g. a GlobalProtect sign-in).
 // `let` so wiring tests can shrink it via testApi.setReconnectSlowDelayMs.
 let reconnectSlowDelayMs = 60_000;
+// Chromium waits indefinitely for a server that accepts the connection but never responds.
+// `let` so wiring tests can shrink it via testApi.setServerResponseTimeoutMs.
+let serverResponseTimeoutMs = 30_000;
 // A silent reconnect's IP access list refusals are usually the VPN still connecting
 // after wake or idle, so the overlay says the network is blocked only once they have
 // lasted this long. `let` so wiring tests can shrink it via testApi.setBlockedHintDelayMs.
@@ -663,10 +678,10 @@ const GRANTED_PERMISSIONS = new Set([
  * (localhost-trusted origins, not just pinned ones — see
  * isLocalhostTrustedOrigin). Two names because Chromium renamed the
  * permission: ``loopback-network`` is the granular Chromium 145+ name
- * (valid in Electron 42's Chromium 148, and the one Okta FastPass queries
+ * (valid in Electron 45's Chromium 156, and the one Okta FastPass queries
  * FIRST), ``local-network-access`` the older aggregate it falls back to.
  *
- * The localhost fetches themselves are NOT gated in Electron 42 (Chromium's
+ * The localhost fetches themselves are NOT gated in Electron 45 (Chromium's
  * LNA checks are disabled; verified empirically, including with
  * LocalNetworkAccessChecks force-enabled). But
  * ``navigator.permissions.query({name: ...})`` for these routes through the
@@ -729,7 +744,7 @@ async function ensureSystemMicAccess() {
  * request/check to a webContents — the requesting page is its top-level
  * page. Permission *checks* (the permissions.query path) can arrive with a
  * null webContents; those are allowed on origin trust alone, because the
- * answer is advisory in Electron 42 — it gates nothing beyond what fetch
+ * answer is advisory in Electron 45 — it gates nothing beyond what fetch
  * already allows, and a "denied" would falsely turn away IdP scripts that
  * probe before fetching.
  *
@@ -1369,6 +1384,9 @@ function applyDockIcon() {
  *   double-counted), then sums across origins.
  * @property {ReturnType<typeof createBrowserViewRegistry>} [browserRegistry]
  *   Per-conversation embedded-browser view registry for this window.
+ * @property {boolean} [closeTabSupported] True while the loaded SPA handles
+ *   Close Tab (CmdOrCtrl+W) itself; cleared on every main-frame navigation so
+ *   an older web bundle or the setup page gets the plain window close.
  *
  * @type {Map<BrowserWindow, WindowState>}
  */
@@ -1819,9 +1837,21 @@ function resolvedCliPath() {
  * @returns {string}
  */
 function missingHostCliError(serverUrl) {
+  const { errorMessage, errorAction } = missingHostCliErrorParts(serverUrl);
+  return `${errorMessage} ${errorAction}`;
+}
+
+/** @param {string} serverUrl */
+function missingHostCliErrorParts(serverUrl) {
   return databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl)
-    ? "The isaac CLI was not found. Install it before connecting this machine."
-    : "The omnigent CLI was not found. Install it or set its path.";
+    ? {
+        errorMessage: "The isaac CLI was not found.",
+        errorAction: "Install it before connecting this machine.",
+      }
+    : {
+        errorMessage: "The omnigent CLI was not found.",
+        errorAction: "Install it or set its path.",
+      };
 }
 
 /**
@@ -2369,7 +2399,7 @@ async function loadServerUrl(
       });
     }
     if (!reconnectOverlay.isShown(win)) connectionLoading.show(win, attempt, "Opening Omnigent…");
-    await win.loadURL(target);
+    await loadServerDocument(win, target, signal);
     assertCurrent();
     diagnostics.record("connection_result", { origin: originOf(serverUrl), outcome: "loaded" });
     // Loaded: any reconnect this window was waiting on is over.
@@ -2396,6 +2426,54 @@ async function loadServerUrl(
 }
 
 /**
+ * Load the server document, failing it as ERR_TIMED_OUT when no response commits
+ * within serverResponseTimeoutMs. A committed page is never aborted, however slow.
+ *
+ * @param {BrowserWindow} win
+ * @param {string} target
+ * @param {AbortSignal} signal Aborted when a newer attempt or the setup page takes the window.
+ */
+function loadServerDocument(win, target, signal) {
+  const contents = win.webContents;
+  let timer;
+  let awaitingResponse = true;
+  const settle = () => {
+    awaitingResponse = false;
+    clearTimeout(timer);
+  };
+  const failed = (_event, _code, _description, _url, isMainFrame) => {
+    if (isMainFrame) settle();
+  };
+  let abandon;
+  const stopped = new Promise((_resolve, reject) => {
+    // Stop a stale load at once so a late response can't commit under the newer attempt.
+    abandon = () => {
+      if (!awaitingResponse) return;
+      settle();
+      reject(signal.reason);
+      if (!win.isDestroyed()) contents.stop();
+    };
+    timer = setTimeout(() => {
+      settle();
+      const message = `ERR_TIMED_OUT (${ERR_TIMED_OUT}) loading '${target}'`;
+      reject(Object.assign(new Error(message), { code: "ERR_TIMED_OUT", errno: ERR_TIMED_OUT }));
+      contents.stop();
+      handleServerLoadFailure(win, ERR_TIMED_OUT, "ERR_TIMED_OUT", target);
+    }, serverResponseTimeoutMs);
+  });
+  // Prepended so the load settles before the window's fallbacks return to setup.
+  contents.prependListener("did-navigate", settle);
+  contents.prependListener("did-fail-load", failed);
+  signal.addEventListener("abort", abandon, { once: true });
+  return Promise.race([win.loadURL(target), stopped]).finally(() => {
+    settle();
+    contents.removeListener("did-navigate", settle);
+    contents.removeListener("did-fail-load", failed);
+    signal.removeEventListener("abort", abandon);
+  });
+}
+
+/**
  * Detach the window's embedded-browser view whenever the shell's main frame
  * commits a new document (`did-navigate`: a reload, the session-expiry
  * reload's login-page redirect, an SSO hop). The committing navigation tears
@@ -2419,6 +2497,51 @@ function registerBrowserViewDetachOnNavigate(win) {
 }
 
 /**
+ * Show a main-frame server-load failure: reconnect behind the overlay or return to setup.
+ *
+ * @param {BrowserWindow} win
+ * @param {number} errorCode Chromium net error code.
+ * @param {string} errorDescription
+ * @param {string} validatedURL
+ */
+function handleServerLoadFailure(win, errorCode, errorDescription, validatedURL) {
+  // A failure report for a URL the window is no longer pinned to (the
+  // window was re-pointed while the failing load was in flight) must
+  // not yank the window off its new destination.
+  const failedOrigin = originOf(validatedURL ?? "");
+  if (failedOrigin !== windows.get(win)?.origin) return;
+  diagnostics.record("navigation_failed", {
+    origin: failedOrigin,
+    code: `net_${Math.abs(errorCode)}`,
+  });
+  let error = `${errorDescription || "load failed"} (${errorCode})`;
+  const serverUrl = windows.get(win)?.serverUrl;
+  const reconnectable =
+    Boolean(serverUrl) &&
+    UNREACHABLE_NET_ERRORS.has(errorCode) &&
+    usesBrowserAuth(pinnedOrigin(win));
+  // Prefill setup with the server origin the user connects to, not the deep route
+  // that failed; workspace reconnects keep the mounted server URL.
+  let url = failedOrigin ? failedOrigin + "/" : (validatedURL ?? "");
+  if (reconnectable) {
+    console.warn("[omnigent] databricks auth: page load failed", {
+      origin: failedOrigin,
+      errorCode,
+    });
+    error = unreachableMessage(validatedURL);
+    url = serverUrl;
+    // The error page underneath is no longer trusted or allowed to navigate.
+    databricksAuth?.rejectConnection(win);
+    pinWindow(win, null);
+    // DNS/VPN may still be reconnecting right after wake: retry behind the overlay.
+    const hint = reconnectingHint(validatedURL);
+    const options = { hint, finalMessage: error, network: true };
+    if (scheduleReconnect(win, serverUrl, validatedURL, options)) return;
+  }
+  showConnectFailure(win, url, error);
+}
+
+/**
  * Wire server-load failure fallbacks for a shell window.
  *
  * @param {BrowserWindow} win
@@ -2435,42 +2558,7 @@ function registerNavigationFallbacks(win) {
       if (errorCode === ERR_ABORTED) return;
       // Browser-mode login requests are deliberately blocked while the shell renews the cookie.
       if (errorCode === ERR_BLOCKED_BY_CLIENT && usesBrowserAuth(pinnedOrigin(win))) return;
-      // A failure report for a URL the window is no longer pinned to (the
-      // window was re-pointed while the failing load was in flight) must
-      // not yank the window off its new destination.
-      const failedOrigin = originOf(validatedURL ?? "");
-      if (failedOrigin !== windows.get(win)?.origin) return;
-      diagnostics.record("navigation_failed", {
-        origin: failedOrigin,
-        code: `net_${Math.abs(errorCode)}`,
-      });
-      let error = `${errorDescription || "load failed"} (${errorCode})`;
-      const serverUrl = windows.get(win)?.serverUrl;
-      const reconnectable =
-        Boolean(serverUrl) &&
-        UNREACHABLE_NET_ERRORS.has(errorCode) &&
-        usesBrowserAuth(pinnedOrigin(win));
-      // The failure often happens on a deep SPA route (e.g. /chat/…);
-      // prefill the setup form with just the server origin — that's what
-      // the user connects to — not the full path that happened to fail.
-      // Workspace reconnects keep the mounted server URL.
-      let url = failedOrigin ? failedOrigin + "/" : (validatedURL ?? "");
-      if (reconnectable) {
-        console.warn("[omnigent] databricks auth: page load failed", {
-          origin: failedOrigin,
-          errorCode,
-        });
-        error = unreachableMessage(validatedURL);
-        url = serverUrl;
-        // The error page underneath is no longer trusted or allowed to navigate.
-        databricksAuth?.rejectConnection(win);
-        pinWindow(win, null);
-        // DNS/VPN may still be reconnecting right after wake: retry behind the overlay.
-        const hint = reconnectingHint(validatedURL);
-        const options = { hint, finalMessage: error, network: true };
-        if (scheduleReconnect(win, serverUrl, validatedURL, options)) return;
-      }
-      showConnectFailure(win, url, error);
+      handleServerLoadFailure(win, errorCode, errorDescription, validatedURL);
     },
   );
 
@@ -2614,6 +2702,25 @@ function createWindow(targetUrl, opts = {}) {
     badgeCount: 0,
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
+  });
+  win.webContents.on("did-navigate", () => {
+    const state = windows.get(win);
+    if (state) {
+      state.closeTabSupported = false;
+      state.closeTabUnresponsive = false;
+    }
+  });
+  win.webContents.on("render-process-gone", () => {
+    const state = windows.get(win);
+    if (state) state.closeTabSupported = false;
+  });
+  win.webContents.on("unresponsive", () => {
+    const state = windows.get(win);
+    if (state) state.closeTabUnresponsive = true;
+  });
+  win.webContents.on("responsive", () => {
+    const state = windows.get(win);
+    if (state) state.closeTabUnresponsive = false;
   });
   registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
   // Show the return banner when the window navigates away from its server
@@ -3607,9 +3714,21 @@ function buildMenu() {
       },
     },
     { type: "separator" },
-    // `role: "close"` carries the standard CmdOrCtrl+W shortcut and closes
-    // the focused window. There is no File menu, so Close lives under Server.
-    { role: "close", label: "Close Window" },
+    // There is no File menu, so the close items live under Server. A menu
+    // accelerator fires even while an embedded Browser view has focus, so
+    // CmdOrCtrl+W reaches the SPA from anywhere in the window.
+    {
+      id: "close_tab",
+      label: "Close Tab",
+      accelerator: "CmdOrCtrl+W",
+      click: () => closeTabOrWindow(BrowserWindow.getFocusedWindow()),
+    },
+    {
+      id: "close_window",
+      label: "Close Window",
+      accelerator: "CmdOrCtrl+Shift+W",
+      click: () => BrowserWindow.getFocusedWindow()?.close(),
+    },
   ];
 
   // Our custom Server menu, inserted right after the leftmost menu — index 1
@@ -4099,7 +4218,7 @@ function createBrowserRegistryForWindow(win) {
       const target = windowArcaServerUrl(win);
       return (
         isArcaAgentContext(arcaIdentities.get(target), context, {
-          enabled: !win.isDestroyed() && !!pinnedOrigin(win) && databricksInternalFeaturesEnabled(),
+          enabled: databricksInternalFeaturesEnabled(),
           managed:
             isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) &&
             isDatabricksManagedServerUrl(target),
@@ -4567,13 +4686,27 @@ function registerIpc() {
       return result;
     }
     const cliCommand = hostCliCommand(target);
-    if (!cliCommand) return { ok: false, error: missingHostCliError(target) };
+    if (!cliCommand) {
+      const missingCli = missingHostCliErrorParts(target);
+      return {
+        ok: false,
+        error: `${missingCli.errorMessage} ${missingCli.errorAction}`,
+        ...missingCli,
+      };
+    }
     log(`$ ${omnigentCli.cliCommandParts(cliCommand).displayName} host --server ${target}`);
     log("Signing in to the server if needed…");
     const auth = await serverManager.ensureServerAuth(cliCommand, target, {
       onLogin: () => log("If a browser window opens, finish signing in there."),
     });
-    if (!auth.ok) return { ok: false, error: auth.error };
+    if (!auth.ok) {
+      return {
+        ok: false,
+        error: auth.error,
+        ...(auth.errorMessage ? { errorMessage: auth.errorMessage } : {}),
+        ...(auth.errorAction ? { errorAction: auth.errorAction } : {}),
+      };
+    }
     // Close out the sign-in lines so the log never ends on a stale prompt.
     log("Signed in. Connecting this laptop to the server…");
     const result = await serverManager.ensureHostConnected(cliCommand, target);
@@ -4592,7 +4725,8 @@ function registerIpc() {
     if (typeof text !== "string") {
       throw new TypeError("copy-setup-text requires a string");
     }
-    clipboard.writeText(text);
+    // Async since Electron 44; returning it lets the page report a failed copy.
+    return clipboard.writeText(text);
   });
 
   // SPA server picker → the sender window's pinned origin plus the persisted
@@ -4698,6 +4832,25 @@ function registerIpc() {
     const params = new URLSearchParams({ step: "server" });
     if (ephemeral) params.set("ephemeral", "1");
     void loadSetupPage(win, params.toString());
+  });
+
+  // SPA → it handles Close Tab itself (see closeTabOrWindow).
+  ipcMain.on("omnigent:set-close-tab-supported", (event, supported) => {
+    if (!isPinnedOriginSender(event)) {
+      console.warn("[omnigent] set-close-tab-supported from untrusted sender dropped");
+      return;
+    }
+    // isPinnedOriginSender guarantees the sender window is tracked.
+    windows.get(BrowserWindow.fromWebContents(event.sender)).closeTabSupported = supported === true;
+  });
+
+  // SPA → Close Tab found nothing to close, so close the sending window.
+  ipcMain.on("omnigent:close-window", (event) => {
+    if (!isPinnedOriginSender(event)) {
+      console.warn("[omnigent] close-window from untrusted sender dropped");
+      return;
+    }
+    BrowserWindow.fromWebContents(event.sender)?.close();
   });
 
   // Find bar → run/continue a search in its parent window. Empty text
@@ -4943,7 +5096,9 @@ function registerIpc() {
     }
     const cliPath = resolvedCliPath();
     if (!cliPath) {
-      return { ok: false, error: "The omnigent CLI was not found. Install it or set its path." };
+      const errorMessage = "The omnigent CLI was not found.";
+      const errorAction = "Install it or set its path.";
+      return { ok: false, error: `${errorMessage} ${errorAction}`, errorMessage, errorAction };
     }
     // Stream the server's startup log lines to the setup page as it boots.
     const onLine = (line) => {
@@ -5573,7 +5728,7 @@ function registerIpc() {
     getAgentContextForEvent: (event, opts) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       const sourceHostId = typeof opts?.sourceHostId === "string" ? opts.sourceHostId : null;
-      // Main derives the server target and local-machine eligibility; the page only routes.
+      // Page supplies the session host ID; main verifies this machine's identity and live enrollment.
       return {
         serverTarget: arcaTarget(windowArcaServerUrl(win)),
         serverOrigin: pinnedOrigin(win) ?? null,
@@ -5747,6 +5902,28 @@ function focusAndRestore(win) {
   if (!win || win.isDestroyed()) return;
   if (win.isMinimized()) win.restore();
   win.focus();
+}
+
+/**
+ * Close Tab: let a capable SPA close its selected tab (or leave the session),
+ * otherwise close the focused window like the standard Close role. Windows the
+ * shell doesn't track (find bar, About) and pages that never advertised
+ * support always close.
+ *
+ * @param {BrowserWindow | null | undefined} win
+ */
+function closeTabOrWindow(win) {
+  if (!win || win.isDestroyed()) return;
+  const state = windows.get(win);
+  if (state?.closeTabSupported && !state.closeTabUnresponsive && state.origin) {
+    try {
+      win.webContents.send("omnigent:close-tab");
+      return;
+    } catch {
+      // Renderer torn down between the check and the send; close instead.
+    }
+  }
+  win.close();
 }
 
 /**

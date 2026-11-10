@@ -27,6 +27,7 @@ import {
   useReplaceHostCliRetention,
   useResetHostCliRetention,
 } from "./useHosts";
+import * as host from "@/lib/host";
 import { ApiError } from "@/lib/sessionsApi";
 
 const fetchMock = vi.fn();
@@ -59,6 +60,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("host catalog refresh", () => {
@@ -933,6 +935,24 @@ describe("useHostModelOptions", () => {
       "/v1/hosts/host_1/harnesses/claude-native/model-options",
     );
     expect(result.current.data?.map((model) => model.displayName)).toEqual(["Sonnet 4.6"]);
+  });
+
+  it("isolates identical host and harness catalogs across servers in one QueryClient", async () => {
+    const server = vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue("server-a");
+    const models = [{ id: "model-a", displayName: "Model A" }];
+    fetchMock.mockResolvedValueOnce(mockResponse({ models }));
+    const { result, rerender } = renderHook(
+      ({ enabled }) => useHostModelOptions("host_1", "codex-native", enabled),
+      { initialProps: { enabled: true }, wrapper },
+    );
+    await waitFor(() => expect(result.current.data).toEqual(models));
+    server.mockReturnValue("server-b");
+    rerender({ enabled: false });
+    expect(result.current.data).toBeUndefined();
+    server.mockReturnValue("server-a");
+    rerender({ enabled: false });
+    expect(result.current.data).toEqual(models);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("does not fetch without a selected host", async () => {
