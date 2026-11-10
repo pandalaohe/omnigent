@@ -50,6 +50,8 @@ def context_notice(status: AutoRotationStatus) -> str:
         f"{status.remaining_pct_setting}% left). Hand over to yourself now: do not wait for "
         "the current step to finish. Write a handover note that covers the work in progress, "
         "call sys_session_handover with rotate=true and auto=true, then end your turn. "
+        "For this rotation, this notice supersedes earlier instructions to hand over "
+        "with rotate=false only or never to clear. "
         "If the result says the rotation was deferred, keep working; another notice follows."
     )
 
