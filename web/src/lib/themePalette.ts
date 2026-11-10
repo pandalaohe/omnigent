@@ -298,10 +298,9 @@ export const PALETTES: readonly PaletteMeta[] = [
         warning: "#826022",
         destructive: "#c3314a",
         keepCold: "#2a6cb3",
-        sidebar: "#fdfafa",
+        sidebar: "#fafafa",
         sidebarPrimary: "var(--link)",
         sidebarRing: "var(--ring)",
-        sidebarBackground: "linear-gradient(90deg, #fffefe, #fbfafb)",
         shellBackground: "var(--background)",
       }),
       dark: paletteTokens({

@@ -34,7 +34,7 @@
   --warning: #826022;
   --destructive: #c3314a;
   --keep-cold: #2a6cb3;
-  --sidebar: #fdfafa;
+  --sidebar: #fafafa;
   --sidebar-foreground: #27272a;
   --sidebar-primary: var(--link);
   --sidebar-primary-foreground: #ffffff;
@@ -44,7 +44,7 @@
   --sidebar-ring: var(--ring);
   --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
   --sidebar-active-foreground: var(--primary);
-  --sidebar-background: linear-gradient(90deg, #fffefe, #fbfafb);
+  --sidebar-background: var(--sidebar);
   --shell-background: var(--background);
 }
 

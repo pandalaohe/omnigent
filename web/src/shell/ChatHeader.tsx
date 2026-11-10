@@ -29,7 +29,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
@@ -60,6 +59,9 @@ import { AutoRotationChip } from "@/components/AutoRotationChip";
 import { StandingApprovalChip } from "@/components/StandingApprovalChip";
 import { SessionChoiceCard } from "@/pages/settings/sessionChoice/SessionChoiceCard";
 import { isEditorLevel } from "@/lib/permissionsApi";
+import { MobileHeaderButton, MobileHeaderButtonGroup } from "./MobileHeaderButton";
+import { MobileHeaderControlsSlot } from "./MobileHeaderControlsSlot";
+import { SessionMenuHeader } from "./SessionMenuHeader";
 
 /**
  * Gating flags + handlers for the mobile workspace-rail entries (Files ·
@@ -161,6 +163,7 @@ interface ChatHeaderProps {
   childCwd?: string | null;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  workingDirectory?: string | null;
   createdBySessionId?: string | null;
   /** Effective access to the active session. */
   permissionLevel?: number | null;
@@ -249,7 +252,7 @@ const PENDING_ACTION_TITLE = "Available when the session starts";
 function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
   if (isMobile) {
     return (
-      <Button
+      <MobileHeaderButton
         type="button"
         variant="ghost"
         size="icon"
@@ -259,7 +262,7 @@ function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
         className="text-muted-foreground md:hidden max-md:size-11"
       >
         <EllipsisVerticalIcon className="size-4 max-md:size-5" />
-      </Button>
+      </MobileHeaderButton>
     );
   }
 
@@ -364,6 +367,7 @@ export function ChatHeader({
   childSession,
   childCwd,
   conversationId,
+  workingDirectory,
   createdBySessionId,
   permissionLevel,
   actionConversation = null,
@@ -540,6 +544,7 @@ export function ChatHeader({
     !pending && actionConversation ? (
       <HeaderConversationMenu
         conversation={actionConversation}
+        workingDirectory={workingDirectory}
         currentProject={projectName}
         canShare={canShare}
         canFork={canFork}
@@ -599,11 +604,10 @@ export function ChatHeader({
   return (
     <header
       className={cn(
-        // h-14 fixes the bar at 56px: 12px symmetric vertical padding around
-        // the 32px controls. Session pages add a fading glass backdrop over
-        // scrolling conversation content.
-        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center justify-between px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)]",
-        conversationId && "session-header-glass",
+        // Desktop sessions fade scrolling content behind the header.
+        // Mobile keeps only the individual glass button surfaces.
+        "chat-header absolute inset-x-0 top-0 z-30 flex h-[76px] md:h-12 items-center justify-between px-4 py-4 md:py-3 md:right-[var(--workspace-panel-offset,0px)]",
+        conversationId && !isMobile && "session-header-glass",
         settingsMode && "settings-mobile-header",
       )}
     >
@@ -665,6 +669,7 @@ export function ChatHeader({
             childSession={childSession}
             childCwd={childCwd}
             actions={isMobile ? undefined : (conversationMenu ?? undefined)}
+            compact={isMobile}
             className="pr-1"
           />
         )}
@@ -688,7 +693,10 @@ export function ChatHeader({
         )}
       </div>
 
-      <div className="flex items-center gap-2 max-md:gap-0 max-md:empty:hidden">
+      <MobileHeaderButtonGroup className="flex items-center gap-2 max-md:empty:hidden">
+        {isMobile && !settingsMode && (
+          <MobileHeaderControlsSlot sessionId={conversationId ?? null} />
+        )}
         {!pending && conversationId && (
           <>
             <StandingApprovalChip
@@ -775,7 +783,7 @@ export function ChatHeader({
             // HeaderConversationMenu).
             <DropdownMenu modal={!isMobile}>
               <DropdownMenuTrigger asChild>
-                <Button
+                <MobileHeaderButton
                   type="button"
                   variant="ghost"
                   size="icon"
@@ -784,22 +792,22 @@ export function ChatHeader({
                   className="text-muted-foreground hover:text-foreground md:hidden max-md:size-11"
                 >
                   <EllipsisVerticalIcon className="size-4 max-md:size-5" />
-                </Button>
+                </MobileHeaderButton>
               </DropdownMenuTrigger>
               <DropdownMenuContent
                 align="end"
-                className={cn("min-w-44 max-w-[min(20rem,calc(100vw-1rem))]", MOBILE_GLASS_SURFACE)}
+                collisionPadding={isMobile ? 16 : undefined}
+                className={cn(
+                  "min-w-44 max-w-[min(20rem,calc(100vw-1rem))]",
+                  MOBILE_GLASS_SURFACE,
+                  isMobile && "w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)]",
+                )}
               >
                 {isMobile && conversationId && (
-                  <>
-                    <DropdownMenuLabel className="flex items-center gap-2 px-2.5 pb-1.5 text-foreground">
-                      <span className="min-w-0 flex-1 truncate">
-                        {conversationTitle || UNTITLED_CONVERSATION_LABEL}
-                      </span>
-                      <PresenceAvatars />
-                    </DropdownMenuLabel>
-                    <DropdownMenuSeparator />
-                  </>
+                  <SessionMenuHeader
+                    title={conversationTitle || UNTITLED_CONVERSATION_LABEL}
+                    workingDirectory={workingDirectory}
+                  />
                 )}
                 {/* Chat/Terminal switch (terminal-first sessions) — self-gates to
                   null otherwise, and renders its own trailing separator. */}
@@ -952,7 +960,7 @@ export function ChatHeader({
             </Button>
           </>
         )}
-      </div>
+      </MobileHeaderButtonGroup>
     </header>
   );
 }

@@ -2,9 +2,12 @@ import { PanelLeftOpenIcon, PanelRightOpenIcon, SearchIcon, SettingsIcon } from 
 
 import { useShortcutHint } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
+import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
+import { MobileHeaderButton } from "./MobileHeaderButton";
 
 /**
  * Search / Settings / sidebar-toggle cluster from the sidebar's header row.
@@ -99,7 +102,7 @@ export function SidebarHeaderActions({
 
 /** Shared sizing for the mobile icon-only Search and Settings actions. */
 const SIDEBAR_FLOAT_BUTTON =
-  "size-6 text-muted-foreground hover:text-foreground max-md:size-11 max-md:text-foreground";
+  "size-6 text-muted-foreground hover:text-foreground max-md:size-11 max-md:rounded-full max-md:border-none max-md:p-0 max-md:text-foreground max-md:shadow-none max-md:[--icon-container-default:20px]";
 
 const SIDEBAR_FLOAT_ICON = "size-4 max-md:size-[22px]";
 
@@ -125,7 +128,7 @@ export function SidebarSearchButton({
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <Button
+        <MobileHeaderButton
           type="button"
           variant="ghost"
           size="icon-xs"
@@ -136,7 +139,7 @@ export function SidebarSearchButton({
           data-testid="sidebar-search-button"
         >
           <SearchIcon className={SIDEBAR_FLOAT_ICON} />
-        </Button>
+        </MobileHeaderButton>
       </TooltipTrigger>
       {/* Bottom placement keeps the tooltip clear of the macOS Electron
       shell's traffic lights at the window's top edge. */}
@@ -166,6 +169,7 @@ export function SidebarSettingsButton({
   testId?: string;
 }) {
   const settingsShortcut = useShortcutHint("openSettings");
+  const isMobile = useIsMobileViewport();
   return (
     <Tooltip delayDuration={750}>
       <TooltipTrigger asChild>
@@ -178,7 +182,8 @@ export function SidebarSettingsButton({
           className={cn(SIDEBAR_FLOAT_BUTTON, "rounded-[8px] bg-transparent", className)}
         >
           <Link to="/settings" onClick={onSettingsClick} data-testid={testId}>
-            <SettingsIcon className={SIDEBAR_FLOAT_ICON} />
+            <SettingsIcon className={cn(SIDEBAR_FLOAT_ICON, isMobile && "relative z-10")} />
+            {isMobile && <OmniGlassSurface width={44} height={44} borderRadius={22} />}
           </Link>
         </Button>
       </TooltipTrigger>

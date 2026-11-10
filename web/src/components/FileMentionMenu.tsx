@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { FileTextIcon, FolderIcon, PlusIcon, StarIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { MobileMenuGlassSurface } from "./MobileMenuGlassSurface";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import { NO_SESSION_MEMBERS, type SessionMember } from "@/lib/sessionMembers";
 
@@ -63,8 +64,9 @@ export function FileMentionMenu({
     <div className="absolute bottom-full left-0 z-30 mb-2 flex items-end gap-2">
       <div
         data-testid="file-mention-menu"
-        className="w-80 max-w-[calc(100vw-2rem)] shrink-0 overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
+        className="mobile-menu-glass max-md:relative w-80 max-w-[calc(100vw-2rem)] shrink-0 overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
       >
+        <MobileMenuGlassSurface />
         {/* One scroll container over both sections so the arrow-keyed row —
             member or file — is scrolled into view either way. */}
         <div ref={listRef} className="max-h-80 overflow-y-auto">

@@ -135,6 +135,7 @@ import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
 import type { ChildSessionLike } from "./subagentRailGroups";
+import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
 import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import {
@@ -263,7 +264,9 @@ function inheritedOrDefaultRightRailTab(): RightRailTab | null {
 export function AppShell() {
   return (
     <GridSessionsProvider>
-      <AppShellImpl />
+      <MobileHeaderControlsProvider>
+        <AppShellImpl />
+      </MobileHeaderControlsProvider>
     </GridSessionsProvider>
   );
 }
@@ -2893,6 +2896,7 @@ function AppShellImpl() {
                     childSession={childBreadcrumbSession}
                     childCwd={childBreadcrumbCwd}
                     conversationId={conversationId}
+                    workingDirectory={activeSession?.workspace ?? activeConv?.workspace}
                     createdBySessionId={activeSession?.labels?.[CREATED_BY_SESSION_LABEL_KEY]}
                     permissionLevel={permissionLevel}
                     actionConversation={actionConversation}
