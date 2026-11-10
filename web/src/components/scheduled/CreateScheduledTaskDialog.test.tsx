@@ -2466,7 +2466,7 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     expect(mutateAsync.mock.calls[0][0].permissionMode).toBe("read-only");
   });
 
-  it("shows saved Codex model and effort when no host catalog is available", () => {
+  it("shows saved Codex model and effort when no host catalog is available", async () => {
     render(
       <CreateScheduledTaskDialog
         open
@@ -2480,6 +2480,8 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     );
     expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("gpt-5.5");
     expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("xHigh");
+    fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
+    expect(await screen.findByRole("option", { name: "xHigh", selected: true })).toBeVisible();
   });
 
   it("shows legacy Codex default as Ask for approval and omits untouched permission on update", async () => {

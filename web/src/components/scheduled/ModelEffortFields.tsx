@@ -2,6 +2,7 @@ import { ScheduleSelect as Select } from "./ScheduleSelect";
 // Harness-specific automation controls; Default leaves the agent configuration unchanged.
 
 import { normalizeSdkPermissionMode } from "@/lib/sdkPermissionModes";
+import { normalizeEffortLabel } from "@/lib/composerModelLabel";
 import { cn } from "@/lib/utils";
 import { pickerTriggerClass } from "./pickerStyles";
 import { Label } from "@/components/scheduled/Label";
@@ -53,7 +54,7 @@ export function ModelEffortFields({
   }
   const effortOptions = [...settings.efforts];
   if (effort && !effortOptions.some((option) => option.value === effort)) {
-    effortOptions.push({ value: effort, label: effort });
+    effortOptions.push({ value: effort, label: normalizeEffortLabel(effort) });
   }
   const permissionOptions = settings.permissions.filter(
     (option) =>
