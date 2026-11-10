@@ -825,6 +825,7 @@ def test_mcp_progress_heartbeat_lifecycle() -> None:
 
     lock = threading.Lock()
     written_messages: list[dict[str, object]] = []
+    second_tick = threading.Event()
 
     def fake_write(
         payload: dict[str, object],
@@ -833,15 +834,16 @@ def test_mcp_progress_heartbeat_lifecycle() -> None:
     ) -> None:
         with stdout_lock:
             written_messages.append(payload)
+            if len(written_messages) >= 2:
+                second_tick.set()
 
     import omnigent.harnesses.claude_native.bridge as bridge_mod
 
     orig_write = bridge_mod._write_jsonrpc
     bridge_mod._write_jsonrpc = fake_write
     try:
-        # With interval = 0.05s, should emit progress notifications
         with bridge_mod._McpProgressHeartbeat("test-token", lock, interval_s=0.05):
-            time.sleep(0.12)
+            assert second_tick.wait(timeout=5), "heartbeat did not emit two notifications"
         assert len(written_messages) >= 2
         assert all(m["method"] == "notifications/progress" for m in written_messages)
         assert all(m["params"]["progressToken"] == "test-token" for m in written_messages)

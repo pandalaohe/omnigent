@@ -18,6 +18,7 @@ import json
 import logging
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -27,11 +28,13 @@ from starlette.websockets import WebSocketDisconnect
 
 import omnigent.server.routes.sessions as sessions_routes
 from omnigent.runtime import pending_elicitations
+from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.server.child_keep_warm import ChildKeepWarmSweeper
 from omnigent.server.routes.sessions import SessionLiveness, create_sessions_router
 from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -104,6 +107,7 @@ def app(
     stores: tuple[SqlAlchemyConversationStore, SqlAlchemyAgentStore, SqlAlchemyPermissionStore],
     liveness_state: dict[str, SessionLiveness],
     comment_store: SqlAlchemyCommentStore,
+    tmp_path: Path,
 ) -> FastAPI:
     """Minimal app mounting only the sessions router, with header-based
     auth and a real permission store — the surface the updates stream
@@ -123,6 +127,10 @@ def app(
         create_sessions_router(
             conversation_store=conversation_store,
             agent_store=agent_store,
+            agent_cache=AgentCache(
+                artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+                cache_dir=tmp_path / "cache",
+            ),
             auth_provider=UnifiedAuthProvider(source="header"),
             permission_store=permission_store,
             liveness_lookup=_liveness_lookup,

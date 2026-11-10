@@ -25,6 +25,8 @@ from omnigent.member_snapshot import (
     member_label_key,
 )
 
+pytestmark = pytest.mark.usefixtures("_clean_subagent_registry")
+
 _LEAD_HOST = "host_lead"
 _MEMBER_HOST = "host_member"
 _CHILD_ID = "conv_child_remote"

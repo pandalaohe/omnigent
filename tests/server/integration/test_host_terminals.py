@@ -332,6 +332,14 @@ async def test_standalone_terminal_with_full_startup_queue_and_session_churn(set
 async def test_restart_waits_for_verified_redial_without_second_runner(
     setup, tmp_path, monkeypatch
 ):
+    from omnigent.runner.transports.ws_tunnel import serve as tunnel_serve
+
+    # Exercise verified redial without random backoff exceeding the two-second guard.
+    monkeypatch.setattr(tunnel_serve, "_INITIAL_RECONNECT_DELAY_S", 0.01)
+    monkeypatch.setattr(tunnel_serve, "_MAX_RECONNECT_DELAY_S", 0.01)
+    monkeypatch.setattr(tunnel_serve, "_RECONNECT_JITTER_FRACTION", 0)
+    monkeypatch.setattr(tunnel_serve, "_RECYCLE_RECONNECT_MIN_S", 0.01)
+    monkeypatch.setattr(tunnel_serve, "_RECYCLE_RECONNECT_MAX_S", 0.01)
     make_server, owner_headers, _, _owner = setup
     server = make_server()
     host = FakeHost(server, tmp_path, owner_headers)
