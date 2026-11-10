@@ -10585,7 +10585,7 @@ def create_runner_app(
 
             _dispatch_owner = (stream_epoch or 0, _cancel_dispatch_tasks)
             _turn_dispatch_cancellers[conv_id] = _dispatch_owner
-            _response_id: str | None = None
+            _response_id = None
             _response_data: _JsonObject = {}
             _terminal_response_type: str | None = None
             _dispatch_tasks: list[_asyncio.Task[object]] = []
