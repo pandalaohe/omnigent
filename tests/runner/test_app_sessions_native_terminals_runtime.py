@@ -3827,6 +3827,14 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     async def _recording_relay(session_id_arg: str, **kwargs: Any) -> None:
         relay_calls.append({"session_id": session_id_arg, **kwargs})
 
+    from omnigent.native.native_bridge_common import (
+        read_agent_instructions_preamble,
+        write_agent_instructions_preamble,
+    )
+
+    stale_bridge = bridge_mod.prepare_bridge_dir(session_id)
+    write_agent_instructions_preamble(stale_bridge, "STALE-STARTUP")
+
     captured_spec: dict[str, Any] = {}
 
     snapshot = {
@@ -3881,6 +3889,7 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     bridge_dir = bridge_mod.bridge_dir_for_bridge_id(session_id)
     text = (bridge_mod.agy_gemini_dir(bridge_dir) / "AGENTS.md").read_text()
     assert text.count(child_session_question_instruction(False)) == int(has_parent)
+    assert read_agent_instructions_preamble(bridge_dir) is None
     iso_home = bridge_mod.agy_home_dir(bridge_dir)
     iso_gemini = bridge_mod.agy_gemini_dir(bridge_dir)
 

@@ -823,6 +823,14 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
 
     monkeypatch.setattr(_mod, "_fetch_global_instructions", _global_text)
 
+    from omnigent.native.native_bridge_common import (
+        read_agent_instructions_preamble,
+        write_agent_instructions_preamble,
+    )
+
+    stale_bridge = bridge_mod.prepare_bridge_dir("bridge_gemini_dir_test")
+    write_agent_instructions_preamble(stale_bridge, "STALE-STARTUP")
+
     captured_args: list[str] = []
     captured_env: dict[str, str] = {}
 
@@ -855,6 +863,7 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
         )
 
     bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_gemini_dir_test")
+    assert read_agent_instructions_preamble(bridge_dir) is None
     iso_gemini = bridge_mod.agy_gemini_dir(bridge_dir)
     assert fetched["session_id"] == "conv_abc123"
     assert not (iso_gemini / "AGENTS.md").is_symlink()

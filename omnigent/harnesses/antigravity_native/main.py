@@ -141,7 +141,7 @@ from omnigent.host.daemon_launch import (
     wait_for_runner_online,
 )
 from omnigent.native._native_resume_hint import echo_native_resume_hint
-from omnigent.native.native_bridge_common import write_agent_instructions_preamble
+from omnigent.native.native_bridge_common import clear_agent_instructions_preamble
 from omnigent.native.native_coding_agents import native_shell_terminal_spec
 from omnigent.native.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -1110,8 +1110,7 @@ async def _launch_and_record(
         has_parent=has_parent,
         peer_messaging_enabled=peer_enabled,
     )
-    if startup_instructions is not None:
-        write_agent_instructions_preamble(bridge_dir, startup_instructions)
+    clear_agent_instructions_preamble(bridge_dir)
     # Clear stale turn/conversation state so a fresh launch rediscovers this run's
     # real agy conversation id instead of binding to the previous run's.
     await asyncio.to_thread(clear_bridge_state, bridge_dir)

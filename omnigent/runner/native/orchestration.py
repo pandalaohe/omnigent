@@ -7714,10 +7714,10 @@ async def _auto_create_antigravity_terminal(
         wrapped agy sees the ``sys_*`` tools (#1194). ``None`` skips relay wiring
         (the ``_run_turn_bg`` first-turn fallback re-ensures it).
     :param agent_spec: The session's resolved agent spec; supplies the author
-        text of the staged startup instructions.
+        text of the startup instructions in the isolated agy home.
     :param global_instructions: The server-held global instructions text for
-        this session, or ``None`` when none is set. Staged with the rest of the
-        startup text for the first injected message.
+        this session, or ``None`` when none is set. Delivered with the rest of
+        the startup text through the isolated agy home.
     :returns: The created terminal resource view.
     :raises RuntimeError: If the session snapshot or required runner env is
         unavailable.
@@ -7795,8 +7795,8 @@ async def _auto_create_antigravity_terminal(
     # claude/codex auto-create teardown ordering).
     await _cancel_auto_forwarder_task(session_id)
     bridge_dir = prepare_bridge_dir(bridge_id)
-    # A relaunched pane is a new agy process, so it must get a fresh copy of the
-    # instructions; the executor clears them only once the first injection lands.
+    # The isolated agy home carries startup instructions. Clear an older
+    # launch's preamble so the executor cannot deliver a second copy.
     from omnigent.runner.app import get_session_peer_messaging_enabled
 
     startup_instructions = _native_startup_instructions_from_spec(
@@ -7805,8 +7805,7 @@ async def _auto_create_antigravity_terminal(
         has_parent=isinstance(snapshot.get("parent_session_id"), str),
         peer_messaging_enabled=get_session_peer_messaging_enabled(session_id),
     )
-    if startup_instructions is not None:
-        write_agent_instructions_preamble(bridge_dir, startup_instructions)
+    clear_agent_instructions_preamble(bridge_dir)
     # Clear stale turn/conversation state so the reader binds this run's real agy
     # conversation id (the cold-start mints it below) instead of a prior run's.
     clear_bridge_state(bridge_dir)
