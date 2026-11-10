@@ -508,6 +508,19 @@ async def test_magic_link_mint_and_redeem(
     assert redeem_resp.headers["location"] == "http://localhost:8000/"
     # A session cookie was set on the redirect response.
     assert any("session" in h.lower() for h in redeem_resp.headers.get_list("set-cookie"))
+    magic_headers = _cookie_header(dict(redeem_resp.cookies))
+    assert (await client.get("/v1/me/api-keys", headers=magic_headers)).status_code == 200
+    created = await client.post(
+        "/v1/me/api-keys",
+        headers={**magic_headers, "Origin": "http://localhost:8000"},
+        json={"name": "magic-feed", "scopes": ["*"]},
+    )
+    assert created.status_code == 201
+    assert (await client.get("/v1/info")).json()["api_keys_available"] is True
+    client.cookies.clear()
+    managed_headers = {"Authorization": "Bearer " + created.json()["value"]}
+    assert (await client.get("/v1/me/tasks", headers=managed_headers)).status_code == 200
+    assert (await client.get("/v1/me/api-keys", headers=managed_headers)).status_code == 401
 
 
 async def test_magic_link_is_single_use(

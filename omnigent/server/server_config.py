@@ -62,6 +62,7 @@ class ApiKey:
     user: str
     scopes: tuple[str, ...]
     sha256: bytes
+    source: str = "config"
 
 
 def load_api_keys(config: Mapping[str, Any], env: Mapping[str, str]) -> tuple[ApiKey, ...]:
@@ -126,7 +127,7 @@ def load_api_keys(config: Mapping[str, Any], env: Mapping[str, str]) -> tuple[Ap
         else:
             if "usage-read-env" in names:
                 raise ValueError("api_keys name usage-read-env conflicts with the legacy input")
-            keys.append(ApiKey("usage-read-env", user, ("usage",), digest))
+            keys.append(ApiKey("usage-read-env", user, ("usage",), digest, source="environment"))
             # Remove the loader one release after the deployment migrates, with release notes.
             logger.warning(
                 "OMNIGENT_USAGE_READ_TOKEN is deprecated and now grants usage reads and writes; "

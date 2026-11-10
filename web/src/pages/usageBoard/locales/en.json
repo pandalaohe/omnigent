@@ -20,7 +20,7 @@
   "copy": "Copy",
   "copied": "Copied",
   "copyFailed": "Copy failed. Select the sample and copy it manually.",
-  "credentialHelp": "Your server operator creates a user-owned API key with scope usage. Keep the raw key in your pusher as USAGE_KEY; the server stores its SHA-256 digest in api_keys. This page stores no credential.",
+  "credentialHelp": "Create a key in Settings → API keys with Usage permission. Copy it once and keep it in your pusher as USAGE_KEY. For headless servers, your operator can configure api_keys instead. This page stores no credential.",
   "storageHelp": "Readings and activity live on the server under your account. Find them in Usage → account; change them by pushing to the same id. Stop the pusher, then remove the account in Account settings to delete its reading and activity.",
   "preferencesHelp": "Display choices are cached in this browser and synced to your user on this server. Change or reset a choice with its control (Auto, an empty field, or the switch). Clearing browser data removes the cache; synced choices return when you sign in.",
   "balance": "Balance",

@@ -6,10 +6,17 @@ it does not poll your vendor or store your vendor password.
 
 ## Credentials
 
-For an accounts-mode server, ask the operator for a user-owned API key with
-scope `usage`. The operator generates a random key, gives its raw value to the
-pusher over a private channel and stores only its SHA-256 digest in the server's
-`config.yaml`:
+In accounts mode, create a key in **Settings → API keys**, keeping Usage enabled.
+Copy the value when it is shown, then store it in the integration as `USAGE_KEY`.
+The value is shown only once; regenerating a key invalidates its old value immediately.
+Permissions can be edited later. Expiration defaults to none; optional dates use UTC.
+The database stores only a SHA-256 digest and a display prefix in `user_api_keys`.
+Manage or delete the key in Settings. For headless deployments, the config-file
+`api_keys` entries below remain supported. The legacy usage token continues working
+until its callers have switched; keep their last usage-feed cursor across the switch.
+
+For a config-file key, the operator generates a random value, delivers it over a
+private channel and stores its SHA-256 digest in `config.yaml`:
 
 ```yaml
 api_keys:
@@ -19,7 +26,7 @@ api_keys:
     sha256: <64 lowercase hexadecimal characters>
 ```
 
-The user must already exist. Keys must be 32–256 characters from
+For config-file keys, the user must already exist. Values must be 32–256 characters from
 `[A-Za-z0-9_-]`. Generate one outside your checkout in a private directory;
 this writes a new private file and prints only the digest for the configuration:
 

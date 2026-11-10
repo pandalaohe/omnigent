@@ -82,6 +82,7 @@ export interface ServerInfo {
   /** Accounts-mode Chrome annotation routes are configured on a shared database. */
   browser_annotations_available?: boolean;
   /** Signed-in delegated grants can be listed and individually revoked. */
+  api_keys_available?: boolean;
   connected_apps_available?: boolean;
   /**
    * True only on an explicit single-user local runtime
@@ -377,6 +378,7 @@ function parseBranding(raw: unknown): Branding | null {
 export const FALLBACK_SERVER_INFO: ServerInfo = {
   accounts_enabled: false,
   browser_annotations_available: false,
+  api_keys_available: false,
   connected_apps_available: false,
   // Fail to multi-user: a failed probe must not hide account/sharing chrome.
   single_user: false,
@@ -478,6 +480,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         cachedServerInfo = {
           accounts_enabled: data.accounts_enabled === true,
           browser_annotations_available: data.browser_annotations_available === true,
+          api_keys_available: data.api_keys_available === true,
           connected_apps_available: data.connected_apps_available === true,
           single_user: data.single_user === true,
           login_url: typeof data.login_url === "string" ? data.login_url : null,

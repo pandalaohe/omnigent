@@ -43,6 +43,7 @@ export type SettingsSectionId =
   | "mcp"
   | "shortcuts"
   | "import"
+  | "api-keys"
   | "account"
   | "members"
   | "policies"
@@ -61,6 +62,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "mcp",
   "shortcuts",
   "import",
+  "api-keys",
   "account",
   "members",
   "policies",
@@ -101,6 +103,7 @@ export function settingsNavGroups(
   integrationsEnabled = false,
   _customAgentsEnabled = false,
   mcpEnabled = false,
+  apiKeysAvailable = false,
 ): SettingsNavGroup[] {
   const harnesses: SettingsNavItem = {
     id: "agents",
@@ -134,6 +137,13 @@ export function settingsNavGroups(
     // Account leads the group when present — it's the most-visited section
     // on a deploy with sign-in.
     general.unshift({ id: "account", label: "Account", icon: UserCogIcon });
+  }
+  if (apiKeysAvailable) {
+    general.splice(hasAuthSession ? 1 : 0, 0, {
+      id: "api-keys",
+      label: "API keys",
+      icon: ShieldCheckIcon,
+    });
   }
   const groups: SettingsNavGroup[] = [{ title: "General", items: general }];
   groups.push({
@@ -332,6 +342,7 @@ export function SettingsSidebarBody({
     integrationsEnabled,
     false,
     mcpEnabled,
+    info !== "loading" && info.api_keys_available === true,
   );
 
   return (

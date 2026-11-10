@@ -47,6 +47,7 @@ from omnigent.entities.session_resources import (
     get_resource_by_id,
     resolve_terminal_entry_by_resource_id,
 )
+from omnigent.entities.user_api_key import UserApiKey
 
 __all__ = [
     "DEFAULT_ENVIRONMENT_ID",
@@ -92,6 +93,7 @@ __all__ = [
     "SlashCommandData",
     "StoredFile",
     "TerminalCommandData",
+    "UserApiKey",
     "filter_resources_by_type",
     "get_resource_by_id",
     "parse_item_data",

@@ -81,6 +81,9 @@ def _revoke_durable_authority(session: Session, user_id: str, *, now: int) -> No
     credentials cleared, and rows with pending sandbox cleanup are kept
     as tombstones instead of being dropped.
     """
+    from omnigent.server.api_key_store import delete_user_api_keys_in_session
+
+    delete_user_api_keys_in_session(session, user_id)
     workspace_id = current_workspace_id()
     session.execute(
         delete(SqlUserDailyCost).where(

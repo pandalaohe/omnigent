@@ -711,6 +711,7 @@ def create_accounts_auth_router(
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=user.account_generation,
+            browser_session=True,
         )
         resp = RedirectResponse(url=f"{config.base_url}/", status_code=302)
         _set_session_cookie(

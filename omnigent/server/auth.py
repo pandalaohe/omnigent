@@ -43,6 +43,8 @@ from typing import TYPE_CHECKING, Final
 
 from starlette.requests import HTTPConnection
 
+from omnigent.entities.user_api_key import UserApiKey
+
 logger = logging.getLogger(__name__)
 
 # Opt-in multi-user switch.
@@ -53,6 +55,16 @@ RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _TRUTHY_STRINGS = ("1", "true", "yes")
 USAGE_READ_TOKEN_PRINCIPAL: Final = "config:usage-read"
+
+
+API_KEY_PREFIX = "omk_"
+API_KEY_SCOPES = ("usage", "tasks")
+ALL_API_KEY_SCOPES = "*"
+
+
+def api_key_scope_allows(scopes: tuple[str, ...], method: str, path: str) -> bool:
+    allowed = API_KEY_SCOPES if "*" in scopes else scopes
+    return any(scope in API_KEY_SCOPES and scope_allows(scope, method, path) for scope in allowed)
 
 
 def scope_allows(scope: str, method: str, path: str) -> bool:
@@ -585,6 +597,10 @@ class UnifiedAuthProvider(AuthProvider):
         self._usage_read_account_lookup: Callable[[str], str | None] | None = None
         from omnigent.server.server_config import load_api_keys
 
+        self._api_key_resolve: Callable[[str, int], tuple[UserApiKey, str] | None] | None = None
+        self._api_key_touch: Callable[[str, str, int], None] | None = None
+        self._api_key_usage_check: Callable[[str], bool] | None = None
+        self._api_key_last_used: dict[str, int] = {}
         self._api_keys: tuple[ApiKey, ...] = ()
         if source != "accounts" and os.environ.get("OMNIGENT_USAGE_READ_TOKEN"):
             logger.warning("OMNIGENT_USAGE_READ_TOKEN ignored outside accounts mode")
@@ -601,7 +617,27 @@ class UnifiedAuthProvider(AuthProvider):
 
     def has_usage_api_key(self, user: str) -> bool:
         """Whether this owner's configured keys can corroborate a feed receipt."""
-        return any(key.user == user and "usage" in key.scopes for key in self._api_keys)
+        return any(key.user == user and "usage" in key.scopes for key in self._api_keys) or (
+            self._api_key_usage_check is not None and self._api_key_usage_check(user)
+        )
+
+    def set_api_key_store(
+        self,
+        resolve: Callable[[str, int], tuple[UserApiKey, str] | None],
+        touch: Callable[[str, str, int], None],
+    ) -> None:
+        self._api_key_resolve = resolve
+        self._api_key_touch = touch
+
+    def set_api_key_usage_check(self, check: Callable[[str], bool]) -> None:
+        self._api_key_usage_check = check
+
+    def read_only_key_usage(self, user: str) -> list[tuple[ApiKey, int | None]]:
+        return [
+            (key, self._api_key_last_used.get(key.name))
+            for key in self._api_keys
+            if key.user == user
+        ]
 
     def set_grant_revocation_check(self, check: Callable[[str], bool]) -> None:
         """Wire the device-grant revocation lookup.
@@ -845,7 +881,39 @@ class UnifiedAuthProvider(AuthProvider):
                         for scope in key.scopes
                     ):
                         request.state.usage_read_grant_id = USAGE_READ_TOKEN_PRINCIPAL
+                    self._api_key_last_used[key.name] = int(time.time())
                     return account
+                if self._source == "accounts" and token.startswith(API_KEY_PREFIX):
+                    if (
+                        re.fullmatch(r"omk_[A-Za-z0-9_-]{43}", token) is None
+                        or self._api_key_resolve is None
+                    ):
+                        return None
+                    now = int(time.time())
+                    try:
+                        found = self._api_key_resolve(digest.hex(), now)
+                    except Exception as exc:  # noqa: BLE001 — credential lookups fail closed
+                        logger.warning("API key lookup failed: %s", type(exc).__name__)
+                        return None
+                    if found is None:
+                        return None
+                    managed, generation = found
+                    method = request.scope.get("method", "")
+                    if not api_key_scope_allows(managed.scopes, method, request.url.path):
+                        return None
+                    from omnigent.db.account_authority import bind_account_authority
+
+                    bind_account_authority(managed.user_id, generation)
+                    if ("*" in managed.scopes or "usage" in managed.scopes) and scope_allows(
+                        "usage", method, request.url.path
+                    ):
+                        request.state.usage_read_grant_id = USAGE_READ_TOKEN_PRINCIPAL
+                    if self._api_key_touch is not None:
+                        try:
+                            self._api_key_touch(managed.id, digest.hex(), now)
+                        except Exception as exc:  # noqa: BLE001 — usage timestamps are advisory
+                            logger.warning("API key usage update failed: %s", type(exc).__name__)
+                    return managed.user_id
         if not token:
             return None
 
