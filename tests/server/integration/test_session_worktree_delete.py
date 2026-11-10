@@ -206,6 +206,16 @@ async def test_safe_cleanup_blocks_admission_during_and_after_removal(db_uri: st
     host_store.upsert_on_connect(_HOST_ID, "lease-test", RESERVED_USER_LOCAL)
     first = SqlAlchemyConversationStore(db_uri)
     second = SqlAlchemyConversationStore(db_uri)
+    profiled = second.create_conversation()
+    profile = {
+        "id": "build",
+        "provider": "company",
+        "revision": "v1",
+        "workspace_id": 0,
+        "user_id": RESERVED_USER_LOCAL,
+        "name": "Build",
+        "description": "",
+    }
     root = "/opt/work/sample-app/topic"
     archived = first.create_conversation(
         host_id=_HOST_ID, workspace=root, git_branch="feature/topic"
@@ -247,6 +257,14 @@ async def test_safe_cleanup_blocks_admission_during_and_after_removal(db_uri: st
                 )
             with pytest.raises(OmnigentError, match="lease is busy"):
                 await first.delete_conversation(archived.id)
+            with pytest.raises(OmnigentError, match="lease is busy"):
+                await asyncio.to_thread(
+                    second.bind_profiled_host,
+                    profiled.id,
+                    _HOST_ID,
+                    f"{root}/packages/app",
+                    profile,
+                )
         finally:
             release_removal.set()
         assert await asyncio.wait_for(cleanup, 3) is True
@@ -255,6 +273,9 @@ async def test_safe_cleanup_blocks_admission_during_and_after_removal(db_uri: st
     assert ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY in row.labels
     with pytest.raises(OmnigentError, match="Worktree was removed"):
         second.create_conversation(host_id=_HOST_ID, workspace=f"{root}/packages/app")
+    with pytest.raises(OmnigentError, match="Worktree was removed"):
+        second.bind_profiled_host(profiled.id, _HOST_ID, f"{root}/packages/app", profile)
+    assert second.get_profile_host_binding(profiled.id).host_id is None
 
 
 async def test_unarchive_after_safe_removal_does_not_admit_old_worktree(db_uri: str) -> None:

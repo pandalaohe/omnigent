@@ -65,6 +65,12 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
+import {
+  SandboxProfilePicker,
+  useSandboxProfileCatalog,
+  type SandboxProfileSelection,
+} from "@/components/SandboxProfilePicker";
+import { SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   MonitorCloudIcon,
@@ -173,12 +179,20 @@ import {
   harnessWarningBadgeText,
   isCodexHarness,
   isNativeCursorHarness,
+  isNativeOpenCodeHarness,
   skillInvocationPrefix,
 } from "@/lib/harnessSetup";
 
 // Re-exported for tests that import the readiness helpers from this module.
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
-import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import {
+  isFeatureEnabled,
+  pickerCuration,
+  sandboxOptionLabel,
+  sandboxProviderOptions,
+  sandboxProfilesEnabled,
+} from "@/lib/capabilities";
+import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { useHeading, usePoweredBy } from "@/lib/branding";
 import {
   isSlashCommandText,
@@ -986,6 +1000,16 @@ function harnessWarningMessage(
       </>
     );
   }
+  // OpenCode 2.x ships as a new npm package; an in-place 1.x upgrade can't reach it.
+  if (reason === "version-too-low" && !!harness && isNativeOpenCodeHarness(harness)) {
+    return (
+      <>
+        {agentName} needs OpenCode 2.0 on {hostName} — run{" "}
+        <code>npm i -g @opencode/cli@2.0.32</code> (after <code>npm rm -g opencode-ai</code>) or{" "}
+        <code>omni setup</code> on that machine.
+      </>
+    );
+  }
   // ``version-too-low`` is a uniform state across all CLI harnesses now that
   // the server checks supported version ranges. Keep the message generic so
   // the user is nudged toward setup rather than being told the CLI is missing.
@@ -1255,6 +1279,8 @@ export function AgentHarnessPicker({
   onDismissCyclePreview,
   blockedReasons,
   onPrefetchEntries,
+  curatedEntries,
+  entriesFailed = false,
 }: {
   agentEntries: AvailableAgent[];
   harnessEntries: AvailableAgent[];
@@ -1350,6 +1376,12 @@ export function AgentHarnessPicker({
   blockedReasons?: ReadonlyMap<string, string>;
   /** Called with the ids of rows the menu is about to show. */
   onPrefetchEntries?: (agentIds: string[]) => void;
+  /** Set when the deployment curates New Chat: exactly these rows, in this
+   *  order, as one flat list. Other embedders leave it unset. */
+  curatedEntries?: AvailableAgent[];
+  /** Whether the roster could not be loaded, so an empty curated list is a
+   *  failed fetch rather than the deployment's doing. */
+  entriesFailed?: boolean;
 }) {
   // Controlled so picking a row can close the menu.
   const [open, setOpen] = useState(false);
@@ -1707,6 +1739,52 @@ export function AgentHarnessPicker({
     effectiveAgentId,
     promotedHarnessId,
   ]);
+  // A curated list keeps the deployment's order but honours the same per-entry
+  // hides and "hide unconfigured harnesses" preference as the grouped menu, with
+  // the selected row always kept so the trigger's choice stays in the list.
+  const visibleCuratedEntries = useMemo(() => {
+    if (curatedEntries === undefined) return undefined;
+    const harnessIds = new Set(harnessEntries.map((agent) => agent.id));
+    return curatedEntries.filter((agent) => {
+      if (isHiddenEntry(agent)) return false;
+      if (agent.id === effectiveAgentId || !hideUnconfigured || !harnessIds.has(agent.id)) {
+        return true;
+      }
+      const readiness = harnessReadinessOnHost(agent.harness, host);
+      return readiness.selectable || !readiness.fallbackRelevant;
+    });
+  }, [curatedEntries, harnessEntries, hideUnconfigured, isHiddenEntry, effectiveAgentId, host]);
+  // Why a curated list is empty, which is not always the deployment's doing:
+  // a failed roster fetch and a harness this host lacks read differently.
+  const curatedEmptyState = entriesFailed
+    ? { title: "Agents could not be loaded.", detail: "Check your connection and try again." }
+    : curatedEntries?.some(isHiddenEntry)
+      ? {
+          title: "Every entry is hidden.",
+          detail: "Turn some back on in Settings, under Appearance.",
+        }
+      : {
+          title: "No agents are available here.",
+          detail:
+            curatedEntries?.length === 0
+              ? "This deployment limits which agents New Chat offers."
+              : "The offered harnesses are not set up on this host and are hidden by your settings.",
+        };
+  // What a menu open prefetches sandbox support for: every harness row it shows.
+  const prefetchIds = useMemo(
+    () =>
+      (visibleCuratedEntries ?? readyHarnessEntries)
+        .filter((agent) => harnessEntries.some((entry) => entry.id === agent.id))
+        .map((agent) => agent.id),
+    [visibleCuratedEntries, readyHarnessEntries, harnessEntries],
+  );
+  // Opening by hotkey skips onOpenChange, so prefetch here like a pointer open.
+  const prefetchedOpenNonce = useRef(0);
+  useEffect(() => {
+    if (!openNonce || openNonce === prefetchedOpenNonce.current) return;
+    prefetchedOpenNonce.current = openNonce;
+    onPrefetchEntries?.(prefetchIds);
+  }, [openNonce, onPrefetchEntries, prefetchIds]);
   const selectedOtherHarness = moreHarnessEntries.find((agent) => agent.id === effectiveAgentId);
   const prefetchedOpenRef = useRef(false);
   useEffect(() => {
@@ -1714,10 +1792,10 @@ export function AgentHarnessPicker({
       for (const agent of [...harnessEntries, ...agentEntries]) {
         void prefetchAvailableAgentDetails(agent, queryClient);
       }
-      onPrefetchEntries?.(readyHarnessEntries.map((agent) => agent.id));
+      onPrefetchEntries?.(prefetchIds);
     }
     prefetchedOpenRef.current = open;
-  }, [open, harnessEntries, agentEntries, queryClient, onPrefetchEntries, readyHarnessEntries]);
+  }, [open, harnessEntries, agentEntries, queryClient, onPrefetchEntries, prefetchIds]);
   const otherHarnessLabel =
     selectedOtherHarness && !autoHarnessActive
       ? `Other... (${selectedOtherHarness.display_name})`
@@ -1788,6 +1866,7 @@ export function AgentHarnessPicker({
     };
   }, [pinnedAgentIds, pinCandidates, recentAgentIds, host, leadHostByAgentId]);
 
+  const curated = curatedEntries !== undefined;
   // "Create custom agent" is reachable on any non-sandbox target (a managed
   // sandbox has no create path for an uploaded bundle), unless the embedder
   // opts out (it has no create flow to route the action to).
@@ -1925,7 +2004,7 @@ export function AgentHarnessPicker({
         onOpenChange?.(next);
       }}
       trigger={{
-        disabled: disabledLabel !== undefined || previewOnly || !hasAgents,
+        disabled: disabledLabel !== undefined || previewOnly || (!hasAgents && !curated),
         "aria-busy": loading || undefined,
         label: disabledLabel ?? visibleCachedPreview?.label ?? triggerAccessibleName,
         model: disabledLabel ?? visibleCachedPreview?.model ?? triggerText,
@@ -2018,6 +2097,28 @@ export function AgentHarnessPicker({
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           {otherAgentsBody}
+        </div>
+      ) : curated ? (
+        // One flat list: the agents this deployment offers, in its order.
+        <div data-testid="new-chat-landing-curated">
+          {visibleCuratedEntries?.length === 0 ? (
+            <div
+              data-testid="new-chat-landing-no-agents"
+              role="status"
+              // The menu is whitespace-nowrap; this copy is a sentence and has to wrap.
+              className="px-2 py-3 text-ui whitespace-normal text-muted-foreground"
+            >
+              {curatedEmptyState.title}
+              <div className="text-xs leading-4">{curatedEmptyState.detail}</div>
+            </div>
+          ) : (
+            visibleCuratedEntries?.map((agent) =>
+              renderEntry(
+                agent,
+                harnessEntries.some((entry) => entry.id === agent.id) ? "harness" : "agent",
+              ),
+            )
+          )}
         </div>
       ) : allEntriesHidden ? (
         <>
@@ -2192,6 +2293,7 @@ interface LandingDraft {
   selectedHostId: string | null;
   sandboxSelected: boolean;
   sandboxProvider: string | null;
+  sandboxProfile: SandboxProfileSelection | null;
   sandboxRepoSelections: LastSandboxRepo[];
   workspace: string;
   branchName: string;
@@ -2381,19 +2483,32 @@ export function NewChatLandingScreen({
     conversationsData !== undefined &&
     conversationsData.pages.every((page) => page.data.length === 0);
 
-  const agentList = useMemo(
-    () =>
-      selectableSessionAgents([
-        // A session-derived row for an agent that came from a library template
-        // is a duplicate of the catalog entry below, so it is dropped — unless
-        // the seed pinned that exact id, which must stay selectable.
-        ...((agentsLoading ? cachedPickerOptions?.agents : undefined) ?? agents ?? []).filter(
-          (agent) => !agent.templateId || agent.id === callingSeedAgentId,
-        ),
-        ...(customCatalog.data ?? []).map(customAgentForPicker),
-      ]),
-    [agents, agentsLoading, cachedPickerOptions, customCatalog.data, callingSeedAgentId],
-  );
+  const info = useServerInfo();
+  const curation = pickerCuration(info);
+  const agentList = useMemo(() => {
+    const selectable = selectableSessionAgents([
+      // A session-derived row for an agent that came from a library template
+      // is a duplicate of the catalog entry below, so it is dropped — unless
+      // the seed pinned that exact id, which must stay selectable.
+      ...((agentsLoading ? cachedPickerOptions?.agents : undefined) ?? agents ?? []).filter(
+        (agent) => !agent.templateId || agent.id === callingSeedAgentId,
+      ),
+      ...(customCatalog.data ?? []).map(customAgentForPicker),
+    ]);
+    if (curation.restrictToAgentNames.size === 0) return selectable;
+    const allowed = selectable.filter(
+      (agent) => agent.id === callingSeedAgentId || curation.restrictToAgentNames.has(agent.name),
+    );
+    const order = [...curation.restrictToAgentNames];
+    return allowed.sort((first, second) => order.indexOf(first.name) - order.indexOf(second.name));
+  }, [
+    agents,
+    agentsLoading,
+    cachedPickerOptions,
+    customCatalog.data,
+    callingSeedAgentId,
+    curation.restrictToAgentNames,
+  ]);
 
   // Split the picker into "Harnesses" (harness-backed picks — the native
   // terminal CLIs plus generic-ACP harness agents like Grok / Devin / Kilocode)
@@ -2449,6 +2564,7 @@ export function NewChatLandingScreen({
           selectedHostId: null,
           sandboxSelected: false,
           sandboxProvider: null,
+          sandboxProfile: null,
           // The repo inputs compose the managed create's workspace string, so
           // they are location state too — keeping them would clone another
           // project's repository into this project's sandbox.
@@ -2529,9 +2645,7 @@ export function NewChatLandingScreen({
     textareaRef.current?.setSelectionRange(pending.caret, pending.caret);
   });
 
-  // The server probe feeds attachment validation (undefined on an older
-  // server → the built-in ceilings).
-  const info = useServerInfo();
+  // The server probe also supplies upload limits, with client defaults on older servers.
   const uploadProgress = useChatStore((s) => s.uploadProgress);
 
   // Attachments for the first message — same affordances as the in-session
@@ -2587,6 +2701,7 @@ export function NewChatLandingScreen({
   // Gates the sandbox host option: only servers whose sandbox
   // config can actually serve a managed launch advertise it. "loading"
   // fails closed (option hidden) until the boot probe resolves.
+  const profilesEnabled = sandboxProfilesEnabled(info);
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   const mcpRegistryEnabled = info !== "loading" && !!info.enabled_connections?.includes("mcp");
   const {
@@ -2669,6 +2784,12 @@ export function NewChatLandingScreen({
   const [sandboxProvider, setSandboxProvider] = useState<string | null>(
     () => restoredDraft?.sandboxProvider ?? null,
   );
+  const [sandboxProfile, setSandboxProfile] = useState<SandboxProfileSelection | null>(
+    () => restoredDraft?.sandboxProfile ?? null,
+  );
+  useEffect(() => {
+    if (info !== "loading" && !profilesEnabled) setSandboxProfile(null);
+  }, [info, profilesEnabled]);
   const hostSelected = !sandboxSelected && selectedHostId !== null;
   const rememberedHostChoice = readLastHostChoice();
   const executionTargetSelectionPending =
@@ -2726,6 +2847,8 @@ export function NewChatLandingScreen({
   // is what the launch will use.
   const effectiveSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
+  const { launchError: sandboxProfileError, selection: selectedSandboxProfile } =
+    useSandboxProfileCatalog(sandboxSelected ? effectiveSandboxProvider : null, sandboxProfile);
   const sandboxMultiRepo =
     info !== "loading" &&
     effectiveSandboxProvider !== null &&
@@ -2916,6 +3039,7 @@ export function NewChatLandingScreen({
     selectedHostId,
     sandboxSelected,
     sandboxProvider,
+    sandboxProfile,
     sandboxRepoSelections,
     workspace,
     branchName,
@@ -3069,6 +3193,7 @@ export function NewChatLandingScreen({
       prefillConfigSig !== seededConfigSigRef.current;
     if (!projectChanged && !configChanged) return;
     setSandboxSelected(false);
+    setSandboxProfile(null);
     setSelectedHostId(null);
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
     agentExplicitlySelectedRef.current = false;
@@ -3427,8 +3552,21 @@ export function NewChatLandingScreen({
           : (agentsLoading || prefillConfig === undefined) &&
               agentList.some((agent) => agent.id === cachedPickerOptions?.agent.id)
             ? cachedPickerOptions!.agent.id
-            : (agentList[0]?.id ?? null);
+            : // No remembered pick: use the configured default, else the first agent.
+              (agentList.find((agent) => agent.name === curation.defaultAgentName)?.id ??
+              agentList[0]?.id ??
+              null);
   const effectiveAgentId = automaticHarnessFallback?.candidate?.value.id ?? defaultEffectiveAgentId;
+  // The remembered agent is not one this deployment offers, so the configured
+  // default runs in its place. Drives the harness re-seed below: an override
+  // belongs to the agent it was stored under, not to whatever runs instead.
+  const curationRejectedTheRememberedPick =
+    curation.restrictToAgentNames.size > 0 &&
+    agents !== undefined &&
+    !agentsArePlaceholder &&
+    pickedAgentId !== null &&
+    pickedAgentId !== PENDING_AGENT_ID &&
+    !agentList.some((agent) => agent.id === pickedAgentId);
   const selectedAgent = useMemo(
     () =>
       effectiveAgentId === PENDING_AGENT_ID && pendingAgent
@@ -4238,14 +4376,19 @@ export function NewChatLandingScreen({
   useEffect(() => {
     setPickerReadyTarget(pickerDataLoading ? null : pickerTarget);
   }, [pickerDataLoading, pickerTarget]);
-  const pickerLoading = pickerDataLoading || pickerReadyTarget !== pickerTarget;
+  // The embed shows an offline fallback after 1.5s; it carries no curation.
+  const curationPending = info === "loading" || isBootFallbackInfo(info);
+  const pickerLoading = pickerDataLoading || pickerReadyTarget !== pickerTarget || curationPending;
   const [interactiveCacheKey, setInteractiveCacheKey] = useState<string | null>(null);
   useEffect(() => {
     setInteractiveCacheKey(cachedPickerOptions ? pickerCacheKey : null);
   }, [cachedPickerOptions, pickerCacheKey]);
+  // A cached roster is only safe to open once the server's curation is known:
+  // before that it could show agents this deployment does not offer.
   const interactiveWhileLoading =
     cachedPickerOptions !== null &&
     interactiveCacheKey === pickerCacheKey &&
+    !curationPending &&
     selectedAgent !== undefined &&
     (!harnessTriggerDetails.some((row) => row.label === "Model") ||
       pickerModelOptions.length > 0 ||
@@ -5281,7 +5424,11 @@ export function NewChatLandingScreen({
       }),
     [smartRoutingEnabled, smartRoutingWrappers, harnessWarningHost, externalRoutingConfigured],
   );
-  const smartRoutingHarnessAvailable = smartRoutingUnavailableCause === null;
+  // The curated menu has no Smart Routing row, so a remembered pick of it has
+  // nothing behind it either.
+  const smartRoutingCuratedAway = curation.restrictToAgentNames.size > 0;
+  const smartRoutingHarnessAvailable =
+    smartRoutingUnavailableCause === null && !smartRoutingCuratedAway;
   // The fully-auto brain needs SOME router able to answer for both model
   // families — the router may land the session's work on either, and an arm the
   // external router can't reach (off the workspace Unity Gateway) is only a loss
@@ -5322,12 +5469,18 @@ export function NewChatLandingScreen({
     if (!smartRoutingHarnessSelected || smartRoutingHarnessAvailable) return;
     setPickedHarness(null);
     _setCostControlMode(null);
-    if (wasAvailable) setSmartRoutingDropped(smartRoutingUnavailableCause);
+    // The placeholder wrapper was picked only to carry Smart Routing; under
+    // curation the configured default decides instead of that leftover.
+    if (smartRoutingCuratedAway) setPickedAgentId(null);
+    if (wasAvailable && smartRoutingUnavailableCause !== null) {
+      setSmartRoutingDropped(smartRoutingUnavailableCause);
+    }
   }, [
     smartRoutingHarnessSelected,
     smartRoutingAvailabilityKnown,
     smartRoutingHarnessAvailable,
     smartRoutingUnavailableCause,
+    smartRoutingCuratedAway,
   ]);
   // Routing came back (host switched again, or the missing arm installed) —
   // there is nothing left to explain. An explicit pick clears it too, from the
@@ -5352,6 +5505,17 @@ export function NewChatLandingScreen({
   // front. `workspaceTrimmed` stays for the presence/equality checks that want
   // whitespace-only input to read as empty.
   const workspaceValue = workspace.trimStart();
+  // Curation replaced the remembered agent: re-seed brain and cost control
+  // from the agent that runs.
+  useEffect(() => {
+    if (!curationRejectedTheRememberedPick || effectiveAgentId === null) return;
+    const remembered = readLastHarness(effectiveAgentId);
+    // Top-level Smart Routing has no curated row either, so its sentinel is no
+    // more adopted here than it is restored above.
+    const inherited = remembered === AUTO_NATIVE_HARNESS_ID ? null : remembered;
+    setPickedHarness(inherited);
+    _setCostControlMode(isAutoHarness(inherited) ? "on" : null);
+  }, [curationRejectedTheRememberedPick, effectiveAgentId]);
   const workspaceTrimmed = workspace.trim();
   const workspaceValid = isValidWorkspace(workspace);
   const isCloudHost =
@@ -6131,8 +6295,15 @@ export function NewChatLandingScreen({
     if (pickerLoading || workspaceStartLoading || worktreeRequestPending) {
       return { field: "other", message: "Loading session configuration…" };
     }
-    if (pickerSelectionError !== null || sandboxCatalogError !== null) {
-      return { field: "other", message: pickerSelectionError ?? sandboxCatalogError };
+    if (
+      pickerSelectionError !== null ||
+      sandboxCatalogError !== null ||
+      sandboxProfileError !== null
+    ) {
+      return {
+        field: "other",
+        message: pickerSelectionError ?? sandboxCatalogError ?? sandboxProfileError,
+      };
     }
     if (sandboxSelected && effectiveAgentId?.startsWith("ca_"))
       return { field: "other", message: "Custom agents require a connected computer" };
@@ -6413,6 +6584,7 @@ export function NewChatLandingScreen({
   }
 
   function selectSandbox(provider: string | null = null) {
+    if (provider !== sandboxProvider) setSandboxProfile(null);
     // Persist the explicit sandbox pick (as the reserved sentinel) even when
     // it's already selected, mirroring selectHost — so the sandbox becomes the
     // sticky default for the next visit, on the provider just picked.
@@ -6974,6 +7146,12 @@ export function NewChatLandingScreen({
                 ...(createProjectId !== null ? { workspace: null, git: null } : {}),
                 // Omitted when null so a default create is unchanged.
                 ...(sandboxProvider !== null ? { sandbox_provider: sandboxProvider } : {}),
+                ...(selectedSandboxProfile !== null
+                  ? {
+                      sandbox_profile_id: selectedSandboxProfile.id,
+                      sandbox_profile_revision: selectedSandboxProfile.revision,
+                    }
+                  : {}),
                 // The new sandbox host's id, in the server's minted shape;
                 // keys the create and the session's requests until it binds.
                 ...(info !== "loading" && info.request_managed_sandbox_host_id
@@ -7084,6 +7262,9 @@ export function NewChatLandingScreen({
         const confirmed = (async (): Promise<{ id: string } | { error: string }> => {
           const response = await createRequest;
           if (!response.ok) {
+            if (sandboxSelected) {
+              void queryClient.invalidateQueries({ queryKey: SANDBOX_PROFILES_QUERY_KEY });
+            }
             if (sandboxPreviewEnabled && response.status === 409) {
               void queryClient.invalidateQueries({
                 queryKey: sandboxModelOptionsKey(
@@ -7624,6 +7805,11 @@ export function NewChatLandingScreen({
                   </div>
                 </PopoverContent>
               </Popover>
+              <SandboxProfilePicker
+                provider={effectiveSandboxProvider}
+                value={sandboxProfile}
+                onChange={setSandboxProfile}
+              />
             </ComposerWorkspaceBar>
           )}
           {!sandboxSelected && (
@@ -8474,6 +8660,10 @@ export function NewChatLandingScreen({
                         effectiveAgentId={effectiveAgentId}
                         agentLabel={agentLabel}
                         hasAgents={agentList.length > 0}
+                        curatedEntries={
+                          curation.restrictToAgentNames.size > 0 ? agentList : undefined
+                        }
+                        entriesFailed={agentsError}
                         loading={pickerLoading}
                         interactiveWhileLoading={pickerInteractiveWhileLoading}
                         disabledLabel={noExecutionTargetSelected ? "No host selected" : undefined}
@@ -8776,6 +8966,11 @@ export function NewChatLandingScreen({
                   Go to Integrations
                 </button>
               )}
+            </p>
+          )}
+          {sandboxProfileError && (
+            <p className="text-sm text-muted-foreground" role="status">
+              {sandboxProfileError}
             </p>
           )}
           {pickerSelectionError && (

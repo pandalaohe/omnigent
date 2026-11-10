@@ -84,6 +84,7 @@ import {
 } from "@/components/chat/conversationScope";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
 import { ElicitationMessage } from "./ElicitationMessage";
+import { MOBILE_CHOICE_CLASS, MOBILE_CHOICE_LIST_CLASS } from "./mobileChoiceClasses";
 import {
   type ElicitationAnswers,
   ElicitationSchemaForm,
@@ -638,8 +639,13 @@ export function ApprovalCard({
       : `Won't ask again for any ${rememberScope.tool} call for the rest of this session`
     : undefined;
   const binaryButtons = (
-    <div className="flex flex-wrap gap-2 pt-1">
-      <Button size="sm" onClick={() => submitBinary("accept")} componentId="approval.approve">
+    <div className={cn("flex flex-wrap gap-2 pt-1", MOBILE_CHOICE_LIST_CLASS)}>
+      <Button
+        size="sm"
+        className={MOBILE_CHOICE_CLASS}
+        onClick={() => submitBinary("accept")}
+        componentId="approval.approve"
+      >
         <CheckIcon className="mr-1 size-3.5" />
         Approve
       </Button>
@@ -648,7 +654,7 @@ export function ApprovalCard({
           <Button
             size="sm"
             variant="outline"
-            className="h-auto max-w-full whitespace-normal text-left"
+            className={cn("h-auto max-w-full whitespace-normal text-left", MOBILE_CHOICE_CLASS)}
             onClick={() => submitPersist("session")}
             title={`Ask Antigravity to allow commands starting with “${agyPermission.alwaysAllowPattern}” for this conversation`}
             data-testid="approval-card-agy-session-allow"
@@ -666,7 +672,7 @@ export function ApprovalCard({
           <Button
             size="sm"
             variant="outline"
-            className="h-auto max-w-full whitespace-normal text-left"
+            className={cn("h-auto max-w-full whitespace-normal text-left", MOBILE_CHOICE_CLASS)}
             onClick={() => submitPersist("always")}
             title={`Ask Antigravity to save a rule allowing commands starting with “${agyPermission.alwaysAllowPattern}” for this Omnigent session`}
             data-testid="approval-card-agy-always-allow"
@@ -686,6 +692,7 @@ export function ApprovalCard({
         <Button
           size="sm"
           variant="outline"
+          className={MOBILE_CHOICE_CLASS}
           onClick={() => submitPersist("session")}
           componentId="approval.approve_session"
         >
@@ -697,6 +704,7 @@ export function ApprovalCard({
         <Button
           size="sm"
           variant="outline"
+          className={MOBILE_CHOICE_CLASS}
           onClick={() => submitPersist("always")}
           componentId="approval.approve_always"
         >
@@ -708,7 +716,7 @@ export function ApprovalCard({
         <Button
           size="sm"
           variant="outline"
-          className="h-auto min-h-8 whitespace-normal text-left"
+          className={cn("h-auto min-h-8 whitespace-normal text-left", MOBILE_CHOICE_CLASS)}
           onClick={() => submit(elicitationId, "accept", { allow_directories: true })}
           componentId="approval.approve_directories"
         >
@@ -720,6 +728,7 @@ export function ApprovalCard({
         <Button
           size="sm"
           variant="outline"
+          className={MOBILE_CHOICE_CLASS}
           onClick={submitAutoMode}
           title="Approve this request and let Claude review future tool permissions automatically for this session"
           componentId="approval.approve_auto_mode"
@@ -732,6 +741,7 @@ export function ApprovalCard({
         <Button
           size="sm"
           variant="outline"
+          className={MOBILE_CHOICE_CLASS}
           onClick={submitAllowAllEdits}
           componentId="approval.approve_allow_edits"
         >
@@ -743,6 +753,7 @@ export function ApprovalCard({
         <Button
           size="sm"
           variant="outline"
+          className={MOBILE_CHOICE_CLASS}
           onClick={submitRemember}
           title={rememberTitle}
           data-testid="approval-card-remember"
@@ -755,6 +766,7 @@ export function ApprovalCard({
       <Button
         size="sm"
         variant="outline"
+        className={cn(MOBILE_CHOICE_CLASS, "mobile-app:mt-2")}
         onClick={() => submitBinary("decline")}
         componentId="approval.reject"
       >
@@ -778,9 +790,13 @@ export function ApprovalCard({
     </div>
   );
   const codexCommandButtons = (
-    <div className="flex flex-wrap items-center gap-2 pt-1" data-testid="codex-command-actions">
+    <div
+      className={cn("flex flex-wrap items-center gap-2 pt-1", MOBILE_CHOICE_LIST_CLASS)}
+      data-testid="codex-command-actions"
+    >
       <Button
         size="sm"
+        className={MOBILE_CHOICE_CLASS}
         onClick={() => submitBinary("accept")}
         componentId="approval.approve_command"
       >
@@ -791,6 +807,7 @@ export function ApprovalCard({
         <Button
           size="sm"
           variant="outline"
+          className={MOBILE_CHOICE_CLASS}
           onClick={() => submitExecPolicyAmendment(execPolicyAmendment)}
           componentId="approval.approve_command_remember"
         >
@@ -798,7 +815,12 @@ export function ApprovalCard({
           Approve and remember
         </Button>
       )}
-      <Button size="sm" variant="outline" onClick={() => submitBinary("decline")}>
+      <Button
+        size="sm"
+        variant="outline"
+        className={cn(MOBILE_CHOICE_CLASS, "mobile-app:mt-2")}
+        onClick={() => submitBinary("decline")}
+      >
         <XIcon className="mr-1 size-3.5" />
         Reject
       </Button>
@@ -1208,8 +1230,8 @@ export function ApprovalCard({
                 onReject={() => submitBinary("decline")}
               />
             ) : isExternalUrl ? (
-              <div className="flex flex-wrap gap-2 pt-1">
-                <Button size="sm" asChild>
+              <div className={cn("flex flex-wrap gap-2 pt-1", MOBILE_CHOICE_LIST_CLASS)}>
+                <Button size="sm" className={MOBILE_CHOICE_CLASS} asChild>
                   <a href={url!} target="_blank" rel="noopener noreferrer">
                     <ExternalLinkIcon className="mr-1 size-3.5" />
                     Open approval page
@@ -1223,12 +1245,16 @@ export function ApprovalCard({
                 onReject={() => submitBinary("decline")}
               />
             ) : isMultiChoice ? (
-              <div className="flex flex-wrap gap-2 pt-1" data-testid="approval-card-options">
+              <div
+                className={cn("flex flex-wrap gap-2 pt-1", MOBILE_CHOICE_LIST_CLASS)}
+                data-testid="approval-card-options"
+              >
                 {optionLabels.map((optLabel) => (
                   <Button
                     key={optLabel}
                     size="sm"
                     variant="outline"
+                    className={MOBILE_CHOICE_CLASS}
                     onClick={() => submitOption(optLabel)}
                   >
                     {optLabel}

@@ -1,3 +1,4 @@
+import type { SandboxProfile } from "./sandboxProfilesApi";
 // Mirrors the response/error/usage types in
 // sdks/python-client/omnigent_client/_types.py.
 //
@@ -313,6 +314,7 @@ export interface SessionStartupHold {
 }
 
 export interface Session {
+  sandboxProfile?: SandboxProfile | null;
   id: string;
   /** Server-confirmed tier state; absent on older servers and unrelated harnesses. */
   permissionTier?: string | null;

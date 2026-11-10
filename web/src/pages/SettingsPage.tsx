@@ -330,7 +330,7 @@ import {
   type CustomTheme,
   writeCustomTheme,
 } from "@/lib/customTheme";
-import { useIsEmbedded } from "@/lib/embedded";
+import { useHostTheme, useIsEmbedded } from "@/lib/embedded";
 import { getOmnigentThemeSettingsUrl } from "@/lib/host";
 import {
   applyImportedSettings,
@@ -640,16 +640,32 @@ function ThemeSubsection({
 function ModeControl() {
   const { theme, setTheme } = useTheme();
   const mode = normalizeThemeMode(theme);
+  const followsHost = useHostTheme() !== undefined;
+  const themeSettingsUrl = followsHost ? getOmnigentThemeSettingsUrl() : undefined;
   const labelId = useId();
   return (
     <div className="flex items-center justify-between gap-4">
-      <SettingsLabel
-        label="Mode"
-        note={null}
-        labelId={labelId}
-        description="Follow your system, or force light or dark."
-        className="flex-1"
-      />
+      <div className="flex-1">
+        <SettingsLabel
+          label="Mode"
+          labelId={labelId}
+          description={
+            followsHost
+              ? "Follow Databricks, or force light or dark."
+              : "Follow your system, or force light or dark."
+          }
+        />
+        {themeSettingsUrl && (
+          <a
+            href={themeSettingsUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="text-sm font-medium text-primary underline underline-offset-2 hover:text-primary/80"
+          >
+            Databricks appearance settings
+          </a>
+        )}
+      </div>
       <IconSegmentedControl<ThemeMode>
         labelledBy={labelId}
         value={mode}
@@ -658,7 +674,7 @@ function ModeControl() {
         items={themeCards.map((card) => ({
           value: card.mode,
           testId: `theme-${card.mode}`,
-          label: card.label,
+          label: card.mode === "system" && followsHost ? "Use Databricks setting" : card.label,
           icon: card.icon,
         }))}
       />
@@ -1140,7 +1156,7 @@ function CompactProgressIndicatorControl() {
   );
 }
 
-/** Opt-in: fold a finished turn's earlier messages so only the last shows. */
+/** Opt-in: fold other agents' progress messages the way Codex turns fold. */
 function FoldAssistantNarrationControl() {
   const enabled = useFoldAssistantNarration();
   const labelId = useId();
@@ -1150,7 +1166,7 @@ function FoldAssistantNarrationControl() {
         label="Show only the final answer"
         note={null}
         labelId={labelId}
-        description="Once a turn finishes, fold its progress messages into the Worked row. Codex's marked answers stay visible; for other agents, the last message does."
+        description="Codex marks its final answer, so a finished Codex turn folds its progress messages into the Worked row. Turn this on to fold other agents' progress messages too, keeping each turn's last message visible."
       />
       <Switch
         aria-labelledby={labelId}
@@ -1165,12 +1181,6 @@ function FoldAssistantNarrationControl() {
 }
 
 function AppearanceSection() {
-  // Embedded: the host owns light/dark, so the Mode picker would be a no-op —
-  // replace it with a note (plus a link to the host's own theme settings when
-  // one is provided). The color palette, terminal theme, and font controls are
-  // per-device prefs that don't conflict with host light/dark, so they stay.
-  // The link opens a new tab: in place, it would replace the app with the
-  // host page, and desktop windows have no Back control.
   const isEmbedded = useIsEmbedded();
   const themeSettingsUrl = getOmnigentThemeSettingsUrl();
   const { setTheme } = useTheme();
@@ -1965,7 +1975,7 @@ function DatabricksIntegrationControl() {
 }
 
 /**
- * Opt-in dispatch for messages sent while the agent is working.
+ * Dispatch for messages sent while the agent is working (on by default).
  */
 function AlwaysSteerControl() {
   const [value, setValue] = useState(() => readAlwaysSteer());

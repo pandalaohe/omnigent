@@ -22,7 +22,6 @@ from omnigent.harnesses.opencode_native.bridge import (
     OPENCODE_NATIVE_BRIDGE_DIR_ENV_VAR,
     OPENCODE_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     read_bridge_state,
-    read_session_instructions,
 )
 from omnigent.harnesses.opencode_native.http_transport import OpenCodeHttpTransport
 from omnigent.native.native_server_harness import NativeServerHarness
@@ -45,41 +44,24 @@ class OpenCodeNativeExecutor(NativeServerHarness):
         self._request_session_id = _request_session_id_from_env()
         super().__init__(
             harness_id=OPENCODE_NATIVE_HARNESS_ID,
-            # OpenCode has no live-steer endpoint, so a mid-turn message is
-            # admitted as a new prompt and the native server's own queue
-            # promotes it when the active turn finishes.
+            # A mid-turn web message is admitted with delivery="queue" and
+            # OpenCode's inbox runs it when the active turn finishes.
             supports_enqueue=True,
             transport=OpenCodeHttpTransport(bridge_dir=self._bridge_dir),
             resolve_session_id=self._resolve_opencode_session_id,
             build_prompt=self._build_prompt_with_model_override,
         )
 
-    def _gate_system_prompt(self, system_prompt: str) -> str | None:
-        """Attach the runner's composed instructions to this turn; ``None`` omits the field.
-
-        Also omits when the session instructions file already carries the same
-        text: the file loads into every turn, so re-sending it would duplicate it.
-        """
-        if not system_prompt:
-            return None
-        if system_prompt == read_session_instructions(self._bridge_dir):
-            return None
-        return system_prompt
-
     def _build_prompt_with_model_override(self, content: object) -> NativePrompt | None:
         """
-        Build a prompt, pinning the resolved model so it governs from turn one.
+        Build a prompt carrying the session's model override.
 
-        OpenCode's ``POST /session`` create body does NOT accept a model
-        (verified against the OpenCode SDK ``SessionCreateData``); the model
-        is a per-prompt field (``{"providerID", "modelID"}``). So the
-        session's ``model_override`` is applied to EVERY injected prompt
-        here. Because OpenCode persists the last-used model as the session
-        default, pinning the first injected turn also governs subsequent
-        TUI-typed turns — the override controls the run from the start, not
-        just a later web turn. A per-turn ``config.model`` (if any) still
-        wins: the base ``run_turn`` only fills the model when the prompt
-        leaves it unset, so it skips a prompt this method already pinned.
+        The transport switches the OpenCode session to ``prompt.model`` via
+        ``POST /api/session/{id}/model`` before admitting the prompt, but only
+        when it differs from ``last_applied_model`` in bridge state, so the
+        override governs the run from the first injected turn. A per-turn
+        ``config.model`` still wins: the base ``run_turn`` only fills the model
+        when the prompt leaves it unset.
 
         :param content: Executor message content (string or content blocks).
         :returns: The prompt with the resolved model applied, or ``None``

@@ -6,11 +6,11 @@
 
 const dns = require("node:dns");
 
-// Schemes the agent may navigate to; everything else (file:, chrome:, data:,
+// Schemes a policy-enforced view may navigate to; everything else (file:, chrome:, data:,
 // javascript:, ...) is a privileged surface or code channel and is rejected.
 const ALLOWED_SCHEMES = new Set(["http:", "https:"]);
 
-// The exact loopback hosts an eligible Arca agent context may open. Other
+// The exact loopback hosts an eligible session context may open. Other
 // loopback spellings and DNS names that resolve to loopback stay blocked.
 // Allowlist entry shapes. Both are validated before any URL parsing so
 // credentials, paths, schemes and CIDR ports can never widen the policy.
@@ -425,6 +425,21 @@ async function checkAgentNavigation(url, options = {}) {
   if (isIpLiteral(parsed.hostname)) return policyDecision(parsed, [], options);
   if (options.allowLocalhost && ARCA_LOOPBACK_HOSTS.has(parsed.hostname))
     return policyDecision(parsed, ["127.0.0.1"], options);
+  const addressRules = [
+    options.allowlist,
+    options.allowOnce,
+    options.access?.allowed,
+    options.access?.ask,
+    options.access?.blocked,
+  ].flatMap((rules) => (Array.isArray(rules) ? rules : []));
+  const needsAddressRules = addressRules.some((raw) => {
+    const rule = parseAllowlistEntry(raw);
+    return rule?.kind === "cidr" || (rule?.kind === "host" && isIpLiteral(rule.host));
+  });
+  if (isBlockedHostname(parsed.hostname) && !needsAddressRules) {
+    const verdict = policyDecision(parsed, [], options);
+    if (!verdict.ok) return verdict;
+  }
   let addresses = [];
   try {
     addresses = await (options.resolveHost ?? lookupHostAddresses)(parsed.hostname);

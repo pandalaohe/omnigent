@@ -16,7 +16,7 @@ only by bridge module, control-function name, and error label; they collapse to
 two parametrized methods driven by :data:`_UNIFORM_INTERRUPT` /
 :data:`_UNIFORM_STOP`. claude interrupt (bridge-id resolution), codex interrupt
 (MCP-startup + app-server ``turn/interrupt``), and opencode interrupt (native
-``POST /session/{id}/abort``) keep dedicated methods; claude stop is likewise
+``POST /api/session/{id}/interrupt``) keep dedicated methods; claude stop is likewise
 special-cased and codex/pi alias stop to their interrupt handler.
 
 Antigravity/OpenCode stop closes the runner-owned terminal instance and
@@ -452,8 +452,8 @@ class NativeInterruptRunner:
     async def stop(self, harness_name: str | None, conv_id: str) -> Response | None:
         """Dispatch a stop_session to the harness's bridge.
 
-        codex/pi have no distinct stop — they route to their interrupt handler,
-        exactly as the original dispatch chain did.
+        codex/pi/opencode have no distinct stop — they route to their interrupt
+        handler.
 
         :returns: A response when this harness has a stop handler, else ``None``
             so the caller falls through to the in-process turn cancel.
@@ -1161,13 +1161,13 @@ class NativeInterruptRunner:
             directory=state.workspace,
         )
         try:
-            # OpenCode answers true even when idle, so the answer is not checked. Record
-            # before closing the client: the abort's idle edge usually follows within ms.
-            await client.abort(state.opencode_session_id)
+            # Record before closing the client: the forwarder publishes the idle edge
+            # from session.execution.interrupted, usually within milliseconds.
+            await client.interrupt(state.opencode_session_id)
             self._defer_parent_wake_after_native_interrupt(conv_id)
         except (OpenCodeClientError, httpx.HTTPError) as exc:
             self._logger.warning(
-                "OpenCode-native abort failed for session=%s opencode_session=%s",
+                "OpenCode-native interrupt failed for session=%s opencode_session=%s",
                 conv_id,
                 state.opencode_session_id,
                 exc_info=True,

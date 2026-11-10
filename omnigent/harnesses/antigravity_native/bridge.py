@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 from omnigent.harnesses.antigravity_native.steps import PendingInteraction
 from omnigent.native import native_bridge_common
 from omnigent.permission_tiers import PERMISSION_TIERS, PermissionTier, normalize_permission_tier
+from omnigent.process_logging import DATA_DIR_ENV_VAR
 
 if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
@@ -44,7 +45,8 @@ _TMUX_FILE = "tmux.json"
 _PLAN_INPUT_RECEIPTS_DIR = "plan-input-receipts"
 _FIRST_PLAN_INPUT_CASCADE = "first-cascade"
 _MAX_PLAN_INPUT_RECEIPTS = 128
-_BRIDGE_ROOT = Path.home() / ".omnigent" / "antigravity-native"
+_BRIDGE_ROOT = native_bridge_common.native_bridge_data_dir() / "antigravity-native"
+_ORPHAN_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 # Prefix of the launcher-minted placeholder conversation id (see
 # ``antigravity_native._mint_agy_conversation_id``). agy mints its own real
@@ -650,11 +652,12 @@ def build_mcp_config(
     ``<python> -I -m omnigent.harnesses.claude_native.bridge serve-mcp --bridge-dir <dir>``.
 
     **HOME pinning.** agy spawns this relay as a child. The relay validates its
-    ``--bridge-dir`` against ``bridge_root()`` (``$HOME/.omnigent/antigravity-native``),
-    which must resolve to the RUNNER's real home where the bridge dir actually
-    lives. Pinning ``HOME`` in the relay env keeps that invariant true even when a
-    future agy launch path customizes process environment. ``-I`` does not clear
-    ``HOME``; it only ignores ``PYTHON*`` vars and user site-packages.
+    ``--bridge-dir`` against ``bridge_root()`` (``<data dir>/antigravity-native``),
+    which must resolve to the RUNNER's data dir where the bridge dir actually
+    lives. Pinning ``HOME`` and ``OMNIGENT_DATA_DIR`` in the relay env keeps that
+    invariant true even when a future agy launch path customizes process
+    environment. ``-I`` does not clear either; it only ignores ``PYTHON*`` vars
+    and user site-packages.
 
     :param bridge_dir: Native Antigravity bridge directory whose relay this
         config points at.
@@ -678,9 +681,10 @@ def build_mcp_config(
                 "enabledTools": list(_AGY_ENABLED_TOOLS),
                 "env": {
                     "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
-                    # Pin the relay to the RUNNER's real home so its bridge-root
-                    # validation matches where the bridge dir lives. See docstring.
+                    # Pin the relay to the RUNNER's real home and data dir so its
+                    # bridge-root validation matches where the bridge dir lives. See docstring.
                     "HOME": str(Path.home()),
+                    DATA_DIR_ENV_VAR: str(native_bridge_common.native_bridge_data_dir()),
                 },
             }
         }

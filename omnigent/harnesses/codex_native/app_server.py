@@ -131,8 +131,9 @@ from omnigent.inner.databricks_executor import (
     _read_databrickscfg_host,
 )
 from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug, codex_spawn_model
-from omnigent.native import policy_allow_cache
+from omnigent.native import native_bridge_common, policy_allow_cache
 from omnigent.process_logging import (
+    DATA_DIR_ENV_VAR,
     harness_stderr_capture_enabled,
     log_info_once,
     log_once,
@@ -417,13 +418,15 @@ def _codex_mcp_server_config_section(
         f'[mcp_servers.omnigent.tools.{tool}]\napproval_mode = "approve"\n'
         for tool in framework_approved_tools(routed_spawns=routed_spawns)
     )
+    relay_data_dir = native_bridge_common.native_bridge_data_dir()
     return (
         f"[mcp_servers.omnigent]\n"
         f"command = {json.dumps(python)}\n"
         # Codex defaults to 60s; the relay can dispatch for 300s and needs
         # time to return its result or its own timeout diagnosis.
         f"tool_timeout_sec = 330\n"
-        f"args = [{args_toml}]\n\n"
+        f"args = [{args_toml}]\n"
+        f"env = {{ {DATA_DIR_ENV_VAR} = {json.dumps(str(relay_data_dir))} }}\n\n"
         f"{approvals}"
     )
 

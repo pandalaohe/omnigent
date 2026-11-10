@@ -43,9 +43,6 @@ export const SingleSelectWithPreview: Story = {
       },
     ],
   },
-  play: async ({ canvasElement }) => {
-    await userEvent.click(requiredElement(canvasElement, "#layout-Side\\ by\\ side"));
-  },
 };
 
 export const MultiQuestionCarousel: Story = {
@@ -76,7 +73,6 @@ export const MultiQuestionCarousel: Story = {
     ],
   },
   play: async ({ canvasElement }) => {
-    await userEvent.click(requiredElement(canvasElement, "#theme-Light"));
     await userEvent.click(requiredElement(canvasElement, '[data-testid="ask-user-question-next"]'));
     await userEvent.click(requiredElement(canvasElement, "#coverage-Loading"));
     await userEvent.click(requiredElement(canvasElement, "#coverage-Error"));

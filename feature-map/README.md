@@ -121,6 +121,11 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 - [Host restart](./host-restart.md) covers restart previews, ownership, draining, reconnect deadlines and result notices.
 
+- [Automation templates](./automation-templates.md) covers the gallery tabs,
+  empty-state preview, and direct template setup.
+
+- [Automations introduction](./automations-introduction.md) covers the first-visit
+  walkthrough, capability-dependent content, and browser-local dismissal.
 
 - [Pull request conversations](./pull-request-conversations.md) covers inline
   GitHub threads and replies through Workspace, composer, mobile and Canvas.
@@ -171,6 +176,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   recording links, file previews, and download fallbacks.
 - [Tool calls in chat](./tool-calls.md) covers tool-call rows and their edit
   counts, the expanded field, error and Raw views, and tool-run folding.
+- [Sandbox profiles](./sandbox-profiles.md) covers provider-owned discovery,
+  desktop and mobile profile selection, and the boundary between browser
+  request proof and live resource/network enforcement.
 
 - [GitLab merge requests](./gitlab.md) covers the shared MR panel, composer,
   Canvas links, and native tracking.
@@ -219,8 +227,8 @@ map an area, remove it here in the same change.
 - Mobile layout: `tests/e2e_ui/mobile/` (only composer labels, the composer
   after an unacknowledged send, sidebar rename under the keyboard, and
   terminal touch scroll are mapped)
-- Onboarding and host import review: `tests/e2e_ui/onboarding/` (only the
-  import review modal's link to Harnesses is mapped)
+- Onboarding and host import review: `tests/e2e_ui/onboarding/` (the import
+  review modal's link to Harnesses and provider profile selection/clone flows are mapped)
 - Visual snapshots: `tests/e2e_ui/visual/`
 - Composer attachment tokens: `tests/e2e_ui/composer/`
 - Projects (host entries and calling defaults): `tests/e2e_ui/projects/`
@@ -255,7 +263,7 @@ interruptions for claude-native are tracked as scenario rows in
 header-menu/custom-agent fork combination still needs a manual browser drive.
 
 **No UI test lane yet:** Slack, the iOS and Android apps, policies and cost
-budgets, MCP servers, sandbox providers,
+budgets, MCP servers, sandbox provider lifecycle beyond profile configuration,
 and smart routing. Smart routing's per-worker model lists, which `sys_list_models`
 also returns, are covered by component tests: `tests/test_model_catalog.py` for
 the worker rows and `tests/host/test_connect.py` for the host's

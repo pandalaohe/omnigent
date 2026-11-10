@@ -1,4 +1,11 @@
-import { forwardRef, useRef, type ComponentPropsWithoutRef, type ReactNode } from "react";
+import {
+  forwardRef,
+  useEffect,
+  useRef,
+  useState,
+  type ComponentPropsWithoutRef,
+  type ReactNode,
+} from "react";
 import {
   BanIcon,
   ChevronDownIcon,
@@ -198,6 +205,7 @@ export function ComposerPermissionPicker({
   onSelect,
   readback,
   testIdPrefix = "composer",
+  openNonce = 0,
 }: {
   label: string;
   value: string;
@@ -215,6 +223,8 @@ export function ComposerPermissionPicker({
   onSelect: (value: string) => void;
   readback?: CodexPermissionReadback;
   testIdPrefix?: string;
+  /** Opens the menu each time this changes to a new nonzero value. */
+  openNonce?: number;
 }) {
   const writeDisabled = disabled || (loading && !interactiveWhileLoading);
   const optionConcept = (mode: string | null | undefined): PermissionModeConcept => {
@@ -228,12 +238,20 @@ export function ComposerPermissionPicker({
   };
   const selectedConcept = optionConcept(selectedValue);
   const SelectedConceptIcon = PERMISSION_CONCEPT_ICONS[selectedConcept];
+  const inert = !readback && writeDisabled;
+  const [open, setOpen] = useState(false);
+  const appliedOpenNonce = useRef(openNonce);
+  useEffect(() => {
+    if (!openNonce || openNonce === appliedOpenNonce.current) return;
+    appliedOpenNonce.current = openNonce;
+    if (!inert) setOpen(true);
+  }, [openNonce, inert]);
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild disabled={!readback && writeDisabled}>
+    <DropdownMenu open={open} onOpenChange={setOpen}>
+      <DropdownMenuTrigger asChild disabled={inert}>
         <button
           type="button"
-          disabled={!readback && writeDisabled}
+          disabled={inert}
           aria-busy={loading || undefined}
           className={cn(
             "flex h-8 min-w-0 w-auto cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7",

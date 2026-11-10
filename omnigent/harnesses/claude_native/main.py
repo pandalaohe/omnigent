@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import functools
 import hashlib
+import importlib.resources
 import json
 import logging
 import os
@@ -265,6 +266,11 @@ _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"
 # Gateway catalogs can reject Claude's canonical refusal fallback.
 # Keep the original model and refusal instead of switching to an unservable id.
 _CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"
+# Claude Code sources this script before every Bash command. The pane's
+# TMUX/TMUX_PANE point at Omnigent's private tmux server, so without the scrub a
+# tool's `tmux kill-session` or `kill-server` ends Claude itself.
+_CLAUDE_CODE_ENV_FILE_ENV = "CLAUDE_ENV_FILE"
+_CLAUDE_TOOL_ENV_SCRIPT = "claude_tool_env.sh"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
@@ -1048,26 +1054,20 @@ def _claude_model_probe_launch(
     from omnigent.claude_launcher import resolve_claude_launch
     from omnigent.config import load_effective_config
     from omnigent.harness_startup_config import resolve_harness_args, resolve_harness_command
+    from omnigent.onboarding.ambient import claude_code_managed_mcp_present
 
     args = ["-p"]
     if stream_input:
         args.extend(("--input-format", "stream-json"))
     else:
         args.append("/model")
-    args.extend(
-        [
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            # The probe asks one client-side question; the MCP fleet, session
-            # persistence, and background chatter are irrelevant startup weight.
-            "--strict-mcp-config",
-            "--mcp-config",
-            '{"mcpServers":{}}',
-            "--no-session-persistence",
-            *extra_args,
-        ]
-    )
+    args.extend(["--output-format", "stream-json", "--verbose"])
+    # The probe asks one client-side question; the MCP fleet, session
+    # persistence, and background chatter are irrelevant startup weight.
+    # Claude Code refuses both MCP flags while an enterprise MCP config exists.
+    if not claude_code_managed_mcp_present():
+        args.extend(["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'])
+    args.extend(["--no-session-persistence", *extra_args])
     if claude_config is not None and claude_config.api_key_helper:
         args.extend(("--settings", json.dumps({"apiKeyHelper": claude_config.api_key_helper})))
     cfg = load_effective_config()
@@ -1667,6 +1667,18 @@ def native_claude_auth_env_unset(
     return ()
 
 
+def claude_tool_env_file() -> str:
+    """
+    Return the packaged script Claude Code sources before each Bash command.
+
+    :returns: Absolute script path, e.g.
+        ``"/opt/omnigent/omnigent/resources/scripts/claude_tool_env.sh"``.
+    """
+    return str(
+        importlib.resources.files("omnigent.resources.scripts").joinpath(_CLAUDE_TOOL_ENV_SCRIPT)
+    )
+
+
 def build_native_claude_terminal_env(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> dict[str, str]:
@@ -1674,10 +1686,11 @@ def build_native_claude_terminal_env(
     Build env overrides for a native Claude Code terminal process.
 
     Forces MCP Tool Search on so Claude defers MCP tool schemas and
-    loads them on demand, disables Claude Code's agent view so the
-    terminal stays pinned to the session the Omnigent UI is showing, and
-    disables the in-TUI feedback surveys, which a web-driven session
-    cannot see or answer (see
+    loads them on demand, keeps Bash tool commands off Omnigent's private
+    tmux server (see :data:`_CLAUDE_CODE_ENV_FILE_ENV`), disables Claude
+    Code's agent view so the terminal stays pinned to the session the
+    Omnigent UI is showing, and disables the in-TUI feedback surveys,
+    which a web-driven session cannot see or answer (see
     :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`). Custom Anthropic
     endpoints keep the selected model when it refuses, since their catalogs
     may not serve Claude Code's canonical refusal-fallback target.
@@ -1706,6 +1719,11 @@ def build_native_claude_terminal_env(
     )
     if _ambient_env_is_non_anthropic_gateway(configured_base_url):
         terminal_env[_CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV] = "1"
+    # A user-provided env file keeps priority; it replaces the tmux scrub.
+    if _CLAUDE_CODE_ENV_FILE_ENV not in terminal_env and not os.environ.get(
+        _CLAUDE_CODE_ENV_FILE_ENV
+    ):
+        terminal_env[_CLAUDE_CODE_ENV_FILE_ENV] = claude_tool_env_file()
     # A raw credential can override the helper or open Claude's API-key menu.
     for name in native_claude_auth_env_unset(claude_config):
         if name in terminal_env:
