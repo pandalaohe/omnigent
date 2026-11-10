@@ -400,7 +400,7 @@ async def resolve_project_session_create(
     bindings: Any = []
     entries: Any = []
     if project is not None:
-        config = project.config
+        config = {} if getattr(body, "sibling_source_id", None) else project.config
         # The legacy agent_id fill moved into the calling chain below; config
         # keeps supplying git, whose semantics have no chain.
         if "git" not in fields_set and "git" in config and "git" in body.__class__.model_fields:

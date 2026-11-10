@@ -930,6 +930,7 @@ function AppShellImpl() {
       worktree: activeSession.worktree ?? null,
       agent_id: activeSession.agentId,
       agent_name: activeSession.agentName,
+      family: activeSession.family,
       git_branch: activeSession.gitBranch ?? null,
       parent_session_id: activeSession.parentSessionId,
     };

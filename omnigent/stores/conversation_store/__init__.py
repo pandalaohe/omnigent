@@ -218,6 +218,10 @@ def _per_user_label_suffix(user_id: str | None, prefix: str) -> str:
     return suffix
 
 
+def _scoped_pin_key(prefix: str, user_id: str | None) -> str:
+    return prefix + _per_user_label_suffix(user_id, prefix.rstrip("."))
+
+
 def pinned_label_key(user_id: str | None) -> str:
     """
     The per-user pinned-label key for ``user_id``.
@@ -445,6 +449,13 @@ SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_sou
 
 # Creation provenance only; this does not confer parentage or permissions.
 CREATED_BY_SESSION_LABEL_KEY = "omnigent.created_by_session_id"
+FAMILY_PIN_LABEL_PREFIX = "omnigent.family_pinned."
+MAX_SESSION_FAMILY_MEMBERS = 100
+
+
+def family_pinned_label_key(user_id: str | None) -> str:
+    """Derive the caller's family pin key within the label column's length limit."""
+    return _scoped_pin_key(FAMILY_PIN_LABEL_PREFIX, user_id)
 
 
 # Labels that must NOT cross into a new session context — deliberately
@@ -2386,6 +2397,22 @@ class ConversationStore(ABC):
         """Persist the native Plan snapshot; empty clears, missing metadata returns false."""
         raise NotImplementedError
 
+    def add_new_sibling(self, source_id: str, session_id: str, *, user_id: str | None) -> None:
+        """Assign a freshly created session to its source's family before launch."""
+        raise NotImplementedError
+
+    def get_session_family(self, session_id: str) -> list[Conversation]:
+        """Return family members in stable creation order, including archived members."""
+        raise NotImplementedError
+
+    def get_session_families(self, family_ids: list[str]) -> dict[str, list[Conversation]]:
+        """Batch-load bounded families in stable creation order, including archived members."""
+        raise NotImplementedError
+
+    def set_family_pin(self, session_id: str, value: str, *, user_id: str | None) -> None:
+        """Pin a representative's family without changing individual session pins."""
+        raise NotImplementedError
+
     @abstractmethod
     def set_conversation_project(
         self,
@@ -2404,7 +2431,6 @@ class ConversationStore(ABC):
         :returns: ``True`` if a metadata row was updated; ``False`` if the
             conversation has no metadata row.
         """
-        ...
 
     @abstractmethod
     def increment_session_usage(
@@ -2862,6 +2888,7 @@ class ConversationStore(ABC):
         conversation_id: str,
         *,
         expected_host_id: str | None = None,
+        expected_sandbox_id: str | None = None,
         clear_profile: bool = False,
     ) -> Conversation:
         """
@@ -3486,9 +3513,10 @@ class ConversationStore(ABC):
         exclude_conversation_id: str,
         include_subdirectories: bool = False,
         include_unclosed_archived: bool = False,
+        include_archived: bool = False,
     ) -> bool:
         """
-        Is another non-archived conversation working in this ``(host_id, workspace)``?
+        Does another conversation use this workspace (active only unless ``include_archived``)?
 
         Sessions routinely share one directory: a fork reusing the source's
         worktree, or several sessions attached to the same existing worktree
@@ -3503,6 +3531,8 @@ class ConversationStore(ABC):
         When ``include_unclosed_archived`` is true, an archived session
         counts until its current revision's CLI release is complete. A Host
         policy may keep an archived CLI running.
+        Archived sessions count only with ``include_archived=True``. Cleanup uses
+        that flag to preserve files needed when an archived session resumes.
 
         :param host_id: Host owning the worktree, e.g. ``"host_a1b2..."``.
         :param workspace: Absolute worktree path, e.g. ``"/w/feature-login"``.
@@ -3517,7 +3547,9 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    async def delete_conversation(self, conversation_id: str) -> bool:
+    async def delete_conversation(
+        self, conversation_id: str, *, preserve_host_binding: str | None = None
+    ) -> bool:
         """
         Delete a conversation and all its items.
 
@@ -3526,6 +3558,8 @@ class ConversationStore(ABC):
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
+        :param preserve_host_binding: Keep the root's metadata reservation when
+            it is bound to this host, for replacement under the same session id.
         :returns: ``True`` if the conversation existed,
             ``False`` otherwise.
         """

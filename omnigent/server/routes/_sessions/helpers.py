@@ -11887,6 +11887,7 @@ async def remove_archived_worktree_best_effort(
     exclude_conversation_id: str,
     archive_mode: str = "green_only",
     rebuildable_paths: list[str] | None = None,
+    host_store: HostStore | None = None,
 ) -> bool:
     """
     Remove an archived session's disposable worktree, best-effort.
@@ -11939,6 +11940,7 @@ async def remove_archived_worktree_best_effort(
             delete_branch=False,
             host_registry=host_registry,
             reason="session-archive",
+            host_store=host_store,
             expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
             conversation_store=conversation_store,
             exclude_conversation_id=exclude_conversation_id,
@@ -11966,6 +11968,7 @@ async def remove_archived_tree_worktrees_best_effort(
     project_host_binding_store: Any,
     archive_mode: str,
     rebuildable_paths: list[str] | None,
+    host_store: HostStore | None = None,
 ) -> None:
     """Clean only the generations in this cascade after the tree released its resources."""
     from omnigent.stores.conversation_store import archive_cascade_members
@@ -12013,6 +12016,7 @@ async def remove_archived_tree_worktrees_best_effort(
         success = binding in removed or await remove_archived_worktree_best_effort(
             target,
             host_registry=host_registry,
+            host_store=host_store,
             project_host_binding_store=project_host_binding_store,
             conversation_store=conversation_store,
             exclude_conversation_id=target.id,
@@ -12043,6 +12047,7 @@ async def _remove_session_worktree_best_effort(
     host_registry: Any,
     reason: str,
     conversation_store: ConversationStore | None = None,
+    host_store: HostStore | None = None,
     exclude_conversation_id: str | None = None,
     fail_if_unavailable: bool = False,
     expected_root_fingerprint: str | None = None,
@@ -12168,6 +12173,7 @@ async def _remove_session_worktree_best_effort(
                     delete_branch=delete_branch,
                     host_registry=host_registry,
                     reason=reason,
+                    host_store=host_store,
                     conversation_store=conversation_store,
                     exclude_conversation_id=exclude_conversation_id,
                     fail_if_unavailable=fail_if_unavailable,
@@ -12202,6 +12208,13 @@ async def _remove_session_worktree_best_effort(
     if not await archive_owner_still_matches():
         return False
 
+    if host_store is not None:
+        host = await asyncio.to_thread(host_store.get_host, host_id, include_deleted=True)
+        if host is not None and host.sandbox_provider is not None:
+            # Shared sandbox files live until last-binding teardown, including
+            # admissions racing this optional worktree cleanup.
+            return False
+
     # A fork reusing the source's directory, or several sessions attached to
     # one existing worktree, all run in the same cwd. Removing it under them
     # leaves their runners on a deleted directory, so leave a shared worktree
@@ -12229,11 +12242,11 @@ async def _remove_session_worktree_best_effort(
             workspace=cleanup_root,
             exclude_conversation_id=exclude_conversation_id,
             include_subdirectories=True,
-            **({"include_unclosed_archived": True} if safe_only else {}),
+            **({"include_unclosed_archived": True} if safe_only else {"include_archived": True}),
         )
         if shared:
             _logger.info(
-                "Keeping worktree %s (%s): another live session still runs there",
+                "Keeping worktree %s (%s): another session still uses it",
                 worktree_path,
                 reason,
             )
@@ -12301,7 +12314,11 @@ async def _remove_session_worktree_best_effort(
                     workspace=worktree_path,
                     exclude_conversation_id=exclude_conversation_id,
                     include_subdirectories=True,
-                    **({"include_unclosed_archived": True} if safe_only else {}),
+                    **(
+                        {"include_unclosed_archived": True}
+                        if safe_only
+                        else {"include_archived": True}
+                    ),
                 ):
                     return False
         fence_set = False
@@ -12937,11 +12954,14 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
     from omnigent.stores.conversation_store import (
         CREATED_BY_SESSION_LABEL_KEY,
+        FAMILY_PIN_LABEL_PREFIX,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
         SIDE_CHAT_SOURCE_LABEL_KEY,
     )
 
+    if any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in labels):
+        raise OmnigentError("Family pins are server-owned", code=ErrorCode.INVALID_INPUT)
     for key in (
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,

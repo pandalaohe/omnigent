@@ -1061,7 +1061,7 @@ class SysSessionCreateTool(Tool):
     The default placement forces ``parent_session_id`` to the caller.
     A child inherits the caller's runner and starts when a message is queued.
     With ``agent_id``, independent placements use the server's orchestration
-    gate and create private top-level sessions without completion forwarding.
+    gate and create private sibling sessions without completion forwarding.
 
     Two optional addressing modes — at most one of ``agent_id`` or
     ``config_path``; with neither the child launches the parent
@@ -1123,9 +1123,11 @@ class SysSessionCreateTool(Tool):
             "for an agent that already exists — never download and "
             "re-upload its bundle. Optionally queue an initial user "
             "message. By default the new session is a child of the caller. "
-            "With agent_id, placement='same_host' creates an independent private session "
-            "on the caller's host/workspace; placement='managed' provisions a new sandbox "
-            "using the server's configured default provider. Managed creation requires a "
+            "With agent_id, placement='same_host' creates a private independent session "
+            "on the caller's host/workspace; placement='managed' creates one on a new sandbox "
+            "using the server's configured default provider. These sessions are grouped as "
+            "nested agents when enabled on the server; otherwise they appear at the top level. "
+            "Managed creation requires a "
             "configured sandbox provider; use same_host for an existing connected host. "
             "These placements require orchestration enabled "
             "and a sending session that is private or shared read-only, including its "
@@ -1188,7 +1190,8 @@ class SysSessionCreateTool(Tool):
                             "enum": ["child", "same_host", "managed"],
                             "description": (
                                 "Default child; same_host or managed launches a private "
-                                "top-level session (agent_id only)."
+                                "independent session (agent_id only), grouped in this family "
+                                "when nested agents are enabled."
                             ),
                         },
                         "sandbox_provider": {

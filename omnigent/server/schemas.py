@@ -2013,6 +2013,7 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
+    sibling_source_id: str | None = None
     parent_session_id: str | None = None
     sub_agent_name: str | None = None
     host_type: Literal["external", "managed"] = "external"
@@ -2282,6 +2283,7 @@ class SessionCreateMetadata(_SandboxProfileSelection):
     host_id: str | None = None
     workspace: str | None = None
     terminal_launch_args: list[str] | None = None
+    sibling_source_id: str | None = None
     parent_session_id: str | None = None
     host_type: Literal["external", "managed"] = "external"
     sandbox_provider: str | None = None
@@ -2518,6 +2520,13 @@ class CancelStartupRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     startup_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     attempt_id: str | None = Field(pattern=r"^[0-9a-f]{32}$")
+
+
+class SessionFamily(BaseModel):
+    id: str
+    representative_id: str | None
+    pinned: bool = False
+    pinned_at: str | None = None
 
 
 class SessionResponse(BaseModel):
@@ -2841,6 +2850,7 @@ class SessionResponse(BaseModel):
         when the user archived it or the row is not archived.
     """
 
+    family: SessionFamily | None = None
     id: str
     session_prompt: str | None = None
     warnings: list[str] = Field(default_factory=list)
@@ -3088,6 +3098,7 @@ class UpdateSessionRequest(BaseModel):
     """
 
     runner_id: str | None = None
+    family_pinned: bool | None = None
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] | None = None
     reasoning_effort: str | None = None
@@ -3844,6 +3855,7 @@ class SessionListItem(BaseModel):
         "not known yet". ``None`` on servers without PR storage.
     """
 
+    family: SessionFamily | None = None
     id: str
     agent_id: str
     agent_template_id: str | None = None
@@ -3901,6 +3913,14 @@ class SessionListItem(BaseModel):
     pull_requests_synced: bool | None = None
 
 
+class SessionPageBoundary(BaseModel):
+    """Last visible primary-page row, before family context is appended."""
+
+    id: str
+    created_at: int
+    updated_at: int
+
+
 class SessionList(BaseModel):
     """Paginated list of sessions; ``data`` is a page of ``SessionListItem``."""
 
@@ -3909,6 +3929,7 @@ class SessionList(BaseModel):
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False
+    page_boundary: SessionPageBoundary | None = None
 
 
 class ArchivedSessionFacetsResponse(BaseModel):

@@ -33,6 +33,7 @@ import type {
   SandboxStatus,
   Session,
   SessionEventInput,
+  SessionFamily,
   SessionItem,
   SessionStatus,
   SessionStartupHold,
@@ -195,6 +196,7 @@ interface ModelUsageWire {
  * camelCase `Session` type at the parse boundary.
  */
 interface SessionResponseWire {
+  family?: SessionFamily | null;
   sandbox_profile?: SandboxProfile | null;
   id: string;
   permission_tier?: string | null;
@@ -468,6 +470,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     permissionTierRevision: wire.permission_tier_revision ?? null,
     permissionTierState: wire.permission_tier_state ?? null,
     permissionTiersCapability: wire.permission_tiers_capability ?? false,
+    family: wire.family,
     agentId: wire.agent_id,
     ...(wire.agent_template_id !== undefined ? { agentTemplateId: wire.agent_template_id } : {}),
     agentName: wire.agent_name ?? null,

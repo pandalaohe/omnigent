@@ -159,6 +159,7 @@ function LocationProbe() {
   const location = useLocation();
   return (
     <>
+      <output data-testid="location">{`${location.pathname}${location.search}`}</output>
       <output data-testid="location-probe">{location.pathname}</output>
       <output data-testid="query-probe">{location.search}</output>
     </>
@@ -167,13 +168,21 @@ function LocationProbe() {
 
 function menuTree(
   overrides: Partial<Parameters<typeof HeaderConversationMenu>[0]> = {},
+  capability: boolean | "missing" = true,
   // A QueryClientProvider is required: the menu reads useQueryClient() to hand
   // the post-archive Undo toast a client for unarchiving.
   queryClient = new QueryClient(),
 ) {
   return (
     <QueryClientProvider client={queryClient}>
-      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, worktree_status: true }}>
+      <CapabilitiesProvider
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          archive_worktree_cleanup: true,
+          worktree_status: true,
+          ...(capability === "missing" ? {} : { sibling_sessions: capability }),
+        }}
+      >
         <MemoryRouter initialEntries={[`/c/${overrides.conversation?.id ?? CONVERSATION.id}`]}>
           <HeaderConversationMenu
             conversation={CONVERSATION}
@@ -195,7 +204,7 @@ function renderMenu(
   overrides: Partial<Parameters<typeof HeaderConversationMenu>[0]> = {},
   queryClient?: QueryClient,
 ) {
-  return render(menuTree(overrides, queryClient));
+  return render(menuTree(overrides, true, queryClient));
 }
 
 function openMenu() {
@@ -399,6 +408,25 @@ describe("HeaderConversationMenu", () => {
     fireEvent.click(screen.getByTestId("header-toggle-session-sounds"));
     expect(readSoundAlertPreferences().mutedSessionIds).toEqual(["conv_child"]);
   });
+  it.each([false, true])(
+    "offers sibling creation but prevents independent project moves (mobile=%s)",
+    (mobile) => {
+      mocks.isMobile = mobile;
+      renderMenu({
+        conversation: {
+          ...CONVERSATION,
+          family: { id: "family", representative_id: "another", pinned: false },
+        },
+      });
+      openMenu();
+      const addAgent = screen.getByTestId("add-sibling-session");
+      expect(addAgent).toBeVisible();
+      expect(screen.getAllByRole("menuitem")[0]).toBe(addAgent);
+      expect(addAgent.nextElementSibling).toHaveAttribute("role", "separator");
+      expect(screen.queryByTestId("header-move-to-project")).not.toBeInTheDocument();
+    },
+  );
+
   it("keeps an unsupported Fork visible without opening its dialog", () => {
     renderMenu({ forkDisabledReason: "Forking this sandbox session is not supported yet." });
     openMenu();
@@ -426,6 +454,7 @@ describe("HeaderConversationMenu", () => {
     // Rename and Move session live in the kebab on desktop too, alongside the
     // breadcrumb title (HeaderTitle) and folder tag (HeaderProjectTag) shortcuts.
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Add nested agent",
       "Pin",
       "Share",
       "Fork",
@@ -469,7 +498,51 @@ describe("HeaderConversationMenu", () => {
     trigger.focus();
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
 
-    expect(screen.getByRole("menuitem", { name: "Pin" })).toHaveFocus();
+    expect(screen.getByRole("menuitem", { name: "Add nested agent" })).toHaveFocus();
+  });
+
+  it.each([false, "missing"] as const)(
+    "hides nested creation without capability %s",
+    (capability) => {
+      render(menuTree({}, capability));
+      openMenu();
+      expect(screen.queryByRole("menuitem", { name: "Add nested agent" })).toBeNull();
+      expect(screen.getByRole("menu").firstElementChild).toBe(
+        screen.getByRole("menuitem", { name: "Pin" }),
+      );
+    },
+  );
+
+  it("opens Add nested agent with Ctrl+Alt+A and ignores held, composing, and AltGraph keys", () => {
+    renderMenu();
+    const addAgentKey = (init: KeyboardEventInit = {}) =>
+      new KeyboardEvent("keydown", {
+        bubbles: true,
+        cancelable: true,
+        code: "KeyA",
+        ctrlKey: true,
+        altKey: true,
+        ...init,
+      });
+
+    fireEvent(window, addAgentKey({ repeat: true }));
+    fireEvent(window, addAgentKey({ isComposing: true }));
+    const altGraph = addAgentKey();
+    vi.spyOn(altGraph, "getModifierState").mockImplementation((key) => key === "AltGraph");
+    fireEvent(window, altGraph);
+    expect(screen.getByTestId("location")).toHaveTextContent("/c/conv-1");
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));
+    screen.getByRole("dialog").querySelector("input")!.focus();
+    fireEvent(window, addAgentKey());
+    expect(screen.getByTestId("location")).toHaveTextContent("/c/conv-1");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    const accepted = addAgentKey();
+    fireEvent(window, accepted);
+    expect(accepted.defaultPrevented).toBe(true);
+    expect(screen.getByTestId("location")).toHaveTextContent("/?sibling=conv-1");
   });
 
   it("runs pin and mark-unread actions for the active session", () => {
@@ -667,6 +740,7 @@ describe("HeaderConversationMenu", () => {
 
     openMenu();
     expect(screen.queryByRole("menuitem", { name: "Archive" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Add nested agent" })).toBeNull();
     const item = screen.getByRole("menuitem", { name: "Unarchive" });
     expect(item.querySelector("svg")).toHaveClass("lucide-archive-restore");
 
@@ -889,6 +963,7 @@ describe("HeaderConversationMenu", () => {
     openMenu();
 
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Add nested agent",
       "Pin",
       "Share",
       "Fork",
@@ -908,11 +983,14 @@ describe("HeaderConversationMenu", () => {
     // and Delete must stay last so a mis-tap doesn't land on them.
     mocks.isMobile = true;
     renderMenu({
+      viewItems: <DropdownMenuItem>Terminal</DropdownMenuItem>,
       workspaceItems: <DropdownMenuItem data-testid="rail-files">Files</DropdownMenuItem>,
     });
     openMenu();
 
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Add nested agent",
+      "Terminal",
       "Pin",
       "Share",
       "Fork",

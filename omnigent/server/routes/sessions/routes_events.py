@@ -6906,6 +6906,7 @@ def register_events_routes(
                         delete_branch=True,
                         host_registry=getattr(state, "host_registry", None),
                         reason="session-delete",
+                        host_store=getattr(state, "host_store", None),
                         expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
                         conversation_store=conversation_store,
                         exclude_conversation_id=conv.id,

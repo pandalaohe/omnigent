@@ -319,7 +319,15 @@ export interface SessionStartupHold {
   since: number;
 }
 
+export interface SessionFamily {
+  id: string;
+  representative_id: string | null;
+  pinned: boolean;
+  pinned_at?: string | null;
+}
+
 export interface Session {
+  family?: SessionFamily | null;
   sandboxProfile?: SandboxProfile | null;
   /**
    * The session whose Workspace rail lists this one as a side chat; `null` for

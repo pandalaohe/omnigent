@@ -81,6 +81,7 @@ export type FeatureValues = Record<string, boolean>;
 
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
+  sibling_sessions?: boolean;
   accounts_enabled: boolean;
   /** Accounts-mode Chrome annotation routes are configured on a shared database. */
   browser_annotations_available?: boolean;
@@ -611,6 +612,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         const smartRoutingEnabled = data.smart_routing_enabled === true;
         const harnessInstallEnabled = data.harness_install_enabled === true;
         cachedServerInfo = {
+          sibling_sessions: data.sibling_sessions === true,
           accounts_enabled: data.accounts_enabled === true,
           browser_annotations_available: data.browser_annotations_available === true,
           api_keys_available: data.api_keys_available === true,

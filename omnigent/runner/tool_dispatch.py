@@ -6327,6 +6327,7 @@ async def _execute_session_create_impl(
         handle: dict[str, object] = {
             "conversation_id": data["id"],
             "kind": "default",
+            "family": data.get("family"),
             "status": data.get("status") or "created",
             "agent_id": data.get("agent_id") or agent_id,
             "title": data.get("title") or args.get("title"),
@@ -8889,6 +8890,7 @@ async def _session_info_item(
         "runner_state_reason": runner_state_reason,
         "host_id": snap.get("host_id"),
         "parent_session_id": snap.get("parent_session_id"),
+        "family": snap.get("family"),
         "created_by_session_id": (_string_mapping(snap.get("labels")) or {}).get(
             CREATED_BY_SESSION_LABEL_KEY
         ),
@@ -10605,6 +10607,7 @@ async def _collect_global_sessions(
                 "last_message_preview": r.get("last_message_preview"),
                 "archived": r.get("archived"),
                 "archived_at": r.get("archived_at"),
+                "family": r.get("family"),
                 "created_by_session_id": (_string_mapping(r.get("labels")) or {}).get(
                     CREATED_BY_SESSION_LABEL_KEY
                 ),

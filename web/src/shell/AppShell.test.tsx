@@ -1056,11 +1056,12 @@ describe("AppShell header", () => {
   });
 
   it.each([
-    { title: "Off-window owner session", archived: false },
-    { title: null, archived: true },
+    { title: "Off-window owner session", archived: false, sibling: false },
+    { title: null, archived: true, sibling: false },
+    { title: "Archived sibling", archived: true, sibling: true },
   ])(
     "shows owner actions for an off-window session ($title, archived=$archived)",
-    ({ title, archived }) => {
+    ({ title, archived, sibling }) => {
       mockConversations([]);
       useSessionMock.mockReturnValue({
         session: {
@@ -1072,6 +1073,7 @@ describe("AppShell header", () => {
           createdAt: 1_700_000_000,
           title,
           archived,
+          family: sibling ? { id: "family", representative_id: "other", pinned: false } : undefined,
           labels: {},
           items: [],
           pendingElicitations: [],
@@ -1092,6 +1094,8 @@ describe("AppShell header", () => {
       expect(
         screen.getByRole("menuitem", { name: archived ? "Unarchive" : "Archive" }),
       ).toBeInTheDocument();
+      if (sibling) expect(screen.queryByTestId("header-move-to-project")).toBeNull();
+      else expect(screen.getByTestId("header-move-to-project")).toBeInTheDocument();
     },
   );
 

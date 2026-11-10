@@ -59,6 +59,7 @@ import {
 import { showToast } from "@/components/ui/toast";
 import {
   conversationDisplayLabel,
+  isPinOrderUnit,
   readPinnedConversationIds,
   setLegacyPinnedConversationId,
 } from "@/shell/sidebarNav";
@@ -83,7 +84,7 @@ import {
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
 import { releaseConversation, useChatStore } from "@/store/chatStore";
-import type { Session } from "@/lib/types";
+import type { Session, SessionFamily } from "@/lib/types";
 import type { SessionPullRequestSummary } from "@/hooks/useSessionPullRequests";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
@@ -295,6 +296,7 @@ export interface KeepWarmStatus {
 
 /** Mirrors the server's `SessionListItem` / `ConversationObject` shape. */
 export interface Conversation {
+  family?: SessionFamily | null;
   id: string;
   object: "conversation";
   title: string | null;
@@ -494,6 +496,8 @@ export interface ConversationsPage {
   first_id: string | null;
   last_id: string | null;
   has_more: boolean;
+  /** Primary page boundary, before family expansion; absent on older servers. */
+  page_boundary?: Pick<Conversation, "id" | "created_at" | "updated_at"> | null;
 }
 
 // ── Deleting-session tombstones ───────────────────────────────────────
@@ -721,6 +725,7 @@ export async function fetchConversationsPage({
     sort_by: sortBy,
     limit: String(limit),
     visibility: visibility ?? "all",
+    ...(!searchQuery ? { expand_families: "true" } : {}),
   });
   if (after) params.set("after", after);
   if (searchQuery) params.set("search_query", searchQuery);
@@ -1327,6 +1332,7 @@ export function useRenameConversation() {
 interface ArchiveListsSnapshot {
   lists: [readonly unknown[], ConversationsInfiniteData | undefined][];
   pinned: PinnedConversationsResult | undefined;
+  family: boolean;
   /** The archived sessions' own fetched rows, such as the sidebar's open-session row. */
   backfill: [string, Conversation | null | undefined][];
 }
@@ -1336,6 +1342,7 @@ function snapshotArchiveLists(
   ids: readonly string[],
 ): ArchiveListsSnapshot {
   return {
+    family: ids.some((id) => !!findCachedConversationRow(queryClient, id)?.family),
     lists: [
       ...queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: ["conversations"] }),
       ...queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: ["project-sessions"] }),
@@ -1395,6 +1402,7 @@ async function paintConversationsArchived(
   await Promise.all([
     queryClient.cancelQueries({ queryKey: ["conversations"] }),
     queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
+    queryClient.cancelQueries({ queryKey: PINNED_CONVERSATIONS_KEY }),
     // Cancelling a first fetch would leave the row empty with nothing to refetch it.
     ...ids
       .filter((id) => queryClient.getQueryData(["conversation-backfill", id]) !== undefined)
@@ -1452,6 +1460,7 @@ export function useArchiveConversation() {
       if (archived && context?.marked !== undefined) {
         expireSessionsArchiving(context.marked, [updated.id]);
       }
+      if (context?.snapshot.family) invalidateFamilyLists(queryClient);
       // Archiving/unarchiving the last (or first) non-archived member of a
       // project removes/restores it from the server's project list, and adds
       // or drops it from that project folder's own paginated list. These read
@@ -1541,10 +1550,7 @@ function reapplyLiveSessionTombstones(queryClient: QueryClient): void {
 }
 
 /** Every cached list touched by an optimistic delete, as it was before. */
-interface DeletedListsSnapshot {
-  lists: [readonly unknown[], ConversationsInfiniteData | undefined][];
-  pinned: PinnedConversationsResult | undefined;
-}
+type DeletedListsSnapshot = ArchiveListsSnapshot;
 
 /**
  * Paint a delete before the server confirms it: hide the sessions from
@@ -1565,14 +1571,9 @@ async function paintConversationsDeleted(
   await Promise.all([
     queryClient.cancelQueries({ queryKey: ["conversations"] }),
     queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
+    queryClient.cancelQueries({ queryKey: PINNED_CONVERSATIONS_KEY }),
   ]);
-  const snapshot: DeletedListsSnapshot = {
-    lists: [
-      ...queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: ["conversations"] }),
-      ...queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: ["project-sessions"] }),
-    ],
-    pinned: queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY),
-  };
+  const snapshot = snapshotArchiveLists(queryClient, ids);
   removeConversationsFromLists(queryClient, new Set(ids));
   return snapshot;
 }
@@ -1617,12 +1618,17 @@ function restoreDeletedConversations(
  * @param queryClient - The app QueryClient.
  * @param ids - Conversation ids the server confirmed deleted.
  */
-function finalizeDeletedConversations(queryClient: QueryClient, ids: readonly string[]): void {
+function finalizeDeletedConversations(
+  queryClient: QueryClient,
+  ids: readonly string[],
+  snapshot?: DeletedListsSnapshot,
+): void {
   for (const id of ids) {
     queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
     queryClient.removeQueries({ queryKey: ["session", id] });
   }
   expireSessionsDeleting([...ids]);
+  if (snapshot?.family) invalidateFamilyLists(queryClient);
   // Deleting the last member of a project empties it, so refresh the
   // project list to drop the now-empty folder. Unlike the conversations
   // list, /v1/sessions/projects reads the DB directly (no search-index
@@ -1716,9 +1722,9 @@ export function useStopAndDeleteConversation() {
       // only hint for what to do next.
       showToast(deleteFailedToast(context?.label, err), { duration: 0 });
     },
-    onSuccess: (_data, { id }) => {
+    onSuccess: (_data, { id }, context) => {
       refreshChildLists(queryClient, id);
-      finalizeDeletedConversations(queryClient, [id]);
+      finalizeDeletedConversations(queryClient, [id], context?.snapshot);
       void queryClient.invalidateQueries({ queryKey: ["recent-sessions"] });
     },
   });
@@ -1868,7 +1874,8 @@ export function useBulkArchiveConversations() {
       }
       for (const id of ids) settleOpenSessionRow(queryClient, id, { archived });
     },
-    onSettled: () => {
+    onSettled: (_data, _error, _variables, context) => {
+      if (context?.snapshot.family) invalidateFamilyLists(queryClient);
       // Project caches read the DB directly (no search-index lag), so unlike
       // ["conversations"] they can be refreshed on every settle without
       // racing the reindex and resurrecting an archived row.
@@ -1968,6 +1975,7 @@ export async function undoArchiveConversations(
       );
     }
   } finally {
+    if (conversations.some((row) => row.family)) invalidateFamilyLists(queryClient);
     void queryClient.invalidateQueries({ queryKey: ["projects"] });
     void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
     void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
@@ -2024,8 +2032,8 @@ export function useBulkDeleteConversations() {
       return { succeeded, failed };
     },
     onMutate: ({ ids }) => paintConversationsDeleted(queryClient, ids),
-    onSuccess: (_data, { ids }) => {
-      finalizeDeletedConversations(queryClient, ids);
+    onSuccess: (_data, { ids }, context) => {
+      finalizeDeletedConversations(queryClient, ids, context);
     },
     onError: (error, { ids }, snapshot) => {
       // Partial failure: the sessions that did delete stay gone; the rest
@@ -2034,7 +2042,7 @@ export function useBulkDeleteConversations() {
       const failed = bulk ? bulk.failed : [...ids];
       const succeeded = bulk ? bulk.succeeded : [];
       restoreDeletedConversations(queryClient, snapshot, failed, succeeded);
-      if (succeeded.length > 0) finalizeDeletedConversations(queryClient, succeeded);
+      if (succeeded.length > 0) finalizeDeletedConversations(queryClient, succeeded, snapshot);
       showToast(
         failed.length === 1
           ? "Couldn't delete 1 session — it's back in the sidebar."
@@ -2126,8 +2134,8 @@ export { PINNED_LABEL_KEY };
 export const PINNED_CONVERSATIONS_KEY = ["pinned-conversations"] as const;
 
 /**
- * Result of the pinned-session query. `conversations` is the viewer's pinned
- * sessions; `filterHonored` says whether the server actually applied the
+ * Result of the pinned-session query. `conversations` includes authorized
+ * family context; `filterHonored` says whether the server actually applied the
  * `?pinned=true` filter (see {@link fetchPinnedConversations}).
  */
 export interface PinnedConversationsResult {
@@ -2150,7 +2158,7 @@ export interface PinnedConversationsResult {
  * window. Pins now live on the server (a session label) so they follow the
  * user across devices; this query is the source of truth for which sessions
  * are pinned and supplies the rows for any pin that sits outside the loaded
- * list. Each enabled scope fetches one page bounded by the configured pin cap.
+ * list. Family members can fill a page, so each scope follows all pinned pages.
  *
  * A pre-upgrade server doesn't know the `pinned` param and silently ignores
  * it (FastAPI drops unknown query params), returning an ordinary session page.
@@ -2169,13 +2177,35 @@ async function fetchPinnedScope(
     limit: String(limit),
     visibility,
     pinned: "true",
+    expand_families: "true",
   });
-  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, {
-    headers: PERMISSION_TIERS_PROTOCOL_HEADERS,
-  });
-  if (!res.ok) throw await apiErrorFromResponse(res);
-  const rows = applySessionTombstones((await res.json()) as ConversationsPage, true).data;
-  const conversations = rows.filter((c) => c.labels?.[PINNED_LABEL_KEY] != null);
+  const byId = new Map<string, Conversation>();
+  let after: string | undefined;
+  for (;;) {
+    if (after) params.set("after", after);
+    // Each page advances the raw session cursor, including members of large families.
+    // eslint-disable-next-line no-await-in-loop
+    const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, {
+      headers: PERMISSION_TIERS_PROTOCOL_HEADERS,
+    });
+    // eslint-disable-next-line no-await-in-loop
+    if (!res.ok) throw await apiErrorFromResponse(res);
+    // eslint-disable-next-line no-await-in-loop
+    const page = applySessionTombstones((await res.json()) as ConversationsPage, true);
+    for (const row of page.data) byId.set(row.id, row);
+    if (
+      !page.has_more ||
+      !page.last_id ||
+      page.last_id === after ||
+      page.data.some((row) => row.labels?.[PINNED_LABEL_KEY] == null && !row.family)
+    )
+      break;
+    after = page.last_id;
+  }
+  const rows = [...byId.values()];
+  const conversations = rows.filter(
+    (c) => c.labels?.[PINNED_LABEL_KEY] != null || c.family?.pinned,
+  );
   // Honored iff the server returned nothing, or everything it returned is
   // actually pinned. An old server returns unfiltered rows (none pinned), so a
   // non-empty raw page with fewer pinned rows means the filter was ignored.
@@ -2190,7 +2220,9 @@ async function fetchPinnedScope(
   // (not cleared) — so no pin is lost even in this corner. Closing the window
   // fully would need a server capability flag; deferred since pins haven't
   // shipped yet.
-  const filterHonored = rows.length === 0 || conversations.length === rows.length;
+  const filterHonored =
+    rows.length === 0 ||
+    rows.every((row) => row.labels?.[PINNED_LABEL_KEY] != null || !!row.family);
   // Keep ownership-dependent filtering in the reactive query selector.
   return { conversations, filterHonored };
 }
@@ -2209,7 +2241,8 @@ export async function fetchPinnedConversations(
   return {
     conversations: [...byId.values()].sort(
       (a, b) =>
-        Number(b.labels[PINNED_LABEL_KEY]) - Number(a.labels[PINNED_LABEL_KEY]) ||
+        Number(b.family?.pinned_at ?? b.labels[PINNED_LABEL_KEY] ?? 0) -
+          Number(a.family?.pinned_at ?? a.labels[PINNED_LABEL_KEY] ?? 0) ||
         b.id.localeCompare(a.id),
     ),
     filterHonored: mine.filterHonored && (shared?.filterHonored ?? true),
@@ -2282,7 +2315,14 @@ function cachedSessionRow(queryClient: QueryClient, id: string): Conversation | 
     agent_id: session.agentId,
     harness: session.harness,
     archived: session.archived,
+    family: session.family,
   };
+}
+
+function invalidateFamilyLists(queryClient: QueryClient) {
+  for (const queryKey of [["conversations"], ["project-sessions"], PINNED_CONVERSATIONS_KEY]) {
+    void queryClient.invalidateQueries({ queryKey });
+  }
 }
 
 // Pin, unpin, and reorder writes share a mutation key, and a new one is refused
@@ -2469,6 +2509,7 @@ export function useTogglePinnedConversation() {
         queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
       const pinIds = new Set([
         ...(cachedPins?.conversations
+          .filter(isPinOrderUnit)
           .filter((row) => includeShared || sessionVisibility(row, viewerId) === "mine")
           .map((row) => row.id) ?? []),
         ...readPinnedConversationIds().filter((pinId) => {
@@ -2487,7 +2528,7 @@ export function useTogglePinnedConversation() {
       const labels: Record<string, string> = pinned
         ? { ...base, [PINNED_LABEL_KEY]: String(pinnedAt ?? Date.now()) }
         : Object.fromEntries(Object.entries(base).filter(([k]) => k !== PINNED_LABEL_KEY));
-      patch(id, labels, pinned);
+      if (!existing?.family) patch(id, labels, pinned);
       return { prevPinned, prevPin: base[PINNED_LABEL_KEY] };
     },
     onError: (_err, { id, pinned }, ctx) => {
@@ -2503,6 +2544,11 @@ export function useTogglePinnedConversation() {
       showToast(pinned ? "Couldn't pin the session." : "Couldn't unpin the session.");
     },
     onSuccess: (updated, { pinned }) => {
+      if (updated.family || findRow(updated.id)?.family) {
+        invalidateFamilyLists(queryClient);
+        return;
+      }
+
       // No `markConversationSeen` here: a pin PATCH writes only the label row,
       // never conversations.updated_at (unlike rename/archive/move, which bump
       // it and need the anchor to suppress that self-bump). Anchoring here would
@@ -2585,6 +2631,9 @@ export function useReorderPinnedConversations() {
       });
       if (results.some((r) => r.status === "rejected")) {
         showToast("Couldn't save the pinned order.");
+      }
+      if (writes.some(({ id }) => findCachedConversationRow(queryClient, id)?.family)) {
+        invalidateFamilyLists(queryClient);
       }
     },
   });
@@ -2962,7 +3011,7 @@ export function useMoveToProject() {
         queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
       ]);
       const row = findCachedConversationRow(queryClient, id);
-      if (!row) return undefined;
+      if (!row || row.family) return undefined;
       // Wholesale snapshots for rollback: the overlay also drops the row from
       // other folders' pages, which a field-level revert couldn't restore.
       const previous = {
@@ -3025,8 +3074,8 @@ export function useMoveToProject() {
  * server-side `?project=` filter (archived included). Used by "Delete project"
  * so it removes ALL members, not just those in the loaded sidebar window.
  */
-async function fetchAllProjectSessionIds(project: string): Promise<string[]> {
-  const ids: string[] = [];
+async function fetchAllProjectSessions(project: string): Promise<Conversation[]> {
+  const members = new Map<string, Conversation>();
   let after: string | undefined;
   for (;;) {
     const params = new URLSearchParams({
@@ -3047,11 +3096,11 @@ async function fetchAllProjectSessionIds(project: string): Promise<string[]> {
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     // eslint-disable-next-line no-await-in-loop
     const page = (await res.json()) as ConversationsPage;
-    for (const conv of page.data) ids.push(conv.id);
+    for (const conv of page.data) members.set(conv.id, conv);
     if (!page.has_more || !page.last_id) break;
     after = page.last_id;
   }
-  return ids;
+  return [...members.values()];
 }
 
 /**
@@ -3093,6 +3142,7 @@ async function fetchProjectSessionsPage(
     limit: String(limit),
     visibility: archived ? "all" : "mine",
     project,
+    expand_families: "true",
   });
   // The all+project path resolves owned first-class projects on older servers too.
   if (archived) params.set("include_archived", "true");
@@ -3187,8 +3237,27 @@ export function useDeleteProject() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async ({ id, name }: ProjectSummary) => {
-      const ids = await fetchAllProjectSessionIds(name);
-      const results = await Promise.allSettled(ids.map((sid) => archiveAndUnfileConversation(sid)));
+      const members = await fetchAllProjectSessions(name);
+      const ids = members.map((member) => member.id);
+      const representatives = new Map(
+        members
+          .filter(
+            (member) =>
+              !member.family?.representative_id || member.family.representative_id === member.id,
+          )
+          .map((member) => [member.id, archiveAndUnfileConversation(member.id)]),
+      );
+      const results = await Promise.allSettled(
+        members.map(async (member) => {
+          const representativeId = member.family?.representative_id ?? member.id;
+          const unfile = representatives.get(representativeId);
+          if (!unfile) throw new Error("Family representative is unavailable");
+          const representative = await unfile;
+          return member.id === representativeId
+            ? representative
+            : archiveConversation(member.id, true);
+        }),
+      );
       const succeeded: string[] = [];
       const failed: string[] = [];
       for (let i = 0; i < results.length; i++) {
@@ -3283,21 +3352,26 @@ export function useRenameProject() {
       // omni_project label; re-file each onto project_id and clear that label so
       // the rename is coherent for both membership representations and nothing
       // is left behind in an oldName folder.
-      const memberIds = await fetchAllProjectSessionIds(oldName);
+      const members = await fetchAllProjectSessions(oldName);
       await Promise.all(
-        memberIds.map(async (sid) => {
-          const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sid)}`, {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              project_id: projectId,
-              labels: { [PROJECT_LABEL_KEY]: "" },
-            }),
-          });
-          // Surface a failed re-file: a resolved-but-4xx/5xx response would
-          // otherwise report success while leaving members behind.
-          if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-        }),
+        members
+          .filter(
+            (member) =>
+              !member.family?.representative_id || member.family.representative_id === member.id,
+          )
+          .map(async ({ id: sid }) => {
+            const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sid)}`, {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                project_id: projectId,
+                labels: { [PROJECT_LABEL_KEY]: "" },
+              }),
+            });
+            // Surface a failed re-file: a resolved-but-4xx/5xx response would
+            // otherwise report success while leaving members behind.
+            if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+          }),
       );
       // Return the resolved id so a caller promoting a label-only folder can
       // target the just-created row for a follow-up write instead of passing

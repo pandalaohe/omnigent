@@ -144,7 +144,7 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
     const current = row[key];
     if (key === "labels") {
       if (labelsChanged(current, value)) changed.add(key);
-    } else if (key === "pull_request" || key === "keep_warm") {
+    } else if (key === "pull_request" || key === "keep_warm" || key === "family") {
       // Each parsed frame yields a fresh object; compare structurally so an
       // unchanged status doesn't rewrite the row on every snapshot.
       if (JSON.stringify(current ?? null) !== JSON.stringify(value ?? null)) changed.add(key);

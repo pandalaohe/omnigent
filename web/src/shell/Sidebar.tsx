@@ -2,6 +2,12 @@ import { AgentBadge } from "@/components/AgentBadge";
 import { WorktreeStatusMark } from "@/components/WorktreeStatusMark";
 import { copyText } from "@/lib/clipboard";
 import { AGENT_TEMPLATE_LABEL } from "@/lib/customAgentsApi";
+import {
+  orderSessionFamilies,
+  isIndentedSibling,
+  isIndividuallyPinnedSibling,
+  sessionFamilyGroups,
+} from "@/lib/sessionFamilies";
 import { filterSessionScope } from "@/lib/sessionVisibility";
 import { useGridSessions } from "@/grid/GridSessionsContext";
 import { GridSidebar } from "@/grid/GridWorkspace";
@@ -123,7 +129,7 @@ import {
 import { useProjectOrder, useSaveProjectOrder } from "@/hooks/useProjectOrder";
 import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { listProjects } from "@/lib/projectsApi";
-import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
+import { PINNED_LABEL_KEY, PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
 import {
   Link,
   useLocation,
@@ -345,6 +351,7 @@ import {
   pinOrderWrites,
   type PinOrderWrite,
   readCollapsedSidebarSectionIds,
+  isPinOrderUnit,
   readPinnedConversationIds,
   resolveSidebarDrop,
   type SidebarDropTarget,
@@ -418,7 +425,7 @@ import {
 // + kebab take its place; on mobile those controls are gone, so the badge holds
 // that edge. A held pinned-row shortcut hint fades it the same way.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0 group-has-[[data-session-shortcut-hint]]:opacity-0";
+  "-translate-y-1/2 pointer-events-none absolute flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-0 group-has-[[data-session-shortcut-hint]]:opacity-0";
 
 function isPlainNavigationClick(event: MouseEvent<HTMLAnchorElement>): boolean {
   return (
@@ -1162,9 +1169,11 @@ function SidebarImpl({
   const { data: pinnedData, isSuccess: pinnedLoaded } = sidebarData.pinned;
   // Stable empty fallback so downstream memos don't re-fire on every render
   // while the query is still loading (`pinnedData` undefined).
+  const pinnedFamilyRows = pinnedData?.conversations ?? EMPTY_CONVERSATIONS;
   const pinnedConversations = useMemo(
-    () => pinnedData?.conversations ?? EMPTY_CONVERSATIONS,
-    [pinnedData],
+    () =>
+      pinnedFamilyRows.filter((row) => isPinOrderUnit(row) || row.labels[PINNED_LABEL_KEY] != null),
+    [pinnedFamilyRows],
   );
   const pinnedFilterHonored = pinnedData?.filterHonored ?? false;
   // Membership is the union of the server's pinned rows and any pins still in
@@ -1785,7 +1794,7 @@ function SidebarImpl({
                     onActiveTabChange={switchTab}
                     multiUser={multiUser}
                     pinnedConversationIds={pinnedConversationIds}
-                    pinnedConversations={pinnedConversations}
+                    pinnedConversations={pinnedFamilyRows}
                     pinReorderEnabled={pinnedFilterHonored}
                     onEnterSelectionMode={enterSelectionMode}
                     selectionMode={selectionMode}
@@ -1873,6 +1882,8 @@ function ProjectFolder({
   active,
   onSelectNewSessionTarget,
   onToggleCollapsed,
+  collapsedFamilies,
+  onToggleFamily,
   pinnedConversationIds,
   sessionShortcutSlots,
   activeOverride,
@@ -1920,6 +1931,8 @@ function ProjectFolder({
   /** Select this project as the destination for global new-session actions. */
   onSelectNewSessionTarget: () => void;
   onToggleCollapsed: () => void;
+  collapsedFamilies: ReadonlySet<string>;
+  onToggleFamily: (familyId: string) => void;
   pinnedConversationIds: string[];
   /** Jump slot per numbered row (the first ten the sidebar lists). */
   sessionShortcutSlots?: ReadonlyMap<string, number>;
@@ -1988,17 +2001,19 @@ function ProjectFolder({
       byId.set(row.id, row);
     for (const c of windowConversations) byId.set(c.id, c);
     // Pinning changes where the row is shown, not its project membership.
-    return sortConversations(
-      [...byId.values()].filter(
-        (c) =>
-          (c.archived === true) === archived &&
-          sessionBelongsToProject(c, { id: projectId, name }, viewerId) &&
-          (archived || !hidePinnedHomeCopies || !pinnedConversationIds.includes(c.id)),
+    return orderSessionFamilies(
+      sortConversations(
+        [...byId.values()].filter(
+          (c) =>
+            (c.archived === true) === archived &&
+            sessionBelongsToProject(c, { id: projectId, name }, viewerId) &&
+            (archived || !hidePinnedHomeCopies || !pinnedConversationIds.includes(c.id)),
+        ),
+        activeOverride,
+        frozenSortKeys,
+        sortBy,
+        customOrder,
       ),
-      activeOverride,
-      frozenSortKeys,
-      sortBy,
-      customOrder,
     );
   }, [
     query.data,
@@ -2190,6 +2205,8 @@ function ProjectFolder({
         // Projects default collapsed: shown only when explicitly expanded.
         collapsed={!expanded}
         onToggleCollapsed={onToggleCollapsed}
+        collapsedFamilies={collapsedFamilies}
+        onToggleFamily={onToggleFamily}
         onRowClick={onRowClick}
         onTogglePinned={onTogglePinned}
         selectionMode={selectionMode}
@@ -2265,6 +2282,8 @@ function FavoriteProjectCopy({
   canonicalInstanceKeys,
   expanded,
   onToggleCollapsed,
+  collapsedFamilies,
+  onToggleFamily,
   windowConversations,
   activeConversationId,
   selectedNewSessionProjectName,
@@ -2288,6 +2307,8 @@ function FavoriteProjectCopy({
   canonicalInstanceKeys: Map<string, string>;
   expanded: boolean;
   onToggleCollapsed: () => void;
+  collapsedFamilies: ReadonlySet<string>;
+  onToggleFamily: (familyId: string) => void;
   windowConversations: Conversation[];
   activeConversationId: string | null;
   selectedNewSessionProjectName: string | null;
@@ -2331,6 +2352,8 @@ function FavoriteProjectCopy({
   };
   return (
     <ProjectFolder
+      collapsedFamilies={collapsedFamilies}
+      onToggleFamily={onToggleFamily}
       scrollRoot={scrollRoot}
       sessionShortcutSlots={sessionShortcutSlots}
       pageSize={projectFolderCollapse ? projectFolderPageSize : undefined}
@@ -2647,6 +2670,15 @@ function ConversationList({
 }: ConversationListProps) {
   const serverInfo = useServerInfo();
   const grids = useGridSessions();
+  const [collapsedFamilies, setCollapsedFamilies] = useState<Set<string>>(() => new Set());
+  const toggleFamily = useCallback((familyId: string) => {
+    setCollapsedFamilies((previous) => {
+      const next = new Set(previous);
+      if (next.has(familyId)) next.delete(familyId);
+      else next.add(familyId);
+      return next;
+    });
+  }, []);
   // Row-invariant values resolved once here and shared with rows via context
   // (see IsMobileContext etc.), so each row doesn't run its own copy.
   const viewerId = useViewerId();
@@ -2719,7 +2751,7 @@ function ConversationList({
     () => (openSessionRow ? [...pagedConversations, openSessionRow] : pagedConversations),
     [pagedConversations, openSessionRow],
   );
-  const groupOrder = useMemo(
+  const groupOrder = useMemo<readonly string[]>(
     () =>
       view.grouping === "harness"
         ? [...new Set(allConversations.map(harnessLabel))].sort((a, b) => a.localeCompare(b))
@@ -2961,17 +2993,9 @@ function ConversationList({
             ? listed.filter((c) => isOwnedByViewer(c, viewerId))
             : listed;
 
-    // With Favorites present, pinned sessions render there in order of the `omnigent.pinned` label
-    // value (pin time, or a dragged position; newest pin at the bottom), NOT by
-    // `updated_at`, so a pinned session holds its slot when a new message bumps
-    // its `updated_at`. Pins are ownership-agnostic, so the favorites section
-    // always shows every non-archived pin regardless of the
-    // My/Shared/All/Archived filter — it's scoped to notArchived (not
-    // tabScoped), so an owned pin stays visible on the Shared tab, a shared pin
-    // stays visible on My sessions, and the pins don't vanish on the Archived
-    // tab either. (An archived session is never pinned into the live sections —
-    // hence notArchived, not allWithPinned.)
-    const pinned = orderByPinnedTimestamp(notArchived.filter((c) => pinnedSet.has(c.id)));
+    const pinned = orderSessionFamilies(
+      orderByPinnedTimestamp(notArchived.filter((c) => c.family?.pinned || pinnedSet.has(c.id))),
+    );
 
     // Folders use live members on All / My and archives on Archived. Filing is
     // owner-only, so Shared and grouped views omit folders; pins precede them.
@@ -2994,12 +3018,8 @@ function ConversationList({
         id,
         name,
         icon,
-        conversations: sortConversations(
-          inProject,
-          activeOverride,
-          frozenKeys,
-          sortBy,
-          customOrder,
+        conversations: orderSessionFamilies(
+          sortConversations(inProject, activeOverride, frozenKeys, sortBy, customOrder),
         ),
       };
     });
@@ -3038,7 +3058,14 @@ function ConversationList({
     const ordered = splitShared
       ? allOrdered.filter((c) => isOwnedByViewer(c, viewerId))
       : allOrdered;
-    if (!grouped) return { pinned, shared, sessions: ordered, projectGroups, groupTitles: null };
+    if (!grouped)
+      return {
+        pinned,
+        shared,
+        sessions: orderSessionFamilies(ordered),
+        projectGroups,
+        groupTitles: null,
+      };
     // Buckets use render-time "now", so a day rollover shows on the next list update.
     const now = new Date();
     const groupTitles = new Map<string, string>(
@@ -3057,8 +3084,31 @@ function ConversationList({
               )}`,
       ]),
     );
+    const familyGroups = new Map<string, string>();
+    const familyRows = sessionFamilyGroups(ordered);
+    for (const row of ordered) {
+      if (!row.family) continue;
+      const representative = familyRows.get(row.family.id)?.[0];
+      const group = groupTitles.get(
+        (view.grouping === "created" || view.grouping === "harness") && representative
+          ? representative.id
+          : row.id,
+      );
+      const previous = familyGroups.get(row.family.id);
+      if (
+        group &&
+        (!previous ||
+          (view.grouping === "status" && groupOrder.indexOf(group) < groupOrder.indexOf(previous)))
+      ) {
+        familyGroups.set(row.family.id, group);
+      }
+    }
+    for (const row of ordered) {
+      const group = row.family ? familyGroups.get(row.family.id) : undefined;
+      if (group) groupTitles.set(row.id, group);
+    }
     const sessions = groupConversations(ordered, (c) => groupTitles.get(c.id), groupOrder).flatMap(
-      (g) => g.conversations,
+      (g) => orderSessionFamilies(g.conversations),
     );
     return { pinned, shared, sessions, projectGroups, groupTitles };
     // `unseenTick` / `draftIds` aren't read here: they version the stores status buckets read.
@@ -3618,6 +3668,11 @@ function ConversationList({
       // A favorites copy drags only to reorder pins or to leave favorites; its
       // folder / Sessions twin owns move / ungroup.
       if (dragged.reorderOnly && action.kind !== "reorder-pin" && action.kind !== "unpin") return;
+      if (
+        (action.kind === "move" || action.kind === "ungroup") &&
+        event.active.data.current?.canMoveProject === false
+      )
+        return;
       if (action.kind === "move") {
         moveToProject.mutate({ id: dragged.id, project: action.project });
         // Open the (possibly brand-new) folder so the session is visible in it.
@@ -4081,7 +4136,7 @@ function ConversationList({
     const ids: string[] = [];
     const seen = new Set<string>();
     const push = (list: readonly Conversation[]) => {
-      for (const conversation of list) {
+      for (const conversation of orderSessionFamilies(list, collapsedFamilies)) {
         if (seen.has(conversation.id)) continue;
         seen.add(conversation.id);
         ids.push(conversation.id);
@@ -4099,10 +4154,14 @@ function ConversationList({
       } else if (section.kind === "favorites" && favoriteOrder !== undefined) {
         const groupById = new Map(groups.map((entry) => [entry.group.id, entry] as const));
         const sessionById = new Map(flatSessions.map((c) => [c.id, c] as const));
+        const visibleFamilyIds = new Set(
+          orderSessionFamilies(flatSessions, collapsedFamilies).map((c) => c.id),
+        );
         for (const ref of favoriteOrder) {
           if (ref.type === "session") {
             const conversation = sessionById.get(ref.id);
-            if (conversation !== undefined) push([conversation]);
+            if (conversation !== undefined && visibleFamilyIds.has(conversation.id))
+              push([conversation]);
           } else {
             const entry = groupById.get(ref.id);
             if (
@@ -4129,6 +4188,7 @@ function ConversationList({
     return ids;
   }, [
     projection,
+    collapsedFamilies,
     expandedProjects,
     sections.shared,
     sections.sessions,
@@ -4165,22 +4225,27 @@ function ConversationList({
         const expandedKey =
           instanceKeyPrefix !== undefined ? `${instanceKeyPrefix}:${group.name}` : group.name;
         if (!expandedProjects.includes(expandedKey)) continue;
-        for (const conversation of rows) visibleIds.add(conversation.id);
+        for (const conversation of orderSessionFamilies(rows, collapsedFamilies))
+          visibleIds.add(conversation.id);
       }
       if (section.kind === "other_sessions") {
         if (!effectiveCollapsedSections.includes("Shared")) {
-          for (const conversation of sections.shared) visibleIds.add(conversation.id);
+          for (const conversation of orderSessionFamilies(sections.shared, collapsedFamilies))
+            visibleIds.add(conversation.id);
         }
         if (sessionGroups) {
           for (const group of sessionGroups) {
             if (effectiveCollapsedSections.includes(group.title)) continue;
-            for (const conversation of group.conversations) visibleIds.add(conversation.id);
+            for (const conversation of orderSessionFamilies(group.conversations, collapsedFamilies))
+              visibleIds.add(conversation.id);
           }
         } else {
-          for (const conversation of sections.sessions) visibleIds.add(conversation.id);
+          for (const conversation of orderSessionFamilies(sections.sessions, collapsedFamilies))
+            visibleIds.add(conversation.id);
         }
       } else {
-        for (const conversation of flatSessions) visibleIds.add(conversation.id);
+        for (const conversation of orderSessionFamilies(flatSessions, collapsedFamilies))
+          visibleIds.add(conversation.id);
       }
     }
     const hidden = new Set<string>();
@@ -4191,6 +4256,7 @@ function ConversationList({
   }, [
     pollingPopulation,
     projection,
+    collapsedFamilies,
     expandedProjects,
     sections.shared,
     sections.sessions,
@@ -4243,7 +4309,7 @@ function ConversationList({
         if (collapsed) continue;
         for (const { group, rows } of groups) {
           if (!expandedProjects.includes(group.name)) continue;
-          for (const conversation of rows) {
+          for (const conversation of orderSessionFamilies(rows, collapsedFamilies)) {
             if (seen.has(conversation.id)) continue;
             seen.add(conversation.id);
             ids.push(conversation.id);
@@ -4259,20 +4325,22 @@ function ConversationList({
           collapsed
             ? []
             : groups.flatMap(({ group, rows }) =>
-                expandedProjects.includes(group.name) ? rows.map((c) => c.id) : [],
+                expandedProjects.includes(group.name)
+                  ? orderSessionFamilies(rows, collapsedFamilies).map((c) => c.id)
+                  : [],
               ),
         )
       : [];
     const sharedIds = effectiveCollapsedSections.includes("Shared")
       ? []
-      : sections.shared.map((c) => c.id);
+      : orderSessionFamilies(sections.shared, collapsedFamilies).map((c) => c.id);
     const sessionIds = sessionGroups
       ? sessionGroups.flatMap((group) =>
           effectiveCollapsedSections.includes(group.title)
             ? []
-            : group.conversations.map((c) => c.id),
+            : orderSessionFamilies(group.conversations, collapsedFamilies).map((c) => c.id),
         )
-      : sections.sessions.map((c) => c.id);
+      : orderSessionFamilies(sections.sessions, collapsedFamilies).map((c) => c.id);
     return [...new Set([...projectIds, ...sharedIds, ...sessionIds])];
   };
 
@@ -4284,7 +4352,7 @@ function ConversationList({
     () =>
       favoritesSectionId !== null && collapsedSectionIds.includes(favoritesSectionId)
         ? []
-        : sections.pinned.map((c) => c.id),
+        : sections.pinned.filter(isPinOrderUnit).map((c) => c.id),
     [sections.pinned, collapsedSectionIds, favoritesSectionId],
   );
   usePinnedSessionHotkeys(pinnedSessionIds, activeId);
@@ -4302,7 +4370,7 @@ function ConversationList({
     () =>
       pinReorderEnabled && !pinWriting
         ? {
-            ids: sections.pinned.map((c) => c.id),
+            ids: sections.pinned.filter(isPinOrderUnit).map((c) => c.id),
             draggingId: activeDrag?.id ?? null,
             overId: overPin,
           }
@@ -4428,6 +4496,8 @@ function ConversationList({
     scrollRoot: RefObject<HTMLElement | null>,
   ) => (
     <ProjectFolder
+      collapsedFamilies={collapsedFamilies}
+      onToggleFamily={toggleFamily}
       scrollRoot={scrollRoot}
       sessionShortcutSlots={sessionShortcutSlots}
       pageSize={projectFolderCollapse ? projectFolderPageSize : undefined}
@@ -4793,6 +4863,12 @@ function ConversationList({
                             const favoriteGroups = new Map(
                               groups.map((entry) => [entry.group.id, entry] as const),
                             );
+                            const favoriteFamilies = sessionFamilyGroups(flatSessions);
+                            const visibleFavoriteIds = new Set(
+                              orderSessionFamilies(flatSessions, collapsedFamilies).map(
+                                (row) => row.id,
+                              ),
+                            );
                             const hasFavoriteRows = (favoriteOrder ?? []).length > 0;
                             if (section.implicit === true && !hasFavoriteRows) return null;
                             // Drop a session here to pin it — pin-precedence then floats
@@ -4809,6 +4885,8 @@ function ConversationList({
                                   <PinDropZone active={activeDrag != null && !activeDrag.isPinned}>
                                     <PinOrderContext.Provider value={pinOrder}>
                                       <ConversationSection
+                                        collapsedFamilies={collapsedFamilies}
+                                        onToggleFamily={toggleFamily}
                                         sessionShortcutSlots={sessionShortcutSlots}
                                         headerDrag={headerDrag}
                                         title={section.name}
@@ -4847,7 +4925,18 @@ function ConversationList({
                                               {(favoriteOrder ?? []).map((ref, index) => {
                                                 if (ref.type === "session") {
                                                   const conversation = favoriteSessions.get(ref.id);
-                                                  if (conversation === undefined) return null;
+                                                  if (
+                                                    conversation === undefined ||
+                                                    !visibleFavoriteIds.has(conversation.id)
+                                                  )
+                                                    return null;
+                                                  const members =
+                                                    conversation.family &&
+                                                    !isIndividuallyPinnedSibling(conversation)
+                                                      ? favoriteFamilies.get(conversation.family.id)
+                                                      : undefined;
+                                                  const familyIndented =
+                                                    !!members && members[0].id !== conversation.id;
                                                   const key = `${section.id}:${conversation.id}`;
                                                   const isCanonical =
                                                     canonicalInstanceKeys.get(conversation.id) ===
@@ -4860,6 +4949,19 @@ function ConversationList({
                                                         conversation.id,
                                                       )}
                                                       conversation={conversation}
+                                                      familyIndented={familyIndented}
+                                                      familyExpanded={
+                                                        members &&
+                                                        members[0].id === conversation.id &&
+                                                        members.length > 1
+                                                          ? !collapsedFamilies.has(
+                                                              conversation.family!.id,
+                                                            )
+                                                          : undefined
+                                                      }
+                                                      onToggleFamily={() =>
+                                                        toggleFamily(conversation.family!.id)
+                                                      }
                                                       instanceKey={
                                                         isCanonical ? conversation.id : key
                                                       }
@@ -4903,6 +5005,8 @@ function ConversationList({
                                                 const expandedKey = `fav:${section.id}:${entry.group.name}`;
                                                 return (
                                                   <FavoriteProjectCopy
+                                                    collapsedFamilies={collapsedFamilies}
+                                                    onToggleFamily={toggleFamily}
                                                     sessionShortcutSlots={sessionShortcutSlots}
                                                     key={favItemId(section.id, "project", ref.id)}
                                                     entry={entry}
@@ -5188,6 +5292,8 @@ function ConversationList({
                                   >
                                     {renderedGroups.map((sessionGroup, groupIndex) => (
                                       <ConversationSection
+                                        collapsedFamilies={collapsedFamilies}
+                                        onToggleFamily={toggleFamily}
                                         sessionShortcutSlots={sessionShortcutSlots}
                                         key={sessionGroup.title}
                                         headerDrag={headerDrag}
@@ -5398,6 +5504,8 @@ function ConversationList({
                               >
                                 {(body, optionsAction, headerDrag) => (
                                   <ConversationSection
+                                    collapsedFamilies={collapsedFamilies}
+                                    onToggleFamily={toggleFamily}
                                     sessionShortcutSlots={sessionShortcutSlots}
                                     headerDrag={headerDrag}
                                     title={section.name}
@@ -6262,6 +6370,8 @@ function ConversationSection({
   onToggleCollapsed,
   onSelect,
   selectionLabel,
+  collapsedFamilies,
+  onToggleFamily,
   onRowClick,
   onTogglePinned,
   selectionMode,
@@ -6308,6 +6418,8 @@ function ConversationSection({
   onToggleCollapsed: () => void;
   onSelect?: () => void;
   selectionLabel?: string;
+  collapsedFamilies: ReadonlySet<string>;
+  onToggleFamily: (familyId: string) => void;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
@@ -6352,6 +6464,16 @@ function ConversationSection({
   listRef?: RefObject<HTMLUListElement | null>;
 }) {
   const { showGoalSessionMarkers } = useSessionNavigationPreferences();
+  const families = sessionFamilyGroups(conversations);
+  const familyRepresentative = (row: Conversation) =>
+    row.family && !isIndividuallyPinnedSibling(row) ? families.get(row.family.id)?.[0] : undefined;
+  const isNestedFamilyRow = (row: Conversation) => {
+    const representative = familyRepresentative(row);
+    return representative !== undefined && representative.id !== row.id;
+  };
+  const visibleFamilyRows = orderSessionFamilies(conversations, collapsedFamilies);
+  const reorderRows = visibleFamilyRows.filter((row) => !isNestedFamilyRow(row));
+
   const groupingEmptyState = isFeatureEnabled(useContext(ServerInfoContext), "sidebar_grouping_ui");
   const grids = useGridSessions();
   const gridMembers = new Set(grids?.activeGrid ? gridSessionIds(grids.activeGrid.layout) : []);
@@ -6473,7 +6595,7 @@ function ConversationSection({
           ) : (
             // Indent project chats a step under the project-folder name above.
             <ul ref={listRef} className={cn("flex flex-col gap-px", indentRows && "pl-6")}>
-              {conversations.map((conv, index) => {
+              {visibleFamilyRows.map((conv) => {
                 const meta = rowMeta?.(conv) ?? {
                   instanceKey: conv.id,
                   canonical: true,
@@ -6482,6 +6604,15 @@ function ConversationSection({
                   <ConversationRow
                     key={meta.instanceKey}
                     conversation={conv}
+                    familyIndented={isNestedFamilyRow(conv)}
+                    familyExpanded={
+                      conv.family &&
+                      familyRepresentative(conv)?.id === conv.id &&
+                      families.get(conv.family.id)!.length > 1
+                        ? !collapsedFamilies.has(conv.family.id)
+                        : undefined
+                    }
+                    onToggleFamily={() => onToggleFamily(conv.family!.id)}
                     instanceKey={meta.instanceKey}
                     canonical={meta.canonical}
                     pinReorderCopy={meta.pinReorderCopy}
@@ -6503,11 +6634,13 @@ function ConversationSection({
                     onProjectAssigned={onProjectAssigned}
                     showGoalSessionMarkers={showGoalSessionMarkers}
                     reorderGroup={
-                      meta.dragDisabled || meta.pinReorderCopy ? undefined : reorderGroup
+                      meta.dragDisabled || meta.pinReorderCopy || isNestedFamilyRow(conv)
+                        ? undefined
+                        : reorderGroup
                     }
-                    previousId={reorderNeighbour(conversations[index - 1])}
-                    nextId={reorderNeighbour(conversations[index + 1])}
-                    reorderIndex={reorderGroup ? index : undefined}
+                    previousId={reorderNeighbour(reorderRows[reorderRows.indexOf(conv) - 1])}
+                    nextId={reorderNeighbour(reorderRows[reorderRows.indexOf(conv) + 1])}
+                    reorderIndex={reorderGroup ? reorderRows.indexOf(conv) : undefined}
                   />
                 );
               })}
@@ -6585,6 +6718,7 @@ function ConversationMenuItems({
   components: C,
   conversation,
   sessionShortcuts,
+  onNavigate,
   isPinned,
   isArchived,
   isOwner,
@@ -6618,6 +6752,7 @@ function ConversationMenuItems({
   conversation: Conversation;
   /** Session menu commands whose chords to list (the open session's row only). */
   sessionShortcuts: ReadonlySet<DesktopCommand>;
+  onNavigate?: (event: MouseEvent<HTMLAnchorElement>) => void;
   isPinned: boolean;
   isArchived: boolean;
   isOwner: boolean;
@@ -6656,6 +6791,7 @@ function ConversationMenuItems({
   /** The neighbours Move up/down swap with in the Custom order. */
   reorder?: { previousId?: string; nextId?: string };
 }) {
+  const info = useContext(ServerInfoContext);
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);
   // Sound mutes are account-scoped and synced; the menu mounts lazily, so
@@ -6737,6 +6873,17 @@ function ConversationMenuItems({
 
   return (
     <>
+      {isOwner && !isArchived && info !== "loading" && info.sibling_sessions && (
+        <>
+          <C.Item asChild data-testid="add-sibling-session">
+            <Link to={`/?sibling=${encodeURIComponent(conversation.id)}`} onClick={onNavigate}>
+              <PlusIcon className="size-3.5" />
+              Add nested agent
+            </Link>
+          </C.Item>
+          <C.Separator />
+        </>
+      )}
       {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
           hover-revealed quick-pin button. Archived rows omit it (archive
           outranks pin). */}
@@ -6938,6 +7085,7 @@ function ConversationMenuItems({
       {/* Projects are a My-sessions-only tool, so filing is owner-only — a
           shared session shows no project affordance. */}
       {isOwner &&
+        !isIndentedSibling(conversation) &&
         (isMobile ? (
           // Mobile: no room for a side flyout, so this item swaps the menu
           // body to the project picker in place (see the `view === "projects"`
@@ -7546,6 +7694,9 @@ function ConversationRowImpl({
   suppressScrollOnClick,
   favoriteItem,
   projectLabel,
+  familyIndented = false,
+  familyExpanded,
+  onToggleFamily,
   isActive,
   inActiveGrid,
   gridSelected,
@@ -7580,6 +7731,9 @@ function ConversationRowImpl({
   favoriteItem?: { sectionId: string; index: number };
   /** Trailing muted project name; recent copies only. */
   projectLabel?: string;
+  familyIndented?: boolean;
+  familyExpanded?: boolean;
+  onToggleFamily?: () => void;
   // Computed by the list owner against the resolved top-level root (so a
   // sub-agent view keeps its owning row highlighted). A prop, not a per-row
   // read, so only the two rows whose value flips re-render on a switch.
@@ -7914,11 +8068,13 @@ function ConversationRowImpl({
       project: currentProject,
       isPinned,
       reorderOnly,
-      canManage: isOwner,
+      canManage: isOwner && !familyIndented,
+      canMoveProject: !isIndentedSibling(conversation),
       reorderGroup: canReorder ? reorderGroup : undefined,
       reorderIndex,
     },
     disabled:
+      (familyIndented && !gridsEnabled) ||
       (!isOwner && !gridsEnabled) ||
       selectionMode ||
       isArchived ||
@@ -7965,7 +8121,8 @@ function ConversationRowImpl({
       : {
           id: `pin-order:${resolvedInstanceKey}`,
           data: { type: "pin-order", id: conversation.id },
-          disabled: !pinOrder || !isPinned || !pinReorderCopy,
+          disabled:
+            !pinOrder || !isPinned || !pinReorderCopy || !pinOrder.ids.includes(conversation.id),
         },
   );
   // A pin dragged down lands below this row; one dragged up, or a new pin, above it.
@@ -8118,6 +8275,7 @@ function ConversationRowImpl({
   const menuItemProps = {
     conversation,
     sessionShortcuts,
+    onNavigate: onClick,
     isPinned,
     isArchived,
     isOwner,
@@ -8189,120 +8347,137 @@ function ConversationRowImpl({
   // The clickable row surface. Extracted so it can be rendered bare (selection
   // mode) or wrapped in the right-click ContextMenuTrigger below.
   const rowLink = (
-    <Link
-      to={selectionMode ? "#" : `/c/${conversation.id}`}
-      componentId="sidebar.conversation_switcher"
-      aria-keyshortcuts={
-        shortcutSlot !== undefined
-          ? sessionNumberAriaShortcut(SESSION_HOTKEY_DIGITS[shortcutSlot])
-          : undefined
-      }
-      draggable={gridsEnabled ? false : undefined}
-      onDragStart={gridsEnabled ? (event) => event.preventDefault() : undefined}
-      className={cn(
-        SIDEBAR_ROW,
-        "relative flex text-left text-foreground transition-colors",
-        // With the harness icon the row takes a project row's shape: a leading
-        // icon centered against the title and meta column.
-        showHarness ? "items-center" : "flex-col justify-center",
-        SIDEBAR_HOVER_HIGHLIGHT,
-        // Full width (not 100%+1rem) so the highlight stays inset from the
-        // right edge, aligning with the project/folder rows above.
-        "w-full",
-        "mobile-touch-target",
-        // Narrow rows reserve a separate slot for the always-visible menu.
-        !selectionMode &&
-          (sessionState?.kind === "awaiting"
-            ? hasBackgroundActivity && hasGoalMarker
-              ? "pr-[10.25rem] max-md:pr-[12.5rem]"
-              : hasBackgroundActivity || hasGoalMarker
-                ? "pr-[8.75rem] max-md:pr-44"
-                : "pr-29 max-md:pr-38"
-            : showUpdated && !hasSessionIndicator
-              ? "pr-11 max-md:pr-20"
-              : compactMarkerCount >= 3
-                ? "pr-17 max-md:pr-26"
-                : compactMarkerCount === 2
-                  ? "pr-12 max-md:pr-21"
-                  : hasSessionIndicator
-                    ? "pr-8 max-md:pr-17"
-                    : "pr-2 max-md:pr-11"),
-        !selectionMode &&
-          showSharedIndicator &&
-          (sessionState?.kind === "awaiting"
-            ? hasBackgroundActivity && hasGoalMarker
-              ? "pr-[12rem] max-md:pr-[14.25rem]"
-              : hasBackgroundActivity || hasGoalMarker
-                ? "pr-[10.5rem] max-md:pr-51"
-                : "pr-36 max-md:pr-45"
-            : compactMarkerCount >= 3
-              ? "pr-24 max-md:pr-33"
-              : compactMarkerCount === 2
-                ? "pr-19 max-md:pr-28"
-                : hasSessionIndicator
-                  ? "pr-15 max-md:pr-24"
-                  : "pr-9 max-md:pr-18"),
-        // The narrowed reserve must track exactly when the trailing controls
-        // appear and the state marker fades — both keyed on `:focus-visible`.
-        // `focus-within` also fires for a plain click, which shrank the reserve
-        // on the selected row while the marker stayed put, sliding the title
-        // under it.
-        !selectionMode && "md:group-hover:pr-20 md:group-has-[:focus-visible]:pr-20",
-        !selectionMode && menuOpen && "md:pr-20",
-        // Same room as the hover controls, so a held hint never covers the title.
-        shortcutSlot !== undefined && "group-has-[[data-session-shortcut-hint]]:pr-20",
-        selectionMode && "pr-2 pl-8",
-        !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
-        !selectionMode && !isActive && inActiveGrid && SIDEBAR_GRID_MEMBER_HIGHLIGHT,
-        !selectionMode && gridSelected && SIDEBAR_GRID_SELECTED_RING,
-        selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
+    <div className="relative">
+      {familyExpanded !== undefined && (
+        <button
+          type="button"
+          aria-label={familyExpanded ? "Collapse session family" : "Expand session family"}
+          aria-expanded={familyExpanded}
+          onClick={onToggleFamily}
+          className="absolute top-1/2 left-2 z-10 -translate-y-1/2 rounded p-0.5 text-muted-foreground hover:text-foreground"
+        >
+          <ChevronRightIcon className={cn("size-3", familyExpanded && "rotate-90")} />
+        </button>
       )}
-      data-goal-state={goalState ?? undefined}
-      onClick={(e) => {
-        recentClickTimesRef.current = [...recentClickTimesRef.current.slice(-1), performance.now()];
-        if (selectionMode) {
-          e.preventDefault();
-          e.stopPropagation();
-          onToggleSelected(conversation.id, e.shiftKey);
-          return;
+      <Link
+        to={selectionMode ? "#" : `/c/${conversation.id}`}
+        componentId="sidebar.conversation_switcher"
+        aria-keyshortcuts={
+          shortcutSlot !== undefined
+            ? sessionNumberAriaShortcut(SESSION_HOTKEY_DIGITS[shortcutSlot])
+            : undefined
         }
-        activateRow(conversation.id, e, Boolean(suppressScrollOnClick));
-        onClick(e);
-      }}
-      onDoubleClick={(e) => {
-        if (selectionMode) return;
-        if (!isOwner) return;
-        if (isProvisionalRow) return; // no rename before the real session exists
-        e.preventDefault();
-        // The dblclick's own second click was already recorded above, so
-        // exactly ONE recent click means the first click landed on a different
-        // row — the list reordered mid-double-click and renaming here would
-        // hit the wrong session. Zero recent clicks (synthetic dblclick with
-        // no click events, e.g. in tests) stays allowed.
-        const now = performance.now();
-        const recent = recentClickTimesRef.current.filter(
-          (t) => now - t <= DOUBLE_CLICK_PAIR_WINDOW_MS,
-        );
-        if (recent.length === 1) return;
-        setIsEditing(true);
-      }}
-      title={isMobile ? (conversation.title ?? conversation.id) : undefined}
-    >
-      {showHarness ? (
-        <>
-          <span className="flex size-4 shrink-0 items-center justify-center">
-            <SessionHarnessIcon
-              conversation={conversation}
-              testId="session-row-harness"
-              withFallback
-            />
-          </span>
-          <div className="flex min-w-0 flex-1 flex-col justify-center gap-2">{rowText}</div>
-        </>
-      ) : (
-        rowText
-      )}
-    </Link>
+        draggable={gridsEnabled ? false : undefined}
+        onDragStart={gridsEnabled ? (event) => event.preventDefault() : undefined}
+        className={cn(
+          SIDEBAR_ROW,
+          "relative flex text-left text-foreground transition-colors",
+          // With the harness icon the row takes a project row's shape: a leading
+          // icon centered against the title and meta column.
+          showHarness ? "items-center" : "flex-col justify-center",
+          SIDEBAR_HOVER_HIGHLIGHT,
+          // Full width (not 100%+1rem) so the highlight stays inset from the
+          // right edge, aligning with the project/folder rows above.
+          "w-full",
+          "mobile-touch-target",
+          familyExpanded !== undefined && "pl-7",
+          // Narrow rows reserve a separate slot for the always-visible menu.
+          !selectionMode &&
+            (sessionState?.kind === "awaiting"
+              ? hasBackgroundActivity && hasGoalMarker
+                ? "pr-[10.25rem] max-md:pr-[12.5rem]"
+                : hasBackgroundActivity || hasGoalMarker
+                  ? "pr-[8.75rem] max-md:pr-44"
+                  : "pr-29 max-md:pr-38"
+              : showUpdated && !hasSessionIndicator
+                ? "pr-11 max-md:pr-20"
+                : compactMarkerCount >= 3
+                  ? "pr-17 max-md:pr-26"
+                  : compactMarkerCount === 2
+                    ? "pr-12 max-md:pr-21"
+                    : hasSessionIndicator
+                      ? "pr-8 max-md:pr-17"
+                      : "pr-2 max-md:pr-11"),
+          !selectionMode &&
+            showSharedIndicator &&
+            (sessionState?.kind === "awaiting"
+              ? hasBackgroundActivity && hasGoalMarker
+                ? "pr-[12rem] max-md:pr-[14.25rem]"
+                : hasBackgroundActivity || hasGoalMarker
+                  ? "pr-[10.5rem] max-md:pr-51"
+                  : "pr-36 max-md:pr-45"
+              : compactMarkerCount >= 3
+                ? "pr-24 max-md:pr-33"
+                : compactMarkerCount === 2
+                  ? "pr-19 max-md:pr-28"
+                  : hasSessionIndicator
+                    ? "pr-15 max-md:pr-24"
+                    : "pr-9 max-md:pr-18"),
+          // The narrowed reserve must track exactly when the trailing controls
+          // appear and the state marker fades — both keyed on `:focus-visible`.
+          // `focus-within` also fires for a plain click, which shrank the reserve
+          // on the selected row while the marker stayed put, sliding the title
+          // under it.
+          !selectionMode && "md:group-hover:pr-20 md:group-has-[:focus-visible]:pr-20",
+          !selectionMode && menuOpen && "md:pr-20",
+          // Same room as the hover controls, so a held hint never covers the title.
+          shortcutSlot !== undefined && "group-has-[[data-session-shortcut-hint]]:pr-20",
+          selectionMode && "pr-2 pl-8",
+          !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
+          !selectionMode && !isActive && inActiveGrid && SIDEBAR_GRID_MEMBER_HIGHLIGHT,
+          !selectionMode && gridSelected && SIDEBAR_GRID_SELECTED_RING,
+          selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
+        )}
+        data-goal-state={goalState ?? undefined}
+        onClick={(e) => {
+          recentClickTimesRef.current = [
+            ...recentClickTimesRef.current.slice(-1),
+            performance.now(),
+          ];
+          if (selectionMode) {
+            e.preventDefault();
+            e.stopPropagation();
+            onToggleSelected(conversation.id, e.shiftKey);
+            return;
+          }
+          activateRow(conversation.id, e, Boolean(suppressScrollOnClick));
+          onClick(e);
+        }}
+        onDoubleClick={(e) => {
+          if (selectionMode) return;
+          if (!isOwner) return;
+          if (isProvisionalRow) return; // no rename before the real session exists
+          e.preventDefault();
+          // The dblclick's own second click was already recorded above, so
+          // exactly ONE recent click means the first click landed on a different
+          // row — the list reordered mid-double-click and renaming here would
+          // hit the wrong session. Zero recent clicks (synthetic dblclick with
+          // no click events, e.g. in tests) stays allowed.
+          const now = performance.now();
+          const recent = recentClickTimesRef.current.filter(
+            (t) => now - t <= DOUBLE_CLICK_PAIR_WINDOW_MS,
+          );
+          if (recent.length === 1) return;
+          setIsEditing(true);
+        }}
+        title={isMobile ? (conversation.title ?? conversation.id) : undefined}
+      >
+        {showHarness ? (
+          <>
+            <span className="flex size-4 shrink-0 items-center justify-center">
+              <SessionHarnessIcon
+                conversation={conversation}
+                testId="session-row-harness"
+                withFallback
+              />
+            </span>
+            <div className="flex min-w-0 flex-1 flex-col justify-center gap-2">{rowText}</div>
+          </>
+        ) : (
+          rowText
+        )}
+      </Link>
+    </div>
   );
 
   // Provisional (`temp:`) row: navigable, but no mutating affordances (kebab,
@@ -8338,8 +8513,15 @@ function ConversationRowImpl({
           dragListeners?.onTouchStart?.(event);
         }
       }}
-      className={cn("group relative", isDragging && "opacity-40")}
+      className={cn("group relative", familyIndented && "ml-9", isDragging && "opacity-40")}
+      data-sibling-session={familyIndented || undefined}
     >
+      {familyIndented && (
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute -left-3 top-0 h-5 w-2 rounded-bl-md border-b border-l border-muted-foreground/40"
+        />
+      )}
       {insertion && (
         <span
           data-testid={pinInsertion ? "pin-order-insertion" : "session-order-insertion"}
@@ -8351,11 +8533,9 @@ function ConversationRowImpl({
           Suppressed in selection mode (bulk-select owns the row), where the
           bare link is rendered instead. ContextMenuTrigger preventDefaults the
           native contextmenu event, so right-click never navigates; asChild
-          merges its handler onto the Link, preserving left-click / double-click.
-          Pinned, project-owned rows nest a HoverCardTrigger around the Link so
-          hovering surfaces the project flyout — the trigger sits innermost so
-          both the context menu and the hover card keep their handlers/refs on
-          the Link. */}
+          merges its handler onto the row surface, preserving left-click /
+          double-click. Pinned, project-owned rows nest a HoverCardTrigger around
+          that same surface so hovering still opens the project flyout. */}
       {selectionMode ? (
         projectFlyoutName ? (
           <HoverCard openDelay={150} closeDelay={0}>
@@ -8575,7 +8755,7 @@ function ConversationRowImpl({
                         "text-muted-foreground transition-opacity",
                         "hidden md:inline-flex",
                         "md:opacity-0 md:group-hover:opacity-100",
-                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
+                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-100",
                       )}
                       onClick={(e) => {
                         // Keep the toggle click off the surrounding Link (no navigation).
@@ -8617,7 +8797,7 @@ function ConversationRowImpl({
                         "text-muted-foreground transition-opacity",
                         "hidden md:inline-flex",
                         "md:opacity-0 md:group-hover:opacity-100",
-                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
+                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-100",
                       )}
                       onClick={(e) => {
                         // Keep the toggle click off the surrounding Link (no navigation).
@@ -8916,6 +9096,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "blocked_on",
   "provisional",
   "shared_with_others",
+  "family",
 ];
 
 function conversationRenderEqual(a: Conversation, b: Conversation): boolean {
@@ -8947,6 +9128,8 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
     prev.favoriteItem?.sectionId === next.favoriteItem?.sectionId &&
     prev.favoriteItem?.index === next.favoriteItem?.index &&
     prev.projectLabel === next.projectLabel &&
+    prev.familyIndented === next.familyIndented &&
+    prev.familyExpanded === next.familyExpanded &&
     prev.isActive === next.isActive &&
     prev.inActiveGrid === next.inActiveGrid &&
     prev.gridSelected === next.gridSelected &&
@@ -9889,8 +10072,17 @@ function BulkActionBar({
     );
   }
 
+  const canMoveSelection =
+    ownedSelected.length > 0 &&
+    ownedSelected.every(
+      (row) =>
+        !isIndentedSibling(row) ||
+        ownedSelected.some((other) => other.id === row.family?.representative_id),
+    );
+
   function handleMoveToProject(project: string) {
-    const ids = ownedSelected.map((c) => c.id);
+    if (!canMoveSelection) return;
+    const ids = ownedSelected.filter((row) => !isIndentedSibling(row)).map((c) => c.id);
     if (ids.length === 0) return;
     bulkMove.mutate(
       { ids, project },
@@ -10098,7 +10290,7 @@ function BulkActionBar({
                         type="button"
                         variant="ghost"
                         size="icon-xs"
-                        disabled={isBusy || ownedSelected.length === 0}
+                        disabled={isBusy || !canMoveSelection}
                         aria-label="Move to project"
                         data-testid="bulk-move-to-project"
                       >

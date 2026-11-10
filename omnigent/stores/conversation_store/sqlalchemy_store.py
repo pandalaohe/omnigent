@@ -10,6 +10,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from functools import wraps
+from itertools import batched
 from pathlib import PureWindowsPath
 from typing import Any, Literal, Protocol, TypeVar, cast
 from uuid import uuid4
@@ -22,6 +23,7 @@ from sqlalchemy import (
     Select,
     and_,
     asc,
+    case,
     delete,
     desc,
     func,
@@ -74,6 +76,7 @@ from omnigent.db.db_models import (
     SqlFile,
     SqlHost,
     SqlPolicy,
+    SqlPreference,
     SqlProject,
     SqlSessionPermission,
     SqlSessionSuccession,
@@ -150,16 +153,19 @@ from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
     ARTIFACT_LINK_KEY_LABEL,
     COMPACTION_COUNT_CAP,
+    FAMILY_PIN_LABEL_PREFIX,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
     MAX_PENDING_INPUTS,
+    MAX_SESSION_FAMILY_MEMBERS,
     PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     PROJECT_ARCHIVE_LABEL_KEY,
     PROJECT_LABEL_KEY,
     ROTATION_SUCCESSOR_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_COPY_ID_PREFIX_LEN,
     SUCCEEDED_BY_LABEL_KEY,
     SUCCEEDS_LABEL_KEY,
@@ -188,6 +194,7 @@ from omnigent.stores.conversation_store import (
     SessionListState,
     SessionSuccession,
     SuccessionRefusedError,
+    family_pinned_label_key,
     pinned_label_key,
     project_archive_batch_label_key,
     runner_seen_is_fresh,
@@ -200,7 +207,11 @@ from omnigent.stores.conversation_store.overrides import (
 from omnigent.stores.conversation_store.overrides import (
     encode_session_overrides as _encode_session_overrides,
 )
-from omnigent.stores.host_store import HostStore
+from omnigent.stores.host_store import (
+    HostStore,
+    delete_unused_host_in_session,
+    lock_host_for_binding,
+)
 from omnigent.stores.project_store.sqlalchemy_store import (
     admitted_project_id,
     assert_project_admits,
@@ -220,6 +231,10 @@ from omnigent.stores.sandbox_profile_store import (
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY
 
 _logger = logging.getLogger(__name__)
+
+_DELETE_METADATA_BATCH_SIZE = 100
+_DELETE_LABEL_BATCH_SIZE = 100
+_FAMILY_READ_BATCH_SIZE = 10
 
 _SESSION_TODOS_STATE_KEY = "_omnigent_native_plan_snapshot_v1"
 _RUNNER_BINDING_LIMIT = 200
@@ -538,6 +553,7 @@ def _to_conversation(
         blocked_on=meta.blocked_on if meta else None,
         project_id=meta.project_id if meta else None,
         side_chat_parent_id=meta.side_chat_parent_id if meta else None,
+        family_id=meta.family_id if meta else None,
     )
 
 
@@ -754,6 +770,8 @@ def _created_session_from_rows(
 def _prepare_label_updates(updates: dict[str, str]) -> dict[str, str]:
     """Return the exact label values accepted by the persistence schema."""
     reject_profile_labels(updates)
+    if any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in updates):
+        raise OmnigentError("Session family labels are server-owned", code=ErrorCode.INVALID_INPUT)
     # Clamp by characters, matching PostgreSQL ``VARCHAR(n)`` semantics.
     return {key: value[:LABEL_VALUE_MAX_LEN] for key, value in updates.items()}
 
@@ -2011,6 +2029,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                         if project_admission != "inherit":
                             raise
                         del prepared_labels[PROJECT_LABEL_KEY]
+                lock_host_for_binding(meta_sess, host_id)
+                previous = (
+                    meta_sess.get(SqlConversationMetadata, (current_workspace_id(), new_id))
+                    if conversation_id is not None
+                    else None
+                )
+                if previous is not None:
+                    # ponytail: keep the binding so replacement can resume after a crash.
+                    if previous.host_id != host_id:
+                        raise OmnigentError(
+                            "Incomplete conversation replacement must reuse its host",
+                            code=ErrorCode.CONFLICT,
+                        )
+                    meta_sess.delete(previous)
+                    meta_sess.flush()
                 meta = SqlConversationMetadata(
                     id=new_id,
                     kind=encoded_kind,
@@ -2046,11 +2079,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                     row = ap_committed
                 return row, meta
 
-            row, meta = run_write_transaction(
-                self._session_immediate,
-                "insert_conversation_project_admission",
-                insert_with_project_admission,
-            )
+            try:
+                row, meta = run_write_transaction(
+                    self._session_immediate,
+                    "insert_conversation_project_admission",
+                    insert_with_project_admission,
+                )
+            except OmnigentError:
+                if ap_committed is not None:
+                    self._discard_unbound_conversation(new_id)
+                raise
             return _to_conversation(row, meta, prepared_labels)
         except IntegrityError as exc:
             # Translate a caller-supplied-id PK collision into a clean exception
@@ -2094,6 +2132,43 @@ class SqlAlchemyConversationStore(ConversationStore):
                     f"conversation id {conversation_id!r} already exists"
                 ) from exc
             raise
+
+    def _discard_unbound_conversation(self, conversation_id: str) -> None:
+        """Undo an unpublished conversation when metadata admission was rejected."""
+
+        def write(session: Session) -> bool:
+            keys = list(
+                session.scalars(
+                    select(SqlConversationLabel.key)
+                    .where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id == conversation_id,
+                    )
+                    .order_by(SqlConversationLabel.key)
+                    .limit(_DELETE_LABEL_BATCH_SIZE)
+                )
+            )
+            if keys:
+                session.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id == conversation_id,
+                        SqlConversationLabel.key.in_(keys),
+                    )
+                )
+            else:
+                session.execute(
+                    delete(SqlConversation).where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id == conversation_id,
+                    )
+                )
+            return bool(keys)
+
+        while run_write_transaction(
+            self._conv_session_immediate, "discard_unbound_conversation", write
+        ):
+            pass
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """
@@ -3479,6 +3554,269 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         return run_write_transaction(self._session_immediate, "set_session_todos", write)
 
+    def _lock_session_family(self, session: Session, family_id: str) -> SqlPreference:
+        """Keep the family lock after its original session is deleted."""
+        # ponytail: one retained lock per family; reclaim only with
+        # coordinated deletion and admission across split databases.
+        from sqlalchemy.dialects.mysql import insert as mysql_insert
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        values = {
+            "workspace_id": current_workspace_id(),
+            "user_id": "__session_families__",
+            "key": family_id,
+            "value": "{}",
+        }
+        dialect = self._engine.dialect.name
+        if dialect == "mysql":
+            statement = (
+                mysql_insert(SqlPreference).values(**values).on_duplicate_key_update(key=family_id)
+            )
+        elif dialect == "sqlite":
+            statement = sqlite_insert(SqlPreference).values(**values).on_conflict_do_nothing()
+        else:
+            statement = pg_insert(SqlPreference).values(**values).on_conflict_do_nothing()
+        session.execute(statement)
+        return session.execute(
+            select(SqlPreference)
+            .where(
+                SqlPreference.workspace_id == current_workspace_id(),
+                SqlPreference.user_id == "__session_families__",
+                SqlPreference.key == family_id,
+            )
+            .with_for_update()
+        ).scalar_one()
+
+    def _family_member_ids(self, session: Session, family_id: str) -> list[str]:
+        ids = list(
+            session.scalars(
+                select(SqlConversationMetadata.id)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.family_id == family_id,
+                )
+                .order_by(SqlConversationMetadata.id)
+                .limit(MAX_SESSION_FAMILY_MEMBERS + 1)
+            )
+        )
+        if len(ids) > MAX_SESSION_FAMILY_MEMBERS:
+            raise OmnigentError("Session family is too large", code=ErrorCode.CONFLICT)
+        return ids
+
+    def get_session_family(self, session_id: str) -> list[Conversation]:
+        source = self.get_conversation(session_id)
+        if source is None:
+            return []
+        family_id = source.family_id
+        if family_id is None:
+            return [source]
+        return self.get_session_families([family_id])[family_id]
+
+    def get_session_families(self, family_ids: list[str]) -> dict[str, list[Conversation]]:
+        families: dict[str, list[Conversation]] = {family_id: [] for family_id in family_ids}
+        if not families:
+            return families
+        for family_batch in batched(families, _FAMILY_READ_BATCH_SIZE):
+            with self._session("read_session_families") as session:
+                rows = session.execute(
+                    select(SqlConversationMetadata.id, SqlConversationMetadata.family_id)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.family_id.in_(family_batch),
+                    )
+                    .order_by(SqlConversationMetadata.family_id, SqlConversationMetadata.id)
+                    .limit(len(family_batch) * MAX_SESSION_FAMILY_MEMBERS + 1)
+                ).all()
+            members = self.get_conversations([row.id for row in rows])
+            for row in rows:
+                if row.id in members:
+                    families[row.family_id].append(members[row.id])
+        for family_id, family in families.items():
+            if len(family) > MAX_SESSION_FAMILY_MEMBERS:
+                raise OmnigentError("Session family is too large", code=ErrorCode.CONFLICT)
+            family.sort(key=lambda member: (member.created_at, member.id != family_id, member.id))
+        return families
+
+    def add_new_sibling(self, source_id: str, session_id: str, *, user_id: str | None) -> None:
+        source = self.get_conversation(source_id)
+        if source is None:
+            raise ConversationNotFoundError(source_id)
+        family_id = source.family_id or source.id
+        pin_key = pinned_label_key(user_id)
+        family_pin_key = family_pinned_label_key(user_id)
+
+        def copy_labels(
+            labels_session: Session,
+            member_ids: list[str],
+            *,
+            label_source_id: str,
+            promote_pin: bool,
+            project_id: str | None,
+        ) -> None:
+            source_labels = _fetch_labels(
+                labels_session, label_source_id, keys=(PROJECT_LABEL_KEY, pin_key, family_pin_key)
+            )
+            updates: dict[str, str] = {}
+            if project_id is None and PROJECT_LABEL_KEY in source_labels:
+                updates[PROJECT_LABEL_KEY] = source_labels[PROJECT_LABEL_KEY]
+            else:
+                labels_session.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id.in_(member_ids),
+                        SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                    )
+                )
+            if promote_pin and pin_key in source_labels:
+                updates[family_pin_key] = source_labels[pin_key]
+                labels_session.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id == label_source_id,
+                        SqlConversationLabel.key == pin_key,
+                    )
+                )
+            elif family_pin_key in source_labels:
+                updates[family_pin_key] = source_labels[family_pin_key]
+            if updates:
+                for member_id in member_ids:
+                    _upsert_prepared_labels(labels_session, member_id, updates, now_epoch())
+
+        def write(session: Session) -> None:
+            family_lock = self._lock_session_family(session, family_id)
+            source_meta = session.get(
+                SqlConversationMetadata, (current_workspace_id(), source_id), with_for_update=True
+            )
+            target_meta = session.get(
+                SqlConversationMetadata, (current_workspace_id(), session_id)
+            )
+            if source_meta is None or target_meta is None:
+                raise ConversationNotFoundError(source_id if source_meta is None else session_id)
+            with self._profile_label_session(session) as labels_session:
+                source_row = labels_session.get(
+                    SqlConversation, (current_workspace_id(), source_id), with_for_update=True
+                )
+                target_row = labels_session.get(
+                    SqlConversation, (current_workspace_id(), session_id), with_for_update=True
+                )
+                if (
+                    source_row is None
+                    or target_row is None
+                    or source_row.archived
+                    or source_row.parent_conversation_id is not None
+                    or target_row.parent_conversation_id is not None
+                    or target_meta.family_id is not None
+                    or (source_meta.family_id or source_id) != family_id
+                ):
+                    raise OmnigentError(
+                        "Sibling source is no longer available", code=ErrorCode.CONFLICT
+                    )
+                members = self._family_member_ids(session, family_id)
+                if source_meta.family_id is None and members:
+                    raise OmnigentError(
+                        "This session ID is still used by another family",
+                        code=ErrorCode.CONFLICT,
+                    )
+                if len(set(members) | {source_id, session_id}) > MAX_SESSION_FAMILY_MEMBERS:
+                    raise OmnigentError(
+                        f"A family supports up to {MAX_SESSION_FAMILY_MEMBERS} sessions",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                if self._conv_engine is self._engine:
+                    copy_labels(
+                        labels_session,
+                        [source_id, session_id],
+                        label_source_id=source_id,
+                        promote_pin=source_meta.family_id is None,
+                        project_id=source_meta.project_id,
+                    )
+            if self._conv_engine is not self._engine and source_meta.family_id is None:
+                family_lock.value = "pending_initial_labels"
+            target_meta.project_id = source_meta.project_id
+            source_meta.family_id = family_id
+            target_meta.family_id = family_id
+
+        run_write_transaction(self._session_immediate, "create_sibling_membership", write)
+        if self._conv_engine is not self._engine:
+            # Commit membership before moving pins in a separate database.
+            def finish_labels(session: Session) -> None:
+                family_lock = self._lock_session_family(session, family_id)
+                source_meta = session.get(
+                    SqlConversationMetadata, (current_workspace_id(), source_id)
+                )
+                members = self._family_member_ids(session, family_id)
+                if source_meta is None or source_id not in members or session_id not in members:
+                    raise OmnigentError(
+                        "Sibling source is no longer available", code=ErrorCode.CONFLICT
+                    )
+                initialize_labels = family_lock.value == "pending_initial_labels"
+                with self._profile_label_session(session) as labels_session:
+                    copy_labels(
+                        labels_session,
+                        members if initialize_labels else [session_id],
+                        label_source_id=family_id if initialize_labels else source_id,
+                        promote_pin=initialize_labels,
+                        project_id=source_meta.project_id,
+                    )
+                # Clear only after the separate label transaction commits.
+                family_lock.value = "{}"
+
+            run_write_transaction(self._session_immediate, "copy_sibling_labels", finish_labels)
+
+    def set_family_pin(self, session_id: str, value: str, *, user_id: str | None) -> None:
+        value = _prepare_label_updates({PINNED_LABEL_KEY: value})[PINNED_LABEL_KEY]
+        source = self.get_conversation(session_id)
+        if source is None or source.family_id is None:
+            raise OmnigentError("Session has no family", code=ErrorCode.INVALID_INPUT)
+        family_id = source.family_id
+        key = family_pinned_label_key(user_id)
+
+        def write(session: Session) -> None:
+            self._lock_session_family(session, family_id)
+            ids = self._family_member_ids(session, family_id)
+            with self._profile_label_session(session) as labels_session:
+                self._require_family_representative(labels_session, ids, session_id, family_id)
+                if value:
+                    for member_id in ids:
+                        _upsert_prepared_labels(
+                            labels_session, member_id, {key: value}, now_epoch()
+                        )
+                else:
+                    labels_session.execute(
+                        delete(SqlConversationLabel).where(
+                            SqlConversationLabel.workspace_id == current_workspace_id(),
+                            SqlConversationLabel.conversation_id.in_(ids),
+                            SqlConversationLabel.key == key,
+                        )
+                    )
+
+        run_write_transaction(self._session_immediate, "pin_session_family", write)
+
+    def _require_family_representative(
+        self, session: Session, ids: list[str], source_id: str, family_id: str
+    ) -> None:
+        representative = session.scalar(
+            select(SqlConversation.id)
+            .where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id.in_(ids),
+            )
+            .order_by(
+                SqlConversation.archived,
+                SqlConversation.created_at,
+                case((SqlConversation.id == family_id, 0), else_=1),
+                SqlConversation.id,
+            )
+            .limit(1)
+            .with_for_update()
+        )
+        if representative != source_id:
+            raise OmnigentError(
+                "Only the family representative can move or pin the family",
+                code=ErrorCode.CONFLICT,
+            )
+
     def set_conversation_project(
         self,
         conversation_id: str,
@@ -3497,22 +3835,90 @@ class SqlAlchemyConversationStore(ConversationStore):
             conversation has no metadata row.
         """
 
-        def write(session: Session) -> bool:
-            assert_project_admits(session, project_id)
-            result = cast(
-                _RowCountResult,
-                session.execute(
+        source = self.get_conversation(conversation_id)
+        if source is None:
+            return False
+        if source.family_id is None:
+
+            def move_standalone(session: Session) -> bool:
+                assert_project_admits(session, project_id)
+                result = session.execute(
                     update(SqlConversationMetadata)
                     .where(
                         SqlConversationMetadata.workspace_id == current_workspace_id(),
                         SqlConversationMetadata.id == conversation_id,
+                        SqlConversationMetadata.family_id.is_(None),
                     )
                     .values(project_id=project_id)
-                ),
-            )
-            return result.rowcount > 0
+                )
+                if not cast(_RowCountResult, result).rowcount:
+                    if (
+                        session.get(
+                            SqlConversationMetadata, (current_workspace_id(), conversation_id)
+                        )
+                        is None
+                    ):
+                        return False
+                    raise OmnigentError("Session family changed", code=ErrorCode.CONFLICT)
+                return True
 
-        return run_write_transaction(self._session_immediate, "set_conversation_project", write)
+            return run_write_transaction(self._session_immediate, "move_session", move_standalone)
+        family_id = source.family_id
+
+        def family_members(session: Session) -> list[str]:
+            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            if meta is None or meta.family_id is None:
+                return []
+            if meta.family_id != family_id:
+                raise OmnigentError("Session family changed", code=ErrorCode.CONFLICT)
+            return self._family_member_ids(session, family_id)
+
+        def clear_legacy_labels(labels_session: Session, ids: list[str]) -> None:
+            labels_session.execute(
+                delete(SqlConversationLabel).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id.in_(ids),
+                    SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                )
+            )
+
+        def write(session: Session) -> bool:
+            assert_project_admits(session, project_id)
+            self._lock_session_family(session, family_id)
+            ids = family_members(session)
+            with self._profile_label_session(session) as labels_session:
+                if ids:
+                    self._require_family_representative(
+                        labels_session, ids, conversation_id, family_id
+                    )
+                    if self._conv_engine is self._engine:
+                        clear_legacy_labels(labels_session, ids)
+                else:
+                    ids = [conversation_id]
+            result = session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id.in_(ids),
+                )
+                .values(project_id=project_id)
+            )
+            return cast(_RowCountResult, result).rowcount > 0
+
+        changed = run_write_transaction(self._session_immediate, "move_session_family", write)
+        if changed and self._conv_engine is not self._engine:
+            # Commit filing before deleting the only legacy copy in another database.
+            def clear_labels(session: Session) -> None:
+                self._lock_session_family(session, family_id)
+                ids = family_members(session)
+                if ids:
+                    with self._profile_label_session(session) as labels_session:
+                        clear_legacy_labels(labels_session, ids)
+
+            run_write_transaction(
+                self._session_immediate, "clear_family_project_labels", clear_labels
+            )
+        return changed
 
     def increment_session_usage(
         self,
@@ -6204,6 +6610,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param key: The label key to remove, e.g. ``"omni_project"``.
         """
 
+        _prepare_label_updates({key: ""})
+
         def write(session: Session) -> None:
             session.execute(
                 delete(SqlConversationLabel).where(
@@ -6213,7 +6621,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             )
 
-        reject_profile_labels({key: ""})
         run_write_transaction(self._conv_session_immediate, "delete_label", write)
 
     def list_conversations(
@@ -6787,7 +7194,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversation.id.in_(
                         select(SqlConversationLabel.conversation_id).where(
                             SqlConversationLabel.workspace_id == current_workspace_id(),
-                            SqlConversationLabel.key == pinned_label_key(pinned_owner),
+                            SqlConversationLabel.key.in_(
+                                [
+                                    pinned_label_key(pinned_owner),
+                                    family_pinned_label_key(pinned_owner),
+                                ]
+                            ),
                         )
                     )
                 )
@@ -8951,6 +9363,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         conversation_id: str,
         *,
         expected_host_id: str | None = None,
+        expected_sandbox_id: str | None = None,
         clear_profile: bool = False,
     ) -> Conversation:
         """
@@ -8975,6 +9388,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             expected_host_id = uuid_to_bytes(expected_host_id).hex()
 
         def write(session: Session) -> SqlConversationMetadata:
+            host = (
+                session.get(
+                    SqlHost, (current_workspace_id(), expected_host_id), with_for_update=True
+                )
+                if expected_host_id
+                else None
+            )
+
             meta = session.get(
                 SqlConversationMetadata,
                 (current_workspace_id(), conversation_id),
@@ -8985,6 +9406,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     f"conversation {conversation_id!r} does not exist",
                 )
             if expected_host_id is not None and meta.host_id != expected_host_id:
+                return meta
+            if expected_sandbox_id is not None and (
+                host is None or host.sandbox_id != expected_sandbox_id
+            ):
                 return meta
             if not clear_profile and meta.host_id is not None:
                 with self._profile_label_session(session, read_only=True) as labels:
@@ -9265,6 +9690,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         host_id = uuid_to_bytes(host_id).hex()
 
         def write(session: Session) -> ProfileHostBinding:
+            lock_host_for_binding(session, host_id)
             meta = session.get(
                 SqlConversationMetadata,
                 (current_workspace_id(), conversation_id),
@@ -9313,6 +9739,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         expected_host_id = uuid_to_bytes(expected_host_id).hex()
 
         def write(session: Session) -> bool:
+            previous_host = (
+                session.get(
+                    SqlHost, (current_workspace_id(), previous.host_id), with_for_update=True
+                )
+                if previous.host_id is not None
+                else None
+            )
             meta = session.get(
                 SqlConversationMetadata,
                 (current_workspace_id(), previous.session_id),
@@ -9334,6 +9767,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     previous.runner_id,
                     previous.worktree,
                 )
+            if previous_host is not None and previous_host.deleted_at is not None:
+                return False
             meta.host_id, meta.workspace, meta.git_branch, meta.worktree = (
                 previous.host_id,
                 previous.workspace,
@@ -9367,10 +9802,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         """Undo a failed rotation without erasing a newer binding or the last host link."""
 
         def write(session: Session) -> bool:
-            if expected_host_id is not None:
-                session.get(
-                    SqlHost, (current_workspace_id(), expected_host_id), with_for_update=True
+            hosts = {
+                host_id: session.get(
+                    SqlHost, (current_workspace_id(), host_id), with_for_update=True
                 )
+                for host_id in sorted(
+                    {value for value in (previous.host_id, expected_host_id) if value}
+                )
+            }
             meta = session.get(
                 SqlConversationMetadata,
                 (current_workspace_id(), previous.id),
@@ -9387,6 +9826,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ):
                     return False
             if previous.runner_id is not None:
+                previous_host = hosts.get(previous.host_id) if previous.host_id else None
+                if previous_host is not None and previous_host.deleted_at is not None:
+                    return False
                 meta.host_id = previous.host_id
                 meta.workspace = previous.workspace
                 meta.git_branch = previous.git_branch
@@ -9495,6 +9937,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
 
         def write(session: Session) -> SqlConversationMetadata:
+            lock_host_for_binding(session, host_id)
             meta = session.get(
                 SqlConversationMetadata,
                 (current_workspace_id(), conversation_id),
@@ -9853,6 +10296,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     if project_admission != "inherit":
                         raise
                     del prepared_labels[PROJECT_LABEL_KEY]
+            lock_host_for_binding(session, host_id)
             agent_row = _new_session_agent_row(
                 created_by=created_by,
                 agent_id=agent_id,
@@ -9895,11 +10339,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                 conversation_row = ap_committed
             return conversation_row, meta_row, agent_row
 
-        conversation_row, meta_row, agent_row = run_write_transaction(
-            self._session_immediate,
-            "create_session_with_agent_project_admission",
-            insert_with_project_admission,
-        )
+        try:
+            conversation_row, meta_row, agent_row = run_write_transaction(
+                self._session_immediate,
+                "create_session_with_agent_project_admission",
+                insert_with_project_admission,
+            )
+        except OmnigentError:
+            if ap_committed is not None:
+                self._discard_unbound_conversation(conversation_id)
+            raise
 
         return _created_session_from_rows(
             conversation_row,
@@ -10531,6 +10980,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 and not key.startswith(f"{PINNED_LABEL_KEY}.")
                 and not key.startswith(f"{TOUCHED_LABEL_KEY}.")
+                and not key.startswith(FAMILY_PIN_LABEL_PREFIX)
                 and not key.startswith(f"{_SANDBOX_REPO_LABEL_KEY}.")
                 and not key.startswith(f"{ARCHIVE_CASCADE_LABEL_KEY}.")
                 and not key.startswith(CHECKIN_LABEL_PREFIX)
@@ -10815,9 +11265,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         exclude_conversation_id: str,
         include_subdirectories: bool = False,
         include_unclosed_archived: bool = False,
+        include_archived: bool = False,
     ) -> bool:
         """
-        Is another non-archived conversation working in this ``(host_id, workspace)``?
+        Does another conversation use this workspace (active only unless ``include_archived``)?
         See the protocol docstring for the semantics.
 
         Compares each row's effective worktree ``worktree ?? workspace``: an
@@ -10881,6 +11332,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             candidate_ids = [candidate_id for candidate_id, _ in candidates]
         if not candidate_ids:
             return False
+        if include_archived:
+            return True
         with self._conv_session("check_workspace_sharers_are_archived") as conv_sess:
             in_use: ColumnElement[bool] = SqlConversation.archived.is_(False)
             if include_unclosed_archived:
@@ -10903,7 +11356,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 is not None
             )
 
-    async def delete_conversation(self, conversation_id: str) -> bool:
+    async def delete_conversation(
+        self, conversation_id: str, *, preserve_host_binding: str | None = None
+    ) -> bool:
         """
         Delete a conversation and all of its descendants, cleaning up
         every related row explicitly (no DB-level CASCADE).
@@ -10915,6 +11370,8 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
+        :param preserve_host_binding: Keep the root's metadata reservation for
+            same-host replacement. Creation consumes it under the host lock.
         :returns: ``True`` if the conversation existed,
             ``False`` otherwise.
         """
@@ -10924,6 +11381,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         # for a conversation that no longer exists — an acceptable best-effort tradeoff.
         # Agent rows are never deleted here: agents outlive the sessions using them
         # and only an explicit agent removal deletes one.
+
+        from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 
         def subtree_ids_in(session: Session) -> list[str]:
             cte = (
@@ -10963,7 +11422,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 }
             )
 
-        def delete_ap(ap_sess: Session) -> list[str] | None:
+        def delete_ap(ap_sess: Session) -> tuple[list[str], dict[str, str]] | None:
             row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if not row:
                 return None
@@ -11000,6 +11459,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                     "Worktree removal is unresolved; retry deletion after host confirmation",
                     code=ErrorCode.CONFLICT,
                 )
+            origins = ap_sess.scalars(
+                select(SqlConversationLabel.value).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id.in_(subtree_ids),
+                    SqlConversationLabel.key == SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+                )
+            ).all()
+            retained_tasks = {
+                continued_sandbox_host_id(task_id, current_workspace_id()): task_id
+                for task_id in origins
+            }
             delete_fts_by_conversation_ids(ap_sess, list(subtree_ids))
             ap_sess.execute(
                 delete(SqlConversationItem).where(
@@ -11030,7 +11500,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             )
             ap_sess.delete(row)
-            return subtree_ids
+            return subtree_ids, retained_tasks
 
         with ExitStack() as host_leases:
             for host_id in host_ids:
@@ -11042,38 +11512,88 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
         if ap_result is None:
             return False
-        subtree_ids = ap_result
+        subtree_ids, retained_tasks = ap_result
 
-        def delete_metadata(session: Session) -> None:
+        def delete_metadata(session: Session, batch_ids: tuple[str, ...]) -> None:
+            host_ids = session.scalars(
+                select(SqlConversationMetadata.host_id)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id.in_(batch_ids),
+                    SqlConversationMetadata.host_id.is_not(None),
+                )
+                .distinct()
+            ).all()
+            hosts = session.scalars(
+                select(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id.in_(host_ids),
+                )
+                .order_by(SqlHost.host_id)
+                .with_for_update()
+            ).all()
             session.execute(
                 delete(SqlComment).where(
                     SqlComment.workspace_id == current_workspace_id(),
-                    SqlComment.conversation_id.in_(subtree_ids),
+                    SqlComment.conversation_id.in_(batch_ids),
                 )
             )
             session.execute(
                 delete(SqlPolicy).where(
                     SqlPolicy.workspace_id == current_workspace_id(),
-                    SqlPolicy.session_id.in_(subtree_ids),
+                    SqlPolicy.session_id.in_(batch_ids),
                 )
             )
             session.execute(
                 delete(SqlSessionPermission).where(
                     SqlSessionPermission.workspace_id == current_workspace_id(),
-                    SqlSessionPermission.conversation_id.in_(subtree_ids),
+                    SqlSessionPermission.conversation_id.in_(batch_ids),
                 )
             )
-            session.execute(
-                delete(SqlConversationMetadata).where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.id.in_(subtree_ids),
-                )
+            metadata_delete = delete(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id.in_(batch_ids),
             )
+            if preserve_host_binding is not None:
+                metadata_delete = metadata_delete.where(
+                    or_(
+                        SqlConversationMetadata.id != conversation_id,
+                        SqlConversationMetadata.host_id.is_(None),
+                        SqlConversationMetadata.host_id != preserve_host_binding,
+                    )
+                )
+            session.execute(metadata_delete)
 
-        run_write_transaction(
-            self._session_immediate,
-            "delete_conversation_metadata",
-            delete_metadata,
-        )
+            for host in hosts:
+                task_id = retained_tasks.get(host.host_id)
+                if task_id is not None:
+                    key = (
+                        current_workspace_id(),
+                        "__host_lifecycle__",
+                        "retained_sandbox:" + host.host_id,
+                    )
+                    marker = session.get(SqlPreference, key, with_for_update=True)
+                    if marker is None:
+                        session.add(
+                            SqlPreference(
+                                workspace_id=key[0],
+                                user_id=key[1],
+                                key=key[2],
+                                value=task_id,
+                            )
+                        )
+                    else:
+                        marker.value = task_id
+            session.flush()
+            for host in hosts:
+                delete_unused_host_in_session(session, host)
+
+        for batch_ids in batched(subtree_ids, _DELETE_METADATA_BATCH_SIZE):
+            run_write_transaction(
+                self._session_immediate,
+                "delete_conversation_metadata",
+                lambda session, batch=batch_ids: delete_metadata(session, batch),
+            )
 
         return True

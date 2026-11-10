@@ -171,17 +171,22 @@ function applyItemsToCache(
         if (!item) return row;
         foundAnywhere.add(row.id);
         changed = true;
-        // Pin membership and pin timestamps reconcile through the pinned query.
+        // Keep optimistic standalone pins; family updates carry canonical labels.
         return {
           ...row,
           ...item,
-          labels: {
-            ...(item.labels ?? row.labels),
-            ["omnigent.pinned"]: row.labels["omnigent.pinned"],
-          },
+          labels:
+            row.family || item.family
+              ? (item.labels ?? row.labels)
+              : {
+                  ...(item.labels ?? row.labels),
+                  ["omnigent.pinned"]: row.labels["omnigent.pinned"],
+                },
         };
       })
-      .filter((row) => !row.archived);
+      .filter(
+        (row) => !row.archived && (row.family?.pinned || row.labels["omnigent.pinned"] != null),
+      );
     return changed ? { ...previous, conversations } : previous;
   });
   // Recent keeps interaction order, independently of the paginated lists.

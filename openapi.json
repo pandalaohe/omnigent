@@ -8977,6 +8977,11 @@
             "title": "Sharing Mode",
             "type": "string"
           },
+          "sibling_sessions": {
+            "default": false,
+            "title": "Sibling Sessions",
+            "type": "boolean"
+          },
           "single_user": {
             "title": "Single User",
             "type": "boolean"
@@ -9723,6 +9728,47 @@
         "title": "SessionCreatedEvent",
         "type": "object"
       },
+      "SessionFamily": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "pinned": {
+            "default": false,
+            "title": "Pinned",
+            "type": "boolean"
+          },
+          "pinned_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pinned At"
+          },
+          "representative_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Representative Id"
+          }
+        },
+        "required": [
+          "id",
+          "representative_id"
+        ],
+        "title": "SessionFamily",
+        "type": "object"
+      },
       "SessionForkRequest": {
         "additionalProperties": false,
         "description": "Request body for `POST /v1/sessions/{source_id}/fork`.\n\nCreates a deep copy of an existing session's items into a new\nsession. All fields are optional.",
@@ -10319,6 +10365,16 @@
             "default": "list",
             "title": "Object",
             "type": "string"
+          },
+          "page_boundary": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionPageBoundary"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "title": "SessionList",
@@ -10442,6 +10498,16 @@
             ],
             "description": "Runtime-native session id this conversation wraps, e.g. a Claude Code session uuid for `omnigent claude` sessions. `None` for regular AP-only conversations. Lets the sidebar / picker render a runtime badge without a follow-up GET.",
             "title": "External Session Id"
+          },
+          "family": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionFamily"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "foreground_status": {
             "description": "Status of this session's own turn, excluding child-session rollup. This distinguishes a busy main turn from background-only activity while preserving `status` for compatibility.",
@@ -10949,6 +11015,32 @@
           "conversation_id"
         ],
         "title": "SessionModelOptionsEvent",
+        "type": "object"
+      },
+      "SessionPageBoundary": {
+        "description": "Last visible primary-page row, before family context is appended.",
+        "properties": {
+          "created_at": {
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "int64",
+            "title": "Updated At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "SessionPageBoundary",
         "type": "object"
       },
       "SessionPermissionModeEvent": {
@@ -11906,6 +11998,16 @@
             },
             "title": "Failed Inputs",
             "type": "array"
+          },
+          "family": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionFamily"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "git_branch": {
             "anyOf": [
@@ -14933,6 +15035,17 @@
             ],
             "description": "Runtime-native session id captured by a wrapper bridge (e.g. Claude Code's session uuid for `omnigent claude` sessions). Idempotent on same-value writes; the server rejects attempts to overwrite an already-set different value with `invalid_input` to surface programmer errors. `None` leaves unchanged.",
             "title": "External Session Id"
+          },
+          "family_pinned": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Family Pinned"
           },
           "keep_worktree": {
             "default": false,
@@ -28068,6 +28181,17 @@
             "schema": {
               "default": false,
               "title": "Pinned",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Add owned family context to matching rows, including members outside the agent, pin, and page filters. Ownership and archive filters still apply; search disables expansion. Pagination cursors refer to the original filtered page.",
+            "in": "query",
+            "name": "expand_families",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Expand Families",
               "type": "boolean"
             }
           },
