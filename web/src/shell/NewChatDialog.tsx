@@ -2460,12 +2460,18 @@ export function resetLandingDraft(): void {
   writeLandingDraft(null);
 }
 
-export function NewChatLandingScreen() {
+export function NewChatLandingScreen({
+  seed: composerSeed,
+  onCreatingChange,
+}: {
+  seed?: { project: string; prompt: string };
+  onCreatingChange?: (creating: boolean) => void;
+} = {}) {
   const harnessCapabilities = useHarnessCapabilities();
   const navigate = useNavigate();
   const location = useLocation();
   const [searchParams] = useSearchParams();
-  const linkedPrompt = searchParams.get("prompt");
+  const linkedPrompt = composerSeed?.prompt ?? searchParams.get("prompt");
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
@@ -2481,7 +2487,8 @@ export function NewChatLandingScreen() {
 
   // Project driving this visit, when the sidebar's per-project "new session"
   // pencil landed here with a `?project=` query param. Empty otherwise.
-  const projectParam = searchParams.get("project") ?? "";
+  const [embeddedProject, setEmbeddedProject] = useState(composerSeed?.project ?? "");
+  const projectParam = composerSeed ? embeddedProject : (searchParams.get("project") ?? "");
   const [cacheUser, setCacheUser] = useState(getCurrentUserId);
   useEffect(() => {
     if (cacheUser !== null) return;
@@ -2658,8 +2665,9 @@ export function NewChatLandingScreen() {
   // visit (or a plain one) must not beat THIS visit's project defaults —
   // strip them so the prefill machine (fill-empty-only) can seed. Read once
   // per mount; only the lazy state initializers below consume it.
-  const restoredDraft: LandingDraft | null =
-    landingDraft === null || landingDraft.project === projectParam
+  const restoredDraft: LandingDraft | null = composerSeed
+    ? null
+    : landingDraft === null || landingDraft.project === projectParam
       ? landingDraft
       : {
           ...landingDraft,
@@ -2692,10 +2700,14 @@ export function NewChatLandingScreen() {
   const effortTouchedRef = useRef(restoredDraft?.effortTouched ?? false);
 
   const [message, setMessage] = useState<string>(() =>
-    linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? ""),
+    composerSeed
+      ? composerSeed.prompt
+      : linkedPrompt?.trim()
+        ? linkedPrompt
+        : (restoredDraft?.message ?? ""),
   );
   useEffect(() => {
-    if (!searchParams.has("prompt")) return;
+    if (composerSeed || !searchParams.has("prompt")) return;
     if (linkedPrompt?.trim()) setMessage(linkedPrompt);
     // Consume the link once so returning to the composer preserves edits.
     const remaining = new URLSearchParams(searchParams);
@@ -2704,7 +2716,7 @@ export function NewChatLandingScreen() {
       { search: remaining.toString(), hash: location.hash },
       { replace: true, state: location.state },
     );
-  }, [linkedPrompt, searchParams, location.hash, location.state, navigate]);
+  }, [composerSeed, linkedPrompt, searchParams, location.hash, location.state, navigate]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -3101,6 +3113,9 @@ export function NewChatLandingScreen() {
   // Controlled so selecting an existing worktree can close the popover.
   const [worktreePopoverOpen, setWorktreePopoverOpen] = useState(false);
   const [creating, setCreating] = useState(false);
+  useEffect(() => {
+    onCreatingChange?.(creating);
+  }, [creating, onCreatingChange]);
   const [dbcertRequired, setDbcertRequired] = useState(false);
   const createAttemptRef = useRef<symbol | null>(null);
   const skipDbcertCheckRef = useRef<(() => void) | null>(null);
@@ -3189,13 +3204,14 @@ export function NewChatLandingScreen() {
     onScreenRef.current = true;
     return () => {
       onScreenRef.current = false;
+      if (composerSeed) return;
       if (!submittedRef.current) {
         writeLandingDraft(draftRef.current);
       } else if (submittedDraftRevisionRef.current === landingDraftRevision) {
         writeLandingDraft(null);
       }
     };
-  }, []);
+  }, [composerSeed]);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
   const lastCreatedWorkspace = useMemo(
@@ -6764,7 +6780,7 @@ export function NewChatLandingScreen() {
       // The draft's files were validated when the user attached them, so
       // they come back verbatim rather than through a re-validating replace.
       restoreFiles(returnedDraft.files);
-    } else {
+    } else if (!composerSeed) {
       writeLandingDraft({ ...returnedDraft, message: reconciledMessage });
     }
   }
@@ -7106,44 +7122,46 @@ export function NewChatLandingScreen() {
       } else {
         // Normal path: bind to an existing registered agent.
         const provisional = newTempConversation();
-        try {
-          localConv = beginLocalConversation(
-            initialPrompt,
-            submittedFiles,
-            provisional,
-            localProject,
-            {
-              // Seed the temp session with the NORMALIZED create identity so the
-              // optimistic composer shows the model/effort/harness/routing being
-              // created, not state projected from the previously active session.
-              modelOverride: normalizedModelOverride,
-              // The SDK catalog's default belongs to the host, not the bound agent.
-              llmModel: sdkHarness !== null ? null : resolvedDefaultModel,
-              reasoningEffort: normalizedReasoningEffort,
-              claudePermissionMode: sdkHarness === "claude-sdk" ? permissionMode : undefined,
-              codexApprovalMode: sdkHarness === "codex" ? approvalMode : undefined,
-              // The RESOLVED native wrapper harness (e.g. "codex-native"), not the
-              // usually-null pickedHarness for a native agent — so the temp page
-              // adapter can re-derive the native model/effort/permission identity.
-              harness: smartRoutingHarnessSelected
-                ? null
-                : (selectionHarness ?? pickedHarness ?? null),
-              costControlModeOverride: costControlOverride ?? null,
-              boundAgentId: effectiveAgentId,
-              // Name (not just id) so the in-session temp composer can evaluate
-              // routing eligibility (isCostRoutingSession needs a bound agent).
-              boundAgentName: agent?.display_name ?? agent?.name ?? null,
-              // Chosen host so temp routing's per-family gateway guard uses the
-              // real host (null for a sandbox create).
-              hostId: sandboxSelected ? null : selectedHostId,
-            },
-            // Visual order of the inline attachments, so the optimistic bubble
-            // shows them where the user put them rather than in a trailing row.
-            submittedFiles.length > 0 ? orderedPromptParts : undefined,
-          );
-          if (localConv !== null) navigate(sessionLocation(localConv.tempConvId));
-        } catch {
-          /* non-fatal: the response still opens the server session */
+        if (!composerSeed) {
+          try {
+            localConv = beginLocalConversation(
+              initialPrompt,
+              submittedFiles,
+              provisional,
+              localProject,
+              {
+                // Seed the temp session with the NORMALIZED create identity so the
+                // optimistic composer shows the model/effort/harness/routing being
+                // created, not state projected from the previously active session.
+                modelOverride: normalizedModelOverride,
+                // The SDK catalog's default belongs to the host, not the bound agent.
+                llmModel: sdkHarness !== null ? null : resolvedDefaultModel,
+                reasoningEffort: normalizedReasoningEffort,
+                claudePermissionMode: sdkHarness === "claude-sdk" ? permissionMode : undefined,
+                codexApprovalMode: sdkHarness === "codex" ? approvalMode : undefined,
+                // The RESOLVED native wrapper harness (e.g. "codex-native"), not the
+                // usually-null pickedHarness for a native agent — so the temp page
+                // adapter can re-derive the native model/effort/permission identity.
+                harness: smartRoutingHarnessSelected
+                  ? null
+                  : (selectionHarness ?? pickedHarness ?? null),
+                costControlModeOverride: costControlOverride ?? null,
+                boundAgentId: effectiveAgentId,
+                // Name (not just id) so the in-session temp composer can evaluate
+                // routing eligibility (isCostRoutingSession needs a bound agent).
+                boundAgentName: agent?.display_name ?? agent?.name ?? null,
+                // Chosen host so temp routing's per-family gateway guard uses the
+                // real host (null for a sandbox create).
+                hostId: sandboxSelected ? null : selectedHostId,
+              },
+              // Visual order of the inline attachments, so the optimistic bubble
+              // shows them where the user put them rather than in a trailing row.
+              submittedFiles.length > 0 ? orderedPromptParts : undefined,
+            );
+            if (localConv !== null) navigate(sessionLocation(localConv.tempConvId));
+          } catch {
+            /* non-fatal: the response still opens the server session */
+          }
         }
         const createToken = localConv?.createToken ?? provisional.token;
         const matchOwnCreate = (item: SessionListWireItem) =>
@@ -7484,7 +7502,7 @@ export function NewChatLandingScreen() {
       appendPromptHistoryEntry(initialPrompt, data.id);
       // The session was created — drop any draft a detour back to this
       // screen stashed, so the next visit starts clean.
-      if (submittedDraftRevisionRef.current === landingDraftRevision) {
+      if (!composerSeed && submittedDraftRevisionRef.current === landingDraftRevision) {
         writeLandingDraft(null);
       }
 
@@ -8448,6 +8466,11 @@ export function NewChatLandingScreen() {
                         }
                         projects={projectList ?? []}
                         onProjectSelect={(name) => {
+                          if (composerSeed) {
+                            setEmbeddedProject(name);
+                            requestAnimationFrame(() => textareaRef.current?.focus());
+                            return;
+                          }
                           const params = new URLSearchParams(searchParams);
                           params.set("project", name);
                           navigate(`/?${params.toString()}`);

@@ -99,6 +99,7 @@ Unknown standard JSCalendar properties (for example `recurrenceRules`, `location
 | `omnigent.ai:waiting` | **Omnigent-defined** | Optional object `{"on": "user"\|"input"\|"auth"\|"dependency"\|"external", "since"?: UTCDateTime, "note"?: string (<= 500)}`. Populates the **Waiting on me** strip and filter when the task is open. |
 | `omnigent.ai:group` | **Omnigent-defined** | Optional object `{"id": string (1..64), "name"?: string (<= 128)}`. Groups tasks into route/milestone cards on the **Routes** tab. |
 | `omnigent.ai:next` | **Omnigent-defined** | Optional string (`<= 500` chars). Short next-step note shown on the route card and detail drawer. |
+| `omnigent.ai:actions` | **Omnigent-defined** | Optional array (at most 8) of `{"kind": "new-session", "label": string (1..64), "project"?: string (<= 128), "prompt": string (<= 2000)}`. Buttons appear inside the task detail card. Selecting a task only opens its details. A button opens the new-session composer over the board, prefills the prompt and project, and never sends. Project resolves by Omnigent project ID first, then exact name; an unresolved project leaves no project preselected. Values round-trip unchanged. Unknown kinds and malformed entries are skipped when rendering; unsupported kinds and invalid values are rejected on write. With usable actions and no `alternate` link, the card omits the no-page message. |
 | `omnigent.ai:workedBy` | **Omnigent-defined** | Optional array (`<= 200`) of `{"session": string (1..128), "agent"?: string (<= 64), "host"?: string (<= 128), "from": UTCDateTime, "to"?: UTCDateTime}`. Links the task to Omnigent sessions so session cards, waiting prompts, and cost rollups join across both views. |
 | `omnigent.ai:sourceFields` | **Omnigent-defined** | Optional map (`<= 32` entries) of field key (`1..64` chars) to `{"label": string (1..64), "value": string (<= 2000)}` rendered in the task detail drawer. |
 | `omnigent.ai:history` | **Omnigent-defined** | Optional array (`<= 5,000` per task) of append-only events `{"id": string (1..128), "time": UTCDateTime, "kind": "created"\|"state"\|"waiting"\|"assignee"\|"parent"\|"relation"\|"field"\|"comment"\|"closed"\|"reopened"\|"commit"\|"other", "actor"?: string (<= 128), "label"?: string (<= 64), "field"?: string (<= 64), "from"?: string (<= 500), "to"?: string (<= 500), "note"?: string (<= 2000)}`. Deduplicated by `(source_id, uid, id)`. |
@@ -194,6 +195,9 @@ The following `Group` report exercises standard RFC 8984 properties and every wr
         "note": "Waiting on ENG-120 checksum contract"
       },
       "omnigent.ai:next": "Run the interrupted-stream test suite after ENG-120 merges.",
+      "omnigent.ai:actions": [
+        {"kind": "new-session", "label": "Continue task", "project": "Example project", "prompt": "Review the interrupted-stream test results for ENG-123."}
+      ],
       "omnigent.ai:workedBy": [
         {
           "session": "37b15a8ddf9a48e48297735f74530d25",

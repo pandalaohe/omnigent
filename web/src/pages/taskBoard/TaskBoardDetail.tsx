@@ -14,6 +14,7 @@ import { useBoardSessionDetails, type BoardSession } from "./taskBoardNative";
 import { taskRelations, taskLocalTime } from "./taskBoardRouteData";
 import { formatDate, formatNumber, t } from "./taskBoardText";
 import { TaskProgressIcon } from "./TaskProgressIcon";
+import { TaskBoardActions, taskActions } from "./TaskBoardActions";
 
 export const taskTitle = (task: BoardTask) =>
   task.title || task["omnigent.ai:key"] || task.uid || t("task.untitled");
@@ -60,6 +61,7 @@ export function TaskBoardDetail({
     refetchInterval: () => (document.visibilityState === "visible" ? 60_000 : false),
   });
   const current = query.data ?? task;
+  const actions = taskActions(current["omnigent.ai:actions"]);
   const spans = current["omnigent.ai:workedBy"] ?? [];
   const ids = [...new Set(spans.map((span) => span.session))];
   const details = useBoardSessionDetails(ids);
@@ -188,7 +190,8 @@ export function TaskBoardDetail({
               </ul>
             </div>
           )}
-          <div>
+          <div className="flex flex-wrap items-center gap-2">
+            <TaskBoardActions actions={actions} />
             {edit ? (
               <a
                 href={edit}
@@ -199,9 +202,9 @@ export function TaskBoardDetail({
                 {t("source.open")}
                 <ExternalLinkIcon className="size-3.5" />
               </a>
-            ) : (
+            ) : actions.length === 0 ? (
               <p className="text-sm text-muted-foreground">{t("source.noPage")}</p>
-            )}
+            ) : null}
           </div>
         </div>
         <div className="min-w-0 space-y-5">

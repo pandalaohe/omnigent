@@ -179,6 +179,17 @@ class _SourceField(_Object):
     value: str = Field(max_length=2_000)
 
 
+class _TaskAction(_Object):
+    kind: Literal["new-session"]
+    label: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"[^\x09-\x0d\x20\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]",
+    )
+    project: str | None = Field(default=None, max_length=128)
+    prompt: str = Field(max_length=2_000)
+
+
 class _History(_Object):
     id: str = Field(min_length=1, max_length=128)
     time: UTCDateTime
@@ -227,6 +238,9 @@ class _Task(_CalendarObject):
     waiting: _Waiting | None = Field(default=None, alias="omnigent.ai:waiting")
     group: _GroupLabel | None = Field(default=None, alias="omnigent.ai:group")
     next_step: Line | None = Field(default=None, alias="omnigent.ai:next")
+    actions: list[_TaskAction] = Field(
+        default_factory=list, max_length=8, alias="omnigent.ai:actions"
+    )
     worked_by: list[_WorkSpan] = Field(
         default_factory=list, max_length=200, alias="omnigent.ai:workedBy"
     )
