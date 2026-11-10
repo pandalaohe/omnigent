@@ -8,7 +8,7 @@
   "board.userOff": "Task board is off",
   "board.enable": "Turn it on in Settings",
   "board.empty": "No tasks yet",
-  "board.connect": "Connect a source by reporting its tasks as JSCalendar.",
+  "board.connect": "Send a source's tasks as JSCalendar with PUT to:",
   "board.endpoint": "/v1/me/tasks/sources/{source_id}",
   "board.loadFailed": "Could not load tasks. Try again.",
   "board.retry": "Try again",

@@ -106,7 +106,7 @@ export interface UsageBoardPreferences {
 }
 
 export const DEFAULT_USAGE_BOARD_PREFERENCES: UsageBoardPreferences = {
-  enabled: false,
+  enabled: true,
   density: "std",
   bands: [],
   windows: {},
@@ -361,7 +361,7 @@ export function normalizeUsageBoardPreferences(value: unknown): UsageBoardPrefer
     }
   }
   return {
-    enabled: raw.enabled === true,
+    enabled: raw.enabled !== false,
     density: raw.density === "mini" ? "mini" : "std",
     bands,
     windows: idMap(raw.windows),
@@ -402,7 +402,7 @@ export function normalizeUsageBoardPreferences(value: unknown): UsageBoardPrefer
 
 export function isDefaultUsageBoardPreferences(board: UsageBoardPreferences): boolean {
   return (
-    !board.enabled &&
+    board.enabled === DEFAULT_USAGE_BOARD_PREFERENCES.enabled &&
     board.density === "std" &&
     board.bands.length === 0 &&
     Object.keys(board.windows).length === 0 &&
