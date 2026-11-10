@@ -10,6 +10,7 @@
 // the chat store's `session.title` handler (a terminal-side `/rename`).
 
 import type { InfiniteData, QueryClient } from "@tanstack/react-query";
+import { scopeBoundaryRow } from "@/lib/sidebarData";
 import type { Conversation, ConversationsPage, SessionSortBy } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
 
@@ -69,6 +70,8 @@ export interface ConversationListFilters {
    * only archived sessions. ``undefined`` is the default all-sessions list.
    */
   visibility?: "mine" | "shared" | "archived";
+  /** Sort order, present only when it isn't the default `updated_at`. */
+  sortBy?: SessionSortBy;
 }
 
 /**
@@ -200,6 +203,7 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
     // Treat null (visibility-scoped key) the same as undefined (no project filter).
     project: project ?? undefined,
     visibility: visibility as ConversationListFilters["visibility"],
+    ...(key[5] === "created_at" ? { sortBy: "created_at" as const } : {}),
   };
 }
 
@@ -335,6 +339,11 @@ export function mergeItemsIntoPages(
   let anyPageChanged = false;
   let needsRefetch = false;
   let orderStale = false;
+  // The row the next page is fetched after, or the last loaded row when the
+  // server filtered the cursor row out (the sidebar's same fallback). Moving it
+  // up leaves "load more" restarting near the top, so it reconciles.
+  const tail = data.pages.at(-1);
+  const cursorId = tail?.has_more ? scopeBoundaryRow(tail.data, tail.last_id)?.id : null;
   const pages = data.pages.map((page) => {
     let rowChanged = false;
     const nextData: Conversation[] = [];
@@ -362,7 +371,8 @@ export function mergeItemsIntoPages(
           changed,
           searchListCached,
           changed.has("labels") && membershipLabelChanged(conv.labels, wire.labels),
-        )
+        ) ||
+        (conv.id === cursorId && changed.has(filters.sortBy ?? "updated_at"))
       ) {
         needsRefetch = true;
       }
@@ -540,11 +550,12 @@ export function parseProjectSessionsQueryKey(key: readonly unknown[]): {
 
 /** Membership filters for an unsearched project-folder query. */
 export function filtersFromProjectQueryKey(key: readonly unknown[]): ConversationListFilters {
-  const { archived } = parseProjectSessionsQueryKey(key);
+  const { archived, sortBy } = parseProjectSessionsQueryKey(key);
   return {
     searchQuery: "",
     includeArchived: archived,
     visibility: archived ? "archived" : "mine",
+    ...(sortBy === "created_at" ? { sortBy } : {}),
   };
 }
 

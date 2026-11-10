@@ -198,6 +198,9 @@ class _SubagentWorkEntry:
         was registered, used by the remote-member liveness interval.
     :param last_remote_check_monotonic: Runner-local monotonic instant of the
         last remote-member liveness check, or ``None`` until first checked.
+    :param corrected_status: The provisional status this terminal report
+        overturned, e.g. ``"cancelled"`` when a confirmed completion
+        corrected an optimistic cancellation. ``None`` for a direct report.
     :param launch_timed_out: Whether the recorded ``failed`` came from the
         launch-liveness reaper rather than from the child itself. Such a
         failure is a guess ("no start acknowledgment"), so a genuine
@@ -231,6 +234,7 @@ class _SubagentWorkEntry:
     native_origin: str = CODEX_NATIVE_ORIGIN_UNKNOWN
     started_monotonic: float = dataclasses.field(default_factory=time.monotonic)
     last_remote_check_monotonic: float | None = None
+    corrected_status: str | None = None
     launch_timed_out: bool = False
     recovered: bool = False
     parent_turn_consumed: bool = False
@@ -287,6 +291,8 @@ _subagent_work_origins: dict[str, str] = {}
 # ``_subagent_work_by_parent``, so parent cleanup finds the remaining
 # per-child entries through this owner map.
 _subagent_retained_state_parents: dict[str, str] = {}
+
+_provisional_cancelled_subagent_work: dict[str, _SubagentWorkEntry] = {}
 # Parents whose restart-recovery scan completed in this process, plus a
 # per-parent lock so an init racing a sys_read_inbox drain cannot run two
 # scans that both pass the registry check and queue one result twice.
@@ -502,6 +508,7 @@ def register_subagent_work(
         _subagent_retained_state_parents[child_session_id] = parent_session_id
     else:
         _subagent_retained_state_parents.pop(child_session_id, None)
+    _provisional_cancelled_subagent_work.pop(child_session_id, None)
     _subagent_work_by_child[child_session_id] = entry
     _subagent_work_by_parent.setdefault(parent_session_id, set()).add(child_session_id)
     if not flow_neutral:
@@ -706,6 +713,12 @@ def unregister_subagent_work(
     ):
         _drained_delivered_subagent_results[child_session_id] = entry.delivered_result_key
         _subagent_retained_state_parents[child_session_id] = entry.parent_session_id
+        if entry.status == "cancelled" and not entry.cancellation_confirmed:
+            # Keep an optimistic cancellation so a surviving child's confirmed
+            # completion can still correct this drained record.
+            _provisional_cancelled_subagent_work[child_session_id] = entry
+        else:
+            _provisional_cancelled_subagent_work.pop(child_session_id, None)
     _subagent_work_by_child.pop(child_session_id, None)
     lock = _in_flight_send_locks.get(child_session_id)
     if lock is not None and not lock.locked():
@@ -735,11 +748,13 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     _drained_delivered_subagent_results.pop(session_id, None)
     _subagent_work_origins.pop(session_id, None)
     _subagent_retained_state_parents.pop(session_id, None)
+    _provisional_cancelled_subagent_work.pop(session_id, None)
     _in_flight_send_locks.pop(session_id, None)
     for child_id in list(_subagent_work_by_parent.get(session_id, set())):
         _seen_subagent_terminal_ids.pop(child_id, None)
         _subagent_work_by_child.pop(child_id, None)
         _drained_delivered_subagent_results.pop(child_id, None)
+        _provisional_cancelled_subagent_work.pop(child_id, None)
         _subagent_work_origins.pop(child_id, None)
         _subagent_retained_state_parents.pop(child_id, None)
         _in_flight_send_locks.pop(child_id, None)
@@ -750,9 +765,16 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
             continue
         _seen_subagent_terminal_ids.pop(child_id, None)
         _drained_delivered_subagent_results.pop(child_id, None)
+        _provisional_cancelled_subagent_work.pop(child_id, None)
         _subagent_work_origins.pop(child_id, None)
         _subagent_retained_state_parents.pop(child_id, None)
         _in_flight_send_locks.pop(child_id, None)
+    # Drained optimistic cancellations are retained keyed by child id, outside the
+    # parent-child index, so clear this parent's retained records too: a late
+    # completion then acknowledges as delivered instead of re-registering work.
+    for child_id, provisional in list(_provisional_cancelled_subagent_work.items()):
+        if provisional.parent_session_id == session_id:
+            _provisional_cancelled_subagent_work.pop(child_id, None)
     _subagent_work_by_parent.pop(session_id, None)
     clear_peer_copies(session_id)
 
@@ -1254,6 +1276,8 @@ def mark_subagent_work_terminal(
     result_key: str | None = None,
     only_if_work_id: str | None = None,
     terminal: TerminalEnvelope | None = None,
+    confirmed_completion: bool = False,
+    confirmed_cancellation: bool = False,
 ) -> _SubagentDeliveryAck:
     """
     Mark a sub-agent dispatch terminal and notify the parent inbox.
@@ -1281,9 +1305,23 @@ def mark_subagent_work_terminal(
         entry is still that dispatch. A delayed op (an interrupt's grace-timer
         cancel) bound to the dispatch it was raised for is dropped when a newer
         send has replaced the entry, so an old timer never cancels new work.
+    :param confirmed_completion: Whether this ``completed`` report is a
+        confirmed turn-end (not a bare quiescence idle). A confirmed
+        completion corrects an optimistic cancellation that was already
+        delivered or drained for the same dispatch, so a child that survived
+        an interrupt still reaches the parent with its real result.
+    :param confirmed_cancellation: Whether this ``cancelled`` report is a
+        confirmed kill. It marks the dispatch's cancellation final (including
+        a delivered or drained provisional entry) so a late survivor
+        completion can no longer correct it.
     :returns: Delivery acknowledgement for this terminal report.
     :raises ValueError: If ``status`` is not terminal.
     """
+    # A confirmed completion is the only edge that corrects an optimistic
+    # cancellation: a surviving child that genuinely fails keeps the cancelled
+    # outcome, and a confirmed kill makes the abort final.
+    corrects_cancellation = confirmed_completion and status == "completed"
+    confirms_cancellation = confirmed_cancellation and status == "cancelled"
     if status not in _SUBAGENT_TERMINAL_STATUSES:
         raise ValueError(
             f"sub-agent terminal status must be one of "
@@ -1303,6 +1341,18 @@ def mark_subagent_work_terminal(
             reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
         )
     if entry is None:
+        provisional = _provisional_cancelled_subagent_work.get(child_session_id)
+        # Only act on a retained record that belongs to the reporting dispatch,
+        # matching the dispatch-binding guard on the live-entry path below.
+        if provisional is not None and (
+            only_if_work_id is None or provisional.work_id == only_if_work_id
+        ):
+            if confirms_cancellation:
+                # A confirmed kill finalizes the abort; the drained-delivery tombstone
+                # alone blocks a late survivor correction, so drop the retained entry.
+                _provisional_cancelled_subagent_work.pop(child_session_id, None)
+            elif corrects_cancellation:
+                return _deliver_corrected_completion(provisional, output, result_key)
         if child_session_id in _drained_delivered_subagent_results:
             drained_key = _drained_delivered_subagent_results[child_session_id]
             if result_key is None or result_key == drained_key:
@@ -1379,6 +1429,19 @@ def mark_subagent_work_terminal(
             reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
         )
     if entry.status in _SUBAGENT_TERMINAL_STATUSES:
+        if confirms_cancellation and entry.status == "cancelled":
+            # A confirmed kill makes the delivered optimistic cancellation
+            # final; a late survivor completion can no longer correct it.
+            entry.cancellation_confirmed = True
+        if (
+            corrects_cancellation
+            and entry.status == "cancelled"
+            and not entry.cancellation_confirmed
+            and entry.delivered
+        ):
+            # The child survived an optimistic cancellation and finished; its
+            # confirmed completion corrects the already-delivered record.
+            return _deliver_corrected_completion(entry, output, result_key)
         # ``failed`` outranks ``completed``: a quiescence-derived ``completed``
         # (the watcher's ``idle`` edge) can be recorded — and delivered — before
         # the turn's real ``failed`` edge lands. The failure must replace it and
@@ -1420,11 +1483,17 @@ def mark_subagent_work_terminal(
                 delivered_now=False,
                 reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
             )
-        # A late stop_session-driven "cancelled" must not downgrade an
-        # already-recorded "completed"/"failed" still awaiting delivery, and a
-        # trailing quiescence "completed" must not launder a recorded "failed".
-        keep_recorded = (status == "cancelled" and entry.status != "cancelled") or (
-            status == "completed" and entry.status in {"failed", "stopped", "killed"}
+        # Only undelivered entries reach here. A late "cancelled" must not
+        # downgrade a recorded "completed"/"failed", a trailing "completed" must
+        # not launder a "failed", and only a confirmed kill outranks a completion.
+        keep_recorded = (
+            (status == "cancelled" and entry.status != "cancelled")
+            or (status == "completed" and entry.status in {"failed", "stopped", "killed"})
+            or (
+                status == "completed"
+                and entry.status == "cancelled"
+                and entry.cancellation_confirmed
+            )
         )
         if not keep_recorded:
             entry.status = status
@@ -1434,6 +1503,44 @@ def mark_subagent_work_terminal(
     entry.status = status
     entry.output = output
     entry.completed_at = time.time()
+    if confirms_cancellation:
+        entry.cancellation_confirmed = True
+    return _deliver_subagent_completion(entry, result_key)
+
+
+def _deliver_corrected_completion(
+    cancelled_entry: _SubagentWorkEntry, output: str | None, result_key: str | None = None
+) -> _SubagentDeliveryAck:
+    """
+    Overturn an optimistic cancellation with the child's confirmed completion.
+
+    Re-registers the dispatch under its original ``work_id`` (clearing the
+    drained-delivery and provisional-cancel tombstones) and delivers the real
+    result, noting the cancellation it superseded so the parent-readable line
+    can explain the correction.
+
+    :param cancelled_entry: The provisional-cancelled entry being corrected.
+    :param output: The surviving child's confirmed completion output.
+    :returns: Delivery acknowledgement for the corrected completion.
+    """
+    entry = register_subagent_work(
+        parent_session_id=cancelled_entry.parent_session_id,
+        child_session_id=cancelled_entry.child_session_id,
+        agent=cancelled_entry.agent,
+        title=cancelled_entry.title,
+        wrapper_label=cancelled_entry.wrapper_label,
+        created_by=cancelled_entry.created_by,
+        work_id=cancelled_entry.work_id,
+        remote=cancelled_entry.remote,
+        host_id=cancelled_entry.host_id,
+        placement_label=cancelled_entry.placement_label,
+        registered_by=cancelled_entry.registered_by,
+        native_origin=cancelled_entry.native_origin,
+    )
+    entry.status = "completed"
+    entry.output = output
+    entry.completed_at = time.time()
+    entry.corrected_status = cancelled_entry.status
     return _deliver_subagent_completion(entry, result_key)
 
 
@@ -1514,6 +1621,8 @@ def _deliver_subagent_completion(
             "result_id": entry.retry_final.result_id,
             "owner": entry.retry_owner.model_dump(mode="json"),
         }
+    if entry.corrected_status is not None:
+        payload["corrected_status"] = entry.corrected_status
     held = _held_successions.get(entry.parent_session_id)
     if held is not None:
         # A successor still waiting for its opening message must not be woken

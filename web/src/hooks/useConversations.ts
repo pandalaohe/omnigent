@@ -65,6 +65,7 @@ import {
   stopSession,
 } from "@/lib/sessionsApi";
 import { isStaleCursorError, useRestartOnStaleCursor } from "@/lib/staleCursor";
+import { isRetryableRequestError } from "@/lib/queryRetry";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import {
   createProject as apiCreateProject,
@@ -120,6 +121,30 @@ function isAbortTimeout(error: unknown): boolean {
 
 const ARCHIVED_CONVERSATIONS_KEY = ["archived-conversations"] as const;
 const ARCHIVED_SESSION_FACETS_KEY = ["archived-session-facets"] as const;
+/**
+ * Retry policy for session-list fetches: up to 3 retries, and only for failures
+ * a retry can fix. A client-side search timeout and a stale cursor are
+ * terminal, and so is a 4xx the same request would hit again.
+ */
+export function retryListFetch(failureCount: number, error: unknown): boolean {
+  return (
+    failureCount < 3 &&
+    !isAbortTimeout(error) &&
+    !isStaleCursorError(error) &&
+    isRetryableRequestError(error)
+  );
+}
+
+/**
+ * Query key for the archived-project-names scan (see `useArchivedProjectNames`).
+ *
+ * Deliberately NOT under the `["projects"]` prefix: that scan pages the whole
+ * archived session list, so a shared prefix would re-run it on every
+ * `invalidateQueries(["projects"])` — including project moves/deletes of
+ * *non-archived* sessions that can't change the archived-project set. The
+ * mutations that actually change archived membership or a project label
+ * invalidate this key explicitly instead.
+ */
 const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
 export const ARCHIVED_PAGE_SIZE = 20;
 
@@ -612,8 +637,10 @@ function withRecentlyCreated(
   queryClient: QueryClient,
   visibility?: "mine" | "shared" | "archived",
 ): ConversationsPage {
-  // Recently-created sessions are always owned (active, not archived), so skip
-  // injection for "shared" and "archived" filters where they would not belong.
+  // Kept-alive rows are active (never archived): your own creates/forks and
+  // sessions newly shared with you. Shared fetches skip injection so a share
+  // that has since ended can't be restored over the server's answer, and the
+  // "mine" tab takes only the viewer's own rows.
   if (
     after !== undefined ||
     searchQuery ||
@@ -624,6 +651,7 @@ function withRecentlyCreated(
   ) {
     return page;
   }
+  const viewerId = visibility ? getCurrentUserId() : null;
   const present = new Set(page.data.map((c) => c.id));
   const inject: Conversation[] = [];
   for (const [id, snapshot] of recentlyCreatedSessions) {
@@ -637,6 +665,7 @@ function withRecentlyCreated(
     const row = findCachedConversationRow(queryClient, id) ?? snapshot;
     if (row.parent_session_id != null) continue;
     if (row.archived && !includeArchived) continue;
+    if (visibility === "mine" && sessionVisibility(row, viewerId) !== "mine") continue;
     inject.push(row);
   }
   if (inject.length === 0) return page;
@@ -886,7 +915,9 @@ export function useConversations(
           : ["conversations", searchQuery, includeArchived];
   const query = useInfiniteQuery({
     queryKey,
-    queryFn: async ({ pageParam }) => {
+    // `signal` aborts a superseded or unmounted list fetch and its remaining page
+    // walk. Searches keep their own timeout signal instead (fetchConversationsPage).
+    queryFn: async ({ pageParam, signal }) => {
       const fetchPage = () =>
         fetchConversationsPage({
           after: pageParam as string | undefined,
@@ -897,6 +928,7 @@ export function useConversations(
           queryClient,
           limit: sessionPageSize,
           sortBy,
+          signal,
         });
       return timeInitialConversationLoad(pageParam, visibility, fetchPage);
     },
@@ -918,13 +950,11 @@ export function useConversations(
         }
       : {}),
     // A client-side search timeout is terminal — retrying would just re-arm the
-    // same slow request (default 3×) and prolong the spinner. Any other failure
-    // keeps React Query's default retry behaviour.
+    // same slow request (default 3×) and prolong the spinner.
     // A stale cursor is terminal for that page param too: the row it names is
     // gone, so a retry reissues the same doomed cursor. The restart below
     // recovers it instead.
-    retry: (failureCount, error) =>
-      !isAbortTimeout(error) && !isStaleCursorError(error) && failureCount < 3,
+    retry: retryListFetch,
     refetchInterval: options.snapshot
       ? false
       : (options.refreshIntervalMs ??
@@ -1152,8 +1182,7 @@ export function useSessionSearch(
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
     staleTime: 0,
     gcTime: 0,
-    retry: (failureCount, error) =>
-      !isAbortTimeout(error) && !isStaleCursorError(error) && failureCount < 3,
+    retry: retryListFetch,
     enabled: enabled && searchQuery !== "",
   });
   useRestartOnStaleCursor(queryKey);
@@ -1743,6 +1772,9 @@ export function useLeaveSession() {
     mutationFn: ({ id, viewerId }: { id: string; viewerId: string }) =>
       revokePermission(id, viewerId),
     onSuccess: (_data, { id }) => {
+      // The left session may still be readable by link, so no removed frame is
+      // guaranteed; stop the keep-alive from re-injecting it.
+      unmarkRecentlyCreated(id);
       const ids = new Set([id]);
       for (const queryKey of [["conversations"], ["project-sessions"]]) {
         for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
@@ -2165,7 +2197,7 @@ async function fetchPinnedScope(
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, {
     headers: PERMISSION_TIERS_PROTOCOL_HEADERS,
   });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) throw await apiErrorFromResponse(res);
   const rows = applySessionTombstones((await res.json()) as ConversationsPage, true).data;
   const conversations = rows.filter((c) => c.labels?.[PINNED_LABEL_KEY] != null);
   // Honored iff the server returned nothing, or everything it returned is
@@ -2217,6 +2249,7 @@ export function usePinnedConversations(sharedEnabled = true, limit = sidebarConf
   const viewerId = useViewerId();
   const query = useQuery<PinnedConversationsResult>({
     queryKey: PINNED_CONVERSATIONS_KEY,
+    retry: retryListFetch,
     queryFn: () => fetchPinnedConversations(sharedEnabled, limit),
     select: (data) =>
       sharedEnabled
@@ -2344,7 +2377,6 @@ function restorePinLabelInCaches(queryClient: QueryClient, id: string, pin: stri
       data,
       new Map([[id, { id, labels: withPin(row.labels) } satisfies SessionListWireItem]]),
       filtersFromConversationQueryKey(key),
-      undefined,
     );
     if (next !== data) queryClient.setQueryData(key, next);
   }
@@ -2379,7 +2411,6 @@ function patchPinnedCaches(
       data,
       itemsById,
       filtersFromConversationQueryKey(key),
-      undefined,
     );
     if (next !== data) queryClient.setQueryData(key, next);
   }
@@ -2685,8 +2716,10 @@ export function useProjectsWithArchived() {
  * collect the distinct `omni_project` labels present on archived rows.
  *
  * Exported for direct unit testing.
+ *
+ * @param signal - Aborts the walk, e.g. when a newer reconcile supersedes it.
  */
-export async function fetchAllArchivedProjectNames(): Promise<string[]> {
+export async function fetchAllArchivedProjectNames(signal?: AbortSignal): Promise<string[]> {
   const names = new Set<string>();
   // First-class memberships to resolve to names once the scan is done.
   const memberProjectIds = new Set<string>();
@@ -2705,6 +2738,7 @@ export async function fetchAllArchivedProjectNames(): Promise<string[]> {
     // cursor (`after`), so these awaits can't be parallelized.
     // eslint-disable-next-line no-await-in-loop
     const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, {
+      signal,
       headers: PERMISSION_TIERS_PROTOCOL_HEADERS,
     });
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -2736,7 +2770,7 @@ export async function fetchAllArchivedProjectNames(): Promise<string[]> {
 export function useArchivedProjectNames() {
   return useQuery<string[]>({
     queryKey: ARCHIVED_PROJECT_NAMES_KEY,
-    queryFn: fetchAllArchivedProjectNames,
+    queryFn: ({ signal }) => fetchAllArchivedProjectNames(signal),
     staleTime: 60_000,
   });
 }
@@ -3116,6 +3150,7 @@ async function fetchProjectSessionsPage(
   limit = 20,
   sortBy: SessionSortBy = "updated_at",
   archived = false,
+  signal?: AbortSignal,
 ): Promise<ConversationsPage> {
   const params = new URLSearchParams({
     order: "desc",
@@ -3131,6 +3166,7 @@ async function fetchProjectSessionsPage(
   for (;;) {
     // eslint-disable-next-line no-await-in-loop
     const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, {
+      signal,
       headers: PERMISSION_TIERS_PROTOCOL_HEADERS,
     });
     // Carries the server's code, so a dead cursor stays recognizable.
@@ -3166,12 +3202,20 @@ export function useProjectSessions(
   const queryKey = ["project-sessions", project, sortBy, archived];
   const query = useInfiniteQuery({
     queryKey,
-    queryFn: ({ pageParam }) =>
-      fetchProjectSessionsPage(project, pageParam as string | undefined, 20, sortBy, archived),
+    // `signal` aborts a superseded refetch and its remaining page walk.
+    queryFn: ({ pageParam, signal }) =>
+      fetchProjectSessionsPage(
+        project,
+        pageParam as string | undefined,
+        20,
+        sortBy,
+        archived,
+        signal,
+      ),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
-    retry: (failureCount, error) => !isStaleCursorError(error) && failureCount < 3,
+    retry: retryListFetch,
     enabled,
   });
   // A session deleted mid-scroll kills the folder's cursor; reload the folder

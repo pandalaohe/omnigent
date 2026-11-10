@@ -80,6 +80,7 @@ import type {
   ToolResult,
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
+import { fileEditRequestFromWire } from "./toolEditDiff";
 import { routingExtrasFromWire } from "./routingDecision";
 import { providerUsageLimitsFromWire } from "./providerUsageLimits";
 import type {
@@ -1281,6 +1282,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         exitPlanModeRaw && typeof exitPlanModeRaw === "object" && !Array.isArray(exitPlanModeRaw)
           ? (exitPlanModeRaw as Record<string, unknown>)
           : null,
+      fileEdit: fileEditRequestFromWire(p.file_edit),
       codexCommand:
         phase === "codex_command_approval" && typeof command === "string" && command
           ? {

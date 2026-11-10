@@ -313,10 +313,15 @@ def _run_to_response(
     }
 
 
-async def _validate_rrule_or_400(rrule: str) -> None:
+async def _validate_rrule_or_400(rrule: str, session_mode: str, execution_target: str) -> None:
     """Raise a 400 ``OmnigentError`` if the RRULE is invalid."""
     try:
-        await asyncio.to_thread(validate_rrule, rrule)
+        await asyncio.to_thread(
+            validate_rrule,
+            rrule,
+            session_mode=session_mode,
+            execution_target=execution_target,
+        )
     except RRuleValidationError as exc:
         raise OmnigentError(f"invalid rrule: {exc}", code=ErrorCode.INVALID_INPUT) from exc
 
@@ -751,7 +756,7 @@ def create_scheduled_tasks_router(
             conversation_store=conversation_store,
             permission_store=permission_store,
         )
-        await _validate_rrule_or_400(body.rrule)
+        await _validate_rrule_or_400(body.rrule, body.session_mode, body.execution_target)
         _validate_timezone_or_400(body.timezone)
         project_id = await _resolve_create_project(
             owner=owner,
@@ -1102,8 +1107,6 @@ def create_scheduled_tasks_router(
         if legacy_workspace:
             # Legacy directory pins already run with the provider default.
             existing = replace(existing, workspace=None)
-        if body.rrule is not None:
-            await _validate_rrule_or_400(body.rrule)
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         # A non-null project must be the caller's; an explicit null clears the
@@ -1129,6 +1132,13 @@ def create_scheduled_tasks_router(
         if fields.get("session_mode") is None:
             fields.pop("session_mode", None)
         target_session_mode = fields.get("session_mode", existing.session_mode)
+        target_execution = fields.get("execution_target") or existing.execution_target
+        if body.rrule is not None or {"session_mode", "execution_target"}.intersection(fields):
+            await _validate_rrule_or_400(
+                body.rrule if body.rrule is not None else existing.rrule,
+                target_session_mode,
+                target_execution,
+            )
         if target_session_mode == "new":
             if fields.get("session_id") is not None:
                 raise OmnigentError(_SESSION_ID_WITHOUT_CONTINUE_MSG, code=ErrorCode.INVALID_INPUT)
@@ -1163,7 +1173,6 @@ def create_scheduled_tasks_router(
         if "speed" in fields and fields["speed"] is not None:
             agent, library_spec = await _resolve_launch_agent(owner, target_agent_id)
             await _gate_speed(agent, library_spec, fields["speed"])
-        target_execution = fields.get("execution_target") or existing.execution_target
         switching_to_managed = target_execution == "managed_sandbox"
         if not switching_to_managed and "workspace" in fields and fields["workspace"] is None:
             # Target-dependent validation retains the schema's original 422 response.
@@ -1258,7 +1267,7 @@ def create_scheduled_tasks_router(
         try:
             if fields.get("project_id") is not None:
                 fields["project_id"] = await _owned_project_id(project_owner, fields["project_id"])
-            updated = store.update(scheduled_task_id, **fields)
+            updated = store.update(scheduled_task_id, expected_schedule=existing, **fields)
             if updated is None:
                 raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         except Exception as exc:

@@ -62,6 +62,7 @@ import {
   encodeRenderedTextAnchor,
   isRenderedTextAnchor,
 } from "./renderedTextAnchor";
+import { SCROLL_RESTORE_BUDGET_MS, getSavedScrollTop, saveScrollTop } from "./useScrollRestore";
 
 // Force a file asset: a data: URL would be blocked by the embed's script-src CSP.
 const HTML_COMMENT_BRIDGE_RUNTIME_URL = new URL(
@@ -76,6 +77,8 @@ interface HtmlCommentViewerProps {
   /** Opened file's path: workspace-relative, or host-absolute with a leading "/". */
   path: string;
   /** Raw HTML source — the embed (srcdoc) fallback's document and comment source. */
+  /** Explicit scroll identity; otherwise derives from the conversation and path. */
+  scrollKey?: string | null;
   content: string;
   truncated: boolean;
   comments: Comment[];
@@ -337,6 +340,7 @@ export function resolveFrameLinkPath(
 export function HtmlCommentViewer({
   conversationId,
   path,
+  scrollKey = `html-preview:${conversationId}:${path}`,
   content,
   truncated,
   comments,
@@ -364,9 +368,10 @@ export function HtmlCommentViewer({
         content,
         n,
         loadBridgeExternally ? HTML_COMMENT_BRIDGE_RUNTIME_URL : undefined,
+        scrollKey ? (getSavedScrollTop(scrollKey) ?? 0) : 0,
       ),
     };
-  }, [isEmbed, content, loadBridgeExternally]);
+  }, [isEmbed, content, loadBridgeExternally, scrollKey]);
 
   const load = useArtifactEntry(conversationId, path, !isEmbed);
   // A re-minted entry for the same file, swapped in when the panel token nears
@@ -546,6 +551,7 @@ export function HtmlCommentViewer({
     if (!iframe || !nonce) return;
     let channel: MessageChannel | null = null;
     let readyTimer: number | null = null;
+    let activeScrollKey = scrollKey;
 
     const clearReadyTimer = () => {
       if (readyTimer !== null) {
@@ -566,6 +572,15 @@ export function HtmlCommentViewer({
       const framePage = framePageFor(pathname, path);
       if (!framePage || !entry) return;
       const { pagePath } = framePage;
+      activeScrollKey =
+        pagePath === path ? scrollKey : `html-preview:${conversationId}:${pagePath}`;
+      const top = activeScrollKey ? getSavedScrollTop(activeScrollKey) : undefined;
+      if (top !== undefined && top > 0) {
+        portRef.current?.postMessage({
+          type: BRIDGE_MSG.restoreScroll,
+          restoreScroll: { top, budgetMs: SCROLL_RESTORE_BUDGET_MS },
+        });
+      }
       setFramePath(pagePath);
       frameTailRef.current = framePage.tail;
       // A ready naming another page means the frame replaced its document:
@@ -681,6 +696,8 @@ export function HtmlCommentViewer({
         setZoomBadgeVisible(true);
         if (zoomBadgeTimerRef.current !== null) clearTimeout(zoomBadgeTimerRef.current);
         zoomBadgeTimerRef.current = setTimeout(() => setZoomBadgeVisible(false), ZOOM_BADGE_MS);
+      } else if (msg.type === BRIDGE_MSG.scroll) {
+        if (activeScrollKey) saveScrollTop(activeScrollKey, msg.top);
       } else if (msg.type === BRIDGE_MSG.openPath) {
         // The desktop and mobile layouts both mount a viewer; a page script can
         // click a link in the hidden copy. Only a rendered frame may open files.
@@ -748,9 +765,19 @@ export function HtmlCommentViewer({
       // targetOrigin "*" is required: the sandboxed frame has an opaque ("null")
       // origin, so we cannot name a concrete origin. The transferred port + the
       // nonce are the trust mechanism, not the origin.
-      win.postMessage({ source: BRIDGE_SOURCE, nonce, type: BRIDGE_MSG.init }, "*", [
-        channel.port2,
-      ]);
+      win.postMessage(
+        {
+          source: BRIDGE_SOURCE,
+          nonce,
+          type: BRIDGE_MSG.init,
+          restoreScroll:
+            isEmbed && scrollKey
+              ? { top: getSavedScrollTop(scrollKey) ?? 0, budgetMs: SCROLL_RESTORE_BUDGET_MS }
+              : null,
+        },
+        "*",
+        [channel.port2],
+      );
       // The bridge is inlined by the server; when the asset is missing from the
       // deployment, nothing answers and comments are impossible on this page.
       clearReadyTimer();
@@ -768,7 +795,7 @@ export function HtmlCommentViewer({
       channel?.port1.close();
       portRef.current = null;
     };
-  }, [nonce, isEmbed, path, entry, showPage, frameVisible, iframeEl]);
+  }, [nonce, isEmbed, path, entry, showPage, frameVisible, iframeEl, scrollKey, conversationId]);
 
   // Push comment-list changes into the frame.
   useEffect(() => {

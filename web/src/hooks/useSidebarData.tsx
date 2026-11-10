@@ -170,6 +170,8 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const watchedIds = useMemo(() => loadedRows.map((row) => row.id), [loadedRows]);
   const mineCursor = mine.data?.pages.at(-1)?.last_id;
   const sharedCursor = shared.data?.pages.at(-1)?.last_id;
+  const mineBoundary = mine.data?.boundary;
+  const sharedBoundary = shared.data?.boundary;
   const merged = useMemo(
     () =>
       mergeScopeRows(
@@ -180,6 +182,8 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
         mineCursor,
         sharedCursor,
         sortBy,
+        mineBoundary,
+        sharedBoundary,
       ),
     [
       mineRows,
@@ -190,6 +194,8 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
       mineCursor,
       sharedCursor,
       sortBy,
+      mineBoundary,
+      sharedBoundary,
     ],
   );
   const hasNextPage = mine.hasNextPage || (sharedActive && shared.hasNextPage);

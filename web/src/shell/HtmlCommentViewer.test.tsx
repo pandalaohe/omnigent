@@ -12,7 +12,7 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { type ReactNode, useMemo, useState } from "react";
+import { type ReactNode, startTransition, Suspense, useMemo, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { showToast } from "@/components/ui/toast";
 import type { Comment } from "@/hooks/useComments";
@@ -31,7 +31,8 @@ import { BRIDGE_MSG, BRIDGE_SOURCE } from "./htmlCommentBridge";
 import { ANNOTATE_SOURCE } from "./htmlAnnotateBridge";
 import { encodeRenderedTextAnchor } from "./renderedTextAnchor";
 import { setOmnigentHostConfig, type HtmlPreviewFrameProps } from "@/lib/host";
-import { connectHtmlPreviewBridge } from "@/test/htmlPreviewBridge";
+import { connectHtmlPreviewBridge, requestedScrollRestore } from "@/test/htmlPreviewBridge";
+import { getSavedScrollTop, saveScrollTop } from "./useScrollRestore";
 
 // Permissions gate the floating "Add comment" button; default to editable.
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn(() => true) }));
@@ -337,6 +338,28 @@ afterEach(() => {
   vi.unstubAllGlobals();
   delete window.__OMNIGENT_BASE_PATH__;
 });
+
+function renderScrollViewer(
+  content: string,
+  truncated = false,
+  embedded = false,
+  scrollKey: string | null = null,
+) {
+  vi.mocked(host.hasOmnigentHostFetcher).mockReturnValue(true);
+  const viewer = (
+    <HtmlCommentViewer
+      conversationId="conv_1"
+      path="plan.html"
+      scrollKey={scrollKey}
+      content={content}
+      truncated={truncated}
+      comments={[]}
+      activeSelection={null}
+      onSetActiveSelection={() => {}}
+    />
+  );
+  return render(embedded ? <EmbeddedProvider>{viewer}</EmbeddedProvider> : viewer);
+}
 
 function HostPreviewFrame({ htmlContent, iframeRef, onLoad }: HtmlPreviewFrameProps) {
   return (
@@ -1463,6 +1486,101 @@ describe("HtmlCommentViewer embed mode", () => {
     expect(screen.queryByText(/truncated/i)).toBeNull();
     rerender(viewer(true));
     expect(screen.getByText(/truncated/i)).toBeTruthy();
+  });
+});
+
+describe("HtmlCommentViewer scroll position", () => {
+  it("saves the frame's reported offset and restores it when the preview remounts", async () => {
+    const key = "html-preview:conv_1:plan.html";
+    const first = renderScrollViewer("<body><p>plan</p></body>", false, false, key);
+    expect(requestedScrollRestore()).toBeNull();
+    const { port, send } = await connectHtmlPreviewBridge(
+      screen.getByTitle<HTMLIFrameElement>("HTML preview"),
+    );
+    send({ type: BRIDGE_MSG.scroll, top: 760 });
+    await waitFor(() => expect(getSavedScrollTop(key)).toBe(760));
+    port.close();
+    first.unmount();
+
+    // Switching back to the tab or session mounts a fresh preview for the file.
+    renderScrollViewer("<body><p>plan</p></body>", false, false, key);
+    expect(requestedScrollRestore()).toMatchObject({ top: 760 });
+  });
+
+  it("returns to the saved offset when the agent rewrites the file", async () => {
+    const key = "html-preview:conv_1:live.html";
+    saveScrollTop(key, 300);
+    const { rerender } = renderScrollViewer("<body><p>v1</p></body>", false, false, key);
+    const rewrite = (content: string) =>
+      rerender(
+        <HtmlCommentViewer
+          conversationId="conv_1"
+          path="plan.html"
+          scrollKey={key}
+          content={content}
+          truncated={false}
+          comments={[]}
+          activeSelection={null}
+          onSetActiveSelection={() => {}}
+        />,
+      );
+    saveScrollTop(key, 512);
+    rewrite("<body><p>v2</p></body>");
+    expect(requestedScrollRestore()).toMatchObject({ top: 512 });
+
+    // The rewritten frame reports its own offset, which the next rewrite restores.
+    const { send } = await connectHtmlPreviewBridge(
+      screen.getByTitle<HTMLIFrameElement>("HTML preview"),
+    );
+    send({ type: BRIDGE_MSG.scroll, top: 140 });
+    await waitFor(() => expect(getSavedScrollTop(key)).toBe(140));
+    rewrite("<body><p>v3</p></body>");
+    expect(requestedScrollRestore()).toMatchObject({ top: 140 });
+  });
+
+  it("saves a frame's offset under its own file while navigation to another file suspends", async () => {
+    const key = "html-preview:conv_1:suspended.html";
+    const nextKey = "html-preview:conv_1:next.html";
+    const pending = new Promise<void>(() => {});
+    const attempted = vi.fn();
+    function Suspend({ blocked }: { blocked: boolean }) {
+      if (blocked) {
+        attempted();
+        throw pending;
+      }
+      return null;
+    }
+    const tree = (scrollKey: string, blocked: boolean) => (
+      <Suspense fallback={<div>Loading navigation</div>}>
+        <HtmlCommentViewer
+          conversationId="conv_1"
+          path="plan.html"
+          scrollKey={scrollKey}
+          content="<body><p>plan</p></body>"
+          truncated={false}
+          comments={[]}
+          activeSelection={null}
+          onSetActiveSelection={() => {}}
+        />
+        <Suspend blocked={blocked} />
+      </Suspense>
+    );
+    const view = render(tree(key, false));
+    const { send } = await connectHtmlPreviewBridge(
+      screen.getByTitle<HTMLIFrameElement>("HTML preview"),
+    );
+
+    // The viewer renders for the next file, but the navigation never commits.
+    act(() => {
+      startTransition(() => {
+        view.rerender(tree(nextKey, true));
+      });
+    });
+    expect(attempted).toHaveBeenCalled();
+    send({ type: BRIDGE_MSG.scroll, top: 420 });
+    await waitFor(() => expect(getSavedScrollTop(key)).toBe(420));
+    expect(getSavedScrollTop(nextKey)).toBeUndefined();
+    view.rerender(tree(key, false));
   });
 });
 

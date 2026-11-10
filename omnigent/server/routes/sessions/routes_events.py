@@ -6708,6 +6708,7 @@ def register_events_routes(
                         # terminate; None (config removed since launch)
                         # still deletes the row and revokes the token.
                         getattr(state, "sandbox_config", None),
+                        keep_if_bound=True,
                         capture_logs=capture_logs,
                     )
                 )

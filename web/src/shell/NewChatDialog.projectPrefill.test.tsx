@@ -680,9 +680,8 @@ describe("NewChatLandingScreen project prefill", () => {
 
     fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
     fireEvent.click(screen.getByRole("button", { name: RECENT_WORKSPACE }));
-    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAttribute(
-      "title",
-      RECENT_WORKSPACE,
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+      `Working directory: ${RECENT_WORKSPACE}`,
     );
     await waitFor(() =>
       expect(screen.queryByTestId("new-chat-landing-branch-chip")).not.toBeInTheDocument(),

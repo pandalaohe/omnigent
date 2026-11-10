@@ -45,10 +45,12 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
     Claude ``/clear`` creates a fresh Omnigent session and consumes the hook.
 
     This exercises the rotation transaction directly: create the new
-    session, bind the same runner, transfer the terminal, rewrite the
-    active bridge session, clear the old runner binding, and keep the
-    hook cursor past the clear record so the next poll does not fork
-    again from the same hook line.
+    session with the old title and project, bind the same runner,
+    transfer the terminal, rewrite the active bridge session, clear the
+    old runner binding, and keep the hook cursor past the clear record
+    so the next poll does not fork again from the same hook line. A
+    project the server reports as not found (deleted, or owned by another
+    user) gets one unfiled retry and the same transaction.
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(

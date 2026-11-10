@@ -498,7 +498,14 @@ describe("filtersFromConversationQueryKey", () => {
   it("accepts creation-order caches for live updates and optimistic mutations", () => {
     expect(
       filtersFromConversationQueryKey(["conversations", "", false, null, "mine", "created_at"]),
-    ).toEqual({ searchQuery: "", includeArchived: false, project: undefined, visibility: "mine" });
+    ).toEqual({
+      searchQuery: "",
+      includeArchived: false,
+      project: undefined,
+      visibility: "mine",
+      // The sort order decides which field can move the pagination cursor.
+      sortBy: "created_at",
+    });
   });
 
   it("rejects non-canonical conversation query keys", () => {
@@ -711,5 +718,59 @@ describe("insertNewRowsIntoPages", () => {
       (id) => id === "gone",
     );
     expect(inserted).toHaveLength(0);
+  });
+});
+
+describe("pagination cursor movement", () => {
+  it("reconciles when the next page's cursor row moves", () => {
+    // Bumping the row "load more" fetches after would leave a stale cursor and
+    // lift the sidebar's completeness watermark above every other row.
+    const before: ConversationsInfiniteData = {
+      pages: [
+        {
+          data: [conv("a", { updated_at: 3 }), conv("b", { updated_at: 2 })],
+          first_id: "a",
+          last_id: "b",
+          has_more: true,
+        },
+      ],
+      pageParams: [undefined],
+    };
+    const bump = (id: string) =>
+      mergeItemsIntoPages(
+        before,
+        new Map<string, SessionListWireItem>([[id, { id, updated_at: 9 }]]),
+        DEFAULT_FILTERS,
+      ).needsRefetch;
+
+    expect(bump("b")).toBe(true);
+    expect(bump("a")).toBe(false);
+    // A cursor the server filtered out of the page (a side chat) falls back to
+    // the last loaded row, as the sidebar's boundary does.
+    const filtered = { ...before, pages: [{ ...before.pages[0], last_id: "side_chat" }] };
+    expect(
+      mergeItemsIntoPages(
+        filtered,
+        new Map<string, SessionListWireItem>([["b", { id: "b", updated_at: 9 }]]),
+        DEFAULT_FILTERS,
+      ).needsRefetch,
+    ).toBe(true);
+    // In a created_at-ordered list an updated_at bump can't move the cursor.
+    expect(
+      mergeItemsIntoPages(
+        before,
+        new Map<string, SessionListWireItem>([["b", { id: "b", updated_at: 9 }]]),
+        { ...DEFAULT_FILTERS, sortBy: "created_at" },
+      ).needsRefetch,
+    ).toBe(false);
+    // With no further page there is no cursor to protect.
+    const complete = { ...before, pages: [{ ...before.pages[0], has_more: false }] };
+    expect(
+      mergeItemsIntoPages(
+        complete,
+        new Map<string, SessionListWireItem>([["b", { id: "b", updated_at: 9 }]]),
+        DEFAULT_FILTERS,
+      ).needsRefetch,
+    ).toBe(false);
   });
 });

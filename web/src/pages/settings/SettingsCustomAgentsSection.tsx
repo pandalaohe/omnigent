@@ -131,7 +131,7 @@ function InstalledAgentsSettingsSection({
     return (
       <div className="@container">
         {back}
-        <h1 className="mb-6 text-2xl font-semibold">Create custom agent</h1>
+        <h1 className="settings-page-title mb-6 text-2xl font-medium">Create custom agent</h1>
         <CreateAgentForm
           submitLabel="Save agent"
           notice="Saving an existing installed agent's name replaces its entire configuration. Sessions using that agent will receive the update. Use a new name to keep both agents."
@@ -178,7 +178,7 @@ function InstalledAgentsSettingsSection({
           />
         ) : (
           <>
-            <h1 className="mb-6 text-2xl font-semibold">Custom agent</h1>
+            <h1 className="settings-page-title mb-6 text-2xl font-medium">Custom agent</h1>
             <p className="text-ui text-muted-foreground">
               {detail.isPending
                 ? "Loading agent…"
@@ -345,7 +345,7 @@ function InstalledAgentsSettingsSection({
 function UnsupportedServer() {
   return (
     <div>
-      <h1 className="mb-6 text-2xl font-semibold">Custom agents</h1>
+      <h1 className="settings-page-title mb-6 text-2xl font-medium">Custom agents</h1>
       <p role="alert" className="text-ui text-muted-foreground">
         Custom agents settings is unavailable on this server. Update the server and reload to enable
         it.
@@ -436,7 +436,9 @@ function AgentDetail({
         <>
           <BackButton label="Custom agents" to={BASE} componentId="settings.custom_agents.back" />
           <div className="flex items-start justify-between gap-4">
-            <h1 className="min-w-0 break-words text-2xl font-semibold">{agent.name}</h1>
+            <h1 className="settings-page-title min-w-0 break-words text-2xl font-medium">
+              {agent.name}
+            </h1>
             {owned === true && (
               <Button variant="ghost" size="icon" aria-label="Delete agent" onClick={confirmDelete}>
                 <TrashIcon className="size-4" />

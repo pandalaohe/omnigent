@@ -1554,7 +1554,10 @@ class ConversationStore(ABC):
         :raises omnigent.errors.StaleCursorError: If the ``after``/``before``
             conversation no longer exists (e.g. deleted between two page
             fetches) — its sort position is unknowable, and an empty page
-            would be indistinguishable from a completed enumeration.
+            would be indistinguishable from a completed enumeration. Also
+            raised when ``accessible_by``/``owned_by`` is set and that user
+            has no grant on the cursor conversation, so a cursor can't
+            reveal where an ungranted session sorts.
         :raises ValueError: If ``touched_label_key`` is set together with
             ``after`` or ``before``.
         """

@@ -148,6 +148,7 @@ function TranscriptImpl({
   const turnActive = useChatStore((s) =>
     computeIsTurnActive(s.sessionStatus, s.status === "streaming"),
   );
+  const sandboxFailed = useChatStore((s) => s.sandboxStatus?.stage === "failed");
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
   const hasTasks = useChatStore((s) => s.todos.length > 0);
@@ -364,6 +365,7 @@ function TranscriptImpl({
   }, [nav]);
 
   const showWorkingIndicator =
+    !sandboxFailed &&
     (!startupVisible || startup?.state === "opened" || startup?.state === "operator_released") &&
     shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
   const arcaWarning = useArcaShutdownBanner();
@@ -443,7 +445,7 @@ function TranscriptImpl({
             !startupVisible &&
             !showWorkingIndicator &&
             !display.mcpStartupActive ? (
-              sandboxLaunching ? (
+              sandboxLaunching || sandboxFailed ? (
                 <RunnerStartingIndicator variant="hero" />
               ) : (
                 <ConversationEmptyState>

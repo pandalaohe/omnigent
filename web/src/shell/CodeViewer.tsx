@@ -1005,6 +1005,7 @@ export function CodeViewer({
         key={`${conversationId}:${path}:${previewKey ?? ""}`}
         conversationId={conversationId}
         path={path}
+        scrollKey={conversationId && path ? `html-preview:${conversationId}:${path}` : null}
         content={content}
         truncated={truncated}
         comments={previewComments}

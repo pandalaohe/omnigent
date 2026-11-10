@@ -12520,11 +12520,23 @@ def _format_async_task_item(payload: _JsonObject) -> str:
                 f"{retry.get('reason')})"
             )
         if status == "completed":
+            # A confirmed completion can overturn an optimistic cancellation the
+            # parent was already told about; note the correction so the earlier
+            # cancelled line is not read as a contradiction.
+            corrected = (
+                ", superseding its earlier cancelled notice"
+                if payload.get("corrected_status") == "cancelled"
+                else ""
+            )
             if not has_output:
                 return (
-                    f"[System: sub-agent task {handle_id} completed — {target} produced no output]"
+                    f"[System: sub-agent task {handle_id} completed — {target} "
+                    f"produced no output{corrected}]"
                 )
-            return f"[System: sub-agent task {handle_id} completed — {target} returned: {output}]"
+            return (
+                f"[System: sub-agent task {handle_id} completed — {target} "
+                f"returned: {output}{corrected}]"
+            )
         if status == "failed":
             return f"[System: sub-agent task {handle_id} failed — {target} error: {output}]"
         if status == "cancelled":

@@ -15,6 +15,7 @@ import {
   PanelLeftIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
+  SearchIcon,
   ShareIcon,
   TerminalIcon,
   UserPlusIcon,
@@ -115,6 +116,12 @@ interface MobileSessionMenuProps {
   githubPanelOpen: boolean;
   /** Open the mobile Pull Requests drawer. */
   onOpenGithub: () => void;
+  /** True while the mobile Content search drawer is open. */
+  contentSearchPanelOpen: boolean;
+  /** Whether workspace content search is available for this session. */
+  showContentSearch: boolean;
+  /** Open the mobile Content search drawer. */
+  onOpenContentSearch: () => void;
   /** True while the mobile side-chats drawer is open. */
   sideChatsPanelOpen: boolean;
   /** Whether the session's harness supports side chats. */
@@ -409,6 +416,7 @@ export function ChatHeader({
     !mobileMenu.subagentsPanelOpen &&
     !mobileMenu.shellsPanelOpen &&
     !mobileMenu.githubPanelOpen &&
+    !mobileMenu.contentSearchPanelOpen &&
     !mobileMenu.sideChatsPanelOpen &&
     (hasRailContent || mobileMenu.debugMode) ? (
       <>
@@ -440,6 +448,15 @@ export function ChatHeader({
                 {mobileMenu.changedCount}
               </span>
             )}
+          </DropdownMenuItem>
+        )}
+        {mobileMenu.showContentSearch && (
+          <DropdownMenuItem
+            onSelect={mobileMenu.onOpenContentSearch}
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
+          >
+            <SearchIcon className="size-4" />
+            Content search
           </DropdownMenuItem>
         )}
         {showFilesPanel && (

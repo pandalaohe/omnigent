@@ -41,14 +41,17 @@ import {
   nullsToUndefined,
   PROJECT_LABEL_KEY,
   removeIdsFromPages,
+  unmarkRecentlyCreated,
 } from "@/lib/sessionListCache";
+import { createListReconcileScheduler } from "@/lib/listReconcileScheduler";
 import { isModalHostResolved, resolveModalHost } from "@/lib/sessionHost";
+import { sessionVisibility } from "@/lib/sessionVisibility";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import { isTempConvId } from "@/lib/tempConversationId";
 
-// Coalesce bursts of structural changes / watch-set recomputes into one
-// action. 250 ms is short enough to feel live, long enough to batch the
-// flurry of cache writes a single frame can trigger.
+// Coalesce bursts of watch-set recomputes into one push. 250 ms is short
+// enough to feel live, long enough to batch the flurry of cache writes a
+// single frame can trigger.
 const DEBOUNCE_MS = 250;
 const ORDER_REFRESH_MS = 15_000;
 
@@ -64,6 +67,7 @@ function applyItemsToCache(
   queryClient: QueryClient,
   items: SessionListWireItem[],
   viewerId?: string | null,
+  activeId?: string,
 ): { missingIds: string[]; needsRefetch: boolean; orderStale: boolean } {
   // Frames are full rows with explicit nulls; convert null → undefined so a
   // cleared field overlays the cache in the same shape GET /v1/sessions
@@ -76,6 +80,20 @@ function applyItemsToCache(
       nullsToUndefined(isSessionArchiving(item.id) ? { ...item, archived: true } : item),
     );
   }
+  // The open session is always in the watch-set, so its row arrives with every
+  // snapshot whether or not the server lists it. Another user's open session
+  // (e.g. opened by a link shared only through a group) is never inserted: list
+  // membership is the server's call, re-read on an access_changed frame or when
+  // the session's permission changes.
+  const activeItem = activeId === undefined ? undefined : itemsById.get(activeId);
+  const skipInsert = (id: string) =>
+    isSessionDeleting(id) ||
+    (id === activeId &&
+      activeItem !== undefined &&
+      sessionVisibility(
+        { owner: activeItem.owner, permission_level: activeItem.permission_level ?? null },
+        viewerId ?? null,
+      ) === "shared");
   const foundAnywhere = new Set<string>();
   let needsRefetch = false;
   let orderStale = false;
@@ -111,7 +129,7 @@ function applyItemsToCache(
       merged,
       missingHere,
       filters,
-      isSessionDeleting,
+      skipInsert,
       viewerId,
     );
     for (const row of inserted) {
@@ -179,7 +197,11 @@ function applyItemsToCache(
     }),
   );
   return {
-    missingIds: [...itemsById.keys()].filter((id) => !foundAnywhere.has(id)),
+    // Sub-agent children are watched for their tree views, but no session list
+    // ever holds them, so their absence is not a sign of a new session.
+    missingIds: [...itemsById.values()]
+      .filter((item) => item.parent_session_id == null && !foundAnywhere.has(item.id))
+      .map((item) => item.id),
     needsRefetch,
     orderStale,
   };
@@ -280,6 +302,10 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
   // socket reconnects, so changes missed while disconnected are caught by
   // the post-reconnect snapshot.
   const commentsFingerprintsRef = useRef(new Map<string, string>());
+
+  // Last permission level streamed for the open session, so a change to it
+  // (a share upgraded or revoked) reconciles list membership.
+  const activePermissionRef = useRef<{ id: string; level: number | null } | null>(null);
 
   // The frame handler is installed once (effect deps are [queryClient]) but
   // the active route changes over the socket's lifetime. Keep the current
@@ -383,38 +409,32 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       });
     }
 
-    let invalidateTimer: ReturnType<typeof setTimeout> | null = null;
+    // Reconcile the session lists against the server when a frame shows a
+    // change no local patch can place. Paced so a busy stream can't stack
+    // refetch rounds against a slow server.
+    const reconciler = createListReconcileScheduler(() =>
+      Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["conversations"],
+          predicate: (query) => query.meta?.snapshot !== true,
+        }),
+        // Converge each project folder's own list too (new/archived/relabeled
+        // members the local field-patch can't place).
+        queryClient.invalidateQueries({ queryKey: ["project-sessions"] }),
+        queryClient.invalidateQueries({ queryKey: ["recent-sessions"] }),
+        // Another client archiving/relabeling/deleting can add or remove a
+        // project from the Archived view's picker; only local mutations
+        // invalidate this scan otherwise.
+        queryClient.invalidateQueries({ queryKey: ["archived-project-names"] }),
+      ]),
+    );
+    const scheduleInvalidate = () => reconciler.schedule();
     let orderRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-    const invalidateLists = () => {
-      void queryClient.invalidateQueries({
-        queryKey: ["conversations"],
-        predicate: (query) => query.meta?.snapshot !== true,
-      });
-      // Converge each project folder's own list too (new/archived/relabeled
-      // members the local field-patch can't place).
-      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-      void queryClient.invalidateQueries({ queryKey: ["recent-sessions"] });
-      // Another client archiving/relabeling/deleting can add or remove a
-      // project from the Archived view's picker; only local mutations
-      // invalidate this scan otherwise.
-      void queryClient.invalidateQueries({ queryKey: ["archived-project-names"] });
-    };
-    const scheduleInvalidate = () => {
-      if (orderRefreshTimer !== null) {
-        clearTimeout(orderRefreshTimer);
-        orderRefreshTimer = null;
-      }
-      if (invalidateTimer !== null) return;
-      invalidateTimer = setTimeout(() => {
-        invalidateTimer = null;
-        invalidateLists();
-      }, DEBOUNCE_MS);
-    };
     const scheduleOrderRefresh = () => {
-      if (orderRefreshTimer !== null || invalidateTimer !== null) return;
+      if (orderRefreshTimer !== null) return;
       orderRefreshTimer = setTimeout(() => {
         orderRefreshTimer = null;
-        invalidateLists();
+        reconciler.schedule();
       }, ORDER_REFRESH_MS);
     };
 
@@ -468,8 +488,17 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           // Summary consumers refetch their own permission-filtered view.
           void queryClient.invalidateQueries({ queryKey: ["system-status", "summary"] });
           return;
+        case "access_changed":
+          // The server decides whether the session now belongs in Shared.
+          scheduleInvalidate();
+          return;
         case "removed":
-          for (const id of frame.ids) commentsFingerprintsRef.current.delete(id);
+          for (const id of frame.ids) {
+            commentsFingerprintsRef.current.delete(id);
+            // A revoked share or a deletion must not be re-injected by the
+            // keep-alive once the refetch correctly leaves it out.
+            unmarkRecentlyCreated(id);
+          }
           queryClient.setQueryData<PinnedConversationsResult>(
             PINNED_CONVERSATIONS_KEY,
             (previous) =>
@@ -520,6 +549,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
             queryClient,
             frame.items,
             getCurrentUserId(),
+            activeIdRef.current ?? undefined,
           );
           // A watched id absent from every page is a new session whose sort
           // position we can't place locally. Membership-affecting deltas
@@ -535,8 +565,27 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           const sidebarMissingIds = missingIds.filter(
             (id) => id !== activeIdRef.current && !childSessionIds.has(id),
           );
-          if (sidebarMissingIds.length > 0 || needsRefetch) scheduleInvalidate();
-          else if (orderStale) scheduleOrderRefresh();
+          // Reconcile list membership when the open session's permission
+          // changes (e.g. its owner shares it with the viewer directly, or
+          // revokes a direct share while a link share remains), not on every
+          // activity update. The refetch is authoritative, so the keep-alive
+          // must not re-inject the row over it.
+          const active = activeIdRef.current;
+          const activeItem = active ? frame.items.find((item) => item.id === active) : undefined;
+          let activePermissionChanged = false;
+          if (active && activeItem) {
+            const level = activeItem.permission_level ?? null;
+            const seen = activePermissionRef.current;
+            activePermissionChanged = seen?.id === active && seen.level !== level;
+            activePermissionRef.current = { id: active, level };
+            if (activePermissionChanged) unmarkRecentlyCreated(active);
+          }
+          if (sidebarMissingIds.length > 0 || needsRefetch || activePermissionChanged) {
+            scheduleInvalidate();
+          } else {
+            reconciler.noteActivity();
+            if (orderStale) scheduleOrderRefresh();
+          }
           return;
         }
       }
@@ -579,7 +628,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       unsubscribeFrames();
       unsubscribeMutations();
       unsubscribeCache();
-      if (invalidateTimer !== null) clearTimeout(invalidateTimer);
+      reconciler.dispose();
       if (orderRefreshTimer !== null) clearTimeout(orderRefreshTimer);
       if (watchTimer !== null) clearTimeout(watchTimer);
       sessionUpdatesSocket.stop();

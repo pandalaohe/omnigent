@@ -40,6 +40,7 @@ import { useViewerId } from "@/hooks/useViewerId";
 import { isTerminalAccessPolicyName, type TerminalAccessRequest } from "@/lib/terminalAccess";
 import {
   CheckIcon,
+  ChevronRightIcon,
   ClipboardListIcon,
   ClockIcon,
   ExternalLinkIcon,
@@ -51,6 +52,7 @@ import {
 } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useDescendantSession } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
@@ -73,8 +75,10 @@ import type {
   ApprovalAnswerer,
   CodexPersistMode,
   ElicitationSource,
+  FileEditRequest,
   RememberScope,
 } from "@/lib/types";
+import { type FileEditDiff, getFileEditDiff } from "@/lib/toolEditDiff";
 import { cn } from "@/lib/utils";
 import { childPrimaryLabel } from "@/shell/subagentLabel";
 import { useChatStore } from "@/store/chatStore";
@@ -91,6 +95,8 @@ import {
   schemaFields,
 } from "./ElicitationSchemaForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
+import { FileEditDiffView } from "./FileEditBody";
+import { ToolValueView } from "./ToolValueView";
 
 const AUTO_RESOLVED_DETAIL =
   "This request was answered outside this view, for example in the " +
@@ -190,6 +196,35 @@ export interface SubagentRequester {
  * Names and links the sub-agent behind a mirrored prompt, so the card is not
  * read as a request from the session being viewed.
  */
+/** A gated edit as a diff, with its full arguments on demand. */
+function FileEditApproval({
+  diff,
+  toolInput,
+}: {
+  diff: FileEditDiff;
+  toolInput: Record<string, unknown>;
+}) {
+  return (
+    <div className="flex flex-col gap-2">
+      {diff.replacesAll && (
+        <p className="text-sm font-medium">
+          Replaces every occurrence of the matched text; the diff shows one.
+        </p>
+      )}
+      <FileEditDiffView diff={diff} />
+      <Collapsible className="group text-sm">
+        <CollapsibleTrigger className="flex cursor-pointer items-center gap-1 text-muted-foreground hover:text-foreground">
+          <ChevronRightIcon className="size-3 transition-transform group-data-[state=open]:rotate-90" />
+          Show request
+        </CollapsibleTrigger>
+        <CollapsibleContent className="pt-2">
+          <ToolValueView value={toolInput} />
+        </CollapsibleContent>
+      </Collapsible>
+    </div>
+  );
+}
+
 function SubagentRequesterLine({ sessionId, ancestorSessionId }: SubagentRequester) {
   const child = useDescendantSession(ancestorSessionId, sessionId);
   const search = sessionNavigationSearch(useLocation().search);
@@ -250,6 +285,8 @@ interface ApprovalCardProps {
    * plan-review actions. Optional/null for other elicitations.
    */
   exitPlanMode?: Record<string, unknown> | null;
+  /** The full file-edit tool call; when it describes a change, the card shows it as a diff. */
+  fileEdit?: FileEditRequest | null;
   /**
    * Structured Codex command approval details. When present, the
    * card renders command metadata instead of the raw JSON preview.
@@ -407,6 +444,7 @@ export function ApprovalCard({
   response,
   askUserQuestion,
   exitPlanMode,
+  fileEdit,
   codexCommand,
   allowAllEdits,
   interruptible,
@@ -588,13 +626,22 @@ export function ApprovalCard({
       ? message.trim() || "Agent has questions"
       : questionPromptTitle(policyName, phase, `${structuredQuestionAgentName} has questions`);
 
+  const fileEditDiff = useMemo(
+    () => (fileEdit ? getFileEditDiff(fileEdit.toolName, fileEdit.toolInput) : null),
+    [fileEdit],
+  );
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-
   // button mode (the buttons render the choices). Codex command
   // approvals get a dedicated command render below, so showing the
   // transport JSON would expose unrelated ids and duplicate details.
   const formattedPreview =
-    isAskUserQuestion || isExitPlanMode || isMultiChoice || isSchemaForm || isCodexCommandApproval
+    isAskUserQuestion ||
+    isExitPlanMode ||
+    isMultiChoice ||
+    isSchemaForm ||
+    isCodexCommandApproval ||
+    fileEditDiff !== null
       ? ""
       : formatPreview(contentPreview);
   const execPolicyAmendment =
@@ -852,6 +899,9 @@ export function ApprovalCard({
             <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
               {formattedPreview}
             </pre>
+          )}
+          {fileEditDiff && fileEdit && (
+            <FileEditApproval diff={fileEditDiff} toolInput={fileEdit.toolInput} />
           )}
           {unconfirmed && nativeDelivery.action && (
             <div className="flex flex-wrap gap-2">
@@ -1221,6 +1271,9 @@ export function ApprovalCard({
                 {formattedPreview}
               </pre>
             )}
+            {fileEditDiff && fileEdit && (
+              <FileEditApproval diff={fileEditDiff} toolInput={fileEdit.toolInput} />
+            )}
             {directoryScope}
             {isTerminalAccess ? (
               <TerminalAccessActions
@@ -1322,6 +1375,7 @@ export function ElicitationCard({
       response={item.response}
       askUserQuestion={item.askUserQuestion}
       exitPlanMode={item.exitPlanMode}
+      fileEdit={item.fileEdit}
       codexCommand={item.codexCommand}
       allowAllEdits={item.allowAllEdits}
       interruptible={item.interruptible}

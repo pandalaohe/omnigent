@@ -26,6 +26,7 @@ export function conversationHooksMock() {
     setConversationPinned: vi.fn(() => Promise.resolve({})),
     PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
     PIN_WRITE_MUTATION_KEY: ["pin-write"],
+    retryListFetch: () => false,
     useRenameConversation: () => ({ mutate: vi.fn() }),
     useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
     useArchiveConversation: () => ({ mutate: vi.fn() }),

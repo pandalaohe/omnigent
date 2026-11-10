@@ -21,6 +21,7 @@ import type {
   ApprovalAnswerer,
   CodexPersistMode,
   ElicitationSource,
+  FileEditRequest,
   RememberScope,
   Response,
 } from "./types";
@@ -705,6 +706,8 @@ export interface ElicitationBlock {
    * Optional/null for every other elicitation.
    */
   exitPlanMode?: Record<string, unknown> | null;
+  /** Claude-native file-edit prompts only: the full tool call, so the card can show a diff. */
+  fileEdit?: FileEditRequest | null;
   /**
    * Structured Codex command-approval payload. Present for
    * codex-native command approvals so the card can show command,

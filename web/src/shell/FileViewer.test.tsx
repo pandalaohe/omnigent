@@ -122,6 +122,8 @@ vi.mock("./CommentsPanel", () => ({
     comments,
     addressedComments,
     activeSelection,
+    addressCount,
+    addressFileCount,
   }: {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     onClickComment?: (comment: any) => void;
@@ -133,12 +135,16 @@ vi.mock("./CommentsPanel", () => ({
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     addressedComments?: any[];
     activeSelection?: { comment_id?: string; start_index?: number; end_index?: number } | null;
+    addressCount?: number;
+    addressFileCount?: number;
   }) => (
     <div
       data-testid="comments-panel"
       data-active-comment-id={activeSelection?.comment_id ?? ""}
       data-active-start={activeSelection?.start_index ?? ""}
       data-active-end={activeSelection?.end_index ?? ""}
+      data-address-count={addressCount}
+      data-address-file-count={addressFileCount}
     >
       {[...(comments ?? []), ...(addressedComments ?? [])].map((c: { id: string }) => (
         <button
@@ -1178,6 +1184,103 @@ describe("FileViewer addressed selection", () => {
     expect(mutate).toHaveBeenCalledWith({ comment_ids: ["c1"] });
     expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-comment-id", "c1");
   });
+});
+
+describe("FileViewer Address All", () => {
+  const otherDraft = { ...makeComment("c2"), path: "other.py" };
+  const otherSent = { ...makeComment("c3", "addressed"), path: "other.py" };
+  const sentHere = makeComment("c4", "addressed");
+
+  it.each([
+    ["the open file and others", [makeComment("c1"), sentHere], ["c1", "c2"], 2],
+    ["only other files", [sentHere], ["c2"], 1],
+  ])("sends drafts from %s in one message", (_label, fileComments, expectedIds, fileCount) => {
+    const mutate = vi.fn();
+    useOptionalCommentSenderMock.mockReturnValue({
+      mutate,
+      mutateAsync: vi.fn(),
+      isPending: false,
+    });
+    // The session-wide list may lag behind this file's list: c4 is still a draft there,
+    // the new draft c1 is missing, and the deleted draft c5 remains.
+    const staleSessionComments = [
+      ...fileComments.filter((c) => c.id !== "c1").map((c) => ({ ...c, status: "draft" as const })),
+      makeComment("c5"),
+      otherDraft,
+      otherSent,
+    ];
+    useCommentsMock.mockImplementation((_sessionId, path) =>
+      makeCommentsQuery(path ? fileComments : staleSessionComments),
+    );
+
+    renderViewer({ open: true, path: "file1.py" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
+
+    expect(mutate).toHaveBeenCalledTimes(1);
+    expect(mutate).toHaveBeenCalledWith({ comment_ids: expectedIds });
+    const panel = screen.getByTestId("comments-panel");
+    expect(panel).toHaveAttribute("data-address-count", String(expectedIds.length));
+    expect(panel).toHaveAttribute("data-address-file-count", String(fileCount));
+  });
+
+  it.each([
+    ["session", "loading", { data: undefined, isPending: true }],
+    ["session", "failed", { data: undefined, isError: true }],
+    ["file", "loading", { data: undefined, isPending: true }],
+    ["file", "failed", { data: undefined, isError: true }],
+  ] as const)("sends nothing until the %s list loads (%s)", (unavailableList, _state, query) => {
+    const mutate = vi.fn();
+    useOptionalCommentSenderMock.mockReturnValue({
+      mutate,
+      mutateAsync: vi.fn(),
+      isPending: false,
+    });
+    const unavailableQuery = query as unknown as ReturnType<typeof useComments>;
+    let loaded = false;
+    useCommentsMock.mockImplementation((_sessionId, path) => {
+      if (!loaded && (path ? "file" : "session") === unavailableList) return unavailableQuery;
+      return makeCommentsQuery(path ? [makeComment("c1")] : [makeComment("c1"), otherDraft]);
+    });
+
+    const { rerender } = renderViewer({ open: true, path: "file1.py" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
+
+    expect(mutate).not.toHaveBeenCalled();
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-address-count", "0");
+
+    loaded = true;
+    rerender(viewerTree({ open: true, path: "file1.py" }));
+    fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
+
+    expect(mutate).toHaveBeenCalledTimes(1);
+    expect(mutate).toHaveBeenCalledWith({ comment_ids: ["c1", "c2"] });
+  });
+
+  it.each(["session", "file"] as const)(
+    "keeps sending cached drafts when the %s list's refresh fails",
+    (failedList) => {
+      const mutate = vi.fn();
+      useOptionalCommentSenderMock.mockReturnValue({
+        mutate,
+        mutateAsync: vi.fn(),
+        isPending: false,
+      });
+      useCommentsMock.mockImplementation((_sessionId, path) => {
+        const data = path ? [makeComment("c1")] : [makeComment("c1"), otherDraft];
+        const isError = (path ? "file" : "session") === failedList;
+        return { data, isError } as unknown as ReturnType<typeof useComments>;
+      });
+
+      renderViewer({ open: true, path: "file1.py" });
+      fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+      fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
+
+      expect(mutate).toHaveBeenCalledWith({ comment_ids: ["c1", "c2"] });
+      expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-address-count", "2");
+    },
+  );
 });
 
 describe("FileViewer copy-link button", () => {

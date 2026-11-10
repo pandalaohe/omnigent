@@ -279,6 +279,7 @@ def register_elicitations_routes(
                 key: params[key]
                 for key in (
                     "native_delivery",
+                    "file_edit",
                     "permission_directories",
                     "terminal_access_owner",
                     "terminal_access_terminal_id",
