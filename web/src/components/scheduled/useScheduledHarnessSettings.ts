@@ -15,6 +15,7 @@ import {
   nativeCodingAgentForAvailableAgent,
 } from "@/lib/nativeCodingAgents";
 import {
+  AGY_NATIVE_FULL_PERMISSION_TIER,
   APPROVAL_SKIPPING_PERMISSION_MODES,
   CODEX_NATIVE_BYPASS_APPROVAL_OPTION,
   nativePermissionOptions,
@@ -33,6 +34,10 @@ const EMPTY_MODELS: NativeModelOption[] = [];
 /** Whether the server accepts automation modes that skip approval; older ones may reject them. */
 export function acceptsApprovalSkippingModes(info: ReturnType<typeof useServerInfo>): boolean {
   return info !== "loading" && info.scheduled_task_approval_skipping_modes === true;
+}
+
+export function isScheduledApprovalSkippingMode(mode: string): boolean {
+  return mode === AGY_NATIVE_FULL_PERMISSION_TIER || APPROVAL_SKIPPING_PERMISSION_MODES.has(mode);
 }
 
 /** Resolve choices for the automation's execution target without launching it. */
@@ -164,7 +169,7 @@ export function useScheduledHarnessSettings(
       ? [...permissions, CODEX_NATIVE_BYPASS_APPROVAL_OPTION]
       : permissions;
   const offeredPermissions = scheduledPermissions.filter(
-    (option) => approvalSkippingAccepted || !APPROVAL_SKIPPING_PERMISSION_MODES.has(option.value),
+    (option) => approvalSkippingAccepted || !isScheduledApprovalSkippingMode(option.value),
   );
   const speedOptions = harness
     ? sessionDefaultModeOptions(harness, "speed", models, model, "create", harnessCapabilities)

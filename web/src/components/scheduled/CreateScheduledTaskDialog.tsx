@@ -32,6 +32,7 @@ import { Label } from "@/components/scheduled/Label";
 import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
 import {
   acceptsApprovalSkippingModes,
+  isScheduledApprovalSkippingMode,
   useScheduledHarnessSettings,
 } from "./useScheduledHarnessSettings";
 import { reconcileSpeed } from "@/lib/speedTiers";
@@ -81,7 +82,6 @@ import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useSched
 import { partitionPickerEntries, selectableSessionAgents } from "@/lib/agentGrouping";
 import {
   AGY_NATIVE_FULL_PERMISSION_TIER,
-  APPROVAL_SKIPPING_PERMISSION_MODES,
   NEW_AUTOMATION_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
 import {
@@ -271,9 +271,7 @@ export function CreateScheduledTaskDialog({
   const approvalSkippingAccepted = acceptsApprovalSkippingModes(info);
   const editablePermissionMode = useCallback(
     (mode: string | null | undefined): string =>
-      mode && (approvalSkippingAccepted || !APPROVAL_SKIPPING_PERMISSION_MODES.has(mode))
-        ? mode
-        : "",
+      mode && (approvalSkippingAccepted || !isScheduledApprovalSkippingMode(mode)) ? mode : "",
     [approvalSkippingAccepted],
   );
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
@@ -875,7 +873,7 @@ export function CreateScheduledTaskDialog({
     else if (harnessName === "codex-native") mode = codexApprovalModeFromSession(sourceSettings);
     if (
       mode &&
-      (approvalSkippingAccepted || !APPROVAL_SKIPPING_PERMISSION_MODES.has(mode)) &&
+      (approvalSkippingAccepted || !isScheduledApprovalSkippingMode(mode)) &&
       harnessPermissions.some((option) => option.value === mode)
     ) {
       setPickedPermission(mode);

@@ -5493,6 +5493,7 @@ describe("automation harness settings", () => {
   it.each([
     ["codex-native", "Approve for me", ["Full Access", "Bypass approvals & sandbox"]],
     ["claude-native", "Auto", ["Bypass permissions", "Don't ask"]],
+    ["pi-native", "Plan", ["Full access"]],
   ])(
     "hides %s modes that skip approval from a server that refuses them",
     async (harness, kept, hidden) => {
@@ -5553,38 +5554,41 @@ describe("automation harness settings", () => {
   });
 
   it.each([
-    [false, { permissionMode: null }],
-    [true, {}],
+    ["skip", false],
+    ["full", false],
+    ["skip", true],
   ] as const)(
-    "on edit, keeps Antigravity's saved skip mode only if the server accepts it (%s)",
-    async (accepted, expected) => {
+    "on edit, keeps Antigravity's saved %s mode only if the server accepts it (%s)",
+    async (permissionMode, accepted) => {
       mockHarness("antigravity-native");
       render(
         <CapabilitiesProvider info={serverInfo(accepted)}>
           <CreateScheduledTaskDialog
             open
             onOpenChange={vi.fn()}
-            editingTask={scheduledTask({ agentId: "selected-agent", permissionMode: "skip" })}
+            editingTask={scheduledTask({ agentId: "selected-agent", permissionMode })}
           />
         </CapabilitiesProvider>,
       );
-      // Without the mode the picker has nothing to offer, so it is hidden.
       if (accepted) {
         expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Full access");
       } else {
-        expect(screen.queryByTestId("task-permission-trigger")).toBeNull();
+        const permission = screen.getByTestId("task-permission-trigger");
+        expect(permission).toHaveTextContent("Default");
+        fireEvent.keyDown(permission, { key: "Enter" });
+        expect(await screen.findByRole("option", { name: "Plan" })).toBeVisible();
+        expect(screen.queryByRole("option", { name: "Full access" })).not.toBeInTheDocument();
+        fireEvent.click(screen.getByRole("option", { name: "Default", exact: true }));
       }
       fireEvent.change(screen.getByLabelText("Instructions"), {
         target: { value: "Review again" },
       });
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-      expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
-        prompt: "Review again",
-        ...expected,
-      });
-      if (accepted)
-        expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("permissionMode");
+      const { input } = updateMutateAsync.mock.calls[0][0];
+      expect(input.prompt).toBe("Review again");
+      if (accepted) expect(input).not.toHaveProperty("permissionMode");
+      else expect(input.permissionMode).toBeNull();
     },
   );
 
