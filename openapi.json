@@ -8534,6 +8534,11 @@
             "title": "Agent Install",
             "type": "boolean"
           },
+          "api_keys_available": {
+            "default": false,
+            "title": "Api Keys Available",
+            "type": "boolean"
+          },
           "archive_worktree_cleanup": {
             "default": true,
             "title": "Archive Worktree Cleanup",

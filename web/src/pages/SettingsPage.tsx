@@ -352,6 +352,7 @@ import {
   writeBackgroundSessionTitlesEnabled,
 } from "@/lib/backgroundSessionTitlesPreferences";
 import { SettingsAgentsSection } from "./settings/SettingsAgentsSection";
+import { ApiKeysSettings } from "@/components/ApiKeysSettings";
 import { ConnectedAppsSettings } from "@/components/ConnectedAppsSettings";
 
 // Admin-only management surfaces, rendered as the Members / Policies / Global
@@ -483,6 +484,9 @@ export function SettingsPage() {
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "import" && <ImportSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
+      {section === "api-keys" && info !== "loading" && info.api_keys_available && (
+        <ApiKeysSettings />
+      )}
       {section === "cli" && isElectronShell() && <LocalCliSection />}
       {section === "updates" && isElectronShell() && <UpdatesSection />}
     </PageScroll>

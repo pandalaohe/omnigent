@@ -1,0 +1,12 @@
+{
+  "title": "API keys",
+  "description": "Integrations use an API key to act as you on this server, limited to the permissions you choose. A key is shown only once, when it is created or regenerated.",
+  "newKey": "New API key",
+  "all": "All permissions — includes permissions added later",
+  "usage": "Usage",
+  "tasks": "Task board",
+  "reveal": "Copy this key now. It will not be shown again.",
+  "regenerateWarning": "The old key stops working immediately. Update every integration using it.",
+  "deleteWarning": "This key stops working immediately. Integrations using it will lose access.",
+  "readOnlyHelp": "Create a key here, switch the integration, then remove the old server entry."
+}

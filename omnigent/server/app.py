@@ -259,6 +259,7 @@ class FilesystemAttachmentsInfo(BaseModel):
 class ServerInfoResponse(BaseModel):
     accounts_enabled: bool
     browser_annotations_available: bool = False
+    api_keys_available: bool = False
     connected_apps_available: bool = False
     single_user: bool
     login_url: str | None
@@ -1851,6 +1852,7 @@ def create_app(
         raise ValueError("auth_provider is required when permission_store is provided")
     annotation_enabled = False
     annotation_storage_supported = False
+    api_keys_enabled = False
     connected_apps_enabled = False
 
     # Public base path for serving behind a subpath reverse proxy (issue
@@ -4156,6 +4158,7 @@ def create_app(
                 "accounts_enabled": accounts_enabled,
                 "browser_annotations_available": annotation_enabled
                 and annotation_storage_supported,
+                "api_keys_available": api_keys_enabled,
                 "connected_apps_available": connected_apps_enabled,
                 "single_user": single_user,
                 "login_url": login_url,
@@ -6409,6 +6412,18 @@ def create_app(
                 return account.account_generation if account is not None else None
 
             auth_provider.set_usage_read_account_lookup(usage_read_account_lookup)
+            from omnigent.server.api_key_store import UserApiKeyStore
+            from omnigent.server.routes.api_keys import create_api_keys_router
+
+            api_key_store = UserApiKeyStore(account_store.storage_location)
+            auth_provider.set_api_key_store(api_key_store.resolve, api_key_store.touch)
+            auth_provider.set_api_key_usage_check(
+                lambda user: api_key_store.has_usage_key(user, int(time.time()))
+            )
+            app.include_router(
+                create_api_keys_router(auth_provider, api_key_store), tags=["api-keys"]
+            )
+            api_keys_enabled = True
             app.add_middleware(AccountAuthenticationMiddleware, auth_provider=auth_provider)
             app.include_router(
                 create_accounts_auth_router(

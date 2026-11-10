@@ -517,6 +517,31 @@ class SqlConnection(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
+class SqlUserApiKey(OmnigentBase):
+    """Personal API credentials, storing only a digest and display prefix."""
+
+    __tablename__ = "user_api_keys"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, server_default="0", default=current_workspace_id
+    )
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    prefix: Mapped[str] = mapped_column(String(16), nullable=False)
+    secret_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    scopes: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_used_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    regenerated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        Index("ix_user_api_keys_digest", "workspace_id", "secret_sha256", unique=True),
+        Index("ix_user_api_keys_name", "workspace_id", "user_id", "name", unique=True),
+        Index("ix_user_api_keys_owner", "workspace_id", "user_id"),
+    )
+
+
 class SqlDeviceGrant(OmnigentBase):
     """
     SQLAlchemy model for the ``device_grants`` table.
