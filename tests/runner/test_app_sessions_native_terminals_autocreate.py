@@ -328,6 +328,7 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
     ],
 )
 @pytest.mark.parametrize("permission_tier", ["full", "ask"])
+@pytest.mark.parametrize("has_parent", [False, True])
 async def test_auto_create_pi_terminal_launches_required_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -335,6 +336,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     expected_env_unset: list[str],
     permission_tier: str,
     instruction_spec: str,
+    has_parent: bool,
 ) -> None:
     """Launch a required terminal with session-local authored instructions.
 
@@ -370,6 +372,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     # config pointing at the tmp workspace.
     async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
         return _PiNativeLaunchConfig(
+            parent_session_id="parent" if has_parent else None,
             workspace=tmp_path,
             server_url="http://127.0.0.1:8000",
             terminal_launch_args=["--append-system-prompt", "User addition"],
@@ -485,6 +488,9 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     config = json.loads(
         Path(captured["spec"].env[pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR]).read_text()
     )
+    assert config.get("startupInstructions", "").count(
+        child_session_question_instruction(False)
+    ) == int(has_parent)
     tool_names = {tool["name"] for tool in config["tools"]}
     assert {"list_comments", "sys_session_list"} <= tool_names
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
@@ -2597,7 +2603,9 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("peer_messaging_enabled", [False, True], ids=["peers-off", "peers-on"])
 @pytest.mark.parametrize("parent_session_id", [None, "conv_mother"], ids=["top-level", "child"])
+@pytest.mark.parametrize("use_envelope", [False, True])
 async def test_auto_create_claude_terminal_child_question_policy(
+    use_envelope: bool,
     parent_session_id: str | None,
     peer_messaging_enabled: bool,
     tmp_path: Path,
@@ -2645,7 +2653,7 @@ async def test_auto_create_claude_terminal_child_question_policy(
             )
 
     def _handle_request(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"labels": {}})
+        return httpx.Response(200, json={"labels": {}, "parent_session_id": parent_session_id})
 
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
@@ -2677,7 +2685,7 @@ async def test_auto_create_claude_terminal_child_question_policy(
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=fake_client,
-        session_init=session_init,
+        session_init=session_init if use_envelope else None,
     )
 
     args = captured["spec"].args

@@ -3771,7 +3771,9 @@ async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("has_parent", [False, True])
 async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
+    has_parent: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3825,9 +3827,20 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     async def _recording_relay(session_id_arg: str, **kwargs: Any) -> None:
         relay_calls.append({"session_id": session_id_arg, **kwargs})
 
+    from omnigent.native.native_bridge_common import (
+        read_agent_instructions_preamble,
+        write_agent_instructions_preamble,
+    )
+
+    stale_bridge = bridge_mod.prepare_bridge_dir(session_id)
+    write_agent_instructions_preamble(stale_bridge, "STALE-STARTUP")
+
     captured_spec: dict[str, Any] = {}
 
-    snapshot = {"workspace": str(tmp_path / "workspace")}
+    snapshot = {
+        "workspace": str(tmp_path / "workspace"),
+        "parent_session_id": "parent" if has_parent else None,
+    }
 
     class _SnapshotServerClient:
         async def get(self, url: str, **_kwargs: Any) -> httpx.Response:
@@ -3867,12 +3880,16 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
             lambda _sid, _event: None,
             server_client=cast(httpx.AsyncClient, _SnapshotServerClient()),
             ensure_comment_relay=_recording_relay,
+            agent_spec=AgentSpec(spec_version=1, instructions="AG author", spawn=True),
         )
         await asyncio.sleep(0)
     finally:
         await runner_app_mod._cancel_auto_forwarder_task(session_id)
 
     bridge_dir = bridge_mod.bridge_dir_for_bridge_id(session_id)
+    text = (bridge_mod.agy_gemini_dir(bridge_dir) / "AGENTS.md").read_text()
+    assert text.count(child_session_question_instruction(False)) == int(has_parent)
+    assert read_agent_instructions_preamble(bridge_dir) is None
     iso_home = bridge_mod.agy_home_dir(bridge_dir)
     iso_gemini = bridge_mod.agy_gemini_dir(bridge_dir)
 

@@ -794,8 +794,10 @@ async def test_launch_and_record_uses_server_tier_for_headless_launch(
     assert (bridge_dir / "permission_tier").read_text() == "auto\n"
 
 
+@pytest.mark.parametrize("has_parent", [False, True])
+@pytest.mark.parametrize("peer", [False, True])
 async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    has_parent: bool, peer: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The CLI launch scopes agy to a per-session Gemini dir, like the runner path.
 
@@ -821,12 +823,27 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
 
     monkeypatch.setattr(_mod, "_fetch_global_instructions", _global_text)
 
+    from omnigent.native.native_bridge_common import (
+        read_agent_instructions_preamble,
+        write_agent_instructions_preamble,
+    )
+
+    stale_bridge = bridge_mod.prepare_bridge_dir("bridge_gemini_dir_test")
+    write_agent_instructions_preamble(stale_bridge, "STALE-STARTUP")
+
     captured_args: list[str] = []
     captured_env: dict[str, str] = {}
 
     def _capture_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/instruction-layers/preview":
+            return httpx.Response(200, json={"route": {"peer": peer}})
         if request.method == "GET":
-            return httpx.Response(200, json=_confirmed_permission_snapshot("ask"))
+            return httpx.Response(
+                200,
+                json=_confirmed_permission_snapshot(
+                    "ask", parent_session_id="parent" if has_parent else None
+                ),
+            )
         body = json.loads(request.content)
         captured_args.extend(body["spec"]["args"])
         captured_env.update(body["spec"]["env"])
@@ -846,10 +863,21 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
         )
 
     bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_gemini_dir_test")
+    assert read_agent_instructions_preamble(bridge_dir) is None
     iso_gemini = bridge_mod.agy_gemini_dir(bridge_dir)
     assert fetched["session_id"] == "conv_abc123"
     assert not (iso_gemini / "AGENTS.md").is_symlink()
-    assert (iso_gemini / "AGENTS.md").read_text() == "USER-RULES\n\nGLOBAL-MARKER"
+    text = (iso_gemini / "AGENTS.md").read_text()
+    assert text.startswith("USER-RULES\n\n")
+    from omnigent.runtime.prompt import (
+        SUBAGENT_WAKE_NOTICE_INSTRUCTION,
+        child_session_question_instruction,
+    )
+
+    assert "GLOBAL-MARKER" in text
+    assert text.count(child_session_question_instruction(peer)) == int(has_parent)
+    assert (SUBAGENT_WAKE_NOTICE_INSTRUCTION in text) == (not has_parent)
+    assert "Antigravity (agy) is running" in text
     assert (real_home / ".gemini" / "AGENTS.md").read_text() == "USER-RULES"
     # The flag leads the args so it is never swallowed by a later positional.
     assert captured_args[0] == f"--gemini_dir={iso_gemini}"

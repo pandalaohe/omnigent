@@ -70,6 +70,7 @@ def _init_body(
     workspace: str | None = None,
     worktree: str | None = None,
     peer_messaging_enabled: bool = False,
+    parent_session_id: str | None = None,
     project_code: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Session-init POST body carrying *global_instructions* in the snapshot."""
@@ -81,6 +82,7 @@ def _init_body(
         "labels": {},
         "global_instructions": global_instructions,
         "peer_messaging_enabled": peer_messaging_enabled,
+        "parent_session_id": parent_session_id,
     }
     if project_code is not None:
         snapshot["project_code"] = project_code
@@ -107,6 +109,7 @@ async def _init_session(
     workspace: str | None = None,
     worktree: str | None = None,
     peer_messaging_enabled: bool = False,
+    parent_session_id: str | None = None,
     project_code: list[dict[str, Any]] | None = None,
 ) -> None:
     init = await client.post(
@@ -118,6 +121,7 @@ async def _init_session(
             workspace=workspace,
             worktree=worktree,
             peer_messaging_enabled=peer_messaging_enabled,
+            parent_session_id=parent_session_id,
             project_code=project_code,
         ),
     )
@@ -424,3 +428,24 @@ async def test_first_init_without_project_code_keeps_it_absent_on_reinit() -> No
 
     assert "This project's code on this host:" not in composed
     assert composed.endswith("GLOBAL-MARKER")
+
+
+@pytest.mark.parametrize("has_parent", [False, True])
+async def test_sdk_turn_keeps_parent_state_after_init(has_parent):
+    from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_INSTRUCTION
+
+    async def resolver(agent_id, session_id=None):
+        return AgentSpec(spec_version=1, name="worker", spawn=True)
+
+    app, harness_client = _build_turn_app(resolver=resolver)
+    session_id, agent_id = _ids()
+    async with _runner_client(app) as client:
+        await _init_session(
+            client,
+            session_id,
+            agent_id,
+            "Global",
+            parent_session_id="parent" if has_parent else None,
+        )
+        composed = await _turn_instructions(client, harness_client, session_id)
+    assert (SUBAGENT_WAKE_NOTICE_INSTRUCTION in composed) == (not has_parent)
