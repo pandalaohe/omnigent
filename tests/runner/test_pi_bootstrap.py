@@ -998,7 +998,7 @@ async def test_runner_adapter_uses_minted_execution_kind_and_tcp_rejects_parent_
 
 
 @pytest.mark.asyncio
-async def test_continuity_ends_on_launch_rebind_with_same_process_and_tier(attestor_relay):
+async def test_continuity_ends_on_launch_rebind_with_same_process_and_tier(attestor_relay, caplog):
     runtime, broker, relay, _source, _registry = attestor_relay
     actor, admission = await bind_ready(runtime, broker, relay)
     revision = runtime.state("session-a").revision
@@ -1015,6 +1015,9 @@ async def test_continuity_ends_on_launch_rebind_with_same_process_and_tier(attes
             with pytest.raises(StopAsyncIteration):
                 await asyncio.wait_for(anext(lines), 3)
     assert actor.closed
+    assert "Pi bootstrap watch ended: stage=continuity exception=ValueError" in caplog.text
+    assert actor.token not in caplog.text
+    assert admission.credential not in caplog.text
     assert runtime.state("session-a").revision == revision
     with pytest.raises(ValueError):
         broker.authenticate("Bearer " + actor.token)

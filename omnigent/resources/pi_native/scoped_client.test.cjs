@@ -51,6 +51,44 @@ test("untrusted endpoint postures fail before connection",async()=>{
  for(const endpoint of ["http://0.0.0.0:9000","http://example.test:9000","https://127.0.0.1:9000","http://127.0.0.1:9000/?next=remote"])
   await assert.rejects(connectAttestor({endpoint,credential:"fixture",brokerIncarnation:"epoch",launchEpoch:"launch"}));
 });
+test("a sealed client records its first cause once and gives recovery guidance",async()=>{
+ const f=fixture();f.lose();f.client.seal();
+ const verdict=await f.client.evaluate(event,{},support);
+ assert.equal(verdict.block,true);
+ assert.match(verdict.reason,/transport_lost.*Restart the Pi session/);
+ assert.deepEqual(f.diagnostics.filter(r=>r.event==="client_sealed"),[{event:"client_sealed",cause:"transport_lost"}]);
+ assert.equal(f.diagnostics.at(-1).cause,"transport_lost");
+});
+test("state refusal and changed support are distinguishable without logging their values",async()=>{
+ const state={status:"blocked",revision:3,private:receipt},f=fixture({state});
+ assert.equal((await f.client.evaluate(event,{},support)).block,true);
+ assert.equal(f.diagnostics.at(-1).cause,"state_not_ready");
+ state.status="ready";
+ await f.client.evaluate(event,{}, {status:"different",private:receipt});
+ assert.equal((await f.client.execute(event,{},()=>f.start())).isError,true);
+ assert.deepEqual(f.diagnostics.at(-1),{event:"client_sealed",cause:"support_changed"});
+ assert.equal(f.starts(),0);
+ assert.equal(JSON.stringify(f.diagnostics).includes(receipt),false);
+});
+test("continuity EOF records its cause before later denials and never logs a private frame",async t=>{
+ const http=require("node:http"),records=[];let stream;
+ const server=http.createServer((req,res)=>{
+  req.resume();stream=res;res.writeHead(200);
+  res.write(JSON.stringify({incarnation:"epoch",launch_epoch:"launch",live:true,revoked_scopes:[],private:receipt})+"\n");
+ });
+ await new Promise(resolve=>server.listen(0,"127.0.0.1",resolve));
+ t.after(()=>{server.closeAllConnections();server.close();});
+ const connection=await connectAttestor({endpoint:`http://127.0.0.1:${server.address().port}`,
+  credential:receipt,brokerIncarnation:"epoch",launchEpoch:"launch",report:r=>records.push(r)});
+ t.after(()=>connection.close());
+ const client=connection.client({scope,credential:receipt},receipt,()=>({status:"ready",revision:3}),async()=>support);
+ stream.end();
+ for(let i=0;i<100&&!records.some(r=>r.event==="continuity_lost");i++)await new Promise(resolve=>setTimeout(resolve,10));
+ assert.equal((await client.evaluate(event,{},support)).block,true);
+ assert.deepEqual(records.filter(r=>r.event==="continuity_lost"),[{event:"continuity_lost",cause:"watch_end"}]);
+ assert.equal(records.at(-1).cause,"transport_lost");
+ assert.equal(JSON.stringify(records).includes(receipt),false);
+});
 test("denial diagnostics distinguish state, attestation, policy and binding without private values",async()=>{
  for(const [options,branch,stage] of [
   [{state:{status:"blocked",revision:3}},"not_current","initial"],
@@ -59,12 +97,13 @@ test("denial diagnostics distinguish state, attestation, policy and binding with
   [{override:{evaluate:async()=>({result:"POLICY_ACTION_ALLOW",permission_tier_binding:{pi_origin_receipt:receipt}})}},"invalid_binding","policy"],
  ]) {
   const f=fixture(options);
-  assert.deepEqual(await f.client.evaluate(event,{},support),{block:true,reason:"Scoped Pi authority is unavailable"});
+  const verdict=await f.client.evaluate(event,{},support);
+  assert.equal(verdict.block,true);assert.match(verdict.reason,/^Scoped Pi authority is unavailable/);
   const [record]=f.diagnostics;
   assert.equal(record.branch,branch);assert.equal(record.stage,stage);
   assert.ok(record.elapsed_ms>=0);
   assert.equal(JSON.stringify(record).includes(receipt),false);
-  assert.deepEqual(Object.keys(record).sort(),["branch","elapsed_ms","event","stage"]);
+  assert.deepEqual(Object.keys(record).sort(),branch==="not_current"?["branch","cause","elapsed_ms","event","stage"]:["branch","elapsed_ms","event","stage"]);
   assert.equal(f.starts(),0);
  }
 });
