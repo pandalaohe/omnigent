@@ -4220,25 +4220,18 @@ function waitForBrowserContentsDestroyed(contents) {
   });
 }
 
-/** Enforce the agent network policy on documents, subresources, and workers. */
-function guardAgentPartitionRequests(partition, registry) {
+/** Enforce document-navigation policy; extensions still observe other requests. */
+function guardAgentPartitionRequests(partition) {
   const ses = session.fromPartition(partition);
   if (guardedAgentSessions.has(ses)) return;
   guardedAgentSessions.add(ses);
   const filter = { urls: ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"] };
-  const registriesFor = (details) => {
-    const owner = registryForAgentWebContents(details.webContentsId);
-    if (owner) return [owner];
-    const owners = [...windows.values()]
-      .map((state) => state.browserRegistry)
-      .filter((candidate) => candidate?.ownsPartition?.(partition));
-    return [...new Set(owners.length ? owners : registry ? [registry] : [])];
-  };
+  const isDocument = (details) =>
+    ["mainFrame", "subFrame", "object"].includes(details.resourceType);
   const cancelledBy = async (details, method) => {
-    const owners = registriesFor(details);
-    if (!owners.length) return true;
-    const results = await Promise.all(owners.map((owner) => owner[method](details, partition)));
-    return results.some(Boolean);
+    if (!isDocument(details)) return false;
+    const owner = registryForAgentWebContents(details.webContentsId);
+    return owner ? owner[method](details, partition) : true;
   };
   const answer = (decision, callback) =>
     decision.then(
@@ -4260,9 +4253,9 @@ function guardAgentPartitionRequests(partition, registry) {
     );
   }
   ses.webRequest.onBeforeSendHeaders(filter, (details, callback) => {
-    const guarded = registriesFor(details)
-      .map((owner) => owner.agentRequestHeaders(details, partition))
-      .find((result) => result.requestHeaders);
+    const guarded = isDocument(details)
+      ? registryForAgentWebContents(details.webContentsId)?.agentRequestHeaders(details, partition)
+      : null;
     callback(guarded ?? {});
   });
   ses.webRequest.onHeadersReceived(filter, (details, callback) =>

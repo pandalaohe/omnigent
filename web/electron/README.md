@@ -677,15 +677,13 @@ including the address bar, chat links, and agent actions, enforces this policy.
   any literal form, except loopback names for eligible views. A
   hostname is resolved through the view's Chromium session and refused if it
   does not resolve or any address is non-public. `main.js` also applies the
-  policy to every HTTP(S) and WebSocket request of a policy-enforced view through
-  `webRequest`, including frames, `<object>`/`<embed>`, scripts, styles, images,
-  media, and fetch/XHR. Worker network requests use the owning view's policy;
-  requests without a registered view use the most restrictive owner in the
-  partition, or public-only access if no owners remain. A never-navigated blank
-  tab makes sibling service-worker requests public-only until it navigates
-  with an eligible context. Every guarded request to a named host resolves DNS
-  through its partition before sending, including GET/HEAD subresources and
-  WebSockets. IP literals use the URL check without DNS. Loopback names
+  policy to document requests of a policy-enforced view through `webRequest`:
+  `mainFrame`, `subFrame`, and `object` (`<object>`/`<embed>`). Scripts, styles,
+  images, media, fetch/XHR, WebSockets and worker traffic remain outside that
+  cancellation boundary. Extension request events are relayed independently
+  of navigation cancellation. Every guarded document request to a named host
+  resolves DNS through its view's partition before sending. IP literals use
+  the URL check without DNS. Loopback names
   (`localhost`, `127.0.0.1`, `[::1]`, and `*.localhost`) remain available to
   eligible Arca and this-machine sessions without DNS. A `*.localhost` request
   is cancelled before sending unless the partition's proxy lookup returns
@@ -697,14 +695,7 @@ including the address bar, chat links, and agent actions, enforces this policy.
   a response whose address is missing
   or non-public (a DNS answer that changed after the check) is cancelled,
   unless that address belongs to a configured proxy. Skipping cache reads adds
-  network round trips and may increase latency and bandwidth. WebSocket upgrades
-  can omit the connected IP; those repeat the partition DNS check at the 101
-  response. This is not connected-IP verification and cannot rule out a DNS
-  change between check and connection. An IP-less `*.localhost` upgrade
-  repeats the direct-route check instead, because Chromium pins those names to
-  loopback and only a proxy could route them elsewhere. The route lookup uses
-  the WebSocket's own `ws:`/`wss:` URL, because Chromium can pick a different
-  proxy for it (an `https=` rule) than for plain HTTP. Limits: a DNS
+  network round trips and may increase latency and bandwidth. Limits: a DNS
   change between preflight and connection can still send a request to a private
   address; the HTTP response check prevents the page from reading its response.
   Pages restored from the back-forward cache and navigations answered by a service worker make no

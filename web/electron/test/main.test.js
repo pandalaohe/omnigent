@@ -2700,6 +2700,10 @@ describe("browser permission wiring", () => {
       registry.openOrNavigate("browser-tab:conv:t1", "https://example.com/");
       assert.equal(partitions[0], partitions[1], "a session's tabs share one partition");
       const ses = sessions.get(partitions[0]);
+      const relayed = [];
+      h.api.browserExtensions.set(partitions[0], {
+        relayWebRequest: (event, details) => relayed.push([event, details.resourceType]),
+      });
       assert.deepEqual(
         // main.js runs in its own vm realm, so copy its arrays before deepEqual.
         ses.installs.map(([kind, filter]) => [kind, [...filter.urls], filter.types]),
@@ -2708,7 +2712,7 @@ describe("browser permission wiring", () => {
           ["sendHeaders", ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"], undefined],
           ["headers", ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"], undefined],
         ],
-        "installed once per partition, with every resource type reaching each network hook",
+        "installed once per partition; request relay coverage is independent from cancellation",
       );
       // Round-trip through JSON so objects from main.js's vm realm compare.
       const decide = (kind, details, session = ses, view = agent) =>
@@ -2731,25 +2735,44 @@ describe("browser permission wiring", () => {
       const worker = { webContentsId: 0, resourceType: "script" };
       assert.deepEqual(
         await decide("request", { ...worker, url: "http://169.254.169.254/worker.js" }),
-        { cancel: true },
-        "a worker without a view ID is guarded using its partition",
+        { cancel: false },
+        "worker traffic is outside the document-navigation gate",
       );
-      assert.deepEqual(await decide("sendHeaders", { ...worker, url: next, requestHeaders: {} }), {
-        requestHeaders: { "Cache-Control": "no-cache" },
-      });
+      assert.deepEqual(
+        await decide("sendHeaders", { ...worker, url: next, requestHeaders: {} }),
+        {},
+      );
       assert.deepEqual(await decide("headers", { ...worker, url: next, ip: "127.0.0.1" }), {
-        cancel: true,
+        cancel: false,
       });
       assert.deepEqual(await decide("request", { url: next, resourceType: "xhr" }), {
         cancel: false,
       });
-      assert.deepEqual(ses.lookups, ["example.com"], "subresources resolve DNS before sending");
+      assert.deepEqual(ses.lookups, [], "subresources do not enter document policy resolution");
+      for (const resourceType of ["xhr", "script", "image", "stylesheet", "webSocket"]) {
+        const details = { url: "http://127.0.0.1/helper", resourceType, ip: "127.0.0.1" };
+        // oxlint-disable-next-line no-await-in-loop -- Keep the request and its relay assertions together.
+        const decisions = await Promise.all([
+          decide("request", details),
+          decide("headers", details),
+          decide("sendHeaders", { ...details, requestHeaders: {} }),
+        ]);
+        assert.deepEqual(decisions, [{ cancel: false }, { cancel: false }, {}], resourceType);
+        assert.ok(
+          relayed.some(([event, type]) => event === "onBeforeRequest" && type === resourceType),
+        );
+      }
+      assert.deepEqual(
+        ses.lookups,
+        [],
+        "extension request relay does not add a cancellation boundary",
+      );
       ses.lookups.length = 0;
       assert.deepEqual(
         await decide("request", { url: "ws://lvh.me/live", resourceType: "webSocket" }),
-        { cancel: true },
+        { cancel: false },
       );
-      assert.deepEqual(ses.lookups, ["lvh.me"], "WebSocket handshakes resolve DNS first");
+      assert.deepEqual(ses.lookups, [], "WebSocket handshakes remain outside the document gate");
       ses.lookups.length = 0;
       ses.resolveProxy = async () => {
         throw new Error("proxy lookup failed");

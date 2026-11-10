@@ -733,6 +733,25 @@ function makeNetworkGuardRegistry({ proxy = "DIRECT", ...extra } = {}) {
 }
 
 describe("browserViewRegistry — network-layer agent guard (DNS + connected address)", () => {
+  it("does not apply a tab policy to unowned worker requests", async () => {
+    const { registry, lookups } = makeNetworkGuardRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    const partition = agentPartition("w-test", "conv_1");
+    const request = {
+      webContentsId: 0,
+      url: "http://lvh.me/worker.js",
+      resourceType: "script",
+      ip: "127.0.0.1",
+    };
+    assert.equal(await registry.shouldCancelAgentRequest(request, partition), false);
+    assert.equal(await registry.shouldCancelAgentResponse(request, partition), false);
+    assert.deepEqual(
+      registry.agentRequestHeaders({ ...request, requestHeaders: {} }, partition),
+      {},
+    );
+    assert.deepEqual(lookups, []);
+  });
+
   it("keeps an address-based localhost allowance through every navigation guard", async () => {
     const { registry, idOf } = makeNetworkGuardRegistry({
       resolveHost: async () => ["127.0.0.1"],
@@ -806,80 +825,7 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     );
   });
 
-  for (const shared of [false, true]) {
-    it(`allows local view reads and requires every owner for ${shared ? "shared" : "isolated"} workers`, async () => {
-      const { registry, idOf, lookups } = makeNetworkGuardRegistry({
-        allowsLocalhost: (context) => context?.hostIsThisMachine === true,
-        ...(shared ? { partitionForView: () => "shared-browser" } : {}),
-      });
-      registry.openOrNavigate("local", "https://example.com/", undefined, {
-        agent: true,
-        agentContext: { hostIsThisMachine: true },
-      });
-      registry.openOrNavigate("remote", "https://example.com/", undefined, { agent: true });
-      const partition = shared ? "shared-browser" : agentPartition("w-test", "local");
-      await Promise.all(
-        ["localhost", "127.0.0.1", "[::1]"].flatMap((host) =>
-          ["xhr", "script", "image", "webSocket"].map(async (resourceType) => {
-            const url = `${resourceType === "webSocket" ? "ws" : "http"}://${host}:5173/x`;
-            const ip = host === "[::1]" ? "::1" : "127.0.0.1";
-            const local = { webContentsId: idOf("local"), resourceType, url, ip };
-            const label = `${resourceType} ${url}`;
-            assert.equal(
-              await registry.shouldCancelAgentRequest(local),
-              false,
-              `${label}: local request`,
-            );
-            assert.equal(
-              await registry.shouldCancelAgentResponse(local),
-              false,
-              `${label}: local response`,
-            );
-            const worker = { ...local, webContentsId: undefined };
-            assert.equal(
-              await registry.shouldCancelAgentRequest(worker, partition),
-              shared,
-              `${label}: worker request`,
-            );
-            assert.equal(
-              await registry.shouldCancelAgentResponse(worker, partition),
-              shared,
-              `${label}: worker response`,
-            );
-            const remote = { ...local, webContentsId: idOf("remote") };
-            assert.equal(
-              await registry.shouldCancelAgentRequest(remote),
-              true,
-              `${label}: remote request`,
-            );
-            assert.equal(
-              await registry.shouldCancelAgentResponse(remote),
-              true,
-              `${label}: remote response`,
-            );
-          }),
-        ),
-      );
-      await Promise.all(
-        ["192.168.1.1", "169.254.169.254"].map(async (ip) => {
-          const request = {
-            webContentsId: idOf("local"),
-            url: `http://${ip}/x`,
-            resourceType: "xhr",
-            ip,
-          };
-          assert.equal(await registry.shouldCancelAgentRequest(request), true);
-          assert.equal(await registry.shouldCancelAgentResponse(request), true);
-          const worker = { ...request, webContentsId: undefined };
-          assert.equal(await registry.shouldCancelAgentRequest(worker, partition), true);
-          assert.equal(await registry.shouldCancelAgentResponse(worker, partition), true);
-        }),
-      );
-      assert.deepEqual(lookups, [], "eligible subresources add no DNS lookups");
-    });
-  }
-
-  it("revokes loopback requests and worker access before the blank page commits", async () => {
+  it("revokes loopback document access before the blank page commits", async () => {
     const { registry, idOf } = makeNetworkGuardRegistry({
       allowsLocalhost: (context) => context?.hostIsThisMachine === true,
     });
@@ -902,8 +848,8 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     const partition = agentPartition("w-test", "local");
     try {
       await Promise.all(
-        [idOf("local"), undefined].flatMap((webContentsId) =>
-          ["xhr", "webSocket"].map(async (resourceType) => {
+        [idOf("local")].flatMap((webContentsId) =>
+          ["mainFrame", "subFrame", "object"].map(async (resourceType) => {
             const request = {
               webContentsId,
               resourceType,
@@ -964,23 +910,14 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     assert.equal(blocked[0].payload.conversationId, "conv_1");
   });
 
-  it("guards all subresource types with DNS and connected-IP rules", async () => {
+  it("guards covered document types with DNS and connected-IP rules", async () => {
     const { registry, lookups, idOf } = makeNetworkGuardRegistry();
     const entry = registry.openOrNavigate("conv_1", "https://example.com/", undefined, {
       agent: true,
     }).entry;
     entry.view.webContents.close = () => assert.fail("network enforcement must keep the view");
     const webContentsId = idOf("conv_1");
-    const resourceTypes = [
-      "xhr",
-      "script",
-      "image",
-      "stylesheet",
-      "font",
-      "media",
-      "ping",
-      "other",
-    ];
+    const resourceTypes = ["mainFrame", "subFrame", "object"];
     const request = { webContentsId, url: "https://example.com/x.js", resourceType: "xhr" };
     await Promise.all(
       resourceTypes.map(async (resourceType) => {
@@ -1021,89 +958,27 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
         hostname: "example.com",
         partition: agentPartition("w-test", "conv_1"),
       })),
-      "named subresources resolve through their owning partition; IP literals skip DNS",
+      "named documents resolve through their owning partition; IP literals skip DNS",
     );
     assert.equal(registry.get("conv_1"), entry);
   });
 
-  it("attributes worker requests to the strictest partition owner and guards orphaned workers", async () => {
-    const context = { sourceHostId: "arca-host" };
-    const { registry, lookups } = makeNetworkGuardRegistry({
-      allowsLocalhost: (ctx) => ctx === context,
-    });
-    const partition = agentPartition("w-test", "conv_1");
-    const local = {
-      webContentsId: 0,
-      url: "http://localhost:5173/worker.js",
-      resourceType: "script",
-      ip: "127.0.0.1",
-    };
-    const publicRequest = { ...local, url: "https://example.com/worker.js", ip: "93.184.215.14" };
-    const open = (id, agentContext) =>
-      registry.openOrNavigate(id, "https://example.com/", undefined, { agent: true, agentContext });
-    open("conv_1", context);
-    assert.equal(await registry.shouldCancelAgentRequest(local, partition), false);
-    assert.equal(await registry.shouldCancelAgentResponse(local, partition), false);
-    registry.openOrNavigate("browser-tab:conv_1:t1", null);
-    assert.equal(
-      await registry.shouldCancelAgentRequest(local, partition),
-      true,
-      "a never-navigated tab is public-only",
-    );
-    open("browser-tab:conv_1:t1", context);
-    assert.equal(
-      await registry.shouldCancelAgentRequest(local, partition),
-      false,
-      "eligible navigation grants worker loopback access",
-    );
-    open("browser-tab:conv_1:t1", null);
-    // Dedicated, shared, and service workers may report zero or no view ID.
-    await Promise.all(
-      [0, undefined, 999].map(async (webContentsId) => {
-        const request = { ...local, webContentsId };
-        assert.equal(await registry.shouldCancelAgentRequest(request, partition), true);
-        assert.equal(await registry.shouldCancelAgentResponse(request, partition), true);
-        assert.deepEqual(
-          registry.agentRequestHeaders({ ...request, requestHeaders: {} }, partition),
-          { requestHeaders: { "Cache-Control": "no-cache" } },
-        );
-      }),
-    );
-    assert.equal(await registry.shouldCancelAgentRequest(publicRequest, partition), false);
-    assert.equal(await registry.shouldCancelAgentResponse(publicRequest, partition), false);
-    const differentPartition = agentPartition("w-test", "different");
-    assert.equal(
-      await registry.shouldCancelAgentRequest(local, differentPartition),
-      true,
-      "another partition cannot borrow loopback access",
-    );
-    registry.closeAll();
-    assert.equal(await registry.shouldCancelAgentRequest(local, partition), true);
-    assert.equal(await registry.shouldCancelAgentResponse(local, partition), true);
-    assert.equal(await registry.shouldCancelAgentRequest(publicRequest, partition), false);
-    assert.equal(await registry.shouldCancelAgentResponse(publicRequest, partition), false);
-    assert.deepEqual(lookups, [
-      { hostname: "example.com", partition },
-      { hostname: "example.com", partition },
-    ]);
-  });
-
-  it("preflights every method and WebSocket to private-resolving names in the owning partition", async () => {
+  it("preflights document methods to private-resolving names in the owning partition", async () => {
     const { registry, lookups, idOf } = makeNetworkGuardRegistry();
     registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
     const aliases = ["lvh.me", "localtest.me", "127.0.0.1.nip.io", "169-254-169-254.nip.io"];
     const methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
     const requests = [
-      ...methods.map((method) => ({ hostname: "localtest.me", method, resourceType: "xhr" })),
+      ...methods.map((method) => ({ hostname: "localtest.me", method, resourceType: "mainFrame" })),
       ...aliases
         .filter((hostname) => hostname !== "localtest.me")
         .map((hostname) => ({
           hostname,
           method: "GET",
-          resourceType: "xhr",
+          resourceType: "mainFrame",
         })),
-      { hostname: "localtest.me", method: "POST", resourceType: "ping" },
-      { hostname: "lvh.me", method: "GET", resourceType: "webSocket" },
+      { hostname: "localtest.me", method: "POST", resourceType: "object" },
+      { hostname: "lvh.me", method: "GET", resourceType: "subFrame" },
     ];
     await Promise.all(
       requests.map(async ({ hostname, method, resourceType }) => {
@@ -1130,21 +1005,11 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
         webContentsId: idOf("conv_1"),
         url: "https://example.com/post",
         method: "POST",
-        resourceType: "xhr",
+        resourceType: "mainFrame",
       }),
       false,
       "public unsafe methods remain available",
     );
-    const worker = { url: "http://localtest.me/post", method: "POST", resourceType: "xhr" };
-    assert.equal(
-      await registry.shouldCancelAgentRequest(worker, agentPartition("w-test", "conv_1")),
-      true,
-      "worker POST uses its partition resolver",
-    );
-    assert.deepEqual(lookups.at(-1), {
-      hostname: "localtest.me",
-      partition: agentPartition("w-test", "conv_1"),
-    });
   });
 
   it("rechecks DNS for WebSocket upgrades without an IP while missing HTTP endpoints fail closed", async () => {
@@ -1269,20 +1134,14 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
       ip: "10.0.0.2",
     };
     assert.equal(await registry.shouldCancelAgentResponse(socket, partition), false);
-    assert.equal(
-      await registry.shouldCancelAgentResponse({ ...socket, webContentsId: 0 }, partition),
-      false,
-      "an unattributed worker resolves its proxy in the owning partition",
-    );
     assert.deepEqual(proxyLookups, [
       { url: "http://rebind.example/", partition },
       { url: "http://rebind.example/", partition },
       { url: "https://rebind.example/live", partition },
-      { url: "https://rebind.example/live", partition },
     ]);
     assert.deepEqual(
       lookups,
-      Array.from({ length: 4 }, () => ({ hostname: "proxy.corp", partition })),
+      Array.from({ length: 3 }, () => ({ hostname: "proxy.corp", partition })),
     );
   });
 
@@ -1375,7 +1234,6 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     // WebSockets are looked up by their own scheme, which picks their proxy.
     assert.deepEqual(directLookups, [
       "http://spog.dev.localhost:5173/",
-      "http://spog.dev.localhost:5173/",
       "ws://spog.dev.localhost:5173/hmr",
       "ws://spog.dev.localhost:5173/hmr",
     ]);
@@ -1396,7 +1254,7 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
       await verdictsOn(direct, "remote"),
       {
         request: true,
-        workerRequest: true,
+        workerRequest: false,
         socketRequest: true,
         upgrade: true,
         exactLocalhost: true,
@@ -1417,7 +1275,7 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     // Exact localhost keeps its existing request-stage behaviour.
     const refused = {
       request: true,
-      workerRequest: true,
+      workerRequest: false,
       socketRequest: true,
       upgrade: true,
       exactLocalhost: false,
@@ -1469,17 +1327,6 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     assert.equal(await registry.shouldCancelAgentRequest(stray), false);
     assert.equal(await registry.shouldCancelAgentResponse(stray), false);
     assert.deepEqual(lookups, []);
-  });
-
-  it("guards unattributed requests with a partition even when its direct owner is unenforced", async () => {
-    const { registry, lookups, idOf } = makeNetworkGuardRegistry();
-    registry.openOrNavigate("conv_1", "http://intranet.example/", undefined, { force: true });
-    const partition = agentPartition("w-test", "conv_1");
-    const request = { webContentsId: 999, url: "http://lvh.me:8899/", ip: "127.0.0.1" };
-    assert.notEqual(request.webContentsId, idOf("conv_1"));
-    assert.equal(await registry.shouldCancelAgentRequest(request, partition), true);
-    assert.equal(await registry.shouldCancelAgentResponse(request, partition), true);
-    assert.deepEqual(lookups, [{ hostname: "lvh.me", partition }]);
   });
 
   it("keeps the Arca loopback exception for exact hosts but not DNS aliases", async () => {

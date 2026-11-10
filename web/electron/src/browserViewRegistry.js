@@ -577,21 +577,7 @@ function createBrowserViewRegistry({
           }
         : null;
     }
-    if (!partition) return null;
-    // Workers may lack a registered view. Every partition owner must grant
-    // loopback; orphaned workers and partitions with blank tabs are public-only.
-    const owners = [...entries.values()].filter((owner) => owner.partition === partition);
-    return {
-      checks: owners.length
-        ? owners.map((owner) => agentNavPolicyOptions(owner.agentContext))
-        : [agentNavPolicyOptions(null)],
-      allowLocalhost:
-        owners.length > 0 &&
-        owners.every(
-          (owner) => owner.navigationPolicyEnforced && allowsLocalhost(owner.agentContext),
-        ),
-      partition,
-    };
+    return null;
   }
 
   function hostnameOf(url) {
@@ -922,8 +908,6 @@ function createBrowserViewRegistry({
     agentRequestHeaders,
     shouldCancelAgentResponse,
     ownsWebContents,
-    ownsPartition: (partition) =>
-      [...entries.values()].some((entry) => entry.partition === partition),
     setActive,
     setSuppressed,
     cancelRecentSessionSwitch,
