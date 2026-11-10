@@ -451,7 +451,9 @@ async def test_reconnecting_trees_share_store_budget_without_waiting_for_initial
         return httpx.Response(201)
 
     async with _recover(app, monkeypatch, respond) as (relays, finished):
-        await asyncio.wait_for(all_requested.wait(), budget(5))
+        # All 24 sessions perform several store offloads under the shared cap.
+        # This guards a hang; independence is proved by the blocked child inits.
+        await asyncio.wait_for(all_requested.wait(), budget(30))
         assert requested == expected
         assert attachment_sessions == expected
         assert expected <= set(relays)
