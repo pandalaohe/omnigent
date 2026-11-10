@@ -447,7 +447,7 @@ function registerBrowserIpc({
         return { error: "Session host changed; the previous browser page is no longer available" };
       }
     }
-    return { entry };
+    return { entry, registry: gated.registry };
   }
 
   // Open (create-if-absent) or navigate a conversation's view, and measure it
@@ -688,7 +688,7 @@ function registerBrowserIpc({
       return {
         ok: false,
         error: e && e.message ? e.message : String(e),
-        noSurface: g.registry.activeConversationId() !== conversationId,
+        noSurface: g.registry.activeConversationId() !== args.conversationId,
       };
     }
   });

@@ -1141,7 +1141,9 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     ]);
     assert.deepEqual(
       lookups,
-      Array.from({ length: 3 }, () => ({ hostname: "proxy.corp", partition })),
+      ["proxy.corp", "proxy.corp", "rebind.example", "proxy.corp", "rebind.example"].map(
+        (hostname) => ({ hostname, partition }),
+      ),
     );
   });
 

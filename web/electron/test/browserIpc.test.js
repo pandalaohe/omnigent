@@ -1786,7 +1786,15 @@ describe("browser IPC sessions on this machine", () => {
     let liveEnrollment = live;
     const webContents = makeWebContents();
     webContents.loadURL = () => {};
-    webContents.capturePage = async () => ({ toPNG: () => Buffer.from("fixture") });
+    const frame = {
+      executeJavaScript: async () => ({ identity: "doc", counter: "0", showing: false }),
+    };
+    frame.framesInSubtree = [frame];
+    webContents.mainFrame = frame;
+    webContents.capturePage = async () => ({
+      isEmpty: () => false,
+      toPNG: () => Buffer.from("fixture"),
+    });
     const registry = createBrowserViewRegistry({
       WebContentsViewCtor: () => ({ webContents, setBounds() {} }),
       createBoundsController: createBrowserViewBoundsController,
@@ -1865,7 +1873,7 @@ describe("browser IPC sessions on this machine", () => {
         };
         webContents.capturePage = async () => {
           reads++;
-          return { toPNG: () => Buffer.from("fixture") };
+          return { isEmpty: () => false, toPNG: () => Buffer.from("fixture") };
         };
         webContents.executeJavaScript = async () => {
           reads++;
