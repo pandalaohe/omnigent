@@ -169,7 +169,7 @@ vi.mock("@/shell/NewChatDialog", () => ({
       data-curated-entries={curatedEntries?.map((agent) => agent.name).join(",")}
       data-sandbox-selected={String(sandboxSelected)}
     >
-      <span>{hasAgents ? agentLabel : "No agents"}</span>
+      <span data-testid="agent-picker-label">{hasAgents ? agentLabel : "No agents"}</span>
       {harnessEntries
         .filter((agent) => agent.name !== "claude-native-ui")
         .map((agent) => (
@@ -1613,6 +1613,13 @@ describe("CreateScheduledTaskDialog saved Agents", () => {
     expect(screen.queryByTestId("task-agent-members")).not.toBeInTheDocument();
   });
 
+  it("renders the selected saved Agent by name on create", () => {
+    mockCustomAgents(CUSTOM_AGENTS);
+    renderDialog();
+    fireEvent.click(screen.getByTestId("pick-ca_release_crew"));
+    expect(screen.getByTestId("agent-picker-label")).toHaveTextContent("Release crew");
+  });
+
   it("renders an edited task's saved Agent by name", () => {
     mockCustomAgents(CUSTOM_AGENTS);
     render(
@@ -1624,7 +1631,7 @@ describe("CreateScheduledTaskDialog saved Agents", () => {
     );
     const picker = screen.getByTestId("agent-picker-stub");
     expect(picker).toHaveAttribute("data-effective", "ca_release_crew");
-    expect(picker).toHaveTextContent("Release crew");
+    expect(screen.getByTestId("agent-picker-label")).toHaveTextContent("Release crew");
     expect(screen.getByTestId("task-agent-members")).toHaveTextContent("architect (Lead)");
   });
 

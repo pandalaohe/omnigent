@@ -307,7 +307,9 @@ export function CreateScheduledTaskDialog({
   // The session's own agent, prefilled as the pick, even when the picker hides it.
   else if (fromSession?.agentId && pickedAgentId === fromSession.agentId)
     effectiveAgentId = fromSession.agentId;
-  const selectedAgent = agents?.find((agent) => agent.id === effectiveAgentId);
+  const selectedAgent =
+    agentList.find((agent) => agent.id === effectiveAgentId) ??
+    agents?.find((agent) => agent.id === effectiveAgentId);
   let agentLabel = "Select agent";
   if (selectedAgent) agentLabel = selectedAgent.display_name;
   else if (fromSession) agentLabel = fromSession.agentName ?? fromSession.agentId ?? agentLabel;
@@ -688,7 +690,7 @@ export function CreateScheduledTaskDialog({
     open && workerSettings !== null,
   );
   const harnessSettings = useScheduledHarnessSettings(
-    selectedAgent ?? agents?.find((agent) => agent.id === effectiveAgentId),
+    agents?.find((agent) => agent.id === effectiveAgentId),
     selectedHost,
     sandboxMode,
     pickedModel,
