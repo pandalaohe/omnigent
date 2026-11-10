@@ -77,6 +77,7 @@ export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } =
     >
       <Segmented
         label="Switch between chat and terminal"
+        quiet
         fitHeight
         options={[
           {

@@ -1,3 +1,4 @@
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -46,7 +47,9 @@ function mountChip(sessionId = "parent-1", readOnly = false) {
   clients.push(client);
   const view = render(
     <QueryClientProvider client={client}>
-      <AutoRotationChip sessionId={sessionId} readOnly={readOnly} />
+      <TooltipProvider delayDuration={0}>
+        <AutoRotationChip sessionId={sessionId} readOnly={readOnly} />
+      </TooltipProvider>
     </QueryClientProvider>,
   );
   return {
@@ -54,7 +57,9 @@ function mountChip(sessionId = "parent-1", readOnly = false) {
     rerenderChip: (nextSessionId: string, nextReadOnly = readOnly) =>
       view.rerender(
         <QueryClientProvider client={client}>
-          <AutoRotationChip sessionId={nextSessionId} readOnly={nextReadOnly} />
+          <TooltipProvider delayDuration={0}>
+            <AutoRotationChip sessionId={nextSessionId} readOnly={nextReadOnly} />
+          </TooltipProvider>
         </QueryClientProvider>,
       ),
   };
@@ -74,6 +79,15 @@ afterEach(() => {
 });
 
 describe("AutoRotationChip", () => {
+  it("shows only the value and names the setting on hover", async () => {
+    mountChip();
+    const trigger = await screen.findByRole("button", { name: "Auto-rotation: Off" });
+    expect(trigger).toHaveTextContent(/^Off$/);
+    fireEvent.pointerMove(trigger, { pointerType: "mouse" });
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Auto-rotation: Off");
+    fireEvent.click(trigger);
+    expect(screen.getByRole("combobox", { name: "Auto-rotation" })).toBeVisible();
+  });
   it("renders nothing when the session is ineligible", async () => {
     fetchMock.mockResolvedValueOnce({
       ok: true,

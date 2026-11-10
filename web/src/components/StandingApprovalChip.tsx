@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ShieldCheckIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { changeStandingApproval, getStandingApproval } from "@/lib/standingApprovalApi";
 
 const kindLabel = (kind: string) =>
@@ -58,17 +59,21 @@ export function StandingApprovalChip({
         : "none";
   return (
     <Popover>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          aria-label={`Standing approval: ${summary}`}
-          className="flex h-7 shrink-0 items-center gap-1 rounded-full border border-border bg-background px-2 text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          <ShieldCheckIcon className="size-3.5" />
-          <span className="hidden sm:inline">Approval</span>
-          <span>{record ? record.kinds.length : "…"}</span>
-        </button>
-      </PopoverTrigger>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <PopoverTrigger asChild>
+            <button
+              type="button"
+              aria-label={`Standing approval: ${summary}`}
+              className="flex h-7 shrink-0 items-center gap-1 rounded-full border border-border bg-background px-2 text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <ShieldCheckIcon className="size-3.5" aria-hidden="true" />
+              <span>{record ? record.kinds.length : "…"}</span>
+            </button>
+          </PopoverTrigger>
+        </TooltipTrigger>
+        <TooltipContent>Standing approval: {summary}</TooltipContent>
+      </Tooltip>
       <PopoverContent align="end" className="w-80 max-w-[calc(100vw-1rem)] p-4">
         <h2 className="font-medium">Standing approval</h2>
         <p className="text-xs text-muted-foreground">

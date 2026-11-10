@@ -143,16 +143,6 @@ describe("ViewModeToggle", () => {
     expect(terminalSegment()).toHaveAttribute("tabindex", "-1");
   });
 
-  it("uses the neutral primary pair and readable unselected text", () => {
-    renderToggle(makeCtx({ view: "chat" }));
-    expect(
-      screen.getByRole("radiogroup", { name: /switch between chat and terminal/i }),
-    ).toHaveClass("bg-muted");
-    expect(chatSegment()).toHaveClass("bg-primary-cta", "text-primary-cta-foreground");
-    expect(terminalSegment()).toHaveClass("text-foreground/90");
-    expect(terminalSegment()).not.toHaveClass("bg-primary-cta", "text-muted-foreground");
-  });
-
   it("checks only the active segment in the terminal view", () => {
     renderToggle(makeCtx({ view: "terminal" }));
     expect(terminalSegment()).toHaveAttribute("aria-checked", "true");
