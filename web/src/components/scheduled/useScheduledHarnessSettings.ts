@@ -145,9 +145,10 @@ export function useScheduledHarnessSettings(
     harness === "claude-native" ||
     (info !== "loading" && info.scheduled_task_harness_settings === true);
   const approvalSkippingAccepted = acceptsApprovalSkippingModes(info);
-  const permissionHandler = harness
-    ? sessionModeHandler(harness, "permission", harnessCapabilities)
-    : null;
+  const permissionHandler =
+    supportsHarnessPermissions && harness
+      ? sessionModeHandler(harness, "permission", harnessCapabilities)
+      : null;
   const permissions =
     harness && permissionHandler
       ? sessionDefaultModeOptions(

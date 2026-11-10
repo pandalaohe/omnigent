@@ -5407,6 +5407,24 @@ describe("scheduler capabilities", () => {
 });
 
 describe("automation harness settings", () => {
+  const codexPermissionCatalog: ReturnType<typeof useHarnessCapabilities> = {
+    "codex-native": {
+      session_modes: {
+        permission: {
+          handler: "codex-approval-preset",
+          options: [
+            {
+              value: "full-access",
+              label: "Full Access",
+              concept: "full-access",
+              contexts: ["create"],
+            },
+          ],
+        },
+        speed: null,
+      },
+    },
+  };
   const models = [
     {
       id: "model-a",
@@ -5460,24 +5478,7 @@ describe("automation harness settings", () => {
     async (label, mode, declaredCatalog) => {
       mockHarness("codex-native");
       if (declaredCatalog) {
-        vi.mocked(useHarnessCapabilities).mockReturnValue({
-          "codex-native": {
-            session_modes: {
-              permission: {
-                handler: "codex-approval-preset",
-                options: [
-                  {
-                    value: "full-access",
-                    label: "Full Access",
-                    concept: "full-access",
-                    contexts: ["create"],
-                  },
-                ],
-              },
-              speed: null,
-            },
-          },
-        });
+        vi.mocked(useHarnessCapabilities).mockReturnValue(codexPermissionCatalog);
       }
       render(
         <CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialName="R" initialPrompt="P" />,
@@ -5978,15 +5979,24 @@ describe("automation harness settings", () => {
   });
 
   it.each([
-    ["codex-native", false],
-    ["claude-native", true],
+    ["codex-native", false, false],
+    ["codex-native", false, true],
+    ["claude-native", true, false],
   ] as const)(
-    "preserves older-server permission support for %s",
-    (harness, supportsPermissions) => {
+    "preserves older-server permission support for %s (%s, declared catalog: %s)",
+    async (harness, supportsPermissions, declaredCatalog) => {
       mockHarness(harness);
+      if (declaredCatalog) {
+        vi.mocked(useHarnessCapabilities).mockReturnValue(codexPermissionCatalog);
+      }
       render(
         <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
-          <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            initialName="R"
+            initialPrompt="P"
+          />
         </CapabilitiesProvider>,
       );
       expect(screen.getByTestId("task-model-trigger")).toBeVisible();
@@ -5994,6 +6004,9 @@ describe("automation harness settings", () => {
         expect(screen.getByTestId("task-permission-trigger")).toBeVisible();
       } else {
         expect(screen.queryByTestId("task-permission-trigger")).not.toBeInTheDocument();
+        fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+        await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+        expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("permissionMode");
       }
     },
   );
