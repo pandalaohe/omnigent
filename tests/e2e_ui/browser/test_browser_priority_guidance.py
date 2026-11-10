@@ -73,13 +73,10 @@ _NATIVE_TURN_TIMEOUT_MS = 240_000
 # defaults to its own web tooling instead of the embedded browser.
 _NEUTRAL_BROWSE_ASK = "Look at https://example.com and tell me the exact text of its main heading."
 
-# What the fix must inject: composed instructions that steer the
-# model toward the Omnigent embedded browser. Matched loosely (any of the
-# browser tool names, or the embedded/Omnigent browser named in prose) so a
-# reasonably-worded fix passes without pinning its exact phrasing.
+# Require an actual preference, not merely a browser tool name: guidance
+# restricting these tools to explicit pane requests must not pass.
 _BROWSER_GUIDANCE_RE = re.compile(
-    r"browser_navigate|browser_snapshot|browser_click|browser_type|"
-    r"browser_screenshot|embedded browser|omnigent browser",
+    r"prefer these embedded-browser tools over your own web tooling",
     re.IGNORECASE,
 )
 
