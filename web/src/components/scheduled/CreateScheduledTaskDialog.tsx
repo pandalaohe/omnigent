@@ -266,7 +266,7 @@ export function CreateScheduledTaskDialog({
   // one gives way to it unless it is the edited task's agent or the current pick
   // (a late catalog must not swap the pick); a kept row hides its library twin.
   const agentList = useMemo(() => {
-    const libraryAgents = customAgents ?? [];
+    const libraryAgents = startsFromSession ? [] : (customAgents ?? []);
     const liveTemplateIds = new Set(libraryAgents.map((agent) => agent.id));
     const sourceAgents = (agents ?? []).filter(
       (agent) =>
@@ -289,7 +289,14 @@ export function CreateScheduledTaskDialog({
       ],
       curation.restrictToAgentNames,
     );
-  }, [agents, customAgents, editingTask?.agentId, pickedAgentId, curation.restrictToAgentNames]);
+  }, [
+    agents,
+    customAgents,
+    editingTask?.agentId,
+    pickedAgentId,
+    startsFromSession,
+    curation.restrictToAgentNames,
+  ]);
   const { harnesses: harnessEntries, agents: agentEntries } = useMemo(
     () => partitionPickerEntries(agentList),
     [agentList],
@@ -839,6 +846,7 @@ export function CreateScheduledTaskDialog({
   // pick beside an already-selected sandbox blocks submit until a host is chosen.
   const libraryAgentSelected = effectiveAgentId?.startsWith("ca_") ?? false;
   const sandboxAgentConflict = sandboxMode && libraryAgentSelected;
+  const sourceAgentConflict = startsFromSession && libraryAgentSelected;
   // Metadata edits can preserve an expired schedule; rescheduling requires a future cutoff.
   const allowPastEnd =
     savedSchedule !== null &&
@@ -925,6 +933,7 @@ export function CreateScheduledTaskDialog({
     (isEdit || sandboxMode || hostId !== "") &&
     !workspaceWithoutHost &&
     !sandboxAgentConflict &&
+    !sourceAgentConflict &&
     !scheduleInvalid &&
     !pollingBlockedReason &&
     !(workerSettings !== null && workerHarnessSettings.blockedReason) &&
@@ -1459,6 +1468,14 @@ export function CreateScheduledTaskDialog({
                           triggerLabelClassName="min-w-0 max-w-none text-ui [&>span]:text-ui [&>span]:font-normal [&>span]:text-inherit"
                         />
                       </div>
+                      {startsFromSession && (
+                        <p
+                          className="text-sm text-muted-foreground"
+                          data-testid="task-agent-history-note"
+                        >
+                          Saved Agents can't start from a session's history. Choose a session agent.
+                        </p>
+                      )}
                       {customAgentMembers && (
                         <p
                           className="text-sm text-muted-foreground"

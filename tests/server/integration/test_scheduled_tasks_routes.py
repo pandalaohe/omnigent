@@ -3705,6 +3705,54 @@ async def test_a_task_that_starts_from_a_session_can_switch_agents_but_not_conti
     assert cleared.json()["source_session_id"] == created["source_session_id"]
 
 
+async def test_history_sources_reject_saved_agents_but_ordinary_saved_agent_tasks_work(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from tests.server.helpers import build_agent_bundle
+
+    saved = await auth_client.post(
+        "/v1/custom-agents",
+        headers=_headers(),
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                build_agent_bundle(
+                    "history-library",
+                    executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+                ),
+            )
+        },
+    )
+    assert saved.status_code == 201, saved.text
+    library_id = saved.json()["id"]
+    ordinary = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(agent_id=library_id, workspace=None),
+        headers=_headers(),
+    )
+    assert ordinary.status_code == 200, ordinary.text
+    source_id = _session_with_history(db_uri)
+    rejected = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(agent_id=library_id, source_session_id=source_id, workspace=None),
+        headers=_headers(),
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert "require a session agent" in rejected.text
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(source_session_id=source_id, workspace=None),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    url = f"/v1/scheduled-tasks/{created.json()['id']}"
+    changed = await auth_client.patch(url, json={"agent_id": library_id}, headers=_headers())
+    assert changed.status_code == 400, changed.text
+    assert "require a session agent" in changed.text
+    unchanged = await auth_client.get(url, headers=_headers())
+    assert unchanged.json()["agent_id"] == created.json()["agent_id"]
+
+
 async def test_the_copy_carries_history_for_its_own_agent_not_the_tasks(
     auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -5869,6 +5869,51 @@ describe("creating an automation from a session", () => {
     expect(screen.queryByTestId("task-session-mode-field")).toBeNull();
   });
 
+  it.each(["create", "edit"] as const)(
+    "hides saved Agents with the reason on a history-source %s form",
+    (operation) => {
+      mockCustomAgents(CUSTOM_AGENTS);
+      renderFromSession({
+        source: operation === "create" ? SOURCE : null,
+        editingTask:
+          operation === "edit"
+            ? scheduledTask({
+                agentId: "ag_claude_native",
+                sourceSessionId: "conv_copy",
+                hostId: "host_1",
+              })
+            : null,
+      });
+
+      expect(screen.queryByTestId("pick-ca_release_crew")).not.toBeInTheDocument();
+      expect(screen.getByTestId("task-agent-history-note")).toHaveTextContent(
+        "Saved Agents can't start from a session's history.",
+      );
+      expect(screen.getByTestId("pick-agent-polly")).toBeEnabled();
+    },
+  );
+
+  it("blocks an existing saved-Agent history combination until a session agent is picked", async () => {
+    mockCustomAgents(CUSTOM_AGENTS);
+    renderFromSession({
+      source: null,
+      editingTask: scheduledTask({
+        agentId: "ca_release_crew",
+        sourceSessionId: "conv_copy",
+        hostId: "host_1",
+      }),
+    });
+    const saveButton = screen.getByTestId("create-scheduled-task-submit");
+    expect(saveButton).toBeDisabled();
+    expect(screen.getByTestId("task-agent-history-note")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("pick-harness-claude"));
+    expect(saveButton).toBeEnabled();
+    fireEvent.click(saveButton);
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.agentId).toBe("ag_claude_native");
+  });
+
   it("saves the session as the source, allows empty instructions, and runs where the session ran", async () => {
     const onCreated = vi.fn();
     renderFromSession({ onCreated });
