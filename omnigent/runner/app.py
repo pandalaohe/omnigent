@@ -2649,6 +2649,30 @@ def create_runner_app(
                     "input_id": result.receipt.input_id,
                     "input_generation": result.receipt.input_generation,
                 }
+        if result.state == "refused":
+            deadline_remaining_s = (
+                frame.claim.admission_deadline - time.time()
+                if frame.claim.admission_deadline is not None
+                else None
+            )
+            _logger.warning(
+                "Input admission decision for %s input_id=%s: state=%s reason=%s "
+                "deadline_remaining_s=%s",
+                session_id,
+                frame.claim.input_id,
+                result.state,
+                result.reason,
+                deadline_remaining_s,
+                extra=debug_event(
+                    "input_execution_admission_refused",
+                    session_id=session_id,
+                    stage="input_admission",
+                    input_id=frame.claim.input_id,
+                    state=result.state,
+                    reason=result.reason,
+                    deadline_remaining_s=deadline_remaining_s,
+                ),
+            )
         reply = await harness_client.post(
             f"/v1/sessions/{session_id}/events",
             json={
