@@ -15752,6 +15752,17 @@ async def test_sys_session_create_refused_from_a_child_session() -> None:
     The refusal is structural and runs before any create POST: a child that
     needs workers uses its harness's own sub-agents, or asks its parent.
     """
+    from omnigent.runtime.prompt import (
+        SUBAGENT_WAKE_NOTICE_INSTRUCTION,
+        native_startup_instructions,
+    )
+    from omnigent.spec import AgentSpec
+
+    instructions = native_startup_instructions(
+        AgentSpec(spec_version=1, spawn=True), has_parent=True
+    )
+    assert instructions is not None
+    assert SUBAGENT_WAKE_NOTICE_INSTRUCTION not in instructions
     from omnigent.runner.tool_dispatch import execute_tool
 
     posts: list[str] = []

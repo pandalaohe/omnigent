@@ -1183,6 +1183,8 @@ async def test_decide_permission_offers_the_agents_own_scopes() -> None:
             "Yes, always allow `ls` commands in all projects",
             "Reject",
         ],
+        "Allow",
+        False,
     )
 
 

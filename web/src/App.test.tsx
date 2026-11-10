@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { Link, Outlet, MemoryRouter, useNavigate } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { RoutingProvider, basenamedRouting, reactRouterRouting } from "@/lib/routing";
@@ -273,6 +273,10 @@ describe("Usage board routes", () => {
 });
 
 describe("Task board route", () => {
+  beforeAll(async () => {
+    await import("@/pages/taskBoard/TaskBoardRoute");
+  });
+
   it("keeps a hard-loaded link registered while deployment info is loading", () => {
     renderRoute("/task-board", {}, "loading");
     expect(screen.queryByText("not found")).toBeNull();

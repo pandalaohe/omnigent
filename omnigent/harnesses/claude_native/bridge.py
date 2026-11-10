@@ -9550,8 +9550,12 @@ def _tool_relay_handler_factory(
             future = asyncio.run_coroutine_threadsafe(_bootstrap_request(authorization), loop)
             try:
                 frame = future.result(timeout=5.0)
-            except Exception:  # noqa: BLE001 - fixed failure before any private frame
+            except Exception as exc:  # noqa: BLE001 - no private frame or exception text
                 future.cancel()
+                _logger.warning(
+                    "Pi bootstrap watch ended: stage=authentication exception=%s",
+                    type(exc).__name__,
+                )
                 self.send_error(HTTPStatus.FORBIDDEN)
                 return
             self.send_response(HTTPStatus.OK)
@@ -9560,16 +9564,23 @@ def _tool_relay_handler_factory(
             self.end_headers()
             self.connection.settimeout(2.0)
             while True:
+                stage = "write"
                 try:
                     self.wfile.write(json.dumps(frame).encode() + b"\n")
                     self.wfile.flush()
                     time.sleep(0.1)
+                    stage = "continuity"
                     future = asyncio.run_coroutine_threadsafe(
                         _bootstrap_request(authorization), loop
                     )
                     frame = future.result(timeout=2.0)
-                except Exception:  # noqa: BLE001 - EOF/error seals the private client
+                except Exception as exc:  # noqa: BLE001 - EOF/error seals the private client
                     future.cancel()
+                    _logger.warning(
+                        "Pi bootstrap watch ended: stage=%s exception=%s",
+                        stage,
+                        type(exc).__name__,
+                    )
                     return
 
         def _handle_bootstrap(self, *, launcher: bool = False) -> None:

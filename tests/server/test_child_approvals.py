@@ -586,6 +586,215 @@ async def test_sdk_wait_receives_parent_verdict_and_cancellation(tree, label, de
     assert set(verdicts[0].meta) == {"omnigent_answered_by"}
 
 
+@pytest.mark.parametrize(
+    "command,allow_once,schema,expected",
+    [
+        ("echo ready", "Allow", True, "answer"),
+        ("rm -rf /etc", "Allow", True, "note_only"),
+        (None, "Allow", True, "note_only"),
+        ("echo ready", None, True, "note_only"),
+        ("echo ready", "not offered", True, "note_only"),
+        ("echo ready", "Allow", False, "note_only"),
+    ],
+)
+def test_acp_parent_approval_requires_inspectable_action_and_once_scope(
+    command, allow_once, schema, expected
+):
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(
+        executor_factory=lambda: None, harness_label="ag", startup_source="acp"
+    )
+    params = adapter._permission_card(
+        "Run a command",
+        {"command": command},
+        requested_schema={
+            "type": "object",
+            "properties": {
+                "answer": {"type": "string", "enum": ["Allow Always", "Allow", "Deny"]}
+            },
+            "required": ["answer"],
+        }
+        if schema
+        else None,
+    ).model_dump()
+    params["acp_allow_once"] = allow_once
+    assert approvals.classify_card(params) == expected
+    if schema:
+        params["requestedSchema"]["required"].append("unrelated_question")
+        assert approvals.classify_card(params) is None
+
+
+@pytest.mark.parametrize("decision", ["approve", "decline", "pass_to_user"])
+@pytest.mark.parametrize("child", [True, False])
+async def test_acp_permission_offers_parent_once_or_preserves_user_choices(tree, decision, child):
+    from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(
+        executor_factory=lambda: None, harness_label="ag", startup_source="acp"
+    )
+    executor = AcpExecutor(AcpAgentConfig(command="unused"))
+    executor._elicitation_choice_handler = adapter._stable_elicitation_choice_handler
+    seen = []
+    session_id = tree.child_id if child else tree.root_id
+
+    async def elicit(eid, params):
+        seen.append(eid)
+        return await orchestration._publish_and_wait_for_harness_elicitation(
+            None,
+            session_id=session_id,
+            params=params,
+            timeout_s=5,
+            conversation_store=tree.store,
+            elicitation_id=eid,
+        )
+
+    adapter._current_ctx = SimpleNamespace(elicit=elicit, cancelled=asyncio.Event())
+    task = asyncio.create_task(
+        executor._decide_permission(
+            {
+                "toolCall": {
+                    "title": "Write-Output 'ready'",
+                    "rawInput": {"command": "echo ready"},
+                },
+                "options": [
+                    {"optionId": "always", "name": "Allow Always", "kind": "allow_always"},
+                    {"optionId": "once", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "deny", "name": "Deny", "kind": "reject_once"},
+                ],
+            }
+        )
+    )
+    try:
+        await poll_until_async(
+            lambda: seen and pending_elicitations.lookup(seen[0], conversation_id=session_id),
+            timeout_s=5,
+        )
+        params = pending_elicitations.lookup(seen[0], conversation_id=session_id)[1]["params"]
+        assert params["requestedSchema"]["properties"]["answer"]["enum"] == [
+            "Allow Always",
+            "Allow",
+            "Deny",
+        ]
+        if child:
+            assert params.get("triage", {}).get("mode") == "answer"
+            await poll_until_async(lambda: tree.offer.await_count > 0, timeout_s=5)
+            assert "echo ready" in str(tree.offer.call_args)
+            extra = (
+                {"note": "Approve this one harmless command", "recommend": "approve"}
+                if decision == "pass_to_user"
+                else {}
+            )
+            assert await _answer(tree, decision, elicitation_id=seen[0], **extra) == {
+                "status": "passed" if decision == "pass_to_user" else "answered"
+            }
+        else:
+            assert "triage" not in params
+            tree.offer.assert_not_awaited()
+        if not child or decision == "pass_to_user":
+            if child:
+                handed_off = pending_elicitations.lookup(seen[0], conversation_id=session_id)[1][
+                    "params"
+                ]
+                assert handed_off["triage"]["recommend"] == "approve"
+            response = await tree.client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "approval",
+                    "data": {
+                        "elicitation_id": seen[0],
+                        "action": "accept",
+                        "content": {"answer": "Allow Always"},
+                    },
+                },
+            )
+            assert response.status_code == 202, response.text
+        assert await asyncio.wait_for(task, 5) == (
+            (True, "always")
+            if not child or decision == "pass_to_user"
+            else (True, "once")
+            if decision == "approve"
+            else (False, None)
+        )
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("choices", [True, False])
+async def test_acp_policy_ask_preserves_user_decision_without_parent_offer(tree, choices):
+    from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(
+        executor_factory=lambda: None, harness_label="ag", startup_source="acp"
+    )
+    executor = AcpExecutor(AcpAgentConfig(command="unused"))
+    executor._elicitation_choice_handler = adapter._stable_elicitation_choice_handler
+    executor._elicitation_handler = adapter._stable_elicitation_handler
+    executor._policy_elicitation_handler = adapter._stable_policy_elicitation_handler
+    executor._policy_evaluator = AsyncMock(
+        return_value=SimpleNamespace(action="POLICY_ACTION_ASK")
+    )
+    seen = []
+
+    async def elicit(eid, params):
+        seen.append(eid)
+        return await orchestration._publish_and_wait_for_harness_elicitation(
+            None,
+            session_id=tree.child_id,
+            params=params,
+            timeout_s=5,
+            conversation_store=tree.store,
+            elicitation_id=eid,
+        )
+
+    adapter._current_ctx = SimpleNamespace(elicit=elicit, cancelled=asyncio.Event())
+    task = asyncio.create_task(
+        executor._decide_permission(
+            {
+                "toolCall": {"title": "shell", "rawInput": {"command": "echo ready"}},
+                "options": [
+                    {"optionId": "once", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "deny", "name": "Deny", "kind": "reject_once"},
+                ]
+                if choices
+                else [],
+            }
+        )
+    )
+    try:
+        await poll_until_async(
+            lambda: seen and pending_elicitations.lookup(seen[0], conversation_id=tree.child_id),
+            timeout_s=5,
+        )
+        params = pending_elicitations.lookup(seen[0], conversation_id=tree.child_id)[1]["params"]
+        assert params["phase"] == "policy_ask"
+        assert "triage" not in params
+        tree.offer.assert_not_awaited()
+        assert await _answer(tree, elicitation_id=seen[0]) == {
+            "status": "refused",
+            "code": "not_offered",
+        }
+        response = await tree.client.post(
+            f"/v1/sessions/{tree.child_id}/events",
+            json={
+                "type": "approval",
+                "data": {
+                    "elicitation_id": seen[0],
+                    "action": "accept",
+                    "content": {"answer": "Allow"} if choices else None,
+                },
+            },
+        )
+        assert response.status_code == 202, response.text
+        assert await asyncio.wait_for(task, 5) == (True, "once" if choices else None)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.fixture(autouse=True)
 async def _offer_tasks():
     yield

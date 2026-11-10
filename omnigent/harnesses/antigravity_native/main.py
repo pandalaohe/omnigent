@@ -141,7 +141,7 @@ from omnigent.host.daemon_launch import (
     wait_for_runner_online,
 )
 from omnigent.native._native_resume_hint import echo_native_resume_hint
-from omnigent.native.native_bridge_common import write_agent_instructions_preamble
+from omnigent.native.native_bridge_common import clear_agent_instructions_preamble
 from omnigent.native.native_coding_agents import native_shell_terminal_spec
 from omnigent.native.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -1069,7 +1069,8 @@ async def _launch_and_record(
         arg for arg in antigravity_args if arg != "--dangerously-skip-permissions"
     )
     bridge_dir = prepare_bridge_dir(bridge_id)
-    from omnigent.runtime.prompt import native_startup_instructions
+    from omnigent.runtime.prompt import native_startup_instructions, session_instruction_parts
+    from omnigent.spec import load as load_agent_spec
 
     global_instructions = await asyncio.to_thread(
         _fetch_global_instructions,
@@ -1077,11 +1078,39 @@ async def _launch_and_record(
         headers=dict(client.headers),
         session_id=session_id,
     )
-    startup_instructions = native_startup_instructions(
-        None, global_instructions=global_instructions
+    # The session snapshot does not expose the owner-aware peer flag. The
+    # preview route resolves that same flag for CLI and runner launches.
+    preview_response = await client.get(
+        "/v1/instruction-layers/preview", params={"session_id": session_id}
     )
-    if startup_instructions is not None:
-        write_agent_instructions_preamble(bridge_dir, startup_instructions)
+    preview_response.raise_for_status()
+    peer_enabled = preview_response.json().get("route", {}).get("peer") is True
+    has_parent = isinstance(snapshot.get("parent_session_id"), str)
+    with TemporaryDirectory(prefix="omnigent-antigravity-spec-") as spec_dir:
+        spec = load_agent_spec(
+            _materialize_antigravity_agent_spec(Path(spec_dir)), expand_env=False
+        )
+    startup_instructions = native_startup_instructions(
+        spec,
+        global_instructions="\n\n".join(
+            part.text
+            for part in session_instruction_parts(
+                global_instructions,
+                workspace=snapshot.get("workspace")
+                if isinstance(snapshot.get("workspace"), str)
+                else None,
+                worktree=snapshot.get("worktree")
+                if isinstance(snapshot.get("worktree"), str)
+                else None,
+                has_parent=has_parent,
+                peer_messaging_enabled=peer_enabled,
+            )
+            if part.text is not None
+        ),
+        has_parent=has_parent,
+        peer_messaging_enabled=peer_enabled,
+    )
+    clear_agent_instructions_preamble(bridge_dir)
     # Clear stale turn/conversation state so a fresh launch rediscovers this run's
     # real agy conversation id instead of binding to the previous run's.
     await asyncio.to_thread(clear_bridge_state, bridge_dir)

@@ -1,5 +1,7 @@
 """Labelled parts preserve the startup and per-turn delivery channels exactly."""
 
+import pytest
+
 from omnigent.runtime.prompt import (
     CHILD_QUIET_INSTRUCTION,
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
@@ -8,12 +10,13 @@ from omnigent.runtime.prompt import (
     InstructionPart,
     build_instructions,
     build_instructions_nullable,
+    child_session_question_instruction,
     instruction_parts,
     native_startup_instruction_parts,
     native_startup_instructions,
     session_instruction_parts,
 )
-from omnigent.spec import AgentSpec
+from omnigent.spec import AgentSpec, BuiltinToolConfig, ToolsConfig
 
 
 def test_native_parts_follow_received_order_without_stripping_user_text():
@@ -80,3 +83,42 @@ def test_explicit_host_side_placeholders_keep_their_position():
     assert native_startup_instructions(spec, global_instructions="Route") == "\n\n".join(
         part.text for part in native if part.text is not None
     )
+
+
+@pytest.mark.parametrize("has_parent", [False, True])
+@pytest.mark.parametrize("grant", ["spawn", "agent", "web_fetch", "none"])
+def test_wake_notice_tracks_effective_dispatch(has_parent, grant):
+    tools = ToolsConfig(
+        agents=["worker"] if grant == "agent" else [],
+        builtins=[BuiltinToolConfig(name="web_fetch")] if grant == "web_fetch" else [],
+    )
+    spec = AgentSpec(spec_version=1, spawn=grant == "spawn", tools=tools)
+    expected = grant in {"agent", "web_fetch"} or (grant == "spawn" and not has_parent)
+    for text in (
+        native_startup_instructions(spec, has_parent=has_parent),
+        build_instructions(spec, None, [], has_parent=has_parent),
+        build_instructions_nullable(spec, None, [], has_parent=has_parent),
+    ):
+        assert text is not None
+        assert (SUBAGENT_WAKE_NOTICE_INSTRUCTION in text) == expected
+
+
+@pytest.mark.parametrize("peer", [False, True])
+@pytest.mark.parametrize("has_parent", [False, True])
+def test_child_question_is_last_and_emitted_once(peer, has_parent):
+    spec = AgentSpec(spec_version=1, spawn=True, instructions=" Author ")
+    session = session_instruction_parts(
+        " Global ",
+        workspace=None,
+        worktree=None,
+        peer_messaging_enabled=peer,
+        has_parent=has_parent,
+    )
+    parts = native_startup_instruction_parts(
+        spec, session, has_parent=has_parent, peer_messaging_enabled=peer
+    )
+    question = child_session_question_instruction(peer)
+    text = "\n\n".join(part.text for part in parts if part.text is not None)
+    assert text.count(question) == int(has_parent)
+    if has_parent:
+        assert parts[-1] == InstructionPart("child_question", question)

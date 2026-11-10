@@ -1,3 +1,4 @@
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -20,7 +21,9 @@ function mount(sessionId = "parent", readOnly = false) {
   clients.push(client);
   render(
     <QueryClientProvider client={client}>
-      <StandingApprovalChip sessionId={sessionId} readOnly={readOnly} />
+      <TooltipProvider delayDuration={0}>
+        <StandingApprovalChip sessionId={sessionId} readOnly={readOnly} />
+      </TooltipProvider>
     </QueryClientProvider>,
   );
   return client;
@@ -33,6 +36,15 @@ afterEach(() => {
 });
 
 describe("standing approval chip", () => {
+  it("shows only the value and names the feature on keyboard focus", async () => {
+    mount();
+    const trigger = await screen.findByRole("button", { name: "Standing approval: 2 active" });
+    expect(trigger).toHaveTextContent(/^2$/);
+    act(() => trigger.focus());
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Standing approval: 2 active");
+    fireEvent.click(trigger);
+    expect(await screen.findByRole("heading", { name: "Standing approval" })).toBeVisible();
+  });
   it("labels child approval delegation and keeps the wire kind when revoking", async () => {
     fetchMock.mockResolvedValueOnce({
       ok: true,

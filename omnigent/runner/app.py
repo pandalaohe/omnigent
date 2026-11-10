@@ -2265,6 +2265,7 @@ def create_runner_app(
     # global text. Read by the launch and composition points, never from the
     # TTL'd envelope cache, so the text outlives the cache. Blank is "off".
     _session_global_instructions: dict[str, str | None] = {}
+    _session_has_parent: dict[str, bool] = {}
     _session_instructions_overrides: dict[str, str | None] = {}
     _base_spec_resolver = spec_resolver
 
@@ -3885,6 +3886,7 @@ def create_runner_app(
             snapshot.peer_messaging_enabled and snapshot.parent_session_id is None
         )
         _session_project_code.setdefault(session_id, snapshot.project_code)
+        _session_has_parent[session_id] = snapshot.parent_session_id is not None
         _session_global_instructions[session_id] = (
             "\n\n".join(
                 part.text
@@ -5716,6 +5718,7 @@ def create_runner_app(
         _session_peer_messaging_enabled.pop(session_id, None)
         _session_open_enabled.pop(session_id, None)
         _session_global_instructions.pop(session_id, None)
+        _session_has_parent.pop(session_id, None)
         _session_instructions_overrides.pop(session_id, None)
         _session_project_code.pop(session_id, None)
         _session_permission_mode.pop(session_id, None)
@@ -9619,6 +9622,7 @@ def create_runner_app(
                     cached_spec,
                     _raw_per_request_instructions,
                     [],
+                    has_parent=_session_has_parent.get(conv, False),
                     framework_instructions=_global_framework_instructions(
                         _session_global_instructions.get(conv)
                     ),
@@ -9628,6 +9632,7 @@ def create_runner_app(
                     cached_spec,
                     _raw_per_request_instructions,
                     [],
+                    has_parent=_session_has_parent.get(conv, False),
                     framework_instructions=_global_framework_instructions(
                         _session_global_instructions.get(conv)
                     ),
@@ -10485,6 +10490,7 @@ def create_runner_app(
                                 _instr_spec_ds,
                                 _per_req_instr,
                                 [],
+                                has_parent=_session_has_parent.get(conv_id, False),
                                 framework_instructions=_global_framework_instructions(
                                     _session_global_instructions.get(conv_id)
                                 ),
@@ -10502,6 +10508,7 @@ def create_runner_app(
                                     _instr_spec_ds,
                                     _per_req_instr,
                                     [],
+                                    has_parent=_session_has_parent.get(conv_id, False),
                                     framework_instructions=_global_framework_instructions(
                                         _session_global_instructions.get(conv_id)
                                     ),

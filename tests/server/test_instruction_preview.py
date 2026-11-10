@@ -7,7 +7,6 @@ import pytest
 from omnigent.runtime.prompt import (
     build_instructions,
     build_instructions_nullable,
-    child_session_question_instruction,
     native_startup_instructions,
     session_instruction_parts,
 )
@@ -190,8 +189,8 @@ def test_role_blocks_follow_route_and_are_exclusive() -> None:
     assert "Child" not in parent["text"]
     assert "Route\n\nChild" in child["text"]
     assert "Parent" not in child["text"]
-    assert child["parts"][-1]["sent"] is True
-    assert child["parts"][-1]["kind"] == "child_question"
+    assert child["parts"][-2]["sent"] is True
+    assert child["parts"][-2]["kind"] == "child_question"
 
 
 @pytest.mark.parametrize("harness", ["codex-native", "claude-sdk", "opencode-native"])
@@ -220,16 +219,17 @@ def test_child_preview_matches_runner_fold_with_peer_and_padding(harness: str) -
         )
     )
     if harness == "codex-native":
-        expected = "\n\n".join(
-            (
-                native_startup_instructions(spec, global_instructions=folded),
-                child_session_question_instruction(True),
-            )
+        expected = native_startup_instructions(
+            spec, global_instructions=folded, has_parent=True, peer_messaging_enabled=True
         )
     elif harness == "opencode-native":
-        expected = build_instructions_nullable(spec, None, [], framework_instructions=[folded])
+        expected = build_instructions_nullable(
+            spec, None, [], framework_instructions=[folded], has_parent=True
+        )
     else:
-        expected = build_instructions(spec, None, [], framework_instructions=[folded])
+        expected = build_instructions(
+            spec, None, [], framework_instructions=[folded], has_parent=True
+        )
     assert preview["text"] == expected
     assert (
         "\n\n".join(p["text"] for p in preview["parts"] if p["sent"] and p["text"] is not None)
@@ -275,3 +275,54 @@ def test_native_aliases_use_the_same_composer_and_child_instructions(product: st
     alias = preview_instructions(layers, harness=f"native-{product}", **arguments)
     assert alias["text"] == canonical["text"]
     assert alias["parts"] == canonical["parts"]
+
+
+@pytest.mark.parametrize(
+    "harness",
+    [
+        "claude-native",
+        "codex-native",
+        "pi-native",
+        "antigravity-native",
+        "hermes-native",
+        "qwen-native",
+    ],
+)
+@pytest.mark.parametrize("has_parent", [False, True])
+@pytest.mark.parametrize("peer", [False, True])
+def test_native_preview_matches_delivered_startup(harness, has_parent, peer):
+    spec = AgentSpec(spec_version=1, instructions=" Author ", spawn=True)
+    layers = [_revision("shared", " Global ")]
+    preview = preview_instructions(
+        layers,
+        host_id=None,
+        agent_key=None,
+        spec=spec,
+        name="agent",
+        harness=harness,
+        has_parent=has_parent,
+        spawn=True,
+        peer=peer,
+    )
+    session = session_instruction_parts(
+        " Global ",
+        workspace=None,
+        worktree=None,
+        peer_messaging_enabled=peer,
+        has_parent=has_parent,
+    )
+    from omnigent.runtime.prompt import native_startup_instruction_parts
+
+    expected = "\n\n".join(
+        part.text
+        for part in native_startup_instruction_parts(
+            spec,
+            session,
+            has_parent=has_parent
+            and harness in {"claude-native", "codex-native", "pi-native", "antigravity-native"},
+            peer_messaging_enabled=peer,
+        )
+        if part.text is not None
+    )
+    assert preview["text"] == expected
+    assert preview["total_chars"] == len(expected)

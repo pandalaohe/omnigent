@@ -1745,6 +1745,10 @@ describe("sidebar favorites", () => {
     });
     await act(async () => {
       fireEvent.mouseUp(document, { clientX: 100, clientY: 45 });
+      // Let dnd-kit remove its document click guard before the next action.
+      await new Promise((resolve) => {
+        setTimeout(resolve, 60);
+      });
     });
 
     await waitFor(() => expect(reorderPinsFn).toHaveBeenCalled());
