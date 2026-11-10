@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.browser_ui.chat.session_contract import ChatSessionContract
+from tests.browser_ui.chat.session_contract import ChatSessionContract, list_payload
 from tests.browser_ui.conftest import BrowserContract
 
 
@@ -18,6 +18,10 @@ def test_standing_approval_chip_and_legacy_route(
     request: pytest.FixtureRequest,
 ) -> None:
     chat = chat_session_contract
+    # Header info can open on hover while moving between adjacent chips.
+    browser_contract.json(f"/v1/sessions/{chat.session_id}/policies", list_payload([]))
+    browser_contract.json("/v1/policy-registry", list_payload([]))
+    browser_contract.json(f"/v1/sessions/{chat.session_id}/owner", {"owner": None})
     page.set_viewport_size({"width": width, "height": 900})
     page.goto(chat.url)
     chip = page.get_by_role("button", name="Standing approval: none", exact=True)
