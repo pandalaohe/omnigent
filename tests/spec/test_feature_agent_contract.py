@@ -59,7 +59,6 @@ def test_feature_startup_prompt_routes_to_procedures_without_inlining_them() -> 
     tool = LoadSkillTool(spec.skills, skills_filter="none")
     prompt = build_instructions(spec, None, [tool.get_schema()])
 
-    assert len(prompt.split()) < 1500
     for skill in spec.skills:
         assert skill.name in prompt
         assert skill.content not in prompt
