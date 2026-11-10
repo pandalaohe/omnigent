@@ -5957,8 +5957,9 @@ def _upgrade_host_service(*, force: bool) -> Iterator[None]:
             processes = capture_host_tree(include_install_users=force)
         except (psutil.Error, OSError, ValueError, RuntimeError) as exc:
             raise click.ClickException(str(exc)) from exc
-        _drain_and_stop_local_server(force=force)
         try:
+            # A drain that fails part-way may already have stopped the Host.
+            _drain_and_stop_local_server(force=force)
             try:
                 try:
                     if wrapper is not None:
