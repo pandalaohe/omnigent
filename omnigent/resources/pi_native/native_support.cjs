@@ -154,7 +154,7 @@ function semanticAction(name, input, record) {
         !(options.agentScope === undefined || ["user","project","both"].includes(options.agentScope))) return null;
     return action;
   }
-  if (!allowed(input, r.run_keys) || typeof input.async !== "boolean") return null;
+  if (!allowed(input, r.run_keys) || ("async" in input && typeof input.async !== "boolean")) return null;
   const options = input.options === undefined ? {} : input.options;
   if (!allowed(options, r.option_keys) || !validNativeOptions(options)) return null;
   const forms = ["agent", "tasks", "chain"].filter(key => key in input);
@@ -381,6 +381,14 @@ async function classifyNativeCall(event, ctx, state) {
       const preflight = !admitted?.ok && admitted?.code === "unsupported_mode"
         ? await record.api.resolveSubagentLaunchContract({...request, parentSessionId:undefined})
         : admitted;
+      // Package messages can include private paths and configuration; expose only known codes.
+      if (preflight?.ok === false && ["missing_agent", "ambiguous_agent", "missing_skill", "denied_required_tool",
+          "invalid_artifact_dir", "invalid_cwd", "unsupported_mode", "restricted_agent", "thinking_ceiling",
+          "model_scope", "invalid_extension_bindings", "invalid_intercom_bridge"].includes(preflight.code)) {
+        const recovery = ["missing_agent", "ambiguous_agent"].includes(preflight.code)
+          ? ' Use subagent with action:"list" to discover available agents, then retry with a listed name.' : "";
+        return failed(bound, `Native launch preflight failed (${preflight.code}).${recovery}`);
+      }
       if (!preflight?.ok || preflight.contract?.version !== 3 || !/^[0-9a-f]{64}$/.test(preflight.contract.launchContractDigest || "") ||
           preflight.contract.protocol?.packageVersion !== pkg.metadata.version ||
           preflight.contract.diagnostics?.some(item => ["error", "host-required"].includes(item.severity)))

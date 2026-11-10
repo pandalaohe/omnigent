@@ -7,7 +7,7 @@ const {pathToFileURL} = require("node:url");
 const support = require("./native_support.cjs");
 const {createChildNativeGate} = require("./omnigent_pi_child_extension.js");
 
-async function fixture(t, {origin = "parent", tier = "auto", duplicate = false, definition = {name:"reader"}, noEvaluator = false, refuseNativeAdmission = false, settings, projectSettings, projectTrusted=false, definitionSource="user", missingRequired=false, scopedClient, asyncDescriptor=false, missingExport, startupRegistration=false, packageVersion="0.80.0", brokenImport=false, sdkPeers=false} = {}) {
+async function fixture(t, {origin = "parent", tier = "auto", duplicate = false, definition = {name:"reader"}, noEvaluator = false, refuseNativeAdmission = false, preflightFailure, settings, projectSettings, projectTrusted=false, definitionSource="user", missingRequired=false, scopedClient, asyncDescriptor=false, missingExport, startupRegistration=false, packageVersion="0.80.0", brokenImport=false, sdkPeers=false} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "native-support-"));
   t.after(() => fs.rmSync(root, {recursive:true, force:true}));
   const workspace = path.join(root, "workspace");
@@ -29,6 +29,7 @@ async function fixture(t, {origin = "parent", tier = "auto", duplicate = false, 
     "./preflight":"./preflight.js", "./native-child-lifecycle":"./lifecycle.js", "./required-child-extensions":"./required.js"}}));
   fs.writeFileSync(path.join(packageRoot, "preflight.js"), `export const SUBAGENT_LAUNCH_CONTRACT_VERSION=3;
 export async function resolveSubagentLaunchContract(input) {
+ if (${JSON.stringify(preflightFailure || null)}) return ${JSON.stringify(preflightFailure || null)};
  if (${refuseNativeAdmission} && input.parentSessionId) return {ok:false,code:"unsupported_mode"};
  return {ok:true,contract:{version:3,
  agent:{name:input.agent,source:${JSON.stringify(definitionSource)},filePath:${JSON.stringify(agentPath)}}, launchContractDigest:"${"0".repeat(64)}", roots:{cwd:input.cwd},
@@ -223,7 +224,7 @@ test("runtimes without resolve hooks disable helpers without failing session bin
 });
 
 test("verified native source still requires admitted sync/async and action semantics", async t => {
-  for (const [input, action] of [[{agent:"reader",task:"read",async:false},"delegate"], [{agent:"reader",task:"read",async:true},"delegate"], [{action:"list"},"read"], [{action:"stop",id:"child"},"control"]]) {
+  for (const [input, action] of [[{agent:"reader",task:"read"},"delegate"], [{agent:"reader",task:"read",async:false},"delegate"], [{agent:"reader",task:"read",async:true},"delegate"], [{tasks:[{agent:"reader",task:"read"}]},"delegate"], [{chain:[{agent:"reader",task:"read"}]},"delegate"], [{action:"list"},"read"], [{action:"stop",id:"child"},"control"]]) {
     await t.test(action+JSON.stringify(input), async t => {
       const f=await fixture(t);
       assert.equal(await f.run("subagent",input),undefined);
@@ -234,6 +235,32 @@ test("verified native source still requires admitted sync/async and action seman
       assert.equal(f.facts[0].binding.arguments_digest.length,64);
     });
   }
+});
+
+test("preflight failures explain recovery without exposing package messages",async t=>{
+  for (const code of ["missing_agent","missing_skill","unrecognized_secret_value"]) await t.test(code,async t=>{
+    const f=await fixture(t,{preflightFailure:{ok:false,code,message:"private package details",diagnostics:[]}});
+    const result=await f.run("subagent",{agent:"reader",task:"read",async:false});
+    assert.equal(result.block,true);
+    assert.equal(f.backendStarts(),0);
+    assert.equal(f.policyCalls(),0);
+    assert.doesNotMatch(result.reason,/private package details|unrecognized_secret_value/);
+    if (code==="missing_agent") {
+      assert.match(result.reason,/missing_agent/);
+      assert.match(result.reason,/action.*list/);
+      assert.match(result.reason,/available agents/);
+    } else if (code==="missing_skill") assert.match(result.reason,/missing_skill/);
+    else assert.equal(result.reason,"Native launch preflight did not prove the selected request");
+  });
+});
+
+test("invalid async values remain denied",async t=>{
+  const f=await fixture(t);
+  for (const async of [null,"false",0,{}]) {
+    assert.equal((await f.run("subagent",{agent:"reader",task:"read",async})).block,true);
+  }
+  assert.equal(f.backendStarts(),0);
+  assert.equal(f.policyCalls(),0);
 });
 
 test("acknowledged async binding wraps root definitions and keeps receipts private", async t => {
