@@ -5213,8 +5213,11 @@ def test_augment_claude_args_appends_caller_system_prompt(
         del omnigent_args[prompt_index : prompt_index + 2]
         assert args == [*merged_args, *omnigent_args]
     elif user_args and user_args[0] != "--":
-        del omnigent_args[prompt_index : prompt_index + 2]
-        assert args == [*user_args, "--append-system-prompt", _FRAMEWORK_PROMPT, *omnigent_args]
+        omnigent_args[prompt_index : prompt_index + 2] = [
+            "--append-system-prompt",
+            _FRAMEWORK_PROMPT,
+        ]
+        assert args == [*user_args, *omnigent_args]
     else:
         assert args == [*user_args, *omnigent_args]
         assert prompt_path.read_text(encoding="utf-8") == _FRAMEWORK_PROMPT

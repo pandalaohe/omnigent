@@ -134,7 +134,7 @@ function InstalledAgentsSettingsSection({
         <h1 className="settings-page-title mb-6 text-2xl font-medium">Create custom agent</h1>
         <CreateAgentForm
           submitLabel="Save agent"
-          notice="Saving an existing installed agent's name replaces its entire configuration. Sessions using that agent will receive the update. Use a new name to keep both agents."
+          notice="Reusing an installed agent's name replaces its configuration and updates its sessions. Use a new name to keep both agents."
           onCancel={() => navigate(BASE)}
           onCreate={async (input) => {
             const agent = await save.mutateAsync(input);
@@ -445,7 +445,7 @@ function AgentDetail({
               </Button>
             )}
           </div>
-          <p className="mt-3 text-ui text-muted-foreground">
+          <p className="mt-3 text-sm text-muted-foreground">
             {agent.description || "No description."}
           </p>
         </>

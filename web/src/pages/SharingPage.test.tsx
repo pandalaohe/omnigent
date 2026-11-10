@@ -141,7 +141,7 @@ describe("SharingPage", () => {
     expect(help).not.toHaveClass("md:hidden");
     fireEvent.click(help);
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
-      /Allow sharing a session with anyone who has the link/,
+      /Anyone with the link can access after signing in/,
     );
   });
 
@@ -151,8 +151,7 @@ describe("SharingPage", () => {
     renderPage();
 
     const trigger = await screen.findByRole("combobox", { name: "Session sharing mode" });
-    const description =
-      "New shares are capped at read (view) access. Edit and manage grants are rejected.";
+    const description = "New shares allow Read access only; Edit and Manage grants are rejected.";
     expect(trigger).toHaveTextContent(/^Read only$/);
     expect(trigger).toHaveAccessibleDescription(description);
     expect(screen.getByText(description)).toBeVisible();
@@ -166,14 +165,14 @@ describe("SharingPage", () => {
     for (const [label, optionDescription] of [
       [
         "On",
-        "Anyone with manage access can share a session at any level (read, edit, or manage) and toggle public / workspace read.",
+        "Users with manage access can share at read, edit, or manage level and enable public or workspace read access.",
       ],
       ["Read only", description],
       [
         "Read only (restricted)",
-        "Read-only, and sessions whose working directory is a home directory or the filesystem root cannot be shared at all — not even read.",
+        "Read-only. Sessions in a home directory or the filesystem root cannot be shared.",
       ],
-      ["Off", "Sharing is disabled. No new grants can be created and the Share control is hidden."],
+      ["Off", "Block new shares and hide the Share control."],
     ]) {
       const option = screen.getByRole("option", { name: label });
       expect(option).toHaveAccessibleDescription(optionDescription);
@@ -204,7 +203,7 @@ describe("SharingPage", () => {
     );
     expect(trigger).toHaveTextContent(/^Read only \(restricted\)$/);
     expect(trigger).toHaveAccessibleDescription(
-      "Read-only, and sessions whose working directory is a home directory or the filesystem root cannot be shared at all — not even read.",
+      "Read-only. Sessions in a home directory or the filesystem root cannot be shared.",
     );
   });
 
@@ -244,7 +243,7 @@ describe("SharingPage", () => {
     expect(screen.getByText("Save failed")).toBeInTheDocument();
     expect(trigger).toHaveTextContent(/^On$/);
     expect(trigger).toHaveAccessibleDescription(
-      "Anyone with manage access can share a session at any level (read, edit, or manage) and toggle public / workspace read.",
+      "Users with manage access can share at read, edit, or manage level and enable public or workspace read access.",
     );
   });
 

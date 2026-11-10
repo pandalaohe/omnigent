@@ -34,7 +34,7 @@ export function requestedScrollRestore(): { top: number } | null {
   const srcDoc = screen.getByTitle<HTMLIFrameElement>("HTML preview").getAttribute("srcdoc");
   const doc = new DOMParser().parseFromString(srcDoc ?? "", "text/html");
   const value = doc
-    .querySelector("script[data-omni-nonce]")
+    .querySelector("script[data-omni-restore-scroll]")
     ?.getAttribute("data-omni-restore-scroll");
   return value ? (JSON.parse(value) as { top: number }) : null;
 }
