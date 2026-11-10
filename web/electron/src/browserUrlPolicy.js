@@ -19,7 +19,10 @@ const ALLOWLIST_HOST_ENTRY = /^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(?::(\d{1,5})
 // CIDR: the base may only hold characters a WHATWG IPv4 form can contain.
 const ALLOWLIST_IPV4_CIDR = /^([0-9A-Fa-fxX.]+)\/(\d+)$/;
 
-const ARCA_LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+// Exact loopback hosts an eligible context may open without an IP check; its
+// `*.localhost` subdomains must also connect to loopback (isAgentConnectionAllowed).
+// Other loopback spellings and DNS names that resolve to loopback stay blocked.
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 /**
  * Parse a dotted-quad IPv4 host into four octets, or null if not IPv4. The
@@ -171,6 +174,31 @@ function isBlockedHostname(hostname) {
   if (host === "localhost" || host === "") return true;
   if (host.endsWith(".localhost")) return true; // *.localhost → loopback per spec
   return isIpLiteral(host) && isInternalAddress(host);
+}
+
+/** True for an RFC 6761 `*.localhost` subdomain without empty labels or a trailing dot. */
+function isLocalhostSubdomain(hostname) {
+  if (!hostname.endsWith(".localhost")) return false;
+  const labels = hostname.slice(0, -".localhost".length).split(".");
+  return labels.every((label) => label !== "");
+}
+
+/** True for a host an eligible context may open as a loopback preview. */
+function isLoopbackName(hostname) {
+  return LOOPBACK_HOSTS.has(hostname) || isLocalhostSubdomain(hostname);
+}
+
+/** True for an http(s) URL whose host is a loopback preview name, including `*.localhost`. */
+function isLoopbackPreviewUrl(url) {
+  if (typeof url !== "string" || !URL.canParse(url)) return false;
+  const { protocol, hostname } = new URL(url);
+  return ALLOWED_SCHEMES.has(protocol) && isLoopbackName(hostname);
+}
+
+/** True if an IP address is in 127.0.0.0/8 or is ::1 (including IPv4-mapped forms). */
+function isLoopbackAddress(address) {
+  const canonical = canonicalAddress(address);
+  return canonical === "0:0:0:0:0:0:0:1" || (canonical?.startsWith("127.") ?? false);
 }
 
 /**
@@ -356,7 +384,7 @@ function policyDecision(parsed, addresses, options = {}) {
   if (matches(allowOnce)) return { ok: true };
   if (matches(access.ask)) return fail(true, "requires confirmation");
   if (matches(access.allowed) || matches(allowlist)) return { ok: true };
-  if (allowLocalhost && ARCA_LOOPBACK_HOSTS.has(host)) return { ok: true };
+  if (allowLocalhost && isLoopbackName(host)) return { ok: true };
   const internal =
     isBlockedHostname(host) ||
     addresses.some((ip) => isInternalAddress(ip) && !(isFakeIp(ip) && !isIpLiteral(host)));
@@ -423,7 +451,7 @@ async function checkAgentNavigation(url, options = {}) {
   }
   if (!ALLOWED_SCHEMES.has(parsed.protocol)) return isAgentNavigationAllowed(url, options);
   if (isIpLiteral(parsed.hostname)) return policyDecision(parsed, [], options);
-  if (options.allowLocalhost && ARCA_LOOPBACK_HOSTS.has(parsed.hostname))
+  if (options.allowLocalhost && isLoopbackName(parsed.hostname))
     return policyDecision(parsed, ["127.0.0.1"], options);
   const addressRules = [
     options.allowlist,
@@ -470,8 +498,16 @@ function isAgentConnectionAllowed(url, ip, options = {}) {
     return { ok: false, error: "navigation blocked: invalid URL" };
   }
   if (!ALLOWED_SCHEMES.has(parsed.protocol)) return isAgentNavigationAllowed(url, options);
+  if (options.allowLocalhost && isLocalhostSubdomain(parsed.hostname)) {
+    if (!ip || !isLoopbackAddress(ip)) {
+      return {
+        ok: false,
+        error: `navigation blocked: host "${parsed.hostname}" did not connect to a loopback address`,
+      };
+    }
+  }
   if (!ip) {
-    if (options.allowLocalhost && ARCA_LOOPBACK_HOSTS.has(parsed.hostname))
+    if (options.allowLocalhost && LOOPBACK_HOSTS.has(parsed.hostname))
       return policyDecision(parsed, [], options);
     return {
       ok: false,
@@ -498,6 +534,15 @@ function proxyHosts(pacResult) {
     hosts.push(bracketed ? bracketed[1] : hostPort.replace(/:\d+$/, ""));
   }
   return hosts;
+}
+
+/** True if a PAC-style `resolveProxy` result lists only DIRECT entries. */
+function isDirectOnly(pacResult) {
+  const entries = String(pacResult ?? "")
+    .split(";")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return entries.length > 0 && entries.every((entry) => entry.toUpperCase() === "DIRECT");
 }
 
 /**
@@ -538,6 +583,9 @@ module.exports = {
   checkAgentNavigation,
   isAgentConnectionAllowed,
   isProxyAddress,
+  isLoopbackPreviewUrl,
+  isDirectOnly,
+  isLocalhostSubdomain,
   lookupHostAddresses,
   // Exported for focused unit tests.
   proxyHosts,
@@ -549,5 +597,7 @@ module.exports = {
   isBlockedIpv6,
   isInternalAddress,
   isBlockedHostname,
+  isLoopbackName,
+  isLoopbackAddress,
   ALLOWED_SCHEMES,
 };

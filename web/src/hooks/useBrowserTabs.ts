@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { onBrowserActionClaimed } from "@/lib/browserActionBus";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
+import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
+import { type BrowserHostOptions, navigationHostOptions } from "@/lib/nativeBridge";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
@@ -10,6 +12,9 @@ export { AGENT_BROWSER_TAB_ID, browserViewId, browserViewOwnerId } from "@/lib/b
 export function validBrowserTabId(tabId: string): boolean {
   return tabId.length > 0 && !tabId.includes(":");
 }
+
+/** How a tab close ended: the view closed, an agent navigation kept it, or it failed. */
+export type BrowserTabCloseResult = "closed" | "kept" | "failed";
 
 interface BrowserTabsState {
   tabs: string[];
@@ -22,6 +27,12 @@ interface BrowserPage {
 }
 
 interface BrowserTabsBridge {
+  browserOpenOrNavigate?: (
+    viewId: string,
+    url: string,
+    bounds: undefined,
+    opts: { force: boolean } & BrowserHostOptions,
+  ) => Promise<{ ok: boolean; error?: string }>;
   browserHasView?: (
     viewId: string,
   ) => Promise<BrowserPage & { exists: boolean; pendingUrl?: string }>;
@@ -35,6 +46,23 @@ const closingViews = new Map<string, number>();
 
 export function isBrowserTabClosing(conversationId: string, tabId: string): boolean {
   return (closingViews.get(browserViewId(conversationId, tabId)) ?? 0) > 0;
+}
+// Counts each session's tab selections, across mounts of its rail, so a slow reopen
+// only selects its tab if nothing was selected after it was requested.
+const browserSelections = new Map<string, number>();
+
+// Mounted rails, told when a session's tabs change, so a reopen that a rail started
+// before it remounted still reaches the one on screen.
+const browserTabsListeners = new Set<(conversationId: string, next: BrowserTabsState) => void>();
+
+// Each session's reopen requests in order, and the latest one whose tab was selected.
+const reopenRequests = new Map<string, number>();
+const shownReopens = new Map<string, number>();
+
+function noteBrowserSelection(conversationId: string): number {
+  const count = (browserSelections.get(conversationId) ?? 0) + 1;
+  browserSelections.set(conversationId, count);
+  return count;
 }
 
 function agentNavigationEpoch(conversationId: string): number {
@@ -108,13 +136,27 @@ export function useBrowserTabs(conversationId: string) {
     () => (state.ownerId === conversationId ? state : readBrowserTabsState(conversationId)),
     [state, conversationId],
   );
+  // The session on screen, so a late async update for another one only persists.
+  const shownConversationRef = useRef(conversationId);
+  shownConversationRef.current = conversationId;
   const [pages, setPages] = useState<Record<string, BrowserPage>>({});
   const viewIdsKey = JSON.stringify(
     visibleTabs.map((tabId) => browserViewId(conversationId, tabId)),
   );
   useEffect(() => {
     setState({ ownerId: conversationId, ...readBrowserTabsState(conversationId) });
+    noteBrowserSelection(conversationId);
   }, [conversationId]);
+  useEffect(() => {
+    const listener = (changedConversationId: string, next: BrowserTabsState) => {
+      if (changedConversationId === shownConversationRef.current)
+        setState({ ownerId: changedConversationId, ...next });
+    };
+    browserTabsListeners.add(listener);
+    return () => {
+      browserTabsListeners.delete(listener);
+    };
+  }, []);
 
   useEffect(() => {
     const viewIds = new Set<string>(JSON.parse(viewIdsKey));
@@ -187,22 +229,25 @@ export function useBrowserTabs(conversationId: string) {
   const update = useCallback(
     (mutate: (current: BrowserTabsState) => BrowserTabsState) => {
       const next = mutate(readBrowserTabsState(conversationId));
+      // Saving is best effort; mounted rails take the new state either way.
       writeSessionWorkspaceState(conversationId, {
         openBrowsers: next.tabs,
         selectedBrowserId: next.selected,
       });
-      setState({ ownerId: conversationId, ...next });
+      for (const listener of browserTabsListeners) listener(conversationId, next);
     },
     [conversationId],
   );
 
   const select = (selected: string | null) => {
+    noteBrowserSelection(conversationId);
     update((current) => ({ ...current, selected }));
   };
 
   useEffect(() => {
     const selectBrowser = (sourceConversationId: string, tabId: string) => {
       if (sourceConversationId === conversationId) {
+        noteBrowserSelection(conversationId);
         setState({ ownerId: conversationId, ...openBrowserTab(conversationId, tabId) });
       }
     };
@@ -218,16 +263,95 @@ export function useBrowserTabs(conversationId: string) {
     };
   }, [conversationId]);
 
-  const add = () => {
-    createBrowserTab(conversationId);
-    setState({ ownerId: conversationId, ...readBrowserTabsState(conversationId) });
+  /** Open and select a tab, loading `url` into its view before the pane mounts; returns its id. */
+  const add = (url?: string): string => {
+    noteBrowserSelection(conversationId);
+    const selected = crypto.randomUUID();
+    if (url) {
+      const bridge = (window as unknown as { omnigentDesktop?: BrowserTabsBridge }).omnigentDesktop;
+      void bridge
+        ?.browserOpenOrNavigate?.(browserViewId(conversationId, selected), url, undefined, {
+          force: true,
+        })
+        .catch(() => undefined);
+    }
+    update((current) => ({ tabs: [...current.tabs, selected], selected }));
+    return selected;
   };
 
-  const close = async (tabId: string): Promise<boolean> => {
+  /**
+   * Reopen a closed tab at `url`. The tab is added only once its view opened, so a
+   * refusal (too many views, a blocked URL) leaves no blank tab behind.
+   */
+  /**
+   * Reopen a closed tab at `url`. `mayShow` lets the caller veto selecting it when the
+   * view opens, such as after the user moved elsewhere in the workspace meanwhile.
+   */
+  const reopen = async (
+    url: string,
+    { mayShow = () => true }: { mayShow?: () => boolean } = {},
+  ): Promise<{ ok: boolean; error?: string }> => {
+    const tabId = crypto.randomUUID();
+    const selection = browserSelections.get(conversationId) ?? 0;
+    const request = (reopenRequests.get(conversationId) ?? 0) + 1;
+    reopenRequests.set(conversationId, request);
+    const bridge = (window as unknown as { omnigentDesktop?: BrowserTabsBridge }).omnigentDesktop;
+    // The session's host lets the shell reopen its localhost pages, as the address bar does.
+    const hostId = await fetchSessionHostId(conversationId);
+    const result = await bridge
+      ?.browserOpenOrNavigate?.(browserViewId(conversationId, tabId), url, undefined, {
+        force: true,
+        ...navigationHostOptions(hostId),
+      })
+      .catch((error: unknown) => ({ ok: false, error: String(error) }));
+    if (result && !result.ok) return result;
+    // The tab comes back either way. It's selected only if nothing was picked since and
+    // no later reopen's tab is already shown; a later one that failed doesn't count.
+    const latest =
+      (browserSelections.get(conversationId) ?? 0) === selection &&
+      request > (shownReopens.get(conversationId) ?? 0) &&
+      mayShow();
+    if (latest) shownReopens.set(conversationId, request);
+    update((current) => ({
+      tabs: [...current.tabs, tabId],
+      selected: latest ? tabId : current.selected,
+    }));
+    return { ok: true };
+  };
+
+  /**
+   * The page a tab shows. Before the strip has loaded it (just after returning to a
+   * session), asks the tab's view, so closing the tab can still remember its page.
+   */
+  const pageUrl = async (tabId: string): Promise<string | undefined> => {
+    const viewId = browserViewId(conversationId, tabId);
+    // A snapshot without a URL (the view didn't exist yet when the strip looked) asks again.
+    const known = pages[viewId]?.url;
+    if (known) return known;
+    const bridge = (window as unknown as { omnigentDesktop?: BrowserTabsBridge }).omnigentDesktop;
+    const page = await bridge?.browserHasView?.(viewId).catch(() => undefined);
+    if (!page?.exists) return undefined;
+    return page.url && page.url !== "about:blank" ? page.url : page.pendingUrl;
+  };
+
+  /**
+   * Close a tab's view and drop the tab. `beforeClose` runs first, after the close's intent
+   * is captured: an agent navigation that arrives while it waits keeps the tab and its view
+   * ("kept"). "failed" means the view didn't close.
+   */
+  const close = async (
+    tabId: string,
+    { beforeClose }: { beforeClose?: () => Promise<void> } = {},
+  ): Promise<BrowserTabCloseResult> => {
     const navigationEpoch = agentNavigationEpoch(conversationId);
     const viewId = browserViewId(conversationId, tabId);
     closingViews.set(viewId, (closingViews.get(viewId) ?? 0) + 1);
     try {
+      // A fresh agent navigation supersedes an older close of the reserved agent view.
+      const superseded = () =>
+        tabId === AGENT_BROWSER_TAB_ID && agentNavigationEpoch(conversationId) !== navigationEpoch;
+      if (beforeClose) await beforeClose();
+      if (superseded()) return "kept";
       const desktop = (
         window as unknown as {
           omnigentDesktop?: {
@@ -235,16 +359,12 @@ export function useBrowserTabs(conversationId: string) {
           };
         }
       ).omnigentDesktop;
-      const result = await desktop?.browserClose?.(viewId).catch(() => ({ ok: false }));
-      if (result && !result.ok) return false;
-      // A fresh agent/link navigation supersedes an older close of the reserved
-      // agent view. Keep the recreated tab selected when the close resolves late.
-      if (
-        tabId === AGENT_BROWSER_TAB_ID &&
-        agentNavigationEpoch(conversationId) !== navigationEpoch
-      ) {
-        return true;
-      }
+      const result = await desktop
+        ?.browserClose?.(browserViewId(conversationId, tabId))
+        .catch(() => ({ ok: false }));
+      if (result && !result.ok) return "failed";
+      // The view closed, but a navigation since recreated the tab: keep it selected.
+      if (superseded()) return "closed";
       update((previous) => {
         const index = previous.tabs.indexOf(tabId);
         if (index === -1) return previous;
@@ -253,7 +373,7 @@ export function useBrowserTabs(conversationId: string) {
           previous.selected === tabId ? (tabs[Math.max(0, index - 1)] ?? null) : previous.selected;
         return { tabs, selected };
       });
-      return true;
+      return "closed";
     } finally {
       const active = closingViews.get(viewId) ?? 0;
       if (active <= 1) closingViews.delete(viewId);
@@ -265,7 +385,10 @@ export function useBrowserTabs(conversationId: string) {
     tabs: visibleTabs,
     selected: visibleSelected,
     labelFor,
+    urlFor: (tabId: string) => pages[browserViewId(conversationId, tabId)]?.url,
+    pageUrl,
     add,
+    reopen,
     close,
     select,
     viewId: visibleSelected === null ? null : browserViewId(conversationId, visibleSelected),

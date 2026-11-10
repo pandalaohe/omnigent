@@ -906,6 +906,7 @@ function renderItem(
             className="chat-markdown text-message"
             mode={isTextStreaming || keepsStreamingMode(item) ? "streaming" : "static"}
             sendCodeBlocks={!isTextStreaming}
+            isStreaming={isTextStreaming}
           >
             {item.text}
           </FilePathAwareMessageResponse>

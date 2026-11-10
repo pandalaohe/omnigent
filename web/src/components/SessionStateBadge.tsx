@@ -8,6 +8,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import type { KeepWarmStatus } from "@/hooks/useConversations";
 import type { SessionState } from "@/hooks/useSessionState";
 import { keepWarmTooltipLine } from "@/lib/keepWarmStatus";
+import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { cn } from "@/lib/utils";
 import type { ReactElement } from "react";
 import { CircleAlertIcon } from "lucide-react";
@@ -44,14 +45,21 @@ interface Visual {
   cold: boolean;
 }
 
+function awaitingTooltip(count: number, terminalReason: string | undefined): string {
+  if (terminalReason === TERMINAL_PROMPT_BLOCKED_ON) {
+    return "May need your input in the agent's terminal";
+  }
+  if (terminalReason) return `Waiting for you in the agent's terminal (${terminalReason})`;
+  return count === 1 ? "1 approval prompt waiting" : `${count} approval prompts waiting`;
+}
+
 function describe(state: SessionState, cold: boolean): Visual {
   switch (state.kind) {
     case "awaiting": {
-      const tooltip = state.terminalReason
-        ? `Waiting for you in the agent's terminal (${state.terminalReason})`
-        : state.count === 1
-          ? "1 approval prompt waiting"
-          : `${state.count} approval prompts waiting`;
+      const tooltip = awaitingTooltip(state.count, state.terminalReason);
+      // The runner infers this reason from the terminal's screen, so stay tentative.
+      const label =
+        state.terminalReason === TERMINAL_PROMPT_BLOCKED_ON ? "May need input" : "Needs response";
       return {
         kind: state.kind,
         ariaLabel: tooltip,
@@ -65,7 +73,7 @@ function describe(state: SessionState, cold: boolean): Visual {
                 : "border-transparent bg-brand-accent/15 text-brand-accent",
             )}
           >
-            Needs response
+            {label}
           </Badge>
         ),
       };

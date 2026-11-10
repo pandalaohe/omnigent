@@ -249,6 +249,7 @@ export function ApprovePage() {
           terminalAccess={state.kind === "pending" ? parseTerminalAccess(state.data) : undefined}
           cardSessionId={sessionId}
           onSubmit={(_id, action, content, meta) => void submit(action, content, meta)}
+          keyboardActive
         />
       )}
       {state.kind === "pending" && !usesApprovalCard && (

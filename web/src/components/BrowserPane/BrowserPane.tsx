@@ -29,6 +29,12 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
+import {
+  ADDRESS_BAR_KEYS,
+  MOD_KEY,
+  RELOAD_KEYS,
+  shortcutText,
+} from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -47,10 +53,12 @@ import {
 } from "@/components/ui/select";
 import { browserPlacesBridge } from "@/lib/browserPlacesBridge";
 
+import { useDesktopCommand } from "@/lib/desktopCommands";
 import {
   getDesktopFeatures,
   navigationHostOptions,
   supportsBrowser,
+  supportsDesktopCommands,
   type BrowserHostOptions,
   type ChromeCookieImportResult,
   type ChromeCookiePreviewResult,
@@ -85,7 +93,10 @@ interface NavResult {
 interface BrowserPaneBridge {
   browserExtensionsMenu?: (viewId: string) => Promise<{ ok: boolean; error?: string }>;
   browserOpenBitwarden?: (viewId: string) => Promise<{ ok: boolean; error?: string }>;
-  browserSetActive?: (conversationId: string | null) => Promise<{ ok: boolean; error?: string }>;
+  browserSetActive?: (
+    conversationId: string | null,
+    options?: { focus?: boolean },
+  ) => Promise<{ ok: boolean; error?: string }>;
   browserResize?: (
     conversationId: string,
     bounds: Bounds,
@@ -163,6 +174,9 @@ export interface BrowserPaneProps {
   active?: boolean;
   /** Extra classes for the measuring placeholder wrapper. */
   className?: string;
+  /** Take keyboard focus once, in the address bar or the page, then call `onFocused`. */
+  focus?: "address" | "page" | null;
+  onFocused?: () => void;
 }
 
 /**
@@ -174,6 +188,8 @@ export function BrowserPane({
   className,
   agentBrowser = true,
   active = true,
+  focus = null,
+  onFocused,
 }: BrowserPaneProps) {
   const places = useMemo(browserPlacesBridge, []);
   const addressRef = useRef<HTMLInputElement>(null);
@@ -204,6 +220,8 @@ export function BrowserPane({
     [places, conversationId],
   );
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const toolbarRef = useRef<HTMLDivElement | null>(null);
+  const addressBarRef = useRef<HTMLInputElement | null>(null);
   const lastBoundsRef = useRef<Bounds | null>(null);
   const browserSupported = supportsBrowser();
   // A detached view still exists; only `active` controls its attachment.
@@ -421,6 +439,32 @@ export function BrowserPane({
     void bridge?.browserReload?.(conversationId);
   }, [conversationId]);
 
+  // Desktop Reload (⌘R) from this toolbar reloads the page rather than the app;
+  // Focus Address Bar (⌘L) selects the address. (A focused page reloads itself in the shell.)
+  useDesktopCommand(
+    "reload",
+    active
+      ? () => {
+          if (!toolbarRef.current?.contains(document.activeElement)) return false;
+          handleReload();
+          return true;
+        }
+      : null,
+    { priority: 10 },
+  );
+  useDesktopCommand(
+    "focus-address-bar",
+    active
+      ? () => {
+          addressBarRef.current?.focus();
+          addressBarRef.current?.select();
+        }
+      : null,
+  );
+  // Chords in the toolbar's native titles; DOM tooltips here could sit under the page.
+  const chord = (label: string, keys: readonly string[]) =>
+    supportsDesktopCommands() ? `${label} (${shortcutText(keys)})` : label;
+
   const handleDevTools = useCallback(() => {
     const bridge = getBridge();
     void bridge?.openBrowserDevTools?.(conversationId);
@@ -622,6 +666,19 @@ export function BrowserPane({
     };
   }, [conversationId, browserSupported, hasView, active, syncBounds]);
 
+  // A tab just opened takes focus in its address bar, as in a browser; one the
+  // user returns to gets it back where it was. The page needs its view attached.
+  useEffect(() => {
+    if (focus === "address") {
+      addressBarRef.current?.focus();
+    } else if (focus === "page" && hasView && active) {
+      void getBridge()?.browserSetActive?.(conversationId, { focus: true });
+    } else {
+      return;
+    }
+    onFocused?.();
+  }, [focus, hasView, active, conversationId, onFocused]);
+
   // Reconcile bounds every frame while shown (cheap: same-rect setBounds is a
   // no-op + we dedupe via lastBoundsRef). Catches position-only shifts that
   // ResizeObserver misses (it only fires on size). try/catch so a throw during
@@ -702,13 +759,16 @@ export function BrowserPane({
       data-browser-pane-conversation={conversationId}
     >
       <BrowserActivityStatus viewId={conversationId} />
-      <div className="flex shrink-0 items-center gap-1 border-border border-b bg-card px-2 py-1.5">
+      <div
+        ref={toolbarRef}
+        className="flex shrink-0 items-center gap-1 border-border border-b bg-card px-2 py-1.5"
+      >
         <button
           type="button"
           onClick={handleBack}
           disabled={!canGoBack}
           aria-label="Go back"
-          title="Back"
+          title={chord("Back", [MOD_KEY, "["])}
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
         >
           <ChevronLeftIcon className="size-4" />
@@ -718,7 +778,7 @@ export function BrowserPane({
           onClick={handleForward}
           disabled={!canGoForward}
           aria-label="Go forward"
-          title="Forward"
+          title={chord("Forward", [MOD_KEY, "]"])}
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
         >
           <ChevronRightIcon className="size-4" />
@@ -728,13 +788,16 @@ export function BrowserPane({
           onClick={handleReload}
           disabled={!hasView}
           aria-label="Reload"
-          title="Reload"
+          title={chord("Reload", RELOAD_KEYS)}
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
         >
           <RotateCwIcon className="size-4" />
         </button>
         <input
-          ref={addressRef}
+          ref={(element) => {
+            addressRef.current = element;
+            addressBarRef.current = element;
+          }}
           type="text"
           value={currentUrl}
           spellCheck={false}
@@ -742,6 +805,7 @@ export function BrowserPane({
           autoCapitalize="off"
           placeholder="Enter a URL"
           aria-label="Address bar"
+          title={chord("Address bar", ADDRESS_BAR_KEYS)}
           onChange={(e) => setCurrentUrl(e.target.value)}
           onFocus={() => {
             window.clearTimeout(blurTimer.current);

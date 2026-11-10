@@ -21,6 +21,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { isKeyOwningOverlayOpen } from "@/lib/hotkeys";
 import { Button } from "@/components/ui/button";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { leaveQuestionCard, useQuestionCardTarget } from "@/hooks/useQuestionCardHotkeys";
@@ -67,6 +68,7 @@ interface StagedCommentBlock {
 interface AskUserQuestionFormProps {
   /** Pending elicitation the questions belong to; keys the unsent draft. */
   elicitationId?: string;
+  keyboardActive?: boolean;
   questions: ClaudeQuestion[];
   onSubmit: (
     answers: AskUserQuestionAnswers,
@@ -723,7 +725,7 @@ export function AskUserQuestionForm({
       e.stopPropagation();
       return;
     }
-    if (e.nativeEvent.isComposing) return;
+    if (e.nativeEvent.isComposing || isKeyOwningOverlayOpen(rootRef.current)) return;
     const isCustomTextarea = e.target instanceof HTMLTextAreaElement;
     const isButtonLike = e.target instanceof Element && e.target.closest("button, a") !== null;
     const isOptionInput =
@@ -843,6 +845,7 @@ export function AskUserQuestionForm({
       ref={rootRef}
       tabIndex={-1}
       data-question-card
+      data-ask-user-question-form=""
       className="flex flex-col gap-2 text-foreground"
       data-testid="ask-user-question-form"
       onKeyDown={handleCardKeyDown}

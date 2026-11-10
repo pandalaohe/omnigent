@@ -2913,47 +2913,48 @@ def register_core_routes(
         # managed) and no runner is bound yet, authorize (caller must
         # own the host AND the session), atomically bind, then launch.
         # Same authorization path as POST /v1/hosts/{host_id}/runners.
-        if hold is None and launch_host_id is not None and resp.runner_id is None:
-            if getattr(request.app.state, "startup_admission", None) is not None:
-                assert resp.workspace is not None
-                await _queue_caller_host_preparation(
-                    request,
-                    user_id=user_id,
-                    session_id=resp.id,
-                    host_id=launch_host_id,
-                    workspace=resp.workspace,
-                    git=body.git,
-                )
-                from omnigent.server.startup_registration import (
-                    STARTUP_CREATE_PREPARATION_LABEL_KEY,
-                )
+        with creation_stage("create_host_launch_ms"):
+            if hold is None and launch_host_id is not None and resp.runner_id is None:
+                if getattr(request.app.state, "startup_admission", None) is not None:
+                    assert resp.workspace is not None
+                    await _queue_caller_host_preparation(
+                        request,
+                        user_id=user_id,
+                        session_id=resp.id,
+                        host_id=launch_host_id,
+                        workspace=resp.workspace,
+                        git=body.git,
+                    )
+                    from omnigent.server.startup_registration import (
+                        STARTUP_CREATE_PREPARATION_LABEL_KEY,
+                    )
 
-                resp.labels.pop(STARTUP_CREATE_PREPARATION_LABEL_KEY, None)
-            else:
-                launched = await _bind_and_launch_on_caller_host(
-                    request,
-                    user_id=user_id,
-                    session_id=resp.id,
-                    host_id=launch_host_id,
-                    # Already written by _create_session_from_existing_agent;
-                    # only runner_id still needs the atomic set inside.
-                    workspace=resp.workspace,
-                    # Already canonical (see _resolve_harness).
-                    harness=resp.harness,
-                    conversation=conv,
-                )
-                if launched is not None:
-                    runner_id, launch_failed = launched
-                    if launch_failed and _terminal_first_create:
-                        # The runner never booted, so its pending=False clear
-                        # will never fire. Clear the spin-up flag here so a
-                        # failed launch doesn't strand the Terminal-pill
-                        # spinner. No-op when we never set it.
-                        _publish_terminal_pending(resp.id, False)
-                    resp.runner_id = runner_id
-                    resp.host_id = launch_host_id
-        elif hold is None and deferred_initial_item is not None and resp.host_id is not None:
-            request.app.state.startup_inputs.host_changed(request.app, resp.host_id)
+                    resp.labels.pop(STARTUP_CREATE_PREPARATION_LABEL_KEY, None)
+                else:
+                    launched = await _bind_and_launch_on_caller_host(
+                        request,
+                        user_id=user_id,
+                        session_id=resp.id,
+                        host_id=launch_host_id,
+                        # Already written by _create_session_from_existing_agent;
+                        # only runner_id still needs the atomic set inside.
+                        workspace=resp.workspace,
+                        # Already canonical (see _resolve_harness).
+                        harness=resp.harness,
+                        conversation=conv,
+                    )
+                    if launched is not None:
+                        runner_id, launch_failed = launched
+                        if launch_failed and _terminal_first_create:
+                            # The runner never booted, so its pending=False clear
+                            # will never fire. Clear the spin-up flag here so a
+                            # failed launch doesn't strand the Terminal-pill
+                            # spinner. No-op when we never set it.
+                            _publish_terminal_pending(resp.id, False)
+                        resp.runner_id = runner_id
+                        resp.host_id = launch_host_id
+            elif hold is None and deferred_initial_item is not None and resp.host_id is not None:
+                request.app.state.startup_inputs.host_changed(request.app, resp.host_id)
 
         # Default-public grant only once every launch step has been accepted, so a
         # rejected request never leaves a public session behind. Sub-agent
@@ -3567,6 +3568,7 @@ def register_core_routes(
                 result.agent_id,
                 runner_router,
                 init_body=notify_body,
+                conversation_store=conversation_store,
             )
         # Grant the creator ownership BEFORE scheduling the managed
         # launch, mirroring the JSON path: a managed-guard failure
@@ -3614,29 +3616,30 @@ def register_core_routes(
             from omnigent.models.model_catalog import spec_harness
 
             raw_harness = spec_harness(spec)
-            if getattr(request.app.state, "startup_admission", None) is not None:
-                assert parsed_metadata.workspace is not None
-                await _queue_caller_host_preparation(
-                    request,
-                    user_id=user_id,
-                    session_id=result.session_id,
-                    host_id=parsed_metadata.host_id,
-                    workspace=parsed_metadata.workspace,
-                )
-                from omnigent.server.startup_registration import (
-                    STARTUP_CREATE_PREPARATION_LABEL_KEY,
-                )
+            with creation_stage("create_host_launch_ms"):
+                if getattr(request.app.state, "startup_admission", None) is not None:
+                    assert parsed_metadata.workspace is not None
+                    await _queue_caller_host_preparation(
+                        request,
+                        user_id=user_id,
+                        session_id=result.session_id,
+                        host_id=parsed_metadata.host_id,
+                        workspace=parsed_metadata.workspace,
+                    )
+                    from omnigent.server.startup_registration import (
+                        STARTUP_CREATE_PREPARATION_LABEL_KEY,
+                    )
 
-                result.labels.pop(STARTUP_CREATE_PREPARATION_LABEL_KEY, None)
-            else:
-                await _bind_and_launch_on_caller_host(
-                    request,
-                    user_id=user_id,
-                    session_id=result.session_id,
-                    host_id=parsed_metadata.host_id,
-                    workspace=parsed_metadata.workspace,
-                    harness=canonicalize_harness(raw_harness) or raw_harness,
-                )
+                    result.labels.pop(STARTUP_CREATE_PREPARATION_LABEL_KEY, None)
+                else:
+                    await _bind_and_launch_on_caller_host(
+                        request,
+                        user_id=user_id,
+                        session_id=result.session_id,
+                        host_id=parsed_metadata.host_id,
+                        workspace=parsed_metadata.workspace,
+                        harness=canonicalize_harness(raw_harness) or raw_harness,
+                    )
         # Default-public grant only after the launch steps were accepted (see the
         # JSON path). Sub-agent children follow their parent's grants, whether or
         # not they inherited its runner.

@@ -41,6 +41,10 @@ from fastapi.routing import APIRoute
 
 from omnigent.errors import OmnigentError
 from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
+from omnigent.native.elicitation_reattach import (
+    HELD_POLL_READ_TIMEOUT_S,
+    PRE_RESOLVED_ELICITATION_TTL_S,
+)
 from omnigent.runtime import session_stream
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_timeouts,
@@ -2603,6 +2607,12 @@ async def test_pre_resolved_elicitation_tombstone_expires_before_hook_registrati
     live forever or resolve a much later prompt that reuses the same
     deterministic id.
     """
+    # The server's effective retention must be the one the hook times against,
+    # and outlast a silently dead poll's read timeout plus a reconnect.
+    assert sessions_route._HARNESS_PRE_RESOLVED_ELICITATION_TTL_S == (
+        PRE_RESOLVED_ELICITATION_TTL_S
+    )
+    assert sessions_route._HARNESS_PRE_RESOLVED_ELICITATION_TTL_S > HELD_POLL_READ_TIMEOUT_S + 30.0
     now = sessions_route.time.time()
     monkeypatch.setattr(
         sessions_route,

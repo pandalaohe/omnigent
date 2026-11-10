@@ -34,7 +34,10 @@ import { useScheduledHarnessSettings } from "./useScheduledHarnessSettings";
 import { reconcileSpeed } from "@/lib/speedTiers";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
-import { TriggerWorkerSettingsFields } from "./TriggerWorkerSettingsFields";
+import {
+  TriggerWorkerHarnessField,
+  TriggerWorkerSettingsFields,
+} from "./TriggerWorkerSettingsFields";
 import {
   combineTriggerPrompt,
   emptyTriggerFields,
@@ -47,6 +50,7 @@ import {
   triggerFieldsComplete,
   updateTriggerWorkerSettings,
   type TriggerFields,
+  type TriggerWorkerSettings,
   type TriggerSource,
 } from "@/components/scheduled/triggerTemplates";
 import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
@@ -66,6 +70,10 @@ import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
 import { partitionPickerEntries, selectableSessionAgents } from "@/lib/agentGrouping";
+import {
+  NEW_AUTOMATION_PERMISSION_MODES,
+  UNATTENDED_DISALLOWED_PERMISSION_MODES,
+} from "@/lib/nativeHarnessModes";
 import {
   isBackdropOverlay,
   isInsidePopper,
@@ -113,6 +121,14 @@ interface AutomationTypeDraft {
   sessionMode: ScheduledTaskSessionMode;
 }
 
+/**
+ * The saved mode to prefill when editing. A stored override may hold a mode
+ * automations refuse; it reverts to the harness default so saving sends null.
+ */
+function editablePermissionMode(mode: string | null | undefined): string {
+  return mode && !UNATTENDED_DISALLOWED_PERMISSION_MODES.has(mode) ? mode : "";
+}
+
 export function CreateScheduledTaskDialog({
   open,
   onOpenChange,
@@ -123,6 +139,7 @@ export function CreateScheduledTaskDialog({
   sessionLink = "",
   editingTask = null,
   currentProjectName = null,
+  onCreated,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -139,6 +156,8 @@ export function CreateScheduledTaskDialog({
    *  `?project=` route param); resolved against the projects list to pre-fill
    *  the Project select on create. */
   currentProjectName?: string | null;
+  /** Called once after a new automation is created (not after an edit). */
+  onCreated?: () => void;
 }) {
   const { data: agents } = useAvailableAgents({ enabled: open });
   const { data: customAgents } = useCustomAgents(open);
@@ -201,6 +220,8 @@ export function CreateScheduledTaskDialog({
   const [pickedEffort, setPickedEffort] = useState<string>("");
   const [pickedSpeed, setPickedSpeed] = useState<string>("");
   const [pickedPermission, setPickedPermission] = useState<string>("");
+  // "Default" and untouched are both "", so track the user's choice separately.
+  const [permissionPicked, setPermissionPicked] = useState(false);
 
   const curation = pickerCuration(info);
   const curationPending = info === "loading" || isBootFallbackInfo(info);
@@ -267,7 +288,6 @@ export function CreateScheduledTaskDialog({
 
   function handleSelectAgent(agent: AvailableAgent) {
     setPickedAgentId(agent.id);
-    setAdvancedOpen(true);
     // Settings belong to their harness. Returning to the edited task's agent
     // restores its saved values; selecting another agent clears them.
     const backToOriginal = isEdit && agent.id === editingTask?.agentId;
@@ -278,7 +298,8 @@ export function CreateScheduledTaskDialog({
       backToOriginal && originalTargetSelected ? (editingTask?.reasoningEffort ?? "") : "",
     );
     setPickedSpeed(backToOriginal && originalTargetSelected ? (editingTask?.speed ?? "") : "");
-    setPickedPermission(backToOriginal ? (editingTask?.permissionMode ?? "") : "");
+    setPickedPermission(backToOriginal ? editablePermissionMode(editingTask?.permissionMode) : "");
+    setPermissionPicked(false);
   }
 
   // ── Nested dropdown dismiss guard ─────────────────────────────────────────
@@ -441,7 +462,7 @@ export function CreateScheduledTaskDialog({
         setPickedModel(editingTask.modelOverride ?? "");
         setPickedEffort(editingTask.reasoningEffort ?? "");
         setPickedSpeed(editingTask.speed ?? "");
-        setPickedPermission(editingTask.permissionMode ?? "");
+        setPickedPermission(editablePermissionMode(editingTask.permissionMode));
         setSchedule(parsedSchedule ?? DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(parsedSchedule === null);
         setHostId(editingTask.hostId ?? "");
@@ -460,6 +481,7 @@ export function CreateScheduledTaskDialog({
         setPickedEffort("");
         setPickedSpeed("");
         setPickedPermission("");
+        setPermissionPicked(false);
         // The manager session must persist: it dedupes against its own workers.
         setSessionMode(initialTrigger ? "continue" : "new");
         setStartNewSession(false);
@@ -543,6 +565,14 @@ export function CreateScheduledTaskDialog({
   const hostOptions = hosts ?? [];
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
+  function handleWorkerSettingsChange(settings: TriggerWorkerSettings) {
+    const updated = updateTriggerWorkerSettings(effectivePrompt, settings);
+    if (updated === null) return;
+    const parts = splitTriggerPrompt(updated);
+    setPrompt(parts.userPrompt);
+    setSystemPrompt(parts.systemPrompt);
+  }
+
   const workerSettings = editingWorkerSettings
     ? readTriggerWorkerSettings(combineTriggerPrompt(prompt, systemPrompt))
     : null;
@@ -570,11 +600,20 @@ export function CreateScheduledTaskDialog({
   const supportsModel = harnessSettings.supportsModel;
   const supportsPermission = harnessSettings.permissions.length > 0;
   const supportsSpeed = harnessSettings.speedOptions.length > 0;
+  const newAutomationPermission =
+    !isEdit && !permissionPicked && harnessSettings.harness
+      ? NEW_AUTOMATION_PERMISSION_MODES[harnessSettings.harness]
+      : undefined;
+  const permissionChoice =
+    newAutomationPermission &&
+    harnessSettings.permissions.some((option) => option.value === newAutomationPermission)
+      ? newAutomationPermission
+      : pickedPermission;
   const effectivePermission =
     !["claude-native", "claude-sdk", "codex"].includes(harnessSettings.harness ?? "") &&
-    pickedPermission === "default"
+    permissionChoice === "default"
       ? ""
-      : pickedPermission;
+      : permissionChoice;
   const originalTargetSelected =
     editingTask?.executionTarget === "managed_sandbox"
       ? sandboxMode
@@ -718,7 +757,7 @@ export function CreateScheduledTaskDialog({
     ? (editingTask?.reasoningEffort ?? "")
     : pickedEffort;
   const displayedPermission = reusesExistingSession
-    ? (editingTask?.permissionMode ?? "")
+    ? editablePermissionMode(editingTask?.permissionMode)
     : effectivePermission;
   const summarySettings = editingWorkerSettings ? workerHarnessSettings : harnessSettings;
   const summaryModel = editingWorkerSettings ? (workerSettings?.model ?? "") : displayedModel;
@@ -803,6 +842,7 @@ export function CreateScheduledTaskDialog({
     setPickedEffort("");
     setPickedSpeed("");
     setPickedPermission("");
+    setPermissionPicked(false);
     setSchedule(DEFAULT_SCHEDULE_MODEL);
     setHostId("");
     setWorkspace("");
@@ -863,9 +903,13 @@ export function CreateScheduledTaskDialog({
         resolveProjectId,
       );
       if (editingTask) {
-        // Continued-session edits omit launch settings; new targets clear stale overrides.
+        // Continued-session edits omit launch settings, except to clear a stored
+        // permission override automations now refuse; new targets clear stale overrides.
         const overrides = reusesExistingSession
-          ? {}
+          ? editablePermissionMode(editingTask.permissionMode) !==
+            (editingTask.permissionMode ?? "")
+            ? { permissionMode: null }
+            : {}
           : {
               ...(supportsModel || !originalTargetSelected
                 ? {
@@ -922,6 +966,7 @@ export function CreateScheduledTaskDialog({
             ? { permissionMode: effectivePermission }
             : {}),
         });
+        onCreated?.();
       }
       handleOpenChange(false);
     } catch (err) {
@@ -1149,13 +1194,13 @@ export function CreateScheduledTaskDialog({
                         id="task-host"
                         data-testid="task-host-trigger"
                         className={cn(
-                          "w-full border-0 shadow-none text-muted-foreground",
+                          "w-auto min-w-0 max-w-full justify-self-end justify-end border-0 shadow-none text-muted-foreground",
                           pickerTriggerClass,
                         )}
                       >
                         <SelectValue placeholder={isEdit ? UNPINNED_HOST_LABEL : "Pick a host"} />
                       </SelectTrigger>
-                      <SelectContent position="popper" align="start">
+                      <SelectContent position="popper" align="end">
                         {(managedSandboxesEnabled || sandboxMode) && (
                           <SelectItem
                             value={SANDBOX_HOST}
@@ -1186,6 +1231,85 @@ export function CreateScheduledTaskDialog({
                       </p>
                     )}
                   </div>
+
+                  {editingWorkerSettings ? (
+                    workerSettings !== null &&
+                    editingTask && (
+                      <div className="border-t border-border pt-3">
+                        <TriggerWorkerHarnessField
+                          value={workerSettings}
+                          pollingAgentId={editingTask.agentId}
+                          agents={agentList}
+                          selectedAgent={workerAgent}
+                          disabled={curationPending}
+                          onSelectOpenChange={handleSelectOpenChange}
+                          onChange={handleWorkerSettingsChange}
+                        />
+                      </div>
+                    )
+                  ) : (
+                    <div
+                      className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-4 gap-y-2 border-t border-border pt-3 [&>p]:col-span-2"
+                      data-testid="task-agent-field"
+                    >
+                      <Label>Agent</Label>
+                      <div className="min-w-0 justify-self-end" data-testid="task-agent-picker">
+                        <AgentHarnessPicker
+                          agentEntries={agentEntries}
+                          harnessEntries={harnessEntries}
+                          effectiveAgentId={effectiveAgentId}
+                          agentLabel={agentLabel}
+                          hasAgents={selectedAgent !== undefined || agentList.length > 0}
+                          loading={curationPending}
+                          curatedEntries={
+                            curation.restrictToAgentNames.size > 0 ? agentList : undefined
+                          }
+                          // Sandboxes provision their own harnesses; host badges only apply to hosts.
+                          host={sandboxMode ? undefined : badgeHost}
+                          onSelectAgent={handleSelectAgent}
+                          pendingAgent={null}
+                          pendingAgentId="__unused_pending_agent__"
+                          onSelectPending={() => {}}
+                          // Custom-agent creation is inert until there is a way to
+                          // persist a new agent independently of creating a session.
+                          onCreateCustomAgent={() => {}}
+                          sandboxSelected={sandboxMode}
+                          allowCreateCustomAgent={false}
+                          open={agentMenuOpen}
+                          onOpenChange={changeAgentMenuOpen}
+                          // This picker is nested inside a Dialog. Radix DropdownMenu's
+                          // default modal mode can turn an inside-dialog click into a
+                          // parent Dialog outside interaction while the menu dismisses.
+                          dropdownModal={false}
+                          // The shared menu caps against available viewport height, so
+                          // constrained screens scroll without clipping taller screens.
+                          contentClassName="w-80"
+                          contentAlign="end"
+                          triggerClassName={cn(
+                            "h-8 max-w-full justify-end gap-1.5 rounded-lg border-0 bg-transparent pr-2 pl-2.5 text-muted-foreground shadow-none",
+                            pickerTriggerClass,
+                          )}
+                          triggerLabelClassName="min-w-0 max-w-none text-ui [&>span]:text-ui [&>span]:font-normal [&>span]:text-inherit"
+                        />
+                      </div>
+                      {customAgentMembers && (
+                        <p
+                          className="text-sm text-muted-foreground"
+                          data-testid="task-agent-members"
+                        >
+                          {customAgentMembers
+                            .map((member) => (member.lead ? `${member.name} (Lead)` : member.name))
+                            .join(", ")}
+                        </p>
+                      )}
+
+                      {agentChanged && (
+                        <p className="text-sm text-muted-foreground">
+                          Future runs use {agentLabel}; past runs keep the agent they ran with
+                        </p>
+                      )}
+                    </div>
+                  )}
 
                   {/* A trigger needs its one kept session, so its form leaves the choice out. */}
                   {sessionModesSupported &&
@@ -1500,19 +1624,10 @@ export function CreateScheduledTaskDialog({
                       {editingWorkerSettings && workerSettings !== null && editingTask ? (
                         <TriggerWorkerSettingsFields
                           value={workerSettings}
-                          pollingAgentId={editingTask.agentId}
-                          agents={agentList}
-                          selectedAgent={workerAgent}
                           settings={workerHarnessSettings}
                           disabled={curationPending}
                           onSelectOpenChange={handleSelectOpenChange}
-                          onChange={(settings) => {
-                            const updated = updateTriggerWorkerSettings(effectivePrompt, settings);
-                            if (updated === null) return;
-                            const parts = splitTriggerPrompt(updated);
-                            setPrompt(parts.userPrompt);
-                            setSystemPrompt(parts.systemPrompt);
-                          }}
+                          onChange={handleWorkerSettingsChange}
                         />
                       ) : editingWorkerSettings ? (
                         <p className="text-sm text-muted-foreground" role="status">
@@ -1521,74 +1636,11 @@ export function CreateScheduledTaskDialog({
                         </p>
                       ) : (
                         <>
-                          <div className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-4 gap-y-2 [&>p]:col-span-2">
-                            <Label>Agent</Label>
-                            <div
-                              className="min-w-0 justify-self-end"
-                              data-testid="task-agent-picker"
-                            >
-                              <AgentHarnessPicker
-                                agentEntries={agentEntries}
-                                harnessEntries={harnessEntries}
-                                effectiveAgentId={effectiveAgentId}
-                                agentLabel={agentLabel}
-                                hasAgents={selectedAgent !== undefined || agentList.length > 0}
-                                loading={curationPending}
-                                curatedEntries={
-                                  curation.restrictToAgentNames.size > 0 ? agentList : undefined
-                                }
-                                // Sandboxes provision their own harnesses; host badges only apply to hosts.
-                                host={sandboxMode ? undefined : badgeHost}
-                                onSelectAgent={handleSelectAgent}
-                                pendingAgent={null}
-                                pendingAgentId="__unused_pending_agent__"
-                                onSelectPending={() => {}}
-                                // Custom-agent creation is inert until there is a way to
-                                // persist a new agent independently of creating a session.
-                                onCreateCustomAgent={() => {}}
-                                sandboxSelected={sandboxMode}
-                                allowCreateCustomAgent={false}
-                                open={agentMenuOpen}
-                                onOpenChange={changeAgentMenuOpen}
-                                // This picker is nested inside a Dialog. Radix DropdownMenu's
-                                // default modal mode can turn an inside-dialog click into a
-                                // parent Dialog outside interaction while the menu dismisses.
-                                dropdownModal={false}
-                                // The shared menu caps against available viewport height, so
-                                // constrained screens scroll without clipping taller screens.
-                                contentClassName="w-80"
-                                contentAlign="end"
-                                triggerClassName={cn(
-                                  "h-8 max-w-full justify-end gap-1.5 rounded-lg border-0 bg-transparent pr-2 pl-2.5 text-muted-foreground shadow-none",
-                                  pickerTriggerClass,
-                                )}
-                                triggerLabelClassName="min-w-0 max-w-none text-ui [&>span]:text-ui [&>span]:font-normal [&>span]:text-inherit"
-                              />
-                            </div>
-                            {customAgentMembers && (
-                              <p
-                                className="text-sm text-muted-foreground"
-                                data-testid="task-agent-members"
-                              >
-                                {customAgentMembers
-                                  .map((member) =>
-                                    member.lead ? `${member.name} (Lead)` : member.name,
-                                  )
-                                  .join(", ")}
-                              </p>
-                            )}
-                            {agentChanged && (
-                              <p className="text-sm text-muted-foreground">
-                                Future runs use {agentLabel}; past runs keep the agent they ran with
-                              </p>
-                            )}
-                            {!showAdvanced && (
-                              <p className="text-sm text-muted-foreground">
-                                Uses this agent&apos;s default model, effort, and permission
-                                settings
-                              </p>
-                            )}
-                          </div>
+                          {!showAdvanced && (
+                            <p className="text-sm text-muted-foreground">
+                              Uses this agent&apos;s default model, effort, and permission settings
+                            </p>
+                          )}
 
                           {harnessSettings.blockedReason && (
                             <p
@@ -1614,7 +1666,10 @@ export function CreateScheduledTaskDialog({
                                 onModelChange={handleModelChange}
                                 onEffortChange={setPickedEffort}
                                 onSpeedChange={setPickedSpeed}
-                                onPermissionModeChange={setPickedPermission}
+                                onPermissionModeChange={(mode) => {
+                                  setPickedPermission(mode);
+                                  setPermissionPicked(true);
+                                }}
                                 onSelectOpenChange={handleSelectOpenChange}
                               />
                               {reusesExistingSession ? (

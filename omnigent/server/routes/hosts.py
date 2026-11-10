@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import logging
 import secrets
+import time
 import weakref
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal, cast
@@ -2305,11 +2306,13 @@ def create_hosts_router(
             ) from None
 
         launch_timeout_s = resolve_launch_timeout_s()
+        launch_sent_at = time.monotonic()
         try:
             result = await asyncio.wait_for(
                 future,
                 timeout=launch_timeout_s,
             )
+            add_audit_attrs(host_launch_ack_ms=round((time.monotonic() - launch_sent_at) * 1000))
         except TimeoutError:
             conn.pending_launches.pop(request_id, None)
             # An unacknowledged admitted runner may still start. Retain its binding

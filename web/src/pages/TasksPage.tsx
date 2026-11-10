@@ -129,6 +129,22 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
     setManualOpen(true);
   }
 
+  // After an automation is created, show the list with filters cleared so the
+  // new row is visible (creating from a template starts on the gallery view).
+  function handleCreated() {
+    setFilter("all");
+    setSearch("");
+    if (view !== "yours") {
+      requestedView.current = "yours";
+      setSearchParams((current) => {
+        const next = new URLSearchParams(current);
+        next.delete("view");
+        return next;
+      });
+    }
+    showToast("Automation created");
+  }
+
   function handleManualOpenChange(next: boolean) {
     setManualOpen(next);
     if (!next) {
@@ -230,6 +246,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
       sessionLink={sessionLink}
       editingTask={editingTask}
       currentProjectName={currentProjectName}
+      onCreated={handleCreated}
     />
   );
 

@@ -31,6 +31,7 @@ import {
   applyUiFontFamily,
   readUiFontFamily,
 } from "./lib/uiFontPreferences";
+import { migrateLegacyProjectFolderPagination } from "./lib/projectFolderPaginationPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
 import { initChatStore } from "./store/chatStore";
@@ -113,6 +114,7 @@ if (typeof window !== "undefined") {
     // localStorage access errors are non-fatal.
   }
 }
+migrateLegacyProjectFolderPagination();
 
 // Apply the saved color palette (data-theme on <html>) before first paint too,
 // so the app renders in the chosen theme rather than flashing the brand default.

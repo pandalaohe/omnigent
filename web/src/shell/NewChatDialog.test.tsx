@@ -8163,6 +8163,7 @@ describe("NewChatLandingScreen", () => {
 
   it.each([
     ["ask-for-approval", "Ask for approval"],
+    ["approve-for-me", "Approve for me"],
     ["full-access", "Full Access"],
     ["read-only", "Read Only"],
     ["bypass", "Bypass approvals & sandbox"],
@@ -8300,6 +8301,30 @@ describe("NewChatLandingScreen", () => {
         "workspace-write",
         "-c",
         'approvals_reviewer="user"',
+      ],
+    ],
+    [
+      "ask-for-approval",
+      "Ask for approval",
+      [
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "on-request",
+        "-c",
+        'approvals_reviewer="user"',
+      ],
+    ],
+    [
+      "approve-for-me",
+      "Approve for me",
+      [
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "on-request",
+        "-c",
+        'approvals_reviewer="auto_review"',
       ],
     ],
     [
@@ -8718,6 +8743,14 @@ describe("NewChatLandingScreen", () => {
 
     expect(row).not.toHaveAttribute("aria-disabled");
     expect(screen.queryByRole("tooltip")).toBeNull();
+  });
+
+  it("names the model-picker shortcut in the picker's tooltip", async () => {
+    renderLanding();
+    fireEvent.focus(screen.getByTestId("new-chat-landing-agent-select"));
+    expect(await screen.findByTestId("new-chat-landing-agent-tooltip")).toHaveTextContent(
+      "Open model picker",
+    );
   });
 
   it("replaces a selected broken harness model label with a warning tooltip", async () => {

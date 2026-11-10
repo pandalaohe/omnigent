@@ -225,6 +225,7 @@ from omnigent.runner.subagent_work import (
     _deliver_subagent_completion,
     _deliver_subagent_wake_post,
     _fetch_latest_assistant_item,
+    _format_async_result_wake_notice,
     _format_subagent_wake_notice,
     _get_recovery_page,
     _held_successions,
@@ -453,6 +454,10 @@ _IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
 _server_version: str | None = None
+# Whether the server on the current connection said, in an init envelope or a
+# session stream request, that it accepts pane-inferred status edges. A
+# reconnect clears it.
+_server_accepts_inferred_status = False
 
 
 def _acknowledge_settings_rollback(response: Response) -> JSONResponse:
@@ -1839,31 +1844,6 @@ async def check_remote_member_liveness(
     return failed
 
 
-def _format_async_result_wake_notice(
-    *,
-    handle_id: str,
-    tool_name: str,
-    status: str,
-    pending: int,
-) -> str:
-    """
-    Build the framework notice that wakes a session after an async tool finishes.
-
-    :param handle_id: Async task handle, e.g. ``"handle_a1b2c3"``.
-    :param tool_name: The dispatched tool name, e.g. ``"sys_os_shell"``.
-    :param status: Inbox item status, e.g. ``"completed"`` or ``"failed"``.
-    :param pending: Number of undrained items in the session's inbox, e.g. ``1``.
-    :returns: A ``[System: ...]`` notice string, e.g. ``"[System: async task
-        handle_a1b2c3 (sys_os_shell) finished (completed) — 1 result waiting in
-        inbox. Call sys_read_inbox to collect.]"``.
-    """
-    noun = "result" if pending == 1 else "results"
-    return (
-        f"[System: async task {handle_id} ({tool_name}) finished ({status}) — "
-        f"{pending} {noun} waiting in inbox. Call sys_read_inbox to collect.]"
-    )
-
-
 # Max length of a child message preview mirrored to the parent stream.
 # Matches the server-side ``_latest_message_preview`` truncation so the
 # live runner-pushed preview and the snapshot preview look the same.
@@ -2135,6 +2115,7 @@ def create_runner_app(
         resolving host credentials again for every terminal launch.
     :param native_pane_idle_timeout_s: Resolved native-pane idle timeout. ``0``
         disables reaping; ``None`` uses the pane environment override or default.
+        Sub-agent panes are capped at the native-pane default window.
     """
     import hmac
 
@@ -2861,6 +2842,11 @@ def create_runner_app(
     # Single-flight holder for the paced stranded-wake retry loop, so
     # back-to-back reconnects don't stack concurrent retry loops.
     _stranded_wake_retry_task: list[asyncio.Task[None]] = []
+    # Latest finished sys_call_async result per session:
+    # (finished_at, handle_id, tool_name, status).
+    _latest_async_results: dict[str, tuple[float, str, str, str]] = {}
+    # Sessions whose background result landed mid-turn; turn end decides on the wake.
+    _deferred_async_result_wakes: set[str] = set()
 
     _session_histories = _session_histories_ref
     _last_server_item_id: dict[str, str] = {}
@@ -3187,6 +3173,7 @@ def create_runner_app(
         background_tasks: list[dict[str, object]] | None = None,
         *,
         failure_detail: str | None = None,
+        inferred: bool = False,
     ) -> None:
         hold_until = _keep_warm_status_hold.get(session_id)
         if hold_until is not None:
@@ -3240,9 +3227,14 @@ def create_runner_app(
             _session_background_task_counts[session_id] = background_task_count
         if background_tasks is not None:
             event["background_tasks"] = background_tasks
+        if inferred:
+            event["inferred"] = True
         _publish_event(session_id, event)
 
-    resource_registry.set_session_status_publisher(_publish_session_status)
+    resource_registry.set_session_status_publisher(
+        _publish_session_status,
+        accepts_inferred_status=lambda: _server_accepts_inferred_status,
+    )
     resource_registry.set_session_failure_publisher(
         lambda session_id, detail: _publish_session_status(
             session_id, "failed", failure_detail=detail
@@ -3811,8 +3803,9 @@ def create_runner_app(
             raise ValueError("session initialization envelope identity mismatch")
         validate_runner_inference_config(envelope.snapshot.inference_config)
 
-        global _server_version
+        global _server_version, _server_accepts_inferred_status
         _server_version = envelope.server_version
+        _server_accepts_inferred_status = envelope.accepts_inferred_status
         snapshot = envelope.snapshot
         _session_instructions_overrides[session_id] = snapshot.instructions_override
         set_session_member_entries(session_id, snapshot.labels)
@@ -5283,7 +5276,14 @@ def create_runner_app(
         )
 
     @app.get("/v1/sessions/{session_id}/stream")
-    async def stream_session(session_id: str) -> StreamingResponse:
+    async def stream_session(
+        session_id: str, accepts_inferred_status: bool = False
+    ) -> StreamingResponse:
+        global _server_accepts_inferred_status
+        # A reconnecting server reopens every bound session's stream, idle ones included.
+        if accepts_inferred_status:
+            _server_accepts_inferred_status = True
+
         async def _event_generator() -> AsyncIterator[bytes]:
             queue = _session_event_queues.get(session_id)
             if queue is None:
@@ -5301,6 +5301,9 @@ def create_runner_app(
                     continue
                 if event is None:
                     break
+                # Drop inferred edges queued before a reconnect until the new server accepts them.
+                if event.get("inferred") is True and not _server_accepts_inferred_status:
+                    continue
                 frame = "data: " + json.dumps(event) + "\n\n"
                 try:
                     yield frame.encode("utf-8")
@@ -5686,7 +5689,8 @@ def create_runner_app(
         _subagent_wake_pending.discard(session_id)
         _stranded_wake_parents.discard(session_id)
         _last_rewake_notice.pop(session_id, None)
-        _last_async_result.pop(session_id, None)
+        _latest_async_results.pop(session_id, None)
+        _deferred_async_result_wakes.discard(session_id)
         _session_sub_agent_names.pop(session_id, None)
         unregister_child_session(session_id)
         unregister_subagent_work_for_session(session_id)
@@ -7992,6 +7996,39 @@ def create_runner_app(
         """Whether this child's terminal result owes its parent an inbox wake."""
         return entry_owes_parent_wake(entry, _session_harness_name(entry.parent_session_id))
 
+    def _schedule_inbox_wake(
+        session_id: str,
+        notice_for_pending: Callable[[int], str],
+        *,
+        source_id: str,
+        created_by: str | None,
+        is_rewake: bool = False,
+    ) -> None:
+        inbox = _session_inboxes.get(session_id)
+        if inbox is None:
+            return
+        if session_id in _subagent_wake_pending:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        notice = notice_for_pending(inbox.qsize())
+        if is_rewake and notice == _last_rewake_notice.get(session_id):
+            return
+        _subagent_wake_pending.add(session_id)
+        _wake_task = loop.create_task(
+            _post_subagent_wake_notice(
+                session_id,
+                notice,
+                source_id,
+                created_by,
+                is_rewake=is_rewake,
+            )
+        )
+        _wake_task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(_wake_task)
+
     def _schedule_subagent_wake(entry: _SubagentWorkEntry, *, is_rewake: bool = False) -> None:
         if entry.parent_session_id == entry.child_session_id:
             return
@@ -8014,80 +8051,80 @@ def create_runner_app(
                 extra={"session_id": runner_primary_session_id()},
             )
             return
-        inbox = _session_inboxes.get(entry.parent_session_id)
+        _schedule_inbox_wake(
+            entry.parent_session_id,
+            lambda pending: _format_subagent_wake_notice(
+                agent=entry.agent,
+                title=entry.title,
+                status=entry.status,
+                pending=pending,
+                placement_label=entry.placement_label,
+                output=entry.output,
+            ),
+            source_id=entry.child_session_id,
+            created_by=entry.created_by,
+            is_rewake=is_rewake,
+        )
+
+    def _schedule_async_result_wake(session_id: str, *, is_rewake: bool = False) -> None:
+        latest = _latest_async_results.get(session_id)
+        if latest is None:
+            return
+        _finished_at, handle_id, tool_name, status = latest
+        _schedule_inbox_wake(
+            session_id,
+            lambda pending: _format_async_result_wake_notice(
+                handle_id=handle_id, tool_name=tool_name, status=status, pending=pending
+            ),
+            source_id=handle_id,
+            created_by=None,
+            is_rewake=is_rewake,
+        )
+
+    def _unread_inbox_handle_ids(session_id: str) -> set[str]:
+        inbox = _session_inboxes.get(session_id)
         if inbox is None:
-            return
-        if entry.parent_session_id in _subagent_wake_pending:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        notice = _format_subagent_wake_notice(
-            agent=entry.agent,
-            title=entry.title,
-            status=entry.status,
-            pending=inbox.qsize(),
-            placement_label=entry.placement_label,
-            output=entry.output,
-        )
-        if is_rewake and notice == _last_rewake_notice.get(entry.parent_session_id):
-            return
-        _subagent_wake_pending.add(entry.parent_session_id)
-        _wake_task = loop.create_task(
-            _post_subagent_wake_notice(
-                entry.parent_session_id,
-                notice,
-                entry.child_session_id,
-                entry.created_by,
-                is_rewake=is_rewake,
-            )
-        )
-        _wake_task.add_done_callback(_background_tasks.discard)
-        _background_tasks.add(_wake_task)
+            return set()
+        # asyncio.Queue has no peek; cycling it without awaiting keeps its order.
+        items = [inbox.get_nowait() for _ in range(inbox.qsize())]
+        for item in items:
+            inbox.put_nowait(item)
+        return {handle_id for item in items if isinstance(handle_id := item.get("handle_id"), str)}
 
-    # Latest async-result wake per parent. The stranded-wake rescue paths
-    # normally replay a sub-agent work entry; an inbox holding only async
-    # results has none, so they replay these recorded arguments instead.
-    _last_async_result: dict[str, tuple[str, str, str]] = {}
+    def _schedule_latest_inbox_wake(session_id: str, *, is_rewake: bool = False) -> None:
+        # Only a completion still waiting in the inbox is worth announcing.
+        unread = _unread_inbox_handle_ids(session_id)
+        latest_async = _latest_async_results.get(session_id)
+        if latest_async is not None and latest_async[1] not in unread:
+            _latest_async_results.pop(session_id, None)
+            latest_async = None
+        latest_work = latest_wake_eligible_subagent_work(
+            [
+                entry
+                for entry in list_subagent_work(session_id)
+                if entry.delivered and entry.child_session_id in unread
+            ],
+            _session_harness_name(session_id),
+        )
+        if latest_async is not None and (
+            latest_work is None or latest_async[0] >= (latest_work.completed_at or 0.0)
+        ):
+            _schedule_async_result_wake(session_id, is_rewake=is_rewake)
+        elif latest_work is not None:
+            _schedule_subagent_wake(latest_work, is_rewake=is_rewake)
 
-    def _wake_for_async_result(
-        parent_id: str,
-        handle_id: str,
-        tool_name: str,
-        status: str,
-        *,
-        is_rewake: bool = False,
+    def _wake_on_async_result(
+        session_id: str, handle_id: str, tool_name: str, status: str
     ) -> None:
-        _last_async_result[parent_id] = (handle_id, tool_name, status)
-        # Reuse the sub-agent wake path: an already-drained inbox needs no wake,
-        # and one pending wake covers every item queued behind it.
-        inbox = _session_inboxes.get(parent_id)
-        if inbox is None or inbox.empty():
+        _latest_async_results[session_id] = (time.time(), handle_id, tool_name, status)
+        if session_id in _active_turns:
+            # The running turn may drain the result itself; its end decides.
+            _deferred_async_result_wakes.add(session_id)
             return
-        if parent_id in _subagent_wake_pending:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        notice = _format_async_result_wake_notice(
-            handle_id=handle_id,
-            tool_name=tool_name,
-            status=status,
-            pending=inbox.qsize(),
-        )
-        if is_rewake and notice == _last_rewake_notice.get(parent_id):
-            return
-        _subagent_wake_pending.add(parent_id)
-        wake_task = loop.create_task(
-            _post_subagent_wake_notice(parent_id, notice, handle_id, None, is_rewake=is_rewake)
-        )
-        wake_task.add_done_callback(_background_tasks.discard)
-        _background_tasks.add(wake_task)
+        _schedule_async_result_wake(session_id)
 
     global _async_result_waker
-    _async_result_waker = _wake_for_async_result
+    _async_result_waker = _wake_on_async_result
 
     def _wake_for_delivered_result(entry: _SubagentWorkEntry) -> None:
         _stamp_subagent_result_item_soon(
@@ -8102,32 +8139,29 @@ def create_runner_app(
     def _rewake_parent_if_inbox_stranded(parent_session_id: str) -> None:
         inbox = _session_inboxes.get(parent_session_id)
         drained = inbox is None or inbox.empty()
+        deferred_async_wake = parent_session_id in _deferred_async_result_wakes
+        _deferred_async_result_wakes.discard(parent_session_id)
         if drained:
             # A drained inbox ends the stranding episode, so the recorded
             # re-wake no longer describes outstanding work; forget it or a
             # later episode's matching notice is wrongly deduped.
             _last_rewake_notice.pop(parent_session_id, None)
-            _last_async_result.pop(parent_session_id, None)
+            _latest_async_results.pop(parent_session_id, None)
             _stranded_wake_parents.discard(parent_session_id)
         # A parent whose wake POST exhausted its retries has no pending flag,
         # but its inbox still holds an undelivered result — rescue it too.
         stranded_retry = parent_session_id in _stranded_wake_parents
-        if parent_session_id not in _subagent_wake_pending and not stranded_retry:
+        if (
+            parent_session_id not in _subagent_wake_pending
+            and not stranded_retry
+            and not deferred_async_wake
+        ):
             return
         _subagent_wake_pending.discard(parent_session_id)
         _stranded_wake_parents.discard(parent_session_id)
         if drained:
             return
-        latest = latest_wake_eligible_subagent_work(
-            list_subagent_work(parent_session_id),
-            _session_harness_name(parent_session_id),
-        )
-        if latest is None:
-            last_async = _last_async_result.get(parent_session_id)
-            if last_async is not None:
-                _wake_for_async_result(parent_session_id, *last_async, is_rewake=True)
-            return
-        _schedule_subagent_wake(latest, is_rewake=True)
+        _schedule_latest_inbox_wake(parent_session_id, is_rewake=True)
 
     async def _retry_stranded_wakes_soon() -> None:
         # Paced rounds: a failed re-attempt lands the parent back in
@@ -8145,14 +8179,6 @@ def create_runner_app(
                 inbox = _session_inboxes.get(parent_id)
                 if inbox is None or inbox.empty():
                     continue
-                latest = latest_wake_eligible_subagent_work(
-                    list_subagent_work(parent_id), _session_harness_name(parent_id)
-                )
-                if latest is None:
-                    last_async = _last_async_result.get(parent_id)
-                    if last_async is not None:
-                        _wake_for_async_result(parent_id, *last_async)
-                    continue
                 _logger.info(
                     "Re-attempting stranded sub-agent wake for parent=%s after reconnect",
                     parent_id,
@@ -8161,7 +8187,7 @@ def create_runner_app(
                 # Deliberately not is_rewake=True: skip the _last_rewake_notice
                 # dedup so the notice always re-sends after a reconnect; the
                 # drained-inbox check above prevents true duplicates.
-                _schedule_subagent_wake(latest)
+                _schedule_latest_inbox_wake(parent_id)
 
     def _retry_stranded_wakes() -> None:
         # A wake POST that exhausted its bounded retries (the server was down
@@ -8939,6 +8965,26 @@ def create_runner_app(
             from omnigent.runner.slow_io import run_slow_io
             from omnigent.runner.tool_dispatch import _maybe_signal_changed_files
 
+            async def _read_text(path: str) -> str | None:
+                environment = resource_registry.resolve_environment(
+                    _captured_session_id, "default", relay_spec
+                )
+                result = await environment.read(path, max_bytes=1_048_576, regular_only=True)
+                content = result.get("content")
+                return content if not result.get("error") and isinstance(content, str) else None
+
+            async def _read_edited_text(path: str) -> str | None:
+                try:
+                    return await _read_text(path)
+                except Exception:
+                    _logger.debug(
+                        "could not read %r after a native edit",
+                        path,
+                        exc_info=True,
+                        extra={"session_id": _captured_session_id},
+                    )
+                    return None
+
             try:
                 changes = native_file_changes(payload)
                 if not changes:
@@ -8950,20 +8996,11 @@ def create_runner_app(
                     for change in changes:
                         try:
                             if registry.needs_snapshot(change.path):
-                                current = None
-                                if change.patch is not None:
-                                    environment = resource_registry.resolve_environment(
-                                        _captured_session_id, "default", relay_spec
-                                    )
-                                    result = await environment.read(
-                                        change.move_path or change.path,
-                                        max_bytes=1_048_576,
-                                        regular_only=True,
-                                    )
-                                    if not result.get("error") and isinstance(
-                                        result.get("content"), str
-                                    ):
-                                        current = result["content"]
+                                current = (
+                                    await _read_text(change.move_path or change.path)
+                                    if change.patch is not None
+                                    else None
+                                )
                                 original = await run_slow_io(
                                     resolve_native_original, change, current
                                 )
@@ -8979,7 +9016,12 @@ def create_runner_app(
                                 exc_info=True,
                                 extra={"session_id": _captured_session_id},
                             )
-                        registry.record_change(change.path, change.operation, _captured_session_id)
+                        await registry.record_tracked_change(
+                            change.path,
+                            change.operation,
+                            _captured_session_id,
+                            functools.partial(_read_edited_text, change.path),
+                        )
                 _maybe_signal_changed_files(
                     _captured_session_id,
                     _publish_event,
@@ -10904,6 +10946,7 @@ def create_runner_app(
                                                     skill_bundle_dir=_resolved_spec_workdir(
                                                         _spec_for_dispatch_entry
                                                     ),
+                                                    wake_on_async_result=_wake_on_async_result,
                                                 )
                                             )
                                         )
@@ -14008,9 +14051,13 @@ def create_runner_app(
         server_client=server_client,
         spec_resolver=spec_resolver,
         terminal_registry=terminal_registry,
+        wake_on_async_result=_wake_on_async_result,
     )
 
     async def _catch_up_scan() -> None:
+        global _server_accepts_inferred_status
+        # The new connection may reach an older server; it must accept inferred status anew.
+        _server_accepts_inferred_status = False
         recreated_prompts = pending_approvals.notify_server_reconnect()
         if recreated_prompts:
             _logger.info(
@@ -14148,7 +14195,16 @@ def create_runner_app(
                 ):
                     instance = _pane_reaper_registry.get(conv_id, name, "main")
                     if instance is not None:
-                        panes.append(PaneRef(conv_id, terminal_id, name, socket_path, instance))
+                        panes.append(
+                            PaneRef(
+                                conv_id,
+                                terminal_id,
+                                name,
+                                socket_path,
+                                instance,
+                                sub_agent=_is_sub_agent_session(conv_id),
+                            )
+                        )
             return panes
 
         async def _server_confirms_turn_in_flight(conv_id: str) -> bool:

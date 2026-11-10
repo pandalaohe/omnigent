@@ -58,6 +58,12 @@ describe("isSettingsHotkey", () => {
       true,
     );
   });
+
+  it("leaves Settings to the desktop menu, which owns Cmd/Ctrl+,", () => {
+    const chord = event({ code: "Comma", metaKey: true, altKey: true });
+    expect(isSettingsHotkey(chord, true, false)).toBe(true);
+    expect(isSettingsHotkey(chord, true, true)).toBe(false);
+  });
 });
 
 describe("useSettingsHotkey", () => {

@@ -197,6 +197,21 @@ export function parseAskUserQuestionPreview(preview: string): AskUserQuestionPay
 }
 
 /**
+ * The AskUserQuestion payload an elicitation renders as its form: the
+ * structured field when present, else the legacy content preview. Null
+ * when the elicitation is not an AskUserQuestion.
+ */
+export function askUserQuestionPayloadOf(elicitation: {
+  askUserQuestion?: Record<string, unknown> | null;
+  contentPreview: string;
+}): AskUserQuestionPayload | null {
+  return (
+    castAskUserQuestionPayload(elicitation.askUserQuestion) ??
+    parseAskUserQuestionPreview(elicitation.contentPreview)
+  );
+}
+
+/**
  * Plan markdown from an ExitPlanMode elicitation's ``exit_plan_mode``
  * extra, or ``null``.
  *
@@ -247,9 +262,7 @@ export function userInputElicitationKey(elicitation: {
   exitPlanMode?: Record<string, unknown> | null;
   contentPreview: string;
 }): string | null {
-  const questions =
-    castAskUserQuestionPayload(elicitation.askUserQuestion) ??
-    parseAskUserQuestionPreview(elicitation.contentPreview);
+  const questions = askUserQuestionPayloadOf(elicitation);
   if (questions !== null) {
     const ids = questions.questions.map((q) => q.id);
     if (ids.length > 0 && ids.every((id) => typeof id === "string" && id !== "")) {

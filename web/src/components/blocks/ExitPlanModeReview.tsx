@@ -21,6 +21,7 @@
 
 import { CheckIcon, SquareIcon, XIcon, ZapIcon } from "lucide-react";
 import { useState } from "react";
+import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 import { Textarea } from "@/components/ui/textarea";
@@ -37,6 +38,8 @@ interface ExitPlanModeReviewProps {
   /** Reject; `feedback` is the user's typed revision guidance (`""` when none). */
   onReject: (feedback: string) => void;
   onAbort?: () => void;
+  /** The approve chord, when it would press "Yes, manually approve edits". */
+  acceptKeys?: readonly string[];
 }
 
 export function ExitPlanModeReview({
@@ -45,6 +48,7 @@ export function ExitPlanModeReview({
   onAccept,
   onReject,
   onAbort,
+  acceptKeys,
 }: ExitPlanModeReviewProps) {
   const [rejecting, setRejecting] = useState(false);
   const [feedback, setFeedback] = useState("");
@@ -115,16 +119,18 @@ export function ExitPlanModeReview({
             <ZapIcon className="mr-1 size-3.5" />
             Yes, and use auto mode
           </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            className={MOBILE_CHOICE_CLASS}
-            onClick={onAccept}
-            componentId="plan.accept_manual"
-          >
-            <CheckIcon className="mr-1 size-3.5" />
-            Yes, manually approve edits
-          </Button>
+          <KeyboardShortcutTooltip label="Yes, manually approve edits" keys={acceptKeys}>
+            <Button
+              size="sm"
+              variant="outline"
+              className={MOBILE_CHOICE_CLASS}
+              onClick={onAccept}
+              componentId="plan.accept_manual"
+            >
+              <CheckIcon className="mr-1 size-3.5" />
+              Yes, manually approve edits
+            </Button>
+          </KeyboardShortcutTooltip>
           <Button
             size="sm"
             variant="outline"

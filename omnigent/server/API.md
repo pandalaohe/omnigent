@@ -575,6 +575,10 @@ Request parts:
     confirmed before a turn. Other harnesses accept the shared effort values
     (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`). Explicit
     null clears an ACP override rather than selecting a literal `default` value.
+    `model_override` and `reasoning_effort` are session-level and win over
+    the uploaded bundle's `executor.model` / `executor.reasoning_effort`, as on
+    the JSON create. Servers that accept `model_override` here report
+    `session_bundle_model_override` in `GET /v1/info`; older ones reject it.
     `terminal_launch_args` carries pass-through CLI args for a native
     terminal wrapper, e.g. `["--permission-mode", "bypassPermissions"]`
     (same field as the JSON create path below). Unknown fields fail with 400.

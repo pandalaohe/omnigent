@@ -24,8 +24,9 @@ export type OpenFileOptions = Partial<FilePosition> & {
   preview?: boolean;
 };
 
+/** `path` is where the viewer goes next; null when its tab closes or the session is left. */
 export type FileNavigationGuard = (
-  path: string,
+  path: string | null,
   options: OpenFileOptions | undefined,
   navigate: () => void,
 ) => void;
@@ -34,6 +35,8 @@ interface FileViewerContextType {
   openFile: (path: string, options?: OpenFileOptions) => void;
   /** The mounted viewer confirms dirty navigation before selection or URL changes. */
   registerNavigationGuard?: (guard: FileNavigationGuard) => () => void;
+  /** Runs the registered guards, then `commit` once the viewer allows leaving its file. */
+  guardFileNavigation?: FileNavigationGuard;
   /** Open Pull Requests in the workspace rail or mobile drawer. */
   openGithubTab: () => void;
   /** Show a host-absolute folder in the Files tree; absent where no Files panel exists. */

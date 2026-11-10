@@ -1,4 +1,4 @@
-import type { FilePosition, OpenFileOptions } from "./FileViewerContext";
+import { type FilePosition, FileViewerContext, type OpenFileOptions } from "./FileViewerContext";
 import {
   BotIcon,
   ArchiveIcon,
@@ -28,6 +28,7 @@ import {
   memo,
   Suspense,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -42,6 +43,9 @@ import {
   useKeyboardShortcutsVersion,
   useShortcutHint,
 } from "@/components/KeyboardShortcut";
+import { useDesktopCommand } from "@/lib/desktopCommands";
+
+import { focusedBrowserView } from "@/lib/nativeBridge";
 import {
   type DefaultWorkspaceTab,
   defaultWorkspaceTabs,
@@ -50,6 +54,9 @@ import {
 } from "@/lib/workspaceTabPreferences";
 import {
   eventMatchesShortcutAction,
+  isShortcutActionEnabled,
+  resolveShortcutBindings,
+  shortcutAriaKeys,
   type ShortcutActionId,
 } from "@/lib/keyboardShortcutPreferences";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
@@ -75,7 +82,8 @@ import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import { useWorkspaceTabHotkeys } from "@/hooks/useWorkspaceTabHotkeys";
 import { useSideChats } from "@/hooks/useSideChats";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { SideChatPicker } from "./SideChatPicker";
+import { useQuery } from "@tanstack/react-query";
+import { authenticatedFetch } from "@/lib/identity";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { SUBAGENT_TAB_FALLBACK_LABEL, SubagentTabPane, useSubagentTabLabels } from "./SubagentTab";
 import { type SubagentPanelOpener, SubagentPanelOpenerContext } from "./subagentPanelOpener";
@@ -92,10 +100,11 @@ import {
   terminalTabKey,
   useCreateTerminal,
   useTerminals,
+  type TerminalInfo,
 } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
-import { WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
+import { scrollTabIntoView, WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
 import { FilesPanel } from "./FilesPanel";
 import { ContentSearchPanel } from "./ContentSearchPanel";
 import { FileViewer } from "./FileViewer";
@@ -222,6 +231,7 @@ function NewTabMenu({
   onOpenPanel,
   onOpenTerminal,
   onOpenBrowser,
+  onOpen,
   onOpenSideChat,
   onCreateStart,
   onCreateError,
@@ -234,6 +244,8 @@ function NewTabMenu({
   /** Open a freshly-created terminal as a rail tab by its tab key. */
   onOpenTerminal: (key: string) => void;
   onOpenBrowser?: () => void;
+  /** Called as the menu opens, before it takes focus, so its caller can note what had it. */
+  onOpen?: () => void;
   /** Open a new side chat (a fork of this conversation) as a rail tab. Absent
    *  when the session can't host one (e.g. Codex uses its typed `/side`). */
   onOpenSideChat?: () => void;
@@ -242,7 +254,8 @@ function NewTabMenu({
   onCreateStart?: () => void;
   /** Called when the shell create POST fails, so the caller can disarm the
    *  focus snapshot armed by ``onCreateStart``. */
-  onCreateError?: () => void;
+  /** The create failed; *opened* is the shell tab opened early, if any. */
+  onCreateError?: (opened?: TerminalInfo) => void;
   /** Open session's derived liveness — drives the "Shell" item's connect
    *  affordance. Absent is treated as ready. */
   liveness?: SessionLiveness;
@@ -260,6 +273,10 @@ function NewTabMenu({
   const [preferred, setPreferred] = useState<string | null>(() => readPreferredShell());
   // Controlled so a launch can force the menu closed on select.
   const [menuOpen, setMenuOpen] = useState(false);
+  const onMenuOpenChange = (open: boolean) => {
+    if (open) onOpen?.();
+    setMenuOpen(open);
+  };
   // Shell access mirrors NewTerminalButton's gate: the agent's spec must
   // declare a non-empty ``terminals:`` block.
   const declaredTerminals = agent?.terminals ?? [];
@@ -277,9 +294,10 @@ function NewTabMenu({
     // (runner-asleep) session the POST can lag the tab's arrival by seconds;
     // ``onOpenTerminal`` on success is a backstop for when it's already open.
     onCreateStart?.();
-    create.mutate(elevated ? { terminal: name, elevated: true } : name, {
-      onSuccess: (info) => onOpenTerminal(terminalTabKey(info)),
-      onError: () => onCreateError?.(),
+    create.launch(name, {
+      elevated,
+      onOpen: (info) => onOpenTerminal(terminalTabKey(info)),
+      onError: (_error, opened) => onCreateError?.(opened),
     });
   };
 
@@ -325,7 +343,7 @@ function NewTabMenu({
   );
 
   return (
-    <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+    <DropdownMenu open={menuOpen} onOpenChange={onMenuOpenChange}>
       <WorkspaceTabTooltip label="Open new">
         <DropdownMenuTrigger asChild>
           <Button
@@ -465,12 +483,10 @@ function FileTabsStrip({
   onCloseFile: (path: string) => void;
 }) {
   // Scroll the active tab into view when it changes (e.g. a newly opened file
-  // appended past the visible edge). `inline: "nearest"` scrolls whichever
-  // ancestor is the scroller — the outer strip (<500px) or the file-tabs
-  // region (≥500px) — without us hard-coding which one.
+  // appended past the visible edge).
   const activeTabRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    activeTabRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    scrollTabIntoView(activeTabRef.current);
   }, [activeFilePath]);
   // Render nothing (not an empty flex row) when there are no files — an empty
   // wrapper would still consume a slot in the parent's gap-0.5 and leave a
@@ -582,7 +598,7 @@ function TerminalTabsStrip({
 }) {
   const activeTabRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    activeTabRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    scrollTabIntoView(activeTabRef.current);
   }, [activeTerminalKey]);
   // Render nothing (not an empty flex row) when there are no shells — an empty
   // wrapper would still consume a slot in the parent's gap-0.5 and leave a
@@ -713,6 +729,8 @@ function RailTerminalView({
 interface WorkspacePanelProps {
   /** Keep the panel and its viewers inside an independently scoped grid workspace. */
   contained?: boolean;
+  /** Whether app-wide workspace hotkeys act here; a grid sets it on its selected cell. */
+  keyboardTarget?: boolean;
   sessionHarness?: ReturnType<typeof useChatStore.getState>["sessionHarness"];
   agentId?: string | null;
 
@@ -751,11 +769,6 @@ interface WorkspacePanelProps {
   /** Unpinned built-in pages opened as closable tabs for this session. */
   openPanels: DefaultWorkspaceTab[];
   onClosePanel: (tab: DefaultWorkspaceTab) => void;
-  /**
-   * Filled with a function that closes the selected rail tab (the desktop
-   * Close Tab shortcut); it returns false when no closable tab is selected.
-   */
-  closeSelectedTabRef?: RefObject<(() => boolean) | null>;
   /** Whether the Files/Changes tabs are available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
   showContentSearch?: boolean;
@@ -770,6 +783,8 @@ interface WorkspacePanelProps {
   onTabShortcut?: (tab: RightRailTab) => void;
   /** Reveal the workspace when a global shortcut opens a tab. */
   onReveal?: () => void;
+  /** Hide the rail; desktop Close uses it when no tab on screen can close. */
+  onHide?: () => void;
   /** Count of changed files, shown as the Changes tab badge. */
   changedCount: number;
   /** How many child agents are actively working (Agents tab badge). */
@@ -803,7 +818,7 @@ interface WorkspacePanelProps {
   onCommentsOpenChange: (open: boolean) => void;
   /** Open a shell as a rail tab (adds/activates its tab), surfacing its
    *  xterm in the content slot. */
-  openTerminalTab: (key: string) => void;
+  openTerminalTab: (key: string, options?: { focus?: boolean }) => void;
   /** Ordered list of open shell tab keys, shown as a strip beside the file
    *  tabs. */
   openTerminals: string[];
@@ -842,7 +857,7 @@ interface WorkspacePanelProps {
   onShellCreateStart?: () => void;
   /** Called when the shell create POST fails, so the focus snapshot armed by
    *  ``onShellCreateStart`` is disarmed and can't grab an unrelated shell. */
-  onShellCreateFailed?: () => void;
+  onShellCreateFailed?: (opened?: TerminalInfo) => void;
   /** Whether the mobile side-chats drawer is open. The rail is hidden on
    *  phones, so side chats render in this drawer instead. */
   mobileSideChatsOpen?: boolean;
@@ -861,6 +876,57 @@ interface WorkspacePanelProps {
   onHasSideChatTabsChange?: (hasSideChatTabs: boolean) => void;
   /** Opens a sub-agent from the Agents tab as a rail tab; absent where unsupported (Grid panes). */
   subagentPanelOpener?: SubagentPanelOpener;
+}
+
+/** A closed tab that Reopen Closed Tab (⇧⌘T) can bring back. */
+type ClosedTab =
+  | { kind: "file"; path: string }
+  | { kind: "panel"; tab: DefaultWorkspaceTab }
+  | { kind: "browser"; url: string | undefined };
+
+// Newest last, per session. Shells and side chats end when closed, so they aren't kept.
+const closedTabsBySession = new Map<string, ClosedTab[]>();
+// Browser tabs still reopening keep their place in the history in case that fails.
+const reopeningTabs = new WeakSet<ClosedTab>();
+// Browser views being closed, across mounts of the rail, so a second Close of one (from a
+// rail mounted since) doesn't record it twice.
+const closingBrowserViews = new Set<string>();
+
+// A close takes its place in the history when it starts, so a browser tab whose close
+// finishes after a later close still reopens after it.
+let lastCloseOrder = 0;
+const closeOrders = new WeakMap<ClosedTab, number>();
+function nextCloseOrder(): number {
+  lastCloseOrder += 1;
+  return lastCloseOrder;
+}
+
+function rememberClosedTab(
+  conversationId: string,
+  tab: ClosedTab,
+  order: number = nextCloseOrder(),
+): void {
+  closeOrders.set(tab, order);
+  const closed = closedTabsBySession.get(conversationId) ?? [];
+  const later = closed.findIndex((entry) => (closeOrders.get(entry) ?? 0) > order);
+  const next =
+    later === -1 ? [...closed, tab] : [...closed.slice(0, later), tab, ...closed.slice(later)];
+  closedTabsBySession.set(conversationId, next.slice(-20));
+}
+
+/**
+ * Where a just-opened browser tab returns when it closes before the user
+ * switches away, as in a browser: the rail tab that was on screen, whether the
+ * rail was open, and where keyboard focus was.
+ */
+interface ReturnPoint {
+  tabId: string;
+  railTab: string | null;
+  railOpen: boolean;
+  /** An element outside the rail (such as the chat box), that tab's page or address bar, or the rail. */
+  focus: { element: HTMLElement } | { browser: "address" | "page" } | { rail: true } | null;
+  /** Set once the new tab is on screen; switching away after that forgets the point. */
+  shown: boolean;
 }
 
 /**
@@ -883,6 +949,7 @@ function WorkspacePanelImpl({
   archiveInitialProject,
   archiveInitialHostId,
   contained = false,
+  keyboardTarget = !contained,
   sessionHarness,
   agentId,
   pending = false,
@@ -897,7 +964,6 @@ function WorkspacePanelImpl({
   onRightRailTabChange,
   openPanels,
   onClosePanel,
-  closeSelectedTabRef,
   showFilesPanel,
   showContentSearch = false,
   showGithubTab,
@@ -905,6 +971,7 @@ function WorkspacePanelImpl({
   onBrowserTabOpened,
   onTabShortcut,
   onReveal,
+  onHide,
   changedCount,
   subagentsWorking,
   agentCount,
@@ -945,18 +1012,63 @@ function WorkspacePanelImpl({
   const contentSearchInputRef = useRef<HTMLInputElement>(null);
   const contentSearchShortcut = useShortcutHint("searchWorkspaceContents");
   const [contentSearchFocusSession, setContentSearchFocusSession] = useState<string | null>(null);
+  const railRef = useRef<HTMLElement | null>(null);
+  const railContentRef = useRef<HTMLDivElement | null>(null);
   const browsers = useBrowserTabs(conversationId);
   const browserViewIds = useMemo(
     () => browsers.tabs.map((id) => browserViewId(conversationId, id)),
     [browsers.tabs, conversationId],
   );
+  const returnPointRef = useRef<ReturnPoint | null>(null);
+  // The latest returnFrom, so a close that finishes later uses the tabs open by then.
+  const returnFromRef = useRef<(point: ReturnPoint) => void>(() => {});
+  // Bumped when the session changes or this rail unmounts, so late work can tell it left.
+  const sessionVisitRef = useRef(0);
+  // A return point belongs to its session: leaving the session, or this rail unmounting,
+  // drops it, so a close that finishes later can't change the rail shown then.
+  useEffect(
+    () => () => {
+      returnPointRef.current = null;
+      sessionVisitRef.current += 1;
+    },
+    [conversationId],
+  );
+  // One-shot focus for a browser tab's pane: its address bar or its page.
+  const [browserFocus, setBrowserFocus] = useState<{
+    viewId: string;
+    target: "address" | "page";
+  } | null>(null);
+  const clearBrowserFocus = useCallback(() => setBrowserFocus(null), []);
   const closeBrowserTab = async (tabId: string) => {
-    const closed = await browsers.close(tabId);
-    if (!closed) toast.error("Couldn't close browser tab. Try again.");
+    const viewId = browserViewId(conversationId, tabId);
+    if (closingBrowserViews.has(viewId)) return;
+    closingBrowserViews.add(viewId);
+    const order = nextCloseOrder();
+    const returnPoint = returnPointRef.current?.tabId === tabId ? returnPointRef.current : null;
+    try {
+      // Just after returning to a session the strip may not have the page yet; the view does.
+      let url: string | undefined;
+      const result = await browsers.close(tabId, {
+        beforeClose: async () => {
+          url = await browsers.pageUrl(tabId);
+        },
+      });
+      if (result === "failed") {
+        toast.error("Couldn't close browser tab. Try again.");
+        return;
+      }
+      // "kept": an agent navigation reused the tab, so nothing closed.
+      if (result === "kept") return;
+      rememberClosedTab(conversationId, { kind: "browser", url }, order);
+      // Switching tabs while the close was pending forgot the point; don't undo that switch.
+      if (returnPoint && returnPointRef.current === returnPoint) returnFromRef.current(returnPoint);
+    } finally {
+      closingBrowserViews.delete(viewId);
+    }
   };
   const activeBrowserRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    activeBrowserRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    scrollTabIntoView(activeBrowserRef.current);
   }, [browsers.selected, rightRailTab]);
   const browserSelected =
     rightRailTab === "browser" &&
@@ -986,11 +1098,104 @@ function WorkspacePanelImpl({
     conversationId,
     browserViewIds,
   ]);
-  const addBrowser = () => {
-    browsers.add();
-    onRightRailTabChange("browser");
-    (onReveal ?? onBrowserTabOpened)?.();
+  const guardFileNavigation = useContext(FileViewerContext)?.guardFileNavigation;
+  // The browser page that took keyboard focus from this page, if any. Clicking into
+  // a page leaves this page's focus where it was, so only the shell can tell.
+  // `pending` is the shell's answer while it's still on its way.
+  const pageFocusRef = useRef<{ viewId: string | null; pending: Promise<string | null> | null }>({
+    viewId: null,
+    pending: null,
+  });
+  useEffect(() => {
+    const onWindowBlur = () => {
+      const query = focusedBrowserView();
+      pageFocusRef.current = { viewId: null, pending: query };
+      void query.then((viewId) => {
+        if (pageFocusRef.current.pending === query)
+          pageFocusRef.current = { viewId, pending: null };
+      });
+    };
+    // Focus moving within this page means no browser page has it.
+    const onFocusIn = () => {
+      pageFocusRef.current = { viewId: null, pending: null };
+    };
+    window.addEventListener("blur", onWindowBlur);
+    document.addEventListener("focusin", onFocusIn);
+    return () => {
+      window.removeEventListener("blur", onWindowBlur);
+      document.removeEventListener("focusin", onFocusIn);
+    };
+  }, []);
+  // What had focus when the "+" menu opened, since the menu takes it.
+  const menuOriginRef = useRef<{ element: Element | null; page: typeof pageFocusRef.current }>({
+    element: null,
+    page: { viewId: null, pending: null },
+  });
+  const noteMenuOrigin = useCallback(() => {
+    menuOriginRef.current = { element: document.activeElement, page: pageFocusRef.current };
+  }, []);
+  const addBrowserFromMenu = () => {
+    const { element, page } = menuOriginRef.current;
+    if (!page.pending) {
+      addBrowser(page.viewId, element);
+      return;
+    }
+    // The shell may still be answering which page had focus when the menu opened. A tab
+    // asked for in a session the user has since left isn't opened in the next one's rail.
+    const visit = sessionVisitRef.current;
+    void page.pending.then((viewId) => {
+      if (sessionVisitRef.current === visit) addBrowser(viewId, element);
+    });
   };
+  // `focusedViewId` names the browser page that had keyboard focus, if any, and
+  // `focusBefore` the element that had it.
+  const addBrowser = (
+    focusedViewId: string | null = null,
+    focusBefore: Element | null = document.activeElement,
+  ) => {
+    const active = focusBefore;
+    const inRail = railRef.current?.contains(active) === true;
+    let focus: ReturnPoint["focus"] = null;
+    if (browserSelected && focusedViewId !== null && focusedViewId === browsers.viewId) {
+      focus = { browser: "page" };
+    } else if (inRail) {
+      focus =
+        browserSelected && active instanceof HTMLInputElement
+          ? { browser: "address" }
+          : { rail: true };
+    } else if (
+      !inRail &&
+      active instanceof HTMLElement &&
+      active !== document.body &&
+      !active.closest('[role="menu"]')
+    ) {
+      focus = { element: active };
+    }
+    const openBrowser = () => {
+      const tabId = browsers.add();
+      returnPointRef.current = {
+        tabId,
+        railTab: panelOptions.find((option) => option.active)?.key ?? null,
+        railOpen: open,
+        focus,
+        shown: false,
+      };
+      setBrowserFocus({ viewId: browserViewId(conversationId, tabId), target: "address" });
+      onRightRailTabChange("browser");
+      (onReveal ?? onBrowserTabOpened)?.();
+    };
+    // A new browser tab replaces the file on screen, so its viewer confirms unsaved edits first.
+    if (selectedFilePath !== null && guardFileNavigation) {
+      guardFileNavigation(null, undefined, openBrowser);
+    } else {
+      openBrowser();
+    }
+  };
+  useDesktopCommand(
+    "new-browser-tab",
+    showBrowserTab && !pending && !contained ? (event) => addBrowser(event.browserViewId) : null,
+  );
+
   useNewBrowserHotkey(addBrowser, showBrowserTab && !pending && !contained);
 
   // ── Side chats: rail tabs backed by forked child conversations. ──────────
@@ -1007,7 +1212,7 @@ function WorkspacePanelImpl({
   const clearSideChatToOpen = useChatStore((s) => s.clearSideChatToOpen);
   const activeSideChatRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    activeSideChatRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    scrollTabIntoView(activeSideChatRef.current);
   }, [sideChats.selected, rightRailTab]);
   // Pending tabs awaiting a real child id, in submit order. Only Codex uses this
   // queue — its child arrives asynchronously via session_created with no id to
@@ -1058,6 +1263,26 @@ function WorkspacePanelImpl({
   const activeAgentId = useChatStore((s) => s.boundAgentId);
   const parentAgentId = agentId === undefined ? activeAgentId : agentId;
   const canStartSideChat = useCanStartSideChat(conversationId, permissionLevel);
+  const discoverSideChats = !pending && supportsSideChat(sideChatHarness, canStartSideChat);
+  const { data: savedSideChats } = useQuery({
+    queryKey: ["conversation", conversationId, "side_chats"],
+    queryFn: async ({ signal }): Promise<{ id: string }[]> => {
+      const response = await authenticatedFetch(
+        `/v1/sessions/${encodeURIComponent(conversationId)}/side_chats?limit=20`,
+        { signal },
+      );
+      if (response.status === 404) return [];
+      if (!response.ok) throw new Error("Could not load side chats");
+      return (await response.json()).data;
+    },
+    enabled: discoverSideChats,
+  });
+  const restoreSideChats = sideChats.restore;
+  useEffect(() => {
+    if (savedSideChats && discoverSideChats) {
+      restoreSideChats(savedSideChats.map((chat) => chat.id));
+    }
+  }, [savedSideChats, discoverSideChats, restoreSideChats]);
   const onNewSideChat = supportsSideChat(sideChatHarness, canStartSideChat)
     ? () => {
         useChatStore.getState().requestSideChatFocus(sideChats.openPending());
@@ -1183,7 +1408,7 @@ function WorkspacePanelImpl({
   for (const tabId of sideChats.tabs) {
     chatTabLabels[tabId] = subagentTabLabels[tabId] ?? `Side chat ${++sideChatNumber}`;
   }
-  const railInertRef = useInertRef<HTMLElement>(inert ?? false);
+  const railInertRef = useInertRef<HTMLElement>(inert ?? false, railRef);
   const selectedSideChat = sideChats.selected;
   const selectedSubagentId =
     selectedSideChat === null ? null : subagentSessionIdFromTab(selectedSideChat);
@@ -1235,13 +1460,32 @@ function WorkspacePanelImpl({
     sideChats.close(childId);
   };
 
+  // Closing the file on screen asks its viewer first, which confirms before
+  // dropping edits it hasn't saved. Other file tabs have no mounted editor.
   // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its
   // window keydown listener on every render — an inline arrow would change
   // identity each render and thrash the effect's add/remove cycle.
-  const closeFileTabRef = useRef<(() => void) | null>(null);
+  const closeFile = useCallback(
+    (path: string) => {
+      const close = () => {
+        rememberClosedTab(conversationId, { kind: "file", path });
+        onCloseFile(path);
+      };
+      if (path === selectedFilePath && guardFileNavigation) {
+        guardFileNavigation(null, undefined, close);
+      } else {
+        close();
+      }
+    },
+    [conversationId, guardFileNavigation, onCloseFile, selectedFilePath],
+  );
   const handleCloseTab = useCallback(() => {
-    if (selectedFilePath !== null) onCloseFile(selectedFilePath);
-  }, [onCloseFile, selectedFilePath]);
+    if (selectedFilePath !== null) closeFile(selectedFilePath);
+  }, [closeFile, selectedFilePath]);
+  const closePanel = (tab: DefaultWorkspaceTab) => {
+    rememberClosedTab(conversationId, { kind: "panel", tab });
+    onClosePanel(tab);
+  };
   // Resolve shell tab keys to display labels. The terminals list is already
   // fetched elsewhere for the session, so this shares the same query cache.
   const { terminals } = useTerminals(conversationId);
@@ -1267,50 +1511,9 @@ function WorkspacePanelImpl({
   ];
   const unpinnedTabs = availablePanels.filter((tab) => !pinnedTabs.includes(tab));
   const visibleOpenPanels = openPanels.filter((tab) => unpinnedTabs.includes(tab));
-  // Mirrors the tab strip's own `active` rules, so Close Tab closes exactly
-  // the tab drawn as selected.
-  const closeSelectedTab = (): boolean => {
-    if (pending || !open || (!contained && isMobile) || (!maximized && width <= 0)) return false;
-    if (selectedFilePath !== null) {
-      closeFileTabRef.current?.();
-      return true;
-    }
-    if (terminalShown && selectedTerminalKey !== null) {
-      // A viewer can't close terminals; still swallow the shortcut so it
-      // doesn't fall through to leaving the session.
-      if (isEditorLevel(permissionLevel) && closingTerminalKey !== selectedTerminalKey) {
-        onCloseTerminal(selectedTerminalKey);
-      }
-      return true;
-    }
-    if (browserSelected && browsers.selected !== null) {
-      void closeBrowserTab(browsers.selected);
-      return true;
-    }
-    if (sideChatSelected && sideChats.selected !== null) {
-      void closeSideChat(sideChats.selected);
-      return true;
-    }
-    const panel =
-      selectedTerminalKey === null
-        ? visibleOpenPanels.find((tab) => tab === rightRailTab)
-        : undefined;
-    if (panel !== undefined) {
-      onClosePanel(panel);
-      return true;
-    }
-    return false;
-  };
-  useLayoutEffect(() => {
-    if (!closeSelectedTabRef) return;
-    closeSelectedTabRef.current = closeSelectedTab;
-    return () => {
-      if (closeSelectedTabRef.current === closeSelectedTab) closeSelectedTabRef.current = null;
-    };
-  });
   const activePanelRef = useRef<HTMLButtonElement | null>(null);
   useEffect(() => {
-    activePanelRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    scrollTabIntoView(activePanelRef.current);
   }, [rightRailTab]);
   const showOpenTabs =
     !pending &&
@@ -1319,23 +1522,13 @@ function WorkspacePanelImpl({
       openTerminals.length > 0 ||
       sideChats.tabs.length > 0 ||
       (showBrowserTab && browsers.tabs.length > 0));
-  const sideChatPicker = supportsSideChat(sideChatHarness, canStartSideChat) && !pending && (
-    <SideChatPicker
-      key={conversationId}
-      conversationId={conversationId}
-      onOpen={(childId) => {
-        sideChats.open(childId);
-        onRightRailTabChange("sidechat");
-        onReveal?.();
-      }}
-    />
-  );
   const newTabMenu = (menuAlign: "start" | "end") => (
     <NewTabMenu
       conversationId={conversationId}
       panels={unpinnedTabs}
       onOpenPanel={selectPermanentTab}
-      onOpenBrowser={showBrowserTab ? addBrowser : undefined}
+      onOpenBrowser={showBrowserTab ? addBrowserFromMenu : undefined}
+      onOpen={noteMenuOrigin}
       onOpenSideChat={onNewSideChat}
       onOpenTerminal={openTerminalTab}
       onCreateStart={onShellCreateStart}
@@ -1357,6 +1550,13 @@ function WorkspacePanelImpl({
     const index = visiblePermanentTabs.findIndex((candidate) => candidate === tab);
     return index === -1 ? undefined : String(index + 1);
   };
+  const tabAriaShortcut = (tab: RightRailTab) => {
+    const number = shortcutFor(tab);
+    const action = number ? workspaceTabActionId(Number(number)) : null;
+    const binding =
+      action && isShortcutActionEnabled(action) ? resolveShortcutBindings(action)[0] : undefined;
+    return binding ? shortcutAriaKeys(binding) : undefined;
+  };
   const selectPermanentTab = (tab: RightRailTab) => {
     onRightRailTabChange(tab);
   };
@@ -1365,7 +1565,7 @@ function WorkspacePanelImpl({
     if (!tab) return;
     if (onTabShortcut) onTabShortcut(tab);
     else selectPermanentTab(tab);
-  }, !pending);
+  }, !pending && keyboardTarget);
   const handlePermanentTabNumber = (event: KeyboardEvent<HTMLDivElement>) => {
     if (
       !event.currentTarget.contains(event.target as Node) ||
@@ -1489,7 +1689,7 @@ function WorkspacePanelImpl({
         <TabsTrigger
           value="files"
           aria-label="Files"
-          aria-keyshortcuts={shortcutFor("files")}
+          aria-keyshortcuts={tabAriaShortcut("files")}
           data-workspace-tab="files"
           disabled={pending}
           className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
@@ -1504,7 +1704,7 @@ function WorkspacePanelImpl({
         <TabsTrigger
           value="changes"
           aria-label={changedCount > 0 ? `Changes ${changedCount} changed` : "Changes"}
-          aria-keyshortcuts={shortcutFor("changes")}
+          aria-keyshortcuts={tabAriaShortcut("changes")}
           data-workspace-tab="changes"
           disabled={pending}
           className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
@@ -1520,7 +1720,7 @@ function WorkspacePanelImpl({
         <TabsTrigger
           value="github"
           aria-label="Pull Requests"
-          aria-keyshortcuts={shortcutFor("github")}
+          aria-keyshortcuts={tabAriaShortcut("github")}
           data-workspace-tab="github"
           disabled={pending}
           className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
@@ -1535,7 +1735,7 @@ function WorkspacePanelImpl({
         <TabsTrigger
           value="subagents"
           disabled={pending}
-          aria-keyshortcuts={shortcutFor("subagents")}
+          aria-keyshortcuts={tabAriaShortcut("subagents")}
           data-workspace-tab="subagents"
           aria-label={
             subagentsWorking > 0
@@ -1577,6 +1777,185 @@ function WorkspacePanelImpl({
   // Stays mounted behind a file or shell to keep tree expansion, listing and scroll.
   const filesPanelMounted = showFilesPanel && !pending && scopeView === "files";
   const filesPanelActive = filesPanelMounted && !terminalShown && selectedFilePath === null;
+  // Desktop Close (⌘W / Ctrl+W) while the rail, or its embedded browser view,
+  // has focus: close the tab on screen, or hide the rail on a fixed page.
+  // Otherwise AppShell's handler leaves the session.
+  useDesktopCommand(
+    "close",
+    (event) => {
+      const browserFocused =
+        event.browserViewId !== null && event.browserViewId === browsers.viewId;
+      if (!browserFocused && !railRef.current?.contains(document.activeElement)) return false;
+      if (pending) return true;
+      // Like the tab strip, a page counts as selected only with no shell selected.
+      const openPanel =
+        selectedTerminalKey === null
+          ? visibleOpenPanels.find((tab) => tab === rightRailTab)
+          : undefined;
+      if (terminalShown && selectedTerminalKey !== null) {
+        // Viewers can't close shells; the tab shows no close button for them either.
+        if (!isEditorLevel(permissionLevel)) return true;
+        // A terminal already closing gets no second request.
+        if (closingTerminalKey !== selectedTerminalKey) onCloseTerminal(selectedTerminalKey);
+      } else if (selectedFilePath !== null) {
+        handleCloseTab();
+      } else if (scopeView === "sidechat" && sideChats.selected !== null) {
+        void closeSideChat(sideChats.selected);
+      } else if (scopeView === "browser" && browsers.selected !== null) {
+        void closeBrowserTab(browsers.selected);
+      } else if (openPanel !== undefined) {
+        closePanel(openPanel);
+      } else if (onHide) {
+        onHide();
+        return true;
+      } else {
+        return false;
+      }
+      // Keep focus in the rail, so the next Close closes the tab shown next.
+      railContentRef.current?.focus({ preventScroll: true });
+      return true;
+    },
+    { priority: 10 },
+  );
+  // Back to the tab, and the focus, that a just-opened browser tab came from.
+  const returnFrom = ({ railTab, railOpen, focus }: ReturnPoint) => {
+    returnPointRef.current = null;
+    if (railTab !== null && openTerminals.includes(railTab)) {
+      // A shell takes focus when shown; only let it if focus was in the rail.
+      openTerminalTab(railTab, { focus: focus !== null && "rail" in focus });
+    } else {
+      panelOptions.find((option) => option.key === railTab)?.select();
+    }
+    if (!railOpen) onHide?.();
+    if (focus && "element" in focus) {
+      if (focus.element.isConnected) focus.element.focus();
+    } else if (focus && "browser" in focus && railTab?.startsWith("browser:")) {
+      const tabId = railTab.slice("browser:".length);
+      setBrowserFocus({ viewId: browserViewId(conversationId, tabId), target: focus.browser });
+    }
+  };
+  returnFromRef.current = returnFrom;
+  useEffect(() => {
+    const point = returnPointRef.current;
+    if (!point) return;
+    if (browserSelected && browsers.selected === point.tabId) point.shown = true;
+    // Closing the tab also moves the selection; only a switch while it's open forgets.
+    else if (point.shown && browsers.tabs.includes(point.tabId)) returnPointRef.current = null;
+  });
+  // Desktop ⇧⌘[ / ⇧⌘] step through the tabs in strip order; ⇧⌘T reopens the last closed one.
+  // Leaves the file on screen, if any, once its viewer allows it (it confirms unsaved
+  // edits). A ref, so a reopen that finishes later asks about the file shown by then.
+  const leaveFileRef = useRef<(path: string | null, commit: () => void) => void>((_path, commit) =>
+    commit(),
+  );
+  leaveFileRef.current = (path, commit) => {
+    if (selectedFilePath !== null && guardFileNavigation) {
+      guardFileNavigation(path, undefined, commit);
+    } else {
+      commit();
+    }
+  };
+  const showAdjacentTab = (step: -1 | 1) => {
+    const options = panelOptions.filter((option) => !option.disabled);
+    const index = options.findIndex((option) => option.active);
+    const target =
+      index === -1 && step === -1 ? options.at(-1) : options.at((index + step) % options.length);
+    if (!target) return;
+    const show = () => {
+      target.select();
+      onReveal?.();
+    };
+    // Opening a file asks about the one on screen itself; any other tab replaces it here.
+    if (target.key.startsWith("file:")) show();
+    else leaveFileRef.current(null, show);
+  };
+  // The session and what its rail shows, apart from the browser tab a reopen selects itself.
+  const railView = [
+    conversationId,
+    rightRailTab,
+    selectedFilePath,
+    selectedTerminalKey,
+    sideChats.selected,
+  ].join("\n");
+  // Counts changes to it, so picking another tab and coming back still counts as a pick.
+  const railViewRef = useRef({ view: railView, changes: 0 });
+  if (railViewRef.current.view !== railView) {
+    railViewRef.current = { view: railView, changes: railViewRef.current.changes + 1 };
+  }
+  const reopenCountRef = useRef(0);
+  // The latest reopen that brought the rail to its browser tab.
+  const shownReopenRef = useRef(0);
+  // A reopen that finishes after this panel unmounted leaves the next session's rail alone.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  // Reopens a closed browser tab at its page; the history entry goes once the view opens.
+  const reopenBrowserTab = (closed: ClosedTab, url: string, reopenId: number) => {
+    const history = closedTabsBySession.get(conversationId) ?? [];
+    if (!history.includes(closed) || reopeningTabs.has(closed)) return;
+    reopeningTabs.add(closed);
+    const changesBefore = railViewRef.current.changes;
+    // Anything the user shows in the rail meanwhile (a file, even one closed again) keeps
+    // the reopened tab in the background.
+    const railUnchanged = () => mountedRef.current && railViewRef.current.changes === changesBefore;
+    void browsers.reopen(url, { mayShow: railUnchanged }).then(({ ok, error }) => {
+      reopeningTabs.delete(closed);
+      if (!ok) {
+        // It stays in the history so the next Reopen Closed Tab can try again.
+        toast.error(`Couldn't reopen the browser tab${error ? `: ${error}` : "."}`);
+        return;
+      }
+      const current = closedTabsBySession.get(conversationId) ?? [];
+      if (current.includes(closed)) current.splice(current.indexOf(closed), 1);
+      // A tab picked while the page loaded, or a later reopen already shown, keeps the
+      // rail where it is. A later reopen that failed doesn't.
+      const showable = () => reopenId > shownReopenRef.current && railUnchanged();
+      if (!showable()) return;
+      // A file opened while the page loaded asks again before the rail leaves it.
+      leaveFileRef.current(null, () => {
+        if (!showable()) return;
+        shownReopenRef.current = reopenId;
+        onRightRailTabChange("browser");
+      });
+    });
+    onReveal?.();
+  };
+  const reopenClosedTab = () => {
+    const closedTabs = closedTabsBySession.get(conversationId) ?? [];
+    const index = closedTabs.findLastIndex((tab) => !reopeningTabs.has(tab));
+    const closed = closedTabs[index];
+    if (!closed) return;
+    const reopenId = ++reopenCountRef.current;
+    if (closed.kind === "browser" && closed.url !== undefined) {
+      const { url } = closed;
+      // Ask about the file on screen first, so keeping its edits reopens nothing.
+      leaveFileRef.current(null, () => reopenBrowserTab(closed, url, reopenId));
+      return;
+    }
+    // The tab leaves the history only once it reopens; keeping a file's edits keeps it there.
+    leaveFileRef.current(closed.kind === "file" ? closed.path : null, () => {
+      const current = closedTabsBySession.get(conversationId) ?? [];
+      if (!current.includes(closed)) return;
+      current.splice(current.indexOf(closed), 1);
+      // This reopen is shown now, so an earlier browser reopen still loading stays behind it.
+      shownReopenRef.current = reopenId;
+      if (closed.kind === "file") openFileViewer(closed.path);
+      else if (closed.kind === "panel") selectPermanentTab(closed.tab);
+      else {
+        browsers.add();
+        onRightRailTabChange("browser");
+      }
+      onReveal?.();
+    });
+  };
+  const tabCommandsActive = !pending && !contained;
+  useDesktopCommand("previous-tab", tabCommandsActive ? () => showAdjacentTab(-1) : null);
+  useDesktopCommand("next-tab", tabCommandsActive ? () => showAdjacentTab(1) : null);
+  useDesktopCommand("reopen-closed-tab", tabCommandsActive ? reopenClosedTab : null);
   const rail = (
     <aside
       aria-label="Workspace"
@@ -1644,8 +2023,8 @@ function WorkspacePanelImpl({
           ref={tabListRef}
           role="toolbar"
           aria-label="Workspace tabs"
-          tabIndex={-1}
           onKeyDown={handlePermanentTabNumber}
+          tabIndex={-1}
           className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3"
         >
           <Tabs
@@ -1717,7 +2096,7 @@ function WorkspacePanelImpl({
                         onAuxClick={(event) => {
                           if (event.button === 1) {
                             event.preventDefault();
-                            onClosePanel(tab);
+                            closePanel(tab);
                           }
                         }}
                       >
@@ -1728,7 +2107,7 @@ function WorkspacePanelImpl({
                         type="button"
                         aria-label={`Close ${label}`}
                         className="flex size-4 items-center justify-center rounded hover:bg-muted"
-                        onClick={() => onClosePanel(tab)}
+                        onClick={() => closePanel(tab)}
                       >
                         <XIcon className="size-3" />
                       </button>
@@ -1739,7 +2118,7 @@ function WorkspacePanelImpl({
                   openFiles={openFiles}
                   activeFilePath={selectedFilePath}
                   onFileSelect={openFileViewer}
-                  onCloseFile={onCloseFile}
+                  onCloseFile={closeFile}
                 />
                 <TerminalTabsStrip
                   openTerminals={openTerminals}
@@ -1847,7 +2226,6 @@ function WorkspacePanelImpl({
             pinned right outside the scrolling viewport; "+" joins it once tabs exist. */}
           <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
             {showOpenTabs && newTabMenu("end")}
-            {sideChatPicker}
             {panelOptions.length > 0 && (
               <DropdownMenu
                 onOpenChange={(isOpen) => {
@@ -1922,8 +2300,11 @@ function WorkspacePanelImpl({
         </div>
         {/* Single content slot: an open shell or file tab, else the selected tab's view. */}
         <div
+          ref={railContentRef}
           data-workspace-panel-content
-          className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
+          // A click on any part of a tab focuses the rail, so Close (⌘W) closes that tab.
+          tabIndex={-1}
+          className="relative flex min-h-0 flex-1 flex-col overflow-hidden focus:outline-none"
         >
           {/* Phones use AppShell's drawer instead; one mounted panel keeps the input state single-owner. */}
           {showContentSearch && showFilesPanel && !pending && !isMobile && (
@@ -1994,7 +2375,6 @@ function WorkspacePanelImpl({
                 position={filePosition}
                 onClose={isMobile && onMobileFileClose ? onMobileFileClose : onShowScopeView}
                 onCloseTab={isMobile && onMobileFileClose ? onMobileFileClose : handleCloseTab}
-                closeTabRef={closeFileTabRef}
                 onNavigateTo={openFileViewer}
                 permissionLevel={permissionLevel}
                 onCommentsOpenChange={onCommentsOpenChange}
@@ -2020,6 +2400,8 @@ function WorkspacePanelImpl({
               conversationId={browsers.viewId!}
               agentBrowser={browsers.agentBrowser}
               active={open}
+              focus={browserFocus?.viewId === browsers.viewId ? browserFocus.target : null}
+              onFocused={clearBrowserFocus}
               className="min-h-0 flex-1"
             />
           ) : scopeView === "github" ? (
@@ -2093,7 +2475,6 @@ function WorkspacePanelImpl({
                 </div>
               );
             })}
-            {sideChatPicker}
             {onNewSideChat && (
               <Button
                 type="button"

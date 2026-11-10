@@ -1439,6 +1439,16 @@ def _legacy_side_chat_attachment(
     if not isinstance(content, list):
         return False
     blocks = [block for block in content if isinstance(block, dict)]
+    if any(
+        block.get("type") == "input_image"
+        or (
+            block.get("type") in {"text", "input_text"}
+            and isinstance(block.get("text"), str)
+            and block["text"]
+        )
+        for block in blocks
+    ):
+        return False
     if file_store is not None and artifact_store is not None:
         try:
             blocks = _resolve_message_content(
@@ -1452,16 +1462,6 @@ def _legacy_side_chat_attachment(
             raise OmnigentError(
                 "Could not read the attachment", code=ErrorCode.INVALID_INPUT
             ) from exc
-    if any(
-        block.get("type") == "input_image"
-        or (
-            block.get("type") in {"text", "input_text"}
-            and isinstance(block.get("text"), str)
-            and block["text"]
-        )
-        for block in blocks
-    ):
-        return False
     texts = []
     for block in blocks:
         if block.get("type") != "input_file":
@@ -2383,10 +2383,7 @@ def register_events_routes(
         if (
             body.type == "message"
             and shell_command_from_input(body.data.get("content")) is not None
-            and await asyncio.to_thread(
-                _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache
-            )
-            == "codex-native"
+            and await _native_pane_harness(conv) == "codex-native"
         ):
             # Direct native shell bypasses tool policies, like the environment shell route.
             await _require_access_and_level(
@@ -4959,7 +4956,7 @@ def register_events_routes(
                 conv,
                 body,
                 conversation_store,
-                lists_side_chat=_has_bound_runner_authority(request, conv)
+                allow_side_chat=_has_bound_runner_authority(request, conv)
                 or await asyncio.to_thread(
                     _is_session_owner,
                     user_id,

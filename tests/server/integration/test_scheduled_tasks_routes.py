@@ -750,15 +750,15 @@ async def test_create_rejects_invalid_reasoning_effort(
 
 
 @pytest.mark.parametrize(
-    ("agent_name", "mode"),
+    ("agent_name", "mode", "allowed"),
     [(CLAUDE_NATIVE_AGENT_NAME, "acceptEdits")]
     + [
         (CODEX_NATIVE_AGENT_NAME, mode)
-        for mode in ("default", "full-access", "read-only", "bypass")
+        for mode in ("default", "ask-for-approval", "approve-for-me", "read-only")
     ],
 )
 async def test_create_persists_permission_mode(
-    auth_client: httpx.AsyncClient, db_uri: str, agent_name: str, mode: str
+    auth_client: httpx.AsyncClient, db_uri: str, agent_name: str, mode: str, allowed: bool
 ) -> None:
     """A valid permission mode round-trips on create, read, and update."""
     _make_user(db_uri)
@@ -775,7 +775,8 @@ async def test_create_persists_permission_mode(
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 200
     assert got.json()["permission_mode"] == mode
-    if mode == "full-access":
+    if mode == "default":
+        # Patch to a different allowed mode so the read-back proves the update was saved.
         changed = await auth_client.patch(
             f"/v1/scheduled-tasks/{task_id}",
             json={"permission_mode": "read-only"},
@@ -783,6 +784,51 @@ async def test_create_persists_permission_mode(
         )
         assert changed.status_code == 200, changed.text
         assert changed.json()["permission_mode"] == "read-only"
+        reread = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+        assert reread.json()["permission_mode"] == "read-only"
+
+
+@pytest.mark.parametrize(
+    ("agent_name", "mode", "allowed"),
+    [
+        (CLAUDE_NATIVE_AGENT_NAME, "bypassPermissions", True),
+        (CLAUDE_NATIVE_AGENT_NAME, "dontAsk", True),
+        (CODEX_NATIVE_AGENT_NAME, "full-access", True),
+        (CODEX_NATIVE_AGENT_NAME, "bypass", True),
+        (CLAUDE_NATIVE_AGENT_NAME, "not-a-registered-mode", False),
+    ],
+)
+async def test_saved_permission_choices_and_unknown_modes(
+    auth_client: httpx.AsyncClient, db_uri: str, agent_name: str, mode: str, allowed: bool
+) -> None:
+    """Create and update retain supported choices and reject truly unknown modes."""
+    _make_user(db_uri)
+    agent_id = builtin_agent_id(agent_name)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(agent_id=agent_id, permission_mode=mode),
+        headers=_headers(),
+    )
+    assert created.status_code == (200 if allowed else 400), created.text
+    if allowed:
+        assert created.json()["permission_mode"] == mode
+    else:
+        assert "permission_mode" in created.text
+
+    ok = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(agent_id=agent_id), headers=_headers()
+    )
+    assert ok.status_code == 200, ok.text
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{ok.json()['id']}",
+        json={"permission_mode": mode},
+        headers=_headers(),
+    )
+    assert patched.status_code == (200 if allowed else 400), patched.text
+    if allowed:
+        assert patched.json()["permission_mode"] == mode
+    else:
+        assert "permission_mode" in patched.text
 
 
 async def test_scheduled_speed_round_trips_and_clears(
@@ -1342,7 +1388,7 @@ async def test_update_agent_switch_clears_the_old_harnesss_settings(
         await auth_client.post(
             "/v1/scheduled-tasks",
             json=_create_body(
-                permission_mode="bypassPermissions",
+                permission_mode="acceptEdits",
                 model_override="databricks-claude-sonnet-4-6",
                 reasoning_effort="high",
             ),
@@ -1350,7 +1396,7 @@ async def test_update_agent_switch_clears_the_old_harnesss_settings(
         )
     ).json()
     task_id = created["id"]
-    assert created["permission_mode"] == "bypassPermissions"
+    assert created["permission_mode"] == "acceptEdits"
 
     patched = await auth_client.patch(
         f"/v1/scheduled-tasks/{task_id}",
@@ -1516,20 +1562,20 @@ async def test_update_clears_permission_mode_with_explicit_null(
     """PATCH ``permission_mode: null`` clears a previously-set mode end-to-end.
 
     The edit dialog resets the control to Default by sending an explicit null,
-    so a task launched with ``bypassPermissions`` must actually revert to the
-    agent default (not silently keep the dangerous mode). Asserts the PERSISTED
+    so a task launched with ``acceptEdits`` must actually revert to the
+    agent default (not silently keep the old mode). Asserts the PERSISTED
     value via a read-back, not just the response.
     """
     _make_user(db_uri)
     created = (
         await auth_client.post(
             "/v1/scheduled-tasks",
-            json=_create_body(permission_mode="bypassPermissions"),
+            json=_create_body(permission_mode="acceptEdits"),
             headers=_headers(),
         )
     ).json()
     task_id = created["id"]
-    assert created["permission_mode"] == "bypassPermissions"
+    assert created["permission_mode"] == "acceptEdits"
 
     patched = await auth_client.patch(
         f"/v1/scheduled-tasks/{task_id}",

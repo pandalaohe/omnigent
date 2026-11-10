@@ -292,6 +292,18 @@ export const CODEX_NATIVE_BYPASS_APPROVAL_OPTION: NativeHarnessMode = {
   args: [],
 };
 
+/** Saved automations retain every registered native and SDK permission choice. */
+export const UNATTENDED_DISALLOWED_PERMISSION_MODES: ReadonlySet<string> = new Set();
+
+/**
+ * Mode a new automation starts with. Nobody watches an automation's turns, so a
+ * mode that asks would stall them; the user can still pick another one.
+ */
+export const NEW_AUTOMATION_PERMISSION_MODES: Readonly<Record<string, string>> = {
+  "claude-native": "auto",
+  "codex-native": "approve-for-me",
+};
+
 /** Create-time permission choices shared by New Chat and automations. */
 export function nativePermissionOptions(harness: string | null | undefined) {
   switch (harness) {

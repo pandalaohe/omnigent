@@ -173,6 +173,8 @@ class _CapturingResourceRegistry:
         publisher: Callable[
             [str, str, str | None, int | None, list[dict[str, object]] | None], None
         ],
+        *,
+        accepts_inferred_status: Callable[[], bool] | None = None,
     ) -> None:
         """
         Accept the session-status publisher installed by the runner app.
@@ -181,8 +183,10 @@ class _CapturingResourceRegistry:
         callback (unused) to satisfy ``create_runner_app``'s wiring.
 
         :param publisher: Callable ``(session_id, status) -> None``.
+        :param accepts_inferred_status: Unused server capability check.
         :returns: None.
         """
+        del accepts_inferred_status
         self._session_status_publisher = publisher
 
     def set_session_failure_publisher(self, publisher: Callable[[str, str], None]) -> None:
