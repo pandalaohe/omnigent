@@ -4580,6 +4580,93 @@ async def test_a_run_starts_from_a_copy_of_the_source_session() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_harness", "target_harness", "source_tier", "status", "mode", "expected"),
+    [
+        ("pi-native", "pi-native", "full", "ready", None, "auto"),
+        ("pi-native", "pi-native", "full", "ready", "plan", "plan"),
+        ("pi-native", "pi-native", "plan", "switching", None, "plan"),
+        ("pi-native", "pi-native", "full", "ready", "full", "full"),
+        ("antigravity-native", "antigravity-native", "full", "ready", None, "auto"),
+        ("pi-native", "antigravity-native", "plan", "ready", None, "plan"),
+        ("pi-native", "claude-native", "full", "ready", None, None),
+    ],
+)
+async def test_history_runs_create_their_own_permission_authority(
+    source_harness: str,
+    target_harness: str,
+    source_tier: str,
+    status: str,
+    mode: str | None,
+    expected: str | None,
+) -> None:
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        PERMISSION_LABEL_KEYS,
+        PERMISSION_MIGRATION_LABEL_KEY,
+        PERMISSION_RUNTIME_ID_LABEL_KEY,
+        ConfirmedPermissionState,
+        read_permission_state,
+    )
+
+    source_agent = "ag_1" if source_harness == target_harness else "ag_source"
+    source = _FakeConversation(
+        id="conv_source",
+        agent_id=source_agent,
+        labels={
+            **ConfirmedPermissionState(
+                source_tier, 8, status, "old-switch" if status == "switching" else None
+            ).labels(source_harness),
+            PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+            PERMISSION_RUNTIME_ID_LABEL_KEY: "old-runtime",
+            PERMISSION_MIGRATION_LABEL_KEY: "old-migration",
+        },
+    )
+    conv_store = FakeConversationStore()
+    conv_store.get_conversation = lambda _: source  # type: ignore[method-assign]
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(source_session_id=source.id, permission_mode=mode)}
+    )
+    agents = FakeAgentStore(
+        {agent: _FakeAgent(agent, bundle_location="bundle") for agent in {source_agent, "ag_1"}}
+    )
+
+    class _AgentCache(FakeAgentCache):
+        def load(self, agent_id: str, bundle_location: str, **_: Any) -> _FakeLoadedAgent:
+            return _FakeLoadedAgent(source_harness if agent_id == source_agent else target_harness)
+
+    async def _launch(conv: Any, task: Any) -> None:
+        pass
+
+    deps = _deps(
+        store, conversation_store=conv_store, agent_store=agents, agent_cache=_AgentCache()
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    (fork,) = conv_store.forked
+    assert fork["dropped_label_keys"] >= PERMISSION_LABEL_KEYS
+    labels = fork["extra_labels"]
+    assert not {
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_RUNTIME_ID_LABEL_KEY,
+        PERMISSION_MIGRATION_LABEL_KEY,
+    }.intersection(labels)
+    if expected is None:
+        assert not PERMISSION_LABEL_KEYS.intersection(labels)
+    else:
+        assert read_permission_state(labels, harness=target_harness) == ConfirmedPermissionState(
+            expected, 1, "blocked"
+        )
+    if target_harness == "antigravity-native":
+        assert (
+            "--dangerously-skip-permissions" in (fork["override_terminal_launch_args"] or [])
+        ) is (expected == "full")
+    assert [run["status"] for run in store.runs] == ["running"]
+
+
+@pytest.mark.asyncio
 async def test_a_run_leaves_out_the_turn_running_in_its_source() -> None:
     conv_store = FakeConversationStore()
 

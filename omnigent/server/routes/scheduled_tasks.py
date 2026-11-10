@@ -883,8 +883,13 @@ def create_scheduled_tasks_router(
         carry: bool,
     ) -> Conversation:
         """Copy *source* and grant its owner the copy, deleting the copy if either fails."""
+        from omnigent.server.routes._sessions.helpers import (
+            _resolve_harness,
+            _stamp_antigravity_permission_tier,
+        )
         from omnigent.server.scheduled.source_session import (
             SourceCopyIncompleteError,
+            copied_permission_labels,
             copy_session,
             source_copy_title,
         )
@@ -892,6 +897,19 @@ def create_scheduled_tasks_router(
 
         # _require_source_session rejects a session without an agent.
         assert source.agent_id is not None
+        source_harness = await asyncio.to_thread(
+            _resolve_harness, source, agent_store=agent_store, agent_cache=agent_cache
+        )
+        labels = copied_permission_labels(
+            source, source_harness=source_harness, target_harness=source_harness
+        )
+        launch_args = None
+        if source_harness == "antigravity-native":
+            from omnigent.permission_tiers import AGY_PERMISSION_TIER_LABEL_KEY
+
+            launch_args = _stamp_antigravity_permission_tier(
+                labels, source.terminal_launch_args, tier=labels[AGY_PERMISSION_TIER_LABEL_KEY]
+            )
         try:
             copy = await asyncio.to_thread(
                 copy_session,
@@ -905,7 +923,9 @@ def create_scheduled_tasks_router(
                 created_by=owner,
                 project_id=project_id,
                 carry_history_into_native=carry,
-                labels={SCHEDULED_TASK_SOURCE_LABEL_KEY: task_id},
+                labels={**labels, SCHEDULED_TASK_SOURCE_LABEL_KEY: task_id},
+                terminal_launch_args=launch_args,
+                override_terminal_launch_args=source_harness == "antigravity-native",
                 up_to_response_id=up_to,
             )
         except SourceCopyIncompleteError as exc:

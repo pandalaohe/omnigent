@@ -751,7 +751,7 @@ async def test_create_rejects_invalid_reasoning_effort(
 
 
 @pytest.mark.parametrize(
-    ("agent_name", "mode", "allowed"),
+    ("agent_name", "mode"),
     [(CLAUDE_NATIVE_AGENT_NAME, "acceptEdits")]
     + [
         (CODEX_NATIVE_AGENT_NAME, mode)
@@ -766,7 +766,7 @@ async def test_create_rejects_invalid_reasoning_effort(
     ],
 )
 async def test_create_persists_permission_mode(
-    auth_client: httpx.AsyncClient, db_uri: str, agent_name: str, mode: str, allowed: bool
+    auth_client: httpx.AsyncClient, db_uri: str, agent_name: str, mode: str
 ) -> None:
     """A valid permission mode round-trips on create, read, and update."""
     _make_user(db_uri)
@@ -3551,6 +3551,65 @@ async def test_create_from_a_session_copies_it_for_the_runs(
     )
     fetched = await auth_client.get(f"/v1/scheduled-tasks/{body['id']}", headers=_headers())
     assert fetched.json()["source_session_id"] == source_copy_id
+
+
+@pytest.mark.parametrize("harness", ["pi-native", "antigravity-native"])
+@pytest.mark.parametrize(
+    ("tier", "status", "expected"), [("full", "ready", "auto"), ("plan", "switching", "plan")]
+)
+async def test_automation_source_snapshot_drops_runtime_permission_authority(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    harness: str,
+    tier: str,
+    status: str,
+    expected: str,
+) -> None:
+    from omnigent.native.native_coding_agents import native_coding_agent_for_harness
+    from omnigent.server.permission_tiers import (
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_CAPABILITY_VALUE,
+        PERMISSION_MIGRATION_LABEL_KEY,
+        PERMISSION_RUNTIME_ID_LABEL_KEY,
+        ConfirmedPermissionState,
+        read_permission_state,
+    )
+
+    native = native_coding_agent_for_harness(harness)
+    assert native is not None
+    source_id = _session_with_history(
+        db_uri,
+        agent_id=builtin_agent_id(native.agent_name),
+        labels={
+            **ConfirmedPermissionState(
+                tier, 8, status, "old-switch" if status == "switching" else None
+            ).labels(harness),
+            PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+            PERMISSION_RUNTIME_ID_LABEL_KEY: "old-runtime",
+            PERMISSION_MIGRATION_LABEL_KEY: "old-migration",
+        },
+        terminal_launch_args=["--dangerously-skip-permissions"]
+        if harness == "antigravity-native"
+        else None,
+    )
+    response = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(source_session_id=source_id), headers=_headers()
+    )
+    assert response.status_code == 200, response.text
+    copy = SqlAlchemyConversationStore(db_uri).get_conversation(
+        response.json()["source_session_id"]
+    )
+    assert copy is not None
+    assert read_permission_state(copy.labels, harness=harness) == ConfirmedPermissionState(
+        expected, 1, "blocked"
+    )
+    assert not {
+        PERMISSION_CAPABILITY_LABEL_KEY,
+        PERMISSION_RUNTIME_ID_LABEL_KEY,
+        PERMISSION_MIGRATION_LABEL_KEY,
+    }.intersection(copy.labels)
+    if harness == "antigravity-native":
+        assert "--dangerously-skip-permissions" not in (copy.terminal_launch_args or [])
 
 
 @pytest.mark.parametrize(

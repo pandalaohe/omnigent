@@ -128,6 +128,7 @@ from omnigent.server.scheduled.source_session import (
     SourceCopyIncompleteError,
     SourceHistoryUnsupportedError,
     carries_native_history,
+    copied_permission_labels,
     copy_session,
     last_finished_response_id,
     run_copy_dropped_label_keys,
@@ -2082,6 +2083,24 @@ async def _copy_source_session_for_run(
     dropped = run_copy_dropped_label_keys(
         source.labels if source is not None else {}, agent_changed=agent_changed
     )
+    if source is not None:
+        source_agent = (
+            agent
+            if not agent_changed
+            else await asyncio.to_thread(deps.agent_store.get, source.agent_id)
+            if source.agent_id is not None
+            else None
+        )
+        source_harness = getattr(
+            source, "harness_override", None
+        ) or await scheduled_agent_harness(source_agent, deps.agent_cache)
+        target_harness = await scheduled_agent_harness(agent, deps.agent_cache)
+        labels = {
+            **copied_permission_labels(
+                source, source_harness=source_harness, target_harness=target_harness
+            ),
+            **labels,
+        }
     project_id = await _fire_project_id(deps, task)
     try:
         conv = await asyncio.to_thread(

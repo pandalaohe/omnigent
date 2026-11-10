@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from omnigent.entities import NON_CONTENT_ITEM_TYPES, Agent, Conversation, ScheduledTask
+from omnigent.server.permission_tiers import PERMISSION_LABEL_KEYS
 from omnigent.stores.conversation_store import (
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
@@ -29,12 +30,15 @@ from omnigent.stores.conversation_store import (
 SOURCE_RUN_OPENER = "Perform the task from this conversation again."
 
 # Never copied from a source session into its copy or a run.
-_NEVER_COPIED_LABEL_KEYS = frozenset(
-    {
-        FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
-        SCHEDULED_TASK_ORIGIN_LABEL_KEY,
-        SCHEDULED_TASK_SOURCE_LABEL_KEY,
-    }
+_NEVER_COPIED_LABEL_KEYS = (
+    frozenset(
+        {
+            FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+            SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+            SCHEDULED_TASK_SOURCE_LABEL_KEY,
+        }
+    )
+    | PERMISSION_LABEL_KEYS
 )
 
 
@@ -66,6 +70,38 @@ def run_prompt_text(task: ScheduledTask) -> str:
 def source_copy_title(source_title: str | None, name: str) -> str:
     """Use the source title, falling back to the automation name."""
     return source_title or name
+
+
+def copied_permission_labels(
+    source: Conversation, *, source_harness: str | None, target_harness: str | None
+) -> dict[str, str]:
+    """Create a fresh permission revision, inheriting only a non-full tier."""
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.server.permission_tiers import (
+        TIER_HARNESSES,
+        ConfirmedPermissionState,
+        creation_permission_tier,
+        legacy_permission_tier,
+    )
+
+    if target_harness not in TIER_HARNESSES:
+        return {}
+    assert target_harness is not None
+    inherited = None
+    if source_harness in TIER_HARNESSES:
+        assert source_harness is not None
+        try:
+            inherited = legacy_permission_tier(
+                harness=source_harness,
+                labels=source.labels or {},
+                launch_args=source.terminal_launch_args or [],
+            )
+        except ValueError as exc:
+            raise OmnigentError(
+                f"Source permission tier requires recovery: {exc}", code=ErrorCode.INVALID_INPUT
+            ) from exc
+    tier = creation_permission_tier(harness=target_harness, inherited=inherited)
+    return ConfirmedPermissionState(tier, 1, "blocked").labels(target_harness)
 
 
 def carries_native_history(agent: Agent) -> bool:
@@ -283,6 +319,7 @@ def run_copy_dropped_label_keys(
         _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY,
         UI_MODE_LABEL_KEY,
         WRAPPER_LABEL_KEY,
+        *PERMISSION_LABEL_KEYS,
     }
     if agent_changed:
         dropped.update(key for key in source_labels if key.startswith(MCP_SELECTION_PREFIX))
