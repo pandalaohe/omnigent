@@ -494,6 +494,9 @@ def _shell_action(params: Mapping[str, Any]) -> tuple[bool, str | None]:
     if approval is not None:
         return True, approval["command"]
     phase = params.get("phase")
+    if phase == "acp_permission":
+        # ACP titles are agent-owned prose, not a reliable tool identity.
+        return True, params.get("command")
     if phase == "codex_command_approval":
         if "command_argv" in params:
             argv = params["command_argv"]
@@ -551,12 +554,16 @@ _CODEX_FILE_SOURCES = frozenset(
 
 def classify_card(params: Mapping[str, Any]) -> Literal["answer", "note_only"] | None:
     """Offer only known single-use approval protocols with inspectable actions."""
-    if params.get("native_delivery") is not None or params.get("requestedSchema"):
+    if params.get("native_delivery") is not None:
         return None
     phase, policy = params.get("phase"), params.get("policy_name")
     if not isinstance(phase, str) or not isinstance(policy, str):
         return None
     source = (phase, policy)
+    acp_permission = source == ("acp_permission", "acp_permission")
+    schema = params.get("requestedSchema")
+    if schema and not acp_permission:
+        return None
     tool = params.get("tool_name")
     if isinstance(tool, str) and tool.removeprefix("mcp__omnigent__") in USER_ONLY_TOOLS:
         return None
@@ -566,6 +573,32 @@ def classify_card(params: Mapping[str, Any]) -> Literal["answer", "note_only"] |
         # Preserve Pi's validated two-option form for a human handoff.
     elif params.get("ask_user_question"):
         return None
+    elif acp_permission:
+        if not isinstance(tool, str) or not tool:
+            return None
+        if not schema:
+            # The binary fallback may select an agent's persistent allow scope.
+            return "note_only"
+        if not isinstance(schema, dict):
+            return None
+        properties = schema.get("properties")
+        answer_schema = properties.get("answer") if isinstance(properties, dict) else None
+        choices = answer_schema.get("enum") if isinstance(answer_schema, dict) else None
+        if (
+            not isinstance(choices, list)
+            or len(choices) < 2
+            or any(not isinstance(choice, str) or not choice.strip() for choice in choices)
+            or len(set(choices)) != len(choices)
+            or schema
+            != {
+                "type": "object",
+                "properties": {"answer": {"type": "string", "enum": choices}},
+                "required": ["answer"],
+            }
+        ):
+            return None
+        if params.get("acp_allow_once") not in choices:
+            return "note_only"
     elif source in _BINARY_SOURCES:
         if (
             not isinstance(tool, str)
@@ -1006,6 +1039,8 @@ async def answer(
         approval = _pi_approval(params)
         if approval is not None:
             data["content"] = {"0": approval["approve" if body.decision == "approve" else "deny"]}
+        if params.get("phase") == "acp_permission" and body.decision == "approve":
+            data["content"] = {"answer": params["acp_allow_once"]}
         parked = _harness_parked_elicitations.get(elicitation_id)
         server_owned = (
             (_harness_elicitation_owners.get(elicitation_id) == target_id and future is not None)

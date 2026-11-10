@@ -1199,7 +1199,8 @@ class ExecutorAdapter(HarnessApp):
             {"ask_user_question": question_payload} if question_payload else {}
         )
         extras["tool_name"] = tool_name
-        if _strip_mcp_tool_prefix(tool_name) in SHELL_TOOLS:
+        acp_permission = self._startup_source == "acp" and phase == "tool_call"
+        if acp_permission or _strip_mcp_tool_prefix(tool_name) in SHELL_TOOLS:
             command = tool_input.get("command")
             if isinstance(command, str):
                 extras["command"] = command
@@ -1208,8 +1209,8 @@ class ExecutorAdapter(HarnessApp):
             message=f"{label} wants to use **{tool_name}**",
             requestedSchema=requested_schema,
             url=None,
-            phase=phase,
-            policy_name=f"{label.lower()}_sdk_permission",
+            phase="acp_permission" if acp_permission else phase,
+            policy_name="acp_permission" if acp_permission else f"{label.lower()}_sdk_permission",
             content_preview=f"{tool_name}({preview})",
             **extras,
         )
@@ -1219,6 +1220,8 @@ class ExecutorAdapter(HarnessApp):
         tool_name: str,
         tool_input: dict[str, Any],
         options: Sequence[str],
+        allow_once: str | None = None,
+        policy_ask: bool = False,
     ) -> str | None:
         """Stable bridge for a multiple-choice tool-permission elicitation.
 
@@ -1246,12 +1249,15 @@ class ExecutorAdapter(HarnessApp):
         params = self._permission_card(
             tool_name,
             tool_input,
+            phase="policy_ask" if policy_ask else "tool_call",
             requested_schema={
                 "type": "object",
                 "properties": {"answer": {"type": "string", "enum": list(options)}},
                 "required": ["answer"],
             },
         )
+        if self._startup_source == "acp" and allow_once is not None:
+            params = params.model_copy(update={"acp_allow_once": allow_once})
         result = await ctx.elicit(elicitation_id, params)
         if result.action != "accept":
             if result.action == "decline":
