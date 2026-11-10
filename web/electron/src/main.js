@@ -42,7 +42,7 @@ const { registerFolderChooser } = require("./folderChooser");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
-const { omnigentBuild } = require("../package.json");
+const { omnigentBuild, productName, appId } = require("../package.json");
 const { execFile } = require("node:child_process");
 const { isLocalhostUrl, registerLocalhostCors } = require("./localhost_cors");
 const {
@@ -313,6 +313,13 @@ const POPUP_PRELOAD = path.join(__dirname, "popup_preload.js");
 const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
 
 const isDevBuild = !app.isPackaged || omnigentBuild === "dev";
+// Set identity before any userData consumers or the single-instance lock.
+const runtimeName = isDevBuild ? "Omnigent Dev" : productName;
+app.setName(runtimeName);
+const runtimeData = path.join(app.getPath("appData"), runtimeName);
+fs.mkdirSync(runtimeData, { recursive: true });
+app.setPath("userData", runtimeData);
+if (process.platform === "win32") app.setAppUserModelId(isDevBuild ? DEV_DOMAIN : appId);
 const getUserDefault =
   !app.isPackaged && process.platform === "darwin"
     ? getDevUserDefault
@@ -5839,14 +5846,6 @@ async function handleDeepLink(raw) {
 // App lifecycle
 // ---------------------------------------------------------------------------
 
-// Name drives the macOS app menu title and the notification source name.
-app.setName(isDevBuild ? "Omnigent Dev" : "Omnigent");
-if (isDevBuild) {
-  const devData = path.join(app.getPath("appData"), "Omnigent Dev");
-  fs.mkdirSync(devData, { recursive: true });
-  app.setPath("userData", devData);
-}
-
 // Single-instance: focus the existing window instead of opening a second.
 const registerWindowDiagnostics = registerDesktopDiagnostics(app);
 const gotLock = app.requestSingleInstanceLock();
@@ -5900,9 +5899,6 @@ if (!gotLock) {
 
   app.whenReady().then(() => {
     diagnostics.initialize(app);
-    // App User Model ID so Windows attributes notifications/taskbar correctly.
-    if (process.platform === "win32")
-      app.setAppUserModelId(isDevBuild ? DEV_DOMAIN : "ai.omnigent.desktop");
     applyDockIcon();
     registerPermissions();
     registerLocalhostAccess();

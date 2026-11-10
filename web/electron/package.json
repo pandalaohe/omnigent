@@ -1,6 +1,7 @@
 {
   "name": "omnigent-desktop-electron",
   "productName": "Omnigent",
+  "appId": "ai.omnigent.desktop",
   "version": "0.18.1",
   "description": "Omnigent desktop shell (Electron edition) — a thin native wrapper around the server-served web UI.",
   "private": true,
