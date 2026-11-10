@@ -341,6 +341,18 @@ export interface Conversation {
    * than per row update. `null`/absent when none are indexed.
    */
   pending_elicitation_key?: string | null;
+  /**
+   * Work outlives the session's ended turn, such as a background shell or a
+   * Codex goal. The sidebar shows the session as working; `status` stays as
+   * reported.
+   */
+  background_work_running?: boolean;
+  /**
+   * Why a running session's agent is parked on a terminal prompt, e.g.
+   * `"permission prompt"`. The sidebar shows the session as needing input even
+   * when no web card exists for the prompt.
+   */
+  blocked_on?: string | null;
   status?: "idle" | "running" | "failed";
   /** This session's own turn status, excluding active child-session rollup. */
   foreground_status?: "idle" | "running" | "failed";

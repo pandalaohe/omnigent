@@ -156,13 +156,22 @@ export const NEW_SESSION_HIDDEN_AGENTS = new Set(["nessie", "kimi", "kimi-code"]
  * composer refuses to show (and then silently substitutes another for).
  *
  * @param agents - Raw catalog + discovery output (e.g. useAvailableAgents).
+ * @param restrictToAgentNames - Optional deployment allowlist in display order.
  */
-export function selectableSessionAgents<T extends AvailableAgent>(agents: readonly T[]): T[] {
-  return sortAgentsForDisplay(
-    agents.filter((agent) =>
-      agent.id.startsWith("ca_") ? true : !NEW_SESSION_HIDDEN_AGENTS.has(agent.name),
+export function selectableSessionAgents<T extends AvailableAgent>(
+  agents: readonly T[],
+  restrictToAgentNames?: ReadonlySet<string>,
+): T[] {
+  const selectable = sortAgentsForDisplay(
+    agents.filter(
+      (agent) => agent.id.startsWith("ca_") || !NEW_SESSION_HIDDEN_AGENTS.has(agent.name),
     ),
   );
+  if (!restrictToAgentNames?.size) return selectable;
+  const order = [...restrictToAgentNames];
+  return selectable
+    .filter((agent) => restrictToAgentNames.has(agent.name))
+    .sort((first, second) => order.indexOf(first.name) - order.indexOf(second.name));
 }
 
 /**

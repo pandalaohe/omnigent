@@ -547,11 +547,13 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
     ] == ["running"]
     old_events = [event for event in session_events if event.session_id == "conv_old"]
     notice_types = {
+        "external_background_work",
         "external_session_status",
         "external_conversation_item",
         "external_session_superseded",
     }
     assert [event.body["type"] for event in old_events if event.body["type"] in notice_types] == [
+        "external_background_work",
         "external_session_status",
         "external_conversation_item",
         "external_session_superseded",

@@ -15,11 +15,9 @@ import {
 import {
   ArrowUpIcon,
   CheckIcon,
-  ClockIcon,
   CopyIcon,
   FileTextIcon,
   FolderIcon,
-  ImageIcon,
   Link2Icon,
   Loader2Icon,
   SplitIcon,
@@ -51,12 +49,17 @@ import {
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { PeerMessageView } from "@/components/blocks/PeerMessage";
 import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMessage";
-import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
+import {
+  isSystemUserContent,
+  parseSystemMessage,
+  stripAutomationContext,
+} from "@/lib/systemMessage";
 import { parsePeerMessage } from "@/lib/peerMessage";
 import { parseAnnotationMessage } from "@/lib/annotationMessage";
 import { AnnotationCards } from "@/components/chat/AnnotationCards";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
+import { RunningDot } from "@/components/RunningDot";
 import { cn } from "@/lib/utils";
 import { mentionItemPath, type MentionItem } from "@/lib/composerMentions";
 import type { ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
@@ -71,7 +74,7 @@ import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
-import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
+import { useChatStore, withoutFailedInputs, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import {
@@ -85,14 +88,15 @@ import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
-import { InlineImage, SessionImage } from "@/components/SessionImage";
+import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/components/SessionImage";
+import { UndeliveredMessageNotice } from "@/components/chat/UndeliveredMessageNotice";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
 import { copyMarkdown } from "@/lib/copyMarkdown";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
-import type { SessionStatus } from "@/lib/types";
+import type { PendingInput, SessionStatus } from "@/lib/types";
 import {
   TRANSCRIPT_SCROLLBAR_DRAG_EVENT,
   type TranscriptScrollbarDragDetail,
@@ -115,10 +119,12 @@ function sliceByCodePoint(str: string, limit: number): string {
 export const SessionSharedContext = createContext(false);
 
 export function extractUserText(content: MessageContentBlock[]): string {
-  return content
-    .filter(isTextBlock)
-    .map((c) => c.text)
-    .join("")
+  return stripAutomationContext(
+    content
+      .filter(isTextBlock)
+      .map((c) => c.text)
+      .join(""),
+  )
     .replace(ATTACHED_RE, "")
     .trimEnd();
 }
@@ -234,6 +240,72 @@ export function buildPendingBubbles(
       ...(p.createdAtS !== undefined ? { createdAtS: p.createdAtS } : {}),
     };
   });
+}
+
+/**
+ * Build "Not delivered" user bubbles from a session's undelivered startup inputs.
+ *
+ * @param failedInputs - The snapshot's `failedInputs`, in submission order.
+ * @param selfAuthor - The viewer's attribution id, or null.
+ */
+export function buildUndeliveredBubbles(
+  failedInputs: PendingInput[],
+  selfAuthor: string | null,
+): Bubble[] {
+  return failedInputs.map((input) => {
+    const author = input.createdBy ?? selfAuthor;
+    return {
+      kind: "user",
+      itemId: input.pendingId,
+      // No transcript item exists, so there is nothing to link to.
+      pending: true,
+      undelivered: true,
+      content: input.content,
+      ...(author !== null ? { createdBy: author } : {}),
+    };
+  });
+}
+
+function isStartupFailureBubble(bubble: Bubble): boolean {
+  return (
+    bubble.kind === "assistant" &&
+    bubble.items.some((item) => item.kind === "error" && item.code === "startup_input_failed")
+  );
+}
+
+/**
+ * Place undelivered messages above the startup failure notice that explains
+ * them, or at the end of the transcript when that notice isn't loaded.
+ */
+export function placeUndeliveredBubbles(committed: Bubble[], undelivered: Bubble[]): Bubble[] {
+  if (undelivered.length === 0) return committed;
+  const notice = committed.findIndex(isStartupFailureBubble);
+  if (notice === -1) return [...committed, ...undelivered];
+  return [...committed.slice(0, notice), ...undelivered, ...committed.slice(notice)];
+}
+
+/**
+ * Add a conversation's uncommitted user messages to its committed bubbles: the
+ * undelivered startup messages, and the optimistic sends they don't replace.
+ *
+ * @param committed - Bubbles built from the transcript.
+ * @param pendingUserMessages - The conversation's optimistic sends.
+ * @param failedInputs - The snapshot's undelivered startup messages.
+ * @param selfAuthor - The viewer's attribution id, or null.
+ */
+export function withUncommittedUserBubbles(
+  committed: Bubble[],
+  pendingUserMessages: PendingUserMessage[],
+  failedInputs: PendingInput[],
+  selfAuthor: string | null,
+): Bubble[] {
+  const withUndelivered = placeUndeliveredBubbles(
+    committed,
+    buildUndeliveredBubbles(failedInputs, selfAuthor),
+  );
+  const pending = withoutFailedInputs(pendingUserMessages, failedInputs);
+  if (pending.length === 0) return withUndelivered;
+  return mergePendingBubbles(withUndelivered, buildPendingBubbles(pending, selfAuthor));
 }
 
 // A committed bubble that exists ONLY to render one or more
@@ -467,10 +539,29 @@ export function WorkingIndicator() {
     ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
     : rootAgentWorking;
   const tick = useWorkingLabelTick();
-  // Once the turn ends but background shells outlive it, BackgroundTaskPill owns
-  // the state and the shimmer stays off (it would misread as the agent still
-  // thinking). While the turn is active the shimmer shows, with the pill beside it.
-  if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) return null;
+  // Background shells outliving a finished turn keep the session in progress,
+  // but the agent isn't thinking: show a plain spinner instead of the shimmer.
+  // The main composer's pill announces the count; side chats have no pill.
+  if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) {
+    const label = `${bgCount} background task${bgCount === 1 ? "" : "s"} running`;
+    return (
+      <>
+        {scopedConversationId && (
+          <span role="status" aria-live="polite" className="sr-only">
+            {label}
+          </span>
+        )}
+        <Message from="assistant" data-testid="background-tasks-indicator" aria-hidden="true">
+          <MessageContent>
+            <div className="flex items-center gap-1.5 py-0.5 text-muted-foreground">
+              <RunningDot className="size-3.5" />
+              <span className="text-sm font-mono">{label}</span>
+            </div>
+          </MessageContent>
+        </Message>
+      </>
+    );
+  }
   const label = workingIndicatorLabel(tick, blockedOn, {
     answerableInChat: hasOwnPendingElicitation,
     // The toggle switches to the root session's terminal, not a side chat's.
@@ -786,6 +877,7 @@ function UserBubble({
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
   const ts = formatBubbleTimestamp(bubble.createdAtS);
+  const awaitingAgent = Boolean(bubble.pending && bubble.awaitingAgent);
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(
     bubble.pending ? null : bubble.itemId,
   );
@@ -849,6 +941,7 @@ function UserBubble({
             </Tooltip>
           )}
           <MessageContent
+            data-testid="user-message-content"
             className={cn("wrap-anywhere", flashing && "animate-message-highlight")}
             // Another contributor's bubble takes their avatar color at low
             // alpha instead of the default bg-muted.
@@ -901,7 +994,7 @@ function UserBubble({
                 if (isTextBlock(block)) {
                   const full = isShellCommand
                     ? block.text
-                    : block.text.replace(ATTACHED_RE, "").trimEnd();
+                    : stripAutomationContext(block.text).replace(ATTACHED_RE, "").trimEnd();
                   if (!full.trim() || budget <= 0) return null;
                   const visible = budget < full.length ? sliceByCodePoint(full, budget) : full;
                   budget -= visible.length;
@@ -935,16 +1028,21 @@ function UserBubble({
                               : undefined
                           }
                           alt={preview.alt}
+                          variant="userAttachment"
                           className="rounded-md object-contain"
                         />
                       ) : preview.kind === "inline" ? (
                         <InlineImage
                           src={preview.src}
                           alt={preview.alt}
+                          variant="userAttachment"
                           className="rounded-md object-contain"
                         />
                       ) : (
-                        <AttachmentChip icon={ImageIcon} label={preview.label} />
+                        <ImageAttachmentPlaceholder
+                          label={preview.label}
+                          pending={bubble.pending === true}
+                        />
                       )}
                     </div>
                   );
@@ -984,27 +1082,39 @@ function UserBubble({
             })()}
           </MessageContent>
         </div>
-        {/* Always visible: a mid-turn message can wait minutes behind a long tool call. */}
-        {bubble.pending && bubble.awaitingAgent && (
-          <div
-            className="flex items-center gap-1 pt-1 text-sm leading-4 text-muted-foreground"
-            data-testid="message-awaiting-agent"
-          >
-            <ClockIcon size={12} aria-hidden />
-            The agent will read this after its current step
-          </div>
+        {bubble.undelivered && (
+          <UndeliveredMessageNotice sessionId={sessionId} text={text} content={bubble.content} />
         )}
-        {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
-        <div className="flex mobile-app:flex-wrap items-center justify-end gap-3 py-1 mobile-app:py-0 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40">
+        {/* 40%-visible on touch, hover/focus-reveal on desktop. A text-less
+            steering message has no enabled footer control to focus (Copy is
+            absent and Copy link is disabled while pending), so keep its
+            explanation visible for keyboard users. */}
+        <div
+          className={cn(
+            "flex max-w-full items-center justify-end gap-3 pt-1 mobile-app:py-0",
+            awaitingAgent && !text
+              ? "opacity-100"
+              : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 [@media(pointer:coarse)]:opacity-40",
+          )}
+        >
+          {awaitingAgent && (
+            <span
+              className="min-w-0 truncate text-sm leading-4 text-muted-foreground"
+              data-testid="message-awaiting-agent"
+              title="The agent will read this after its current step"
+            >
+              The agent will read this after its current step
+            </span>
+          )}
           {ts && (
             <span
-              className="select-none text-sm leading-4 text-foreground/56"
+              className="shrink-0 select-none whitespace-nowrap text-[11px] leading-4 text-foreground/56"
               data-testid="message-timestamp"
             >
               {ts}
             </span>
           )}
-          <MessageActions>
+          <MessageActions className="shrink-0">
             {text && (
               <MessageAction
                 tooltip="Copy"
@@ -1351,7 +1461,7 @@ export function ScrollToBottomOnSessionOpen({
 /** Keep bottom-locked readers pinned before the frame paints when the viewport shrinks
  *  (the composer grows) or the content grows (a reply lands). `pinRef` receives the
  *  growth check so the transcript can run it when a mounted row grows. */
-export function KeepBottomOnViewportResize({
+export function KeepBottomOnResize({
   pinRef,
 }: {
   pinRef?: React.RefObject<(() => void) | null>;
@@ -1377,13 +1487,18 @@ export function KeepBottomOnViewportResize({
       el.scrollHeight - el.clientHeight - el.scrollTop <= 1 ||
       scrollHeight - clientHeight - el.scrollTop <= 1;
     let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isAtBottom();
+    let pointerDown = false;
     let frame: number | null = null;
     const onScroll = () => {
       wasBottomLocked = isAtBottom();
     };
+    const onPointer = (event: Event) => {
+      pointerDown = event.type === "pointerdown";
+    };
     const isSelecting = () => {
       const selection = document.getSelection();
-      if (!selection || selection.isCollapsed || selection.rangeCount === 0) return false;
+      if (!pointerDown || !selection || selection.isCollapsed || selection.rangeCount === 0)
+        return false;
       const node = selection.getRangeAt(0).commonAncestorContainer;
       return el.contains(node) || node.contains(el);
     };
@@ -1418,6 +1533,8 @@ export function KeepBottomOnViewportResize({
     };
     const observer = new ResizeObserver(settle);
     el.addEventListener("scroll", onScroll, { passive: true });
+    const pointerEvents = ["pointerdown", "pointerup", "pointercancel"] as const;
+    for (const type of pointerEvents) document.addEventListener(type, onPointer, true);
     observer.observe(el); // viewport height
     // Content growth changes scrollHeight, which the container's own box never reports.
     const content = contentRef?.current;
@@ -1425,6 +1542,7 @@ export function KeepBottomOnViewportResize({
     if (pinRef) pinRef.current = settle;
     return () => {
       el.removeEventListener("scroll", onScroll);
+      for (const type of pointerEvents) document.removeEventListener(type, onPointer, true);
       observer.disconnect();
       if (frame !== null) cancelAnimationFrame(frame);
       if (pinRef?.current === settle) pinRef.current = null;

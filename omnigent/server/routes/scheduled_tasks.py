@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -29,6 +30,7 @@ from omnigent.db.account_authority import account_generation, current_account_us
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
+from omnigent.runtime import pending_elicitations
 from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_LOCAL,
@@ -53,6 +55,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_uploaded_bundle_host_workspace,
 )
 from omnigent.server.routes._sessions.helpers import (
+    SessionLiveness,
     _read_state_entry,
     _session_status_from_cache,
 )
@@ -273,6 +276,7 @@ def _run_to_response(
     viewer_last_seen: int | None = None,
     viewer_unread: bool | None = None,
     session_cost_usd: float | None = None,
+    conversation_pending_approvals: int = 0,
 ) -> dict[str, Any]:
     """Serialize a :class:`ScheduledTaskRun` to a JSON-safe dict.
 
@@ -295,6 +299,7 @@ def _run_to_response(
         so the frontend never needs a separate session fetch.
     :param session_cost_usd: Current cumulative session cost, or ``None`` when
         unreported. Runs continuing the same session share this total.
+    :param conversation_pending_approvals: Current session approval/question count.
     """
     return {
         "id": run.id,
@@ -310,6 +315,7 @@ def _run_to_response(
         "viewer_last_seen": viewer_last_seen,
         "viewer_unread": viewer_unread,
         "session_cost_usd": session_cost_usd,
+        "conversation_pending_approvals": conversation_pending_approvals,
     }
 
 
@@ -413,6 +419,7 @@ def create_scheduled_tasks_router(
     artifact_store: ArtifactStore | None = None,
     project_store: ProjectStore | None = None,
     automations: DeploymentGate = True,
+    liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
 ) -> APIRouter:
     """Build the scheduled-tasks router.
 
@@ -425,6 +432,7 @@ def create_scheduled_tasks_router(
     :param project_store: Checks the project fired sessions are filed into.
         ``None`` rejects tasks that set a project.
     :param automations: Per-request gate; every route returns 404 while it is off.
+    :param liveness_lookup: Shared bulk session liveness; masks stale approval counts.
     :param auth_provider: Auth provider used to identify the requesting user.
         ``None`` disables auth (owner resolves to ``"local"``).
     :param custom_agents_store: Owner-scoped saved-Agent library. When wired
@@ -994,11 +1002,30 @@ def create_scheduled_tasks_router(
         # Runs without a conversation_id (skipped/failed) contribute null fields.
         conv_ids = [r.conversation_id for r in runs if r.conversation_id is not None]
         sessions = conversation_store.get_session_activity(conv_ids) if conv_ids else {}
+        live_counts = pending_elicitations.counts_for(list(sessions))
+        # Only runner-bound sessions need the persisted cross-replica mirror.
+        pending_counts = {
+            sid: max(live_counts.get(sid, 0), session.pending_elicitation_count or 0)
+            if session.runner_id is not None
+            else live_counts.get(sid, 0)
+            for sid, session in sessions.items()
+        }
+        pending_ids = [sid for sid, count in pending_counts.items() if count]
+        liveness = (
+            await asyncio.to_thread(liveness_lookup, pending_ids)
+            if liveness_lookup is not None and pending_ids
+            else {}
+        )
         run_rows = []
         for r in runs:
             session = sessions.get(r.conversation_id) if r.conversation_id is not None else None
             if r.conversation_id is not None and session is not None:
                 last_seen, explicit_unread = _read_state_entry(viewer_id, r.conversation_id)
+                pending_approvals = pending_counts[r.conversation_id]
+                live = liveness.get(r.conversation_id)
+                # A disconnected runner's persisted count can outlive its approval requests.
+                if live is not None and not live.runner_online:
+                    pending_approvals = 0
                 run_rows.append(
                     _run_to_response(
                         r,
@@ -1010,6 +1037,7 @@ def create_scheduled_tasks_router(
                         viewer_last_seen=last_seen,
                         viewer_unread=explicit_unread,
                         session_cost_usd=session.total_cost_usd,
+                        conversation_pending_approvals=pending_approvals,
                     )
                 )
             else:
@@ -1044,6 +1072,7 @@ def create_scheduled_tasks_router(
         history and in the LIST endpoint's ``last_run_status``. Legacy timers
         return ``409`` when a fire for this task is already in flight. Both return
         ``503`` when the scheduler subsystem is not running.
+        The database scheduler also returns ``run_id`` to identify the queued run.
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
@@ -1055,9 +1084,10 @@ def create_scheduled_tasks_router(
                     "scheduled task scheduler is not running",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
-            if await scheduler.run_now(task) is None:
+            run = await scheduler.run_now(task)
+            if run is None:
                 raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
-            return {"triggered": True, "id": task.id}
+            return {"triggered": True, "id": task.id, "run_id": run.id}
         run_now = getattr(request.app.state, "scheduled_task_run_now", None)
         if task.project_id is not None and project_store is not None:
             project = await asyncio.to_thread(

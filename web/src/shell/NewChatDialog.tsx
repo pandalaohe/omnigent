@@ -473,6 +473,11 @@ import {
   PERMISSION_TIERS_PROTOCOL_HEADERS,
 } from "@/lib/sessionsApi";
 import { promoteSessionDraft, recoverFailedSessionDraft } from "@/lib/sessionDrafts";
+import {
+  NEW_SESSION_HANDOFF_PARAM,
+  forgetNewSessionHandoff,
+  peekNewSessionHandoff,
+} from "@/lib/newSessionHandoff";
 
 // Re-exported for the composer and settings, whose import paths predate the
 // leaf module extraction.
@@ -1269,6 +1274,7 @@ export function AgentHarnessPicker({
   allowCreateCustomAgent = true,
   onOpenChange,
   onConfigOpen,
+  open: controlledOpen,
   dropdownModal = false,
   contentClassName,
   contentAlign = "end",
@@ -1339,6 +1345,9 @@ export function AgentHarnessPicker({
   onOpenChange?: (open: boolean) => void;
   /** Refresh the selected host's model catalog when its config menu opens. */
   onConfigOpen?: () => void;
+  /** Controlled visibility; pair with onOpenChange and update open when it fires.
+   * Omit open to let the picker manage its own visibility. */
+  open?: boolean;
   /** Whether the dropdown blocks outside interaction. Defaults false so composer clicks reach their target. */
   dropdownModal?: boolean;
   /** Extra classes merged onto the dropdown content (e.g. a tighter max-h). */
@@ -1396,7 +1405,19 @@ export function AgentHarnessPicker({
   entriesFailed?: boolean;
 }) {
   // Controlled so picking a row can close the menu.
-  const [open, setOpen] = useState(false);
+  const [internalOpen, setInternalOpen] = useState(false);
+  const open = controlledOpen ?? internalOpen;
+  const changeOpen = useCallback(
+    (next: boolean) => {
+      if (!next) {
+        pendingConfigAgentId.current = null;
+        setFocusConfigAgentId(null);
+      }
+      setInternalOpen(next);
+      onOpenChange?.(next);
+    },
+    [onOpenChange],
+  );
   // Tracks the last-applied openNonce so the imperative-open effect (below,
   // after the drill-in state it drives) skips the initial value.
   const appliedOpenNonce = useRef(0);
@@ -1536,6 +1557,8 @@ export function AgentHarnessPicker({
     if (!open) {
       setMenuPage(null);
       setConfigAgentId(null);
+      pendingConfigAgentId.current = null;
+      setFocusConfigAgentId(null);
     }
   }, [open]);
 
@@ -1561,8 +1584,8 @@ export function AgentHarnessPicker({
         pendingConfigAgentId.current = effectiveAgentId;
       }
     }
-    setOpen(true);
-  }, [openNonce, effectiveAgentId, hasSelectedConfig, isMobile, open]);
+    changeOpen(true);
+  }, [openNonce, effectiveAgentId, hasSelectedConfig, isMobile, open, changeOpen]);
 
   // A row's Agent action: a saved (`ca_`) Agent opens the Settings editor, a
   // built-in opens the read-only view that can duplicate it. Harness rows never
@@ -1790,13 +1813,19 @@ export function AgentHarnessPicker({
         .map((agent) => agent.id),
     [visibleCuratedEntries, readyHarnessEntries, harnessEntries],
   );
-  // Opening by hotkey skips onOpenChange, so prefetch here like a pointer open.
-  const prefetchedOpenNonce = useRef(0);
+  const prefetchedOpenNonce = useRef<number | null>(null);
   useEffect(() => {
-    if (!openNonce || openNonce === prefetchedOpenNonce.current) return;
+    if (!open) {
+      prefetchedOpenNonce.current = null;
+      return;
+    }
+    if (prefetchedOpenNonce.current === openNonce) return;
     prefetchedOpenNonce.current = openNonce;
+    for (const agent of [...harnessEntries, ...agentEntries]) {
+      void prefetchAvailableAgentDetails(agent, queryClient);
+    }
     onPrefetchEntries?.(prefetchIds);
-  }, [openNonce, onPrefetchEntries, prefetchIds]);
+  }, [open, openNonce, harnessEntries, agentEntries, queryClient, onPrefetchEntries, prefetchIds]);
   const selectedOtherHarness = moreHarnessEntries.find((agent) => agent.id === effectiveAgentId);
   const prefetchedOpenRef = useRef(false);
   useEffect(() => {
@@ -2007,14 +2036,7 @@ export function AgentHarnessPicker({
       cyclePreview={cyclePreview}
       onDismissCyclePreview={onDismissCyclePreview}
       open={open}
-      onOpenChange={(next) => {
-        if (!next) {
-          pendingConfigAgentId.current = null;
-          setFocusConfigAgentId(null);
-        }
-        setOpen(next);
-        onOpenChange?.(next);
-      }}
+      onOpenChange={changeOpen}
       trigger={{
         disabled: disabledLabel !== undefined || previewOnly || (!hasAgents && !curated),
         "aria-busy": loading || undefined,
@@ -2158,7 +2180,6 @@ export function AgentHarnessPicker({
                 onSelect={() => {
                   if (!autoHarnessAvailable) return;
                   onSelectAutoHarness?.();
-                  setOpen(false);
                 }}
                 className="mobile-touch-target group/routing items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
               >
@@ -2363,6 +2384,10 @@ export function NewChatLandingScreen({
   const location = useLocation();
   const [searchParams] = useSearchParams();
   const linkedPrompt = composerSeed?.prompt ?? searchParams.get("prompt");
+  const handoffToken = searchParams.get(NEW_SESSION_HANDOFF_PARAM);
+  // A copied message replaces the whole draft, even with no text or files. Read
+  // once: the link effect below releases the token.
+  const [handoff] = useState(() => peekNewSessionHandoff(handoffToken));
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
@@ -2600,19 +2625,19 @@ export function NewChatLandingScreen({
   const modelTouchedRef = useRef(restoredDraft?.modelTouched ?? false);
   const effortTouchedRef = useRef(restoredDraft?.effortTouched ?? false);
 
-  const [message, setMessage] = useState<string>(() =>
-    composerSeed
-      ? composerSeed.prompt
-      : linkedPrompt?.trim()
-        ? linkedPrompt
-        : (restoredDraft?.message ?? ""),
-  );
+  const [message, setMessage] = useState<string>(() => {
+    if (composerSeed) return composerSeed.prompt;
+    if (handoff !== null) return handoff.text;
+    return linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? "");
+  });
   useEffect(() => {
-    if (composerSeed || !searchParams.has("prompt")) return;
+    if (composerSeed || (!searchParams.has("prompt") && handoffToken === null)) return;
     if (linkedPrompt?.trim()) setMessage(linkedPrompt);
     // Consume the link once so returning to the composer preserves edits.
     const remaining = new URLSearchParams(searchParams);
     remaining.delete("prompt");
+    remaining.delete(NEW_SESSION_HANDOFF_PARAM);
+    forgetNewSessionHandoff(handoffToken);
     navigate(
       { pathname: location.pathname, search: remaining.toString(), hash: location.hash },
       { replace: true, state: location.state },
@@ -2620,6 +2645,7 @@ export function NewChatLandingScreen({
   }, [
     composerSeed,
     linkedPrompt,
+    handoffToken,
     searchParams,
     location.pathname,
     location.hash,
@@ -2685,7 +2711,9 @@ export function NewChatLandingScreen({
     onPaste,
     clearError,
   } = useComposerAttachments({
-    initialFiles: restoredDraft?.files ?? [],
+    initialFiles: composerSeed
+      ? (restoredDraft?.files ?? [])
+      : (handoff?.files ?? restoredDraft?.files ?? []),
     limits: info !== "loading" ? info.attachment_limits : undefined,
     // Fork mod: accepted files take their `[image N]` / `[file N]` label and a
     // visible token at the caret. Runs before the append commits, so `files`

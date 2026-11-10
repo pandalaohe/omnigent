@@ -111,6 +111,12 @@ import { latestOutput } from "@/lib/lastAssistantText";
 import { isEditorLevel } from "@/lib/permissionsApi";
 import { randomUUID } from "@/lib/randomUUID";
 import { describeSendFailure } from "@/lib/sendFailure";
+import {
+  acknowledgeLocalElicitationResolution,
+  affectedSessionIds,
+  beginLocalElicitationResolution,
+  cancelLocalElicitationResolution,
+} from "@/lib/localElicitationResolutions";
 import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
 import { useOmnigentAnalytics } from "@/lib/analytics";
@@ -210,7 +216,9 @@ export function InboxPage() {
   }, [queryClient]);
   const {
     inbox: conversationsQuery,
-    inboxRows: allRows,
+    // Server counts, not the answer overlay: a card answered here stays listed,
+    // with its delivery state, until the server drops the prompt.
+    serverInboxRows: allRows,
     comments: commentInbox,
     automationInbox,
   } = useSidebarData();
@@ -432,6 +440,15 @@ export function InboxPage() {
       pendingSubmissions.current.set(elicitationId, verdict);
       const asyncQuestion = item.elicitation.asyncKind === "question";
       if (!asyncQuestion) setResponded((prev) => ({ ...prev, [elicitationId]: verdict }));
+      const holdToken = beginLocalElicitationResolution(
+        elicitationId,
+        affectedSessionIds(
+          [item.row.id, item.resolveSessionId],
+          (knownSessionId) =>
+            queryClient.getQueryData<Session>(["session", knownSessionId])?.parentSessionId,
+        ),
+        { nativeDelivery: Boolean(item.elicitation.nativeDelivery) },
+      );
       try {
         await approve(item.resolveSessionId, elicitationId, {
           action,
@@ -440,6 +457,7 @@ export function InboxPage() {
         });
         if (pendingSubmissions.current.get(elicitationId) !== verdict) return false;
         pendingSubmissions.current.delete(elicitationId);
+        acknowledgeLocalElicitationResolution(elicitationId, holdToken);
         clearAskUserQuestionDraft(elicitationId);
         if (asyncQuestion) setResponded((prev) => ({ ...prev, [elicitationId]: verdict }));
         void queryClient.invalidateQueries({ queryKey: ["conversations"] });
@@ -452,6 +470,7 @@ export function InboxPage() {
       } catch (error: unknown) {
         if (pendingSubmissions.current.get(elicitationId) !== verdict) return false;
         pendingSubmissions.current.delete(elicitationId);
+        cancelLocalElicitationResolution(elicitationId, holdToken);
         // The prompt timed out before this verdict arrived. Keep the
         // responded entry with reason "timed_out" so ApprovalCard
         // renders nothing — restoring the buttons would offer a retry

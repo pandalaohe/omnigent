@@ -644,7 +644,7 @@ function CommentCard({
             <button
               type="button"
               aria-expanded={expanded}
-              className="cursor-pointer text-ui font-medium text-blue-600 hover:underline dark:text-blue-400"
+              className="cursor-pointer text-ui font-medium text-link hover:underline"
               onClick={(e) => {
                 e.stopPropagation();
                 setExpanded((v) => !v);

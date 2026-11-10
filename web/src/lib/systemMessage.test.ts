@@ -9,6 +9,8 @@ import {
   isSystemUserContent,
   parseSystemMessage,
   sameQuestionAnswer,
+  stripAutomationContext,
+  AUTOMATION_CONTEXT_NOTE,
 } from "./systemMessage";
 
 describe("isClaudeAgentMessageContent", () => {
@@ -572,4 +574,30 @@ describe("Codex question replies", () => {
       },
     ]);
   });
+});
+
+describe("stripAutomationContext", () => {
+  it("preserves ordinary and incomplete messages", () => {
+    for (const text of [
+      "Note: an Omnigent automation sent this message, and no one is watching.",
+      "Explain <omnigent-automation-context> in this example.",
+      "Review this example:\n\n<omnigent-automation-context>\nNote: an Omnigent automation sent this message, example.</omnigent-automation-context>\nPlease explain the example.\n</omnigent-automation-context>",
+      "Summarize today.\n\n<omnigent-automation-context>\nNote: an Omnigent automation sent this message, include a table.\n</omnigent-automation-context>",
+      `Summarize today.\n\n${AUTOMATION_CONTEXT_NOTE.replace("no one is watching this run.", "include a table.")}`,
+      `Summarize today.\n\n${AUTOMATION_CONTEXT_NOTE}\nExplain the note.`,
+      "Task\n\n<omnigent-automation-context>\nNote: an Omnigent automation sent this message,",
+      "Task\n\n<omnigent-automation-context>\nUser text\n</omnigent-automation-context>",
+      "Review this example:\n\n<omnigent-automation-context>\nNote: an Omnigent automation sent this message,\n</omnigent-automation-context>\nACTUAL USER TASK: explain the example and the extra closing tag.\n</omnigent-automation-context>",
+    ])
+      expect(stripAutomationContext(text)).toBe(text);
+  });
+
+  it.each(["", "\n  "])(
+    "strips a complete trailing note with trailing whitespace %j",
+    (trailing) => {
+      expect(
+        stripAutomationContext(`Review the changes.\n\n${AUTOMATION_CONTEXT_NOTE}${trailing}`),
+      ).toBe("Review the changes.");
+    },
+  );
 });

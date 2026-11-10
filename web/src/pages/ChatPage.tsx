@@ -224,7 +224,7 @@ export {
   HistoryAutoLoader,
   HistoryLoadingIndicator,
   JumpToTopButton,
-  KeepBottomOnViewportResize,
+  KeepBottomOnResize,
   LatestTurnSpacer,
   ScrollToBottomOnSend,
   ScrollToBottomOnSessionOpen,
@@ -2393,6 +2393,24 @@ export function buildSlashCommandMap(
 }
 
 /**
+ * Whether the composer offers ``/clear`` for a session on *harness*.
+ *
+ * SDK clear requires its capability flag; native clear uses
+ * ``session_event_types``. Elsewhere a typed /clear stays plaintext.
+ */
+export function composerOffersClear(harness: string | null, info: ServerInfo | "loading"): boolean {
+  if (info === "loading") return false;
+  if (harness === "claude-sdk") return info.session_claude_sdk_clear === true;
+  return (
+    (harness === "claude-native" ||
+      harness === "codex-native" ||
+      harness === "antigravity-native" ||
+      harness === "pi-native") &&
+    !!info.session_event_types?.includes("clear")
+  );
+}
+
+/**
  * Set of slash commands that should fill the textarea with
  * ``"/cmd "`` on menu selection rather than executing immediately.
  * Includes the arg-taking built-ins (each gated on its own capability
@@ -3668,16 +3686,8 @@ function ComposerImpl(
   // for claude-sdk, whose runner sends /compact to the live SDK client to
   // trigger native compaction. Other SDK harnesses don't support it yet.
   const showCompact = isNativeWrapper || sessionHarness === "claude-sdk";
-  // /clear runs the harness's own /clear in the session terminal, which moves
-  // the terminal onto a fresh session the view then follows.
   const composerServerInfo = useServerInfo();
-  const showClear =
-    composerServerInfo !== "loading" &&
-    !!composerServerInfo.session_event_types?.includes("clear") &&
-    (sessionHarness === "claude-native" ||
-      sessionHarness === "codex-native" ||
-      sessionHarness === "antigravity-native" ||
-      sessionHarness === "pi-native");
+  const showClear = composerOffersClear(sessionHarness, composerServerInfo);
   // /btw is a Claude Code CLI built-in (side chat), so offer it only on
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
@@ -5213,10 +5223,12 @@ function ComposerImpl(
                         const sourceId = useChatStore.getState().conversationId;
                         if (sourceId === null) return;
                         createSideChat(sourceId).then(
-                          ({ childSessionId }) =>
+                          ({ childSessionId }) => {
+                            useChatStore.getState().requestSideChatFocus(childSessionId);
                             useChatStore.setState({
                               sideChatToOpen: { childId: childSessionId, parentId: sourceId },
-                            }),
+                            });
+                          },
                           () => toast.error("Couldn't start a side chat for this session."),
                         );
                       }

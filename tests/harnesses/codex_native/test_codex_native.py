@@ -2502,10 +2502,14 @@ def test_supervise_forwarder_subscribes_without_replaying_dead_letters(
     assert fake_client.requests == [
         ("thread/goal/get", {"threadId": "thread_123"}),
         ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
+        ("thread/goal/get", {"threadId": "thread_123"}),
+        ("thread/backgroundTerminals/list", {"threadId": "thread_123"}),
     ]
     assert fake_client.closed
     assert [
-        (request.method, request.url.path, json.loads(request.content)) for request in ap_requests
+        (request.method, request.url.path, json.loads(request.content))
+        for request in ap_requests
+        if json.loads(request.content)["type"] != "external_background_work"
     ] == [
         (
             "POST",
@@ -2530,6 +2534,9 @@ def test_supervise_forwarder_subscribes_without_replaying_dead_letters(
             },
         )
     ]
+    assert [json.loads(request.content)["type"] for request in ap_requests].count(
+        "external_background_work"
+    ) == 1
     assert (tmp_path / "dead_letter.jsonl").exists()
 
 
@@ -2578,6 +2585,8 @@ def test_supervise_forwarder_resumes_when_it_opens_client(
     assert fake_client.requests == [
         ("thread/goal/get", {"threadId": "thread_123"}),
         ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
+        ("thread/goal/get", {"threadId": "thread_123"}),
+        ("thread/backgroundTerminals/list", {"threadId": "thread_123"}),
     ]
     assert fake_client.closed
 
@@ -6370,11 +6379,13 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
     ] == ["running"]
     old_events = [event for event in session_events if event.session_id == "conv_old"]
     notice_types = {
+        "external_background_work",
         "external_session_status",
         "external_conversation_item",
         "external_session_superseded",
     }
     assert [event.body["type"] for event in old_events if event.body["type"] in notice_types] == [
+        "external_background_work",
         "external_session_status",
         "external_conversation_item",
         "external_session_superseded",

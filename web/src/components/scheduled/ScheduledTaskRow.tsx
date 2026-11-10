@@ -38,6 +38,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import { describeSchedule, formatNextRunAt } from "@/lib/scheduleText";
+import { isTriggerPrompt } from "./triggerTemplates";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
@@ -73,7 +74,9 @@ export function ScheduledTaskRow({
   onMoveAndResume?: (task: ScheduledTask, projectId: string) => void;
 }) {
   const navigate = useNavigate();
-  const detailPageEnabled = isFeatureEnabled(useServerInfo(), "automations_v2");
+  const info = useServerInfo();
+  const detailPageEnabled = isFeatureEnabled(info, "automations_v2");
+  const triggerMode = task.sessionMode === "continue" && isTriggerPrompt(task.prompt);
   const [menuOpen, setMenuOpen] = useState(false);
   const [moveOpen, setMoveOpen] = useState(false);
   const { trackClick } = useOmnigentAnalytics();
@@ -128,8 +131,8 @@ export function ScheduledTaskRow({
         )}
       </span>
       <span className="truncate text-ui text-muted-foreground/80" data-testid="task-schedule-line">
-        {scheduleSummary}
-        {nextRun && (
+        {triggerMode ? "Runs when new items match" : scheduleSummary}
+        {!triggerMode && nextRun && (
           <>
             {" · "}
             <span data-testid="task-next-run">Next run {nextRun}</span>
@@ -215,16 +218,18 @@ export function ScheduledTaskRow({
             </>
           ) : (
             <>
-              <DropdownMenuItem
-                onSelect={() => {
-                  trackClick("tasks.scheduled.run_now", "button");
-                  onRunNow(task);
-                }}
-                data-testid="task-run-now"
-              >
-                <PlayIcon className="size-4" />
-                Run this automation now
-              </DropdownMenuItem>
+              {!triggerMode && (
+                <DropdownMenuItem
+                  onSelect={() => {
+                    trackClick("tasks.scheduled.run_now", "button");
+                    onRunNow(task);
+                  }}
+                  data-testid="task-run-now"
+                >
+                  <PlayIcon className="size-4" />
+                  Run this automation now
+                </DropdownMenuItem>
+              )}
               <DropdownMenuItem
                 onSelect={() => {
                   trackClick("tasks.scheduled.edit", "button");

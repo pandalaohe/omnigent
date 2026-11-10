@@ -87,7 +87,6 @@ import {
   SquareCheckIcon,
   Trash2Icon,
   UserRoundIcon,
-  UsersIcon,
   WalletIcon,
   XIcon,
   type LucideIcon,
@@ -542,7 +541,7 @@ type SidebarTab = SessionFilter;
 const SIDEBAR_FILTERS: { value: SidebarTab; label: string }[] = [
   { value: "all", label: "All sessions" },
   { value: "mine", label: "My sessions" },
-  { value: "shared", label: "Shared sessions" },
+  { value: "shared", label: "Shared with me" },
   { value: "archived", label: "Archived sessions" },
 ];
 
@@ -1897,7 +1896,7 @@ function ProjectFolder({
   /** Per-row identity for a copy whose rows aren't canonical (favorites). */
   rowMeta?: (conversation: Conversation) => ConversationRowMeta;
 }) {
-  const { registerFolder, sortBy, customOrder } = useSidebarData();
+  const { registerFolder, sortBy, customOrder, applyLocalResolutions } = useSidebarData();
   const query = useProjectSessions(name, expanded, sortBy, archived);
   const hidePinnedHomeCopies =
     useSidebarLayoutContext()?.layout.sections.some((section) => section.kind === "favorites") ===
@@ -1919,8 +1918,10 @@ function ProjectFolder({
     // window, window rows winning: those carry the move overlay
     // (useMoveToProject), so a just-filed session shows here immediately
     // instead of waiting out the PATCH + folder refetch round-trips.
+    // Window rows already carry the answer overlay; only the folder's own rows get it here.
     const byId = new Map<string, Conversation>();
-    for (const c of query.data?.pages.flatMap((page) => page.data) ?? []) byId.set(c.id, c);
+    for (const row of applyLocalResolutions(query.data?.pages.flatMap((page) => page.data) ?? []))
+      byId.set(row.id, row);
     for (const c of windowConversations) byId.set(c.id, c);
     // Pinning changes where the row is shown, not its project membership.
     return sortConversations(
@@ -1940,6 +1941,7 @@ function ProjectFolder({
     windowConversations,
     hidePinnedHomeCopies,
     pinnedConversationIds,
+    applyLocalResolutions,
     activeOverride,
     frozenSortKeys,
     sortBy,
@@ -2867,9 +2869,8 @@ function ConversationList({
     // hence notArchived, not allWithPinned.)
     const pinned = orderByPinnedTimestamp(notArchived.filter((c) => pinnedSet.has(c.id)));
 
-    // Folders use live members on All / My / Shared and archives on Archived.
-    // Filing is owner-only so legacy label collisions cannot file shared rows.
-    // Pins precede live folders; grouped views omit folders.
+    // Folders use live members on All / My and archives on Archived. Filing is
+    // owner-only, so Shared and grouped views omit folders; pins precede them.
     const folderCandidates = activeTab === "archived" ? tabScoped : notArchived;
     const filedIds = new Set<string>();
     const projectGroups: {
@@ -2877,7 +2878,7 @@ function ConversationList({
       name: string;
       icon?: string | null;
       conversations: Conversation[];
-    }[] = (grouped ? [] : projects).map(({ id, name, icon }) => {
+    }[] = (grouped || activeTab === "shared" ? [] : projects).map(({ id, name, icon }) => {
       // Dual-read membership: a session belongs to this folder if it has
       // the first-class id OR the legacy omni_project label of this name,
       // and (filing being owner-only) the viewer owns it.
@@ -3061,7 +3062,8 @@ function ConversationList({
   const sessionsSelecting = selectionMode && selectionScope === "sessions";
   // With sidebar_grouping_ui on, the default grouping's one "Select sessions" (on
   // the Projects header) selects project folders, Shared and Sessions together.
-  const unifiedSelection = groupingUi && !grouped;
+  // The Shared filter hides Projects, so its list owns selection alone.
+  const unifiedSelection = groupingUi && !grouped && activeTab !== "shared";
   const projectsSelecting =
     selectionMode && (selectionScope === "projects" || (unifiedSelection && sessionsSelecting));
 
@@ -5445,6 +5447,7 @@ function projectMarkerState(
   showGoalSessionMarkers: boolean,
 ): ProjectMarkerState {
   let awaiting = 0;
+  let terminalReason: string | undefined;
   let running = false;
   let backgroundActivityCount = 0;
   let starting = false;
@@ -5456,6 +5459,7 @@ function projectMarkerState(
     const state = getSessionState(c, errors[i]);
     if (state?.kind === "awaiting") {
       awaiting += state.count;
+      terminalReason ??= state.terminalReason;
     } else if (state?.kind === "running") {
       running = true;
     } else if (c.id === startingConversationId) {
@@ -5474,17 +5478,19 @@ function projectMarkerState(
   const state: SessionState | null =
     awaiting > 0
       ? { kind: "awaiting", count: awaiting }
-      : running
-        ? { kind: "running" }
-        : starting
-          ? { kind: "starting" }
-          : error
-            ? { kind: "error" }
-            : disconnected
-              ? { kind: "disconnected" }
-              : unseen
-                ? { kind: "unseen" }
-                : null;
+      : terminalReason
+        ? { kind: "awaiting", count: 0, terminalReason }
+        : running
+          ? { kind: "running" }
+          : starting
+            ? { kind: "starting" }
+            : error
+              ? { kind: "error" }
+              : disconnected
+                ? { kind: "disconnected" }
+                : unseen
+                  ? { kind: "unseen" }
+                  : null;
   return { state, backgroundActivityCount };
 }
 
@@ -7638,7 +7644,6 @@ function ConversationRowImpl({
     hasBackgroundActivity ||
     hasGoalMarker ||
     showDraftIndicator;
-  const showSharedIndicator = !isOwner;
   const compactMarkerCount =
     ((sessionState !== null && sessionState.kind !== "awaiting") || hasColdIdleDot ? 1 : 0) +
     (hasBackgroundActivity ? 1 : 0) +
@@ -7646,7 +7651,7 @@ function ConversationRowImpl({
   // The "Show → Updated" timestamp takes the indicator slot only when it's free.
   const show = useContext(SidebarShowContext);
   const showUpdated = show.includes("updated") && !hasSessionIndicator;
-  const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator || showUpdated;
+  const hasTrailingIndicator = hasSessionIndicator || showUpdated;
   const metaEnvironment = show.includes("environment") ? (
     <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
   ) : null;
@@ -7950,9 +7955,7 @@ function ConversationRowImpl({
                 ? "pr-[8.75rem] max-md:pr-44"
                 : "pr-29 max-md:pr-38"
             : showUpdated && !hasSessionIndicator
-              ? showSharedIndicator
-                ? "pr-18 max-md:pr-27"
-                : "pr-11 max-md:pr-20"
+              ? "pr-11 max-md:pr-20"
               : compactMarkerCount >= 3
                 ? "pr-17 max-md:pr-26"
                 : compactMarkerCount === 2
@@ -8234,24 +8237,6 @@ function ConversationRowImpl({
           <SessionUpdatedLabel updatedAt={conversation.updated_at} />
         </span>
       ) : null}
-      {!selectionMode && showSharedIndicator && (
-        <span
-          role="img"
-          aria-label="Shared session"
-          title="Shared with you"
-          className={cn(
-            "-translate-y-1/2 pointer-events-none absolute inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
-            unfiledWorkspace ? "top-4" : overlayTop,
-            hasSessionIndicator
-              ? "right-8 max-md:right-17"
-              : showUpdated
-                ? "right-11 max-md:right-20"
-                : "right-1 max-md:right-10",
-          )}
-        >
-          <UsersIcon className="size-3.5" aria-hidden="true" />
-        </span>
-      )}
       {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
           row, so their spacing is defined once (gap-0.5) and stays aligned
           with the project-folder header actions, which use the same pattern.
@@ -8625,6 +8610,9 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "keep_warm",
   "agent_id",
   "agent_template_id",
+  "background_work_running",
+  "blocked_on",
+  "provisional",
 ];
 
 function conversationRenderEqual(a: Conversation, b: Conversation): boolean {

@@ -27,6 +27,7 @@ from omnigent.server.server_config import (
     attachment_archive_cleanup_days,
     attachment_archive_cleanup_dry_run,
     attachment_archive_cleanup_min_bytes,
+    automation_trigger_poll_minutes,
     branding_config,
     branding_logo_asset,
     config_str_list,
@@ -421,6 +422,18 @@ def test_attachment_archive_cleanup_dry_run_reads_booleans(
     with caplog.at_level("WARNING", logger=server_config_module.__name__):
         assert attachment_archive_cleanup_dry_run() is True
     assert "is not a bool" in caplog.text
+
+
+@pytest.mark.parametrize("value", [10, 30, 60, 240])
+def test_automation_trigger_poll_minutes(value: int) -> None:
+    assert automation_trigger_poll_minutes({}) == 10
+    assert automation_trigger_poll_minutes({"automation_trigger_poll_minutes": value}) == value
+
+
+@pytest.mark.parametrize("value", [9, 241, 10.5, True, "30", None])
+def test_automation_trigger_poll_minutes_rejects_invalid_values(value: object) -> None:
+    with pytest.raises(ValueError, match="integer from 10 to 240"):
+        automation_trigger_poll_minutes({"automation_trigger_poll_minutes": value})
 
 
 def test_session_title_instructions_accepts_trimmed_string() -> None:
