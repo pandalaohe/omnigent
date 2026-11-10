@@ -315,7 +315,85 @@ def _read(app: Any, owner: str, name: str, operation: Any, default: Any):
         return default
 
 
-def context_request(
+async def context_request(
+    app: Any,
+    owner: str,
+    host: str,
+    settings: SessionChoice,
+    caller: Conversation | None,
+    *,
+    user_id: str | None = None,
+    **options: Any,
+) -> ChoiceRequest:
+    """Verify missing candidate models against the host when its cache is stale."""
+    from omnigent.host.frames import CAP_CACHED_MODEL_OPTIONS
+    from omnigent.server.routes._host_launch import resolve_host_owner
+    from omnigent.server.routes._sessions.helpers import _resolve_harness_impl
+    from omnigent.server.routes.calling_defaults import _sync_pair
+
+    request = await asyncio.to_thread(
+        _context_request, app, owner, host, settings, caller, **options
+    )
+    catalogs = getattr(app.state, "host_model_catalog_cache_store", None)
+    registry = getattr(app.state, "host_registry", None)
+    connection = registry.get(host) if registry is not None else None
+    if catalogs is None or registry is None or connection is None:
+        return request
+    if CAP_CACHED_MODEL_OPTIONS not in connection.hello.capabilities:
+        return request
+    records = {row["harness"]: row for row in await asyncio.to_thread(catalogs.list, [host])}
+    harnesses = set()
+    for link in ordered_links(settings):
+        if (
+            not link.model
+            or link.agent_id in request.unavailable
+            or link.model in request.models.get(link.agent_id, ())
+        ):
+            continue
+        probe = Conversation(
+            id="", created_at=0, updated_at=0, root_conversation_id="", agent_id=link.agent_id
+        )
+        harness = await asyncio.to_thread(
+            _resolve_harness_impl,
+            probe,
+            agent_store=app.state.agent_store,
+            agent_cache=getattr(app.state, "agent_cache", None),
+        )
+        record = records.get(harness)
+        if harness in {"codex", "codex-native"} and (
+            record is None or time.time() - (record["fetched_at"] or 0) > 300
+        ):
+            harnesses.add(harness)
+    if harnesses:
+        await asyncio.to_thread(
+            resolve_host_owner,
+            user_id=user_id if user_id is not None else owner,
+            host_id=host,
+            host_store=app.state.host_store,
+        )
+    semaphore = asyncio.Semaphore(4)
+    await asyncio.gather(
+        *(
+            _sync_pair(
+                host_registry=registry,
+                host_conn=connection,
+                catalog_store=catalogs,
+                semaphore=semaphore,
+                host_id=host,
+                harness=harness,
+                refresh="cached",
+            )
+            for harness in harnesses
+        )
+    )
+    if harnesses:
+        return await asyncio.to_thread(
+            _context_request, app, owner, host, settings, caller, **options
+        )
+    return request
+
+
+def _context_request(
     app: Any,
     owner: str,
     host: str,
@@ -572,13 +650,13 @@ async def admit_create(
     async with AsyncExitStack() as stack:
         await stack.enter_async_context(app.state.child_cap_locks.hold(f"owner:{owner}"))
         now = time.time()
-        request = await asyncio.to_thread(
-            context_request,
+        request = await context_request(
             app,
             owner,
             host,
             settings,
             caller,
+            user_id=user_id,
             pin=pin,
             exclude=tuple(body.exclude),
             differ_from=body.differ_from,
@@ -751,7 +829,7 @@ async def release_choice(app: Any, session: Conversation, host: str) -> bool:
         else:
             settings = parse_session_choice({"workTypes": [{"id": "work", "label": "Work"}]})
             work = settings.work_types[0]
-        request = await asyncio.to_thread(context_request, app, owner, host, settings, None)
+        request = await context_request(app, owner, host, settings, None)
         request = await authorize_agents(app, request)
         readings, running, floors = await asyncio.to_thread(inputs, app, settings, request, now)
         running = {

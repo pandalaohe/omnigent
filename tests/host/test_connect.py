@@ -912,6 +912,53 @@ async def test_handle_model_options_devin_probe_failure_still_warns(
 
 
 @pytest.mark.parametrize("harness", ["codex-native", "codex"])
+@pytest.mark.parametrize("cache_state", ["fresh", "stale", "missing"])
+@pytest.mark.parametrize("source_kind", ["native", "command", "url", "static"])
+async def test_selection_reads_cached_codex_models_without_probing(
+    tmp_path, monkeypatch, harness, cache_state, source_kind
+):
+    from omnigent.harnesses.codex_native import app_server
+    from omnigent.models import model_catalog_store, model_source
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    launch = app_server.NativeCodexLaunch([], None, None)
+    monkeypatch.setattr(app_server, "resolve_native_codex_launch", lambda **kw: launch)
+    monkeypatch.setattr(app_server, "_find_codex_cli", lambda: sys.executable)
+    probe = AsyncMock(side_effect=AssertionError("selection must not launch a probe"))
+    monkeypatch.setattr(app_server, "codex_launch_catalog", probe)
+    rows = [{"id": "provider-example/gpt-example"}]
+    fingerprint = app_server.codex_catalog_fingerprint(launch)
+    namespace = "codex-native"
+    if source_kind != "native":
+        model_catalog_store.write_catalog("codex-native", fingerprint, [{"id": "native-only"}])
+        source = model_source.ModelSource(
+            source_kind,
+            command="unused-command",
+            url="https://models.example/v1",
+            static=(rows[0]["id"],),
+        )
+        monkeypatch.setattr(model_source, "model_source_for", lambda harness: source)
+        namespace, fingerprint, _ = model_source._source_catalog(harness, source)
+        execute = AsyncMock(side_effect=AssertionError("selection must not execute a source"))
+        monkeypatch.setattr(model_source, "fetch_model_source", execute)
+    if cache_state != "missing":
+        model_catalog_store.write_catalog(namespace, fingerprint, rows)
+        if cache_state == "stale":
+            os.utime(model_catalog_store.catalog_path(namespace, fingerprint), (1, 1))
+    host = _make_host_process()
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="selection", harness=harness, refresh="cached")
+    )
+    available = cache_state == "fresh" or source_kind == "static"
+    assert result.status == ("ok" if available else "failed")
+    assert [row["id"] for row in result.models] == ([rows[0]["id"]] if available else [])
+    probe.assert_not_awaited()
+    if source_kind != "native":
+        execute.assert_not_awaited()
+    _cleanup_host(host)
+
+
+@pytest.mark.parametrize("harness", ["codex-native", "codex"])
 @pytest.mark.parametrize("failure", ["raises", "resolves_nothing"])
 async def test_handle_model_options_codex_probe_failure_is_failed(
     monkeypatch: pytest.MonkeyPatch, failure: str, harness: str

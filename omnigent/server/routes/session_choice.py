@@ -82,9 +82,7 @@ def create_session_choice_router(
         settings = (
             await asyncio.to_thread(read_collab_settings, preferences(), owner)
         ).session_choice
-        context = await asyncio.to_thread(
-            context_request, request.app, owner, host_id, settings, None, preview=True
-        )
+        context = await context_request(request.app, owner, host_id, settings, None, preview=True)
         readings, running, floors = await asyncio.to_thread(
             inputs, request.app, settings, context, time.time()
         )
@@ -189,8 +187,7 @@ def create_session_choice_router(
             != owner
         ):
             raise HTTPException(404, "Session not found")
-        choice_request = await asyncio.to_thread(
-            context_request,
+        choice_request = await context_request(
             request.app,
             owner,
             body.host_id,
@@ -233,9 +230,7 @@ def create_session_choice_router(
         ).session_choice
         if not active_on(settings, host_id):
             return {"notice": None}
-        context = await asyncio.to_thread(
-            context_request, request.app, owner, host_id, settings, None, preview=True
-        )
+        context = await context_request(request.app, owner, host_id, settings, None, preview=True)
         session = Conversation(
             id="",
             created_at=0,
