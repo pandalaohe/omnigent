@@ -80,6 +80,7 @@ import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capa
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
 import { partitionPickerEntries, selectableSessionAgents } from "@/lib/agentGrouping";
 import {
+  AGY_NATIVE_FULL_PERMISSION_TIER,
   APPROVAL_SKIPPING_PERMISSION_MODES,
   NEW_AUTOMATION_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
@@ -1044,9 +1045,14 @@ export function CreateScheduledTaskDialog({
   const displayedEffort = reusesExistingSession
     ? (editingTask?.reasoningEffort ?? "")
     : pickedEffort;
-  const displayedPermission = reusesExistingSession
+  const savedOrPickedPermission = reusesExistingSession
     ? editablePermissionMode(editingTask?.permissionMode)
     : effectivePermission;
+  // A legacy Antigravity override stays stored as-is until edited; show the current tier.
+  const displayedPermission =
+    harnessSettings.harness === "antigravity-native" && savedOrPickedPermission === "skip"
+      ? AGY_NATIVE_FULL_PERMISSION_TIER
+      : savedOrPickedPermission;
   const summarySettings = editingWorkerSettings ? workerHarnessSettings : harnessSettings;
   const summaryModel = editingWorkerSettings ? (workerSettings?.model ?? "") : displayedModel;
   const summaryEffort = editingWorkerSettings ? (workerSettings?.effort ?? "") : displayedEffort;

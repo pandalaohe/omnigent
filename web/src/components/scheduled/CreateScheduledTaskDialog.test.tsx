@@ -5553,9 +5553,9 @@ describe("automation harness settings", () => {
   });
 
   it.each([
-    [false, null],
-    [true, "skip"],
-  ])(
+    [false, { permissionMode: null }],
+    [true, {}],
+  ] as const)(
     "on edit, keeps Antigravity's saved skip mode only if the server accepts it (%s)",
     async (accepted, expected) => {
       mockHarness("antigravity-native");
@@ -5570,7 +5570,7 @@ describe("automation harness settings", () => {
       );
       // Without the mode the picker has nothing to offer, so it is hidden.
       if (accepted) {
-        expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Skip permissions");
+        expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Full access");
       } else {
         expect(screen.queryByTestId("task-permission-trigger")).toBeNull();
       }
@@ -5581,8 +5581,10 @@ describe("automation harness settings", () => {
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
       expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
         prompt: "Review again",
-        permissionMode: expected,
+        ...expected,
       });
+      if (accepted)
+        expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("permissionMode");
     },
   );
 
