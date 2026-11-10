@@ -133,7 +133,7 @@ async def test_create_posts_payload() -> None:
         "agent_id": "ag_1",
         "project_id": "proj_1",
         # The calling session rides along so the server can inherit its project.
-        "source_session_id": "conv_caller",
+        "source_session_id": "conv_source",
         "workspace": "/repo",
         "host_id": "host_1",
         "session_mode": "continue",

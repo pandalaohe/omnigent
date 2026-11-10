@@ -12168,6 +12168,7 @@ async def test_codex_update_keeps_thread_when_replacement_cannot_start(
 @pytest.fixture
 def disabled_mcp_session(tmp_path, monkeypatch):
     from omnigent import mcp_disabled_servers as disabled
+    from tests._helpers.mcp_disabled_servers import launch_activation
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
     source_home = tmp_path / "source-codex-home"
@@ -12198,7 +12199,7 @@ def disabled_mcp_session(tmp_path, monkeypatch):
         env={},
         tool_executor=None,
         codex_config_overrides=["base=true"],
-        active_harnesses=["codex"],
+        active_harnesses=launch_activation(["codex"]),
     )
     spawns = []
     processes = []
@@ -12357,13 +12358,20 @@ async def test_disabled_mcp_not_applied_early_exit_does_not_retry(disabled_mcp_s
     assert RELAUNCH_WITHOUT_OVERRIDES_EVENT not in caplog.text
 
 
-async def test_disabled_mcp_inactive_keeps_baseline(disabled_mcp_session):
+@pytest.mark.parametrize("active", [None, [], ["codex"]])
+async def test_disabled_mcp_launch_activation(disabled_mcp_session, active):
+    from tests._helpers.mcp_disabled_servers import launch_activation
+
     harness = disabled_mcp_session
-    harness.session._mcp_active_harnesses = None
+    harness.session._mcp_active_harnesses = launch_activation(active)
     try:
         await harness.session.start()
-        assert harness.plans[0].outcome == "none"
-        assert harness.spawns == [("/bin/echo", "app-server", "-c", "base=true")]
+        assert harness.plans[0].outcome == ("applied" if active else "none")
+        baseline = ("/bin/echo", "app-server", "-c", "base=true")
+        expected = (*baseline, "-c", "mcp_servers.fixture.enabled=false") if active else baseline
+        assert harness.spawns == [expected]
+        assert harness.hook.call_args.kwargs["executor"] == "codex"
+        assert harness.hook.call_args.kwargs["active_harnesses"] == active
     finally:
         await harness.session.close()
 

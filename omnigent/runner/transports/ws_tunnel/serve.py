@@ -1537,6 +1537,7 @@ async def _send_hello(
         CAP_FILESYSTEM_ATTACHMENTS,
         CAP_PATH_ATTACHMENTS,
     )
+    from omnigent.runner.background_titles.service import CAP_LONG_BACKGROUND_TITLE_INSTRUCTIONS
     from omnigent.startup_observation import registered_observation_capabilities
     from omnigent.startup_protocol import CONTEXT_INVENTORY_V2, STARTUP_QUEUE_V1
 
@@ -1559,6 +1560,7 @@ async def _send_hello(
                     # The aggregate route is registered by create_runner_app itself.
                     CONTEXT_INVENTORY_V2,
                     CAP_SIDE_CHAT_SETTINGS,
+                    CAP_LONG_BACKGROUND_TITLE_INSTRUCTIONS,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],
                 telemetry_opt_out=_tel_opt_out,

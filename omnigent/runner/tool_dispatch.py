@@ -8012,8 +8012,7 @@ async def _execute_scheduled_task_tool(
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         returns an error string.
     :param conversation_id: The calling session id, sent as
-        ``source_session_id`` on create so the server can inherit its project.
-    :param conversation_id: Session whose approved tool call is being dispatched.
+        ``source_session_id`` with the agent-origin header as a legacy project hint.
     :returns: Tool output JSON string.
     """
     if server_client is None:

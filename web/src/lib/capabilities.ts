@@ -246,6 +246,14 @@ export interface ServerInfo {
   archive_worktree_cleanup?: boolean;
   /** Live worktree status and server-side safe archive policy are supported. */
   worktree_status?: boolean;
+  /**
+   * True when the automations feature (recurring scheduled tasks) is enabled
+   * for the caller. When false the SPA hides the sidebar Automations tab and
+   * every automation entry point (the ``/v1/scheduled-tasks`` API 404s, so
+   * linking to it would be a dead page). Absent ⇒ true: servers from before
+   * the gate always offered automations.
+   */
+  automations_enabled?: boolean;
   /** True when scheduled tasks accept the optional random-worktree base ref. */
   scheduled_task_worktrees?: boolean;
   /**
@@ -260,6 +268,12 @@ export interface ServerInfo {
    * Session control there. Fails to ``false``.
    */
   scheduled_task_session_modes?: boolean;
+  /**
+   * True when a scheduled task can start every run from a copy of an existing
+   * session (``source_session_id``). Gates the session menu's "Create
+   * automation…" item. Fails to ``false``.
+   */
+  scheduled_task_source_sessions?: boolean;
   /** Connected hosts and continued sandboxes accept ten-minute schedules. */
   scheduled_task_subhour?: boolean;
   /** Server default for new trigger templates, from 10 to 240 minutes. */
@@ -296,6 +310,11 @@ export interface ServerInfo {
    * and ``Conversation.pull_request``); absent on older servers (off).
    */
   session_pull_requests?: boolean;
+  /**
+   * True when the server stores each user's session title instructions
+   * (``/v1/settings/session-title-instructions``); absent on older servers (off).
+   */
+  session_title_instructions?: boolean;
   /**
    * Which uploads Claude Code and Codex sessions receive as files. Null on
    * older servers, whose policy is the default extension list.
@@ -498,8 +517,10 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   scheduled_task_worktrees: false,
   archive_worktree_cleanup: false,
   worktree_status: false,
+  automations_enabled: true,
   session_search_scope: false,
   scheduled_task_session_modes: false,
+  scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
   scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
@@ -669,10 +690,12 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_worktrees: data.scheduled_task_worktrees === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           worktree_status: data.worktree_status === true,
+          automations_enabled: data.automations_enabled !== false,
           session_search_scope: data.session_search_scope === true,
           usage_board_enabled: data.usage_board_enabled === true,
           task_board_enabled: data.task_board_enabled === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
+          scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
           automation_trigger_poll_minutes:
             typeof data.automation_trigger_poll_minutes === "number" &&
@@ -692,6 +715,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : [],
           session_claude_sdk_clear: data.session_claude_sdk_clear === true,
           session_pull_requests: data.session_pull_requests === true,
+          session_title_instructions: data.session_title_instructions === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,

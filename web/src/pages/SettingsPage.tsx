@@ -102,6 +102,7 @@ import { ArchiveTranscriptViewer } from "@/components/archive/ArchiveTranscriptV
 import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import { SettingsLabel } from "@/components/SettingsLabel";
+import { SessionTitleInstructionsControl } from "@/components/SessionTitleInstructionsControl";
 import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
 import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
@@ -2472,6 +2473,7 @@ function TerminalClipboardControl() {
 function GeneralSection() {
   const info = useServerInfo();
   const sessionCollabEnabled = isFeatureEnabled(info, "session_peer_messaging");
+  const titleInstructions = info !== "loading" && info.session_title_instructions === true;
   return (
     <Section title="General">
       <div className="flex flex-col gap-6">
@@ -2536,6 +2538,11 @@ function GeneralSection() {
         )}
         <SettingsGroup title="Sessions" testId="settings-group-sessions" className="max-w-none">
           <BackgroundSessionTitlesControl />
+          {titleInstructions && (
+            <div className="mt-4 border-t border-border pt-4">
+              <SessionTitleInstructionsControl />
+            </div>
+          )}
           <div className="mt-4 border-t border-border pt-4">
             <OpenAtLatestSetting />
           </div>

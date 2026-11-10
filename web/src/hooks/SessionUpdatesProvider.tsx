@@ -29,6 +29,7 @@ import {
   isSessionArchiving,
   isSessionDeleting,
   markRecentlyCreated,
+  withMoveTombstone,
 } from "@/hooks/useConversations";
 import {
   type ConversationsInfiniteData,
@@ -78,7 +79,9 @@ function applyItemsToCache(
     if (isSessionDeleting(item.id)) continue;
     itemsById.set(
       item.id,
-      nullsToUndefined(isSessionArchiving(item.id) ? { ...item, archived: true } : item),
+      nullsToUndefined(
+        withMoveTombstone(isSessionArchiving(item.id) ? { ...item, archived: true } : item),
+      ),
     );
   }
   // The open session is always in the watch-set, so its row arrives with every

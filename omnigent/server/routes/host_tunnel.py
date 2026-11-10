@@ -79,6 +79,7 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerLogRunawayFrame,
     HostRunnerStatusResultFrame,
+    HostSetMcpServerEnabledResultFrame,
     HostSkillContentResultFrame,
     HostSkillsResultFrame,
     HostStartupClaimFrame,
@@ -1487,6 +1488,11 @@ async def _receive_loop(
             startup_future = conn.pending_harness_startup.pop(frame.request_id, None)
             if startup_future is not None and not startup_future.done():
                 startup_future.set_result(frame.startup)
+            continue
+        if isinstance(frame, HostSetMcpServerEnabledResultFrame):
+            enabled_future = conn.pending_mcp_server_enabled.pop(frame.request_id, None)
+            if enabled_future is not None and not enabled_future.done():
+                enabled_future.set_result(frame)
             continue
         if isinstance(frame, HostMcpServersResultFrame):
             mcp_future = conn.pending_mcp_servers.pop(frame.request_id, None)

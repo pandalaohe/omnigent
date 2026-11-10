@@ -55,12 +55,14 @@ from omnigent.host.frames import (
     HostOwnerInventoryResultFrame,
     HostPluginsResultFrame,
     HostProbeAccountsFrame,
+    HostSetMcpServerEnabledResultFrame,
     HostSkillContentResultFrame,
     HostSkillsResultFrame,
     encode_host_frame,
 )
 from omnigent.host.harness_startup import HarnessStartup
 from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
+from omnigent.server.feature_flags import FeatureFlags, McpDisabledServersGate, active_harnesses
 from omnigent.startup_protocol import StartupAttemptRef
 
 _logger = logging.getLogger(__name__)
@@ -197,6 +199,7 @@ def _fail_pending_skills(conn: HostConnection) -> None:
 def _fail_pending_mcp_servers(conn: HostConnection) -> None:
     """Fail MCP inventory requests as soon as their host disappears."""
     _fail_pending_inventory(conn.pending_mcp_servers, conn.host_id)
+    _fail_pending_inventory(conn.pending_mcp_server_enabled, conn.host_id)
 
 
 def _fail_pending_folder_facts(conn: HostConnection) -> None:
@@ -629,6 +632,9 @@ class HostConnection:
     pending_skill_content: dict[str, asyncio.Future[HostSkillContentResultFrame]] = field(
         default_factory=dict
     )
+    pending_mcp_server_enabled: dict[str, asyncio.Future[HostSetMcpServerEnabledResultFrame]] = (
+        field(default_factory=dict)
+    )
     pending_mcp_tools: dict[str, asyncio.Future[HostMcpToolsResultFrame]] = field(
         default_factory=dict
     )
@@ -670,8 +676,15 @@ class HostRegistry:
     don't race.
     """
 
-    def __init__(self) -> None:
-        """Initialize an empty host registry."""
+    def __init__(
+        self,
+        *,
+        mcp_disabled_servers: McpDisabledServersGate = False,
+        feature_flags: FeatureFlags | None = None,
+    ) -> None:
+        """Initialize an empty host registry with fail-closed launch activation."""
+        self._mcp_disabled_servers = mcp_disabled_servers
+        self._feature_flags = feature_flags or FeatureFlags()
         from omnigent.server.host_restart import HostRestarts
 
         self.restarts = HostRestarts(self)
@@ -736,6 +749,10 @@ class HostRegistry:
             yield True
         finally:
             lock.release()
+
+    def mcp_disabled_servers_active_harnesses(self) -> list[str] | None:
+        """Resolve launch activation; omit the wire field when no harness is active."""
+        return active_harnesses(self._mcp_disabled_servers, self._feature_flags) or None
 
     def register(
         self,

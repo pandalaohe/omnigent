@@ -67,6 +67,7 @@ const mocks = vi.hoisted(() => ({
   // single_user: explicit single-user marker; false for accounts/OIDC/
   // multi-user-header. Gates the settings-route single-user redirect.
   singleUser: false,
+  sessionTitleInstructions: false,
   nestedAgents: false,
   // Identity from the mode-agnostic `/v1/me` probe (resolveIdentity returns
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
@@ -114,7 +115,11 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     usage_board_enabled: mocks.usageBoardEnabled,
     task_board_enabled: mocks.taskBoardEnabled,
     features: { session_peer_messaging: mocks.sessionCollabEnabled },
+    session_title_instructions: mocks.sessionTitleInstructions,
   }),
+}));
+vi.mock("@/components/SessionTitleInstructionsControl", () => ({
+  SessionTitleInstructionsControl: () => <div data-testid="mock-session-title-instructions" />,
 }));
 vi.mock("@/shell/ImportSessionsPanel", () => ({
   ImportSessionsPanel: mocks.importSessionsPanel,
@@ -415,6 +420,7 @@ beforeEach(() => {
   mocks.isEmbedded = false;
   mocks.accountsEnabled = true;
   mocks.worktreeStatusEnabled = false;
+  mocks.sessionTitleInstructions = false;
   mocks.nestedAgents = false;
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
@@ -792,6 +798,17 @@ describe("SettingsPage", () => {
         conversationId: previous.conversationId,
       });
     }
+  });
+
+  it.each([
+    [true, true],
+    [false, false],
+  ])("shows title instructions only when the server stores them (%s)", async (supported, shown) => {
+    mocks.sessionTitleInstructions = supported;
+    renderPage("/settings/general");
+    const sessions = await screen.findByTestId("settings-group-sessions");
+
+    expect(within(sessions).queryByTestId("mock-session-title-instructions") !== null).toBe(shown);
   });
 
   it("persists session auto-rename changes", async () => {

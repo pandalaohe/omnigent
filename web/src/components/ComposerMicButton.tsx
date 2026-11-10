@@ -69,6 +69,15 @@ const BAR_BINS: readonly (readonly [number, number])[] = [
 
 const BAR_BASELINE = 0.2;
 
+// Browsers end a Web Speech take on their own after a pause (Android after
+// ~1–2 s, even with `continuous`), so a live take restarts the recognizer until
+// the user stops it. It gives up after this long without any recognized speech.
+const WEB_SPEECH_IDLE_LIMIT_MS = 60_000;
+// A recognizer that ends this soon after starting, with no speech, is failing
+// rather than hearing silence; this many in a row ends the take with an error.
+const WEB_SPEECH_QUICK_END_MS = 1_000;
+const WEB_SPEECH_MAX_QUICK_ENDS = 3;
+
 export interface ComposerMicButtonProps {
   onTranscript: (text: string) => void;
   className?: string;
@@ -245,6 +254,15 @@ export const ComposerMicButton = ({
   // was spoken instead of blanking it. Set on each partial, cleared on final,
   // and reset when a take starts so a stale partial can't resurrect.
   const interimRef = useRef("");
+  // Web Speech take the user has started and not stopped. While set, a
+  // recognizer that ends on its own is restarted rather than ending the take.
+  const webSpeechTakeRef = useRef<{
+    lastSpeechAt: number;
+    recognizerStartedAt: number;
+    quickEnds: number;
+    restarting: boolean;
+    started: boolean;
+  } | null>(null);
 
   // Surface a failure both in the button (tooltip + red tint) and as a toast,
   // so a failed take is an explained error rather than a silent flash back to
@@ -262,7 +280,7 @@ export const ComposerMicButton = ({
     if (!Ctor || electron) return;
 
     const recognition = new Ctor();
-    // Keep listening until the user clicks stop — no auto-stop on silence.
+    // Ask for one long take; handleEnd restarts browsers that end it anyway.
     recognition.continuous = true;
     recognition.interimResults = false;
     recognition.lang = lang;
@@ -275,6 +293,15 @@ export const ComposerMicButton = ({
     const handleStart = () => {
       if (serverTakeOwnsState()) return;
       transitionRef.current = false;
+      const take = webSpeechTakeRef.current;
+      // No take: the user stopped while a restart was starting; end follows.
+      if (!take) return;
+      take.started = true;
+      if (take.restarting) {
+        // A restart continues the same take: keep the Esc snapshot and state.
+        take.restarting = false;
+        return;
+      }
       discardingRef.current = false;
       takeGenerationRef.current += 1;
       punctuationQueueRef.current = Promise.resolve();
@@ -283,15 +310,50 @@ export const ComposerMicButton = ({
       // Snapshot point: let the parent record the text so Esc can revert to it.
       onVoiceStartRef.current?.();
     };
+    // Restart the recognizer when it ends on its own mid-take. Returns false
+    // when the take should end instead.
+    const restartTake = (): boolean => {
+      const take = webSpeechTakeRef.current;
+      // Only a take that reached "start" is listening; a hidden page can't
+      // reacquire the mic, so let the take end rather than fail noisily.
+      if (!take?.started || disabledRef.current || discardingRef.current) return false;
+      if (document.hidden) return false;
+      const now = Date.now();
+      if (now - take.lastSpeechAt >= WEB_SPEECH_IDLE_LIMIT_MS) return false;
+      const heardNothing = take.lastSpeechAt <= take.recognizerStartedAt;
+      if (heardNothing && now - take.recognizerStartedAt < WEB_SPEECH_QUICK_END_MS) {
+        take.quickEnds += 1;
+        if (take.quickEnds >= WEB_SPEECH_MAX_QUICK_ENDS) {
+          reportError("Voice input stopped unexpectedly. Please try again.");
+          return false;
+        }
+      } else {
+        take.quickEnds = 0;
+      }
+      take.restarting = true;
+      take.recognizerStartedAt = now;
+      try {
+        recognition.start();
+      } catch {
+        return false;
+      }
+      return true;
+    };
     const handleEnd = () => {
       if (serverTakeOwnsState()) return;
       transitionRef.current = false;
+      if (restartTake()) return;
+      webSpeechTakeRef.current = null;
       setIsListening(false);
     };
     const handleError = (event: Event) => {
       if (serverTakeOwnsState()) return;
       transitionRef.current = false;
       const err = (event as SpeechRecognitionErrorEventLike).error;
+      // "no-speech" is the browser's silence timeout: the end event that
+      // follows restarts a live take. Any other error ends it.
+      if (err === "no-speech" && webSpeechTakeRef.current) return;
+      webSpeechTakeRef.current = null;
       // An unavailable or blocked speech service can still use client mic
       // capture with server transcription. getUserMedia checks mic permission.
       if (
@@ -324,6 +386,8 @@ export const ComposerMicButton = ({
           finalTranscript += result[0]?.transcript ?? "";
         }
       }
+      if (finalTranscript.trim() && webSpeechTakeRef.current)
+        webSpeechTakeRef.current.lastSpeechAt = Date.now();
       enqueueWebTranscriptRef.current(finalTranscript);
     };
 
@@ -338,6 +402,7 @@ export const ComposerMicButton = ({
       recognition.removeEventListener("end", handleEnd);
       recognition.removeEventListener("error", handleError);
       recognition.removeEventListener("result", handleResult);
+      webSpeechTakeRef.current = null;
       recognition.stop();
       recognitionRef.current = null;
     };
@@ -360,6 +425,7 @@ export const ComposerMicButton = ({
       onInterimRef.current?.("");
       return;
     }
+    webSpeechTakeRef.current = null;
     try {
       recognitionRef.current?.stop();
     } catch {
@@ -566,10 +632,18 @@ export const ComposerMicButton = ({
     if (!recognition) return;
     transitionRef.current = true;
     try {
-      if (isListening) recognition.stop();
-      else {
-        // Clicking start defines the new take immediately. Do not wait for the
-        // browser's asynchronous start event before invalidating old results.
+      if (isListening) {
+        webSpeechTakeRef.current = null;
+        recognition.stop();
+      } else {
+        const now = Date.now();
+        webSpeechTakeRef.current = {
+          lastSpeechAt: now,
+          recognizerStartedAt: now,
+          quickEnds: 0,
+          restarting: false,
+          started: false,
+        };
         takeGenerationRef.current += 1;
         punctuationQueueRef.current = Promise.resolve();
         recognition.start();
@@ -578,6 +652,7 @@ export const ComposerMicButton = ({
       // InvalidStateError from a double-call — drop the guard so the
       // user can try again, and let the next event reconcile state.
       transitionRef.current = false;
+      if (!isListening) webSpeechTakeRef.current = null;
     }
   }, [
     isListening,
@@ -629,6 +704,7 @@ export const ComposerMicButton = ({
           session.cancel();
           setIsListening(false);
         } else {
+          webSpeechTakeRef.current = null;
           try {
             recognitionRef.current?.stop();
           } catch {

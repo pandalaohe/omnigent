@@ -143,32 +143,25 @@ import { ChatHeader } from "./ChatHeader";
 import type { ChildSessionLike } from "./subagentRailGroups";
 import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
 import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
-import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import {
   FileViewerContext,
   type FilePosition,
   type OpenFileOptions,
   type FileNavigationGuard,
 } from "./FileViewerContext";
-import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { revealFolderInFilesPanel } from "./FilesPanel";
 import type { ChangedSort } from "./FlatFileList";
-import { PullRequestPanel } from "./PullRequestPanel";
-import { MobilePanelDrawer } from "./MobilePanelDrawer";
-import { ArchiveLibraryRail } from "@/components/archive/ArchiveLibraryRail";
-import { ContentSearchPanel } from "./ContentSearchPanel";
 import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import { useSettingsRoute } from "./settingsNav";
-import { SubagentsPanel } from "./SubagentsPanel";
 import { isCachedAncestor, useRootSessionId, useSession } from "@/hooks/useSession";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
 } from "./TerminalFirstContext";
-import { TerminalsPanel } from "./TerminalsPanel";
+import { AppShellWorkspacePanels } from "./AppShellWorkspacePanels";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { PeerHeldPanel } from "@/components/PeerHeldPanel";
 import { MobileFloatingAssistant } from "@/components/MobileFloatingAssistant";
@@ -184,7 +177,6 @@ import { CloseWindowDialog } from "./CloseWindowDialog";
 import { QuitDialog } from "./QuitDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
-import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { resolveDefaultShell } from "./preferredShell";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
@@ -3145,111 +3137,42 @@ function AppShellImpl() {
                 )}
               </div>
 
-              {/* Push panels — flex siblings to main, animate width. Only one is open at a time.
-          Terminal-first sessions render the terminal inline inside main
-          (via MainTerminalView in ChatPage) and never mount the drawer. */}
-              {conversationId && !terminalFirst && (
-                <TerminalsPanel
-                  open={panelOpen}
-                  conversationId={conversationId}
-                  initialTerminalKey={panelInitialKey}
-                  // No neighbor to resize against (chat is hidden, FilesPanel
-                  // owns its own width) — grow via flex-1.
-                  fluid={panelOpen}
-                  // Non-owners attach read-only: a shared PTY can't attribute
-                  // input per-user, so only the owner may type (server-enforced).
-                  readOnly={!isOwnerLevel(permissionLevel)}
-                  onClose={() => setPanelInitialKey(null)}
-                />
-              )}
-              {conversationId && (
-                <ExecutionLogsPanel
-                  open={executionLogsOpen}
-                  conversationId={conversationId}
-                  initialKey={executionLogsKey}
-                  onClose={() => setExecutionLogsKey(null)}
-                />
-              )}
-              {conversationId && showFilesPanel && (
-                <FilesPanelDrawer
-                  open={filesPanelOpen}
-                  onClose={() => setFilesPanelOpen(false)}
-                  onFileSelect={openFileViewer}
-                  flatView={filesDrawerFlatView}
-                  showHidden={filesPanelShowHidden}
-                  onShowHiddenChange={setFilesPanelShowHidden}
-                  sort={filesPanelSort}
-                  onSortChange={handleFilesSortChange}
-                />
-              )}
-              {/* Mobile-only full-screen drawers for the rail tabs that have no
-          desktop push panel of their own. `MobilePanelDrawer` is `md:hidden`,
-          so these never collide with the desktop rail; they're opened from
-          the session-menu FAB above. */}
-              {conversationId && rootSessionId && (
-                <MobilePanelDrawer
-                  open={subagentsPanelOpen}
-                  title="Agents"
-                  onClose={() => setSubagentsPanelOpen(false)}
-                  testId="subagents-panel-drawer"
-                >
-                  <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-                </MobilePanelDrawer>
-              )}
-              {conversationId && (
-                <MobilePanelDrawer
-                  open={archivePanelOpen}
-                  title="Archived sessions"
-                  onClose={() => setArchivePanelOpen(false)}
-                  testId="archive-panel-drawer"
-                >
-                  <ArchiveLibraryRail />
-                </MobilePanelDrawer>
-              )}
-              {conversationId && (
-                <MobilePanelDrawer
-                  open={shellsPanelOpen}
-                  title="Shells"
-                  onClose={() => setShellsPanelOpen(false)}
-                  testId="shells-panel-drawer"
-                >
-                  <InlineTerminalsSection
-                    conversationId={conversationId}
-                    onExpand={openTerminalsPanel}
-                    canClose={isEditorLevel(permissionLevel)}
-                    // Mobile has no tab strip "+" menu, so the drawer carries
-                    // the "+ New shell" create row.
-                    showNewShell
-                  />
-                </MobilePanelDrawer>
-              )}
-              {conversationId && showFilesPanel && (
-                <MobilePanelDrawer
-                  open={githubPanelOpen}
-                  title="Pull Requests"
-                  onClose={() => setGithubPanelOpen(false)}
-                  testId="github-panel-drawer"
-                >
-                  <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
-                    <PullRequestPanel conversationId={conversationId} />
-                  </RenderErrorBoundary>
-                </MobilePanelDrawer>
-              )}
-              {conversationId && mobileViewport && railTabsAvailable["content-search"] && (
-                <MobilePanelDrawer
-                  open={contentSearchPanelOpen}
-                  title="Content search"
-                  onClose={() => setContentSearchPanelOpen(false)}
-                  testId="content-search-panel-drawer"
-                >
-                  <ContentSearchPanel
-                    key={conversationId}
-                    conversationId={conversationId}
-                    onFileSelect={openContentSearchResult}
-                  />
-                </MobilePanelDrawer>
-              )}
-              <div ref={setMobileFileTarget} className="md:hidden" />
+              <AppShellWorkspacePanels
+                conversationId={conversationId}
+                terminalFirst={terminalFirst}
+                panelOpen={panelOpen}
+                panelInitialKey={panelInitialKey}
+                setPanelInitialKey={setPanelInitialKey}
+                permissionLevel={permissionLevel}
+                executionLogsOpen={executionLogsOpen}
+                executionLogsKey={executionLogsKey}
+                setExecutionLogsKey={setExecutionLogsKey}
+                showFilesPanel={showFilesPanel}
+                filesPanelOpen={filesPanelOpen}
+                setFilesPanelOpen={setFilesPanelOpen}
+                openFileViewer={openFileViewer}
+                filesDrawerFlatView={filesDrawerFlatView}
+                filesPanelShowHidden={filesPanelShowHidden}
+                setFilesPanelShowHidden={setFilesPanelShowHidden}
+                filesPanelSort={filesPanelSort}
+                handleFilesSortChange={handleFilesSortChange}
+                rootSessionId={rootSessionId}
+                subagentsPanelOpen={subagentsPanelOpen}
+                setSubagentsPanelOpen={setSubagentsPanelOpen}
+                archivePanelOpen={archivePanelOpen}
+                setArchivePanelOpen={setArchivePanelOpen}
+                shellsPanelOpen={shellsPanelOpen}
+                setShellsPanelOpen={setShellsPanelOpen}
+                openTerminalsPanel={openTerminalsPanel}
+                githubPanelOpen={githubPanelOpen}
+                setGithubPanelOpen={setGithubPanelOpen}
+                mobileViewport={mobileViewport}
+                railTabsAvailable={railTabsAvailable}
+                contentSearchPanelOpen={contentSearchPanelOpen}
+                setContentSearchPanelOpen={setContentSearchPanelOpen}
+                openContentSearchResult={openContentSearchResult}
+                setMobileFileTarget={setMobileFileTarget}
+              />
             </GridWorkspace>
           </div>
           {conversationId && (

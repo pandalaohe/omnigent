@@ -94,6 +94,7 @@ from omnigent.native.native_coding_agents import (
 from omnigent.native.native_dispatch import resolve_hook
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.process_logging import process_log_reference
+from omnigent.runner.identity import runner_mcp_disabled_servers_active_harnesses
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -6719,6 +6720,7 @@ async def _auto_create_codex_terminal(
     # Keep it off the runner loop so heartbeats and other sessions can progress.
     app_server = await asyncio.to_thread(
         build_codex_native_server,
+        active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
         session_id=session_id,
         socket_path=socket_path,
         codex_home=codex_home,
@@ -10910,6 +10912,7 @@ async def _auto_create_claude_terminal(
     _harness_cfg = load_effective_config(workspace=workspace)
     claude_args = augment_claude_args(
         base_claude_args,
+        active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
         bridge_dir=bridge_dir,
         workspace=Path(workspace),
         ap_server_url=server_url,

@@ -7069,11 +7069,14 @@ async def _run_managed_launch(
             sandbox_config = deployment_with_sandbox_profile(sandbox_config, profile)
             provider = profile["provider"]
         elif sandbox_profiles is not None:
-            await asyncio.to_thread(
-                sandbox_profiles.require_selection,
-                relaunch_host.sandbox_provider if relaunch_host is not None else provider,
-                user_id=owner,
-            )
+            if relaunch_host is not None:
+                sandbox_config = deployment_with_sandbox_profile(
+                    sandbox_config, None, unprofiled_host=relaunch_host
+                )
+            else:
+                await asyncio.to_thread(
+                    sandbox_profiles.require_selection, provider, user_id=owner
+                )
     except (OmnigentError, HTTPException) as exc:
         reason = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
         tracker.fail(session_id, reason)
@@ -8257,6 +8260,7 @@ async def _run_managed_wake(
 
     try:
         profile = None
+        unprofiled_host = None
         if sandbox_profiles is not None:
             host = await asyncio.to_thread(host_store.get_host, host_id)
             if host is None:
@@ -8265,10 +8269,10 @@ async def _run_managed_wake(
                 sandbox_profiles, session_id, user_id=host.user_id, host_id=host_id
             )
             if profile is None:
-                await asyncio.to_thread(
-                    sandbox_profiles.require_selection, host.sandbox_provider, user_id=host.user_id
-                )
-        sandbox_config = deployment_with_sandbox_profile(sandbox_config, profile)
+                unprofiled_host = host
+        sandbox_config = deployment_with_sandbox_profile(
+            sandbox_config, profile, unprofiled_host=unprofiled_host
+        )
         # Wake the same sandbox in place; resume_managed_host is single-flight
         # per host and a no-op if it's already online.
         # Re-derived here rather than by the caller, matching the launch path:
@@ -11381,14 +11385,17 @@ def set_relay_host_offline_probe(probe: Callable[[str, str], Awaitable[bool]] | 
     _relay_turn_held_for_host = probe
 
 
-async def _host_row_offline(host_store: HostStore | None, host_id: str) -> bool | None:
+async def _host_row_offline(
+    host_store: HostStore | None, host_id: str, *, updated_since: float | None = None
+) -> bool | None:
     """
     Report whether a user-run host's row shows it offline on every replica.
 
     :param host_store: Persistent host registrations, or ``None`` without hosts.
     :param host_id: The host to check.
-    :returns: ``True`` for a stale non-sandbox host; ``False`` when it is live,
-        managed, or missing; ``None`` when its row can't be read.
+    :param updated_since: Optional oldest host observation eligible for recovery.
+    :returns: ``True`` for a stale non-sandbox host within the optional window;
+        ``False`` when live, managed, missing or too old; ``None`` when unreadable.
     """
     if host_store is None:
         return False
@@ -11397,7 +11404,12 @@ async def _host_row_offline(host_store: HostStore | None, host_id: str) -> bool 
     except Exception:  # noqa: BLE001 — an unreadable row proves nothing
         _logger.warning("Host lookup failed for host=%s", host_id, exc_info=True)
         return None
-    return host is not None and host.sandbox_provider is None and not host_is_live(host)
+    return (
+        host is not None
+        and host.sandbox_provider is None
+        and not host_is_live(host)
+        and (updated_since is None or host.updated_at >= updated_since)
+    )
 
 
 class _RelayTransportLost(Exception):

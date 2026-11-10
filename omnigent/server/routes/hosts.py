@@ -935,11 +935,17 @@ class LaunchRunnerRequest(BaseModel):
         as the session's ``git_branch`` for display and opt-in cleanup.
         ``None`` binds ``workspace`` directly. ``host_id`` is always
         present (it is in the path), so no host check is needed here.
+    :param session_env_handoff_id: Opaque, non-secret ID of the launching
+        CLI's local forwarded-environment file, relayed to the host so only
+        this launch's runner consumes it. ``None`` when nothing is forwarded.
     """
 
     session_id: str
     workspace: str
     git: SessionGitOptions | None = None
+    session_env_handoff_id: str | None = Field(
+        default=None, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"
+    )
 
 
 async def _resolve_agent_spec_cwd(
@@ -2012,10 +2018,16 @@ def create_hosts_router(
                         host_type="external",
                     )
 
-            if (
-                host_profile is None
-                and target.conv.family_id is not None
-                and flags.enabled(Feature.SIBLING_SESSIONS)
+            legacy_continuation = (
+                profile_catalog is not None
+                and target.conv.host_id == target.host.host_id
+                and target.host.sandbox_provider is not None
+                and target.host.sandbox_provider
+                in profile_catalog.managed_providers(target.host.sandbox_provider)
+            )
+            if host_profile is None and (
+                legacy_continuation
+                or (target.conv.family_id is not None and flags.enabled(Feature.SIBLING_SESSIONS))
             ):
                 # Capture the binding after any preceding launch has finished.
                 profile_binding = await asyncio.to_thread(
@@ -2328,6 +2340,7 @@ def create_hosts_router(
                 startup=startup,
                 startup_required=startup is not None,
                 harness=harness,
+                mcp_disabled_servers_active_harnesses=host_registry.mcp_disabled_servers_active_harnesses(),
                 inference_config=(
                     target.conv.inference_snapshot["runtime_config"]
                     if target.conv.inference_snapshot
@@ -2339,6 +2352,7 @@ def create_hosts_router(
                     if profile_binding is not None and profile_binding.runner_id is not None
                     else ()
                 ),
+                session_env_handoff_id=body.session_env_handoff_id,
             )
         )
         try:

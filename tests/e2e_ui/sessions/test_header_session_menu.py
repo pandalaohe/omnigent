@@ -124,6 +124,7 @@ def test_header_session_menu_manages_owner_and_child(
                 "Export",
                 "Rename",
                 "Mark as unread",
+                "Create automation",
                 "Add to project",
                 "Archive",
                 "Delete",
