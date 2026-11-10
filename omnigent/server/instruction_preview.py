@@ -14,7 +14,6 @@ from omnigent.runtime.instruction_layers import (
 )
 from omnigent.runtime.prompt import (
     InstructionPart,
-    child_session_question_instruction,
     instruction_parts,
     native_startup_instruction_parts,
     session_instruction_parts,
@@ -113,7 +112,12 @@ def preview_instructions(
     canonical = canonicalize_harness(harness)
     native = terminal is not None and terminal != "opencode"
     if native:
-        delivered = native_startup_instruction_parts(spec, session)
+        delivered = native_startup_instruction_parts(
+            spec,
+            session,
+            has_parent=has_parent and terminal in {"claude", "codex", "pi", "antigravity"},
+            peer_messaging_enabled=peer,
+        )
     else:
         # SDK/OpenCode receives one runner-folded session block. The builder
         # strips only its outer whitespace; never strip each user layer.
@@ -123,6 +127,7 @@ def preview_instructions(
             None,
             [],
             framework_instructions=[InstructionPart("user_layers", folded)] if folded else [],
+            has_parent=has_parent,
             fallback=terminal != "opencode" and canonical not in {"hermes", "kimi"},
         )
 
@@ -167,13 +172,6 @@ def preview_instructions(
     if not inserted_placeholders:
         parts.extend(session_placeholders)
     parts.append(_framework_part(InstructionPart("routing_note", None)))
-    question = (
-        child_session_question_instruction(peer)
-        if native and has_parent and terminal in {"claude", "codex"}
-        else None
-    )
-    if question:
-        parts.append(_framework_part(InstructionPart("child_question", question)))
     parts.extend(replaced)
     composed = "\n\n".join(p["text"] for p in parts if p["sent"] and p["text"] is not None)
     return {

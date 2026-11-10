@@ -1290,6 +1290,7 @@ class _PiNativeLaunchConfig:
     server_url: str
     terminal_launch_args: list[str] | None
     external_session_id: str | None
+    parent_session_id: str | None = None
     fork_source_id: str | None = None
     fork_source_external_id: str | None = None
     fork_carry_history: bool = False
@@ -1904,6 +1905,9 @@ async def _pi_native_launch_config(
         ):
             native_usage_baseline["cumulative_cost_usd"] = cost
     return _PiNativeLaunchConfig(
+        parent_session_id=snapshot.get("parent_session_id")
+        if isinstance(snapshot.get("parent_session_id"), str)
+        else None,
         workspace=_pi_session_workspace(session_workspace),
         server_url=os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/"),
         terminal_launch_args=terminal_launch_args,
@@ -3303,6 +3307,7 @@ async def _auto_create_pi_terminal(
     clear_agent_instructions_preamble(bridge_dir)
     # A relaunched pane gets a fresh config; the extension appends these
     # instructions to Pi's native prompt on every agent start.
+    from omnigent.runner.app import get_session_peer_messaging_enabled
     from omnigent.runtime.prompt import (
         InstructionPart,
         native_startup_instruction_parts,
@@ -3314,7 +3319,10 @@ async def _auto_create_pi_terminal(
         "\n\n".join(
             part.text
             for part in native_startup_instruction_parts(
-                pi_spec, [InstructionPart("user_layers", global_instructions)]
+                pi_spec,
+                [InstructionPart("user_layers", global_instructions)],
+                has_parent=launch_config.parent_session_id is not None,
+                peer_messaging_enabled=get_session_peer_messaging_enabled(session_id),
             )
             if part.kind != "author" and part.text is not None
         )
@@ -6534,7 +6542,6 @@ async def _auto_create_codex_terminal(
 
         _codex_routing_note = smart_routing_spawn_note("codex-native")
     from omnigent.runner.app import get_session_peer_messaging_enabled
-    from omnigent.runtime.prompt import child_session_question_instruction
 
     _peer_messaging_enabled = get_session_peer_messaging_enabled(session_id)
     _codex_developer_instructions = (
@@ -6542,12 +6549,12 @@ async def _auto_create_codex_terminal(
             x
             for x in [
                 _native_startup_instructions_from_spec(
-                    agent_spec, global_instructions=global_instructions
+                    agent_spec,
+                    global_instructions=global_instructions,
+                    has_parent=launch_config.parent_session_id is not None,
+                    peer_messaging_enabled=_peer_messaging_enabled,
                 ),
                 _codex_routing_note,
-                child_session_question_instruction(_peer_messaging_enabled)
-                if launch_config.parent_session_id
-                else None,
             ]
             if x
         )
@@ -7790,8 +7797,13 @@ async def _auto_create_antigravity_terminal(
     bridge_dir = prepare_bridge_dir(bridge_id)
     # A relaunched pane is a new agy process, so it must get a fresh copy of the
     # instructions; the executor clears them only once the first injection lands.
+    from omnigent.runner.app import get_session_peer_messaging_enabled
+
     startup_instructions = _native_startup_instructions_from_spec(
-        agent_spec, global_instructions=global_instructions
+        agent_spec,
+        global_instructions=global_instructions,
+        has_parent=isinstance(snapshot.get("parent_session_id"), str),
+        peer_messaging_enabled=get_session_peer_messaging_enabled(session_id),
     )
     if startup_instructions is not None:
         write_agent_instructions_preamble(bridge_dir, startup_instructions)
@@ -8490,6 +8502,8 @@ def _native_startup_instructions_from_spec(
     agent_spec: AgentSpec | ResolvedSpec | None,
     *,
     global_instructions: str | None = None,
+    has_parent: bool = False,
+    peer_messaging_enabled: bool = False,
 ) -> str | None:
     """Compose the text for a native harness's startup-additive channel.
 
@@ -8510,7 +8524,12 @@ def _native_startup_instructions_from_spec(
     from omnigent.runtime.prompt import native_startup_instructions
 
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
-    return native_startup_instructions(spec, global_instructions=global_instructions)
+    return native_startup_instructions(
+        spec,
+        global_instructions=global_instructions,
+        has_parent=has_parent,
+        peer_messaging_enabled=peer_messaging_enabled,
+    )
 
 
 def _opencode_session_instructions(
@@ -9614,6 +9633,7 @@ def _routed_spawn_launch_args(
 class _ClaudeSessionLaunchMetadata:
     """Persisted values consumed by Claude terminal launch."""
 
+    parent_session_id: str | None = None
     reasoning_effort: str | None = None
     speed_tier: str | None = None
     model_override: str | None = None
@@ -9658,6 +9678,7 @@ def _claude_launch_metadata_from_envelope(
         labels=snapshot.labels,
     )
     return _ClaudeSessionLaunchMetadata(
+        parent_session_id=snapshot.parent_session_id,
         routing_enabled=routing_class.routing_enabled,
         auto_harness=routing_class.auto_harness,
         turn_routing=routing_class.turn_routing,
@@ -9717,6 +9738,9 @@ async def _load_legacy_claude_launch_metadata(
         labels={str(key): str(value) for key, value in labels.items()},
     )
     metadata = _ClaudeSessionLaunchMetadata(
+        parent_session_id=snapshot.get("parent_session_id")
+        if isinstance(snapshot.get("parent_session_id"), str)
+        else None,
         routing_enabled=routing_class.routing_enabled,
         auto_harness=routing_class.auto_harness,
         turn_routing=routing_class.turn_routing,
@@ -10606,13 +10630,14 @@ async def _auto_create_claude_terminal(
         router_started=subagent_router_dir is not None,
     )
     from omnigent.runner.app import get_session_peer_messaging_enabled
-    from omnigent.runtime.prompt import child_session_question_instruction
 
     # Child role, not a tool limit: a child's question goes to its parent, so
     # it loses AskUserQuestion. A top-level session keeps today's argv.
     is_child_session = (
-        session_init is not None and session_init.snapshot.parent_session_id is not None
-    )
+        session_init.snapshot.parent_session_id
+        if session_init is not None
+        else launch_metadata.parent_session_id
+    ) is not None
     if bundle_dir is None:
         # Reuse the bridge's owned directory across retries and terminal transfers.
         # Its dead-owner cleanup also reclaims these generated skill links.
@@ -10642,12 +10667,12 @@ async def _auto_create_claude_terminal(
             x
             for x in [
                 _native_startup_instructions_from_spec(
-                    agent_spec, global_instructions=global_instructions
+                    agent_spec,
+                    global_instructions=global_instructions,
+                    has_parent=is_child_session,
+                    peer_messaging_enabled=get_session_peer_messaging_enabled(session_id),
                 ),
                 routed_spawn_note,
-                child_session_question_instruction(get_session_peer_messaging_enabled(session_id))
-                if is_child_session
-                else None,
             ]
             if x
         )
