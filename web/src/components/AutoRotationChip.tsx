@@ -5,6 +5,7 @@ import { RefreshCwIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSessionCollabPreferences } from "@/hooks/useSessionCollabPreferences";
 import {
   getAutoRotation,
@@ -271,38 +272,42 @@ export function AutoRotationChip({
     });
   };
 
+  const chipLabel = status.enabled
+    ? t("chipAriaLabelActive", {
+        compactions: status.compactions,
+        limit: status.compactions_setting,
+      })
+    : t("chipAriaLabelOff");
+
   return (
     <Popover
       onOpenChange={(nextOpen) => {
         if (nextOpen && query.isStale) void query.refetch();
       }}
     >
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          data-testid="auto-rotation-chip-trigger"
-          aria-label={
-            status.enabled
-              ? t("chipAriaLabelActive", {
-                  compactions: status.compactions,
-                  limit: status.compactions_setting,
-                })
-              : t("chipAriaLabelOff")
-          }
-          className="inline-flex h-7 shrink-0 items-center justify-center gap-1 rounded-full border border-border bg-background px-2 text-xs leading-none text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          <RefreshCwIcon className="size-3.5 shrink-0" aria-hidden="true" />
-          <span className="hidden sm:inline">{t("chipLabel")}</span>
-          <span>
-            {status.enabled
-              ? t("chipValueRatio", {
-                  compactions: status.compactions,
-                  limit: status.compactions_setting,
-                })
-              : t("chipValueOff")}
-          </span>
-        </button>
-      </PopoverTrigger>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <PopoverTrigger asChild>
+            <button
+              type="button"
+              data-testid="auto-rotation-chip-trigger"
+              aria-label={chipLabel}
+              className="inline-flex h-7 shrink-0 items-center justify-center gap-1 rounded-full border border-border bg-background px-2 text-xs leading-none text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <RefreshCwIcon className="size-3.5 shrink-0" aria-hidden="true" />
+              <span>
+                {status.enabled
+                  ? t("chipValueRatio", {
+                      compactions: status.compactions,
+                      limit: status.compactions_setting,
+                    })
+                  : t("chipValueOff")}
+              </span>
+            </button>
+          </PopoverTrigger>
+        </TooltipTrigger>
+        <TooltipContent>{chipLabel}</TooltipContent>
+      </Tooltip>
       <PopoverContent align="end" className="w-80 max-w-[calc(100vw-1rem)] space-y-3 p-4">
         <h2 className="font-medium text-foreground">{t("popoverTitle")}</h2>
         <div className="space-y-1 text-xs text-muted-foreground">
