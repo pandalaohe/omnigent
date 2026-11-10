@@ -909,6 +909,7 @@ def _write_compaction_transcript(
     *,
     summary_uuid: str = "summary-uuid",
     summary: str = "compaction summary text",
+    boundary_timestamp: str | None = None,
 ) -> None:
     """Write the native boundary/summary shape emitted by Claude Code."""
     records = [
@@ -946,6 +947,8 @@ def _write_compaction_transcript(
             "message": {"role": "user", "content": summary},
         },
     ]
+    if boundary_timestamp is not None:
+        records[2]["timestamp"] = boundary_timestamp
     path.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
 
 
@@ -2691,6 +2694,91 @@ async def test_fallback_post_failure_does_not_reset_snapshot_retry_budget(tmp_pa
     assert persist.await_args_list[-2].kwargs["allow_snapshot_fallback"]
     assert persist.await_args_list[-1].kwargs["allow_snapshot_fallback"]
     assert forwarder._read_compaction_state(bridge_dir).persisted_seqs == (1,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_boundary", [False, True])
+async def test_hook_completion_without_new_boundary_never_counts_compaction(
+    tmp_path: Path, old_boundary: bool
+) -> None:
+    """An unconfirmed completion must not advance the server's rotation round."""
+    bridge_dir = tmp_path / "bridge"
+    transcript = tmp_path / "session.jsonl"
+    if old_boundary:
+        _write_compaction_transcript(transcript, boundary_timestamp="1970-01-01T00:00:01Z")
+    else:
+        transcript.write_text("", encoding="utf-8")
+    await _note_precompact(
+        bridge_dir,
+        claude_session_id="claude-parent",
+        transcript_path=str(transcript),
+        recorded_at=100.0,
+    )
+    await _acknowledge_compaction_completion(
+        bridge_dir,
+        claude_session_id="claude-parent",
+        transcript_path=str(transcript),
+        now=101.0,
+    )
+    client = AsyncMock()
+    client.get.return_value = httpx.Response(
+        200, json={"data": [{"id": "latest-item"}]}, request=httpx.Request("GET", "http://test")
+    )
+    client.post.return_value = httpx.Response(200, request=httpx.Request("POST", "http://test"))
+    tracker = _PostRetryTracker(base_delay_s=0, max_delay_s=0)
+    with (
+        patch.object(forwarder, "read_transcript_path", return_value=transcript),
+        patch.object(forwarder, "_read_sdk_compaction_snapshot", return_value=None),
+    ):
+        for _ in range(forwarder._COMPACTION_SNAPSHOT_MAX_FAILURES + 1):
+            await _maybe_persist_compaction_fallback(
+                client,
+                session_id="parent-session",
+                bridge_dir=bridge_dir,
+                now=104.0,
+                retry_tracker=tracker,
+            )
+        client.post.assert_not_called()
+        assert _read_compaction_state(bridge_dir).fallback_persisted_seq == 0
+        _write_compaction_transcript(transcript, boundary_timestamp="1970-01-01T00:01:42Z")
+        assert await _maybe_persist_compaction_fallback(
+            client,
+            session_id="parent-session",
+            bridge_dir=bridge_dir,
+            now=105.0,
+            retry_tracker=tracker,
+        )
+        assert not await _maybe_persist_compaction_fallback(
+            client,
+            session_id="parent-session",
+            bridge_dir=bridge_dir,
+            now=106.0,
+            retry_tracker=tracker,
+        )
+    client.post.assert_called_once()
+    assert client.post.call_args.kwargs["json"]["data"]["source_id"] == "summary-uuid"
+
+
+@pytest.mark.parametrize("parent_boundary", [False, True])
+def test_latest_compaction_evidence_excludes_sidechain(
+    tmp_path: Path, parent_boundary: bool
+) -> None:
+    transcript = tmp_path / "session.jsonl"
+    _write_compaction_transcript(transcript, boundary_timestamp="1970-01-01T00:01:42Z")
+    parent_records = [json.loads(line) for line in transcript.read_text().splitlines()]
+    child_records = []
+    for record in parent_records:
+        child = {**record, "uuid": f"child-{record['uuid']}", "isSidechain": True}
+        if record.get("parentUuid"):
+            child["parentUuid"] = f"child-{record['parentUuid']}"
+        child_records.append(child)
+    records = (parent_records if parent_boundary else []) + child_records
+    transcript.write_text("".join(f"{json.dumps(record)}\n" for record in records))
+    if parent_boundary:
+        assert forwarder._latest_compact_summary_uuid(transcript, not_before=100) == "summary-uuid"
+    else:
+        with pytest.raises(ValueError, match="boundary"):
+            forwarder._latest_compact_summary_uuid(transcript, not_before=100)
 
 
 @pytest.mark.asyncio

@@ -9090,6 +9090,8 @@ def _latest_compact_summary_uuid(
                 continue
             if not isinstance(record, dict) or not isinstance(record.get("uuid"), str):
                 continue
+            if record.get("isSidechain") is True:
+                continue
             records[record["uuid"]] = record
             if record.get("type") == "system" and record.get("subtype") == "compact_boundary":
                 boundary = record
@@ -9467,17 +9469,20 @@ async def _persist_native_compaction_item(
     if compacted_messages is None and fallback_snapshot_loaded and not allow_snapshot_fallback:
         raise _CompactionSnapshotError("Claude SDK fallback snapshot is unavailable")
 
-    if summary_uuid is None and summary_not_before is not None:
-        # Hook-driven boundary: no summary record reached the forwarder yet, so
-        # bind the identity to the transcript's boundary for this compaction.
+    if summary_uuid is None and fallback_snapshot_loaded:
+        # Completion hooks can fire without a real compaction. Snapshot retry
+        # exhaustion must not turn the unchanged context into a new round.
         hook_transcript_path = read_transcript_path(bridge_dir)
-        if hook_transcript_path is not None:
-            with contextlib.suppress(ValueError):
-                summary_uuid = await asyncio.to_thread(
-                    _latest_compact_summary_uuid,
-                    hook_transcript_path,
-                    not_before=summary_not_before,
-                )
+        if hook_transcript_path is None:
+            raise _CompactionSnapshotError("Claude compaction transcript is unavailable")
+        try:
+            summary_uuid = await asyncio.to_thread(
+                _latest_compact_summary_uuid,
+                hook_transcript_path,
+                not_before=summary_not_before,
+            )
+        except (OSError, ValueError) as exc:
+            raise _CompactionSnapshotError("Claude compaction is not confirmed") from exc
 
     summary = (
         summary_override
