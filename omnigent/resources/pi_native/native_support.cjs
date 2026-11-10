@@ -538,10 +538,10 @@ function bindNativeSession(session, descriptor) {
         return execute.apply(this, args);
       };
     }
-    lifecycle.closingSignal.addEventListener("abort", () => {record.closed = true;client?.seal();}, {once:true});
+    lifecycle.closingSignal.addEventListener("abort", () => {record.closed = true;client?.seal("lifecycle_closing");}, {once:true});
     lifecycle.bindHost({id:`omnigent:${record.scope.scope_id}`, async beforeClose(event) {
       record.closed = true;
-      client?.seal();
+      client?.seal("lifecycle_closing");
       const ack = await descriptor.beforeClose(event);
       if (!ack || ack.revoked !== true || ack.scope_id !== record.scope.scope_id || ack.installation_id !== record.scope.installation_id)
         throw new Error("Native child revocation acknowledgement was rejected");
@@ -629,7 +629,7 @@ function closeNativeSession(manager) {
   const record = store.bindings.get(manager);
   if (!record) return;
   record.closed = true;
-  record.scopedClient?.seal();
+  record.scopedClient?.seal("installation_closed");
   return record.scopedClient?.close();
 }
 function hasScopedEvaluator(ctx) { return typeof store.bindings.get(ctx?.sessionManager)?.evaluateScope === "function"; }

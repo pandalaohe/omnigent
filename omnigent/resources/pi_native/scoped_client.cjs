@@ -12,7 +12,8 @@ function publicValue(value) {
   if(value && typeof value === "object") return Object.fromEntries(Object.entries(value).filter(([key])=>!privateKeys.has(key)).map(([key,item])=>[key,publicValue(item)]));
   return value;
 }
-const denied = () => ({block:true,reason:"Scoped Pi authority is unavailable"});
+const denied = cause => ({block:true,reason:"Scoped Pi authority is unavailable"+(cause?
+  ` (${cause}). ${["state_not_ready","revision_changed"].includes(cause)?"Wait for the permission update; if it persists, restart the Pi session.":"Restart the Pi session to establish fresh scoped authority."}`:"")});
 const failedResult = () => ({isError:true,content:[{type:"text",text:"Scoped Pi execution is unavailable"}]});
 const fingerprint = event => JSON.stringify([event.toolName,event.input]);
 // Only fixed codes and elapsed time cross this boundary; never pass an event,
@@ -31,13 +32,24 @@ function reportDiagnostic(report, record) {
 /** The injected transport is private bootstrap code, never a model-facing API. */
 function createScopedClient({scope, transport, readState, recheck, report=diagnostic}) {
   const calls = new Map(), finished = new Set(), evaluating = new Set();
-  let closed = false;
-  const current = revision => {
+  let closedCause = null;
+  const unavailable = revision => {
     const state=readState();
-    return !closed && transport.isCurrent(scope) && state?.status==="ready" && state.revision===revision;
+    if(closedCause)return closedCause;
+    if(!transport.isCurrent(scope))return "transport_not_current";
+    if(state?.status!=="ready")return "state_not_ready";
+    if(state.revision!==revision)return "revision_changed";
+    return null;
   };
-  const seal = () => {closed=true;for(const [id,call] of calls) if(call.phase!=="executing") calls.delete(id);};
-  transport.onLoss(seal);
+  const current = revision => unavailable(revision)===null;
+  const seal = (cause="explicit_seal") => {
+    if(closedCause)return;
+    closedCause=["transport_lost","scope_revoked","support_changed","state_changed","client_close",
+      "lifecycle_closing","installation_closed"].includes(cause)?cause:"explicit_seal";
+    reportDiagnostic(report,{event:"client_sealed",cause:closedCause});
+    for(const [id,call] of calls) if(call.phase!=="executing") calls.delete(id);
+  };
+  transport.onLoss(cause=>seal(cause==="scope_revoked"?cause:"transport_lost"));
   function metadata(call) {
     return {...call.binding,expected_revision:call.revision,pi_origin_receipt:call.receipt,
       name:call.event.toolName,arguments:call.event.input,operation_id:call.operation,step:"initial"};
@@ -45,13 +57,14 @@ function createScopedClient({scope, transport, readState, recheck, report=diagno
   async function evaluate(event, _ctx, support) {
     const started=performance.now();
     let stage="initial";
-    const refuse=branch=>{
-      reportDiagnostic(report,{event:"evaluate_denied",branch,stage,elapsed_ms:Math.round(performance.now()-started)});
-      return denied();
+    const refuse=(branch,cause)=>{
+      reportDiagnostic(report,{event:"evaluate_denied",branch,stage,elapsed_ms:Math.round(performance.now()-started),...(cause?{cause}:{})});
+      return denied(cause);
     };
+    const refuseCurrent=revision=>refuse("not_current",unavailable(revision));
     const state=readState();
     if(!event || typeof event.toolCallId!=="string" || !event.toolCallId) return refuse("invalid_event");
-    if(!current(state?.revision)) return refuse("not_current");
+    if(!current(state?.revision)) return refuseCurrent(state?.revision);
     const id=event.toolCallId, signature=fingerprint(event), old=calls.get(id);
     if(finished.has(id) || evaluating.has(id) || calls.size+finished.size>=32768) return refuse("replay_or_capacity");
     if(old) return old.signature===signature && old.phase==="allowed" ? {block:false} : refuse("call_changed");
@@ -59,10 +72,10 @@ function createScopedClient({scope, transport, readState, recheck, report=diagno
     try {
       stage="attest";
       await transport.attest(event,support,state.revision);
-      if(!current(state.revision)) return refuse("not_current");
+      if(!current(state.revision)) return refuseCurrent(state.revision);
       stage="policy";
       const response=await transport.evaluate(event,state.revision);
-      if(!current(state.revision)) return refuse("not_current");
+      if(!current(state.revision)) return refuseCurrent(state.revision);
       if(!["POLICY_ACTION_ALLOW","POLICY_ACTION_UNSPECIFIED"].includes(response?.result))
         return {block:true,reason:publicValue(typeof response?.reason==="string"?response.reason:"Scoped Pi policy denied")};
       const binding=response.permission_tier_binding;
@@ -81,7 +94,9 @@ function createScopedClient({scope, transport, readState, recheck, report=diagno
     call.phase="checking";
     try {
       const support=await recheck(event,ctx);
-      if(JSON.stringify(support)!==call.support || !current(call.revision)) {seal();return failedResult();}
+      if(JSON.stringify(support)!==call.support || !current(call.revision)) {
+        seal(JSON.stringify(support)!==call.support?"support_changed":"state_changed");return failedResult();
+      }
       await transport.attest(event,support,call.revision);
       if(!current(call.revision)) return failedResult();
       return await new Promise(resolve=>{
@@ -106,7 +121,7 @@ function createScopedClient({scope, transport, readState, recheck, report=diagno
     } catch (_) {return false;}
   }
   async function close() {
-    seal();
+    seal("client_close");
     const reply=await transport.revoke();
     if(reply?.revoked!==true || reply.scope_id!==scope.scope_id || reply.installation_id!==scope.installation_id)
       throw new Error("Scoped Pi revocation was not acknowledged");
@@ -130,7 +145,12 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
     throw new Error("Scoped Pi endpoint is not trusted loopback");
   let live=true, ready=false, sequence=0, queue=Promise.resolve();
   const listeners=new Set(), scopeListeners=new Map(), revoked=new Set();
-  const lose=()=>{live=false;ready=false;for(const callback of listeners)callback();};
+  const lose=cause=>{
+    if(!live)return;
+    live=false;ready=false;
+    reportDiagnostic(report,{event:"continuity_lost",cause});
+    for(const callback of listeners)callback("transport_lost");
+  };
   function request(route,body,token,onResponse,signal) {
     return new Promise((resolve,reject)=>{
       const started=performance.now();
@@ -157,28 +177,29 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
     });
   }
   const watch=http.get(new URL("/pi/bootstrap/watch",url),{headers:{authorization:`Bearer ${credential}`}},res=>{
-    if(res.statusCode!==200) {res.resume();lose();return;}
+    if(res.statusCode!==200) {res.resume();lose("watch_http_rejected");return;}
     let text="";
     res.on("data",chunk=>{
       text+=chunk;
-      if(text.length>16384){res.destroy();lose();return;}
+      if(text.length>16384){res.destroy();lose("watch_buffer_limit");return;}
       let end;
       while((end=text.indexOf("\n"))!==-1){
         const line=text.slice(0,end);text=text.slice(end+1);
         try {
           const frame=JSON.parse(line);
-          if(frame.incarnation!==brokerIncarnation || frame.launch_epoch!==launchEpoch || frame.live!==true || !Array.isArray(frame.revoked_scopes))lose();
+          if(frame.incarnation!==brokerIncarnation || frame.launch_epoch!==launchEpoch || frame.live!==true || !Array.isArray(frame.revoked_scopes))lose("watch_frame_invalid");
           else if(live){
-            for(const id of frame.revoked_scopes){revoked.add(id);for(const callback of scopeListeners.get(id)||[])callback();}
+            for(const id of frame.revoked_scopes){revoked.add(id);for(const callback of scopeListeners.get(id)||[])callback("scope_revoked");}
+            if(!ready)reportDiagnostic(report,{event:"continuity_ready"});
             ready=true;
           }
         }
-        catch(_){lose();}
+        catch(_){lose("watch_frame_invalid");}
       }
     });
-    res.on("close",lose);res.on("end",lose);res.on("error",lose);
+    res.on("close",()=>lose("watch_close"));res.on("end",()=>lose("watch_end"));res.on("error",()=>lose("watch_error"));
   });
-  watch.on("error",lose);
+  watch.on("error",()=>lose("watch_request_error"));
   for(let count=0;count<100&&!ready&&live;count++)await new Promise(resolve=>setTimeout(resolve,10));
   if(!ready||!live){watch.destroy();throw new Error("Scoped Pi continuity unavailable");}
   async function control(op,values) {
@@ -190,7 +211,7 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
       signal?.throwIfAborted();
       if(!live||!ready)throw new Error("Scoped Pi continuity unavailable");
       const reply=await request("/pi/bootstrap",{protocol:1,sequence:++sequence,op,...values},credential,undefined,signal);
-      if(reply.broker_incarnation!==undefined&&reply.broker_incarnation!==brokerIncarnation){lose();throw new Error("Scoped Pi broker changed");}
+      if(reply.broker_incarnation!==undefined&&reply.broker_incarnation!==brokerIncarnation){lose("broker_changed");throw new Error("Scoped Pi broker changed");}
       return reply;
     });
     queue=task.catch(()=>{});
@@ -205,7 +226,7 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
     const scope=binding.scope, scopeCredential=binding.credential;
     return createScopedClient({scope,readState,recheck,report,transport:{
       isCurrent:value=>live&&ready&&!revoked.has(value.scope_id)&&value.runner_epoch===scope.runner_epoch&&value.launch_epoch===launchEpoch,
-      onLoss:callback=>{listeners.add(callback);const set=scopeListeners.get(scope.scope_id)||new Set();set.add(callback);scopeListeners.set(scope.scope_id,set);if(revoked.has(scope.scope_id))callback();},
+      onLoss:callback=>{listeners.add(callback);const set=scopeListeners.get(scope.scope_id)||new Set();set.add(callback);scopeListeners.set(scope.scope_id,set);if(revoked.has(scope.scope_id))callback("scope_revoked");},
       attest:(event,support,revision)=>control("attest",{handle,call_id:event.toolCallId,name:event.toolName,arguments:event.input,revision,support}),
       evaluate:(event,revision)=>request("/policies/evaluate",{event:{type:"PHASE_TOOL_CALL",target:"",context:{},data:{name:event.toolName,arguments:event.input,call_id:event.toolCallId,expected_permission_tier_revision:revision}}},scopeCredential),
       execute:(metadata,onResponse)=>request("/permission-tiers/control",{type:"permission_tier_execute",...metadata},scopeCredential,onResponse),
@@ -233,7 +254,7 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
       },
     }});
   }
-  return Object.freeze({bind:values=>control("bind",values),client,close:()=>{lose();watch.destroy();}});
+  return Object.freeze({bind:values=>control("bind",values),client,close:()=>{lose("connection_close");watch.destroy();}});
 }
 
 async function connectFromHandoff(locator, {timeoutMs=8000}={}) {
