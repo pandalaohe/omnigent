@@ -159,6 +159,93 @@ def test_deleted_request_cannot_create_for_reregistered_account(keys):
         store.create("owner", name="old-request", scopes=("*",), expires_at=None, now=1)
 
 
+@pytest.mark.parametrize("first", ["create", "delete"])
+def test_create_and_delete_serialize_on_the_active_account(keys, monkeypatch, first):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, local
+
+    from sqlalchemy import event
+
+    import omnigent.server.accounts_store as accounts_module
+    import omnigent.server.api_key_store as keys_module
+
+    store, accounts = keys
+    locked = Event()
+    competing = Event()
+    acquired = Event()
+    operation = local()
+    release = Event()
+    require = keys_module.require_active_account
+    revoke = accounts_module._revoke_durable_authority
+
+    def gate():
+        locked.set()
+        assert release.wait(30)
+
+    def require_account(session, user_id):
+        result = require(session, user_id)
+        if first == "create":
+            gate()
+        return result
+
+    def revoke_account(session, user_id, *, now):
+        if first == "delete":
+            gate()
+        return revoke(session, user_id, now=now)
+
+    def create():
+        return store.create("owner", name="racing", scopes=("*",), expires_at=None, now=1)
+
+    def delete():
+        return accounts.delete_user("owner")
+
+    def lock_request(statement):
+        statement = statement.upper()
+        return getattr(operation, "second", False) and (
+            statement.startswith("BEGIN IMMEDIATE")
+            or ("FOR UPDATE" in statement and "USERS" in statement)
+        )
+
+    def before_query(_connection, _cursor, statement, _parameters, _context, _many):
+        if lock_request(statement):
+            competing.set()
+
+    def after_query(_connection, _cursor, statement, _parameters, _context, _many):
+        if lock_request(statement):
+            acquired.set()
+
+    def second_operation():
+        operation.second = True
+        return delete() if first == "create" else create()
+
+    monkeypatch.setattr(keys_module, "require_active_account", require_account)
+    monkeypatch.setattr(accounts_module, "_revoke_durable_authority", revoke_account)
+    event.listen(store._engine, "before_cursor_execute", before_query)
+    event.listen(store._engine, "after_cursor_execute", after_query)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_result = pool.submit(create if first == "create" else delete)
+            try:
+                assert locked.wait(30)
+                second_result = pool.submit(second_operation)
+                assert competing.wait(30)
+                assert not acquired.wait(0.2), "competing account lock was not blocked"
+                assert not second_result.done()
+            finally:
+                release.set()
+            first_result.result(timeout=30)
+            if first == "delete":
+                with pytest.raises(OmnigentError):
+                    second_result.result(timeout=30)
+            else:
+                assert second_result.result(timeout=30) is True
+    finally:
+        event.remove(store._engine, "before_cursor_execute", before_query)
+        event.remove(store._engine, "after_cursor_execute", after_query)
+    assert store.list_for_user("owner") == []
+    assert accounts.get_user("owner") is None
+
+
 def test_legacy_to_managed_feed_cursor_keeps_cutover_receipt(keys, db_uri, monkeypatch):
     import secrets
     import uuid

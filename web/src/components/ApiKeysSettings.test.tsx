@@ -1,15 +1,17 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiKeysSettings } from "./ApiKeysSettings";
 import { apiKeysRequest } from "@/lib/apiKeysApi";
 import { settingsNavGroups } from "@/shell/settingsNav";
 
+const identity = vi.hoisted(() => ({ user: "owner", server: "server", generation: 1 }));
+
 vi.mock("@/lib/apiKeysApi", () => ({ apiKeysRequest: vi.fn() }));
-vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "owner" }));
-vi.mock("@/lib/identity", () => ({ getCurrentUserId: () => "owner" }));
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => identity.user }));
+vi.mock("@/lib/identity", () => ({ getCurrentUserId: () => identity.user }));
 vi.mock("@/lib/host", () => ({
-  getOmnigentServerIdentity: () => "server",
-  getOmnigentHostGeneration: () => 1,
+  getOmnigentServerIdentity: () => identity.server,
+  getOmnigentHostGeneration: () => identity.generation,
   getEmbedRoot: () => null,
 }));
 
@@ -27,11 +29,61 @@ const list = { keys: [], read_only: [], available_scopes: ["usage", "tasks"] };
 const request = vi.mocked(apiKeysRequest);
 afterEach(cleanup);
 beforeEach(() => {
+  Object.assign(identity, { user: "owner", server: "server", generation: 1 });
   request.mockReset();
   request.mockResolvedValue(list);
 });
 
 describe("API key settings", () => {
+  it.each([
+    ["create", "user"],
+    ["create", "server"],
+    ["create", "generation"],
+    ["create", "unmount"],
+    ["regenerate", "user"],
+    ["regenerate", "server"],
+    ["regenerate", "generation"],
+    ["regenerate", "unmount"],
+  ])("drops a late %s response after %s changes", async (operation, transition) => {
+    let finish!: (result: { key: typeof key; value: string }) => void;
+    const pending = new Promise<{ key: typeof key; value: string }>((resolve) => {
+      finish = resolve;
+    });
+    request.mockImplementation(async (_path, method) =>
+      method === "POST" ? pending : { ...list, keys: operation === "regenerate" ? [key] : [] },
+    );
+    const view = render(<ApiKeysSettings />);
+    const button = await screen.findByRole("button", {
+      name: operation === "create" ? "New API key" : "Regenerate",
+    });
+    await waitFor(() => expect(button).toBeEnabled());
+    fireEvent.click(button);
+    if (operation === "create")
+      fireEvent.change(screen.getByLabelText("Name"), { target: { value: "feed" } });
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: operation === "create" ? "Create API key" : "Regenerate API key",
+      }),
+    );
+    await waitFor(() => expect(request.mock.calls.some((call) => call[1] === "POST")).toBe(true));
+    if (transition === "unmount") view.unmount();
+    else {
+      if (transition === "user") identity.user = "other";
+      else if (transition === "server") identity.server = "another-server";
+      else identity.generation += 1;
+      view.rerender(<ApiKeysSettings />);
+    }
+    await act(async () => {
+      finish({ key, value: "late-private-value" });
+      await pending;
+    });
+    expect(screen.queryByText("late-private-value")).not.toBeInTheDocument();
+    if (transition === "unmount") {
+      render(<ApiKeysSettings />);
+      expect(await screen.findByRole("button", { name: "New API key" })).toBeInTheDocument();
+      expect(screen.queryByText("late-private-value")).not.toBeInTheDocument();
+    }
+  });
   it("deletes an expired key without validating its old expiry", async () => {
     const expired = { ...list, keys: [{ ...key, expires_at: 1 }] };
     request.mockImplementation(async (_path, method) =>

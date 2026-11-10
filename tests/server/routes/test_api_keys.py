@@ -90,3 +90,99 @@ def test_browser_and_origin_required(client):
     del client.headers["authorization"]
     client.cookies.clear()
     assert client.get(path).status_code == 401
+
+
+def test_managed_config_environment_and_valid_jwt_coexist(request, monkeypatch):
+    import hashlib
+    import secrets
+
+    from fastapi import HTTPException, Request
+
+    from omnigent.server.auth import AccountAuthenticationMiddleware
+    from omnigent.server.server_config import load_api_keys
+
+    store, accounts = request.getfixturevalue("keys")
+    config_value, env_value = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+    provider = _provider()
+    provider.set_api_keys(
+        load_api_keys(
+            {
+                "api_keys": [
+                    {
+                        "name": "configured",
+                        "user": "owner",
+                        "scopes": ["usage"],
+                        "sha256": hashlib.sha256(config_value.encode()).hexdigest(),
+                    }
+                ]
+            },
+            {"OMNIGENT_USAGE_READ_TOKEN": f"owner:{env_value}"},
+        )
+    )
+    provider.set_account_check(accounts.accepts_generation)
+    provider.set_usage_read_account_lookup(lambda user: accounts.get_user(user).account_generation)
+    lookups = []
+
+    def resolve(digest, now):
+        lookups.append(digest)
+        return store.resolve(digest, now)
+
+    provider.set_api_key_store(resolve, store.touch)
+    _, managed_value = store.create("owner", name="managed", scopes=("*",), expires_at=None, now=1)
+    app = FastAPI()
+    app.add_middleware(AccountAuthenticationMiddleware, auth_provider=provider)
+    app.include_router(create_api_keys_router(provider, store))
+
+    @app.get("/v1/usage-events")
+    def usage(request: Request):
+        user = provider.get_user_id(request)
+        if user is None:
+            raise HTTPException(401)
+        return {"user": user, "principal": request.state.usage_read_grant_id}
+
+    @app.get("/v1/me/tasks")
+    def tasks(request: Request):
+        user = provider.get_user_id(request)
+        if user is None:
+            raise HTTPException(401)
+        return {"user": user}
+
+    monkeypatch.setenv("OMNIGENT_WS_ALLOWED_ORIGINS", "")
+    with TestClient(app, base_url="https://omni.example.test") as client:
+        for value in (config_value, env_value, managed_value):
+            response = client.get("/v1/usage-events", headers={"Authorization": "Bearer " + value})
+            assert response.status_code == 200
+            assert response.json() == {"user": "owner", "principal": "config:usage-read"}
+        assert len(lookups) == 1
+        token = mint_session_cookie(
+            "owner",
+            _KEY,
+            1,
+            "accounts",
+            account_generation=accounts.get_user("owner").account_generation,
+        )
+        assert (
+            client.get("/v1/me/tasks", headers={"Authorization": "Bearer " + token}).status_code
+            == 200
+        )
+        assert len(lookups) == 1
+        browser = mint_session_cookie(
+            "owner",
+            _KEY,
+            1,
+            "accounts",
+            browser_session=True,
+            account_generation=accounts.get_user("owner").account_generation,
+        )
+        client.cookies.set(provider.session_cookie_name, browser)
+        rows = client.get("/v1/me/api-keys").json()
+        assert len(rows["keys"]) == 1
+        assert {row["source"] for row in rows["read_only"]} == {"config", "environment"}
+        assert all(row["last_used_at"] is not None for row in rows["read_only"])
+        client.headers["Origin"] = "https://omni.example.test"
+        assert (
+            client.post(
+                "/v1/me/api-keys", json={"name": "configured", "scopes": ["usage"]}
+            ).status_code
+            == 409
+        )
