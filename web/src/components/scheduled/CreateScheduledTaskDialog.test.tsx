@@ -2461,25 +2461,26 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     expect(await screen.findByRole("option", { name: "Bypass permissions" })).toBeInTheDocument();
   });
 
-  it("shows Codex SDK presets and only default model and effort without a host", async () => {
+  it("shows Codex SDK presets without guessing an effort when no host model is known", async () => {
     renderDialog();
     fireEvent.click(screen.getByTestId("pick-agent-codex"));
     expect(screen.getByTestId("task-model-effort-field")).toBeInTheDocument();
     fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
     expect(await screen.findAllByRole("option")).toHaveLength(1);
     fireEvent.click(await screen.findByRole("option", { name: "Default" }));
-    fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
-    expect(await screen.findAllByRole("option")).toHaveLength(1);
-    fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+    expect(screen.queryByTestId("task-effort-trigger")).not.toBeInTheDocument();
     fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
-    expect(await screen.findByRole("option", { name: "Agent default" })).toBeInTheDocument();
+    expect(await screen.findByRole("option", { name: "Default", exact: true })).toBeInTheDocument();
     expect(await screen.findByRole("option", { name: "Ask for approval" })).toBeInTheDocument();
     fireEvent.click(await screen.findByRole("option", { name: "Read Only" }));
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
-    expect(mutateAsync.mock.calls[0][0].permissionMode).toBe("read-only");
+    const [input] = mutateAsync.mock.calls[0];
+    expect(input.permissionMode).toBe("read-only");
+    expect(input).not.toHaveProperty("modelOverride");
+    expect(input).not.toHaveProperty("reasoningEffort");
   });
 
   it("shows saved Codex model and effort when no host catalog is available", async () => {
@@ -5474,17 +5475,26 @@ describe("automation harness settings", () => {
 
   it.each([
     ["codex-native", true, true, true],
-    ["pi-native", true, true, false],
+    ["pi-native", true, true, true],
     ["devin-native", true, true, true],
     ["cursor-native", false, false, true],
-    ["antigravity-native", false, false, true],
+    ["antigravity-native", true, true, true],
     ["opencode-native", false, false, false],
-  ])("shows independent settings for %s", (harness, model, effort, permission) => {
+  ] as const)("shows independent settings for %s", async (harness, model, effort, permission) => {
     mockHarness(harness);
     renderDialog();
     expect(!!screen.queryByTestId("task-model-trigger")).toBe(model);
+    if (["codex-native", "devin-native", "antigravity-native"].includes(harness)) {
+      expect(screen.queryByTestId("task-effort-trigger")).not.toBeInTheDocument();
+      await choose("model", "Model A");
+      expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Model A");
+    }
     expect(!!screen.queryByTestId("task-effort-trigger")).toBe(effort);
     expect(!!screen.queryByTestId("task-permission-trigger")).toBe(permission);
+    if (harness === "pi-native" || harness === "antigravity-native") {
+      await choose("permission", "Plan");
+      expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Plan");
+    }
     expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith("host_1", harness, model);
   });
 
@@ -5920,6 +5930,7 @@ describe("automation harness settings", () => {
     vi.spyOn(identity, "getCurrentUserId").mockReturnValue("alice");
     mockHarness("codex-native");
     const first = renderDialog();
+    await choose("model", "Model A");
     expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
     first.unmount();
     vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
@@ -5930,9 +5941,11 @@ describe("automation harness settings", () => {
     } as ReturnType<typeof hostsHook.useHosts>);
     const { rerender } = renderDialog();
     await choose("host", "Offline host (offline)");
-    expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
     await choose("model", "Model A");
     expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Model A");
+    fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
+    expect(await screen.findByRole("option", { name: "High" })).toBeVisible();
+    fireEvent.click(screen.getByRole("option", { name: "Default", exact: true }));
     vi.mocked(hostsHook.useHostModelOptions).mockReturnValue({ data: [] } as unknown as ReturnType<
       typeof hostsHook.useHostModelOptions
     >);
@@ -5957,6 +5970,7 @@ describe("automation harness settings", () => {
       dataUpdatedAt: fetchedAt,
     } as ReturnType<typeof hostsHook.useHostModelOptions>);
     const first = renderDialog();
+    await choose("model", "Model A");
     expect(screen.getByTestId("task-effort-trigger")).toBeVisible();
     first.unmount();
     vi.spyOn(Date, "now").mockReturnValue(fetchedAt + 25 * 60 * 60 * 1000);
