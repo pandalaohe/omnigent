@@ -60,6 +60,7 @@ import {
   PENDING_FILE_PREFIX,
   structuredErrorFields,
 } from "@/lib/blocks";
+import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
@@ -3616,6 +3617,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...(meta === undefined ? {} : { _meta: meta }),
       });
       if (asyncQuestion) markResponded();
+      clearAskUserQuestionDraft(elicitationId);
       if (elicitationRechecksAfterVerdict.delete(elicitationId)) {
         void recheckAnsweredElicitation(sessionId, elicitationId);
       }
@@ -9845,6 +9847,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // elsewhere".
       return;
     case "elicitation_resolved":
+      // Without a verdict the card can reopen if the prompt re-parks, so keep its draft.
+      if (event.action) clearAskUserQuestionDraft(event.elicitationId);
       // Match by id, not first-pending — the `pending` guard keeps
       // a user-delivered verdict from being overwritten by a later
       // duplicate-resolve.

@@ -655,7 +655,7 @@ function ChatCodeBlockWrapToggle({ wrap, onToggle }: { wrap: boolean; onToggle: 
   );
 }
 
-function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
+export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   const code = extractCodeText(children);
   const getCode = useCallback(() => code, [code]);
   const send = useContext(CodeBlockSendContext);
@@ -702,7 +702,7 @@ export const MessageResponse = memo(
     const themeMode = useResolvedThemeMode();
     const inheritedSend = useContext(CodeBlockSendContext);
     const messageComponents = useMemo(
-      () => ({ ...components, pre: ChatCodeBlockPre, table: ChatTable }),
+      () => ({ ...components, pre: components?.pre ?? ChatCodeBlockPre, table: ChatTable }),
       [components],
     );
 

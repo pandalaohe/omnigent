@@ -95,6 +95,7 @@ import {
   writeInboxFilter,
   type InboxFilter,
 } from "@/lib/inboxFilterPreferences";
+import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
 import {
   isComposerAltNewlineKey,
   isComposerSendKey,
@@ -412,6 +413,7 @@ export function InboxPage() {
         });
         if (pendingSubmissions.current.get(elicitationId) !== verdict) return false;
         pendingSubmissions.current.delete(elicitationId);
+        clearAskUserQuestionDraft(elicitationId);
         if (asyncQuestion) setResponded((prev) => ({ ...prev, [elicitationId]: verdict }));
         void queryClient.invalidateQueries({ queryKey: ["conversations"] });
         if (item.elicitation.nativeDelivery) {

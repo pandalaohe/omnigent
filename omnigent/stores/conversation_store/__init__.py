@@ -85,6 +85,9 @@ CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 
 # Receiver-owned readback, scoped to one native session instance.
 CODEX_NATIVE_PERMISSION_OBSERVATION_LABEL_KEY = "omnigent.codex_native.permission_observation"
+# Codex collaboration mode of a codex-native session (``"plan"`` / ``"default"``),
+# persisted by the in-session Plan toggle or seeded by the New Session screen.
+CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration_mode"
 
 # Reserved label key that stores a session's sidebar "project" membership
 # (implicit collections — a project exists while ≥1 session carries this key).

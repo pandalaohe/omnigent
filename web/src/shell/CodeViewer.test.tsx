@@ -9,6 +9,8 @@ import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { FileViewerContext } from "./FileViewerContext";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PANEL_SANDBOX, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
+import { BRIDGE_MSG } from "./htmlCommentBridge";
+import { connectHtmlPreviewBridge } from "@/test/htmlPreviewBridge";
 import { highlightCode } from "@/components/ai-elements/code-block";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
@@ -126,6 +128,7 @@ function Providers({ children }: { children: ReactNode }) {
 }
 
 interface RenderViewerOpts {
+  conversationId?: string;
   markdownSourceFallback?: boolean;
   mediaActive?: boolean;
   viewMode?: "editor" | "preview" | "source" | "diff";
@@ -156,7 +159,7 @@ function viewerElement(
         markdownSourceFallback={opts.markdownSourceFallback ?? false}
         mediaActive={opts.mediaActive}
         position={opts.position}
-        conversationId="conv_1"
+        conversationId={opts.conversationId ?? "conv_1"}
         path={path}
         fileQuery={makeFileQuery(content, opts.truncated)}
         comments={[]}
@@ -907,6 +910,31 @@ describe("CodeViewer HTML preview sandbox", () => {
       viewerElement("<html></html>", true, "page.html", { viewMode: "preview", previewKey: 1 }),
     );
     await waitFor(() => expect(mintCalls()).toBe(2));
+  });
+
+  it.each([
+    ["another file", "b.html", "conv_1"],
+    ["the same path in another conversation", "a.html", "conv_2"],
+  ])("opens %s at 100% zoom", async (_, nextPath, nextConversationId) => {
+    const html = "<html><head></head><body><p>report</p></body></html>";
+    const { rerender } = renderViewer(html, true, "a.html", { viewMode: "preview" });
+    const { port, send } = await connectHtmlPreviewBridge(
+      await screen.findByTitle<HTMLIFrameElement>("HTML preview"),
+    );
+    send({ type: BRIDGE_MSG.zoom, action: "in" });
+    const zoomBox = () => screen.getByTitle("HTML preview").parentElement as HTMLElement;
+    await waitFor(() => expect(zoomBox().style.transform).toBe("scale(1.1)"));
+
+    // The content stays loaded, as it does for a cached file.
+    rerender(
+      viewerElement(html, true, nextPath, {
+        viewMode: "preview",
+        conversationId: nextConversationId,
+      }),
+    );
+    await screen.findByTitle("HTML preview");
+    expect(zoomBox().style.transform).toBe("");
+    port.close();
   });
 });
 

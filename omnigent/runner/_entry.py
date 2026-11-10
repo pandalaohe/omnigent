@@ -1633,6 +1633,7 @@ def create_app(
     # Out-of-process runner owns its own TerminalRegistry.
     from omnigent.inner.terminal import reap_orphaned_terminals
     from omnigent.terminals import TerminalRegistry
+    from omnigent.terminals.pane_reaper import resolve_native_pane_idle_timeout_s
 
     _terminal_registry = TerminalRegistry(conversation_link_base_url=server_url)
     if not host_owns_global_cleanup:
@@ -1685,6 +1686,9 @@ def create_app(
         auth_token_factory=auth_token_factory,
         root_startup_session_id=runner_primary_session_id(),
         root_startup_attempt=root_startup_attempt,
+        native_pane_idle_timeout_s=resolve_native_pane_idle_timeout_s(
+            _load_runner_idle_timeout_s_from_config()
+        ),
     )
 
     async def _start_pm() -> None:

@@ -309,6 +309,10 @@ import {
   writeRetentionDays,
 } from "@/lib/retentionPreferences";
 import {
+  HIDDEN_PICKER_AGENTS_STORAGE_KEY,
+  notifyHiddenPickerAgentsChanged,
+} from "@/lib/pickerEntryVisibility";
+import {
   applyThemePalette,
   DEFAULT_PALETTE,
   isThemeSelection,
@@ -354,6 +358,7 @@ import {
 import { SettingsAgentsSection } from "./settings/SettingsAgentsSection";
 import { ApiKeysSettings } from "@/components/ApiKeysSettings";
 import { ConnectedAppsSettings } from "@/components/ConnectedAppsSettings";
+import { PickerVisibilitySetting } from "./settings/PickerVisibilitySetting";
 
 // Admin-only management surfaces, rendered as the Members / Policies / Global
 // instructions / Sharing settings sub-categories. Visible to admins in all
@@ -1232,12 +1237,15 @@ function AppearanceSection() {
           "omnigent:new-session-inherit-right-rail-tab",
           PINNED_WORKSPACE_TABS_STORAGE_KEY,
           FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+          HIDDEN_PICKER_AGENTS_STORAGE_KEY,
         ]) {
           window.localStorage.removeItem(key);
         }
       } catch {
         // localStorage access errors are non-fatal.
       }
+      // As with import: a same-tab write fires no storage event.
+      notifyHiddenPickerAgentsChanged();
     }
     applyStoredUiFontSize();
 
@@ -1334,6 +1342,9 @@ function AppearanceSection() {
 
           <SettingsGroup title="Session defaults" testId="settings-group-chat">
             <TranscriptViewDefaultControl />
+            <div className="mt-4 border-t border-border pt-4">
+              <PickerVisibilitySetting />
+            </div>
           </SettingsGroup>
 
           <SettingsGroup title="Workspace" testId="settings-group-workspace">

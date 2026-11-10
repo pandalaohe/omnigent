@@ -108,6 +108,10 @@ class SkillSourceContext:
     :param claude_portable_skills: Whether Claude-family discovery may include
         ``.agents/skills`` tiers; the host's ``skills.claude_portable_skills``
         setting.
+    :param warnings: When not ``None``, providers append a user-facing note
+        for each source they could not read (for example a failed
+        ``codex plugin list``), so callers can show an incomplete catalog as
+        incomplete rather than empty.
     """
 
     roots: tuple[Path, ...]
@@ -118,6 +122,7 @@ class SkillSourceContext:
     codex_home: Path | None = None
     is_native: bool = False
     claude_portable_skills: bool = True
+    warnings: list[str] | None = None
 
 
 SkillSource = Callable[[SkillSourceContext], list[SkillSpec]]
@@ -129,6 +134,7 @@ def skill_source_context_from_env(
     harness: str | None,
     skills_filter: str | list[str] = "all",
     bundle_dir: Path | None = None,
+    warnings: list[str] | None = None,
 ) -> SkillSourceContext:
     """Use the same ambient harness configuration for host and runner discovery."""
     configured_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
@@ -148,6 +154,7 @@ def skill_source_context_from_env(
         ),
         codex_home=codex_home,
         claude_portable_skills=host_skill_settings().claude_portable_skills,
+        warnings=warnings,
     )
 
 
@@ -327,6 +334,7 @@ def _session_skills(
     harness: str | None,
     *,
     invocable_only: bool,
+    warnings: list[str] | None = None,
 ) -> list[SkillSpec]:
     """One assembly shared by the menu and the loadable registry."""
     from omnigent.harness_aliases import canonicalize_harness
@@ -336,7 +344,11 @@ def _session_skills(
     seen = {s.name for s in spec.skills}
     seen_dirs = {s.skill_dir.resolve() for s in spec.skills if s.skill_dir is not None}
     ctx = skill_source_context_from_env(
-        roots=roots, harness=harness, skills_filter=spec.skills_filter, bundle_dir=bundle_dir
+        roots=roots,
+        harness=harness,
+        skills_filter=spec.skills_filter,
+        bundle_dir=bundle_dir,
+        warnings=warnings,
     )
     if not roots:
         host_skills: list[SkillSpec] = []
@@ -373,13 +385,16 @@ def resolve_session_skills(
     bundle_dir: Path | None,
     *,
     harness: str | None = None,
+    warnings: list[str] | None = None,
 ) -> list[SkillSpec]:
     """Use identical precedence and filters for menu discovery and invocation.
 
     :param harness: The harness whose sources to use; ``None`` means the
         spec's declared harness.
     """
-    return _session_skills(spec, roots, bundle_dir, harness, invocable_only=True)
+    return _session_skills(
+        spec, roots, bundle_dir, harness, invocable_only=True, warnings=warnings
+    )
 
 
 def resolve_session_skill_registry(
@@ -997,7 +1012,9 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
             continue
         out.append(replace(spec, name=name))
     codex_home = host_override if host_override is not None else ctx.home / ".codex"
-    out.extend(discover_codex_plugin_skills(codex_home, ctx.skills_filter, cwd=cwd))
+    out.extend(
+        discover_codex_plugin_skills(codex_home, ctx.skills_filter, cwd=cwd, warnings=ctx.warnings)
+    )
     return out
 
 

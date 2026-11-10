@@ -653,6 +653,14 @@ class SysSessionListTool(Tool):
                                 "affect the 'sub_agents' view."
                             ),
                         },
+                        "include_archived": {
+                            "type": "boolean",
+                            "description": (
+                                "Optional: also list archived sessions in the "
+                                "global 'sessions' view; each row then carries "
+                                "'archived'. Defaults to false."
+                            ),
+                        },
                         "limit": {
                             "type": "integer",
                             "minimum": 1,

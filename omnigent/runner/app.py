@@ -125,7 +125,11 @@ from omnigent.runner.background_titles import (
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.codex.goal import CodexGoalRunner
 from omnigent.runner.environment_filesystem import _MAX_READ_BYTES
-from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_failure
+from omnigent.runner.launch_failure import (
+    TERMINAL_CLOSED_OUTSIDE_OMNIGENT,
+    FailureDiagnosis,
+    classify_terminal_failure,
+)
 from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
@@ -279,9 +283,11 @@ from omnigent.startup_protocol import (
     SDK_STARTUP_SOURCES,
     StartupAttemptRef,
 )
+from omnigent.util.dedicated_executor import DedicatedExecutor
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
+_BRIDGE_NOTIFICATIONS = DedicatedExecutor(max_workers=2, thread_name_prefix="runner-bridge-notify")
 
 # Allow process termination and forwarder cleanup to finish before DELETE proceeds.
 _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
@@ -2031,6 +2037,7 @@ def create_runner_app(
     auth_token_factory: Callable[[], str | None] | None = None,
     root_startup_session_id: str | None = None,
     root_startup_attempt: StartupAttemptRef | None = None,
+    native_pane_idle_timeout_s: float | None = None,
 ) -> FastAPI:
     """Build a fresh runner FastAPI app.
 
@@ -2066,6 +2073,8 @@ def create_runner_app(
     :param auth_token_factory: Refresh-capable server bearer factory owned by
         the runner process. Native terminal helpers reuse it instead of
         resolving host credentials again for every terminal launch.
+    :param native_pane_idle_timeout_s: Resolved native-pane idle timeout. ``0``
+        disables reaping; ``None`` uses the pane environment override or default.
     """
     import hmac
 
@@ -2460,6 +2469,8 @@ def create_runner_app(
     _ingest_next_seq: dict[str, int] = {}
     _ingest_now_serving: dict[str, int] = {}
     _ingest_cond: dict[str, asyncio.Condition] = {}
+    # Server pending IDs owned by each session's current turn, including injections.
+    _turn_pending_ids: dict[str, set[str]] = {}
     _interrupted_sessions: set[str] = set()
     app.state.interrupted_sessions = _interrupted_sessions
     _turn_dispatch_cancellers: dict[str, tuple[int, Callable[[], list[asyncio.Task[object]]]]] = {}
@@ -2843,6 +2854,31 @@ def create_runner_app(
             for entry in list_subagent_work(session_id)
         )
 
+    def _native_pane_shows_live_work(terminals: Any, session_id: str, terminal_name: str) -> bool:
+        """Whether a native pane shows the live work the pane reaper spares it for.
+
+        A pane parked on a permission prompt is quiet and can read ``idle``, and a
+        pane still redrawing output can too, so the status edge alone misses them.
+        Reads the same in-memory signals the reaper uses, not its tmux calls.
+
+        :param terminals: Terminal registry holding the pane instance.
+        :param session_id: Session/conversation id, e.g. ``"conv_abc"``.
+        :param terminal_name: Native harness terminal name, e.g. ``"claude"``.
+        :returns: ``True`` when a permission hook is parked or the pane shows recent
+            input or output.
+        """
+        from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
+        from omnigent.terminals.pane_reaper import PANE_OUTPUT_BUSY_WINDOW_S
+
+        if approval_wait_is_fresh(session_id):
+            return True
+        instance = terminals.get(session_id, terminal_name, "main")
+        if instance is None:
+            return False
+        if instance.client_interaction_within(PANE_OUTPUT_BUSY_WINDOW_S):
+            return True
+        return instance.screen_changed_within(PANE_OUTPUT_BUSY_WINDOW_S) is True
+
     def _has_active_work() -> bool:
         pane_reaper = getattr(app.state, "native_pane_reaper", None)
         if pane_reaper is not None and pane_reaper.has_managed_panes():
@@ -2866,15 +2902,16 @@ def create_runner_app(
         # Read current resources so deleting a terminal also retires this pin.
         terminals = resource_registry.terminal_registry
         if terminals is not None:
-            session_ids.update(
-                session_id
-                for session_id, name, _ in terminals.native_panes()
-                if is_native_harness(
+            for session_id, name, _ in terminals.native_panes():
+                if not is_native_harness(
                     resource_registry.terminal_resource_role(
                         session_id, terminal_resource_id(name, "main")
                     )
-                )
-            )
+                ):
+                    continue
+                session_ids.add(session_id)
+                if _native_pane_shows_live_work(terminals, session_id, name):
+                    return True
         if process_manager is not None and any(
             process_manager.has_active_turn(session_id) for session_id in session_ids
         ):
@@ -3316,6 +3353,8 @@ def create_runner_app(
             exit_status=event.exit_status,
             output=event.last_output,
         )
+        if diagnosis is None and event.closed_outside_omnigent:
+            diagnosis = TERMINAL_CLOSED_OUTSIDE_OMNIGENT
         error = _build_required_terminal_error(event, diagnosis)
         _required_terminal_exit_errors[event.session_id] = error
         # A dead required terminal cannot still be working a turn.
@@ -5406,6 +5445,7 @@ def create_runner_app(
         _native_interrupt_runner.clear_pending_interrupt(session_id)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
+        _turn_pending_ids.pop(session_id, None)
         _ingest_cond.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
@@ -6604,6 +6644,9 @@ def create_runner_app(
 
         Must be used instead of a bare ``_active_turns[conv] = None`` so recovery can detect
         a replacement turn that ran and finished during a teardown await.
+
+        :param conv_id: Session whose turn slot is bound.
+        :param body: Forwarded message that starts the turn, when there is one.
         """
         _unknown_sdk_peers(conv_id, "runner_turn_rebound")
         _active_turns[conv_id] = None
@@ -6615,6 +6658,28 @@ def create_runner_app(
         if source.get("recovered") is True:
             identity["recovered"] = True
         _turn_identities[conv_id] = identity
+        pending_id = body.get("pending_id") if body is not None else None
+        if isinstance(pending_id, str):
+            _turn_pending_ids[conv_id] = {pending_id}
+        else:
+            _turn_pending_ids.pop(conv_id, None)
+
+    def _message_already_taken(conv_id: str, body: Mapping[str, Any]) -> bool:
+        """Whether a forward repeats a message that is still queued or running.
+
+        The server re-forwards a message under the same pending id when an
+        earlier forward timed out on its side; the runner may still hold that
+        earlier forward, so taking the repeat would deliver the message twice.
+        """
+        pending_id = body.get("pending_id")
+        if not isinstance(pending_id, str):
+            return False
+        if conv_id in _active_turns and pending_id in _turn_pending_ids.get(conv_id, ()):
+            return True
+        return any(
+            queued.get("pending_id") == pending_id
+            for queued in _session_message_buffers.get(conv_id, ())
+        )
 
     def _release_live_turn_markers(conv_id: str) -> None:
         """Clear ``_live_response_id`` and the process-manager in-flight marker atomically.
@@ -6633,6 +6698,7 @@ def create_runner_app(
         if _active_turns.get(conv_id) is not occupant:
             return False
         _active_turns.pop(conv_id, None)
+        _turn_pending_ids.pop(conv_id, None)
         _release_live_turn_markers(conv_id)
         _interrupted_sessions.discard(conv_id)
         return True
@@ -6943,6 +7009,7 @@ def create_runner_app(
             terminal_data["turn_id"] = response_id
         _unknown_sdk_peers(conv_id, "runner_turn_ended")
         _active_turns.pop(conv_id, None)
+        _turn_pending_ids.pop(conv_id, None)
         _release_live_turn_markers(conv_id)
         # A claude-sdk `/compact` turn that ended without emitting
         # `response.compaction.completed` produced no compaction (nothing to
@@ -7250,6 +7317,7 @@ def create_runner_app(
         )
         if stream_sentinel:
             _active_turns.pop(conv_id, None)
+            _turn_pending_ids.pop(conv_id, None)
             await _forward_harness_interrupt(conv_id, turn_epoch=_entry_epoch)
         else:
             await _cancel_inprocess_turn(conv_id)
@@ -7527,6 +7595,11 @@ def create_runner_app(
                 )
                 _sdk_compact_inprogress.add(session_id)
             _begin_turn_slot(session_id, next_body)
+            _turn_pending_ids[session_id] = {
+                pending_id
+                for body in drained
+                if isinstance(pending_id := body.get("pending_id"), str)
+            }
             _publish_turn_status(session_id, "running")
             _turn_task = asyncio.create_task(
                 _run_turn_bg(
@@ -8688,7 +8761,10 @@ def create_runner_app(
 
             cancelled = Event()
             try:
-                await asyncio.to_thread(post_tools_changed, bridge_dir, cancelled=cancelled)
+                # Bridge readiness waits must not compete with git or message delivery.
+                await _BRIDGE_NOTIFICATIONS.run(
+                    post_tools_changed, bridge_dir, cancelled=cancelled
+                )
             except (RuntimeError, OSError):
                 # Fire-and-forget below, so anything escaping here resurfaces as
                 # an unretrieved task exception at ERROR. Re-advertising the tool
@@ -9139,6 +9215,9 @@ def create_runner_app(
             harness_body["peer_delivery"] = msg_body["peer_delivery"]
             if msg_body.get("peer_delivery_start") is True:
                 harness_body["peer_delivery_start"] = True
+        _authorized_shell = msg_body.get("authorized_native_shell_command")
+        if isinstance(_authorized_shell, str):
+            harness_body["authorized_native_shell_command"] = _authorized_shell
         # The routed model rides in-band on the forwarded message. This body is
         # built field by field (not copied), so it must be threaded explicitly:
         # the harness forwards it onto CreateResponseRequest.model_override and
@@ -9495,6 +9574,7 @@ def create_runner_app(
             _slot = _active_turns.get(session_id)
             if _slot is None or _slot is asyncio.current_task():
                 _active_turns.pop(session_id, None)
+                _turn_pending_ids.pop(session_id, None)
                 # Clear the live response AND the in-flight marker together (B1
                 # class fix): a bare pop would leak the process-manager marker and
                 # the idle reaper would skip the harness forever.
@@ -10210,6 +10290,11 @@ def create_runner_app(
                                         _session_message_buffers[conv_id] = _remaining
                                         await _restore_pending_session_attachments(conv_id)
                                         for _m in _consumed:
+                                            _pending_id = _m.get("pending_id")
+                                            if isinstance(_pending_id, str):
+                                                _turn_pending_ids.setdefault(conv_id, set()).add(
+                                                    _pending_id
+                                                )
                                             _session_histories.setdefault(conv_id, []).append(
                                                 {
                                                     "type": "message",
@@ -10693,6 +10778,19 @@ def create_runner_app(
             )
 
         body = await request.json()
+        if isinstance(body, dict):
+            from omnigent.harnesses.codex_native.shell_input import (
+                CODEX_SHELL_AUTHORIZED_HEADER,
+                shell_command_from_input,
+            )
+
+            # Only the authenticated server transport can authorize direct shell
+            # execution; legacy or caller-supplied body fields confer no authority.
+            body.pop("authorized_native_shell_command", None)
+            if request.headers.get(CODEX_SHELL_AUTHORIZED_HEADER) == "1":
+                authorized_command = shell_command_from_input(body.get("content"))
+                if authorized_command is not None:
+                    body["authorized_native_shell_command"] = authorized_command
         body_type = body.get("type") if isinstance(body, dict) else None
         if isinstance(body, dict) and body_type in ("message", None):
             if not await _settle_abandoned_inputs(conversation_id):
@@ -11026,6 +11124,20 @@ def create_runner_app(
                 while _ingest_now_serving.get(conversation_id, 0) != _seq:
                     await _cond.wait()
             try:
+                if _message_already_taken(conversation_id, message_body):
+                    _logger.info(
+                        "post_session_events: dropping repeated forward conv=%s pending_id=%s",
+                        conversation_id,
+                        message_body.get("pending_id"),
+                        extra={"session_id": conversation_id},
+                    )
+                    return JSONResponse(
+                        status_code=202,
+                        content={
+                            "status": "duplicate",
+                            "detail": "Message already queued or running.",
+                        },
+                    )
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
                     message_body["content"] = await _resolve_forwarded_message_content(
@@ -11732,9 +11844,21 @@ def create_runner_app(
             resource_registry.note_terminal_control_request(conversation_id, "stop_session")
             _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
+            # Killing Claude's pane fails a turn still waiting to deliver into it;
+            # mark that turn interrupted first so it ends cancelled, not failed.
+            _cancels_turn = _harness == "claude-native" and isinstance(
+                _active_turns.get(conversation_id), asyncio.Task
+            )
+            if _cancels_turn:
+                _interrupted_sessions.add(conversation_id)
             _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)
             if _stop_resp is not None:
                 await _settle_control_input(body, _stop_resp)
+                if _cancels_turn:
+                    if _stop_resp.status_code == 204:
+                        await _cancel_inprocess_turn(conversation_id)
+                    else:
+                        _interrupted_sessions.discard(conversation_id)
                 return _stop_resp
             await _cancel_inprocess_turn(conversation_id)
             control_response = Response(status_code=204)
@@ -13701,6 +13825,7 @@ def create_runner_app(
             finish_retired=lambda conversation_id, terminal_name, token: _finish_retired(
                 conversation_id, terminal_name, token
             ),
+            idle_timeout_s=native_pane_idle_timeout_s,
         )
     else:
         app.state.native_pane_reaper = None

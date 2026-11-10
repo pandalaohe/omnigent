@@ -1,33 +1,7 @@
-// Interactive form for Claude Code's built-in ``AskUserQuestion``
-// tool. Rendered inside the existing ``ApprovalCard`` when the
-// PermissionRequest carries a structured ``ask_user_question``
-// payload — see :file:`@/lib/askUserQuestion`.
+// Question carousel for structured elicitation, with single- or multi-select answers.
+// isOther controls custom input; submit requires an answer to every question.
 //
-// **Carousel** layout: only one question is visible at a time with
-// Prev / Next / Submit navigation. ``Question N of M`` indicator
-// keeps progress legible without stacking N fieldsets vertically.
-//
-// Each question section renders:
-//   - the question text in primary foreground color + an optional
-//     ``header`` badge in muted text
-//   - radio inputs (single-select) or checkboxes (multi-select)
-//     for the predefined options, with each option's description
-//     under the label in muted text
-//   - a "Type something" custom-input row at the bottom of the
-//     option list — same radio/checkbox prefix as the real
-//     options, so visually it's "one more option" whose value the
-//     user types. The radio/checkbox is part of the same group
-//     as the predefined options (single-select mutex; multi-select
-//     independent toggle).
-//   - <pre> blocks showing the ``preview`` of any currently-selected
-//     option that has one (single-select: 0 or 1; multi-select:
-//     one per selected option with a preview).
-//
-// Submit is gated on EVERY question having an answer (a predefined
-// option selected, custom text, or an async-card image).
-// Selections are gathered into a flat ``{[question id or text]:
-// answer}`` map matching MCP's ``ElicitResult.content`` shape and
-// passed to ``onSubmit``.
+// Unsent answers are restored on remount (see ``@/lib/askUserQuestionDrafts``).
 
 import {
   CheckIcon,
@@ -42,6 +16,7 @@ import {
   type FocusEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   useEffect,
+  useId,
   useLayoutEffect,
   useRef,
   useState,
@@ -69,6 +44,13 @@ import {
   type ShortcutActionId,
 } from "@/lib/keyboardShortcutPreferences";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
+import {
+  type AskUserQuestionDraft,
+  askUserQuestionSignature,
+  clearAskUserQuestionDraft,
+  getAskUserQuestionDraft,
+  saveAskUserQuestionDraft,
+} from "@/lib/askUserQuestionDrafts";
 
 /**
  * Map from question id/text → either a single selected label
@@ -83,6 +65,8 @@ interface StagedCommentBlock {
 }
 
 interface AskUserQuestionFormProps {
+  /** Pending elicitation the questions belong to; keys the unsent draft. */
+  elicitationId?: string;
   questions: ClaudeQuestion[];
   onSubmit: (
     answers: AskUserQuestionAnswers,
@@ -145,6 +129,26 @@ function questionKey(question: ClaudeQuestion): string {
   return question.id && question.id.length > 0 ? question.id : question.question;
 }
 
+/** Answers on a freshly opened card, before the user touches it. */
+function initialAnswers(questions: ClaudeQuestion[]): Omit<AskUserQuestionDraft, "currentIndex"> {
+  const answers: Omit<AskUserQuestionDraft, "currentIndex"> = {
+    selections: {},
+    customSelected: {},
+    customInputs: {},
+  };
+  for (const q of questions) {
+    const key = questionKey(q);
+    answers.selections[key] = q.multiSelect
+      ? []
+      : q.isOther === false
+        ? ""
+        : (q.options[0]?.label ?? "");
+    answers.customSelected[key] = q.textInput !== undefined;
+    answers.customInputs[key] = q.textInput?.default ?? "";
+  }
+  return answers;
+}
+
 /** In-card actions in the order a key event resolves against them. */
 const CARD_ACTION_IDS: ShortcutActionId[] = [
   "questionCardPreviousOption",
@@ -197,6 +201,7 @@ function plainEnterIsBoundToCardAction(): boolean {
 }
 
 export function AskUserQuestionForm({
+  elicitationId: savedElicitationId,
   questions,
   onSubmit,
   onReject,
@@ -205,37 +210,30 @@ export function AskUserQuestionForm({
   asyncTarget,
 }: AskUserQuestionFormProps) {
   const serverInfo = useServerInfo();
+  const localElicitationId = useId();
+  const elicitationId = savedElicitationId ?? localElicitationId;
+  // Form state belongs to the first questions; ApprovalCard remounts the form for new ones.
+  const [draftQuestions] = useState(questions);
+  const [signature] = useState(() => askUserQuestionSignature(questions));
+  const [draft] = useState(() => getAskUserQuestionDraft(elicitationId, signature));
+  const [initial] = useState(() => initialAnswers(questions));
+
   // Currently-visible question (carousel index).
-  const [currentIndex, setCurrentIndex] = useState(0);
+  const [currentIndex, setCurrentIndex] = useState(draft?.currentIndex ?? 0);
 
-  // Per-question option selection. Single-select stores a string and starts
-  // on its first option; multi-select stores a deduped array and starts empty.
-  const [selections, setSelections] = useState<Record<string, string | string[]>>(() => {
-    const initial: Record<string, string | string[]> = {};
-    for (const q of questions) {
-      initial[questionKey(q)] = q.multiSelect
-        ? []
-        : q.isOther === false
-          ? ""
-          : (q.options[0]?.label ?? "");
-    }
-    return initial;
-  });
+  // Per-question option selection. Single-select stores a string;
+  // multi-select stores a deduped array.
+  const [selections, setSelections] = useState(draft?.selections ?? initial.selections);
 
-  // Per-question custom-input state. ``text`` is what the user
-  // typed; ``selected`` is whether the custom row's radio/checkbox
+  // Per-question custom-input state. ``customInputs`` is what the user
+  // typed; ``customSelected`` is whether the custom row's radio/checkbox
   // is checked (which determines whether the typed text is part of
   // the answer).
-  const [customSelected, setCustomSelected] = useState<Record<string, boolean>>(() => {
-    const initial: Record<string, boolean> = {};
-    for (const q of questions) initial[questionKey(q)] = q.textInput !== undefined;
-    return initial;
-  });
-  const [customInputs, setCustomInputs] = useState<Record<string, string>>(() => {
-    const initial: Record<string, string> = {};
-    for (const q of questions) initial[questionKey(q)] = q.textInput?.default ?? "";
-    return initial;
-  });
+  const [customSelected, setCustomSelected] = useState(
+    draft?.customSelected ?? initial.customSelected,
+  );
+  const [customInputs, setCustomInputs] = useState(draft?.customInputs ?? initial.customInputs);
+
   const customInputsRef = useRef(customInputs);
   customInputsRef.current = customInputs;
   const [images, setImages] = useState<Record<string, File[]>>({});
@@ -382,6 +380,36 @@ export function AskUserQuestionForm({
       ?.scrollIntoView({ block: "nearest" });
   }, [keyboardActive, highlight, currentIndex]);
 
+  useEffect(() => {
+    const answers = {
+      selections: { ...selections },
+      customSelected: { ...customSelected },
+      customInputs: { ...customInputs },
+    };
+    // Answers to a secret question are never kept past this mount.
+    for (const q of draftQuestions) {
+      if (!q.isSecret) continue;
+      const key = questionKey(q);
+      answers.selections[key] = initial.selections[key]!;
+      answers.customSelected[key] = initial.customSelected[key]!;
+      answers.customInputs[key] = initial.customInputs[key]!;
+    }
+    // Untouched cards keep no draft, so they cannot evict real ones.
+    if (currentIndex === 0 && JSON.stringify(answers) === JSON.stringify(initial)) {
+      clearAskUserQuestionDraft(elicitationId, signature);
+      return;
+    }
+    saveAskUserQuestionDraft(elicitationId, signature, { currentIndex, ...answers });
+  }, [
+    elicitationId,
+    draftQuestions,
+    signature,
+    initial,
+    currentIndex,
+    selections,
+    customSelected,
+    customInputs,
+  ]);
   if (!current) return null;
   const currentKey = questionKey(current);
   const isFirst = currentIndex === 0;

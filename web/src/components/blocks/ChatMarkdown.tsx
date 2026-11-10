@@ -41,6 +41,7 @@ import { cn } from "@/lib/utils";
 import {
   useFileViewer,
   useFileViewerConversationId,
+  useFolderOpener,
   useIsChangedPath,
   useWorkspacePaths,
 } from "@/shell/FileViewerContext";
@@ -63,9 +64,9 @@ type WithHastNode<T> = T & { node?: unknown };
 /** What the chat renderers know about a cited path's openability. */
 interface WorkspaceFileOpener {
   /**
-   * Click handler opening the file in the FileViewer, or null when the text
-   * isn't an openable file (no FileViewer, unresolvable path, or no such
-   * file).
+   * Click handler opening the file in the FileViewer (or an explicitly linked
+   * folder in the Files tree), or null when the text isn't openable (no
+   * FileViewer, unresolvable path, or no such file).
    */
   open: (() => void) | null;
   /**
@@ -95,6 +96,8 @@ interface WorkspaceFileOpener {
   reveal: (() => void) | null;
   /** Clipboard path: host-absolute when the root is known, else the cited path. */
   copyPath: string;
+  /** True when `open` shows a folder in the Files tree rather than a file. */
+  isFolder: boolean;
 }
 
 /**
@@ -104,6 +107,7 @@ interface WorkspaceFileOpener {
  */
 function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFileOpener {
   const openFile = useFileViewer();
+  const openFolder = useFolderOpener();
   const isChangedPath = useIsChangedPath();
   const conversationId = useFileViewerConversationId();
   const { root, home } = useWorkspacePaths();
@@ -134,7 +138,7 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
   // workspace-relative); an outside-workspace absolute is never a change.
   const isChanged = !!linkPath && !linkPath.startsWith("/") && isChangedPath(linkPath);
   // Explicit links also verify basenames; inline code keeps its path heuristic.
-  const { exists, settled } = useWorkspaceFileExists(
+  const { exists, isDirectory, settled } = useWorkspaceFileExists(
     conversationId,
     openFile && linkPath && !isChanged ? linkPath : null,
     explicitLink || (resolution?.trusted ?? false) || isVideoFile(cited),
@@ -151,6 +155,22 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
               })
       : null;
 
+  // Only explicit links open folders; the Files tree navigates by host-absolute path.
+  if (openFolder && explicitLink && isDirectory && linkPath && copyPath.startsWith("/")) {
+    return {
+      open: () => openFolder(copyPath),
+      unopenable: false,
+      resolvedPath: linkPath,
+      hasFileViewer: !!openFile,
+      linkPath,
+      parentDir,
+      pathShaped,
+      reveal: () => openFolder(copyPath),
+      copyPath,
+      isFolder: true,
+    };
+  }
+
   if (!openFile || !linkPath || !(isChanged || exists)) {
     // An absolute / "~"-relative citation is unjudgeable until the workspace
     // root is known — resolution returning null then means "not yet", not
@@ -162,7 +182,8 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
       // be noise; with one, a hard-rejected resolution is final immediately
       // and a resolved path is final once its existence check settles with a
       // completed listing (skipped/pending/errored checks stay unverified).
-      unopenable: !!openFile && !rootPending && (linkPath === null || (settled && !exists)),
+      unopenable:
+        !!openFile && !rootPending && (linkPath === null || (settled && !exists && !isDirectory)),
       resolvedPath: linkPath ?? "",
       hasFileViewer: !!openFile,
       linkPath,
@@ -170,6 +191,7 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
       pathShaped,
       reveal: openResolved,
       copyPath,
+      isFolder: false,
     };
   }
   return {
@@ -182,6 +204,7 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
     pathShaped,
     reveal: openResolved,
     copyPath,
+    isFolder: false,
   };
 }
 
@@ -393,6 +416,7 @@ function WorkspaceFileLink({
     unopenable,
     resolvedPath,
     copyPath,
+    isFolder,
   } = useWorkspaceFileOpener(path, true);
   // Scopes the desktop in-app browser route to this conversation's view.
   const conversationId = useFileViewerConversationId();
@@ -483,8 +507,8 @@ function WorkspaceFileLink({
         </FileLinkContextMenu>
       );
     }
-    // Not verified yet (existence check still in flight, or it can't run):
-    // plain text, with the path on hover so it stays discoverable.
+    // Not verified yet (existence check still in flight, or it can't run), or
+    // a folder with no Files tree to show it: plain text, with the path on hover.
     return (
       <FileLinkContextMenu path={copyPath}>
         <span className={className} title={title ?? path}>
@@ -494,7 +518,7 @@ function WorkspaceFileLink({
     );
   }
 
-  if (conversationId && isVideoFile(resolvedPath)) {
+  if (conversationId && !isFolder && isVideoFile(resolvedPath)) {
     return (
       <VideoPlayer
         compact

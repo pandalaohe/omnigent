@@ -367,6 +367,9 @@ def _like_contains_pattern(query: str) -> str:
 # single statement it always was.
 _LIST_ITEMS_MAX_ROWS_PER_STATEMENT = 200
 
+# Max stable ids bound per idempotency-probe statement; each can match a full row.
+_APPEND_STABLE_ID_PROBE_BATCH = _LIST_ITEMS_MAX_ROWS_PER_STATEMENT
+
 # How many co-located sessions ``has_other_live_session_in_workspace`` will
 # name before it stops looking. Real directories hold one or two sessions; the
 # bound keeps the archived-filter query's ``IN`` list small and caps the work a
@@ -5188,25 +5191,26 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if present is None:
                     raise ConversationLabelConditionFailed
 
-            stable_ids = [item.stable_id for item in items if item.stable_id is not None]
+            stable_ids = list(
+                dict.fromkeys(item.stable_id for item in items if item.stable_id is not None)
+            )
             replaced_ids = {item.replaces_pending_id for item in items}
-            existing_ids = (
-                set(
-                    session.scalars(
-                        select(SqlConversationItem.id).where(
-                            SqlConversationItem.workspace_id == workspace_id,
-                            SqlConversationItem.conversation_id == conversation_id,
-                            SqlConversationItem.id.in_(stable_ids),
-                            ~(
-                                SqlConversationItem.id.in_(replaced_ids - {None})
-                                & (SqlConversationItem.response_id == PENDING_INPUT_RESPONSE_ID)
-                            ),
+            existing_ids: set[str] = set()
+            for start in range(0, len(stable_ids), _APPEND_STABLE_ID_PROBE_BATCH):
+                batch = stable_ids[start : start + _APPEND_STABLE_ID_PROBE_BATCH]
+                probe = select(SqlConversationItem.id).where(
+                    SqlConversationItem.workspace_id == workspace_id,
+                    SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.id.in_(batch),
+                )
+                if replacements_pending := replaced_ids - {None}:
+                    probe = probe.where(
+                        ~(
+                            SqlConversationItem.id.in_(replacements_pending)
+                            & (SqlConversationItem.response_id == PENDING_INPUT_RESPONSE_ID)
                         )
                     )
-                )
-                if stable_ids
-                else set()
-            )
+                existing_ids.update(session.scalars(probe))
             replacements: dict[str, tuple[int, int]] = {}
             for item, prepared, _ in prepared_rows:
                 if item.replaces_pending_id is None or item.stable_id in existing_ids:

@@ -1444,6 +1444,7 @@ function setupLandingMocks() {
           useAvailableAgentsMock().data?.find(
             (agent: AvailableAgent) => agent.id === target?.agentId,
           )?.skills ?? [],
+        skillsWarnings: [],
         skillsStatus: target && enabled ? "ready" : starting ? "loading" : "unavailable",
         refetch: vi.fn(),
       }) as ReturnType<typeof useSkills>,
@@ -1574,7 +1575,10 @@ function renderLanding(
     // routing). Cases that exercise the built-in judge pass the field
     // explicitly.
     smart_routing_sources: { external: infoOverrides.smart_routing_enabled === true, oss: false },
-    features: { harness_install: infoOverrides.harness_install_enabled === true },
+    features: {
+      harness_install: infoOverrides.harness_install_enabled === true,
+      codex_plan_at_launch: true,
+    },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -7530,6 +7534,29 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  const sshDesktop = { kind: "electron", connectSshHost: vi.fn() };
+  it.each([
+    ["the browser", undefined, null, false],
+    ["a desktop app without SSH connect", { kind: "electron" }, null, false],
+    ["a window that offers Run on Arca", sshDesktop, { databricksInternalFeatures: true }, false],
+    ["a desktop app with SSH connect", sshDesktop, null, true],
+  ])("offers SSH connect in %s only when it can", async (_name, desktop, features, shown) => {
+    (window as { omnigentDesktop?: unknown }).omnigentDesktop = desktop;
+    vi.mocked(getDesktopFeatures).mockResolvedValue(features);
+    try {
+      renderLanding();
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+      fireEvent.click(screen.getByTestId("new-chat-landing-connect-host"));
+      // Let the shell's feature answer land before judging.
+      await act(async () => {});
+
+      expect(screen.queryByTestId("ssh-connect-form") !== null).toBe(shown);
+    } finally {
+      vi.mocked(getDesktopFeatures).mockResolvedValue(null);
+      delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+    }
+  });
+
   it("offers connect-host even when no hosts are online (no dead end)", () => {
     mockHosts([]);
     renderLanding();
@@ -8020,6 +8047,43 @@ describe("NewChatLandingScreen", () => {
     // The label is what the runner reads to launch with the bypass flag.
     expect(labels["omnigent.codex_native.bypass_sandbox"]).toBe("1");
     // The native wrapper labels still ride alongside it.
+    expect(labels["omnigent.wrapper"]).toBe("codex-native-ui");
+  });
+
+  it.each([true, false])("requires server support for Codex Plan (%s)", async (supported) => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    selectAgent("a2");
+    const togglePlan = () => {
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
+      const plan = screen.getByTestId("composer-plan-action");
+      expect(plan).not.toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(plan);
+    };
+    togglePlan();
+    cleanup();
+    renderLanding({ features: supported ? { codex_plan_at_launch: true } : {} });
+    if (supported) {
+      expect(screen.getByTestId("new-chat-landing-plan-mode")).toHaveTextContent("Plan mode");
+      togglePlan();
+      expect(screen.queryByTestId("new-chat-landing-plan-mode")).toBeNull();
+      togglePlan();
+      selectAgent("a1");
+      selectAgent("a2");
+      expect(screen.queryByTestId("new-chat-landing-plan-mode")).toBeNull();
+      togglePlan();
+    } else {
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
+      expect(screen.getByTestId("composer-plan-action")).toHaveAttribute("aria-disabled", "true");
+      expect(screen.queryByTestId("new-chat-landing-plan-mode")).toBeNull();
+      closeMenu();
+    }
+    const { body } = await submitAndReadBody();
+    const labels = body.labels as Record<string, string>;
+    expect(labels["omnigent.codex_native.collaboration_mode"]).toBe(supported ? "plan" : undefined);
     expect(labels["omnigent.wrapper"]).toBe("codex-native-ui");
   });
 
@@ -9739,7 +9803,8 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("gates the add-repository button on a valid URL; submit stays enabled", async () => {
+  it("blocks submit until a pending repository URL is added or cleared", async () => {
+    const user = userEvent.setup();
     renderLanding({ managed_sandboxes_enabled: true });
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
@@ -9750,22 +9815,62 @@ describe("NewChatLandingScreen", () => {
     // No repo at all is a valid sandbox create (empty workspace).
     expect(submit.disabled).toBe(false);
     fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
-    const add = screen.getByTestId("new-chat-landing-repo-add") as HTMLButtonElement;
-    // An unusable URL shape can't be added (it would 422 server-side); the
-    // half-typed input is not a selection, so submit stays enabled.
+    // An unfinished URL must be resolved instead of silently omitted.
     fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
       target: { value: "org/repo" },
     });
-    expect(add.disabled).toBe(true);
+    expect(screen.getByTestId("new-chat-landing-repo-add")).toBeDisabled();
+    expect(submit.disabled).toBe(true);
+    async function assertPendingUrlReopens(attempt: () => void): Promise<void> {
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByTestId("new-chat-landing-repo-input")).toBeNull());
+      attempt();
+      const pendingInput = await screen.findByTestId("new-chat-landing-repo-input");
+      expect(pendingInput).toHaveValue("org/repo");
+      await waitFor(() => expect(pendingInput).toHaveFocus());
+      expect(submit).toBeDisabled();
+    }
+    await assertPendingUrlReopens(() =>
+      fireEvent.pointerDown(submit.parentElement!, { pointerType: "mouse", button: 0 }),
+    );
+    await assertPendingUrlReopens(() => fireEvent.keyDown(submit.parentElement!, { key: "Enter" }));
+    await assertPendingUrlReopens(() =>
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer")),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "" },
+    });
     expect(submit.disabled).toBe(false);
-    // A valid URL enables Add; adding it keeps submit enabled.
+    // A valid URL enables Add; adding it enables submit.
     fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
       target: { value: "https://github.com/org/repo" },
     });
-    expect(add.disabled).toBe(false);
-    fireEvent.click(add);
+    expect(screen.getByTestId("new-chat-landing-repo-add")).toBeEnabled();
+    expect(submit.disabled).toBe(true);
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-add"));
     await screen.findByTestId("new-chat-landing-repo-row");
     expect(submit.disabled).toBe(false);
+    fireEvent.change(screen.getByRole("textbox", { name: "Branch for repo" }), {
+      target: { value: "feature#invalid" },
+    });
+    expect(submit).toBeDisabled();
+    await user.keyboard("{Escape}");
+    await waitFor(() =>
+      expect(screen.queryByRole("textbox", { name: "Branch for repo" })).toBeNull(),
+    );
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    const branchInput = await screen.findByRole("textbox", { name: "Branch for repo" });
+    await waitFor(() => expect(branchInput).toHaveFocus());
+    fireEvent.change(branchInput, { target: { value: "b".repeat(256) } });
+    expect(submit).toBeDisabled();
+    expect(branchInput).toHaveAccessibleDescription(
+      "Repository URL and branch must be at most 256 characters together.",
+    );
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    expect(branchInput).toHaveFocus();
+    fireEvent.change(branchInput, { target: { value: "feature/valid" } });
+    expect(submit).toBeEnabled();
   });
 });
 
@@ -9804,6 +9909,7 @@ describe("NewChatLandingScreen skills menu", () => {
       ({ target, enabled = true, starting = false }) =>
         ({
           skills: [],
+          skillsWarnings: [],
           skillsStatus: "ready",
           refetch: vi.fn(),
           ...state,
@@ -10043,6 +10149,23 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.getByText("No matching skills")).toBeInTheDocument();
     typeMessage("/");
     expect(screen.getByText("No skills available")).toBeInTheDocument();
+  });
+
+  it("explains an incomplete catalog with Retry while listing the skills it read", () => {
+    const retry = vi.fn();
+    const warning = "Codex plugin skills unavailable: `codex plugin list` exited 1";
+    mockSkills({
+      skills: [{ name: "host-review", description: "Host-only skill" }],
+      skillsWarnings: [warning],
+      refetch: retry,
+    });
+    renderLanding();
+    typeMessage("/");
+    expect(screen.getByText(warning)).toBeInTheDocument();
+    expect(screen.getByTestId("slash-menu-item-host-review")).toBeInTheDocument();
+    expect(screen.queryByText("No skills available")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(retry).toHaveBeenCalledOnce();
   });
 
   it("dismisses a loading-only menu with Escape", () => {
@@ -11302,7 +11425,7 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
 
   // Switch the target to the connected host, then create + submit a pending
   // custom agent from the dialog so it becomes the selected agent.
-  async function createAndSelectPendingAgentOnHost(): Promise<void> {
+  async function createAndSelectPendingAgentOnHost(harnessLabel: string): Promise<void> {
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
         "Sandbox",
@@ -11321,15 +11444,29 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
     fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "my-agent" } });
     await chooseCreateAgentModel();
+    fireEvent.click(screen.getByTestId("create-agent-harness"));
+    fireEvent.click(screen.getByRole("option", { name: harnessLabel }));
     fireEvent.click(screen.getByTestId("create-agent-submit"));
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("my-agent"),
-    );
+    await waitFor(() => expect(screen.queryByTestId("create-agent-dialog")).toBeNull());
   }
 
-  it("drops a selected pending custom agent when the target switches to a sandbox", async () => {
+  it("disables Plan for pending custom Codex agents and drops them on a sandbox switch", async () => {
+    const agentLabels = await import("@/lib/agentLabels");
+    const catalog = vi.spyOn(agentLabels, "useBrainHarnessLabels").mockReturnValue({
+      ...agentLabels.BRAIN_HARNESS_LABELS,
+      "codex-native": "Codex CLI",
+    });
+    onTestFinished(() => catalog.mockRestore());
     renderLanding({ managed_sandboxes_enabled: true });
-    await createAndSelectPendingAgentOnHost();
+    await createAndSelectPendingAgentOnHost("Codex CLI");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
+    const plan = screen.getByTestId("composer-plan-action");
+    expect(plan).toHaveAttribute("aria-disabled", "true");
+    expect(plan).toHaveAttribute(
+      "title",
+      "Turn Plan mode on after this custom agent's session starts",
+    );
+    closeMenu();
     // Switch back to the sandbox: the pending pick can't run there, so the
     // selection falls back to a real agent and the pending row disappears.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
@@ -14279,12 +14416,44 @@ describe("managed sandbox inference models", () => {
   );
 
   it("blocks stale cached choices when a catalog refresh fails", async () => {
+    const user = userEvent.setup();
     preview(catalog, new Error("Gateway unavailable"));
     renderConfiguredSandbox({ managed_sandboxes_enabled: true, sandbox_provider: "kubernetes" });
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "start" } });
     expect(screen.getByRole("alert")).toHaveTextContent("Gateway unavailable");
     expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
     expect(screen.queryByTestId("sandbox-catalog-error-integrations-link")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "org/repo" },
+    });
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-repo-input")).toBeNull());
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    fireEvent.pointerDown(submit.parentElement!, { pointerType: "mouse", button: 0 });
+    expect(await screen.findByTestId("new-chat-landing-submit-error-tooltip")).toHaveTextContent(
+      "Gateway unavailable",
+    );
+    expect(screen.queryByTestId("new-chat-landing-repo-input")).toBeNull();
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+    preview();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "start after reconnect" },
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-submit-error-tooltip")).toHaveTextContent(
+        "Finish or clear the repository URL",
+      ),
+    );
+    fireEvent.pointerDown(submit.parentElement!, { pointerType: "mouse", button: 0 });
+    const repositoryInput = await screen.findByTestId("new-chat-landing-repo-input");
+    await waitFor(() => expect(repositoryInput).toHaveFocus());
+    expect(repositoryInput).toHaveValue("org/repo");
+    expect(screen.queryByTestId("new-chat-landing-submit-error-tooltip")).toBeNull();
+    fireEvent.change(repositoryInput, { target: { value: "" } });
+    expect(submit).toBeEnabled();
   });
 
   it("offers Integrations when Unity requires an account connection", () => {

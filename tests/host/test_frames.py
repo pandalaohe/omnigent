@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import pytest
@@ -233,6 +234,12 @@ def test_import_local_frames_round_trip() -> None:
         HostSkillsResultFrame(request_id="req_skills", status="ok"),
         HostSkillsResultFrame(
             request_id="req_skills",
+            status="ok",
+            skills=[{"name": "review", "description": "Review changes"}],
+            warnings=["Codex plugin skills unavailable: `codex plugin list` exited 1"],
+        ),
+        HostSkillsResultFrame(
+            request_id="req_skills",
             status="failed",
             error_code="invalid_path",
             error="path must be absolute",
@@ -250,6 +257,29 @@ def test_old_skills_frames_keep_waiting_and_pending_opt_in_is_boolean() -> None:
     assert frame.allow_pending is False
     with pytest.raises(ValueError):
         decode_host_frame(json.dumps({**payload, "allow_pending": "true"}))
+
+
+def test_skills_result_from_an_older_host_is_a_complete_catalog() -> None:
+    frame = decode_host_frame(
+        json.dumps({"kind": "host.skills_result", "request_id": "r", "status": "ok"})
+    )
+    assert isinstance(frame, HostSkillsResultFrame)
+    assert frame.warnings == []
+
+
+@pytest.mark.parametrize("warnings", ["codex", [1], [None]])
+def test_skills_result_rejects_malformed_warnings(warnings: object) -> None:
+    with pytest.raises(ValueError, match="warnings"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.skills_result",
+                    "request_id": "r",
+                    "status": "ok",
+                    "warnings": warnings,
+                }
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -551,7 +581,7 @@ def test_encode_import_local_session_frames_slices_oversized_session(
 ) -> None:
     """An oversized session is sliced into ordered chunk frames that reassemble."""
     monkeypatch.setattr("omnigent.host.frames.IMPORT_SESSION_CHUNK_CHARS", 64)
-    session = _session_with_payload("x" * 500)
+    session = dataclasses.replace(_session_with_payload("x" * 500), archived=True)
 
     frames = [
         decode_host_frame(text)
@@ -571,6 +601,7 @@ def test_encode_import_local_session_frames_slices_oversized_session(
     reassembled = [assembler.add(f) for f in frames]
     assert reassembled[:-1] == [None] * (len(frames) - 1)
     assert reassembled[-1] == session
+    assert reassembled[-1].archived is True
 
 
 def _session_json(session: HostImportedLocalSession) -> str:
@@ -3529,6 +3560,43 @@ def test_hello_frame_omitted_project_code_is_legacy_false() -> None:
     )
     assert isinstance(decoded, HostHelloFrame)
     assert decoded.project_code is False
+
+
+def test_import_local_session_archived_flag_defaults_and_must_be_a_bool() -> None:
+    """``archived`` defaults to False from older hosts and must be a bool.
+
+    The oversized-session chunk test covers its round trip.
+    """
+    legacy_session = {
+        "external_session_id": "s1",
+        "workspace": None,
+        "items": [],
+        "source": "codex",
+    }
+    legacy = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.import_local_session",
+                "request_id": "req_imp",
+                "total": 1,
+                "session": legacy_session,
+            }
+        )
+    )
+    assert isinstance(legacy, HostImportLocalSessionFrame)
+    assert legacy.session.archived is False
+
+    with pytest.raises(ValueError, match="archived"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.import_local_session",
+                    "request_id": "req_imp",
+                    "total": 1,
+                    "session": {**legacy_session, "archived": "yes"},
+                }
+            )
+        )
 
 
 def test_legacy_runner_exit_has_unknown_connection_history() -> None:

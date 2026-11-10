@@ -18,6 +18,10 @@ import { syncAllUserPreferencesFromLocal } from "./userPreferencesSync";
 import { WORKTREE_DEFAULTS_STORAGE_KEY } from "./worktreeDefaultPreferences";
 import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
 import {
+  HIDDEN_PICKER_AGENTS_STORAGE_KEY,
+  notifyHiddenPickerAgentsChanged,
+} from "./pickerEntryVisibility";
+import {
   resetSessionWorkspaceTabSelections,
   unpinSessionWorkspaceTabs,
 } from "./sessionWorkspaceState";
@@ -43,6 +47,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:default-transcript-view",
   "omnigent:hide-unconfigured-harnesses",
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",
   WORKTREE_DEFAULTS_STORAGE_KEY,
@@ -193,6 +198,9 @@ export function applyImportedSettings(imported: ExportedSettings): number {
   // performs the import. Notify every synchronized preference owner and queue
   // its server patch so the current device and the user's other devices agree.
   syncAllUserPreferencesFromLocal();
+  // Same-tab writes fire no storage event, so the subscribable preferences
+  // have to be told; otherwise an open picker keeps the pre-import set.
+  notifyHiddenPickerAgentsChanged();
   const nextPins = readPinnedWorkspaceTabs();
   const removedPins = previousPins.filter((tab) => !nextPins.includes(tab));
   unpinSessionWorkspaceTabs(removedPins);

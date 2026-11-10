@@ -17,6 +17,7 @@
     selectionCleared: "omni:selectionCleared",
     openPath: "omni:openPath",
     orphans: "omni:orphans",
+    zoom: "omni:zoom",
   };
 
   // The highlight styles live here rather than in the injected markup so the
@@ -396,7 +397,7 @@
     return { range: sel.getRangeAt(0), text: text };
   }
 
-  function emitSelection() {
+  function emitSelection(reflow) {
     var s = currentSelection();
     if (s) {
       var anchor = selectionAnchor(s.range, s.text);
@@ -409,6 +410,7 @@
         suffix: anchor.suffix,
         selector: anchor.selector,
         rect: rectOf(s.range),
+        reflow: reflow,
       });
     }
   }
@@ -544,10 +546,39 @@
   // Debounced; only emits for a non-empty selection so a collapse here never
   // clears the active comment (mouseup owns the clear path).
   var selTimer = null;
-  document.addEventListener("selectionchange", function () {
+  var reflowOnly = true;
+  function scheduleSelection(reflow) {
+    if (!reflow) reflowOnly = false;
     if (selTimer) clearTimeout(selTimer);
-    selTimer = setTimeout(emitSelection, 150);
+    selTimer = setTimeout(function () {
+      var onlyReflowed = reflowOnly;
+      selTimer = null;
+      reflowOnly = true;
+      emitSelection(onlyReflowed);
+    }, 150);
+  }
+  document.addEventListener("selectionchange", function () {
+    scheduleSelection(false);
   });
+  window.addEventListener("resize", function () {
+    scheduleSelection(true);
+  });
+
+  function zoomAction(e) {
+    if (!(e.metaKey || e.ctrlKey) || e.altKey) return null;
+    if (e.key === "=" || e.key === "+" || e.code === "NumpadAdd") return "in";
+    if (e.key === "-" || e.key === "_" || e.code === "NumpadSubtract") return "out";
+    if (e.key === "0" || e.code === "Numpad0") return "reset";
+    return null;
+  }
+
+  function onZoomKey(e) {
+    if (e.defaultPrevented) return;
+    var action = zoomAction(e);
+    if (!action) return;
+    e.preventDefault();
+    send({ type: T.zoom, action: action });
+  }
 
   window.addEventListener("message", function (e) {
     var d = e.data;
@@ -555,6 +586,7 @@
     if (d.type === T.init && e.ports && e.ports[0]) {
       VISIT = d.visit === true;
       port = e.ports[0];
+      if (!VISIT) window.addEventListener("keydown", onZoomKey);
       port.onmessage = function (ev) {
         var m = ev.data;
         if (!m) return;

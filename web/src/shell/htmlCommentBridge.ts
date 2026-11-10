@@ -34,6 +34,7 @@ import annotateSource from "../../public/omni-html-annotate.js?raw";
 import bridgeSource from "../../public/omni-html-bridge.js?raw";
 import captureSource from "../../public/omni-html-capture.js?raw";
 import { prepareHtmlPreviewDoc, startTagEnd } from "./codeViewerHelpers";
+import { type HtmlPreviewZoomAction, isHtmlPreviewZoomAction } from "./htmlPreviewZoom";
 
 /** Protocol version — bump on any breaking change to the message shapes. */
 export const BRIDGE_VERSION = 1;
@@ -60,6 +61,8 @@ export const BRIDGE_MSG = {
   /** iframe → parent: a panel-mode link that names a workspace file. */
   openPath: "omni:openPath",
   orphans: "omni:orphans",
+  /** iframe → parent: the user pressed a zoom shortcut inside the preview. */
+  zoom: "omni:zoom",
 } as const;
 
 /** Rect of a selection in the iframe's own viewport coordinates. */
@@ -82,6 +85,8 @@ export interface BridgeSelection {
   suffix: string;
   selector?: string;
   rect: BridgeRect;
+  /** The frame resized and re-reported an unchanged selection at its new position. */
+  reflow: boolean;
 }
 
 export interface BridgeCommentClick {
@@ -117,6 +122,11 @@ export interface BridgeOrphans {
   ids: string[];
 }
 
+export interface BridgeZoom {
+  type: typeof BRIDGE_MSG.zoom;
+  action: HtmlPreviewZoomAction;
+}
+
 /** Any message the iframe can send to the parent (post-handshake). */
 export type InboundBridgeMessage =
   | BridgeReady
@@ -124,7 +134,8 @@ export type InboundBridgeMessage =
   | BridgeCommentClick
   | BridgeSelectionCleared
   | BridgeOpenPath
-  | BridgeOrphans;
+  | BridgeOrphans
+  | BridgeZoom;
 
 // ---------------------------------------------------------------------------
 // Inbound message validation
@@ -189,6 +200,7 @@ export function parseBridgeMessage(data: unknown, nonce: string): InboundBridgeM
           suffix: d.suffix,
           ...(d.selector ? { selector: d.selector } : {}),
           rect: d.rect,
+          reflow: d.reflow === true,
         };
       }
       return null;
@@ -218,6 +230,8 @@ export function parseBridgeMessage(data: unknown, nonce: string): InboundBridgeM
         return { type: BRIDGE_MSG.orphans, ids: d.ids };
       }
       return null;
+    case BRIDGE_MSG.zoom:
+      return isHtmlPreviewZoomAction(d.action) ? { type: BRIDGE_MSG.zoom, action: d.action } : null;
     default:
       return null;
   }

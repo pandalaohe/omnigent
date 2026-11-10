@@ -103,6 +103,8 @@ const cliInstall = require("./cli_install");
 const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { createArcaAutoConnect } = require("./arca_autoconnect");
+const sshConnect = require("./ssh_connect");
+const { createSshConnectFlow } = require("./ssh_connect_window");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { registerDesktopDiagnostics } = require("./desktopDiagnostics");
 const { ensureDatabricksSession } = require("./databricks-session");
@@ -385,6 +387,26 @@ const arcaConnectFlow = createArcaConnectFlow({
       return "arca ssh isaac omni host …"; // the run itself re-validates and fails loud
     }
   },
+  log: (message) => console.log(`[omnigent] ${message}`),
+});
+
+/** Shell-owned flow for connecting a remote machine over SSH (ssh_connect.js). */
+const sshConnectFlow = createSshConnectFlow({
+  BrowserWindow,
+  ipcMain,
+  pagePath: path.join(__dirname, "..", "ssh-connect", "index.html"),
+  preloadPath: path.join(__dirname, "ssh_connect_preload.js"),
+  startConnect: (serverUrl, destination, hooks) =>
+    sshConnect.startSshConnect(serverUrl, destination, {
+      hooks,
+      openExternal: (url) => shell.openExternal(url),
+      readInstallScript: () => {
+        const script = cliInstall.resolveInstallScript();
+        return script ? fs.readFileSync(script, "utf8") : null;
+      },
+      log: (message) => console.log(`[omnigent] ${message}`),
+    }),
+  commandLines: (serverUrl, destination) => sshConnect.describeCommands(serverUrl, destination),
   log: (message) => console.log(`[omnigent] ${message}`),
 });
 
@@ -5110,6 +5132,31 @@ function registerIpc() {
       chromeCookieImport: process.platform === "darwin",
       browserBitwarden: true,
     };
+  });
+
+  // SPA → connect a machine over SSH as a host. Requires the window's pinned origin
+  // and revalidates the destination before the shell-owned console asks consent.
+  ipcMain.handle("omnigent:ssh-connect", async (event, destination) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("ssh-connect is only available to a connected server page");
+    }
+    if (process.platform === "win32") {
+      return { ok: false, error: "Connecting over SSH isn't available on Windows yet." };
+    }
+    const serverUrl = senderServerUrl(event);
+    if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
+    // Where Run on Arca is offered, it replaces this path. Re-checked here: the
+    // server's own page decides what it shows.
+    if (databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl)) {
+      return { ok: false, error: "Connecting over SSH is off here. Use Run on Arca instead." };
+    }
+    let target;
+    try {
+      target = sshConnect.validateDestination(destination);
+    } catch (error) {
+      return { ok: false, error: error.message };
+    }
+    return sshConnectFlow.run(BrowserWindow.fromWebContents(event.sender), serverUrl, target);
   });
 
   // SPA → connect the user's Arca instance (Databricks-internal sandbox) to

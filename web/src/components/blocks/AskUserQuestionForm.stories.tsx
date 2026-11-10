@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { userEvent } from "storybook/test";
+import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
 import { AskUserQuestionForm } from "./AskUserQuestionForm";
 
 const meta = {
@@ -10,6 +11,10 @@ const meta = {
     onSubmit: () => undefined,
     onReject: () => undefined,
   },
+  // Each play function expects a fresh card, not one restored from a previous render.
+  beforeEach: ({ args }) => {
+    if (args.elicitationId) clearAskUserQuestionDraft(args.elicitationId);
+  },
 } satisfies Meta<typeof AskUserQuestionForm>;
 
 export default meta;
@@ -17,6 +22,7 @@ type Story = StoryObj<typeof meta>;
 
 export const SingleSelectWithPreview: Story = {
   args: {
+    elicitationId: "elicit_story_single_select",
     questions: [
       {
         id: "layout",
@@ -44,6 +50,7 @@ export const SingleSelectWithPreview: Story = {
 
 export const MultiQuestionCarousel: Story = {
   args: {
+    elicitationId: "elicit_story_carousel",
     questions: [
       {
         id: "theme",

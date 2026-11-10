@@ -481,6 +481,8 @@ describe("WorkspacePanel surface presentation", () => {
     expect(panel).toHaveAttribute("data-animate-visibility", "true");
     expect(panel).toHaveAttribute("data-resizing", "true");
     expect(panel).toHaveAttribute("aria-hidden", "true");
+    // A focusable closed rail lets Tab scroll the shell sideways.
+    expect(panel).toHaveAttribute("inert");
   });
 
   it("offers the Archive Library as a peer tab and renders its split reader", () => {

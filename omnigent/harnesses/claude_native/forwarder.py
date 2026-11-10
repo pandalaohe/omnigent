@@ -907,6 +907,8 @@ class TranscriptForwardState:
         waits for transcript quiescence). Persisted so a restart inside
         that window doesn't lose the settle — the hook cursor has
         already advanced past the Stop edge and won't re-read it.
+    :param pending_settled_at: Hook timestamp distinguishing later peer input
+        from delayed observations of the stopped turn's input.
     :param api_error_context: Latest explicit API error for the current response, kept
         while the next turn has no output yet. Cleared by subsequent output and
         persisted for hook retries after restart.
@@ -920,6 +922,7 @@ class TranscriptForwardState:
     cursor_fingerprint: str | None = None
     settled_response_id: str | None = None
     pending_settled_response_id: str | None = None
+    pending_settled_at: float | None = None
     api_error_context: FailureContext | None = None
 
 
@@ -1053,6 +1056,7 @@ class _ForwardDedupeState:
     # output inheriting the ACTIVE settled id gets a fresh turn id plus a
     # ``[System: scheduled prompt fired]`` marker (see the bridge parser).
     pending_settled_response_id: str | None = None
+    pending_settled_at: float | None = None
     settled_response_id: str | None = None
     # Failed cost posts are retried by this long-running poll loop. Without a
     # retry gate, an edge 429 turns the poll interval into a request storm and
@@ -6574,9 +6578,13 @@ async def _forward_available_status_events(
             # assistant entry still inheriting it is marked as a scheduled
             # wake (see _promote_pending_settle and the bridge parser).
             dedupe.pending_settled_response_id = response_id
+            dedupe.pending_settled_at = record.recorded_at
         durable = next_durable
         await _write_hook_state_async(
-            bridge_dir, durable, pending_settled_response_id=dedupe.pending_settled_response_id
+            bridge_dir,
+            durable,
+            pending_settled_response_id=dedupe.pending_settled_response_id,
+            pending_settled_at=dedupe.pending_settled_at,
         )
     durable = HookForwardState(
         event_cursor=result.event_cursor,
@@ -6728,6 +6736,7 @@ def _promote_pending_settle(
         return False
     dedupe.settled_response_id = pending
     dedupe.pending_settled_response_id = None
+    dedupe.pending_settled_at = None
     return True
 
 
@@ -6745,6 +6754,7 @@ def _with_settle_latch(
         state,
         settled_response_id=dedupe.settled_response_id,
         pending_settled_response_id=dedupe.pending_settled_response_id,
+        pending_settled_at=dedupe.pending_settled_at,
     )
 
 
@@ -7289,8 +7299,14 @@ async def _forward_available_items(
         and state.pending_settled_response_id is not None
     ):
         dedupe.pending_settled_response_id = state.pending_settled_response_id
+        dedupe.pending_settled_at = state.pending_settled_at
     result = await asyncio.to_thread(
-        _read_transcript_items_for_state, state, agent_name, dedupe.settled_response_id
+        _read_transcript_items_for_state,
+        state,
+        agent_name,
+        dedupe.settled_response_id,
+        dedupe.pending_settled_response_id,
+        dedupe.pending_settled_at,
     )
     if result.goal_state_observed and result.byte_offset >= dedupe.observed_goal_byte_offset:
         dedupe.observed_goal_state = result.latest_goal_state
@@ -7387,7 +7403,11 @@ async def _forward_transcript_item_batch(
                 transcript_path=state.transcript_path,
                 byte_offset=result.byte_offset,
             )
-            if promoted or dedupe.pending_settled_response_id != state.pending_settled_response_id:
+            if (
+                promoted
+                or dedupe.pending_settled_response_id != state.pending_settled_response_id
+                or dedupe.pending_settled_at != state.pending_settled_at
+            ):
                 state = _with_settle_latch(state, dedupe)
                 await _write_forward_state_async(bridge_dir, state)
             return state
@@ -7474,6 +7494,7 @@ async def _forward_transcript_item_batch(
             # compaction card is the boundary) — drop any settle so the
             # resume is not mis-marked as a scheduled wake.
             dedupe.pending_settled_response_id = None
+            dedupe.pending_settled_at = None
             dedupe.settled_response_id = None
             seen.add(item.source_id)
             seen_source_ids.append(item.source_id)
@@ -7487,6 +7508,7 @@ async def _forward_transcript_item_batch(
                 cursor_fingerprint=state.cursor_fingerprint,
                 settled_response_id=dedupe.settled_response_id,
                 pending_settled_response_id=dedupe.pending_settled_response_id,
+                pending_settled_at=dedupe.pending_settled_at,
             )
             await _write_forward_state_async(bridge_dir, updated)
             continue
@@ -7578,6 +7600,7 @@ async def _forward_transcript_item_batch(
                     cursor_fingerprint=state.cursor_fingerprint,
                     settled_response_id=dedupe.settled_response_id,
                     pending_settled_response_id=dedupe.pending_settled_response_id,
+                    pending_settled_at=dedupe.pending_settled_at,
                 )
                 await _write_forward_state_async(bridge_dir, updated)
                 continue
@@ -7617,6 +7640,7 @@ async def _forward_transcript_item_batch(
             cursor_fingerprint=state.cursor_fingerprint,
             settled_response_id=dedupe.settled_response_id,
             pending_settled_response_id=dedupe.pending_settled_response_id,
+            pending_settled_at=dedupe.pending_settled_at,
         )
         await _write_forward_state_async(bridge_dir, updated)
     # Fully-consumed batch: a pending settle may activate now, provided
@@ -7650,6 +7674,7 @@ async def _forward_transcript_item_batch(
         cursor_fingerprint=cursor.cursor_fingerprint,
         settled_response_id=dedupe.settled_response_id,
         pending_settled_response_id=dedupe.pending_settled_response_id,
+        pending_settled_at=dedupe.pending_settled_at,
     )
     await _write_forward_state_async(bridge_dir, updated)
     return updated
@@ -8092,6 +8117,8 @@ def _read_transcript_items_for_state(
     state: TranscriptForwardState,
     agent_name: str,
     settled_response_id: str | None = None,
+    pending_settled_response_id: str | None = None,
+    pending_settled_at: float | None = None,
 ) -> TranscriptReadResult:
     """
     Read transcript items using the best cursor available in ``state``.
@@ -8100,6 +8127,9 @@ def _read_transcript_items_for_state(
     :param agent_name: Agent/model name to stamp on mirrored output.
     :param settled_response_id: Active turn-settle latch — assistant
         output inheriting this id parses as a scheduled wake.
+    :param pending_settled_response_id: Stopped turn awaiting transcript
+        quiescence; peer inputs can already establish a new turn.
+    :param pending_settled_at: Timestamp of the pending Stop edge.
     :returns: Transcript items and updated cursors. States without a
         byte offset are migrated by one line-cursor compatibility scan.
     """
@@ -8110,6 +8140,8 @@ def _read_transcript_items_for_state(
             agent_name=agent_name,
             current_response_id=state.current_response_id,
             settled_response_id=settled_response_id,
+            pending_settled_response_id=pending_settled_response_id,
+            pending_settled_at=pending_settled_at,
         )
     return read_transcript_items_from_offset(
         state.transcript_path,
@@ -8118,6 +8150,8 @@ def _read_transcript_items_for_state(
         agent_name=agent_name,
         current_response_id=state.current_response_id,
         settled_response_id=settled_response_id,
+        pending_settled_response_id=pending_settled_response_id,
+        pending_settled_at=pending_settled_at,
     )
 
 
@@ -9932,12 +9966,14 @@ async def _write_hook_state_async(
     state: HookForwardState,
     *,
     pending_settled_response_id: str | None = None,
+    pending_settled_at: float | None = None,
 ) -> None:
     """Persist a terminal latch before the hook cursor makes its edge unreplayable.
 
     :param bridge_dir: Native Claude bridge directory.
     :param state: Cursor state to persist.
     :param pending_settled_response_id: Acknowledged turn's pending settlement.
+    :param pending_settled_at: Timestamp of the pending Stop edge.
     :returns: None.
     """
     if pending_settled_response_id is not None:
@@ -9945,7 +9981,11 @@ async def _write_hook_state_async(
         if transcript_state is not None:
             await _write_forward_state_async(
                 bridge_dir,
-                replace(transcript_state, pending_settled_response_id=pending_settled_response_id),
+                replace(
+                    transcript_state,
+                    pending_settled_response_id=pending_settled_response_id,
+                    pending_settled_at=pending_settled_at,
+                ),
             )
     await asyncio.to_thread(_write_hook_state, bridge_dir, state)
 
@@ -10794,6 +10834,7 @@ def _read_forward_state(bridge_dir: Path) -> TranscriptForwardState | None:
     current_response_id = raw.get("current_response_id")
     settled_response_id = raw.get("settled_response_id")
     pending_settled_response_id = raw.get("pending_settled_response_id")
+    pending_settled_at = raw.get("pending_settled_at")
     cursor_fingerprint = raw.get("cursor_fingerprint")
     seen_source_ids = raw.get("seen_source_ids", [])
     if not isinstance(transcript_path, str) or not isinstance(line_cursor, int):
@@ -10810,6 +10851,8 @@ def _read_forward_state(bridge_dir: Path) -> TranscriptForwardState | None:
         pending_settled_response_id, str
     ):
         pending_settled_response_id = None
+    if pending_settled_response_id is None or type(pending_settled_at) not in (int, float):
+        pending_settled_at = None
     if cursor_fingerprint is not None and not isinstance(cursor_fingerprint, str):
         return None
     if not isinstance(seen_source_ids, list) or not all(
@@ -10825,6 +10868,7 @@ def _read_forward_state(bridge_dir: Path) -> TranscriptForwardState | None:
         cursor_fingerprint=cursor_fingerprint,
         settled_response_id=settled_response_id,
         pending_settled_response_id=pending_settled_response_id,
+        pending_settled_at=pending_settled_at,
         api_error_context=normalize_failure_context(raw.get("api_error_context")) or None,
     )
 
@@ -10844,6 +10888,7 @@ def _write_forward_state(bridge_dir: Path, state: TranscriptForwardState) -> Non
         "current_response_id": state.current_response_id,
         "settled_response_id": state.settled_response_id,
         "pending_settled_response_id": state.pending_settled_response_id,
+        "pending_settled_at": state.pending_settled_at,
         "seen_source_ids": list(state.seen_source_ids),
         "updated_at": time.time(),
     }
