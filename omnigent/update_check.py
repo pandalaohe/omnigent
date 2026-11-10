@@ -1746,10 +1746,26 @@ def _run_upgrade_command(command: str, console: Console) -> int:
         if IS_WINDOWS:
             from omnigent.host.windows_upgrade import retained_install
 
+            skip_web_ui = {**os.environ, "OMNIGENT_SKIP_WEB_UI": "true"}
+            bundled = _web_ui_bundled()
+            if not bundled:
+                console.print("This install has no web UI, so the upgrade does not build one.")
             with retained_install(argv):
-                result = subprocess.run(argv, check=False)
+                result = subprocess.run(argv, check=False, env=None if bundled else skip_web_ui)
+                if result.returncode and bundled:
+                    # A Windows web UI build failure must not block the Host upgrade.
+                    console.print(
+                        "[yellow]Retrying without building the web UI. Later upgrades keep "
+                        "skipping it; run the command above by hand to get it back.[/yellow]"
+                    )
+                    result = subprocess.run(argv, check=False, env=skip_web_ui)
                 if result.returncode:
                     raise InstallFailed(result.returncode)
+                if not _installed_cli_imports():
+                    console.print(
+                        "[red]The new install does not start; restoring the previous one.[/red]"
+                    )
+                    raise InstallFailed(1)
         else:
             result = subprocess.run(argv, check=False)
     except InstallFailed as exc:
@@ -1761,6 +1777,28 @@ def _run_upgrade_command(command: str, console: Console) -> int:
         console.print(f"[red]Upgrade failed to start:[/red] {exc}")
         return -1
     return result.returncode
+
+
+def _web_ui_bundled() -> bool:
+    """Whether the running install carries the built web UI."""
+    return (Path(__file__).resolve().parent / "server/static/web-ui/index.html").is_file()
+
+
+def _installed_cli_imports() -> bool:
+    """Whether the freshly installed environment can import the CLI.
+
+    ``sys.executable`` is the tool environment's interpreter path, which now holds the new install.
+    """
+    try:
+        probe = subprocess.run(
+            [sys.executable, "-I", "-c", "import omnigent.cli"],
+            check=False,
+            capture_output=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0
 
 
 def upgrade_command_for_installed() -> _UpgradeSuggestion | None:

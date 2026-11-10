@@ -246,7 +246,9 @@ def test_windows_reinstall_restores_before_retry(
     monkeypatch.setattr("omnigent.cli._run_windows_host_service", service)
     calls = 0
 
-    def install(args: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
+    def install(
+        args: list[str], *, check: bool, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
         nonlocal calls
         calls += 1
         assert not launcher.exists(), "locked launcher must be renamed before copying"
@@ -263,6 +265,8 @@ def test_windows_reinstall_restores_before_retry(
         return subprocess.CompletedProcess(args, 2 if outcome == "failed" and calls == 1 else 0)
 
     monkeypatch.setattr("omnigent.update_check.subprocess.run", install)
+    monkeypatch.setattr("omnigent.update_check._web_ui_bundled", lambda: False)
+    monkeypatch.setattr("omnigent.update_check._installed_cli_imports", lambda: True)
     command = f"uv tool {verb} omnigent"
     with _upgrade_host_service(force=True):
         code = _run_upgrade_command(command, Console())
@@ -646,3 +650,180 @@ def test_orphan_venv_holder_aborts_install_and_restores(
     assert not host.alive and orphan.alive
     assert events == ["stop", "start"]
     assert "File is in use by the surviving worker" in capsys.readouterr().out
+
+
+def test_release_closes_launcher_zip_opened_by_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib
+    import importlib.metadata
+    import zipfile
+
+    # uv's launcher runs `python <omni.exe>`, so the zip-bearing exe is sys.path[0].
+    launcher = tmp_path / "omni.exe"
+    with zipfile.ZipFile(launcher, "w") as archive:
+        archive.writestr("__main__.py", "")
+    monkeypatch.syspath_prepend(str(launcher))
+
+    def held() -> bool:
+        return any(Path(f.path) == launcher for f in psutil.Process().open_files())
+
+    with pytest.raises(importlib.metadata.PackageNotFoundError):
+        importlib.metadata.version("bug271-absent-distribution")
+    assert held(), "importlib.metadata keeps the launcher zip open"
+    windows._release_launcher_zip()
+    assert not held()
+    importlib.invalidate_caches()
+
+
+def test_retained_install_releases_launcher_before_first_rename(
+    monkeypatch: pytest.MonkeyPatch, uv_layout: tuple[Path, Path]
+) -> None:
+    events: list[str] = []
+    original_rename = Path.rename
+
+    def rename(path: Path, target: Path) -> Path:
+        events.append("rename")
+        return original_rename(path, target)
+
+    monkeypatch.setattr(windows, "_release_launcher_zip", lambda: events.append("release"))
+    monkeypatch.setattr(Path, "rename", rename)
+    with windows.retained_install(["uv", "tool", "install", "omnigent"]):
+        pass
+    assert events[0] == "release" and "rename" in events
+
+
+def test_verified_backups_become_trash_that_the_next_upgrade_removes(
+    monkeypatch: pytest.MonkeyPatch, uv_layout: tuple[Path, Path]
+) -> None:
+    prefix, bindir = uv_layout
+    hex_id = "0" * 32
+    recovery = prefix.with_name(f"tool.previous-{hex_id}")
+    recovery.mkdir()
+    decoy = prefix.with_name("tool.trash-notours")
+    decoy.mkdir()
+    outside = prefix.parent / "outside"
+    outside.mkdir()
+    (outside / "keep").write_text("keep")
+    linked = prefix.with_name(f"tool.trash-{'1' * 32}")
+    linked.symlink_to(outside, target_is_directory=True)
+    original_unlink = Path.unlink
+
+    def unlink(path: Path, missing_ok: bool = False) -> None:
+        if path.name.startswith("omni.exe.previous-"):
+            raise PermissionError("running launcher image")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    receipt = (prefix / "uv-receipt.toml").read_text()
+
+    def install() -> None:
+        (prefix / "Scripts").mkdir(parents=True)
+        (prefix / "uv-receipt.toml").write_text(receipt)
+        for name in ("omni", "omnigent"):
+            (bindir / f"{name}.exe").write_bytes(b"replacement")
+            (prefix / "Scripts" / f"{name}.exe").write_bytes(b"replacement")
+
+    with windows.retained_install(["uv", "tool", "install", "omnigent"]):
+        install()
+    # Recovery copies and anything not named by this module stay; this run's leftovers are trash.
+    assert [path.name for path in prefix.parent.glob("tool.previous-*")] == [recovery.name]
+    first_trash = set(prefix.parent.glob(f"tool.trash-{'[0-9a-f]' * 32}")) - {linked}
+    assert len(first_trash) == 1 and decoy.exists() and linked.is_symlink()
+    assert len(list(bindir.glob("omni.exe.trash-*"))) == 1
+    assert not list(bindir.glob("*.previous-*"))
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+
+    with windows.retained_install(["uv", "tool", "install", "omnigent"]):
+        install()
+    assert not list(bindir.glob("*.trash-*")) and not list(bindir.glob("*.previous-*"))
+    assert not any(path.exists() for path in first_trash)
+    assert recovery.exists() and decoy.exists() and linked.is_symlink()
+    assert (outside / "keep").read_text() == "keep"
+    assert len(set(prefix.parent.glob(f"tool.trash-{'[0-9a-f]' * 32}")) - {linked}) == 1
+
+
+@pytest.mark.parametrize("bundled", [False, True])
+@pytest.mark.parametrize("first_exit", [0, 1])
+def test_windows_web_ui_build_cannot_block_the_install(
+    monkeypatch: pytest.MonkeyPatch, uv_layout: tuple[Path, Path], bundled: bool, first_exit: int
+) -> None:
+    prefix, bindir = uv_layout
+    calls: list[dict[str, str] | None] = []
+
+    def install(args: list[str], *, check: bool, env: dict[str, str] | None = None):
+        calls.append(env)
+        prefix.mkdir(exist_ok=True)
+        (bindir / "omni.exe").write_bytes(b"replacement")
+        code = first_exit if len(calls) == 1 else 0
+        return subprocess.CompletedProcess(args, code)
+
+    monkeypatch.setattr("omnigent.update_check.IS_WINDOWS", True)
+    monkeypatch.setattr("omnigent.update_check._web_ui_bundled", lambda: bundled)
+    monkeypatch.setattr("omnigent.update_check._installed_cli_imports", lambda: True)
+    monkeypatch.setattr("omnigent.update_check.subprocess.run", install)
+    assert _run_upgrade_command("uv tool install --reinstall omnigent", Console()) == (
+        first_exit if not bundled else 0
+    )
+    skip = [env is not None and env.get("OMNIGENT_SKIP_WEB_UI") == "true" for env in calls]
+    if not bundled:
+        assert skip == [True]
+    elif first_exit:
+        assert skip == [False, True]
+    else:
+        assert skip == [False]
+
+
+def test_windows_install_that_cannot_start_is_rolled_back(
+    monkeypatch: pytest.MonkeyPatch, uv_layout: tuple[Path, Path]
+) -> None:
+    prefix, bindir = uv_layout
+
+    def install(args: list[str], *, check: bool, env: dict[str, str] | None = None):
+        (prefix / "Scripts").mkdir(parents=True)
+        (bindir / "omni.exe").write_bytes(b"broken replacement")
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr("omnigent.update_check.IS_WINDOWS", True)
+    monkeypatch.setattr("omnigent.update_check._web_ui_bundled", lambda: False)
+    monkeypatch.setattr("omnigent.update_check._installed_cli_imports", lambda: False)
+    monkeypatch.setattr("omnigent.update_check.subprocess.run", install)
+    assert _run_upgrade_command("uv tool install --reinstall omnigent", Console()) != 0
+    assert (bindir / "omni.exe").read_bytes() == b"current environment"
+    assert (prefix / "Scripts" / "omni.exe").read_bytes() == b"current environment"
+
+
+def test_host_restarts_when_draining_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    import click
+
+    from omnigent.cli import _upgrade_host_service
+
+    events: list[str] = []
+
+    def drain(**_: object) -> None:
+        raise click.ClickException("drain interrupted")
+
+    monkeypatch.setattr("omnigent.cli.IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "omnigent.cli._windows_host_service_wrapper", lambda: Path("/opt/wrapper.cmd")
+    )
+    monkeypatch.setattr("omnigent.cli.shutil.which", lambda _: "/opt/bin/pwsh.exe")
+    monkeypatch.setattr("omnigent.cli._drain_and_stop_local_server", drain)
+    monkeypatch.setattr(
+        "omnigent.cli._run_windows_host_service", lambda _wrapper, action: events.append(action)
+    )
+    monkeypatch.setattr(windows, "capture_host_tree", lambda **_: [])
+    with pytest.raises(click.ClickException, match="drain interrupted"):
+        with _upgrade_host_service(force=False):
+            pytest.fail("the install must not run after a failed drain")
+    assert events == ["start"]
+
+
+def test_installed_cli_import_check_reports_a_missing_interpreter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.update_check import _installed_cli_imports
+
+    assert _installed_cli_imports()
+    monkeypatch.setattr("omnigent.update_check.sys.executable", str(tmp_path / "python.exe"))
+    assert not _installed_cli_imports()

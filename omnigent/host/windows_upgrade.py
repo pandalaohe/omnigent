@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import contextlib
 import filecmp
+import gc
+import importlib
 import os
+import re
 import shutil
 import sys
 import tomllib
@@ -14,6 +17,8 @@ from pathlib import Path
 from time import sleep, time
 
 import psutil
+
+_TRASH_SUFFIX = re.compile(r"\.trash-[0-9a-f]{32}")
 
 
 def installed_launchers() -> list[Path]:
@@ -334,16 +339,54 @@ def _rename_with_retry(path: Path, destination: Path) -> None:
             raise OSError(f"{exc}; applications using {path}: {users}") from exc
 
 
+def _release_launcher_zip() -> None:
+    """Close the launcher zip that importlib.metadata keeps open.
+
+    uv's launcher runs ``python <omni.exe>``, so the exe (a zip) is ``sys.path[0]``; a metadata
+    lookup caches an open ``ZipFile`` on it, and Windows refuses to rename an open file.
+    """
+    importlib.invalidate_caches()
+    gc.collect()
+
+
+def _remove_trash(paths: list[Path]) -> None:
+    """Delete leftovers that an earlier verified upgrade marked as trash, best effort.
+
+    A file still in use stops its removal; the rest of that leftover may already be gone.
+    """
+    for path in paths:
+        try:
+            siblings = list(path.parent.iterdir())
+        except OSError:
+            continue
+        for sibling in siblings:
+            name = sibling.name
+            if (
+                not name.startswith(path.name)
+                or not _TRASH_SUFFIX.fullmatch(name[len(path.name) :])
+                or sibling.is_symlink()
+            ):
+                continue
+            with contextlib.suppress(OSError):
+                if sibling.is_dir():
+                    shutil.rmtree(sibling)
+                else:
+                    sibling.unlink()
+
+
 @contextlib.contextmanager
 def retained_install(argv: list[str]) -> Iterator[None]:
     """Move locked entrypoints aside; restore the uv environment on install failure."""
-    suffix = f".previous-{uuid.uuid4().hex}"
+    token = uuid.uuid4().hex
+    suffix = f".previous-{token}"
     moved: list[tuple[Path, Path]] = []
     try:
         paths = installed_launchers()
         # uv replaces the tool environment; retaining it also covers a partial
         # removal of the running interpreter (including its loaded DLLs).
         prefix = Path(sys.prefix)
+        _remove_trash([*paths, prefix])
+        _release_launcher_zip()
         if (
             len(argv) >= 3
             and Path(argv[0]).stem.casefold() == "uv"
@@ -381,14 +424,24 @@ def retained_install(argv: list[str]) -> Iterator[None]:
             ) from exc
         raise
     else:
-        # A live Windows executable/DLL cannot be unlinked yet. Keep that
-        # backup until this CLI exits instead of turning success into failure.
-        for _, backup in moved:
+        # A live Windows executable/DLL cannot be deleted yet; mark what is left
+        # as trash so the next upgrade removes it, instead of failing the upgrade.
+        for path, backup in moved:
+            if not backup.exists():
+                continue
             if backup.is_file():
-                with contextlib.suppress(OSError):
+                try:
                     backup.unlink()
-            elif backup.is_dir():
+                    continue
+                except OSError:
+                    pass
+            trash = path.with_name(f"{path.name}.trash-{token}")
+            try:
+                backup.rename(trash)
+            except OSError:
+                trash = backup
+            if trash.is_dir():
                 print(
-                    f"Previous tool environment retained until this CLI exits: {backup}",
+                    f"Previous tool environment kept until the next upgrade: {trash}",
                     file=sys.stderr,
                 )

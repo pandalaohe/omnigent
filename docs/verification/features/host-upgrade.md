@@ -18,6 +18,10 @@ already-renamed launchers. Check that `file_users` reports the known holder PID.
 If Restart Manager is unavailable, expect the error to include its failure and
 visible process candidates with PID and image. These candidates are not confirmed
 lock holders; denied process visibility must be reported explicitly.
+Start the upgrade through the installed `omni.exe` too: uv's launcher puts that file on
+`sys.path`, so a metadata lookup holds it open until `retained_install` releases it.
+After a successful install the old launcher and environment become `<name>.trash-<hex>`
+siblings; the next upgrade removes them, while `.previous-*` and `.failed-*` copies stay.
 Stop only the trial's processes and remove only its temporary directories.
 
 The final installed-host acceptance belongs to the operator, from a terminal outside
