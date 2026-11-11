@@ -1444,6 +1444,11 @@ _PRERELEASE_FLAG = {
 }
 
 
+def _uv_python_minor() -> str:
+    """Return a bare interpreter minor for subprocess argument lists."""
+    return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
 def _uv_python_pin() -> str:
     """Return uv's ``--python`` flag pinned to the running interpreter.
 
@@ -1455,7 +1460,7 @@ def _uv_python_pin() -> str:
     same tool environment, so pinning our own interpreter keeps the upgrade
     in place.
     """
-    return f" --python {sys.version_info.major}.{sys.version_info.minor}"
+    return f" --python {_uv_python_minor()}"
 
 
 def _pip_invocation() -> str:

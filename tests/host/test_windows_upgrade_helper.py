@@ -13,6 +13,7 @@ from omnigent.host import windows_upgrade_launch as shim
 from omnigent.update_check import _InstalledWheelInfo
 
 STOP_TASK = helper.windows_task.stop
+REQUIRE_HOST_ALIVE = helper.require_host_alive
 
 
 def test_helper_absent_task_with_gbk_listing(transaction, monkeypatch):
@@ -59,6 +60,8 @@ def test_host_verification_uses_registration_and_liveness(
     record = SimpleNamespace(mode="server", target=args.server, pid=123, started_at=1)
     monkeypatch.setattr(daemon_lifecycle, "read_daemon_records", lambda: [record])
     monkeypatch.setattr(daemon_lifecycle, "pid_is_recorded_daemon", lambda _: alive)
+    monkeypatch.setattr(helper, "pid_is_recorded_daemon", lambda _: alive)
+    monkeypatch.setattr(helper, "require_host_alive", REQUIRE_HOST_ALIVE)
     times = iter([0, 1, 100] if not alive else [0, 1, 2, 3, 100])
     monkeypatch.setattr(helper.time, "monotonic", lambda: next(times))
     monkeypatch.setattr(helper.time, "sleep", lambda _: None)
@@ -72,7 +75,7 @@ def test_host_verification_uses_registration_and_liveness(
         with pytest.raises(RuntimeError):
             VERIFY_HOST(args)
     else:
-        assert VERIFY_HOST(args) == ("online" if online else "not-online-yet")
+        assert VERIFY_HOST(args)[0] == ("online" if online else "not-online-yet")
 
 
 VERIFY_HOST = helper.verify_host
@@ -141,7 +144,8 @@ def transaction(monkeypatch, tmp_path):
     monkeypatch.setattr(
         helper, "_probe_installed_distribution", lambda *a, **k: ("1", args.target)
     )
-    monkeypatch.setattr(helper, "verify_host", lambda _: "not-online-yet")
+    monkeypatch.setattr(helper, "verify_host", lambda _: ("not-online-yet", None))
+    monkeypatch.setattr(helper, "require_host_alive", lambda _: None)
     return args, tool, commands, tmp_path
 
 
@@ -247,10 +251,10 @@ def test_dry_run_and_unknown_flags(transaction, monkeypatch):
 
 def test_lock_live_and_stale(monkeypatch, tmp_path):
     path = tmp_path / "upgrade.lock"
-    shim.acquire_lock(path)
+    owner = shim.acquire_lock(path)
     with pytest.raises(RuntimeError, match="already running"):
         shim.acquire_lock(path)
-    helper.release_lock(path, [os.getpid()])
+    helper.release_lock(path, owner)
     path.write_text(json.dumps({"pid": 12345, "create_time": 0}))
     real = psutil.Process
 
@@ -324,8 +328,13 @@ def launcher(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
-def test_shim_argv_env_and_detach(launcher, dry_run):
+def test_shim_argv_env_and_detach(launcher, dry_run, monkeypatch):
     info, events, root = launcher
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "omnigent.update_check.sys.version_info", SimpleNamespace(major=3, minor=12)
+    )
     shim.launch(info, "b" * 40, extras=("slack",), force=False, dry_run=dry_run)
     if not dry_run:
         assert events.pop(0) == "drain"
@@ -334,7 +343,7 @@ def test_shim_argv_env_and_detach(launcher, dry_run):
     source = "git+https://example.test/repo.git@" + "b" * 40
     assert argv[argv.index("--with") + 1] == source
     assert argv[argv.index("--install-spec") + 1] == source + "#egg=omnigent[all,slack]"
-    assert argv[argv.index("--python") + 1] == shim._uv_python_pin()
+    assert [argv[i + 1] for i, value in enumerate(argv) if value == "--python"] == ["3.12", "3.12"]
     assert options["creationflags"] == 0x09000200
     assert options["cwd"] == root / "updates"
     assert options["env"][helper.ORIGINAL_PATH] == options["env"]["PATH"]
@@ -383,7 +392,7 @@ def test_rename_back_failure_emits_recovery(transaction, monkeypatch, capsys, pr
     assert helper.run(args) == 1
     installs = [cmd for cmd, _ in commands if cmd[1:3] == ["tool", "install"]]
     assert len(installs) == (2 if previous else 1)
-    assert "Recovery: /opt/bin/uv.exe tool install" in capsys.readouterr().out
+    assert "Recovery: & '/opt/bin/uv.exe' 'tool' 'install'" in capsys.readouterr().out
 
 
 def test_steps_written_before_actions(transaction, monkeypatch):
@@ -485,3 +494,177 @@ def test_shim_external_terminal_refusal(monkeypatch):
         shim.launch(
             cast(_InstalledWheelInfo, None), "b" * 40, extras=(), force=False, dry_run=False
         )
+
+
+@pytest.mark.parametrize(
+    "failure", ["stop-task", "capture", "stop-tree", "restart", "restore-tool"]
+)
+def test_recovery_faults_are_journaled_and_do_not_skip_actions(transaction, monkeypatch, failure):
+    from omnigent.host.service import HostServiceError
+
+    args, tool, commands, root = transaction
+    monkeypatch.setattr(helper, "_probe_installed_distribution", lambda *a, **k: ("1", "wrong"))
+    journal = root / "updates/last-upgrade.json"
+    actions = []
+
+    def observe(name):
+        state = json.loads(journal.read_text())
+        assert state["step"] == "recovery-" + name
+        assert state["failed_step"] == "verify"
+        assert state["snapshot"].startswith(str(tool) + ".previous-")
+        actions.append(name)
+        if failure == name:
+            raise HostServiceError(f"recovery {name} failed")
+
+    def stop(_):
+        if json.loads(journal.read_text())["step"].startswith("recovery-"):
+            observe("stop-task")
+
+    def capture(**kwargs):
+        if json.loads(journal.read_text())["step"].startswith("recovery-"):
+            observe("capture")
+        return []
+
+    def stop_tree(_):
+        if json.loads(journal.read_text())["step"].startswith("recovery-"):
+            observe("stop-tree")
+
+    original_run, original_rename, original_remove, original_copy = (
+        helper._run,
+        Path.rename,
+        helper.shutil.rmtree,
+        helper.shutil.copy2,
+    )
+
+    def command(argv, env):
+        if argv[1:3] == ["host", "enable"]:
+            observe("restart")
+        elif json.loads(journal.read_text())["step"] == "recovery-reinstall":
+            observe("reinstall")
+        original_run(argv, env)
+
+    def rename(path, destination):
+        if ".previous-" in path.name:
+            observe("restore-tool")
+        return original_rename(path, destination)
+
+    def remove(path, **kwargs):
+        observe("remove-partial")
+        return original_remove(path, **kwargs)
+
+    def copy(source, destination, **kwargs):
+        if ".previous-" in source.name:
+            observe("restore-" + destination.name)
+        return original_copy(source, destination, **kwargs)
+
+    monkeypatch.setattr(helper.windows_task, "stop", stop)
+    monkeypatch.setattr(helper.windows_upgrade, "capture_host_tree", capture)
+    monkeypatch.setattr(helper.windows_upgrade, "stop_host_tree", stop_tree)
+    monkeypatch.setattr(helper, "_run", command)
+    monkeypatch.setattr(Path, "rename", rename)
+    monkeypatch.setattr(helper.shutil, "rmtree", remove)
+    monkeypatch.setattr(helper.shutil, "copy2", copy)
+    assert helper.run(args) == 1
+    state = json.loads(journal.read_text())
+    assert state["step"] == "recovery-complete" and state["result"] == "failed"
+    assert state["failed_step"] == "verify"
+    assert state["recovery_result"] == "incomplete"
+    assert state["recovery"]["recovery-" + failure].startswith("failed:")
+    assert state["recovery_command"].startswith(
+        "& '/opt/bin/uv.exe' 'tool' 'install' '--reinstall' '--python' '3.12' "
+    )
+    assert actions[:6] == [
+        "stop-task",
+        "capture",
+        "stop-tree",
+        "remove-partial",
+        "restore-tool",
+        "restore-omni.exe",
+    ]
+    assert "restore-omnigent.exe" in actions and "restart" in actions
+    if failure == "restore-tool":
+        assert (Path(state["snapshot"]) / "old.txt").exists()
+        assert "reinstall" in actions
+    else:
+        assert (tool / "old.txt").read_text() == "previous install"
+        assert sum(cmd[1:3] == ["tool", "install"] for cmd, _ in commands) == 1
+
+
+@pytest.mark.parametrize("reused", [False, True])
+def test_direct_helper_retries_interrupted_owner(transaction, monkeypatch, reused):
+    args, _, _, root = transaction
+    args.dry_run = True
+    lock = root / "updates/upgrade.lock"
+    lock.parent.mkdir()
+    lock.write_text(json.dumps({"pid": 12345, "create_time": 1}))
+    from omnigent.host import windows_upgrade_lock as locks
+
+    original = locks.process_owner
+
+    def identity(pid):
+        if pid == 12345:
+            if reused:
+                return {"pid": pid, "create_time": 2.0}
+            raise psutil.NoSuchProcess(pid)
+        return original(pid)
+
+    monkeypatch.setattr(locks, "process_owner", identity)
+    assert helper.run(args) == 0
+    assert not lock.exists()
+
+
+def test_host_dying_during_connection_wait_rolls_back(transaction, monkeypatch):
+    from types import SimpleNamespace
+
+    from omnigent import cli
+    from omnigent.host import daemon_lifecycle
+
+    args, tool, _, root = transaction
+    live = [True]
+    record = SimpleNamespace(mode="server", target=args.server, pid=12345, started_at=1)
+    monkeypatch.setattr(helper, "verify_host", VERIFY_HOST)
+    monkeypatch.setattr(helper, "require_host_alive", REQUIRE_HOST_ALIVE)
+    monkeypatch.setattr(helper, "pid_is_recorded_daemon", lambda _: live[0])
+    monkeypatch.setattr(daemon_lifecycle, "pid_is_recorded_daemon", lambda _: live[0])
+    monkeypatch.setattr(daemon_lifecycle, "read_daemon_records", lambda: [record])
+    monkeypatch.setattr(helper.windows_task, "installed", lambda _: (None, args.server))
+    monkeypatch.setattr(helper.time, "sleep", lambda _: None)
+    polls = []
+
+    def status(*args, **kwargs):
+        polls.append("disconnected")
+        live[0] = False
+        return {"host_status": "offline", "process": "offline"}
+
+    monkeypatch.setattr(cli, "_daemon_status_payload", status)
+    assert helper.run(args) == 1
+    assert polls == ["disconnected"]
+    assert (tool / "old.txt").exists()
+    state = json.loads((root / "updates/last-upgrade.json").read_text())
+    assert state["failed_step"] == "register" and state["result"] == "failed"
+
+
+def test_host_death_at_commit_preserves_rollback(transaction, monkeypatch):
+    args, tool, _, root = transaction
+    monkeypatch.setattr(
+        helper, "require_host_alive", lambda _: (_ for _ in ()).throw(RuntimeError("Host died"))
+    )
+    assert helper.run(args) == 1
+    assert (tool / "old.txt").exists()
+    state = json.loads((root / "updates/last-upgrade.json").read_text())
+    assert state["failed_step"] == "commit" and state["result"] == "failed"
+
+
+def test_recovery_command_quotes_powershell_paths(transaction, monkeypatch):
+    args, _, _, root = transaction
+    monkeypatch.setattr(
+        helper.windows_upgrade, "resolve_uv_executable", lambda: "/opt/Tool Dir/O'Brien/uv.exe"
+    )
+    monkeypatch.setattr(helper, "_probe_installed_distribution", lambda *a, **k: ("1", "wrong"))
+    assert helper.run(args) == 1
+    state = json.loads((root / "updates/last-upgrade.json").read_text())
+    assert state["recovery_command"].startswith(
+        "& '/opt/Tool Dir/O''Brien/uv.exe' 'tool' 'install'"
+    )
+    assert "'#egg" not in state["recovery_command"]
+    assert state["recovery_command"].endswith("#egg=omnigent[all]'")

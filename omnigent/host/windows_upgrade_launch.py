@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
-import json
 import os
 import shutil
 import subprocess
@@ -16,15 +15,15 @@ import click
 import psutil
 
 from omnigent.host import windows_upgrade
-from omnigent.host.windows_upgrade_helper import ORIGINAL_PATH, clean_environment, release_lock
+from omnigent.host.windows_upgrade_helper import ORIGINAL_PATH, clean_environment
+from omnigent.host.windows_upgrade_lock import acquire_lock, release_lock, transfer_lock
 from omnigent.process_logging import data_dir
 from omnigent.update_check import (
     _InstalledWheelInfo,
     _split_vcs_url,
-    _uv_python_pin,
+    _uv_python_minor,
     _web_ui_bundled,
 )
-from omnigent.util.atomic_json import atomic_write_json
 
 
 def in_job() -> bool:
@@ -39,27 +38,6 @@ def in_job() -> bool:
     if not kernel.IsProcessInJob(kernel.GetCurrentProcess(), None, ctypes.byref(result)):
         raise ctypes.WinError()  # type: ignore[attr-defined]
     return bool(result.value)
-
-
-def acquire_lock(path: Path) -> None:
-    for _ in range(2):
-        try:
-            with path.open("x", encoding="utf-8") as stream:
-                json.dump(
-                    {"pid": os.getpid(), "create_time": psutil.Process().create_time()}, stream
-                )
-            return
-        except FileExistsError:
-            try:
-                owner = json.loads(path.read_text(encoding="utf-8"))
-                if psutil.Process(owner["pid"]).create_time() == owner["create_time"]:
-                    raise RuntimeError("Another Windows upgrade is already running.")
-            except psutil.NoSuchProcess:
-                pass
-            except (ValueError, KeyError) as exc:
-                raise RuntimeError(f"Unreadable upgrade lock: {path}") from exc
-            path.unlink()
-    raise RuntimeError("Could not acquire the Windows upgrade lock.")
 
 
 def launch(
@@ -105,7 +83,7 @@ def launch(
         "run",
         "--no-project",
         "--python",
-        _uv_python_pin(),
+        _uv_python_minor(),
         "--with",
         source,
         "python",
@@ -124,7 +102,7 @@ def launch(
         str(bin_dir),
         *mode,
         "--python",
-        _uv_python_pin(),
+        _uv_python_minor(),
         "--log",
         str(log),
         "--web-ui",
@@ -150,7 +128,7 @@ def launch(
     breakaway = 0x01000000
     job = in_job()
     lock = updates / "upgrade.lock"
-    acquire_lock(lock)
+    owner = acquire_lock(lock)
     env = clean_environment()
     env[ORIGINAL_PATH] = env.get("PATH", "")
     env["OMNIGENT_SKIP_WEB_UI"] = "true"
@@ -195,13 +173,9 @@ def launch(
                 )
         # uv may spend minutes building before importing the helper. Keep its
         # live identity in the lock during that interval, then the helper takes it.
-        owner = json.loads(lock.read_text(encoding="utf-8"))
-        if owner["pid"] == os.getpid():
-            atomic_write_json(
-                lock, {"pid": child.pid, "create_time": psutil.Process(child.pid).create_time()}
-            )
+        owner = transfer_lock(lock, owner, child.pid)
     except BaseException:
-        release_lock(lock, parents)
+        release_lock(lock, owner)
         raise
     viewer = shutil.which("powershell.exe")
     if viewer:

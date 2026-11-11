@@ -11,11 +11,14 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import psutil
 
 from omnigent.host import windows_task, windows_upgrade
+from omnigent.host.daemon_lifecycle import HostDaemonRecord, pid_is_recorded_daemon
+from omnigent.host.windows_upgrade_lock import Owner, acquire_lock, release_lock
 from omnigent.process_logging import data_dir
 from omnigent.update_check import _probe_installed_distribution, _split_vcs_url
 from omnigent.util.atomic_json import atomic_write_json
@@ -96,7 +99,12 @@ def enable_host(args: argparse.Namespace, env: dict[str, str]) -> None:
     )
 
 
-def verify_host(args: argparse.Namespace) -> str:
+def require_host_alive(record: HostDaemonRecord) -> None:
+    if not pid_is_recorded_daemon(record):
+        raise RuntimeError("The registered Host exited during upgrade verification.")
+
+
+def verify_host(args: argparse.Namespace) -> tuple[str, HostDaemonRecord]:
     from omnigent import cli
     from omnigent.host.daemon_lifecycle import pid_is_recorded_daemon, read_daemon_records
 
@@ -128,15 +136,19 @@ def verify_host(args: argparse.Namespace) -> str:
     if record is None:
         raise RuntimeError("The registered Host did not start within 60 seconds.")
     if not args.server:
-        return "online"
+        require_host_alive(record)
+        return "online", record
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
+        require_host_alive(record)
         payload = cli._daemon_status_payload(record, include_sessions=False)
         if payload.get("host_status") == "online":
-            return "online"
+            require_host_alive(record)
+            return "online", record
         time.sleep(2)
+    require_host_alive(record)
     print("Host started; server connection is not online yet.", flush=True)
-    return "not-online-yet"
+    return "not-online-yet", record
 
 
 def holders(prefix: Path) -> str:
@@ -157,7 +169,7 @@ def holders(prefix: Path) -> str:
 def run(args: argparse.Namespace) -> int:
     updates = data_dir() / "updates"
     updates.mkdir(parents=True, exist_ok=True)
-    record = {
+    record: dict[str, object] = {
         "from": args.previous,
         "to": args.target,
         "log": args.log,
@@ -180,22 +192,12 @@ def run(args: argparse.Namespace) -> int:
     launchers: list[tuple[Path, Path]] = []
     stopped = False
     saved = False
+    owner: Owner | None = None
     try:
-        from omnigent.host.windows_upgrade_launch import acquire_lock
-
         step("wait")
         wait_for_parents(args.wait_pid)
         lock = updates / "upgrade.lock"
-        if not lock.exists():
-            acquire_lock(lock)
-        else:
-            owner = json.loads(lock.read_text(encoding="utf-8"))
-            ancestors = {proc.pid for proc in psutil.Process().parents()}
-            if owner["pid"] not in {*args.wait_pid, *ancestors}:
-                raise RuntimeError("Another Windows upgrade owns the lock.")
-            atomic_write_json(
-                lock, {"pid": os.getpid(), "create_time": psutil.Process().create_time()}
-            )
+        owner = acquire_lock(lock, handoff_from={proc.pid for proc in psutil.Process().parents()})
         step("resolve")
         if (
             not prefix.is_dir()
@@ -273,13 +275,15 @@ def run(args: argparse.Namespace) -> int:
         _run([str(bin_dir / "omni.exe"), "--version"], env)
         step("register")
         enable_host(args, env)
-        record["host"] = verify_host(args)
+        record["host"], host_record = verify_host(args)
         step("channel")
         receipt = updates / "custom-host-rollback.json"
         if receipt.exists():
             channel = json.loads(receipt.read_text(encoding="utf-8"))
             channel["channel_tracking_migrated"] = True
             atomic_write_json(receipt, channel)
+        step("commit")
+        require_host_alive(host_record)
         step("cleanup")
         with contextlib.suppress(OSError):
             shutil.rmtree(backup)
@@ -288,55 +292,83 @@ def run(args: argparse.Namespace) -> int:
                 retained.unlink()
         step("complete", "ok")
         return 0
-    except (OSError, RuntimeError, ValueError, psutil.Error) as exc:
+    except Exception as exc:  # noqa: BLE001 — every transaction failure must enter recovery
         failed_step = str(record.get("step", "lock"))
+        record["failed_step"] = failed_step
+        record["error"] = str(exc)
+        record["snapshot"] = str(backup)
+        outcomes: dict[str, str] = {}
+        record["recovery"] = outcomes
         print(f"Upgrade failed at {failed_step}: {exc}", flush=True)
-        if saved and backup.exists():
+
+        def attempt(name: str, action: Callable[[], object]) -> bool:
+            step(name)
             try:
-                windows_task.stop(windows_task.description())
-                windows_upgrade.stop_host_tree(
+                action()
+            except Exception as recovery:  # noqa: BLE001 — one failure cannot skip other recovery
+                outcomes[name] = f"failed: {recovery}"
+                print(f"{name}: {recovery}", flush=True)
+                step(name)
+                return False
+            outcomes[name] = "ok"
+            step(name)
+            return True
+
+        repo, _ = _split_vcs_url(args.install_spec)
+        fragment = args.install_spec.partition("#")[2]
+        spec = f"git+{repo}@{args.previous}" + (f"#{fragment}" if fragment else "")
+        uv = "uv"
+        with contextlib.suppress(OSError):
+            uv = windows_upgrade.resolve_uv_executable()
+        command = [
+            uv,
+            "tool",
+            "install",
+            "--reinstall",
+            "--python",
+            args.python,
+            spec if args.previous else args.install_spec,
+        ]
+        # PowerShell needs the invocation operator for a quoted executable path.
+        record["recovery_command"] = "& " + " ".join(
+            "'" + argument.replace("'", "''") + "'" for argument in command
+        )
+        if saved and backup.exists():
+            attempt("recovery-stop-task", lambda: windows_task.stop(windows_task.description()))
+            captured: list[psutil.Process] = []
+            attempt(
+                "recovery-capture",
+                lambda: captured.extend(
                     windows_upgrade.capture_host_tree(
                         prefix=prefix, bin_dir=bin_dir, include_install_users=True
                     )
+                ),
+            )
+            attempt("recovery-stop-tree", lambda: windows_upgrade.stop_host_tree(captured))
+            if prefix.exists():
+                attempt("recovery-remove-partial", lambda: shutil.rmtree(prefix))
+            restored = attempt("recovery-restore-tool", lambda: backup.rename(prefix))
+            for path, retained in launchers:
+                attempt(
+                    f"recovery-restore-{path.name}",
+                    lambda path=path, retained=retained: shutil.copy2(retained, path),
                 )
-                if prefix.exists():
-                    shutil.rmtree(prefix)
-                backup.rename(prefix)
-                for path, retained in launchers:
-                    shutil.copy2(retained, path)
-            except OSError as recovery:
-                print(f"Snapshot restore failed: {recovery}", flush=True)
-                repo, _ = _split_vcs_url(args.install_spec)
-                fragment = args.install_spec.partition("#")[2]
-                spec = f"git+{repo}@{args.previous}" + (f"#{fragment}" if fragment else "")
-                command = [
-                    windows_upgrade.resolve_uv_executable(),
-                    "tool",
-                    "install",
-                    "--reinstall",
-                    "--python",
-                    args.python,
-                    spec if args.previous else args.install_spec,
-                ]
-                if args.previous:
-                    with contextlib.suppress(Exception):
-                        _run(command, {**env, "OMNIGENT_SKIP_WEB_UI": "true"})
-                print("Recovery: " + subprocess.list2cmdline(command), flush=True)
+            if not restored and args.previous:
+                attempt(
+                    "recovery-reinstall",
+                    lambda: _run(command, {**env, "OMNIGENT_SKIP_WEB_UI": "true"}),
+                )
         if stopped:
-            try:
-                enable_host(args, env)
-            except (OSError, RuntimeError, psutil.Error) as recovery:
-                print(f"Host restart failed: {recovery}", flush=True)
-        step(failed_step, "failed")
+            attempt("recovery-restart", lambda: enable_host(args, env))
+        record["recovery_result"] = (
+            "incomplete" if any(value != "ok" for value in outcomes.values()) else "ok"
+        )
+        print("Recovery: " + str(record["recovery_command"]), flush=True)
+        step("recovery-complete", "failed")
         return 1
     finally:
-        release_lock(updates / "upgrade.lock", [os.getpid()])
-
-
-def release_lock(path: Path, owners: list[int]) -> None:
-    with contextlib.suppress(OSError, ValueError, KeyError):
-        if json.loads(path.read_text(encoding="utf-8"))["pid"] in owners:
-            path.unlink()
+        if owner is not None:
+            release_lock(updates / "upgrade.lock", owner)
 
 
 def main() -> int:
