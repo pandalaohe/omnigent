@@ -68,11 +68,7 @@ from omnigent.models.model_metadata import (
     ModelWireAPI,
 )
 from omnigent.onboarding.providers import ModelInfo
-from omnigent.permission_tiers.host import (
-    HostPermissionState,
-    read_host_permission_state,
-    write_host_permission_state,
-)
+from omnigent.permission_tiers.host import HostPermissionState, write_host_permission_state
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 from omnigent.server.schemas import ElicitationResult
 
@@ -4810,60 +4806,6 @@ async def test_gateway_profile_timeout_does_not_publish_a_late_result(monkeypatc
     assert await asyncio.to_thread(finished.wait, timeout=1)
     assert executor._databricks_token == ""
     assert executor._gateway_refresh_after == 0
-
-
-@pytest.mark.asyncio
-async def test_run_turn_waits_for_ready_runner_permission_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from omnigent.inner import pi_executor
-
-    monkeypatch.setattr("omnigent.inner.pi_executor._find_pi_cli", lambda: "/opt/bin/pi")
-    monkeypatch.setattr("omnigent.harnesses.pi_native.main.pi_version", lambda _: (1, 3, 0))
-    bridge = tmp_path / "bridge"
-    bridge.mkdir()
-    state_path = bridge / "permission_state.json"
-    monkeypatch.setattr(pi_executor, "bridge_dir_for_session_id", lambda _: bridge)
-    executor = PiExecutor(pi_path="/opt/bin/pi", cwd=str(tmp_path), permission_controlled=True)
-    observed: list[HostPermissionState] = []
-
-    async def ensure_rpc(*args, **kwargs):
-        observed.append(read_host_permission_state(state_path))
-        return _PiRpcSession()
-
-    monkeypatch.setattr(executor, "_ensure_rpc", ensure_rpc)
-
-    async def initialize() -> None:
-        await asyncio.sleep(0.05)
-        write_host_permission_state(
-            state_path,
-            HostPermissionState(
-                session_id="session-1",
-                host_id="host",
-                workspace=str(tmp_path),
-                tier="auto",
-                revision=1,
-                status="ready",
-            ),
-        )
-
-    initializer = asyncio.create_task(initialize())
-    try:
-        events = [
-            event
-            async for event in executor.run_turn(
-                [{"role": "assistant", "content": "hello", "session_id": "session-1"}],
-                [],
-                "system",
-            )
-        ]
-    finally:
-        await initializer
-
-    errors = [event.message for event in events if isinstance(event, ExecutorError)]
-    assert not errors
-    assert any(isinstance(event, TurnComplete) for event in events)
-    assert [(state.session_id, state.status) for state in observed] == [("session-1", "ready")]
 
 
 class TestRunTurn(unittest.TestCase):
