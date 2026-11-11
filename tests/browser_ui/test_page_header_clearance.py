@@ -163,6 +163,8 @@ def test_sidebar_page_scroll_viewport_clears_mobile_navigation(
 ) -> None:
     page.set_viewport_size({"width": 390, "height": 844})
     page.goto(f"{pages_url}{route}")
+    if route == "/tasks":
+        page.get_by_role("button", name="Maybe later", exact=True).click()
     if route == "/settings/system-status":
         expect(page).to_have_url(f"{pages_url}/system?monitor=1")
         monitor = page.get_by_role("dialog", name="Monitor settings", exact=True)
