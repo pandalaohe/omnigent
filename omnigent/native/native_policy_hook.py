@@ -694,7 +694,12 @@ def post_evaluate_with_retry(
     # it so the server can re-park the SAME elicitation rather than opening
     # a second approval card. The ``elicit_evaluate_`` namespace is validated
     # server-side by ``_EVALUATE_HOOK_ELICITATION_ID_RE``.
-    elicitation_id = f"elicit_evaluate_{secrets.token_hex(16)}"
+    supplied_elicitation_id = eval_request.get("_omnigent_elicitation_id")
+    elicitation_id = (
+        supplied_elicitation_id
+        if isinstance(supplied_elicitation_id, str) and supplied_elicitation_id
+        else f"elicit_evaluate_{secrets.token_hex(16)}"
+    )
     request_body = {**eval_request, "_omnigent_elicitation_id": elicitation_id}
     retry_budget_s, max_backoff_s = _retry_budget_for_request(eval_request, outage_wait_s)
     bounded_wait = outage_wait_s is not None
@@ -897,7 +902,12 @@ async def post_evaluate_with_retry_async(
     import asyncio
 
     # One stable id for the whole retry sequence; see the sync helper.
-    elicitation_id = f"elicit_evaluate_{secrets.token_hex(16)}"
+    supplied_elicitation_id = eval_request.get("_omnigent_elicitation_id")
+    elicitation_id = (
+        supplied_elicitation_id
+        if isinstance(supplied_elicitation_id, str) and supplied_elicitation_id
+        else f"elicit_evaluate_{secrets.token_hex(16)}"
+    )
     request_body = {**eval_request, "_omnigent_elicitation_id": elicitation_id}
     retry_budget_s, max_backoff_s = _retry_budget_for_request(eval_request)
     deadline = time.monotonic() + retry_budget_s

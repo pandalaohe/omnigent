@@ -2073,7 +2073,7 @@ async def test_async_result_waker_posts_one_notice_when_inbox_holds_an_item(
     ]
     assert event["type"] == "message"
     text = event["data"]["content"][0]["text"]
-    assert text.startswith("[System: async task"), text
+    assert text.startswith("[System: background task"), text
     assert "handle_abc123" in text
     assert "sys_os_shell" in text
     assert "completed" in text
@@ -2153,7 +2153,7 @@ async def test_async_result_waker_rewakes_stranded_parent_on_next_turn(
     last_url, last_kwargs = server_client.posts[-1]
     assert last_url == f"/v1/sessions/{PARENT_SESSION_ID}/events"
     text = last_kwargs["json"]["data"]["content"][0]["text"]
-    assert text.startswith("[System: async task"), text
+    assert text.startswith("[System: background task"), text
     assert "handle_abc123" in text
 
     # The inbox stays undrained (no turn ever consumed it), so every later turn

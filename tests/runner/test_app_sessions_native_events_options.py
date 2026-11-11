@@ -1040,7 +1040,9 @@ async def test_events_codex_native_approval_mode_change_types_only_when_idle(
         # prints the confirmation line.
         if any(call[-1] == "2" for call in tmux_calls):
             return "• Permissions updated to Full Access\n"
-        return popup
+        if any(call[-1] == "/permissions" for call in tmux_calls):
+            return popup
+        return "› \x1b[2mType a message\x1b[0m\n\n  ? for shortcuts"
 
     async def _no_op_auto_create(*args: Any, **kwargs: Any) -> None:
         # Session creation would otherwise rewrite the bridge state below.
@@ -1089,7 +1091,6 @@ async def test_events_codex_native_approval_mode_change_types_only_when_idle(
         assert resp.json() == {"approval_mode": "full-access"}
         target = instance.tmux_target
         assert tmux_calls == [
-            ("send-keys", "-t", target, "Escape"),
             ("send-keys", "-t", target, "C-u"),
             ("send-keys", "-l", "-t", target, "/permissions"),
             ("send-keys", "-t", target, "Enter"),

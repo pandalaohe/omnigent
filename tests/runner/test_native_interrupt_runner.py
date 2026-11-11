@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -557,18 +558,30 @@ async def test_opencode_interrupt_stops_native_turn(
     routed = _patch_opencode_bridge(monkeypatch, state=_OPENCODE_STATE, client=client)
     runner, captured = _make_runner()
     captured["current_work_id"] = "work_oc"
+    server = SimpleNamespace(close=AsyncMock())
+    if method == "stop":
+        monkeypatch.setattr(
+            "omnigent.runner.native.orchestration._AUTO_OPENCODE_SERVERS", {"conv_oc": server}
+        )
 
     resp = await getattr(runner, method)("opencode-native", "conv_oc")
 
     assert isinstance(resp, Response) and resp.status_code == 204
-    assert client.interrupt_calls == ["ses_oc"] and client.closed
-    assert routed == {
-        "base_url": "http://127.0.0.1:9999/",
-        "auth_secret": "secret",
-        "directory": "/ws",
-    }
-    assert captured["wakes"] == []
-    assert runner.take_pending_interrupt("conv_oc") == (True, "work_oc")
+    if method == "interrupt":
+        assert client.interrupt_calls == ["ses_oc"] and client.closed
+        assert routed == {
+            "base_url": "http://127.0.0.1:9999/",
+            "auth_secret": "secret",
+            "directory": "/ws",
+        }
+        assert captured["wakes"] == []
+        assert runner.take_pending_interrupt("conv_oc") == (True, "work_oc")
+    else:
+        server.close.assert_awaited_once()
+        assert client.interrupt_calls == [] and not client.closed
+        assert routed == {}
+        assert captured["wakes"] == [("conv_oc", "cancelled", None)]
+        assert runner.take_pending_interrupt("conv_oc") == (False, None)
     stopped = await runner.stop("opencode-native", "conv_oc")
     assert stopped is not None and stopped.status_code == 204
 

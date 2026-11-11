@@ -608,7 +608,7 @@ async def test_only_pane_inferred_status_is_marked_inferred() -> None:
     app = await _native_app_with_session(conv_id)
     publish = app.state.session_resource_registry._session_status_publisher
     assert publish is not None
-    async with _runner_client(app) as client:
+    async with _runner_client(app, permission_harness="pi-native") as client:
         created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
         assert created.status_code == 201, created.text
         publish(conv_id, "running", "dialog open")
@@ -647,6 +647,8 @@ async def test_pane_inference_is_scoped_to_the_server_connection(
             updated_at=1,
             agent_id="ag",
             root_conversation_id=session_id,
+            host_id="test-host",
+            workspace="/opt/work/project",
         )
         return build_runner_session_init_payload(conversation, server_version="0.22.0")
 
@@ -669,7 +671,7 @@ async def test_pane_inference_is_scoped_to_the_server_connection(
 
     conv_id = "conv_native_current_server"
     monkeypatch.setattr("omnigent.runner.app._server_accepts_inferred_status", False)
-    app = await _native_app_with_session(conv_id)
+    app = await _native_app_with_session(conv_id, harness="codex-native")
     registry = app.state.session_resource_registry
     accepts_inferred_status = registry._accepts_inferred_status
     publish = registry._session_status_publisher
@@ -680,8 +682,10 @@ async def test_pane_inference_is_scoped_to_the_server_connection(
         assert created.status_code == 201, created.text
         assert accepts_inferred_status() is True
         # A current server falls back to this body when it cannot build an envelope.
-        created = await client.post(
-            "/v1/sessions", json={"session_id": "conv_native_id_only_init", "agent_id": "ag"}
+        created = await httpx.AsyncClient.post(
+            client,
+            "/v1/sessions",
+            json={"session_id": "conv_native_id_only_init", "agent_id": "ag"},
         )
         assert created.status_code == 201, created.text
         assert accepts_inferred_status() is True

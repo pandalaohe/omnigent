@@ -19,7 +19,7 @@ from tests.runner.test_permission_tier_runtime import _extension_runtime
 
 async def main():
     mode = sys.argv[3] if len(sys.argv) > 3 else "normal"
-    with tempfile.TemporaryDirectory(prefix="scoped-sdk-", dir=Path.cwd() / "tmp") as directory:
+    with tempfile.TemporaryDirectory(prefix="scoped-sdk-") as directory:
         root = Path(directory)
         runtime, *_ = _extension_runtime(root, "ask")
         (root / "workspace/marker.txt").write_text("REAL_SCOPED_READ\npi_receipt_" + "m" * 43)

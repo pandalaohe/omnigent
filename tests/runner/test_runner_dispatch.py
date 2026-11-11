@@ -2528,6 +2528,8 @@ async def test_runner_cancels_dispatch_with_turn(
     monkeypatch: pytest.MonkeyPatch, harness: str, control: str, streamed: bool, eof_first: bool
 ) -> None:
     """A stopped turn must finish its runner-owned tool tasks and response."""
+    from tests.runner.conftest import _runner_client
+
     started = asyncio.Event()
     finished = asyncio.Event()
     interrupted = asyncio.Event()
@@ -2570,6 +2572,8 @@ async def test_runner_cancels_dispatch_with_turn(
             return Stream([])
 
         async def post(self, *args: object, **kwargs: object) -> httpx.Response:
+            if args and args[0] == "/v1/permission-tier/bootstrap":
+                return httpx.Response(200, json={"installed": True})
             interrupted.set()
             return httpx.Response(200, json={})
 
@@ -2587,7 +2591,12 @@ async def test_runner_cancels_dispatch_with_turn(
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
     try:
-        async with _runner_test_client(app) as http:
+        async with _runner_client(app, permission_harness=harness) as http:
+            if harness == "pi":
+                created = await http.post(
+                    "/v1/sessions", json={"session_id": conv, "agent_id": "fixture"}
+                )
+                assert created.status_code == 201, created.text
             request_task = asyncio.create_task(
                 http.post(
                     f"/v1/sessions/{conv}/events",
@@ -9651,6 +9660,8 @@ async def test_sys_session_create_config_path_refuses_unsendable_overrides(
     creates: list[httpx.Request] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
         if request.url.path == "/v1/info":
             return httpx.Response(200, json=info) if info is not None else httpx.Response(503)
         creates.append(request)
@@ -9702,6 +9713,14 @@ async def test_sys_session_create_config_path_checks_effort_against_the_bundle_h
     creates: list[httpx.Request] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
+        if request.method == "GET":
+            return httpx.Response(
+                200, json={"id": "conv_child", "parent_session_id": "conv_caller"}
+            )
+        if request.method == "PATCH":
+            return httpx.Response(200, json={})
         creates.append(request)
         return httpx.Response(201, json={"session_id": "conv_child", "agent_id": "ag_new"})
 
@@ -16709,6 +16728,8 @@ async def test_sys_session_create_stamp_failure_fails_closed() -> None:
         "status": "failed",
         "error": "dispatch_stamp_failed",
         "detail": '500 {"error":"boom"}',
+        "guidance": "inspect this session before continuing. Do not create a "
+        "replacement; do not automatically resend the task.",
     }
     assert entry is None, "a failed stamp must not register the dispatch"
     assert ops == ["create", "patch"], "a failed stamp must not post the first message"

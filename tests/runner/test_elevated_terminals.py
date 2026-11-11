@@ -8,6 +8,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -41,6 +42,19 @@ from tests._helpers.polling import poll_until, poll_until_async
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 from tests.runner.test_session_resources import _make_capturing_instance, _WatcherCapture
+
+
+def _receive_binary_frame(websocket: Any) -> bytes:
+    """Skip attach metadata frames and return the next PTY output frame."""
+    while True:
+        message = websocket.receive()
+        if message.get("type") in {"websocket.disconnect", "websocket.close"}:
+            raise WebSocketDisconnect(
+                code=message.get("code", 1000), reason=message.get("reason", "")
+            )
+        data = message.get("bytes")
+        if isinstance(data, bytes):
+            return data
 
 
 @pytest.fixture
@@ -282,6 +296,8 @@ async def test_sign_in_readers_ignore_admin_native_name_collision(admin, monkeyp
     service = build_sign_in_watch(
         _background_tasks=set(),
         _session_harness_name=lambda _: "codex-native",
+        _claim_sign_in_release=lambda _: False,
+        _release_sign_in_hold=lambda _: None,
         _sign_in_watchers=watchers,
         resource_registry=resources,
         server_client=NullServerClient(),
@@ -360,12 +376,12 @@ def test_stand_in_prompt_attach_interrupt_and_registry_exit(monkeypatch, tmp_pat
             path + f"/terminal_shell_admin/attach?elevated_instance_id={instance.instance_id}"
         ) as ws:
             while b"Password:" not in output:
-                output += ws.receive_bytes()
+                output += _receive_binary_frame(ws)
             before = instance.last_input_at
             ws.send_bytes(b"\x03")
             with pytest.raises(WebSocketDisconnect) as closed:
                 while True:
-                    ws.receive_bytes()
+                    _receive_binary_frame(ws)
         poll_until(lambda: registry.get("session", "shell", "admin") is None, timeout_s=5)
         assert instance.last_input_at >= before
         assert closed.value.code in (4404, 4405)

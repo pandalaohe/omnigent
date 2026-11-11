@@ -893,7 +893,7 @@ async def test_interrupt_or_stop_during_the_hold_drops_the_held_message(
         await _until(lambda: sid in app.state.sign_in_holds)
         hold = app.state.sign_in_holds[sid]
         response = await client.post(f"/v1/sessions/{sid}/events", json={"type": action})
-        assert response.status_code == 204
+        assert response.status_code == (200 if action == "interrupt" else 204)
         # The sign-in completes after the control.
         hold.waiting = False
         await asyncio.sleep(0.1)  # custom-lint: disable=sleep-then-assert -- no send in window

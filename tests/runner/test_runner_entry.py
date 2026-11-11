@@ -2080,6 +2080,8 @@ def test_create_app_native_pane_idle_windows_follow_runner_config(
         assert reaper._sub_agent_idle_timeout_s == 0
         return
     resource_registry = app.state.session_resource_registry
+    subagent_work.unregister_child_session("conv_idle")
+    subagent_work.unregister_subagent_work_for_session("conv_idle")
     for conv in ("conv_idle", "conv_child"):
         resource_registry.terminal_registry._by_conversation[conv] = {
             ("codex", "main"): make_test_terminal_instance("codex", "main", tmp_path / conv)

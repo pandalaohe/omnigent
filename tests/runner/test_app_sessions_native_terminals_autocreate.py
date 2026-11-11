@@ -2640,7 +2640,7 @@ async def test_auto_create_claude_terminal_child_question_policy(
 
     captured: dict[str, Any] = {}
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         terminal_registry = None
 
         async def launch_required_terminal(
@@ -4156,6 +4156,7 @@ async def test_auto_create_claude_terminal_cold_resume_retains_confirmed_sid(
         terminal_registry = None
 
         def __init__(self, *, fail_first: bool) -> None:
+            super().__init__()
             self._fail_first = fail_first
             self.launch_args: list[list[str]] = []
 
@@ -7688,7 +7689,7 @@ async def _run_opencode_launch(
         await _launch_opencode(
             NativeLaunchContext(
                 session_id=session_id,
-                resource_registry=object(),  # type: ignore[arg-type]
+                resource_registry=SessionResourceRegistry(),
                 publish_event=lambda *_: None,
                 agent_spec=agent_spec,
                 global_instructions=global_instructions,
@@ -7827,11 +7828,12 @@ async def test_launch_opencode_registers_session_instructions_file(
     )
 
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    assert config["instructions"] == [str(bridge_dir / "session_instructions.md")]
-    assert (bridge_dir / "session_instructions.md").read_text(encoding="utf-8") == (
+    instructions_file = bridge_dir / "xdg-config" / "opencode" / "AGENTS.md"
+    assert config["instructions"] == [str(instructions_file)]
+    assert instructions_file.read_text(encoding="utf-8") == (
         "Be a concise, careful coding assistant.\n\n"
         + EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
-        + "\n\nG"
+        + "\n\nG\n"
     )
 
 
@@ -7846,7 +7848,8 @@ async def test_launch_opencode_overwrites_stale_instructions_file(
     monkeypatch.setattr(opencode_bridge, "_BRIDGE_ROOT", tmp_path / "opencode-native")
     stale_bridge_dir = opencode_bridge.bridge_dir_for_bridge_id("opencode-launch-session")
     stale_bridge_dir.mkdir(parents=True, exist_ok=True)
-    stale_file = stale_bridge_dir / "session_instructions.md"
+    stale_file = stale_bridge_dir / "xdg-config" / "opencode" / "AGENTS.md"
+    stale_file.parent.mkdir(parents=True, exist_ok=True)
     stale_file.write_text("stale text from an earlier launch", encoding="utf-8")
 
     agent_spec = AgentSpec(
@@ -7860,7 +7863,8 @@ async def test_launch_opencode_overwrites_stale_instructions_file(
     )
 
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    assert config["instructions"] == [str(bridge_dir / "session_instructions.md")]
-    assert (bridge_dir / "session_instructions.md").read_text(encoding="utf-8") == (
-        EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+    instructions_file = bridge_dir / "xdg-config" / "opencode" / "AGENTS.md"
+    assert config["instructions"] == [str(instructions_file)]
+    assert instructions_file.read_text(encoding="utf-8") == (
+        EMBEDDED_BROWSER_PRIORITY_INSTRUCTION + "\n"
     )

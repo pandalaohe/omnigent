@@ -7851,7 +7851,7 @@ def create_runner_app(
                     if resolved_dir is None:
                         try:
                             resolved_dir = await _claude_prompt_bridge_dir(session_id)
-                        except (httpx.HTTPError, RuntimeError, OSError):
+                        except (HTTPException, httpx.HTTPError, RuntimeError, OSError):
                             # A failed lookup must not strand the queue; try again next poll.
                             if not warned:
                                 warned = True
@@ -8594,6 +8594,8 @@ def create_runner_app(
                     only_if_work_id=entry.work_id if entry else only_if_work_id,
                     terminal=terminal,
                     _retry_bypass=True,
+                    confirmed_completion=confirmed_completion,
+                    confirmed_cancellation=confirmed_cancellation,
                 )
 
             task = asyncio.create_task(accept())

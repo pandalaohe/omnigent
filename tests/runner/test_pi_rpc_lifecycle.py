@@ -44,6 +44,7 @@ async def test_real_pi_tool_survives_tier_and_harness_changes(
     agent_dir.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(home / ".omnigent"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(home / ".omnigent"))
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(agent_dir))
     monkeypatch.setenv("PI_OFFLINE", "1")
     monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", home / ".omnigent/pi-native")
@@ -115,6 +116,9 @@ async def test_real_pi_tool_survives_tier_and_harness_changes(
                             "workspace": conv.workspace,
                             "labels": conv.labels,
                             "harness_override": "pi",
+                            "permission_tier_state": "ready",
+                            "permission_tier_revision": self.revision,
+                            "permission_tiers_capability": True,
                         },
                     )
                 if url.endswith("/items"):

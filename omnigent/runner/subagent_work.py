@@ -753,7 +753,8 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
     for child_id in list(_subagent_work_by_parent.get(session_id, set())):
         _seen_subagent_terminal_ids.pop(child_id, None)
         _subagent_work_by_child.pop(child_id, None)
-        _drained_delivered_subagent_results.pop(child_id, None)
+        if child_id not in _provisional_cancelled_subagent_work:
+            _drained_delivered_subagent_results.pop(child_id, None)
         _provisional_cancelled_subagent_work.pop(child_id, None)
         _subagent_work_origins.pop(child_id, None)
         _subagent_retained_state_parents.pop(child_id, None)
@@ -764,7 +765,8 @@ def unregister_subagent_work_for_session(session_id: str) -> None:
         if parent_id != session_id:
             continue
         _seen_subagent_terminal_ids.pop(child_id, None)
-        _drained_delivered_subagent_results.pop(child_id, None)
+        if child_id not in _provisional_cancelled_subagent_work:
+            _drained_delivered_subagent_results.pop(child_id, None)
         _provisional_cancelled_subagent_work.pop(child_id, None)
         _subagent_work_origins.pop(child_id, None)
         _subagent_retained_state_parents.pop(child_id, None)
@@ -1428,11 +1430,31 @@ def mark_subagent_work_terminal(
             delivered_now=False,
             reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
         )
+    if (
+        entry.status == "cancelled"
+        and entry.delivered
+        and not confirms_cancellation
+        and identity_key is None
+        and (entry.cancellation_confirmed or not corrects_cancellation)
+    ):
+        return _SubagentDeliveryAck(
+            entry=entry,
+            delivered=True,
+            delivered_now=False,
+            reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
+        )
     if entry.status in _SUBAGENT_TERMINAL_STATUSES:
         if confirms_cancellation and entry.status == "cancelled":
             # A confirmed kill makes the delivered optimistic cancellation
             # final; a late survivor completion can no longer correct it.
             entry.cancellation_confirmed = True
+            if entry.delivered:
+                return _SubagentDeliveryAck(
+                    entry=entry,
+                    delivered=True,
+                    delivered_now=False,
+                    reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
+                )
         if (
             corrects_cancellation
             and entry.status == "cancelled"

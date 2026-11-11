@@ -1617,6 +1617,11 @@ async def test_native_revision_refreshes_relay_before_turn_without_reset(
     harness_name: str,
 ) -> None:
     """Same-agent selection edits replace relay tools before native message delivery."""
+    if harness_name == "pi-native":
+        monkeypatch.setattr(
+            "omnigent.harnesses.pi_native.bridge.verify_pi_permission_installation",
+            lambda *_: True,
+        )
     session_id = f"conv_{uuid.uuid4().hex[:12]}"
     bridge_id = f"bridge_{uuid.uuid4().hex[:12]}"
     bridge_dir = prepare_bridge_dir(bridge_id, workspace=tmp_path)
@@ -1627,6 +1632,17 @@ async def test_native_revision_refreshes_relay_before_turn_without_reset(
     tools_at_delivery: list[set[str]] = []
 
     class GatewayClient(_SwitchableServerClient):
+        async def get(self, url: str, **kwargs: Any) -> _SwitchableServerClient._Response:
+            response = await super().get(url, **kwargs)
+            return self._Response(
+                {
+                    **response.json(),
+                    "permission_tier_state": "ready",
+                    "permission_tier_revision": 3,
+                    "permission_tiers_capability": True,
+                }
+            )
+
         async def post(self, url: str, **kwargs: Any) -> _SwitchableServerClient._Response:
             if kwargs.get("json", {}).get("method") == "tools/list":
                 return self._Response(
@@ -1661,6 +1677,22 @@ async def test_native_revision_refreshes_relay_before_turn_without_reset(
             transport=httpx.ASGITransport(app=app), base_url="http://runner"
         ) as client:
             try:
+                if harness_name == "pi-native":
+                    from dataclasses import replace
+
+                    from omnigent.permission_tiers.host import write_host_permission_state
+                    from tests.runner.test_permission_tier_runtime import _runtime
+
+                    _runtime(tmp_path, "auto", runtime=app.state.permission_tiers)
+                    runtime = app.state.permission_tiers
+                    state = runtime._states.pop("session-a")
+                    runtime._states[session_id] = replace(state, session_id=session_id)
+                    runtime._paths[session_id] = runtime._paths.pop("session-a")
+                    runtime._harnesses.pop("session-a")
+                    runtime._harnesses[session_id] = "pi-native"
+                    write_host_permission_state(
+                        runtime._paths[session_id], runtime._states[session_id]
+                    )
                 # Seed the shared relay; native CLI startup is outside this test.
                 await _launch_bridged(client, session_id)
                 initial_relay = json.loads(relay_file.read_text())

@@ -135,8 +135,12 @@ async def test_claude_program_status_real_launch_and_fallback(
     terminals = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminals)
     statuses: list[tuple[str, str | None]] = []
+    counts: list[int | None] = []
     registry.set_session_status_publisher(
-        lambda _, state, reason, _count=None, _tasks=None: statuses.append((state, reason))
+        lambda _, state, reason, count=None, _tasks=None: (
+            statuses.append((state, reason)),
+            counts.append(count),
+        )
     )
     background: list[bool] = []
     registry.set_session_background_publisher(lambda _, running: background.append(running))
@@ -243,7 +247,9 @@ async def test_claude_program_status_real_launch_and_fallback(
         await wait_background(True)
         write_status_file("idle")
         await wait_background(False)
-        assert len(statuses) == published
+        assert len(statuses) == published + 1
+        assert statuses[published:] == [("idle", None)]
+        assert counts[published:] == [0]
         for key in ("c", "u"):
             await instance.send(keys=key)
             await wait_status("idle")  # Falls back to the still-unchanged status file.
@@ -2032,7 +2038,7 @@ async def test_stop_leaving_a_background_agent_settles_a_busy_session(
                 }
             )
         )
-    on_tick, statuses, registry, status_file = await _observe_native_with_real_poller(
+    on_tick, statuses, _counts, registry, status_file = await _observe_native_with_real_poller(
         tmp_path, monkeypatch, session_id, program_status_path=report
     )
     bridge_dir = bridge_dir_for_conversation_id(session_id)
@@ -2085,7 +2091,13 @@ async def test_stop_leaving_a_background_agent_settles_a_busy_session(
     )
     assert statuses == settled
 
-    restarted_tick, restarted_statuses, restarted, _ = await _observe_native_with_real_poller(
+    (
+        restarted_tick,
+        restarted_statuses,
+        _counts,
+        restarted,
+        _status_file,
+    ) = await _observe_native_with_real_poller(
         tmp_path, monkeypatch, session_id, program_status_path=report
     )
     restarted_tick()
@@ -2320,11 +2332,11 @@ async def test_next_turn_gets_its_own_hidden_input_box_delay(
 
 
 # Status changes that can land between an inference and its delivery, with the edge each leaves.
-_INTERVENING_STATUS_EDGES: dict[str, tuple[str, str | None]] = {
-    "idle": ("idle", None),
-    "failed": ("failed", None),
-    "dialog-open": ("running", "dialog open"),
-    "new-turn": ("running", None),
+_INTERVENING_STATUS_EDGES: dict[str, tuple[str, str | None, int | None]] = {
+    "idle": ("idle", None, None),
+    "failed": ("failed", None, None),
+    "dialog-open": ("running", "dialog open", None),
+    "new-turn": ("running", None, None),
 }
 
 
@@ -2332,7 +2344,9 @@ def _change_session_status(
     registry: SessionResourceRegistry, session_id: str, intervening: str
 ) -> None:
     if intervening == "dialog-open":
-        registry._claim_status_edge(session_id, "running", "dialog open", explicit_activity=True)
+        registry._claim_status_edge(
+            session_id, "running", "dialog open", None, explicit_activity=True
+        )
     elif intervening == "new-turn":
         registry.note_external_session_status(session_id, "idle")
         registry.note_external_session_status(session_id, "running")
@@ -2471,7 +2485,7 @@ async def test_hidden_input_box_alert_is_raised_again_after_a_reconnect(
     await session.tick_at(117.0, _CLAUDE_NOTICE_PANE)
     # The new server holds plain running: the resync republished it, or the alert never left.
     assert session.published[-1] == ("running", None)
-    assert session.registry._published_status_edge(session_id) == ("running", None)
+    assert session.registry._published_status_edge(session_id) == ("running", None, None)
 
     supported["value"] = True
     raised = len(session.inferred_edges)
@@ -2884,7 +2898,7 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(
     if hold_edges:
         # The status poller's edges for a turn that left a background agent running.
         for status in hold_edges:
-            assert registry._claim_status_edge("conv_idle", status, None)
+            assert registry._claim_status_edge("conv_idle", status, None, None)
     else:
         on_idle()
     # Then the pane disappeared (e.g. Claude Code exited cleanly).

@@ -492,8 +492,11 @@ async def test_keep_warm_ping_holds_its_own_dialog_open_status_edge(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_keep_warm_ping_publishes_a_real_busy_edge_mid_ping(tmp_path: Path) -> None:
+async def test_keep_warm_ping_publishes_a_real_busy_edge_mid_ping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A running/waiting edge with no (or another) reason is a real turn: it publishes."""
+    monkeypatch.setattr("omnigent.runner.app._server_version", "0.22.0")
     harness = _StatusEdgeHarnessClient(
         [(_CONV, "running", None), (_CONV, "waiting", "permission prompt")]
     )
@@ -557,8 +560,16 @@ async def test_keep_warm_dismiss_failure_leaves_the_runner_status_idle(tmp_path:
     registry = app.state.session_resource_registry
     pollers: list[_FakeStatusFilePoller] = []
 
-    def _fake_build(*, session_id: str, instance: Any, on_status: Any) -> _FakeStatusFilePoller:
-        del session_id, instance
+    def _fake_build(
+        *,
+        session_id: str,
+        instance: Any,
+        on_status: Any,
+        on_replay: Any,
+        on_failure: Any,
+        on_background: Any = None,
+    ) -> _FakeStatusFilePoller:
+        del session_id, instance, on_replay, on_failure, on_background
         poller = _FakeStatusFilePoller(on_status)
         pollers.append(poller)
         return poller

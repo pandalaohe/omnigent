@@ -195,11 +195,26 @@ class _RelayStubRegistry:
     def set_terminal_activity_publisher(self, publisher: object) -> None:
         del publisher
 
-    def set_session_status_publisher(self, publisher: object) -> None:
-        del publisher
+    def set_session_status_publisher(
+        self, publisher: object, *, accepts_inferred_status: object = None
+    ) -> None:
+        del publisher, accepts_inferred_status
 
     def set_terminal_exit_publisher(self, publisher: object) -> None:
         del publisher
+
+    def set_session_failure_publisher(self, publisher: object) -> None:
+        del publisher
+
+    def set_session_background_publisher(self, publisher: object) -> None:
+        del publisher
+
+    def client_surface(self, session_id: str) -> str:
+        del session_id
+        return "unknown"
+
+    def client_surface_env(self, session_id: str) -> dict[str, str]:
+        return {"OMNIGENT_CLIENT_SURFACE": self.client_surface(session_id)}
 
     def set_client_surface(self, session_id: str, surface: str | None) -> None:
         del session_id, surface

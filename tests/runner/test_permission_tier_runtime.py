@@ -2068,6 +2068,7 @@ async def test_full_mcp_call_runs_only_with_ready_runtime(
     ) as client:
         register_mcp_routes(
             app,
+            wake_on_async_result=lambda *_args: None,
             _publish_event=lambda *_args: None,
             _recover_undrained_subagent_results=none,
             _resolve_conversation_id=none,  # type: ignore[arg-type]
@@ -2210,6 +2211,7 @@ async def test_mcp_lease_finishes_in_actual_execution_callback(
     ) as client:
         register_mcp_routes(
             app,
+            wake_on_async_result=lambda *_args: None,
             _publish_event=lambda *_args: None,
             _recover_undrained_subagent_results=none,
             _resolve_conversation_id=none,  # type: ignore[arg-type]
@@ -2416,6 +2418,7 @@ async def test_mcp_lease_survives_detached_request_until_tool_finishes(
     ) as client:
         register_mcp_routes(
             app,
+            wake_on_async_result=lambda *_args: None,
             _publish_event=lambda *_args: None,
             _recover_undrained_subagent_results=none,
             _resolve_conversation_id=none,  # type: ignore[arg-type]

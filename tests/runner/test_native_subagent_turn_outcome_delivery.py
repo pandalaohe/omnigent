@@ -480,7 +480,7 @@ async def test_confirmed_completion_corrects_drained_grace_cancel(
             # drained-delivery tombstone for this child.
             for payload in cancelled:
                 await _cleanup_drained_subagent_work(payload, server_client=None)
-            assert rig.child_id in subagent_work._drained_delivered_subagent_children
+            assert rig.child_id in subagent_work._drained_delivered_subagent_results
 
             resp = await rig.post_status(
                 client, {"status": "idle", "turn_completed": True, "output": "the verdict"}
@@ -532,7 +532,7 @@ async def test_confirmed_stop_blocks_late_completion_after_drain(
                 # The parent drains the cancellation, recording the drained tombstone.
                 for payload in cancelled:
                     await _cleanup_drained_subagent_work(payload, server_client=None)
-                assert rig.child_id in subagent_work._drained_delivered_subagent_children
+                assert rig.child_id in subagent_work._drained_delivered_subagent_results
 
             # The runner confirms the kill, making the cancellation final.
             resp = await client.post(
@@ -544,7 +544,7 @@ async def test_confirmed_stop_blocks_late_completion_after_drain(
             # and a still-registered entry is confirmed in place.
             assert rig.child_id not in subagent_work._provisional_cancelled_subagent_work
             if drain_before_stop:
-                assert rig.child_id in subagent_work._drained_delivered_subagent_children
+                assert rig.child_id in subagent_work._drained_delivered_subagent_results
             else:
                 entry = subagent_work.get_subagent_work(rig.child_id)
                 assert entry is not None and entry.cancellation_confirmed
@@ -560,7 +560,7 @@ async def test_confirmed_stop_blocks_late_completion_after_drain(
         assert rig.child_id not in subagent_work._provisional_cancelled_subagent_work
     finally:
         rig.close()
-        subagent_work._drained_delivered_subagent_children.discard(rig.child_id)
+        subagent_work._drained_delivered_subagent_results.pop(rig.child_id, None)
         subagent_work._provisional_cancelled_subagent_work.pop(rig.child_id, None)
 
 
@@ -750,7 +750,7 @@ def test_parent_teardown_clears_drained_provisional_cancellation() -> None:
         # The parent drains the optimistic cancellation, retaining the record.
         subagent_work.unregister_subagent_work(child_id, remember_drained_delivery=True)
         assert child_id in subagent_work._provisional_cancelled_subagent_work
-        assert child_id in subagent_work._drained_delivered_subagent_children
+        assert child_id in subagent_work._drained_delivered_subagent_results
 
         # The parent session is deleted.
         subagent_work._session_inboxes_ref.pop(parent_id, None)
@@ -766,7 +766,7 @@ def test_parent_teardown_clears_drained_provisional_cancellation() -> None:
         assert parent_id not in subagent_work._subagent_work_by_parent
     finally:
         subagent_work.unregister_subagent_work_for_session(parent_id)
-        subagent_work._drained_delivered_subagent_children.discard(child_id)
+        subagent_work._drained_delivered_subagent_results.pop(child_id, None)
         subagent_work._provisional_cancelled_subagent_work.pop(child_id, None)
         subagent_work._session_inboxes_ref.pop(parent_id, None)
 
@@ -798,7 +798,7 @@ def test_new_send_clears_drained_optimistic_cancellation() -> None:
         assert ack.delivered_now
         subagent_work.unregister_subagent_work(child_id, remember_drained_delivery=True)
         assert child_id in subagent_work._provisional_cancelled_subagent_work
-        assert child_id in subagent_work._drained_delivered_subagent_children
+        assert child_id in subagent_work._drained_delivered_subagent_results
 
         # Dispatch B reuses the same child session, superseding the retained state.
         entry_b = subagent_work.register_subagent_work(
@@ -808,11 +808,11 @@ def test_new_send_clears_drained_optimistic_cancellation() -> None:
             title="B",
         )
         assert child_id not in subagent_work._provisional_cancelled_subagent_work
-        assert child_id not in subagent_work._drained_delivered_subagent_children
+        assert child_id not in subagent_work._drained_delivered_subagent_results
         assert subagent_work.get_subagent_work(child_id) is entry_b
     finally:
         subagent_work.unregister_subagent_work_for_session(parent_id)
-        subagent_work._drained_delivered_subagent_children.discard(child_id)
+        subagent_work._drained_delivered_subagent_results.pop(child_id, None)
         subagent_work._provisional_cancelled_subagent_work.pop(child_id, None)
         subagent_work._session_inboxes_ref.pop(parent_id, None)
 
@@ -876,7 +876,7 @@ def test_corrected_completion_redelivers_when_inbox_returns() -> None:
         assert inbox.empty()
     finally:
         subagent_work.unregister_subagent_work_for_session(parent_id)
-        subagent_work._drained_delivered_subagent_children.discard(child_id)
+        subagent_work._drained_delivered_subagent_results.pop(child_id, None)
         subagent_work._provisional_cancelled_subagent_work.pop(child_id, None)
         subagent_work._session_inboxes_ref.pop(parent_id, None)
 

@@ -97,12 +97,14 @@ async def test_opencode_work_read_uses_owned_requests_and_exact_message_events(
             action = OpenCodeHttpTransport(bridge_dir=server.bridge_dir).send_prompt(
                 "primary", NativePrompt(text="work")
             )
-        else:
-            action = (
-                native.summarize("primary", provider_id="test", model_id="test")
-                if operation == "summarize"
-                else getattr(native, operation)("primary", {"parts": []})
+        elif operation in {"prompt", "prompt_async"}:
+            action = native.prompt(
+                "primary",
+                text="work",
+                delivery="queue" if operation == "prompt_async" else "steer",
             )
+        else:
+            action = native.compact("primary")
         task = asyncio.create_task(action)
         try:
             await asyncio.wait_for(entered.wait(), 2)
@@ -142,26 +144,22 @@ async def test_opencode_work_read_uses_owned_requests_and_exact_message_events(
                 )
 
             responses[0] = stream
-            observed = [event async for event in native.events()]
+            observed = [event async for event in native.stream_events()]
             assert len(observed) == len(entries)
 
         def message(identifier, *, completed=False):
             return {
-                "type": "message.updated",
-                "properties": {
-                    "info": {
-                        "id": identifier,
-                        "sessionID": "primary",
-                        "role": "assistant",
-                        "time": {"completed": 10} if completed else {"created": 1},
-                    }
+                "type": "session.step.ended" if completed else "session.step.started",
+                "data": {
+                    "assistantMessageID": identifier,
+                    "sessionID": "primary",
                 },
             }
 
         await events(message("old"), message("new"), message("old", completed=True))
         assert (await read()).inventory.observations[0].live_turn
         malformed = message("new")
-        malformed["properties"]["info"]["time"] = {"completed": True}
+        malformed["data"]["assistantMessageID"] = True
         await events(malformed)
         assert (await read()).inventory.observations[0].live_turn
         await events({"type": "session.idle", "properties": {"sessionID": "primary"}})
@@ -198,7 +196,7 @@ async def test_opencode_work_links_retain_uncertain_lifetimes(context_server, mo
         await asyncio.Event().wait()
 
     responses[0] = pending
-    task = asyncio.create_task(native.prompt_async("primary", {"parts": []}))
+    task = asyncio.create_task(native.prompt("primary", text="work"))
     await asyncio.wait_for(entered.wait(), 2)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -249,14 +247,8 @@ async def test_opencode_work_events_are_bounded_and_do_not_cross_owner(context_s
                     "data: "
                     + json.dumps(
                         {
-                            "type": "message.updated",
-                            "properties": {
-                                "info": {
-                                    "id": identifier,
-                                    "sessionID": "primary",
-                                    "role": "assistant",
-                                }
-                            },
+                            "type": "session.step.started",
+                            "data": {"assistantMessageID": identifier, "sessionID": "primary"},
                         }
                     )
                     + "\n\n"
@@ -265,7 +257,7 @@ async def test_opencode_work_events_are_bounded_and_do_not_cross_owner(context_s
             )
 
         responses[0] = reply
-        return [event async for event in native.events()]
+        return [event async for event in native.stream_events()]
 
     await stream("old-message")
     assert server.context_work_snapshot_v2("conversation")[1].live_turn
@@ -284,7 +276,7 @@ async def test_opencode_work_events_are_bounded_and_do_not_cross_owner(context_s
             return httpx.Response(200, json={"id": "primary"})
 
         responses[0] = created
-        await replacement.create_session()
+        await replacement.create_session(title="Replacement", directory="/opt/work/project")
         await stream("stale-from-old-client")
         source, row = server.context_work_snapshot_v2("conversation")
         assert row.runtime_id == "replacement-owner" and not row.live_turn
