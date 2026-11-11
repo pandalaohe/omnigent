@@ -82,7 +82,7 @@ function navigate(win, eventName, url, ...rest) {
   return prevented;
 }
 
-function harness({ refresh, signIn, accepted = new Set(["valid"]) } = {}) {
+function harness({ refresh, signIn, accepted = new Set(["valid"]), now } = {}) {
   const session = fakeSession();
   const credentials = {
     refreshSession: mock.fn(refresh ?? (async () => ({ token: "valid", expiresIn: 3600 }))),
@@ -105,6 +105,7 @@ function harness({ refresh, signIn, accepted = new Set(["valid"]) } = {}) {
     onAuthRequired: (win, serverUrl, error) => authRequired.push({ win, serverUrl, error }),
     onSignedOut: (win, serverUrl, details) => signedOut.push({ win, serverUrl, ...details }),
     fetchFn,
+    now,
     setTimeoutFn: (fn, delay) => {
       const timer = { fn, delay };
       timers.push(timer);
@@ -433,5 +434,86 @@ describe("window lifecycle", () => {
     const win = h.connect();
     h.origins.set(win, "https://other.example");
     assert.equal(navigate(win, "will-navigate", `${SERVER}/auth/login`), false);
+  });
+});
+
+describe("browser authority lifecycle", () => {
+  const browser = `header.${Buffer.from(JSON.stringify({ browser_session: true })).toString("base64url")}.signature`;
+
+  it("keeps native authority until expiry, renews without it, then explicitly signs in again", async () => {
+    let clock = Date.now();
+    const h = harness({
+      now: () => clock,
+      accepted: new Set([browser, "grant"]),
+      signIn: async () => ({ token: browser, expiresIn: 28800 }),
+      refresh: async () => ({ token: "grant", expiresIn: 3600 }),
+    });
+    await h.auth.ensureSession(SERVER, COOKIE, { interactive: true, forceBrowserSignIn: true });
+    const win = h.connect();
+    await tick();
+    const timer = h.timers.at(-1);
+    assert.ok(timer.delay >= 28_799_000, "browser cookie must retain its full lifetime");
+    assert.equal(h.session.cookies.jar.get(COOKIE).value, browser);
+    navigate(win, "will-navigate", `${SERVER}/auth/login`);
+    await tick();
+    await tick();
+    assert.equal(
+      h.session.cookies.jar.get(COOKIE).value,
+      browser,
+      "early renewal must preserve a valid browser cookie",
+    );
+    clock += 28_800_000;
+    h.timers.at(-1).fn();
+    await tick();
+    await tick();
+    assert.equal(
+      h.session.cookies.jar.get(COOKIE).value,
+      "grant",
+      "renewal cannot carry browser authority",
+    );
+    const refreshCount = h.credentials.refreshSession.mock.callCount();
+    assert.equal(navigate(win, "will-navigate", `${SERVER}/auth/login?native_reauth=1`), true);
+    await tick();
+    await tick();
+    assert.equal(
+      h.credentials.refreshSession.mock.callCount(),
+      refreshCount,
+      "recovery bypasses refresh",
+    );
+    assert.equal(h.credentials.signInWithBrowser.mock.callCount(), 2);
+    assert.equal(h.session.cookies.jar.get(COOKIE).value, browser);
+    assert.deepEqual(win.loads, [`${SERVER}/c/1`, `${SERVER}/c/1`]);
+  });
+
+  it("recovers a valid old unmarked cookie without reusing or refreshing it", async () => {
+    const h = harness();
+    await h.session.cookies.set({ url: SERVER, name: COOKIE, value: "valid" });
+    const win = h.connect();
+    navigate(win, "will-navigate", `${SERVER}/auth/login?native_reauth=1`);
+    await tick();
+    await tick();
+    assert.equal(h.credentials.signInWithBrowser.mock.callCount(), 1);
+    assert.equal(h.credentials.refreshSession.mock.callCount(), 0);
+    assert.deepEqual(win.loads, [`${SERVER}/c/1`]);
+  });
+
+  it("does not let an overlapping background refresh replace a fresh browser cookie", async () => {
+    let release;
+    const h = harness({
+      accepted: new Set([browser, "valid"]),
+      signIn: async () => ({ token: browser, expiresIn: 28800 }),
+      refresh: () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    });
+    const win = h.connect();
+    navigate(win, "will-navigate", `${SERVER}/auth/login`);
+    navigate(win, "will-navigate", `${SERVER}/auth/login?native_reauth=1`);
+    await tick();
+    release({ token: "valid", expiresIn: 3600 });
+    await tick();
+    await tick();
+    assert.equal(h.session.cookies.jar.get(COOKIE).value, browser);
   });
 });

@@ -16,6 +16,8 @@
  */
 
 import { stripBasePath, withBasePath } from "./basePath";
+import { toast } from "sonner";
+import { isElectronShell } from "./nativeBridge";
 import { PERMISSION_TIERS_PROTOCOL_HEADERS } from "./permissionTierProtocol";
 import { getCachedServerInfo } from "./capabilities";
 import {
@@ -822,6 +824,24 @@ export async function authenticatedFetch(
     clearHostKeyless(derivedHostId);
   }
 
+  if (
+    (res.status === 401 || res.status === 403) &&
+    res.headers?.get("X-Omnigent-Auth-Recovery") === "browser-session-required" &&
+    isElectronShell() &&
+    currentIdentityConnectionId() === dispatchConnectionId
+  ) {
+    toast.error("A trusted human browser session is required", {
+      id: "browser-session-required",
+      action: {
+        label: "Sign in again",
+        onClick: () => {
+          if (currentIdentityConnectionId() !== dispatchConnectionId) return;
+          window.location.assign(withBasePath("/auth/login?native_reauth=1"));
+        },
+      },
+    });
+    return res;
+  }
   handleUnauthorizedResponse(input, res);
   return res;
 }

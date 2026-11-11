@@ -502,3 +502,73 @@ async def test_native_exchange_requires_the_exact_redirect_uri(
 
     assert resp.status_code == 400
     assert resp.json() == {"error": "invalid_grant"}
+
+
+@pytest.mark.parametrize("initial", ["native", "legacy"])
+async def test_native_browser_authority_refresh_and_recovery(monkeypatch, tmp_path, initial):
+    """Native sign-in restores browser authority; real refresh grants never do."""
+    from fastapi import HTTPException
+
+    from omnigent.server.device_grant_store import DeviceGrantStore
+    from omnigent.server.oidc import mint_session_cookie
+    from omnigent.server.routes.device_auth import create_oauth_token_router
+
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "0")
+    monkeypatch.setenv("OMNIGENT_WS_ALLOWED_ORIGINS", "http://test")
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/grants.db")
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=_config())
+    transport = _transport(device_grant_store=store)
+    transport.app.include_router(create_oauth_token_router(provider, store))
+    async with _client(transport) as client:
+        state, cookie = await _start(client)
+        code = _loopback_query(await _callback(client, state, cookie))["code"]
+        login = await _exchange(client, code=code, code_verifier=_VERIFIER, redirect_uri=_REDIRECT)
+        assert login.status_code == 200
+        fresh = login.json()
+
+        def browser_action(token, origin="http://test"):
+            request = Request(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/terminal",
+                    "headers": [
+                        (b"origin", origin.encode()),
+                        (b"cookie", f"{provider.session_cookie_name}={token}".encode()),
+                    ],
+                }
+            )
+            require_terminal_browser_session(request, provider)
+
+        if initial == "native":
+            browser_action(fresh["token"])
+        else:
+            legacy = mint_session_cookie("alice@example.com", _TEST_SECRET, 8, "github")
+            with pytest.raises(HTTPException) as refused:
+                browser_action(legacy)
+            assert refused.value.headers == {
+                "X-Omnigent-Auth-Recovery": "browser-session-required"
+            }
+        renewed = await client.post(
+            "/oauth/token",
+            data={"grant_type": "refresh_token", "refresh_token": fresh["refresh_token"]},
+        )
+        assert renewed.status_code == 200
+        claims = jwt.decode(renewed.json()["access_token"], _TEST_SECRET, algorithms=["HS256"])
+        assert "browser_session" not in claims
+        assert claims["grant_id"]
+        with pytest.raises(HTTPException) as refused:
+            browser_action(renewed.json()["access_token"])
+        assert refused.value.status_code == 403
+        assert refused.value.headers == {"X-Omnigent-Auth-Recovery": "browser-session-required"}
+        browser_action(fresh["token"])  # Renewal does not revoke the unexpired browser cookie.
+        with pytest.raises(HTTPException) as bad_origin:
+            browser_action(renewed.json()["access_token"], "https://untrusted.example")
+        assert not bad_origin.value.headers
+        state, cookie = await _start(client)
+        code = _loopback_query(await _callback(client, state, cookie))["code"]
+        recovered = await _exchange(
+            client, code=code, code_verifier=_VERIFIER, redirect_uri=_REDIRECT
+        )
+        assert recovered.status_code == 200
+        browser_action(recovered.json()["token"])

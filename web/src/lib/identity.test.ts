@@ -1423,3 +1423,61 @@ describe("login redirect", () => {
     expect(hrefWrites).toEqual([]);
   });
 });
+
+describe("browser authority recovery", () => {
+  it("offers desktop reauthentication only for the stable browser-session refusal", async () => {
+    const error = vi.fn();
+    vi.doMock("sonner", () => ({ toast: { error } }));
+    vi.doMock("./nativeBridge", () => ({ isElectronShell: () => true }));
+    const { authenticatedFetch } = await import("./identity");
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ detail: "server refusal" }), {
+        status: 403,
+        headers: { "X-Omnigent-Auth-Recovery": "browser-session-required" },
+      }),
+    );
+    const response = await authenticatedFetch("/v1/sessions/test/resources/terminals");
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ detail: "server refusal" });
+    expect(error).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        action: { label: "Sign in again", onClick: expect.any(Function) },
+      }),
+    );
+    const navigate = vi.fn();
+    const location = window.location;
+    vi.stubGlobal(
+      "window",
+      new Proxy(window, {
+        get: (target, key) =>
+          key === "location" ? { ...location, assign: navigate } : Reflect.get(target, key),
+      }),
+    );
+    error.mock.calls[0][1].action.onClick();
+    expect(navigate).toHaveBeenCalledWith("/auth/login?native_reauth=1");
+    error.mockClear();
+    fetchMock.mockResolvedValue(new Response("forbidden", { status: 403 }));
+    await authenticatedFetch("/v1/sessions/test/resources/terminals");
+    expect(error).not.toHaveBeenCalled();
+    vi.doUnmock("./nativeBridge");
+    vi.doUnmock("sonner");
+  });
+
+  it("keeps plain-browser refusal handling unchanged", async () => {
+    const error = vi.fn();
+    vi.doMock("sonner", () => ({ toast: { error } }));
+    vi.doMock("./nativeBridge", () => ({ isElectronShell: () => false }));
+    const { authenticatedFetch } = await import("./identity");
+    fetchMock.mockResolvedValue(
+      new Response("refused", {
+        status: 403,
+        headers: { "X-Omnigent-Auth-Recovery": "browser-session-required" },
+      }),
+    );
+    await authenticatedFetch("/v1/sessions/test/resources/terminals");
+    expect(error).not.toHaveBeenCalled();
+    vi.doUnmock("./nativeBridge");
+    vi.doUnmock("sonner");
+  });
+});
