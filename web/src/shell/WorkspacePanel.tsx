@@ -292,7 +292,10 @@ function NewTabMenu({
     create.launch(name, {
       elevated,
       onOpen: (info) => onOpenTerminal(terminalTabKey(info)),
-      onError: (_error, opened) => onCreateError?.(opened),
+      onError: (error, opened) => {
+        onCreateError?.(opened);
+        if (elevated) toast.error(`Couldn't open an admin terminal: ${error.message}`);
+      },
     });
   };
 

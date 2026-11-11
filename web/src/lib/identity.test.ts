@@ -1468,3 +1468,53 @@ describe("isSignInExpired", () => {
     await expect(isSignInExpired()).resolves.toBe(false);
   });
 });
+
+describe("browser authority recovery", () => {
+  it("offers desktop reauthentication only for the stable browser-session refusal", async () => {
+    const error = vi.fn();
+    vi.doMock("sonner", () => ({ toast: { error } }));
+    const signInAgain = vi.fn().mockResolvedValue(true);
+    vi.doMock("./nativeBridge", () => ({ supportsSignInAgain: () => true, signInAgain }));
+    const { authenticatedFetch } = await import("./identity");
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ detail: "server refusal" }), {
+        status: 403,
+        headers: { "X-Omnigent-Auth-Recovery": "browser-session-required" },
+      }),
+    );
+    const response = await authenticatedFetch("/v1/sessions/test/resources/terminals");
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ detail: "server refusal" });
+    expect(error).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        action: { label: "Sign in again", onClick: expect.any(Function) },
+      }),
+    );
+    error.mock.calls[0][1].action.onClick();
+    await vi.waitFor(() => expect(signInAgain).toHaveBeenCalledOnce());
+    error.mockClear();
+    fetchMock.mockResolvedValue(new Response("forbidden", { status: 403 }));
+    await authenticatedFetch("/v1/sessions/test/resources/terminals");
+    expect(error).not.toHaveBeenCalled();
+    vi.doUnmock("./nativeBridge");
+    vi.doUnmock("sonner");
+  });
+
+  it("keeps plain-browser refusal handling unchanged", async () => {
+    const error = vi.fn();
+    vi.doMock("sonner", () => ({ toast: { error } }));
+    vi.doMock("./nativeBridge", () => ({ supportsSignInAgain: () => false }));
+    const { authenticatedFetch } = await import("./identity");
+    fetchMock.mockResolvedValue(
+      new Response("refused", {
+        status: 403,
+        headers: { "X-Omnigent-Auth-Recovery": "browser-session-required" },
+      }),
+    );
+    await authenticatedFetch("/v1/sessions/test/resources/terminals");
+    expect(error).not.toHaveBeenCalled();
+    vi.doUnmock("./nativeBridge");
+    vi.doUnmock("sonner");
+  });
+});

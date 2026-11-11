@@ -4997,6 +4997,27 @@ function registerIpc() {
     return signOutOfServer(BrowserWindow.fromWebContents(event.sender));
   });
 
+  ipcMain.handle("omnigent:sign-in-again", async (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (
+      !isPinnedOriginSender(event) ||
+      event.senderFrame !== event.sender.mainFrame ||
+      !usesOidcBrowserAuth(win)
+    ) {
+      throw new Error("sign-in-again requires the connected server's main frame");
+    }
+    const server = new URL(windows.get(win).serverUrl);
+    const committed = new URL(event.senderFrame.url);
+    const mount = server.pathname.replace(/\/+$/, "");
+    if (
+      committed.origin !== server.origin ||
+      (committed.pathname !== mount && !committed.pathname.startsWith(`${mount}/`))
+    ) {
+      throw new Error("sign-in-again requires the connected server mount");
+    }
+    return getOidcAuth().signInAgain(win);
+  });
+
   // SPA title-bar server picker → re-point the SENDING window to another
   // server. Only URLs in the persisted recent list or the current managed list
   // are accepted: pinning is a privilege grant (notifications, badge, protocol

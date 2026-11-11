@@ -20,11 +20,6 @@ def browser_action_user(
         or not isinstance(auth_provider, UnifiedAuthProvider)
     ):
         raise HTTPException(401, "Sign in through the web app")
-    user = auth_provider.browser_session_user_id(request)
-    if user is None:
-        raise HTTPException(401, "Sign in through the web app")
-    if not mutating:
-        return user
     origin = request.headers.get("origin")
     try:
         parts = urlsplit(origin or "")
@@ -41,8 +36,17 @@ def browser_action_user(
     except ValueError:
         valid_origin = False
     allowed = parse_allowed_origins() | frozenset({auth_provider.browser_session_origin or ""})
-    if not valid_origin or not origin_allowed(origin, local_mode=False, extra_allowed=allowed):
+    if mutating and (
+        not valid_origin or not origin_allowed(origin, local_mode=False, extra_allowed=allowed)
+    ):
         raise HTTPException(403, "A trusted browser origin is required")
+    user = auth_provider.browser_session_user_id(request)
+    if user is None:
+        raise HTTPException(
+            401,
+            "Sign in through the web app",
+            headers={"X-Omnigent-Auth-Recovery": "browser-session-required"},
+        )
     return user
 
 

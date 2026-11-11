@@ -138,6 +138,8 @@ interface NativeShellApi {
   switchServer?: (url: string) => Promise<void>;
   /** Sign the window's server out. Absent on shells that predate it. */
   signOutOfServer?: () => Promise<boolean>;
+  /** Explicit OIDC browser sign-in recovery, checked by the desktop main process. */
+  signInAgain?: () => Promise<boolean>;
   /** Return to the shell's "connect to server" setup page. */
   openServerSetup?: () => void;
   /**
@@ -790,6 +792,14 @@ function callSetColorScheme(scheme: ThemeSource): boolean {
 /** True when running inside the Electron desktop shell. */
 export function isElectronShell(): boolean {
   return electronApi() !== undefined;
+}
+
+export function supportsSignInAgain(): boolean {
+  return typeof electronApi()?.signInAgain === "function";
+}
+
+export async function signInAgain(): Promise<boolean> {
+  return (await electronApi()?.signInAgain?.()) === true;
 }
 
 /** Desktop auto-update bridge, or undefined outside Electron / older shells. */

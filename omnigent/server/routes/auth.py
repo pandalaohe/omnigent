@@ -1113,6 +1113,7 @@ def create_auth_router(
                 cookie_secret=config.cookie_secret,
                 ttl_hours=config.session_ttl_hours,
                 provider=config.provider_type,
+                browser_session=True,
             ),
             "user_id": pending.user_id,
             "expires_in": config.session_ttl_hours * 3600,

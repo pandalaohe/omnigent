@@ -44,6 +44,16 @@ function cookieMatches(cookie, origin, name) {
   return cookie.name === name && (cookie.domain ?? "").replace(/^\./, "") === host;
 }
 
+// Used only to preserve the cookie's lifetime; the server verifies authority.
+function browserPurpose(token) {
+  try {
+    const claims = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString());
+    return claims.browser_session === true && !claims.grant_id && !claims.scope;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * @param {{
  *   session: Electron.Session,
@@ -76,8 +86,8 @@ function createOidcAuth({
 }) {
   const connections = new Map();
   const renewals = new Map();
-  // Bumped per origin on sign-out, so a renewal already in flight can't
-  // reinstall a session the user just signed out of.
+  // Bumped per origin on sign-out or browser sign-in so an older renewal
+  // cannot replace the session chosen by the user.
   const signOutGenerations = new Map();
 
   async function installSession(serverUrl, cookieName, { token, expiresIn }) {
@@ -153,6 +163,17 @@ function createOidcAuth({
         if ((signOutGenerations.get(origin) ?? 0) !== generation) {
           throw Object.assign(new Error("signed out during renewal"), { code: "SIGNED_OUT" });
         }
+        const cookies = await session.cookies.get({ url: origin, name: cookieName });
+        const browser = cookies.find(
+          (cookie) =>
+            cookieMatches(cookie, origin, cookieName) &&
+            browserPurpose(cookie.value) &&
+            cookie.expirationDate * 1000 > now(),
+        );
+        if (browser && (await tokenAccepted(serverUrl, cookieName, browser.value))) return;
+        if ((signOutGenerations.get(origin) ?? 0) !== generation) {
+          throw Object.assign(new Error("session changed during renewal"), { code: "SIGNED_OUT" });
+        }
         return installSession(serverUrl, cookieName, minted);
       })
       .finally(() => {
@@ -189,29 +210,38 @@ function createOidcAuth({
    *
    * @param {string} serverUrl
    * @param {string} cookieName
-   * @param {{ interactive?: boolean, signal?: AbortSignal, onBrowserSignIn?: () => void }} [options]
+   * @param {{ interactive?: boolean, forceBrowserSignIn?: boolean, signal?: AbortSignal, onBrowserSignIn?: () => void }} [options]
    * @returns {Promise<"existing" | "renewed" | "signed-in">}
    */
   async function ensureSession(
     serverUrl,
     cookieName,
-    { interactive = false, signal, onBrowserSignIn } = {},
+    { interactive = false, forceBrowserSignIn = false, signal, onBrowserSignIn } = {},
   ) {
-    const existing = await storedToken(serverUrl, cookieName);
-    signal?.throwIfAborted();
-    if (existing && (await tokenAccepted(serverUrl, cookieName, existing, signal))) {
-      diagnostics.record("oidc_session", {
-        origin: new URL(serverUrl).origin,
-        outcome: "existing",
-      });
-      return "existing";
+    if (forceBrowserSignIn && !interactive) throw new Error("interactive sign-in required");
+    if (!forceBrowserSignIn) {
+      const existing = await storedToken(serverUrl, cookieName);
+      signal?.throwIfAborted();
+      if (existing && (await tokenAccepted(serverUrl, cookieName, existing, signal))) {
+        diagnostics.record("oidc_session", {
+          origin: new URL(serverUrl).origin,
+          outcome: "existing",
+        });
+        return "existing";
+      }
+      const renewError = await renewForConnect(serverUrl, cookieName, signal);
+      if (!renewError) {
+        diagnostics.record("oidc_session", {
+          origin: new URL(serverUrl).origin,
+          outcome: "renewed",
+        });
+        return "renewed";
+      }
+      if (!interactive) throw renewError;
     }
-    const renewError = await renewForConnect(serverUrl, cookieName, signal);
-    if (!renewError) {
-      diagnostics.record("oidc_session", { origin: new URL(serverUrl).origin, outcome: "renewed" });
-      return "renewed";
-    }
-    if (!interactive) throw renewError;
+    const origin = new URL(serverUrl).origin;
+    const generation = (signOutGenerations.get(origin) ?? 0) + 1;
+    signOutGenerations.set(origin, generation);
     diagnostics.record("oidc_session", { origin: new URL(serverUrl).origin, outcome: "browser" });
     onBrowserSignIn?.();
     const minted = await credentials.signInWithBrowser(serverUrl, { signal });
@@ -220,6 +250,9 @@ function createOidcAuth({
       throw Object.assign(new Error("the server rejected the new session"), {
         code: "SESSION_REJECTED",
       });
+    }
+    if (signOutGenerations.get(origin) !== generation) {
+      throw Object.assign(new Error("session changed during sign-in"), { code: "SIGNED_OUT" });
     }
     await installSession(serverUrl, cookieName, minted);
     diagnostics.record("oidc_session", { origin: new URL(serverUrl).origin, outcome: "signed_in" });
@@ -263,9 +296,12 @@ function createOidcAuth({
     // No local expiry (or no cookie yet): the SPA's own sign-in redirect recovers.
     if (!expiries.length) return;
     const remaining = Math.min(...expiries) - now();
+    const browser = cookies.some(
+      (cookie) => cookieMatches(cookie, ctx.origin, ctx.cookieName) && browserPurpose(cookie.value),
+    );
     const delay = Math.max(
       1000,
-      Math.min(2_147_483_647, remaining - Math.min(60_000, remaining / 5)),
+      Math.min(2_147_483_647, remaining - (browser ? 0 : Math.min(60_000, remaining / 5))),
     );
     ctx.timer = setTimeoutFn(() => void renew(ctx, { reason: "cookie expiry" }), delay);
     ctx.timer?.unref?.();
@@ -280,9 +316,13 @@ function createOidcAuth({
    */
   function renew(ctx, { reload = false, reason = "renewal" } = {}) {
     if (!current(ctx)) return Promise.resolve();
+    if (ctx.interactivePending) return Promise.resolve();
     if (reload) ctx.reloadRequested = true;
     if (ctx.pending) return ctx.pending;
     clearTimeoutFn(ctx.timer);
+    const generation = signOutGenerations.get(ctx.origin) ?? 0;
+    const obsolete = () =>
+      !current(ctx) || (signOutGenerations.get(ctx.origin) ?? 0) !== generation;
     diagnostics.record("oidc_renewal", {
       origin: ctx.origin,
       phase: reload ? "recovery" : "background",
@@ -290,10 +330,10 @@ function createOidcAuth({
     console.log("[omnigent] oidc auth: silent renewal", { origin: ctx.origin, reason, reload });
     ctx.pending = renewSession(ctx.serverUrl, ctx.cookieName)
       .then(async () => {
-        if (!current(ctx)) return;
+        if (obsolete()) return;
         diagnostics.record("oidc_renewal", { origin: ctx.origin, outcome: "renewed" });
         await schedule(ctx);
-        if (!ctx.reloadRequested || !current(ctx)) return;
+        if (!ctx.reloadRequested || obsolete()) return;
         ctx.reloadRequested = false;
         try {
           await ctx.win.loadURL(ctx.returnUrl);
@@ -307,6 +347,7 @@ function createOidcAuth({
         }
       })
       .catch((error) => {
+        if (obsolete()) return;
         diagnostics.record("oidc_renewal", {
           origin: ctx.origin,
           outcome: "failed",
@@ -327,6 +368,10 @@ function createOidcAuth({
       })
       .finally(() => {
         ctx.pending = null;
+        if (obsolete()) {
+          ctx.reloadRequested = false;
+          return;
+        }
         // A sign-in request that landed after the outcome was handled still
         // has a stalled page waiting on it.
         if (ctx.reloadRequested && current(ctx)) {
@@ -339,6 +384,7 @@ function createOidcAuth({
 
   function recover(ctx) {
     if (!current(ctx)) return;
+    if (ctx.interactivePending) return;
     if (!ctx.pending && now() - ctx.lastRecoveredAt < REJECTED_RENEWAL_WINDOW_MS) {
       fail(
         ctx,
@@ -350,6 +396,30 @@ function createOidcAuth({
     }
     ctx.lastRecoveredAt = now();
     void renew(ctx, { reload: true, reason: "sign-in requested" });
+  }
+
+  /** Called only by the main process after validating the recovery IPC sender. */
+  function signInAgain(win) {
+    const ctx = connections.get(win);
+    if (!ctx || !current(ctx)) return Promise.resolve(false);
+    if (ctx.interactivePending) return ctx.interactivePending;
+    ctx.reloadRequested = false;
+    clearTimeoutFn(ctx.timer);
+    ctx.interactivePending = ensureSession(ctx.serverUrl, ctx.cookieName, {
+      interactive: true,
+      forceBrowserSignIn: true,
+    })
+      .then(async () => {
+        if (!current(ctx)) return false;
+        await schedule(ctx);
+        if (!current(ctx)) return false;
+        await ctx.win.loadURL(ctx.returnUrl);
+        return true;
+      })
+      .finally(() => {
+        ctx.interactivePending = null;
+      });
+    return ctx.interactivePending;
   }
 
   async function signOut(ctx) {
@@ -476,6 +546,7 @@ function createOidcAuth({
     attach,
     detach,
     signOutWindow,
+    signInAgain,
     isAttached: (win) => connections.has(win),
     dispose() {
       for (const win of [...connections.keys()]) detach(win);

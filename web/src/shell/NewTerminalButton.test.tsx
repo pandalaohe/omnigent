@@ -17,9 +17,11 @@ import {
 } from "@/components/ui/dropdown-menu";
 
 const elevated = vi.hoisted(() => ({ allowed: false }));
+const toastMocks = vi.hoisted(() => ({ showToast: vi.fn() }));
 vi.mock("@/hooks/useSessionTerminalAccess", () => ({
   useSessionTerminalAccess: () => ({ canCreateElevated: elevated.allowed }),
 }));
+vi.mock("@/components/ui/toast", () => ({ showToast: toastMocks.showToast }));
 import type { TerminalFirstContextValue } from "./TerminalFirstContext";
 import { TerminalFirstContextProvider } from "./TerminalFirstContext";
 
@@ -73,6 +75,7 @@ function renderButton(
 
 beforeEach(() => {
   elevated.allowed = false;
+  toastMocks.showToast.mockReset();
   fetchMock.mockReset();
   vi.stubGlobal("fetch", fetchMock);
 });
@@ -120,6 +123,28 @@ describe("NewTerminalButton access gate", () => {
     expect(screen.queryByRole("menu")).toBeNull();
     client.clear();
   });
+  it("shows the server refusal when admin creation fails", async () => {
+    elevated.allowed = true;
+    const refusal = "a trusted human browser session is required";
+    fetchMock.mockImplementation(async (_url, init) =>
+      init?.method === "POST"
+        ? mockResponse({ error: { message: refusal } }, { ok: false, status: 403 })
+        : mockResponse(agentWire(["shell"])),
+    );
+    const created = vi.fn();
+    renderButton(created);
+    await screen.findByRole("button", { name: "Choose shell" });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Choose shell" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "New admin shell" }));
+
+    await waitFor(() =>
+      expect(toastMocks.showToast).toHaveBeenCalledWith(
+        `Couldn't open an admin terminal: ${refusal}`,
+      ),
+    );
+    expect(created).not.toHaveBeenCalled();
+  });
+
   it("adds Admin and sends elevated true for a capable owner", async () => {
     elevated.allowed = true;
     fetchMock.mockImplementation(async (_url, init) =>

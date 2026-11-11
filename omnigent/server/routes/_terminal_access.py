@@ -9,11 +9,10 @@ from fastapi import HTTPException, Request
 from starlette.requests import HTTPConnection
 
 from omnigent.entities import Conversation
-from omnigent.errors import OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.routing import routing_host_id
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
-from omnigent.server.browser_approval import require_owner_browser_approval
+from omnigent.server.browser_approval import browser_action_user
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.stores import ConversationStore
@@ -34,10 +33,13 @@ def require_terminal_browser_session(
     if user_id == RESERVED_USER_LOCAL:
         return
     try:
-        require_owner_browser_approval(cast(Request, connection), auth_provider, user_id)
-    except OmnigentError as exc:
+        if browser_action_user(cast(Request, connection), auth_provider, mutating=True) != user_id:
+            raise HTTPException(403, "browser account does not match")
+    except HTTPException as exc:
         raise HTTPException(
-            status_code=403, detail="a trusted human browser session is required"
+            status_code=403,
+            detail="a trusted human browser session is required",
+            headers=exc.headers,
         ) from exc
 
 

@@ -5844,6 +5844,75 @@ describe("OIDC system-browser sign-in wiring", () => {
     assert.equal(h.api.windows.get(h.win).authKind, "oidc");
   });
 
+  it("routes the preload recovery action through main, forcing sign-in before reload", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      manifest: oidcManifest,
+      oidc: { refresh: minted("renewed"), signIn: minted("browser-session") },
+      acceptedSessions: new Set(["renewed", "browser-session"]),
+    });
+    t.after(h.cleanup);
+    await h.api.loadServerUrl(h.win, server);
+    h.api.registerIpc();
+    h.webContents.mainFrame = { url: `${server}/c/1` };
+    h.setUrl(`${server}/c/1`);
+    const event = { sender: h.webContents, senderFrame: h.webContents.mainFrame };
+    let desktop;
+    vm.runInNewContext(preloadSource, {
+      process: { platform: "linux" },
+      require: () => ({
+        contextBridge: {
+          exposeInMainWorld: (name, value) => {
+            if (name === "omnigentDesktop") desktop = value;
+          },
+        },
+        ipcRenderer: { on() {}, invoke: (channel) => h.ipc.get(channel)(event) },
+      }),
+    });
+    const refreshes = h.calls.oidc.refresh;
+    assert.equal(await desktop.signInAgain(), true);
+    assert.equal(h.calls.oidc.signIn, 1);
+    assert.equal(h.calls.oidc.refresh, refreshes);
+    assert.equal(h.calls.cookiesSet.at(-1).value, "browser-session");
+    assert.deepEqual(h.calls.loadURL.at(-1), [server]);
+    assert.equal(h.api.windows.get(h.win).authKind, "oidc");
+    assert.equal(h.calls.loadFile.length, 0);
+  });
+
+  it("refuses recovery IPC outside the committed connected main frame and mount", async (t) => {
+    const mounted = `${server}/omni`;
+    const h = loadNavigationHarness({
+      serverUrl: mounted,
+      manifest: oidcManifest,
+      oidc: { refresh: minted("renewed"), signIn: minted("browser-session") },
+      acceptedSessions: new Set(["renewed", "browser-session"]),
+    });
+    t.after(h.cleanup);
+    await h.api.loadServerUrl(h.win, mounted);
+    h.api.registerIpc();
+    const recover = h.ipc.get("omnigent:sign-in-again");
+    const frame = { url: `${mounted}/c/1` };
+    h.webContents.mainFrame = frame;
+    h.setUrl(frame.url);
+    await assert.rejects(
+      recover({ sender: h.webContents, senderFrame: { url: frame.url } }),
+      /main frame/,
+    );
+    frame.url = "https://external.example/";
+    h.setUrl(frame.url);
+    await assert.rejects(recover({ sender: h.webContents, senderFrame: frame }), /main frame/);
+    frame.url = `${server}/omni-other/c/1`;
+    h.setUrl(frame.url);
+    await assert.rejects(recover({ sender: h.webContents, senderFrame: frame }), /mount/);
+    frame.url = `${mounted}/c/1`;
+    h.setUrl("https://external.example/");
+    await assert.rejects(recover({ sender: h.webContents, senderFrame: frame }), /main frame/);
+    assert.equal(h.calls.oidc.signIn, 0);
+    h.setUrl(frame.url);
+    assert.equal(await recover({ sender: h.webContents, senderFrame: frame }), true);
+    assert.equal(h.calls.oidc.signIn, 1);
+  });
+
   it("restores from the stored grant without opening the browser", async (t) => {
     const h = loadNavigationHarness({
       serverUrl: server,

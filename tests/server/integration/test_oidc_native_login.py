@@ -15,11 +15,13 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import httpx
 import jwt
 import pytest
+from starlette.requests import Request
 
 from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.oidc import OIDCConfig, derive_code_challenge
 from omnigent.server.routes import auth as auth_routes
+from omnigent.server.routes._terminal_access import require_terminal_browser_session
 from omnigent.server.routes.auth import create_auth_router
 
 pytestmark = pytest.mark.asyncio
@@ -149,8 +151,12 @@ def _client(transport: httpx.ASGITransport) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=transport, base_url="http://test", follow_redirects=False)
 
 
-async def test_native_sign_in_delivers_code_and_exchanges_for_session() -> None:
-    """The full loopback flow ends with a session token, and the browser gets none."""
+async def test_native_sign_in_delivers_code_and_exchanges_for_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The desktop's native cookie passes the human admin-terminal guard."""
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "0")
+    monkeypatch.setenv("OMNIGENT_WS_ALLOWED_ORIGINS", "http://test")
     grant_store = MagicMock()
     with patch.object(auth_routes, "issue_login_grant", return_value="refresh-abc") as issue:
         async with _client(_transport(device_grant_store=grant_store)) as client:
@@ -167,9 +173,25 @@ async def test_native_sign_in_delivers_code_and_exchanges_for_session() -> None:
     assert resp.status_code == 200
     assert resp.headers["cache-control"] == "no-store"
     body = resp.json()
-    assert jwt.decode(body["token"], _TEST_SECRET, algorithms=["HS256"])["sub"] == (
-        "alice@example.com"
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=_config())
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/sessions/session-a/resources/terminals",
+            "headers": [
+                (b"origin", b"http://test"),
+                (
+                    b"cookie",
+                    f"{provider.session_cookie_name}={body['token']}".encode(),
+                ),
+            ],
+        }
     )
+    require_terminal_browser_session(request, provider)
+    claims = jwt.decode(body["token"], _TEST_SECRET, algorithms=["HS256"])
+    assert claims["sub"] == "alice@example.com"
+    assert claims["browser_session"] is True
     assert body["user_id"] == "alice@example.com"
     assert body["expires_in"] == 8 * 3600
     assert body["refresh_token"] == "refresh-abc"
@@ -480,3 +502,73 @@ async def test_native_exchange_requires_the_exact_redirect_uri(
 
     assert resp.status_code == 400
     assert resp.json() == {"error": "invalid_grant"}
+
+
+@pytest.mark.parametrize("initial", ["native", "legacy"])
+async def test_native_browser_authority_refresh_and_recovery(monkeypatch, tmp_path, initial):
+    """Native sign-in restores browser authority; real refresh grants never do."""
+    from fastapi import HTTPException
+
+    from omnigent.server.device_grant_store import DeviceGrantStore
+    from omnigent.server.oidc import mint_session_cookie
+    from omnigent.server.routes.device_auth import create_oauth_token_router
+
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "0")
+    monkeypatch.setenv("OMNIGENT_WS_ALLOWED_ORIGINS", "http://test")
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/grants.db")
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=_config())
+    transport = _transport(device_grant_store=store)
+    transport.app.include_router(create_oauth_token_router(provider, store))
+    async with _client(transport) as client:
+        state, cookie = await _start(client)
+        code = _loopback_query(await _callback(client, state, cookie))["code"]
+        login = await _exchange(client, code=code, code_verifier=_VERIFIER, redirect_uri=_REDIRECT)
+        assert login.status_code == 200
+        fresh = login.json()
+
+        def browser_action(token, origin="http://test"):
+            request = Request(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/terminal",
+                    "headers": [
+                        (b"origin", origin.encode()),
+                        (b"cookie", f"{provider.session_cookie_name}={token}".encode()),
+                    ],
+                }
+            )
+            require_terminal_browser_session(request, provider)
+
+        if initial == "native":
+            browser_action(fresh["token"])
+        else:
+            legacy = mint_session_cookie("alice@example.com", _TEST_SECRET, 8, "github")
+            with pytest.raises(HTTPException) as refused:
+                browser_action(legacy)
+            assert refused.value.headers == {
+                "X-Omnigent-Auth-Recovery": "browser-session-required"
+            }
+        renewed = await client.post(
+            "/oauth/token",
+            data={"grant_type": "refresh_token", "refresh_token": fresh["refresh_token"]},
+        )
+        assert renewed.status_code == 200
+        claims = jwt.decode(renewed.json()["access_token"], _TEST_SECRET, algorithms=["HS256"])
+        assert "browser_session" not in claims
+        assert claims["grant_id"]
+        with pytest.raises(HTTPException) as refused:
+            browser_action(renewed.json()["access_token"])
+        assert refused.value.status_code == 403
+        assert refused.value.headers == {"X-Omnigent-Auth-Recovery": "browser-session-required"}
+        browser_action(fresh["token"])  # Renewal does not revoke the unexpired browser cookie.
+        with pytest.raises(HTTPException) as bad_origin:
+            browser_action(renewed.json()["access_token"], "https://untrusted.example")
+        assert not bad_origin.value.headers
+        state, cookie = await _start(client)
+        code = _loopback_query(await _callback(client, state, cookie))["code"]
+        recovered = await _exchange(
+            client, code=code, code_verifier=_VERIFIER, redirect_uri=_REDIRECT
+        )
+        assert recovered.status_code == 200
+        browser_action(recovered.json()["token"])

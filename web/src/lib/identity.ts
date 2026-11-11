@@ -16,6 +16,8 @@
  */
 
 import { stripBasePath, withBasePath } from "./basePath";
+import { toast } from "sonner";
+import { signInAgain, supportsSignInAgain } from "./nativeBridge";
 import { PERMISSION_TIERS_PROTOCOL_HEADERS } from "./permissionTierProtocol";
 import { getCachedServerInfo } from "./capabilities";
 import {
@@ -820,6 +822,28 @@ export async function authenticatedFetch(
     clearHostKeyless(derivedHostId);
   }
 
+  if (
+    (res.status === 401 || res.status === 403) &&
+    res.headers?.get("X-Omnigent-Auth-Recovery") === "browser-session-required" &&
+    supportsSignInAgain() &&
+    currentIdentityConnectionId() === dispatchConnectionId
+  ) {
+    toast.error("A trusted human browser session is required", {
+      id: "browser-session-required",
+      action: {
+        label: "Sign in again",
+        onClick: () => {
+          if (currentIdentityConnectionId() !== dispatchConnectionId) return;
+          void signInAgain()
+            .then((signedIn) => {
+              if (!signedIn) toast.error("Sign-in was not completed. Try again.");
+            })
+            .catch(() => toast.error("Sign-in was not completed. Try again."));
+        },
+      },
+    });
+    return res;
+  }
   handleUnauthorizedResponse(input, res);
   return res;
 }

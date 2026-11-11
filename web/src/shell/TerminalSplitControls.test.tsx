@@ -1,8 +1,9 @@
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 
 vi.mock("@/hooks/useSessionTerminalAccess", () => ({
-  useSessionTerminalAccess: () => ({ canCreateElevated: false }),
+  useSessionTerminalAccess: () => ({ canCreateElevated: fixture.canElevate }),
 }));
+vi.mock("@/components/ui/toast", () => ({ showToast: fixture.showToast }));
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -25,6 +26,8 @@ const BASH_KEY = "terminal:terminal_bash_u-1";
 const fixture = vi.hoisted(() => ({
   createTerminal: vi.fn(),
   createPending: false,
+  canElevate: false,
+  showToast: vi.fn(),
   deleteTerminal: vi.fn(),
   declaredShells: ["zsh", "bash"],
   mobile: false,
@@ -46,6 +49,8 @@ beforeEach(() => {
   fixture.createTerminal.mockReset();
   fixture.deleteTerminal.mockReset();
   fixture.createPending = false;
+  fixture.canElevate = false;
+  fixture.showToast.mockReset();
   fixture.declaredShells = ["zsh", "bash"];
   fixture.mobile = false;
   fixture.terminals = [AGENT];
@@ -131,6 +136,28 @@ it("splits the agent pane with the picked shell and focuses the new pane", async
       layout: { axis: "rows", ratio: 0.5, children: [AGENT_KEY, BASH_KEY] },
       focusedKey: BASH_KEY,
     }),
+  );
+});
+
+it("shows the server refusal when an admin split fails", async () => {
+  fixture.canElevate = true;
+  writePreferredShell("zsh");
+  const refusal = "a trusted human browser session is required";
+  fixture.createTerminal.mockImplementation(
+    (_value: unknown, opts: { onError: (error: Error) => void }) =>
+      opts.onError(new Error(refusal)),
+  );
+  renderControls("conv_admin_refusal", { permissionLevel: 4 });
+
+  fireEvent.pointerDown(screen.getByRole("button", { name: "Split right" }), { button: 0 });
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Admin" }));
+
+  expect(fixture.createTerminal).toHaveBeenCalledWith(
+    "zsh",
+    expect.objectContaining({ elevated: true }),
+  );
+  await waitFor(() =>
+    expect(fixture.showToast).toHaveBeenCalledWith(`Couldn't open a shell: ${refusal}`),
   );
 });
 

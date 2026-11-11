@@ -239,6 +239,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   switchServer: (url) => ipcRenderer.invoke("omnigent:switch-server", url),
   /** Sign this window's server out; every window on it returns to the setup page. */
   signOutOfServer: () => ipcRenderer.invoke("omnigent:sign-out-of-server"),
+  /** Explicit browser sign-in recovery; main validates the connected main frame. */
+  signInAgain: () => ipcRenderer.invoke("omnigent:sign-in-again"),
   /** Return this window to the bundled "connect to server" setup page. */
   openServerSetup: () => {
     ipcRenderer.send("omnigent:open-server-setup");
