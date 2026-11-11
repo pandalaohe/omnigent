@@ -1744,8 +1744,10 @@ def _run_upgrade_command(command: str, console: Console) -> int:
     try:
         argv = shlex.split(command)
         if IS_WINDOWS:
-            from omnigent.host.windows_upgrade import retained_install
+            from omnigent.host.windows_upgrade import resolve_uv_executable, retained_install
 
+            if argv and argv[0].casefold() in ("uv", "uv.exe"):
+                argv[0] = resolve_uv_executable()
             skip_web_ui = {**os.environ, "OMNIGENT_SKIP_WEB_UI": "true"}
             bundled = _web_ui_bundled()
             if not bundled:

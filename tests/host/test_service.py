@@ -367,9 +367,9 @@ def test_installed_service_rejects_unreadable_target(
 
 
 def test_host_service_rejects_unsupported_platform(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(service.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(service.platform, "system", lambda: "FreeBSD")
 
-    with pytest.raises(service.HostServiceError, match="macOS and Linux"):
+    with pytest.raises(service.HostServiceError, match="macOS, Linux and Windows"):
         service.enable_user_host_service(None, environment={})
 
 

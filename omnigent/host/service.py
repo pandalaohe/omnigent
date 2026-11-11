@@ -34,7 +34,7 @@ class HostServiceError(RuntimeError):
 class HostService:
     """Description of the current platform's per-user host service."""
 
-    kind: Literal["launchd", "systemd_user"]
+    kind: Literal["launchd", "systemd_user", "windows_task"]
     path: Path
     label: str
     log_path: Path | None = None
@@ -51,6 +51,13 @@ def _current_uid() -> int:
 def _service_for_current_platform() -> HostService:
     """Return the current platform's per-user service description."""
     system = platform.system()
+    if system == "Windows":
+        from omnigent.host.windows_task import description
+
+        try:
+            return description()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise HostServiceError(f"Cannot identify the Windows host service: {exc}") from exc
     if system == "Darwin":
         home = Path(os.environ.get("HOME", Path.home())).expanduser()
         log_path = data_dir() / "logs" / "host" / "service.log"
@@ -68,7 +75,8 @@ def _service_for_current_platform() -> HostService:
             label=SYSTEMD_UNIT,
         )
     raise HostServiceError(
-        f"Host services are supported on macOS and Linux, not {system or 'this platform'}."
+        "Host services are supported on macOS, Linux and Windows, "
+        f"not {system or 'this platform'}."
     )
 
 
@@ -82,7 +90,12 @@ def _clean_environment(environment: Mapping[str, str]) -> dict[str, str]:
     """Validate environment values before persisting them in a service file."""
     cleaned: dict[str, str] = {}
     for key, value in environment.items():
-        if not _ENV_NAME_RE.fullmatch(key):
+        valid_name = (
+            bool(key) and "=" not in key and "\x00" not in key
+            if platform.system() == "Windows"
+            else _ENV_NAME_RE.fullmatch(key) is not None
+        )
+        if not valid_name:
             raise HostServiceError(f"Cannot persist invalid environment variable name {key!r}.")
         if "\x00" in value or "\n" in value or "\r" in value:
             raise HostServiceError(f"Cannot persist multiline environment variable {key!r}.")
@@ -309,9 +322,16 @@ def enable_user_host_service(
             environment=clean_environment,
         )
         _enable_launchd(service, content)
-    else:
+    elif service.kind == "systemd_user":
         content = _systemd_unit(command=command, environment=clean_environment)
         _enable_systemd(service, content)
+    else:
+        from omnigent.host.windows_task import enable
+
+        try:
+            enable(service, server_url, clean_environment)
+        except OSError as exc:
+            raise HostServiceError(str(exc)) from exc
     _record_service(service)
     return service
 
@@ -320,7 +340,34 @@ def disable_user_host_service() -> HostService:
     """Stop, disable, and remove the current user's host service."""
     service = _service_for_current_platform()
     still_running = False
-    if service.kind == "launchd":
+    if service.kind == "windows_task":
+        from omnigent.host.windows_task import disable, installed
+
+        snapshot = installed(service)
+        if snapshot is not None:
+            service = snapshot[0]
+        else:
+            from omnigent.install_ledger import backfill_ledger_path, ledger_path, load_ledger
+
+            # A failed file removal keeps its ledger row even though the task
+            # is already gone, including a previous config-home destination.
+            for path in (ledger_path(), backfill_ledger_path()):
+                ledger = load_ledger(path)
+                if ledger is None:
+                    continue
+                entry = next(
+                    (
+                        entry
+                        for entry in ledger.entries.launch_agents
+                        if entry.kind == service.kind and entry.label == service.label
+                    ),
+                    None,
+                )
+                if entry is not None:
+                    service = HostService(service.kind, Path(entry.path), service.label)
+                    break
+        disable(service)
+    elif service.kind == "launchd":
         domain = f"gui/{_current_uid()}"
         service_target = f"{domain}/{service.label}"
         _run_best_effort(["launchctl", "bootout", service_target])
@@ -347,10 +394,13 @@ def disable_user_host_service() -> HostService:
 
 def installed_user_host_service() -> tuple[HostService, str | None] | None:
     """Read the installed service and its target; unsupported platforms return None."""
-    try:
-        service = _service_for_current_platform()
-    except HostServiceError:
+    if platform.system() not in ("Darwin", "Linux", "Windows"):
         return None
+    service = _service_for_current_platform()
+    if service.kind == "windows_task":
+        from omnigent.host.windows_task import installed
+
+        return installed(service)
     if not service.path.exists():
         return None
     try:
@@ -382,7 +432,11 @@ def installed_user_host_service() -> tuple[HostService, str | None] | None:
 
 def stop_user_host_service(service: HostService) -> None:
     """Stop the service while preserving its installed definition."""
-    if service.kind == "launchd":
+    if service.kind == "windows_task":
+        from omnigent.host.windows_task import stop
+
+        stop(service)
+    elif service.kind == "launchd":
         domain = f"gui/{_current_uid()}"
         service_target = f"{domain}/{service.label}"
         _run_best_effort(["launchctl", "bootout", service_target])
@@ -396,6 +450,11 @@ def stop_user_host_service(service: HostService) -> None:
 
 def start_user_host_service(service: HostService) -> None:
     """Start the installed service definition as-is."""
+    if service.kind == "windows_task":
+        from omnigent.host.windows_task import start
+
+        start(service)
+        return
     if not service.path.exists():
         raise HostServiceError(f"Host service definition disappeared: {service.path}")
     if service.kind == "launchd":

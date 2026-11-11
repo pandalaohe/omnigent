@@ -11,6 +11,30 @@ from omnigent import cli as cli_module
 from omnigent.install_ledger import InstallLedger, new_ledger
 
 
+def test_windows_uninstall_preview_and_apply(monkeypatch, tmp_path: Path) -> None:
+    from omnigent.host import service
+
+    installed = service.HostService("windows_task", tmp_path / "task.xml", "test-task")
+    monkeypatch.setattr(cli_module, "IS_WINDOWS", True)
+    monkeypatch.setattr(service, "installed_user_host_service", lambda: (installed, None))
+    calls = []
+    monkeypatch.setattr(service, "disable_user_host_service", lambda: calls.append("remove"))
+    monkeypatch.setattr(
+        cli_module,
+        "_uninstall_script_path",
+        lambda: (_ for _ in ()).throw(AssertionError("Windows must not run a POSIX uninstaller")),
+    )
+    runner = CliRunner()
+    result = runner.invoke(cli_module.cli, ["uninstall"])
+    assert result.exit_code == 0, result.output
+    assert "Would remove" in result.output
+    assert calls == []
+    result = runner.invoke(cli_module.cli, ["uninstall", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert calls == ["remove"]
+    assert "uv tool uninstall omnigent" in result.output
+
+
 def test_uninstall_cli_resolves_ledger_and_forwards_flags(monkeypatch, tmp_path: Path) -> None:
     runner = CliRunner()
     script = tmp_path / "uninstall_oss.sh"

@@ -10,8 +10,18 @@ import psutil
 import pytest
 from rich.console import Console
 
+from omnigent.host import service as services
 from omnigent.host import windows_upgrade as windows
 from omnigent.update_check import _run_upgrade_command
+
+TEST_SERVICE = services.HostService("windows_task", Path("/opt/work/task.xml"), "test-task")
+
+
+@pytest.fixture(autouse=True)
+def installer_location(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Installer subprocesses are explicit fakes in this module. Location itself
+    # is exercised at the real resolver boundary in test_windows_task.
+    monkeypatch.setattr(windows, "resolve_uv_executable", lambda: "uv")
 
 
 class Process:
@@ -75,7 +85,7 @@ def process_table(monkeypatch: pytest.MonkeyPatch) -> list[Process]:
     return table
 
 
-@pytest.mark.parametrize("options", [[], ["-NoProfile", "-ExecutionPolicy", "Bypass"]])
+@pytest.mark.parametrize("options", [[], ["-P"]])
 def test_unrecorded_autostart_tree_is_stopped(
     monkeypatch: pytest.MonkeyPatch, process_table: list[Process], options: list[str]
 ) -> None:
@@ -87,15 +97,16 @@ def test_unrecorded_autostart_tree_is_stopped(
     loop = Process(
         10,
         [
-            "/opt/bin/pwsh.exe",
+            "/opt/tools/omnigent/Scripts/pythonw.exe",
             *options,
-            "-File",
-            str(home / ".omnigent/autostart/Start-OmnigentHostDefault.ps1"),
+            "-m",
+            "omnigent.host.service_entry",
         ],
         [host, runner],
     )
     unrelated = Process(40, ["/opt/other/omni.exe", "host"])
     monkeypatch.setattr(windows.Path, "home", lambda: home)
+    monkeypatch.setattr(windows.sys, "prefix", "/opt/tools/omnigent")
     monkeypatch.setattr(
         windows, "installed_launchers", lambda: [Path("/opt/user/.local/bin/omni.exe")]
     )
@@ -113,9 +124,9 @@ def test_upgrade_inside_host_is_refused(
     loop = Process(
         10,
         [
-            "/opt/bin/pwsh.exe",
-            "-File",
-            "/opt/user/.omnigent/autostart/Start-OmnigentHostDefault.ps1",
+            "/opt/tools/omnigent/Scripts/pythonw.exe",
+            "-m",
+            "omnigent.host.service_entry",
         ],
     )
     monkeypatch.setattr(windows.Path, "home", lambda: Path("/opt/user"))
@@ -190,10 +201,11 @@ def test_daemon_replaced_during_drain_is_also_stopped(
     snapshots = iter([[], [replacement]])
     monkeypatch.setattr("omnigent.cli.IS_WINDOWS", True)
     monkeypatch.setattr(
-        "omnigent.cli._windows_host_service_wrapper", lambda: Path("/opt/wrapper.cmd")
+        "omnigent.host.service.installed_user_host_service", lambda: (TEST_SERVICE, None)
     )
     monkeypatch.setattr("omnigent.cli._drain_and_stop_local_server", lambda **_: None)
-    monkeypatch.setattr("omnigent.cli._run_windows_host_service", lambda *_: None)
+    monkeypatch.setattr(services, "stop_user_host_service", lambda *_: None)
+    monkeypatch.setattr(services, "start_user_host_service", lambda *_: None)
     monkeypatch.setattr(windows, "capture_host_tree", lambda **_: next(snapshots))
     monkeypatch.setattr(
         windows.psutil,
@@ -231,7 +243,7 @@ def test_windows_reinstall_restores_before_retry(
     monkeypatch.setattr("omnigent.update_check.IS_WINDOWS", True)
     monkeypatch.setattr("omnigent.cli.IS_WINDOWS", True)
     monkeypatch.setattr(
-        "omnigent.cli._windows_host_service_wrapper", lambda: tmp_path / "wrapper.cmd"
+        "omnigent.host.service.installed_user_host_service", lambda: (TEST_SERVICE, None)
     )
     monkeypatch.setattr("omnigent.cli._drain_and_stop_local_server", lambda **_: None)
     monkeypatch.setattr(windows, "capture_host_tree", lambda **_: [])
@@ -243,7 +255,8 @@ def test_windows_reinstall_restores_before_retry(
             assert launcher.exists()
             assert (prefix / "pyvenv.cfg").exists()
 
-    monkeypatch.setattr("omnigent.cli._run_windows_host_service", service)
+    monkeypatch.setattr(services, "stop_user_host_service", lambda svc: service(svc, "stop"))
+    monkeypatch.setattr(services, "start_user_host_service", lambda svc: service(svc, "start"))
     calls = 0
 
     def install(
@@ -300,24 +313,24 @@ def test_vanished_process_is_ignored(
 @pytest.mark.parametrize(
     "args",
     [
-        ["/opt/editor.exe", "/opt/user/.omnigent/autostart/Start-OmnigentHostDefault.ps1"],
+        ["/opt/editor.exe", "omnigent.host.service_entry"],
         [
             "/opt/bin/pwsh.exe",
             "-Command",
-            "/opt/user/.omnigent/autostart/Start-OmnigentHostDefault.ps1",
+            "omnigent.host.service_entry",
         ],
-        ["/opt/bin/pwsh.exe", "-File", "/opt/other/Start-OmnigentHostDefault.ps1"],
+        ["/opt/bin/pwsh.exe", "-File", "unrelated.module"],
         [
             "/opt/bin/pwsh.exe",
             "-Command",
             "echo",
             "-File",
-            "/opt/user/.omnigent/autostart/Start-OmnigentHostDefault.ps1",
+            "omnigent.host.service_entry",
         ],
         [
             "/opt/python.exe",
             "-File",
-            "/opt/user/.omnigent/autostart/Start-OmnigentHostDefault.ps1",
+            "omnigent.host.service_entry",
         ],
         ["/opt/bin/omni.exe", "host", "update", "custom", "--server", "https://example.test"],
         ["/opt/bin/omni.exe", "host"],
@@ -333,30 +346,21 @@ def test_capture_excludes_editors_and_management_commands(
     assert process_table[0].alive
 
 
-@pytest.mark.parametrize("missing", ["wrapper", "pwsh"])
-def test_missing_restart_path_refuses_before_any_stop(
-    monkeypatch: pytest.MonkeyPatch, missing: str
-) -> None:
-    import click
-
+def test_no_service_upgrades_without_windows_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     from omnigent.cli import _upgrade_host_service
 
     monkeypatch.setattr("omnigent.cli.IS_WINDOWS", True)
-    monkeypatch.setattr(
-        "omnigent.cli._windows_host_service_wrapper",
-        lambda: None if missing == "wrapper" else Path("/opt/wrapper.cmd"),
-    )
-    monkeypatch.setattr(
-        windows.shutil, "which", lambda _: None if missing == "pwsh" else "/opt/pwsh.exe"
-    )
+    monkeypatch.setattr(services, "installed_user_host_service", lambda: None)
+    monkeypatch.setattr(windows, "capture_host_tree", lambda **_: [])
+    monkeypatch.setattr("omnigent.cli._drain_and_stop_local_server", lambda **_: None)
 
-    def untouched(**_: object) -> None:
-        raise AssertionError("must refuse before draining or stopping any process")
+    def unexpected(*_: object) -> None:
+        pytest.fail("no service stop or start without an installed task")
 
-    monkeypatch.setattr("omnigent.cli._drain_and_stop_local_server", untouched)
-    with pytest.raises(click.ClickException, match="required before upgrading"):
-        with _upgrade_host_service(force=True):
-            raise AssertionError("installer must not run")
+    monkeypatch.setattr(services, "stop_user_host_service", unexpected)
+    monkeypatch.setattr(services, "start_user_host_service", unexpected)
+    with _upgrade_host_service(force=False):
+        pass
 
 
 def test_shutdown_collects_late_children_and_grandchildren(
@@ -638,10 +642,11 @@ def test_orphan_venv_holder_aborts_install_and_restores(
     monkeypatch.setattr("omnigent.cli.IS_WINDOWS", True)
     monkeypatch.setattr("omnigent.update_check.IS_WINDOWS", True)
     monkeypatch.setattr(
-        "omnigent.cli._windows_host_service_wrapper", lambda: bindir / "wrapper.cmd"
+        "omnigent.host.service.installed_user_host_service", lambda: (TEST_SERVICE, None)
     )
     monkeypatch.setattr("omnigent.cli._drain_and_stop_local_server", lambda **_: None)
-    monkeypatch.setattr("omnigent.cli._run_windows_host_service", service)
+    monkeypatch.setattr(services, "stop_user_host_service", lambda svc: service(svc, "stop"))
+    monkeypatch.setattr(services, "start_user_host_service", lambda svc: service(svc, "start"))
     monkeypatch.setattr(windows, "capture_host_tree", lambda **_: [host])
     monkeypatch.setattr("omnigent.update_check.subprocess.run", unexpected_install)
     with _upgrade_host_service(force=True):
@@ -805,13 +810,11 @@ def test_host_restarts_when_draining_fails(monkeypatch: pytest.MonkeyPatch) -> N
 
     monkeypatch.setattr("omnigent.cli.IS_WINDOWS", True)
     monkeypatch.setattr(
-        "omnigent.cli._windows_host_service_wrapper", lambda: Path("/opt/wrapper.cmd")
+        "omnigent.host.service.installed_user_host_service", lambda: (TEST_SERVICE, None)
     )
     monkeypatch.setattr("omnigent.cli.shutil.which", lambda _: "/opt/bin/pwsh.exe")
     monkeypatch.setattr("omnigent.cli._drain_and_stop_local_server", drain)
-    monkeypatch.setattr(
-        "omnigent.cli._run_windows_host_service", lambda _wrapper, action: events.append(action)
-    )
+    monkeypatch.setattr(services, "start_user_host_service", lambda _svc: events.append("start"))
     monkeypatch.setattr(windows, "capture_host_tree", lambda **_: [])
     with pytest.raises(click.ClickException, match="drain interrupted"):
         with _upgrade_host_service(force=False):
