@@ -214,6 +214,25 @@ describe("host terminal page", () => {
     view.dispose();
   });
 
+  it("shows the server refusal when admin creation fails", async () => {
+    const refusal = "a trusted human browser session is required";
+    vi.mocked(authenticatedFetch).mockImplementation(async (_, init) =>
+      init?.method === "POST"
+        ? Response.json({ error: { message: refusal, code: "forbidden" } }, { status: 403 })
+        : Response.json({ terminals: [] }),
+    );
+    const view = mount();
+    await screen.findByText(/No open terminals/);
+    await newMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Admin" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(refusal);
+    expect(
+      vi.mocked(authenticatedFetch).mock.calls.filter(([, init]) => init?.method === "POST"),
+    ).toEqual([[expect.any(String), expect.objectContaining({ body: '{"elevated":true}' })]]);
+    view.dispose();
+  });
+
   it("creates an ordinary shell with elevated false and reports mutation failure", async () => {
     vi.mocked(authenticatedFetch).mockImplementation(async (_, init) =>
       init?.method === "POST"

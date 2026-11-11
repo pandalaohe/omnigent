@@ -282,7 +282,10 @@ function NewTabMenu({
     onCreateStart?.();
     create.mutate(elevated ? { terminal: name, elevated: true } : name, {
       onSuccess: (info) => onOpenTerminal(terminalTabKey(info)),
-      onError: () => onCreateError?.(),
+      onError: (error) => {
+        onCreateError?.();
+        if (elevated) toast.error(`Couldn't open an admin terminal: ${error.message}`);
+      },
     });
   };
 

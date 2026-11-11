@@ -15,11 +15,13 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import httpx
 import jwt
 import pytest
+from starlette.requests import Request
 
 from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.oidc import OIDCConfig, derive_code_challenge
 from omnigent.server.routes import auth as auth_routes
+from omnigent.server.routes._terminal_access import require_terminal_browser_session
 from omnigent.server.routes.auth import create_auth_router
 
 pytestmark = pytest.mark.asyncio
@@ -149,8 +151,12 @@ def _client(transport: httpx.ASGITransport) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=transport, base_url="http://test", follow_redirects=False)
 
 
-async def test_native_sign_in_delivers_code_and_exchanges_for_session() -> None:
-    """The full loopback flow ends with a session token, and the browser gets none."""
+async def test_native_sign_in_delivers_code_and_exchanges_for_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The desktop's native cookie passes the human admin-terminal guard."""
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "0")
+    monkeypatch.setenv("OMNIGENT_WS_ALLOWED_ORIGINS", "http://test")
     grant_store = MagicMock()
     with patch.object(auth_routes, "issue_login_grant", return_value="refresh-abc") as issue:
         async with _client(_transport(device_grant_store=grant_store)) as client:
@@ -167,9 +173,25 @@ async def test_native_sign_in_delivers_code_and_exchanges_for_session() -> None:
     assert resp.status_code == 200
     assert resp.headers["cache-control"] == "no-store"
     body = resp.json()
-    assert jwt.decode(body["token"], _TEST_SECRET, algorithms=["HS256"])["sub"] == (
-        "alice@example.com"
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=_config())
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/sessions/session-a/resources/terminals",
+            "headers": [
+                (b"origin", b"http://test"),
+                (
+                    b"cookie",
+                    f"{provider.session_cookie_name}={body['token']}".encode(),
+                ),
+            ],
+        }
     )
+    require_terminal_browser_session(request, provider)
+    claims = jwt.decode(body["token"], _TEST_SECRET, algorithms=["HS256"])
+    assert claims["sub"] == "alice@example.com"
+    assert claims["browser_session"] is True
     assert body["user_id"] == "alice@example.com"
     assert body["expires_in"] == 8 * 3600
     assert body["refresh_token"] == "refresh-abc"

@@ -10,8 +10,9 @@ import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
 
+const terminalAccess = vi.hoisted(() => ({ canCreateElevated: false }));
 vi.mock("@/hooks/useSessionTerminalAccess", () => ({
-  useSessionTerminalAccess: () => ({ canCreateElevated: false }),
+  useSessionTerminalAccess: () => ({ canCreateElevated: terminalAccess.canCreateElevated }),
 }));
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import type * as UsePermissionsModule from "@/hooks/usePermissions";
@@ -139,6 +140,7 @@ const useCreateTerminalMock = vi.mocked(useCreateTerminal);
 const useSessionAgentMock = vi.mocked(useSessionAgent);
 
 beforeEach(() => {
+  terminalAccess.canCreateElevated = false;
   vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
 });
 
@@ -1175,6 +1177,29 @@ describe('WorkspacePanel "+" new-tab menu', () => {
       expect(toolbar).not.toHaveClass("no-drag");
     },
   );
+
+  it("shows the server refusal when Admin creation fails", async () => {
+    terminalAccess.canCreateElevated = true;
+    declaresShell();
+    const refusal = "a trusted human browser session is required";
+    const mutate = vi.fn((_value: unknown, opts: { onError: (error: Error) => void }) =>
+      opts.onError(new Error(refusal)),
+    );
+    useCreateTerminalMock.mockReturnValue({
+      mutate,
+      isPending: false,
+      isError: true,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+    renderWorkspace({ showBrowserTab: false });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Admin" }));
+
+    expect(mutate).toHaveBeenCalledWith({ terminal: "zsh", elevated: true }, expect.any(Object));
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(`Couldn't open an admin terminal: ${refusal}`),
+    );
+  });
 
   it("offers Shell (gated on declared terminals), creating one and opening it as a tab", async () => {
     // Agent declares a shell; creating it resolves to a terminal whose tab key
