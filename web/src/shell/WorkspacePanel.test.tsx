@@ -1366,10 +1366,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
     fireEvent.click(await screen.findByRole("menuitem", { name: "Admin" }));
 
-    expect(launch).toHaveBeenCalledWith(
-      "zsh",
-      expect.objectContaining({ elevated: true }),
-    );
+    expect(launch).toHaveBeenCalledWith("zsh", expect.objectContaining({ elevated: true }));
     await waitFor(() =>
       expect(toast.error).toHaveBeenCalledWith(`Couldn't open an admin terminal: ${refusal}`),
     );
