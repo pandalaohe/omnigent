@@ -215,7 +215,7 @@ def test_rename_refused_names_holders_and_restarts(transaction, monkeypatch, cap
     monkeypatch.setattr(Path, "rename", rename)
     monkeypatch.setattr(helper, "holders", lambda _: "PID 42 (holder)")
     assert helper.run(args) == 1
-    assert "PID 42" in capsys.readouterr().out
+    assert "PID 42" in capsys.readouterr().err
     assert commands[-1][0][1:3] == ["host", "enable"]
     assert (tool / "old.txt").exists()
 
@@ -392,7 +392,7 @@ def test_rename_back_failure_emits_recovery(transaction, monkeypatch, capsys, pr
     assert helper.run(args) == 1
     installs = [cmd for cmd, _ in commands if cmd[1:3] == ["tool", "install"]]
     assert len(installs) == (2 if previous else 1)
-    assert "Recovery: & '/opt/bin/uv.exe' 'tool' 'install'" in capsys.readouterr().out
+    assert "Recovery: & '/opt/bin/uv.exe' 'tool' 'install'" in capsys.readouterr().err
 
 
 def test_steps_written_before_actions(transaction, monkeypatch):
@@ -668,3 +668,157 @@ def test_recovery_command_quotes_powershell_paths(transaction, monkeypatch):
     )
     assert "'#egg" not in state["recovery_command"]
     assert state["recovery_command"].endswith("#egg=omnigent[all]'")
+
+
+RECOVERY_JOURNAL_FAULTS = [
+    (name, occurrence)
+    for name in (
+        "recovery-stop-task",
+        "recovery-capture",
+        "recovery-stop-tree",
+        "recovery-remove-partial",
+        "recovery-restore-tool",
+        "recovery-restore-omni.exe",
+        "recovery-restore-omnigent.exe",
+        "recovery-restart",
+    )
+    for occurrence in (1, 2)
+] + [("recovery-complete", 1)]
+
+
+@pytest.mark.parametrize("phase,occurrence", RECOVERY_JOURNAL_FAULTS)
+@pytest.mark.parametrize("persistent", [False, True])
+def test_journal_io_failure_never_stops_recovery(
+    transaction, monkeypatch, capsys, phase, occurrence, persistent
+):
+    args, tool, commands, root = transaction
+    monkeypatch.setattr(helper, "_probe_installed_distribution", lambda *a, **k: ("1", "wrong"))
+    original = helper.atomic_write_json
+    attempts = []
+    states = []
+    faulted = [False]
+    seen = [0]
+
+    def write(path, state):
+        current = state["step"]
+        attempts.append(current)
+        states.append(json.loads(json.dumps(state)))
+        if current == phase:
+            seen[0] += 1
+        if (current == phase and seen[0] == occurrence) or (persistent and faulted[0]):
+            faulted[0] = True
+            raise OSError("journal storage unavailable")
+        original(path, state)
+
+    monkeypatch.setattr(helper, "atomic_write_json", write)
+    assert helper.run(args) == 1
+    assert faulted[0]
+    assert (tool / "old.txt").read_text() == "previous install"
+    assert not (tool / "new.txt").exists()
+    assert (Path(args.bin_dir) / "omni.exe").read_text() == "old launcher"
+    assert commands[-1][0][1:3] == ["host", "enable"]
+    assert sum(cmd[1:3] == ["tool", "install"] for cmd, _ in commands) == 1
+    assert attempts[-1] == "recovery-complete"
+    final = states[-1]
+    assert final["result"] == "failed" and final["failed_step"] == "verify"
+    assert final["recovery"]["recovery-restore-tool"] == "ok"
+    assert final["recovery"]["recovery-restart"] == "ok"
+    if persistent:
+        assert final["journal_errors"]
+    else:
+        persisted = json.loads((root / "updates/last-upgrade.json").read_text())
+        assert persisted["step"] == "recovery-complete" and persisted["result"] == "failed"
+        assert persisted["journal_errors"][0]["step"] == phase
+    output = capsys.readouterr().err
+    assert "Could not persist/report recovery step " + phase in output
+    assert "Recovery: & '/opt/bin/uv.exe'" in output
+    assert "journal storage unavailable" in Path(args.log).read_text()
+
+
+@pytest.mark.parametrize("phase", ["stop", "holders", "install"])
+def test_forward_journal_failure_precedes_its_action(transaction, monkeypatch, phase):
+    args, tool, commands, root = transaction
+    original_write, original_rename = helper.atomic_write_json, Path.rename
+    stopped, renamed = [], []
+
+    def write(path, state):
+        if state["step"] == phase:
+            raise OSError("forward journal unavailable")
+        original_write(path, state)
+
+    def rename(path, destination):
+        renamed.append((path, destination))
+        return original_rename(path, destination)
+
+    monkeypatch.setattr(helper, "atomic_write_json", write)
+    monkeypatch.setattr(helper.windows_task, "stop", lambda _: stopped.append("stop"))
+    monkeypatch.setattr(Path, "rename", rename)
+    assert helper.run(args) == 1
+    assert (tool / "old.txt").exists()
+    assert not any(cmd[1:3] == ["tool", "install"] for cmd, _ in commands)
+    if phase == "stop":
+        assert not stopped and not renamed and not commands
+    elif phase == "holders":
+        assert stopped == ["stop"] and not renamed
+    else:
+        assert renamed[0][0] == tool and renamed[-1][1] == tool
+    state = json.loads((root / "updates/last-upgrade.json").read_text())
+    assert state["result"] == "failed" and state["failed_step"] == phase
+
+
+def test_recovery_continues_when_all_diagnostic_outputs_fail(transaction, monkeypatch):
+    args, tool, commands, _ = transaction
+    monkeypatch.setattr(helper, "_probe_installed_distribution", lambda *a, **k: ("1", "wrong"))
+    original = helper.atomic_write_json
+
+    def write(path, state):
+        if state["step"].startswith("recovery-"):
+            raise OSError("journal full")
+        original(path, state)
+
+    class ClosedOutput:
+        def write(self, text):
+            raise OSError("output closed")
+
+        def flush(self):
+            raise OSError("output closed")
+
+    original_open = Path.open
+
+    def open_path(path, *a, **kw):
+        if path == Path(args.log):
+            raise PermissionError("log locked")
+        return original_open(path, *a, **kw)
+
+    monkeypatch.setattr(helper, "atomic_write_json", write)
+    monkeypatch.setattr(helper.sys, "stderr", ClosedOutput())
+    monkeypatch.setattr(Path, "open", open_path)
+    assert helper.run(args) == 1
+    assert (tool / "old.txt").exists()
+    assert commands[-1][0][1:3] == ["host", "enable"]
+
+
+def test_reinstall_journal_failure_retains_snapshot_and_restarts(transaction, monkeypatch):
+    args, _tool, commands, root = transaction
+    monkeypatch.setattr(helper, "_probe_installed_distribution", lambda *a, **k: ("1", "wrong"))
+    original_write, original_rename = helper.atomic_write_json, Path.rename
+
+    def write(path, state):
+        if state["step"] == "recovery-reinstall":
+            raise OSError("fallback journal locked")
+        original_write(path, state)
+
+    def rename(path, destination):
+        if ".previous-" in path.name:
+            raise PermissionError("restore locked")
+        return original_rename(path, destination)
+
+    monkeypatch.setattr(helper, "atomic_write_json", write)
+    monkeypatch.setattr(Path, "rename", rename)
+    assert helper.run(args) == 1
+    state = json.loads((root / "updates/last-upgrade.json").read_text())
+    assert (Path(state["snapshot"]) / "old.txt").exists()
+    assert state["result"] == "failed"
+    assert state["recovery"]["recovery-reinstall"] == "ok"
+    assert commands[-1][0][1:3] == ["host", "enable"]
+    assert sum(cmd[1:3] == ["tool", "install"] for cmd, _ in commands) == 2

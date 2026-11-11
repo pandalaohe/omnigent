@@ -166,6 +166,14 @@ def holders(prefix: Path) -> str:
     return ", ".join(found) or "no holders visible with current permissions"
 
 
+def _report_recovery(message: str, log: Path) -> None:
+    """Try independent output sinks without making recovery depend on either."""
+    with contextlib.suppress(OSError, ValueError):
+        print(message, file=sys.stderr, flush=True)
+    with contextlib.suppress(OSError, ValueError), log.open("a", encoding="utf-8") as stream:
+        stream.write(message + "\n")
+
+
 def run(args: argparse.Namespace) -> int:
     updates = data_dir() / "updates"
     updates.mkdir(parents=True, exist_ok=True)
@@ -299,19 +307,34 @@ def run(args: argparse.Namespace) -> int:
         record["snapshot"] = str(backup)
         outcomes: dict[str, str] = {}
         record["recovery"] = outcomes
-        print(f"Upgrade failed at {failed_step}: {exc}", flush=True)
+        journal_errors: list[dict[str, str]] = []
+        record["journal_errors"] = journal_errors
+
+        def report(message: str) -> None:
+            _report_recovery(message, Path(args.log))
+
+        report(f"Upgrade failed at {failed_step}: {exc}")
+
+        def recovery_step(name: str, result: str | None = None) -> bool:
+            try:
+                step(name, result)
+            except Exception as journal_error:  # noqa: BLE001 — journal failure cannot gate rollback
+                journal_errors.append({"step": name, "error": str(journal_error)})
+                report(f"Could not persist/report recovery step {name}: {journal_error}")
+                return False
+            return True
 
         def attempt(name: str, action: Callable[[], object]) -> bool:
-            step(name)
+            recovery_step(name)
             try:
                 action()
             except Exception as recovery:  # noqa: BLE001 — one failure cannot skip other recovery
                 outcomes[name] = f"failed: {recovery}"
-                print(f"{name}: {recovery}", flush=True)
-                step(name)
+                report(f"{name}: {recovery}")
+                recovery_step(name)
                 return False
             outcomes[name] = "ok"
-            step(name)
+            recovery_step(name)
             return True
 
         repo, _ = _split_vcs_url(args.install_spec)
@@ -363,8 +386,9 @@ def run(args: argparse.Namespace) -> int:
         record["recovery_result"] = (
             "incomplete" if any(value != "ok" for value in outcomes.values()) else "ok"
         )
-        print("Recovery: " + str(record["recovery_command"]), flush=True)
-        step("recovery-complete", "failed")
+        report("Recovery: " + str(record["recovery_command"]))
+        if not recovery_step("recovery-complete", "failed"):
+            recovery_step("recovery-complete", "failed")
         return 1
     finally:
         if owner is not None:
