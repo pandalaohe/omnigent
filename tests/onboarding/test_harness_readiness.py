@@ -17,10 +17,12 @@ import omnigent.onboarding.harness_install as hi
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
+    HARNESS_CLI_UNRESPONSIVE,
     HARNESS_NEEDS_AUTH,
     HARNESS_TMUX_UNAVAILABLE,
     HARNESS_VERSION_TOO_LOW,
     HarnessAvailability,
+    harness_launch_availability,
 )
 from omnigent.onboarding.harness_readiness import (
     _READINESS_PROBE_MAX_WORKERS,
@@ -323,7 +325,7 @@ def test_unanswered_pi_version_probe_is_not_reported_as_outdated(
     assert hi.harness_cli_binary(hi.PI_KEY) == str(launcher)
     result = configured_harness_map()
     for harness in ("pi", "pi-native", "native-pi"):
-        assert result[harness] is False, f"{harness}: {result[harness]!r}"
+        assert result[harness] == HARNESS_CLI_UNRESPONSIVE, f"{harness}: {result[harness]!r}"
     assert harness_is_configured("pi-native") is True
 
 
@@ -993,10 +995,11 @@ def test_failed_version_probe_is_not_reported_as_old(
         )
 
     monkeypatch.setattr(hi.subprocess, "run", probe)
-    assert _harness_availability(harness) is False
+    expected = HARNESS_CLI_UNRESPONSIVE if failure == "timeout" else False
+    assert _harness_availability(harness) == expected
 
 
-def test_timed_out_version_probe_stays_unavailable_and_passes_launch_gates(
+def test_timed_out_version_probe_reports_unknown_and_passes_launch_gates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A resolved CLI whose ``--version`` times out is neither outdated nor missing."""
@@ -1019,7 +1022,8 @@ def test_timed_out_version_probe_stays_unavailable_and_passes_launch_gates(
         "cursor-native",
         "kiro-native",
     ):
-        assert result[harness] is False, f"{harness}: {result[harness]!r}"
+        assert result[harness] == HARNESS_CLI_UNRESPONSIVE, f"{harness}: {result[harness]!r}"
+        assert harness_launch_availability(harness, result)[0] is not False
         assert harness_is_configured(harness) is True, harness
         assert hi.missing_harness_cli(harness) is None, harness
     assert hi.harness_cli_installed(hi.PI_KEY) is False
@@ -1061,7 +1065,7 @@ def test_unanswered_version_probe_still_requires_antigravity_credential(
     assert configured_harness_map()["antigravity-native"] is False
     assert harness_is_configured("antigravity-native") is False
     monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)
-    assert configured_harness_map()["antigravity-native"] is False
+    assert configured_harness_map()["antigravity-native"] == HARNESS_CLI_UNRESPONSIVE
     assert harness_is_configured("antigravity-native") is True
 
 

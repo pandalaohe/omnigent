@@ -72,6 +72,7 @@ async def test_child_create_rejects_unavailable_harness(
 @pytest.mark.parametrize(
     "readiness",
     [
+        "timed-out-pi",
         None,
         {},
         {"jcode": True},
@@ -83,10 +84,28 @@ async def test_child_create_preserves_ready_and_unknown_hosts(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
-    readiness: dict | None,
+    readiness: dict | str | None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.host_store import HostStore
+
+    harness = "jcode"
+    if readiness == "timed-out-pi":
+        import subprocess
+
+        import omnigent.onboarding.harness_install as install
+        from omnigent.onboarding.harness_readiness import _harness_availability
+
+        monkeypatch.setattr(install.shutil, "which", lambda name: f"/opt/bin/{name}")
+
+        def timed_out(*args: object, **kwargs: object) -> None:
+            raise subprocess.TimeoutExpired("pi --version", 10)
+
+        monkeypatch.setattr(install, "_harness_cli_version_string", timed_out)
+        harness = "pi"
+        readiness = {harness: _harness_availability(harness), "claude-sdk": True}
+        assert readiness[harness] == "cli-unresponsive"
 
     agent = await create_test_agent(client)
     parent = (await client.post("/v1/sessions", json={"agent_id": agent["id"]})).json()
@@ -103,11 +122,11 @@ async def test_child_create_preserves_ready_and_unknown_hosts(
         json={
             "agent_id": agent["id"],
             "parent_session_id": parent["id"],
-            "harness_override": "jcode",
+            "harness_override": harness,
         },
     )
     assert response.status_code == 201, response.text
-    assert response.json()["harness"] == "jcode"
+    assert response.json()["harness"] == harness
 
 
 @pytest.mark.parametrize(

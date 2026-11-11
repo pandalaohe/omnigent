@@ -368,7 +368,7 @@ def relay(path: Path, app: str, command: list[str], *, owner_pid: int | None = N
             if stopping_at is not None and time.monotonic() - stopping_at > 2:
                 break
             readers = []
-            if stdin_open and len(pending_input) < 65536:
+            if stdin_open and not pending_input:
                 readers.append(0)
             if master_open and len(pending_output) < 65536:
                 readers.append(master)
@@ -385,8 +385,14 @@ def relay(path: Path, app: str, command: list[str], *, owner_pid: int | None = N
                     drain_deadline = None
             for fd, pending in ((master, pending_input), (1, pending_output)):
                 if fd in writable:
-                    with contextlib.suppress(BlockingIOError):
+                    try:
                         del pending[: os.write(fd, pending)]
+                    except BlockingIOError:
+                        pass
+                    except OSError as exc:
+                        if fd != master or exc.errno != errno.EIO:
+                            raise
+                        pending_input.clear()
             if master_open and master in readable:
                 try:
                     data = os.read(master, 65536)
@@ -427,6 +433,9 @@ def relay(path: Path, app: str, command: list[str], *, owner_pid: int | None = N
                 break
     finally:
         try:
+            if stopping_at is not None and exit_status is None:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pid, signal.SIGKILL)
             # A child exiting its controlling PTY may wait for the master to close.
             os.close(master)
             # PTY EOF can precede waitpid readiness; allow the child's real exit to arrive.

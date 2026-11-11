@@ -6026,7 +6026,7 @@ describe("automation harness settings", () => {
         vi.mocked(useHarnessCapabilities).mockReturnValue(codexPermissionCatalog);
       }
       render(
-        <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
+        <CapabilitiesProvider info={{ ...SERVER_INFO_OFFLINE_FALLBACK }}>
           <CreateScheduledTaskDialog
             open
             onOpenChange={vi.fn()}

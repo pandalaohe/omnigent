@@ -4241,7 +4241,7 @@ describe("chatStore — send (first-send ordering)", () => {
       expect(client.isFetching({ queryKey: ["session", "conv_joined_load"], exact: true })).toBe(1);
     });
 
-    it("recovers a load stuck on a shared read that never answers, even past a transient 503", async () => {
+    it("loads independently of a stuck shared read, even past a transient 503", async () => {
       vi.useFakeTimers();
       seedSession("conv_stuck_join", []);
       // Another caller's read of the same session, which the server never answers.
@@ -4263,7 +4263,7 @@ describe("chatStore — send (first-send ordering)", () => {
       void useChatStore.getState().switchTo("conv_stuck_join");
       await vi.advanceTimersByTimeAsync(SESSION_READ_TIMEOUT_MS - 1_000);
       expect(conversationRegistry.peek("conv_stuck_join")!.getState()).toMatchObject({
-        loadingConversation: true,
+        loadingConversation: false,
       });
 
       await vi.advanceTimersByTimeAsync(SESSION_READ_TIMEOUT_MS);
@@ -4274,7 +4274,7 @@ describe("chatStore — send (first-send ordering)", () => {
       });
     });
 
-    it("reads a session once when its load joins a shared read that answers", async () => {
+    it("loads an independent snapshot while another caller reads the same session", async () => {
       vi.useFakeTimers();
       seedSession("conv_shared_read", []);
       void client.fetchQuery({
@@ -4288,7 +4288,7 @@ describe("chatStore — send (first-send ordering)", () => {
       const sessionReads = fetchMock.mock.calls.filter(
         ([input]) => String(input).split("?")[0] === "/v1/sessions/conv_shared_read",
       );
-      expect(sessionReads).toHaveLength(1);
+      expect(sessionReads).toHaveLength(2);
     });
 
     it("fails a missing session at once", async () => {
@@ -17449,7 +17449,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const sinks: StreamSink[] = [];
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+      if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
         const sink = pushableStream();
         sinks.push(sink);
         init?.signal?.addEventListener("abort", () =>
@@ -19871,7 +19871,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
           return mockResponse({ error: "unavailable" }, { ok: false, status: 503 });
         }
       }
-      if (url === `/v1/sessions/${id}/stream`) {
+      if (url.split("?")[0] === `/v1/sessions/${id}/stream`) {
         const sink = pushableStream();
         sinks.push(sink);
         init?.signal?.addEventListener("abort", () =>
@@ -20855,7 +20855,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       let opens = 0;
       fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input.toString();
-        if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
           opens += 1;
           return loginPageResponse();
         }
@@ -20947,7 +20947,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     let opens = 0;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+      if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
         const answer = answers[opens % answers.length];
         opens += 1;
         if (answer === "login") return loginPageResponse();
@@ -20981,7 +20981,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input.toString();
         if (url.endsWith("/v1/me")) return mockResponse({}, { ok: false, status: 401 });
-        if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
           opens += 1;
           return answerStream();
         }
@@ -21019,7 +21019,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
           init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
         });
       }
-      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+      if (/\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
         opens += 1;
         return Promise.reject(new TypeError("Failed to fetch"));
       }
@@ -21042,7 +21042,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     seedSession("conv_probe_down", []);
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url.endsWith("/v1/me") || /\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+      if (url.endsWith("/v1/me") || /\/v1\/sessions\/[^/]+\/stream(?:\?.*)?$/.test(url)) {
         return Promise.reject(new TypeError("Failed to fetch"));
       }
       return defaultFetchHandler(input, init);

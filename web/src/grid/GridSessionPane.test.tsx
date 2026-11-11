@@ -404,11 +404,11 @@ it.each(["chat", "terminal"])(
       "File draft",
     );
     fireEvent.change(workspaceDraft, { target: { value: "Unsaved file" } });
-    fireEvent.click(within(first).getByRole("button", { name: "Terminal view" }));
+    fireEvent.click(within(first).getByRole("radio", { name: "Terminal view" }));
     const terminal = await within(first).findByLabelText("Terminal input");
     fireEvent.change(terminal, { target: { value: "Terminal draft" } });
     if (surface === "chat") {
-      fireEvent.click(within(first).getByRole("button", { name: "Chat view" }));
+      fireEvent.click(within(first).getByRole("radio", { name: "Chat view" }));
       fixture.failedChat = "first";
     } else {
       fixture.failedTerminal = "first";
@@ -554,11 +554,11 @@ it("keeps failed automatic recovery across grid view switches", async () => {
     </MemoryRouter>,
   );
   const first = screen.getByRole("region", { name: "first (active)" });
-  fireEvent.click(within(first).getByRole("button", { name: "Terminal view" }));
+  fireEvent.click(within(first).getByRole("radio", { name: "Terminal view" }));
   const failure = await within(first).findByRole("alert");
   expect(failure).toHaveTextContent("Couldn't reconnect the terminal automatically.");
-  fireEvent.click(within(first).getByRole("button", { name: "Chat view" }));
-  fireEvent.click(within(first).getByRole("button", { name: "Terminal view" }));
+  fireEvent.click(within(first).getByRole("radio", { name: "Chat view" }));
+  fireEvent.click(within(first).getByRole("radio", { name: "Terminal view" }));
   await act(async () => {});
   expect(within(first).getByRole("alert")).toBe(failure);
   expect(within(first).getByRole("button", { name: "Resume session" })).toBeEnabled();

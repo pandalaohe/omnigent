@@ -12,6 +12,7 @@ import re
 import secrets
 import shutil
 import socket
+import subprocess
 import time
 import uuid
 from collections import Counter
@@ -36,6 +37,7 @@ from omnigent.entities.conversation import NON_CONTENT_ITEM_TYPES
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
+    HARNESS_CLI_UNRESPONSIVE,
     HARNESS_NEEDS_AUTH,
     HarnessAvailability,
 )
@@ -294,7 +296,12 @@ def _codex_auth_unavailable_reason() -> HarnessAvailability | None:
 
     if _find_codex_cli() is None:
         return HARNESS_BINARY_MISSING
-    state = harness_cli_readiness(OPENAI_FAMILY, timeout=READINESS_CLI_PROBE_TIMEOUT_S)
+    try:
+        state = harness_cli_readiness(
+            OPENAI_FAMILY, timeout=READINESS_CLI_PROBE_TIMEOUT_S, raise_on_timeout=True
+        )
+    except subprocess.TimeoutExpired:
+        return HARNESS_CLI_UNRESPONSIVE
     if state is not True:
         return state
     # On a host with no configured provider this may run ambient detection.

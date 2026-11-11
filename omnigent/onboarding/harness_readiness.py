@@ -897,7 +897,7 @@ def _installer_only_availability(install_key: str, *, launch: bool = False) -> H
     """
     try:
         state = harness_cli_readiness(
-            install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S, raise_on_timeout=launch
+            install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S, raise_on_timeout=True
         )
     except subprocess.TimeoutExpired:
         state = HARNESS_CLI_UNRESPONSIVE
@@ -916,7 +916,12 @@ def _binary_availability_reason(install_key: str) -> HarnessAvailability:
     ``--version`` probe times out reports ``"cli-unresponsive"``: its version
     is unknown, not outdated.
     """
-    return harness_cli_readiness(install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S)
+    try:
+        return harness_cli_readiness(
+            install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S, raise_on_timeout=True
+        )
+    except subprocess.TimeoutExpired:
+        return HARNESS_CLI_UNRESPONSIVE
 
 
 def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailability:
