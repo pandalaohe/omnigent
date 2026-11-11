@@ -48,6 +48,7 @@ import time
 from pathlib import Path
 
 import psutil
+import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -182,7 +183,8 @@ def _reap(pid: int) -> None:
         os.kill(pid, signal.SIGKILL)
 
 
-def test_pytest_run_leaves_no_omnigent_processes(tmp_path: Path) -> None:
+@pytest.mark.parametrize("boundary", ["session", "test"])
+def test_pytest_run_leaves_no_omnigent_processes(tmp_path: Path, boundary: str) -> None:
     """A pytest session must reap every Omnigent child its tests spawned.
 
     Drives the real journey: run pytest on a CLI test that spawns a
@@ -197,7 +199,35 @@ def test_pytest_run_leaves_no_omnigent_processes(tmp_path: Path) -> None:
     tmp_root = tmp_path / "nested-tmp"
     tmp_root.mkdir()
     nested_test = tmp_path / "leak_probe_test.py"
-    nested_test.write_text(_NESTED_LEAKY_TEST, encoding="utf-8")
+    probe = _NESTED_LEAKY_TEST
+    plugins = ["-p", "tests.conftest"]
+    if boundary == "test":
+        plugins += ["-p", "tests.e2e.conftest", "-p", "tests.e2e.omnigent.conftest"]
+        probe = """
+import os
+import subprocess
+import sys
+from pathlib import Path
+from omnigent.testing.process_reaper import find_leaked_omnigent_processes
+
+def test_spawn_real_detached_host(mock_credentials_env):
+    global leak_data_dir
+    leak_data_dir = mock_credentials_env['OMNIGENT_DATA_DIR']
+    # Leave teardown to the fixture under test, rather than the CLI's startup timeout.
+    proc = subprocess.Popen(
+        [sys.executable, '-m', 'omnigent.host._daemon_entry',
+         '--server', os.environ['LEAK_PROBE_SERVER_URL']],
+        env=mock_credentials_env, start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    assert proc.pid in {p.pid for p in find_leaked_omnigent_processes(Path(leak_data_dir))}
+
+def test_previous_test_reaped_host_but_kept_shared_mock(mock_llm_server_url):
+    import httpx
+    assert not find_leaked_omnigent_processes(Path(leak_data_dir))
+    assert httpx.post(f"{mock_llm_server_url}/mock/reset").status_code == 200
+"""
+    nested_test.write_text(probe, encoding="utf-8")
 
     env = os.environ.copy()
     # Confine the nested run's mkdtemp'd OMNIGENT_DATA_DIR to a private
@@ -223,8 +253,7 @@ def test_pytest_run_leaves_no_omnigent_processes(tmp_path: Path) -> None:
             # not discover tests/conftest.py for it. Load it explicitly:
             # it is the session-level spawn/teardown wiring under test
             # (OMNIGENT_DATA_DIR isolation + unconfigure cleanup).
-            "-p",
-            "tests.conftest",
+            *plugins,
         ],
         cwd=_REPO_ROOT,
         env=env,

@@ -18,6 +18,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests._helpers.live_server import find_free_port
 
 # Root of the Omnigent checkout that ships the ``omnigent``
@@ -113,23 +114,25 @@ def omnigent_repo_root() -> Path:
     return _OMNIGENT_REPO
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def mock_credentials_env(
     mock_llm_server_url: str,
-    tmp_path_factory: pytest.TempPathFactory,
-) -> dict[str, str]:
+    tmp_path: Path,
+) -> Iterator[dict[str, str]]:
     """
     Environment dict for subprocess invocations against the mock LLM.
 
     Wires ``OPENAI_BASE_URL`` to the session-scoped mock LLM server
     so all LLM calls go to deterministic canned responses instead of
-    a real Databricks gateway.
+    a real Databricks gateway. Each invocation gets a private config
+    and data directory, so a test that starts a detached CLI host is
+    attributable to this test and can be reaped on the way out (even
+    when the test fails).
 
     :param mock_llm_server_url: Base URL of the mock LLM server,
         e.g. ``"http://127.0.0.1:12345"``.
-    :param tmp_path_factory: Pytest factory for a session-scoped
-        config home.
-    :returns: A dict suitable for ``subprocess.Popen(env=...)``.
+    :param tmp_path: Per-test directory for the private config/data dirs.
+    :yields: A dict suitable for ``subprocess.Popen(env=...)``.
     """
     env = dict(os.environ)
     env["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
@@ -149,17 +152,29 @@ def mock_credentials_env(
         env.pop(stale, None)
     env["OMNIGENT_SKIP_ONBOARD"] = "1"
     env["OMNIGENT_NO_UPDATE_CHECK"] = "1"
-    config_home = tmp_path_factory.mktemp("omnigent-mock-e2e-config")
+    fixture_home = tmp_path / "mock-credentials"
+    config_home = fixture_home / "config"
+    config_home.mkdir(parents=True)
     (config_home / "config.yaml").write_text(
         "auth:\n  type: api_key\nauto_open_conversation: false\n",
         encoding="utf-8",
     )
     env["OMNIGENT_CONFIG_HOME"] = str(config_home)
+    data_dir = fixture_home / "data"
+    data_dir.mkdir()
+    env["OMNIGENT_DATA_DIR"] = str(data_dir)
     repo = str(_OMNIGENT_REPO)
     omnigent_path = str(_OMNIGENT_REPO / "omnigent")
     existing_pp = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = os.pathsep.join(p for p in (repo, omnigent_path, existing_pp) if p)
-    return env
+    try:
+        yield env
+    finally:
+        _, survivors = reap_leaked_omnigent_processes(data_dir)
+        if survivors:
+            raise RuntimeError(
+                "CLI fixture left Omnigent process(es) running: " + "; ".join(survivors)
+            )
 
 
 # ── Mock LLM server fixtures ────────────────────────────────
