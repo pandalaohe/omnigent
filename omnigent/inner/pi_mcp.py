@@ -318,6 +318,14 @@ def _write_generated_copy(target: Path, digest: Path, data: Mapping[str, object]
         raise
 
 
+def _is_resource_seed(target: Path, content_hash: str) -> bool:
+    from omnigent.inner.pi_settings import _PI_SEED_MANIFEST, _read_settings_file
+
+    seeded = _read_settings_file(target.parent / _PI_SEED_MANIFEST).get(target.name)
+    seeded_hashes = seeded if isinstance(seeded, list) else [seeded]
+    return content_hash in seeded_hashes
+
+
 def _is_session_owned(target: Path, digest: Path) -> bool:
     """Whether *target* is a regular file that this module did not write unchanged."""
     if target.is_symlink() or not target.exists():
@@ -325,14 +333,14 @@ def _is_session_owned(target: Path, digest: Path) -> bool:
     try:
         recorded = digest.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
-        from omnigent.inner.pi_settings import _PI_SEED_MANIFEST, _read_settings_file
-
-        seeded = _read_settings_file(target.parent / _PI_SEED_MANIFEST).get(target.name)
-        seeded_hashes = seeded if isinstance(seeded, list) else [seeded]
-        return hashlib.sha256(target.read_bytes()).hexdigest() not in seeded_hashes
+        recorded = None
     except (OSError, UnicodeDecodeError):
         return True
-    return recorded != hashlib.sha256(target.read_bytes()).hexdigest()
+    current_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+    if current_hash == recorded:
+        return False
+    # Resource reseeding can refresh a plain copy without changing the MCP digest.
+    return not _is_resource_seed(target, current_hash)
 
 
 def _restore_user_link(target: Path, source: Path, digest: Path) -> None:
@@ -386,6 +394,14 @@ def sync_managed_pi_mcp_config(
                 _restore_user_copy(target, source, digest)
             except OSError:
                 _logger.exception("Could not refresh the user's Pi MCP copy at %s", target)
+                try:
+                    if not target.is_symlink() and not _is_session_owned(target, digest):
+                        current_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+                        if not _is_resource_seed(target, current_hash):
+                            target.unlink(missing_ok=True)
+                            digest.unlink(missing_ok=True)
+                except OSError:
+                    _logger.exception("Could not remove the stale Pi MCP copy at %s", target)
             return
         _write_generated_copy(target, digest, merged)
     except Exception:

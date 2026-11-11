@@ -444,6 +444,34 @@ def test_user_file_stays_isolated_when_it_covers_the_host(home: Path, pi_agent: 
     assert _managed_servers(pi_agent) == {"github": {"command": "mine"}}
 
 
+@pytest.mark.parametrize("session_edited", [False, True])
+def test_refreshed_user_copy_can_merge_new_host_servers(
+    home: Path, pi_agent: Path, session_edited: bool
+) -> None:
+    user_file = pi_agent / "mcp.json"
+    _write_json(user_file, {"mcpServers": {"notes": {"command": "first"}}})
+    managed = _prepare(home, pi_agent)
+    target = managed / "mcp.json"
+    assert target.read_bytes() == user_file.read_bytes()
+    assert not target.is_symlink()
+
+    if session_edited:
+        _write_json(target, {"mcpServers": {"session": {"command": "mine"}}})
+    _write_json(user_file, {"mcpServers": {"notes": {"command": "updated"}}})
+    _write_json(home / ".claude.json", {"mcpServers": {"docs": {"command": "host"}}})
+    source_bytes = user_file.read_bytes()
+
+    for _ in range(2):
+        _prepare(home, pi_agent)
+        assert _managed_servers(managed) == (
+            {"session": {"command": "mine"}}
+            if session_edited
+            else {"notes": {"command": "updated"}, "docs": {"command": "host"}}
+        )
+        assert not target.is_symlink()
+        assert user_file.read_bytes() == source_bytes
+
+
 def test_reused_dir_regenerates_and_relinks(home: Path, pi_agent: Path) -> None:
     """Generated copies follow host and source changes without linking the source."""
     claude = home / ".claude.json"
@@ -523,6 +551,45 @@ def test_unreadable_user_config_is_copied_not_replaced(
     assert (managed / "mcp.json").read_bytes() == user_file.read_bytes()
     assert user_file.read_text(encoding="utf-8") == "{not json"
     assert "unreadable" in caplog.text
+
+
+@pytest.mark.parametrize("session_edited", [False, True])
+def test_unreadable_source_drops_only_unchanged_generated_config(
+    home: Path, pi_agent: Path, monkeypatch: pytest.MonkeyPatch, session_edited: bool
+) -> None:
+    claude = home / ".claude.json"
+    _write_json(claude, {"mcpServers": {"removed": {"command": "host"}}})
+    user_file = pi_agent / "mcp.json"
+    _write_json(user_file, {"mcpServers": {"notes": {"command": "mine"}}})
+    source_bytes = user_file.read_bytes()
+    managed = _prepare(home, pi_agent)
+    target = managed / "mcp.json"
+    assert _managed_servers(managed) == {
+        "removed": {"command": "host"},
+        "notes": {"command": "mine"},
+    }
+    if session_edited:
+        _write_json(target, {"mcpServers": {"session": {"command": "mine"}}})
+    _write_json(claude, {"mcpServers": {}})
+    open_path = Path.open
+
+    def fail_source_read(path: Path, *args, **kwargs):
+        if path == user_file:
+            raise PermissionError("source is unreadable")
+        return open_path(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", fail_source_read)
+        _prepare(home, pi_agent)
+
+    assert (managed / "settings.json").exists()
+    assert not target.is_symlink()
+    if session_edited:
+        assert _managed_servers(managed) == {"session": {"command": "mine"}}
+    else:
+        assert not target.exists()
+        assert not (managed / pi_mcp._GENERATED_DIGEST_NAME).exists()
+    assert user_file.read_bytes() == source_bytes
 
 
 @pytest.mark.parametrize("failure", ["inventory", "write", "digest", "replace"])
