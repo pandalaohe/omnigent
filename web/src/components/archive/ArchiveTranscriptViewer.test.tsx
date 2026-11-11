@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Conversation } from "@/hooks/useConversations";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ArchiveTranscriptViewer } from "./ArchiveTranscriptViewer";
 
@@ -14,7 +15,8 @@ const mocks = vi.hoisted(() => ({
   copyText: vi.fn(() => Promise.resolve()),
 }));
 
-vi.mock("@/lib/sessionsApi", () => ({
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
   INITIAL_WINDOW_ITEMS: 100,
   fetchSessionItemsPage: mocks.fetchPage,
   fetchSessionItemsWindow: mocks.fetchWindow,
