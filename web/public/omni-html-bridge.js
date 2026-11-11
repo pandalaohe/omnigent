@@ -70,27 +70,37 @@
 
   // Flat rendered-text index. A block gap is indexed as text so a selection
   // across paragraphs matches the quote sent to the parent.
-  function buildIndex() {
-    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
-      acceptNode: function (n) {
-        var p = n.parentElement;
-        if (!p) return NodeFilter.FILTER_REJECT;
-        var tag = p.tagName;
-        if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") {
-          return NodeFilter.FILTER_REJECT;
-        }
-        var visibility = window.getComputedStyle(p).visibility;
-        if (visibility === "hidden" || visibility === "collapse") return NodeFilter.FILTER_REJECT;
-        for (var el = p; el; el = el.parentElement) {
-          if (window.getComputedStyle(el).display === "none") return NodeFilter.FILTER_REJECT;
-        }
-        return NodeFilter.FILTER_ACCEPT;
+  function buildIndex(includeBreaks) {
+    var walker = document.createTreeWalker(
+      document.body,
+      NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
+      {
+        acceptNode: function (n) {
+          if (n.nodeType === 1 && n.tagName !== "BR") return NodeFilter.FILTER_SKIP;
+          var p = n.nodeType === 1 ? n : n.parentElement;
+          if (!p) return NodeFilter.FILTER_REJECT;
+          var tag = p.tagName;
+          if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") {
+            return NodeFilter.FILTER_REJECT;
+          }
+          var visibility = window.getComputedStyle(p).visibility;
+          if (visibility === "hidden" || visibility === "collapse") return NodeFilter.FILTER_REJECT;
+          for (var el = p; el; el = el.parentElement) {
+            if (window.getComputedStyle(el).display === "none") return NodeFilter.FILTER_REJECT;
+          }
+          return NodeFilter.FILTER_ACCEPT;
+        },
       },
-    });
+    );
     var nodes = [];
     var text = "";
     var n;
     while ((n = walker.nextNode())) {
+      // Native selections include BR line breaks even within a single cell.
+      if (n.nodeType === 1) {
+        if (includeBreaks !== false) text += "\n";
+        continue;
+      }
       if (nodes.length) text += blockGap(nodes[nodes.length - 1].node, n);
       nodes.push({ node: n, start: text.length });
       text += n.nodeValue;
@@ -98,11 +108,11 @@
     return { nodes: nodes, text: text };
   }
 
-  function locate(nodes, pos) {
+  function locate(nodes, pos, preferNext) {
     for (var i = 0; i < nodes.length; i++) {
       if (pos < nodes[i].start) return { node: nodes[i].node, offset: 0 };
       var len = nodes[i].node.nodeValue.length;
-      if (pos <= nodes[i].start + len) {
+      if (pos < nodes[i].start + len || (!preferNext && pos === nodes[i].start + len)) {
         return { node: nodes[i].node, offset: pos - nodes[i].start };
       }
     }
@@ -173,7 +183,7 @@
     while (guard++ < 1000) {
       var at = H.norm.indexOf(needle, from);
       if (at === -1) break;
-      var s = locate(index.nodes, H.map[at]);
+      var s = locate(index.nodes, H.map[at], true);
       var e = locate(index.nodes, H.map[at + needle.length]);
       if (s && e) {
         var r = document.createRange();
@@ -235,13 +245,13 @@
         H.norm.slice(Math.max(0, at - prefix.length), at) === prefix &&
         H.norm.slice(end, end + suffix.length) === suffix
       ) {
-        if (match !== -1) return [];
+        if (match !== -1) return null;
         match = at;
       }
       from = at + 1;
     }
     if (match === -1) return [];
-    var s = locate(index.nodes, H.map[match]);
+    var s = locate(index.nodes, H.map[match], true);
     var e = locate(index.nodes, H.map[match + needle.length]);
     if (!s || !e) return [];
     var range = document.createRange();
@@ -324,6 +334,9 @@
     // Normalize the document text once and reuse it for every comment, rather
     // than rebuilding the whitespace map per comment inside anchorRanges.
     var H = normWs(index.text);
+    // Saved anchors predate BR-aware text. Both views must identify one range.
+    var legacyIndex = buildIndex(false);
+    var legacyH = normWs(legacyIndex.text);
     ranges = [];
     var base = [];
     var activeHi = [];
@@ -333,8 +346,20 @@
       var picked = c.anchor
         ? matchingRanges(index, H, c.anchor)
         : typeof c.occ === "number" && c.occ >= 0
-          ? anchorRanges(index, H, c.anchor_content).slice(c.occ, c.occ + 1)
+          ? anchorRanges(legacyIndex, legacyH, c.anchor_content).slice(c.occ, c.occ + 1)
           : [];
+      if (c.anchor && legacyH.norm !== H.norm) {
+        var legacy = matchingRanges(legacyIndex, legacyH, c.anchor);
+        if (picked === null || legacy === null) picked = [];
+        else if (!picked.length) picked = legacy;
+        else if (
+          legacy.length &&
+          (picked[0].compareBoundaryPoints(Range.START_TO_START, legacy[0]) !== 0 ||
+            picked[0].compareBoundaryPoints(Range.END_TO_END, legacy[0]) !== 0)
+        )
+          picked = [];
+      }
+      picked = picked || [];
       if (!picked.length && c.id) orphans.push(c.id);
       var isActive = active && active.comment_id === c.id;
       for (var j = 0; j < picked.length; j++) {

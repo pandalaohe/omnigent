@@ -626,9 +626,9 @@ function CommentCard({
         </div>
       )}
 
-      {/* Footer: user/time on left, actions on right */}
+      {/* Keep actions below metadata so narrow cards retain the full timestamp. */}
       {!editing && (
-        <div className="flex items-end justify-between gap-2">
+        <div className="flex flex-col gap-2">
           <div className="flex min-w-0 flex-col gap-0.5">
             <div className="flex min-w-0 items-center gap-1.5">
               <span
@@ -654,7 +654,7 @@ function CommentCard({
             )}
           </div>
           {(onEdit || onDelete || onCopyLink) && (
-            <div className="flex shrink-0 items-center gap-2 mr-0.5">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
               {onEdit && (
                 <button
                   type="button"

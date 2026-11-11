@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict
+from pathlib import Path
 
 import pytest
 from playwright.sync_api import Page, Route, expect
@@ -14,6 +15,147 @@ from omnigent.server.routes.artifacts import _inject_in_frame_assets
 from omnigent.server.routes.comments import AddCommentRequest, _format_message
 from tests.browser_ui.files.test_file_line_navigation import BrowserSession, _open_viewer
 from tests.browser_ui.files.test_file_line_navigation import seeded_session as seeded_session
+
+
+def test_narrow_comment_card_footer_stays_inside_card(
+    page: Page, seeded_session: BrowserSession, tmp_path: Path
+) -> None:
+    session = seeded_session
+    session.comments.append(
+        asdict(
+            Comment(
+                id="narrow-comment",
+                conversation_id=session.session_id,
+                path="reports/preview.html",
+                body="请检查减伤数值",
+                start_index=0,
+                end_index=0,
+                status="draft",
+                created_at=1,
+                updated_at=1,
+                anchor_content=None,
+            )
+        )
+    )
+    page.emulate_media(color_scheme="dark")
+    viewer, _ = _html_viewer(page, session, "<p>Review this page</p>")
+    viewer.get_by_role("button", name="Show comments", exact=True).click()
+    edit = viewer.get_by_role("button", name="Edit this comment", exact=True)
+    expect(edit).to_be_visible()
+    panel = edit.locator("xpath=ancestor::div[.//span[text()='Comments']][1]")
+    panel.evaluate("el => el.style.width = '380px'")
+    card = edit.locator("xpath=ancestor::div[contains(@class, 'rounded')][1]")
+    page.screenshot(path=tmp_path / "narrow-card.png")
+    for width in (380, 320, 240):
+        panel.evaluate("(el, width) => el.style.width = width + 'px'", width)
+        bounds = card.bounding_box()
+        actions = [edit, viewer.get_by_role("button", name="Delete this comment", exact=True)]
+        for action in actions:
+            box = action.bounding_box()
+            assert box and bounds and box["x"] >= bounds["x"]
+            assert box["x"] + box["width"] <= bounds["x"] + bounds["width"]
+        time = card.get_by_text(re.compile("Jan|1970")).bounding_box()
+        box = edit.bounding_box()
+        assert time and box
+        assert box["y"] >= time["y"] + time["height"] or box["x"] >= time["x"] + time["width"]
+
+
+def test_table_multiline_selection_can_be_saved_and_reloaded(
+    page: Page, seeded_session: BrowserSession, tmp_path: Path
+) -> None:
+    page.emulate_media(color_scheme="dark")
+    viewer, _ = _html_viewer(
+        page,
+        seeded_session,
+        "<style>body{background:#1d1e27;color:#eee}td{border:1px solid #666;padding:16px}</style>"
+        '<table><tr><td id="left">小首领启用强化加成</td>'
+        '<td id="right">0：关闭<br>1：减伤40%<br>生命未满时逐秒衰减</td></tr></table>',
+    )
+    frame = viewer.frame_locator('iframe[title="HTML preview"]')
+    frame.locator("#left").select_text()
+    expect(page.get_by_role("button", name="Add comment", exact=True)).to_be_visible()
+    frame.locator("#right").click()
+    expect(page.get_by_role("button", name="Add comment", exact=True)).to_have_count(0)
+    frame.locator("#right").select_text()
+    expect(page.get_by_role("button", name="Add comment", exact=True)).to_be_visible()
+    page.screenshot(path=tmp_path / "table-selection.png")
+    button = page.get_by_role("button", name="Add comment", exact=True).bounding_box()
+    assert button and button["x"] + button["width"] <= page.viewport_size["width"]
+    payload = _save(page, viewer, seeded_session)
+    assert payload["text"] == "0：关闭\n1：减伤40%\n生命未满时逐秒衰减"
+    page.reload()
+    frame = page.locator('[data-testid="file-viewer"]:visible').frame_locator(
+        'iframe[title="HTML preview"]'
+    )
+    frame.locator("#right").evaluate("""async el => {
+      for (let i=0;i<100;i++) {
+        const ranges = Array.from(CSS.highlights.get('omni-comment') || []);
+        if (ranges.length === 1 && el.contains(ranges[0].startContainer) &&
+            el.contains(ranges[0].endContainer) &&
+            ranges[0].toString() === el.textContent) return;
+        await new Promise(requestAnimationFrame);
+      }
+      throw new Error('Saved multiline cell highlight was not restored');
+    }""")
+
+
+@pytest.mark.parametrize(
+    "prefix,duplicate,padded_br",
+    [
+        ("Alpha", False, False),
+        ("Alpha ", False, False),
+        ("Alpha", True, False),
+        ("Alpha ", False, True),
+    ],
+)
+def test_saved_html_anchor_before_and_after_br_index_change(
+    page: Page, seeded_session: BrowserSession, prefix: str, duplicate: bool, padded_br: bool
+) -> None:
+    session = seeded_session
+    anchor = {
+        "v": 1,
+        "kind": "html",
+        "text": "Beta",
+        "occ": 0,
+        "prefix": prefix,
+        "suffix": "x" * 32 if padded_br else "",
+        "selector": "#second",
+    }
+    session.comments.append(
+        asdict(
+            Comment(
+                id="saved-before-update",
+                conversation_id=session.session_id,
+                path="reports/preview.html",
+                body="Keep this comment located",
+                start_index=0,
+                end_index=0,
+                status="draft",
+                created_at=1,
+                updated_at=1,
+                anchor_content="__text__" + json.dumps(anchor),
+            )
+        )
+    )
+    markup = '<div>Alpha<br><span id="second">Beta</span></div>'
+    if padded_br:
+        markup = '<div>Alpha <br><span id="second">Beta</span>' + "x" * 40 + "<br>Tail</div>"
+    viewer, _ = _html_viewer(page, session, markup + ("<div>AlphaBeta</div>" if duplicate else ""))
+    if duplicate:
+        viewer.get_by_role("button", name="Show comments", exact=True).click()
+        expect(
+            viewer.get_by_text("Original location cannot be confirmed on this page", exact=True)
+        ).to_be_visible()
+        return
+    frame = viewer.frame_locator('iframe[title="HTML preview"]')
+    frame.locator("#second").evaluate("""async el => {
+      for (let i=0;i<100;i++) {
+        const ranges = Array.from(CSS.highlights.get('omni-comment') || []);
+        if (ranges.length === 1 && ranges[0].toString() === 'Beta') return;
+        await new Promise(requestAnimationFrame);
+      }
+      throw new Error('Saved BR-adjacent quote lost its highlight');
+    }""")
 
 
 def _comments_backend(session: BrowserSession) -> list[str]:

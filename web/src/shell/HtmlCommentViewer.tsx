@@ -17,7 +17,7 @@
 
 import { createPortal } from "react-dom";
 import { ADD_COMMENT_BUTTON_CLASS_NAME } from "./addCommentButtonStyles";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { MessageSquarePlusIcon, MousePointerClickIcon } from "lucide-react";
 import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
@@ -421,6 +421,19 @@ export function HtmlCommentViewer({
   }, []);
   const portRef = useRef<MessagePort | null>(null);
   const [floating, setFloating] = useState<FloatingAnchor | null>(null);
+  const floatingButtonRef = useRef<HTMLButtonElement>(null);
+  useLayoutEffect(() => {
+    const button = floatingButtonRef.current;
+    const frame = iframeRef.current;
+    if (!floating || !button || !frame) return;
+    const bounds = button.getBoundingClientRect();
+    const preview = frame.getBoundingClientRect();
+    button.style.left = `${Math.max(
+      Math.max(8, preview.left),
+      Math.min(floating.x, Math.min(window.innerWidth, preview.right) - bounds.width - 8),
+    )}px`;
+    button.style.top = `${Math.max(bounds.height + 8, floating.y)}px`;
+  }, [floating, canEdit]);
   const [renderedOrphans, setRenderedOrphans] = useState<ReadonlySet<string>>(new Set());
 
   // Single writer for the displayed page: keeps displayedPathRef in lockstep
@@ -883,6 +896,7 @@ export function HtmlCommentViewer({
         canEdit &&
         createPortal(
           <button
+            ref={floatingButtonRef}
             data-add-comment-btn
             type="button"
             className={`fixed z-50 ${ADD_COMMENT_BUTTON_CLASS_NAME}`}

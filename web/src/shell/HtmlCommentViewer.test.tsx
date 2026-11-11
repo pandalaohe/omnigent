@@ -740,6 +740,30 @@ describe("HtmlCommentViewer standalone (artifact URL)", () => {
     );
   });
 
+  it("keeps the selection action inside the preview at its top right edge", async () => {
+    renderViewer();
+    const { iframe, postMessage } = await openFrame();
+    vi.spyOn(iframe, "getBoundingClientRect").mockReturnValue(new DOMRect(600, 0, 380, 500));
+    const measure = vi
+      .spyOn(HTMLButtonElement.prototype, "getBoundingClientRect")
+      .mockReturnValue(new DOMRect(970, -40, 140, 32));
+    try {
+      await sendFromFrame(postMessage, {
+        type: BRIDGE_MSG.selection,
+        text: "edge",
+        occ: 0,
+        prefix: "",
+        suffix: "",
+        rect: { left: 370, top: 0, right: 380, bottom: 20 },
+      });
+      const button = await screen.findByRole("button", { name: /add comment/i });
+      // 140px action fits within the preview's 980px right edge with an 8px gap.
+      expect(button).toHaveStyle({ left: "832px", top: "40px" });
+    } finally {
+      measure.mockRestore();
+    }
+  });
+
   it("re-fetches a linked page on a revisit and reports the new source", async () => {
     const v1 = "<html><body><p>page two v1</p></body></html>";
     const v2 = "<html><body><p>page two v2</p></body></html>";
