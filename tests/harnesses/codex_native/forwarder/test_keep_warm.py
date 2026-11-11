@@ -145,9 +145,16 @@ async def test_legacy_conversation_id_fork_request_is_skipped(tmp_path: Path) ->
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    # Only the parent's resume observation and running status may surface.
-    assert len(posted) == 2
+    # Only the parent's resume state and running status may surface.
+    assert len(posted) == 3
     assert posted == [
+        (
+            "/v1/sessions/conv_parent/events",
+            {
+                "type": "external_background_work",
+                "data": {"running": False, "background_task_count": 0, "background_tasks": []},
+            },
+        ),
         (
             "/v1/sessions/conv_parent/events",
             {
@@ -382,10 +389,17 @@ async def test_keep_warm_fork_stream_is_invisible_and_a_parent_event_still_lands
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    # Only the parent's resume observation and running status may surface:
+    # Only the parent's resume state and running status may surface:
     # nothing from the fork (owner message, elicitation, usage or child session).
-    assert len(posted) == 2
+    assert len(posted) == 3
     assert posted == [
+        (
+            "/v1/sessions/conv_parent/events",
+            {
+                "type": "external_background_work",
+                "data": {"running": False, "background_task_count": 0, "background_tasks": []},
+            },
+        ),
         (
             "/v1/sessions/conv_parent/events",
             {
@@ -415,7 +429,7 @@ async def test_keep_warm_fork_stream_is_invisible_and_a_parent_event_still_lands
             },
         ),
     ]
-    path, body = posted[1]
+    path, body = posted[2]
     assert path == "/v1/sessions/conv_parent/events"
     assert body["type"] == "external_session_status"
     # The loop never answered the fork's approval request itself.

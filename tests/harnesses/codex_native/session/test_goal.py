@@ -84,7 +84,10 @@ def test_forwarder_posts_goal_notifications_and_dedupes(tmp_path: Path) -> None:
 
     asyncio.run(run())
     assert posted == [
+        {"type": "external_background_work", "data": {"running": False}},
+        {"type": "external_background_work", "data": {"running": True}},
         {"type": "external_goal_state", "data": {"state": "active"}},
+        {"type": "external_background_work", "data": {"running": False}},
         {"type": "external_goal_state", "data": {"state": "paused"}},
         {"type": "external_goal_state", "data": {"state": None}},
     ]

@@ -23,6 +23,7 @@ from PIL import Image
 
 from omnigent._runner_startup import RunnerStartupProgress
 from omnigent.entities import CompactionData
+from omnigent.errors import OmnigentError
 from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native import main as codex_native
@@ -1140,9 +1141,9 @@ def test_preload_codex_thread_moves_unconfigured_thread_provider(
     )
 
     if restamped_to is None:
-        with pytest.raises(codex_native_app_server.CodexAppServerResponseError) as raised:
+        with pytest.raises(OmnigentError) as raised:
             asyncio.run(preload)
-        assert raised.value is refusal
+        assert "Restore its provider configuration" in str(raised.value)
         assert rollout.read_bytes() == original
         assert [method for method, _params in fake_client.requests] == [
             "thread/resume",

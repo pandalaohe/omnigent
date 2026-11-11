@@ -1744,7 +1744,7 @@ class ClaudeNativeToolRelay:
 
 def _relay_info_tool_names(relay_info: _JsonObject) -> frozenset[str]:
     """
-    Return the tool names listed in a relay advertisement.
+    Return callable tool names, including aliases of advertised tools.
 
     :param relay_info: Relay advertisement, e.g.
         ``{"tools": [{"name": "list_comments", ...}]}``.
@@ -1753,11 +1753,14 @@ def _relay_info_tool_names(relay_info: _JsonObject) -> frozenset[str]:
     tools = relay_info.get("tools")
     if not isinstance(tools, list):
         return frozenset()
-    return frozenset(
+    names = {
         name
         for name in (tool.get("name") for tool in tools if isinstance(tool, dict))
         if isinstance(name, str) and name
-    )
+    }
+    if "sys_standing_approval" in names:
+        names.add("sys_standing_pass")
+    return frozenset(names)
 
 
 def _ensure_secure_dir(target: Path) -> None:
@@ -2738,7 +2741,7 @@ def _relay_hook_command(bridge_dir: Path, path: str, python_command: str) -> str
     sent the request, then got part of the answer, timed out, or lost the
     connection: exit 18, 28, 52 or 56), the command exits rather than record it
     twice. curl also exits 28 when the connection itself times out, so it
-    reports the request bytes it sent (``%{size_request}``), and a failure
+    reports the body bytes it uploaded (``%{size_upload}``), and a failure
     before any were sent counts as a miss. Any other failure, a refusal from
     the relay included, sends stdin to *python_command*, as do a missing
     ``tool_relay.env`` and a host without curl.
@@ -2747,13 +2750,13 @@ def _relay_hook_command(bridge_dir: Path, path: str, python_command: str) -> str
 
     relay_env = shlex.quote(str(bridge_dir / _TOOL_RELAY_ENV_FILE))
     headers = " ".join(f'-H "{header}: ${name}"' for name, header in _TERMINAL_ENV_HEADERS)
-    options = f"-sf -w '\\n%{{size_request}}' {headers}"
+    options = f"-sf -w '\\n%{{size_upload}}' {headers}"
     return (
         "p=$(cat); "
         f"if [ -r {relay_env} ] && command -v curl >/dev/null 2>&1; then . {relay_env}; "
         "out=$(printf '%s' \"$p\" | "
         + relay_curl(path, max_time=10, options=options)
-        # The last line of curl's output is the request size from -w.
+        # Uploaded bytes stay observable after a lost reply, including on macOS curl.
         + "); rc=$?; nl='\n'; sent=${out##*$nl}; out=${out%$nl*}; "
         "case $rc in 0) printf '%s' \"$out\"; exit 0 ;; "
         '18|28|52|56) [ "$sent" = 0 ] || exit 0 ;; esac; fi; '
@@ -6466,7 +6469,7 @@ _BTW_QUESTION_PREFIX = "/btw"
 # A settled overlay footer offers this only when earlier /btw exchanges
 # of the process are threaded into the current one; x keeps just the
 # current exchange. Absent, x must not be sent.
-_BTW_CLEAR_HISTORY_HINT = "x to clear history"
+_BTW_CLEAR_HISTORY_HINT = "xtoclearhistory"
 # Keep-warm's fixed /btw question. The marker identifies the settled
 # overlay to the ping that asked it, and tells the forwarder the
 # exchange must never be published to the web view.
@@ -11092,15 +11095,7 @@ def _read_relay_tool_names(bridge_dir: Path) -> set[str]:
     :returns: Set of callable names for the per-turn relay,
         e.g. ``{"sys_terminal_launch"}``.
     """
-    names = {
-        name
-        for name in (tool_spec.get("name") for tool_spec in _read_relay_tool_specs(bridge_dir))
-        if isinstance(name, str) and name
-    }
-    # Resumed sessions may still call the old name; keep it out of tools/list.
-    if "sys_standing_approval" in names:
-        names.add("sys_standing_pass")
-    return names
+    return set(_relay_info_tool_names({"tools": _read_relay_tool_specs(bridge_dir)}))
 
 
 def _read_relay_tool_specs(bridge_dir: Path) -> list[_JsonObject]:
@@ -11205,11 +11200,15 @@ def _call_relay_tool(
     # through ``_call_mcp_tool`` → ``_stdio_jsonrpc_loop`` and kill the MCP
     # server.
     except OSError as exc:
+        if name == "sys_session_create" and state is not None and state.cancelled.is_set():
+            return _detached_create_result()
         detail = str(exc).strip() or type(exc).__name__
         return _mcp_error(
             f"failed to call Omnigent tool relay: {detail}. Completion is unknown; "
             "check the affected state before retrying."
         )
+    if name == "sys_session_create" and state is not None and state.cancelled.is_set():
+        return _detached_create_result()
     try:
         decoded = json.loads(raw)
     except json.JSONDecodeError:

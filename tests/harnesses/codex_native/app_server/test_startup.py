@@ -102,6 +102,7 @@ async def test_start_reuses_initialized_readiness_client_for_hook_trust(
     """Startup trusts hooks over the readiness connection, then closes it."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 
+    _disable_codex_startup_rpc(monkeypatch)
     source_home = tmp_path / "source-codex-home"
     source_home.mkdir()
     workspace = tmp_path / "workspace"
@@ -1672,6 +1673,38 @@ async def test_disabled_mcp_early_exit_waits_for_returncode(tmp_path, monkeypatc
         assert caplog.text.count(disabled.RELAUNCH_WITHOUT_OVERRIDES_EVENT) == 1
     finally:
         await harness.server.close()
+
+
+async def test_disabled_mcp_early_exit_does_not_retry_without_confirmed_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exited wrapper cannot authorize replacing its unconfirmed process group."""
+    from omnigent import mcp_disabled_servers as disabled
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    disabled.set_disabled(disabled.ServerKey("codex", "fixture"), True)
+
+    async def ready(server: CodexNativeAppServer) -> _FakeStartupClient:
+        assert server.proc is not None
+        server.proc.returncode = 1
+        raise RuntimeError("early exit")
+
+    harness = _respawn_harness(tmp_path, monkeypatch, ready)
+    (tmp_path / "source-codex-home/config.toml").write_text(
+        '[mcp_servers.fixture]\ncommand="true"\n'
+    )
+    harness.server.active_harnesses = ["codex"]
+    original_close = CodexNativeAppServer._close_locked
+
+    async def unconfirmed_close(server: CodexNativeAppServer) -> None:
+        await original_close(server)
+        server.exit_confirmed = False
+
+    monkeypatch.setattr(CodexNativeAppServer, "_close_locked", unconfirmed_close)
+    with pytest.raises(RuntimeError, match="exit could not be confirmed"):
+        await harness.server.start()
+    assert len(harness.spawn_calls) == 1
+    assert "mcp_servers.fixture.enabled=false" in harness.server.config_overrides
 
 
 @pytest.mark.parametrize("second_fails", [False, True])

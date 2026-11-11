@@ -4689,6 +4689,13 @@ async def _handle_event(
                 params=params,
                 forwarder_state=forwarder_state,
             )
+            if method == _CODEX_GOAL_CLEARED_METHOD or "goal" in params:
+                await _post_codex_goal_state_if_changed(
+                    client,
+                    session_id=parent_session_id,
+                    goal=None if method == _CODEX_GOAL_CLEARED_METHOD else params.get("goal"),
+                    forwarder_state=forwarder_state,
+                )
         return
     if _is_thread_idle_status_event(method, params) and _thread_id_from_params(params) in {
         None,
@@ -4917,22 +4924,6 @@ async def _handle_event(
             ):
                 forwarder_state.deferred_child_terminal_edges.pop(_child_tid, None)
                 await _post_turn_status_edge(client, _child_sid, _deferred_edge)
-        if method == _CODEX_GOAL_UPDATED_METHOD and "goal" in params:
-            await _post_codex_goal_state_if_changed(
-                client,
-                session_id=route_session_id,
-                goal=params.get("goal"),
-                forwarder_state=forwarder_state,
-            )
-            return
-        if method == _CODEX_GOAL_CLEARED_METHOD:
-            await _post_codex_goal_state_if_changed(
-                client,
-                session_id=route_session_id,
-                goal=None,
-                forwarder_state=forwarder_state,
-            )
-            return
     # First model-produced item settles the synthesized MCP startup round
     # mid-turn — codex defers turn execution until the round ends, so
     # assistant-side output proves startup is over before the idle edge.

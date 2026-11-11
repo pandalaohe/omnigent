@@ -18,6 +18,7 @@ import httpx
 import pytest
 
 from omnigent._platform import stable_user_id
+from omnigent.harnesses.claude_native import forwarder as claude_native_forwarder
 from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
     OBSERVER_HOOK_STDERR_FILE,
@@ -280,22 +281,23 @@ def test_clear_session_start_hook_only_records_rotation(
     assert captured.err == ""
 
 
-def test_clear_session_start_hook_stops_when_the_unfiled_retry_fails(
+@pytest.mark.asyncio
+async def test_clear_session_start_stops_when_the_successor_is_rejected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
-    A rejected unfiled retry leaves the pane on its old session.
+    A rejected server-owned successor leaves the pane on its old session.
 
-    The hook returns ``None`` so the background forwarder can rotate later; it
-    must not transfer the terminal or repoint the bridge after the failure.
+    The forwarder consumes the failed clear without transferring the terminal
+    or repointing the bridge.
     """
     requests: list[tuple[str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         """
-        Mock rotation endpoints whose creates are all rejected.
+        Mock rotation endpoints whose successor is rejected.
 
         :param request: Incoming request.
         :returns: Canned Omnigent response.
@@ -312,31 +314,34 @@ def test_clear_session_start_hook_stops_when_the_unfiled_retry_fails(
                     "project_id": "proj_foreign",
                 },
             )
-        if request.method == "POST" and request.url.path == "/v1/sessions":
-            body = json.loads(request.content)
-            status = 404 if "project_id" in body else 503
-            return httpx.Response(status, json={"error": {"message": "rejected"}})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_old/successor":
+            return httpx.Response(503, json={"error": {"message": "rejected"}})
         return httpx.Response(200, json={"id": "ok"})
 
-    real_client = httpx.Client
     transport = httpx.MockTransport(handler)
-    monkeypatch.setattr(
-        httpx, "Client", lambda **kwargs: real_client(transport=transport, **kwargs)
-    )
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir("conv_old", bridge_id="bridge_shared", workspace=tmp_path)
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
 
-    assert claude_native_hook._rotate_session_on_clear(bridge_dir) is None
+    record_hook_event(bridge_dir, {"hook_event_name": "SessionStart", "source": "clear"})
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as client:
+        assert (
+            await claude_native_forwarder._maybe_rotate_session_on_clear(
+                client=client,
+                session_id="conv_old",
+                bridge_dir=bridge_dir,
+                state=claude_native_forwarder.HookForwardState(event_cursor=0),
+            )
+            is None
+        )
 
     assert requests == [
         ("GET", "/v1/sessions/conv_old"),
-        ("POST", "/v1/sessions"),
-        ("POST", "/v1/sessions"),
+        ("POST", "/v1/sessions/conv_old/successor"),
     ]
     assert read_active_session_id(bridge_dir) == "conv_old"
-    assert "Omnigent rotation failed" in capsys.readouterr().err
+    assert "Claude /clear rotation failed" in caplog.text
 
 
 def test_fork_session_start_hook_forks_before_printing_conversation_url(
@@ -546,9 +551,8 @@ def test_session_rotation_honours_ambient_proxy_for_a_remote_server(
 ) -> None:
     """A remote-server rotation callback keeps honouring the ambient proxy.
 
-    The loopback branch is covered by the clear/fork rotation tests above; this
-    guards the other branch so an unconditional ``trust_env=False`` at either
-    rotation call site would fail.
+    Forks create a client that honors the proxy. Clear hooks leave rotation to
+    the forwarder's existing client and start no second transaction.
     """
     captured_trust_env: list[object] = []
 
@@ -591,12 +595,18 @@ def test_session_rotation_honours_ambient_proxy_for_a_remote_server(
     )
     write_active_session_id(bridge_dir, "conv_old")
 
-    rotate = {
-        "clear": claude_native_hook._rotate_session_on_clear,
-        "fork": claude_native_hook._rotate_session_on_fork,
-    }[mode]
-    assert rotate(bridge_dir) == "conv_new"
-    assert captured_trust_env == [True]
+    if mode == "clear":
+        monkeypatch.setattr(
+            sys,
+            "stdin",
+            io.StringIO(json.dumps({"hook_event_name": "SessionStart", "source": "clear"})),
+        )
+        assert claude_native_hook.main(["--bridge-dir", str(bridge_dir)]) == 0
+        assert read_active_session_id(bridge_dir) == "conv_old"
+        assert captured_trust_env == []
+    else:
+        assert claude_native_hook._rotate_session_on_fork(bridge_dir) == "conv_new"
+        assert captured_trust_env == [True]
 
 
 def test_resume_session_start_without_branch_marker_does_not_fork(

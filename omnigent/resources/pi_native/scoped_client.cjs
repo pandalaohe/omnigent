@@ -206,8 +206,10 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
     // The bridge allows 5s for authentication and 5s for the operation.
     // Allow scheduling slack, but cap the entire attest (including queue wait)
     // at 15s, well below the RPC caller's 120s idle budget. Bind/revoke stay short.
+    const deadline=op==="attest"?performance.now()+15000:undefined;
     const signal=op==="attest"?AbortSignal.timeout(15000):undefined;
     const task=queue.then(async()=>{
+      if(deadline!==undefined && performance.now()>=deadline) throw new Error("Scoped Pi attestation deadline");
       signal?.throwIfAborted();
       if(!live||!ready)throw new Error("Scoped Pi continuity unavailable");
       const reply=await request("/pi/bootstrap",{protocol:1,sequence:++sequence,op,...values},credential,undefined,signal);
@@ -217,7 +219,9 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
     queue=task.catch(()=>{});
     if(!signal)return task;
     return new Promise((resolve,reject)=>{
-      const abort=()=>reject(new Error("Scoped Pi attestation deadline"));
+      const abort=()=>{
+        reject(new Error("Scoped Pi attestation deadline"));
+      };
       signal.addEventListener("abort",abort,{once:true});
       task.then(resolve,reject).finally(()=>signal.removeEventListener("abort",abort));
     });

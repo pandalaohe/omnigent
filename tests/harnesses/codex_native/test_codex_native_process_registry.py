@@ -616,9 +616,12 @@ def test_reap_state_dir_kills_matching_app_server_and_spares_others(
     """
     state_dir = tmp_path / "deadbeefdeadbeefdeadbeefdeadbeef"
     monkeypatch.setattr(
-        registry,
-        "_ps_output",
-        lambda _columns: f" 222 222 node {state_dir} app-server\n 333 333 node {state_dir}\n",
+        registry.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=f" 222 222 node {state_dir} app-server\n 333 333 node {state_dir}\n",
+        ),
     )
     monkeypatch.setattr(registry, "_pid_alive", lambda _pid: False)
     killed: list[tuple[int, signal.Signals]] = []
