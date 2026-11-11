@@ -6,7 +6,6 @@ import contextlib
 import csv
 import io
 import json
-import locale
 import subprocess
 import sys
 import warnings
@@ -62,7 +61,9 @@ def query(service: HostService) -> ET.Element | None:
         # A missing task and access denied have the same exit code. A successful
         # enumeration must also show the name absent before we call it missing.
         listing = _run(["/Query", "/FO", "CSV", "/NH"])
-        rows = csv.reader(io.StringIO(listing.stdout.decode(locale.getpreferredencoding(False))))
+        # Our SID-based task name is ASCII. Preserve other tasks' bytes without
+        # assuming their code page matches Python's UTF-8 mode.
+        rows = csv.reader(io.StringIO(listing.stdout.decode("ascii", errors="surrogateescape")))
         if any(row and row[0].casefold() == service.label.casefold() for row in rows):
             raise HostServiceError("Cannot read the installed Windows host task.")
         return None
