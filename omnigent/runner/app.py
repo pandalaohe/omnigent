@@ -2176,6 +2176,13 @@ def create_runner_app(
     _session_init_tasks: dict[
         tuple[str, str, str | None, str | None], asyncio.Task[JSONResponse]
     ] = {}
+    _session_current_init_keys: dict[str, tuple[str, str, str | None, str | None]] = {}
+
+    def _current_init_tasks(session_id: str) -> list[asyncio.Task[JSONResponse]]:
+        key = _session_current_init_keys.get(session_id)
+        task = _session_init_tasks.get(key) if key is not None else None
+        return [task] if task is not None else []
+
     _recovery_turn_ids: dict[str, set[str]] = {}
     # Dropping the server's forward of an item a replay turn already started is
     # what keeps one posted message from running twice.
@@ -5102,11 +5109,16 @@ def create_runner_app(
             )
         )
         if task is None or failed_done:
+            for old_key in [
+                old_key for old_key in _session_init_tasks if old_key[0] == session_id
+            ]:
+                _session_init_tasks.pop(old_key, None)
             task = asyncio.create_task(
                 _initialize_session(body),
                 name=f"session-init-{session_id}",
             )
             _session_init_tasks[key] = task
+            _session_current_init_keys[session_id] = key
 
             def _drop_completed_init(done: asyncio.Task[JSONResponse]) -> None:
                 if (
@@ -5116,6 +5128,8 @@ def create_runner_app(
                     and done.result().status_code < 400
                 ):
                     _session_init_tasks.pop(key, None)
+                    if _session_current_init_keys.get(session_id) == key:
+                        _session_current_init_keys.pop(session_id, None)
 
             task.add_done_callback(_drop_completed_init)
         response = await asyncio.shield(task)
@@ -5374,11 +5388,13 @@ def create_runner_app(
             _sdk_peer_attempts.pop(key)
         _session_message_buffers.pop(session_id, None)
         # Stop initialization before it can recreate resources during teardown.
-        init_tasks = [
-            task
-            for key, task in list(_session_init_tasks.items())
-            if key[0] == session_id and not task.done()
+        init_records = [
+            (key, task) for key, task in list(_session_init_tasks.items()) if key[0] == session_id
         ]
+        for key, _task in init_records:
+            _session_init_tasks.pop(key, None)
+        _session_current_init_keys.pop(session_id, None)
+        init_tasks = [task for _key, task in init_records if not task.done()]
         for init_task in init_tasks:
             init_task.cancel()
         if init_tasks:
@@ -8830,9 +8846,7 @@ def create_runner_app(
                 permission_state = permission_tiers.state(conv)
                 if permission_state is None or permission_state.status != "ready":
                     # Initialization owns the deny-safe fence until bootstrap settles.
-                    initializations = [
-                        task for key, task in list(_session_init_tasks.items()) if key[0] == conv
-                    ]
+                    initializations = _current_init_tasks(conv)
                     if initializations:
                         try:
                             await asyncio.wait_for(
@@ -9547,8 +9561,8 @@ def create_runner_app(
                 while True:
                     completed = [
                         task
-                        for key, task in list(_session_init_tasks.items())
-                        if key[0] == session_id and task.done() and task not in observed
+                        for task in _current_init_tasks(session_id)
+                        if task.done() and task not in observed
                     ]
                     if completed:
                         results = await asyncio.shield(

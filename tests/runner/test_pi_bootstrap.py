@@ -780,6 +780,97 @@ async def test_late_initialization_failure_rejects_first_pi_turn_immediately(
     assert statuses[-1] == "failed"
 
 
+def _init_task_registry(app):
+    route = next(
+        route for route in app.routes if route.path == "/v1/sessions" and "POST" in route.methods
+    )
+    cells = zip(
+        route.endpoint.__code__.co_freevars,
+        route.endpoint.__closure__,
+        strict=False,
+    )
+    return next(cell.cell_contents for name, cell in cells if name == "_session_init_tasks")
+
+
+async def _retired_init_task(outcome: str):
+    if outcome == "cancelled":
+        task = asyncio.create_task(asyncio.sleep(60))
+        task.cancel()
+    else:
+
+        async def fail():
+            raise RuntimeError("old init failed")
+
+        task = asyncio.create_task(fail())
+    await asyncio.gather(task, return_exceptions=True)
+    return task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["cancelled", "exception"])
+async def test_new_init_generation_supersedes_old_failure(outcome):
+    from tests.runner.conftest import _build_app_for_spec, _runner_client
+    from tests.runner.native_helpers import _harness_spec
+
+    session = f"generation-{outcome}"
+    app, manager = await _build_app_for_spec(_harness_spec("codex"))
+    registry = _init_task_registry(app)
+    registry[(session, "old-agent", "old-subagent", "old-recovery")] = await _retired_init_task(
+        outcome
+    )
+    async with _runner_client(app) as client:
+        initialized = await client.post(
+            "/v1/sessions", json={"session_id": session, "agent_id": "test-agent"}
+        )
+        assert initialized.status_code == 201, initialized.text
+        # Initialization spawns the harness itself, so only the calls the turn
+        # adds after the event show whether the turn was admitted.
+        calls_before_turn = len(manager.get_client_calls)
+        response = await client.post(
+            f"/v1/sessions/{session}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "test-agent",
+                "content": [{"type": "input_text", "text": "NEW_GENERATION_OK"}],
+            },
+        )
+        assert response.status_code == 202, response.text
+        turn = app.state.active_turns[session]
+        await asyncio.wait_for(asyncio.gather(turn, return_exceptions=True), 2)
+    turn_calls = [call[0] for call in manager.get_client_calls[calls_before_turn:]]
+    assert turn_calls == [session]
+    statuses = [
+        event["status"]
+        for event in list(app.state.session_event_queues[session]._queue)
+        if event.get("type") == "session.status"
+    ]
+    assert statuses[-1] == "idle"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup", ["replacement", "delete"])
+async def test_init_task_records_are_cleaned_on_replacement_and_delete(cleanup):
+    from tests.runner.conftest import _build_app_for_spec, _runner_client
+    from tests.runner.native_helpers import _harness_spec
+
+    session = f"cleanup-{cleanup}"
+    app, _manager = await _build_app_for_spec(_harness_spec("codex"))
+    registry = _init_task_registry(app)
+    for index, outcome in enumerate(("cancelled", "exception")):
+        registry[(session, f"old-agent-{index}", None, None)] = await _retired_init_task(outcome)
+    async with _runner_client(app) as client:
+        if cleanup == "replacement":
+            response = await client.post(
+                "/v1/sessions", json={"session_id": session, "agent_id": "test-agent"}
+            )
+            assert response.status_code == 201, response.text
+        else:
+            response = await client.delete(f"/v1/sessions/{session}")
+            assert response.status_code == 200, response.text
+    assert not [key for key in registry if key[0] == session]
+
+
 @pytest.mark.parametrize(
     "fault", ["session", "remote", "port", "empty", "long", "nonstring", "extra"]
 )
