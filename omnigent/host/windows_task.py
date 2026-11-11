@@ -17,6 +17,7 @@ from xml.etree import ElementTree as ET
 import psutil
 
 from omnigent.host.service import HostService, HostServiceError
+from omnigent.util.console_output import decode_console_output
 from omnigent.util.private_files import atomic_write_private, windows_user_sid
 
 TASK_NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
@@ -61,9 +62,7 @@ def query(service: HostService) -> ET.Element | None:
         # A missing task and access denied have the same exit code. A successful
         # enumeration must also show the name absent before we call it missing.
         listing = _run(["/Query", "/FO", "CSV", "/NH"])
-        # Our SID-based task name is ASCII. Preserve other tasks' bytes without
-        # assuming their code page matches Python's UTF-8 mode.
-        rows = csv.reader(io.StringIO(listing.stdout.decode("ascii", errors="surrogateescape")))
+        rows = csv.reader(io.StringIO(decode_console_output(listing.stdout)))
         if any(row and row[0].casefold() == service.label.casefold() for row in rows):
             raise HostServiceError("Cannot read the installed Windows host task.")
         return None

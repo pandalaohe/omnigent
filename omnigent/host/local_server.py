@@ -38,6 +38,7 @@ from omnigent.process_logging import (
     child_logging_popen_kwargs,
     open_process_log_file,
 )
+from omnigent.util.console_output import decode_console_output
 
 _logger = logging.getLogger(__name__)
 
@@ -1211,7 +1212,7 @@ def _read_log_tail(log_path: Path, max_lines: int = 50) -> str:
             size = fh.tell()
             offset = max(0, size - _TAIL_MAX_BYTES)
             fh.seek(offset)
-            raw = fh.read(_TAIL_MAX_BYTES).decode(errors="replace")
+            raw = decode_console_output(fh.read(_TAIL_MAX_BYTES))
     except OSError as exc:
         return f"(could not read log file: {exc})"
     lines = raw.splitlines()

@@ -286,6 +286,7 @@ from omnigent.runtime.websocket_metrics import (
     websocket_close_reason,
 )
 from omnigent.util.atomic_json import atomic_write_json
+from omnigent.util.console_output import decode_console_output
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
@@ -495,8 +496,8 @@ def _read_log_tail(path: Path, max_bytes: int = _LOG_TAIL_MAX_BYTES) -> str:
         ``Path("~/.omnigent/logs/runner/runner-ab12.log")``.
     :param max_bytes: Max bytes to read from the end of the file,
         e.g. ``4096``.
-    :returns: The decoded tail (lossy UTF-8 — runner output may
-        contain arbitrary bytes), or ``""`` when the file is empty,
+    :returns: The decoded console tail (with replacement for invalid bytes),
+        or ``""`` when the file is empty,
         missing, or unreadable. Diagnostics are best-effort: an
         unreadable log must not turn a useful "runner died with code
         1" answer into a failure.
@@ -512,7 +513,7 @@ def _read_log_tail(path: Path, max_bytes: int = _LOG_TAIL_MAX_BYTES) -> str:
                 starts_mid_line = fh.read(1) != b"\n"
             else:
                 fh.seek(0)
-            raw = fh.read().decode("utf-8", errors="replace")
+            raw = decode_console_output(fh.read())
             if starts_mid_line:
                 # Discard partial first line when seeking into the middle of a line.
                 return "\n".join(raw.splitlines()[1:])
