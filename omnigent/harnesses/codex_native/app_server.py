@@ -3439,7 +3439,7 @@ class CodexNativeAppServer:
             try:
                 try:
                     startup_client = await self._wait_until_ready()
-                except Exception:
+                except Exception as startup_error:
                     fallback = mcp_plan.overrides_after_early_exit()
                     if (
                         fallback is None
@@ -3449,6 +3449,10 @@ class CodexNativeAppServer:
                         raise
                     _logger.warning(RELAUNCH_WITHOUT_OVERRIDES_EVENT)
                     await self._close_locked()
+                    if not self.exit_confirmed:
+                        raise RuntimeError(
+                            "Codex app-server exit could not be confirmed before MCP fallback"
+                        ) from startup_error
                     self.certificate_failure = None
                     clear_certificate_failure(self.bridge_dir)
                     self.config_overrides = list(fallback)

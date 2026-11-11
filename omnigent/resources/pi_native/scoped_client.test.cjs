@@ -107,16 +107,30 @@ test("denial diagnostics distinguish state, attestation, policy and binding with
   assert.equal(f.starts(),0);
  }
 });
-test("a stalled bootstrap attestation and its queued calls stop within the shared deadline",async t=>{
+test("a queued attestation timeout expires old calls and a new call still succeeds",async t=>{
  const http=require("node:http"),records=[];
- let attestRequests=0;
+ let attestRequests=0,recovered=false;
  const server=http.createServer((req,res)=>{
-  req.resume();
   if(req.url==="/pi/bootstrap/watch") {
+   req.resume();
    res.writeHead(200,{"content-type":"application/x-ndjson"});
    res.write(JSON.stringify({incarnation:"epoch",launch_epoch:"launch",live:true,revoked_scopes:[]})+"\n");
-  } else if(req.url==="/pi/bootstrap")attestRequests++;
-  // The attestation endpoint deliberately never responds.
+   return;
+  }
+  let text="";req.on("data",chunk=>text+=chunk);
+  req.on("end",()=>{
+   const body=JSON.parse(text);
+   if(req.url==="/pi/bootstrap") {
+    attestRequests++;
+    if(!recovered)return;
+    res.end(JSON.stringify({attested:true}));
+   } else if(req.url==="/policies/evaluate") {
+    const id=body.event.data.call_id;
+    res.end(JSON.stringify({result:"POLICY_ACTION_ALLOW",permission_tier_binding:{
+     call_id:"pi:"+crypto.createHash("sha256").update("scope\0"+id).digest("hex"),
+     revision:3,arguments_digest:"0".repeat(64),pi_origin_receipt:receipt}}));
+   } else res.end(JSON.stringify({executed:true}));
+  });
  });
  await new Promise(resolve=>server.listen(0,"127.0.0.1",resolve));
  t.after(()=>{server.closeAllConnections();server.close();});
@@ -142,6 +156,14 @@ test("a stalled bootstrap attestation and its queued calls stop within the share
  const output=JSON.stringify(records);
  for(const secret of [receipt,"private-handle","pi_attestor_"+"a".repeat(43),"pi_scope_"+"s".repeat(43)])
   assert.equal(output.includes(secret),false);
+ recovered=true;
+ const fresh={...event,toolCallId:"fresh"};
+ assert.deepEqual(await client.evaluate(fresh,{},support),{block:false});
+ let starts=0;
+ const result={content:[{type:"text",text:"fresh result"}]};
+ assert.deepEqual(await client.execute(fresh,{},()=>{starts++;return result;}),result);
+ assert.equal(starts,1);
+ assert.equal(attestRequests,3,"only the first stalled call and the fresh call's two attestations dispatch");
 });
 test("three serial attestations slower than two seconds succeed; bind and revoke keep their short timeout",async t=>{
  const http=require("node:http"),records=[],operations=[];
