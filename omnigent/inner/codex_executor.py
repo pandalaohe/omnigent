@@ -3908,7 +3908,9 @@ class _CodexAppServerSession:
                 cwd=process_cwd,
             )
             try:
-                initialized = await self._spawn_and_initialize(mcp_plan.config_overrides, proc_env)
+                initialized, connection = await self._spawn_and_initialize(
+                    mcp_plan.config_overrides, proc_env
+                )
             except Exception:
                 fallback = mcp_plan.overrides_after_early_exit()
                 if (
@@ -3919,11 +3921,8 @@ class _CodexAppServerSession:
                     raise
                 logger.warning(RELAUNCH_WITHOUT_OVERRIDES_EVENT)
                 await self._discard_early_exit_worker()
-                initialized = await self._spawn_and_initialize(fallback, proc_env)
-            proc = self._proc
-            reader = self._reader_task
-            assert proc is not None and reader is not None
-            stdin = proc.stdin
+                initialized, connection = await self._spawn_and_initialize(fallback, proc_env)
+            proc, stdin, reader = connection
             # Tool processes report session liveness with the native server's
             # pid: the spawned shim can exit while the server lives on.
             if not (self._worker_launch.sandboxed and IS_LINUX):
@@ -3982,7 +3981,10 @@ class _CodexAppServerSession:
 
     async def _spawn_and_initialize(
         self, overrides: Sequence[str], proc_env: dict[str, str]
-    ) -> CodexMessage:
+    ) -> tuple[
+        CodexMessage,
+        tuple[asyncio.subprocess.Process, asyncio.StreamWriter | None, asyncio.Task[None]],
+    ]:
         """Spawn the prepared worker and complete its initialize handshake."""
         assert self._worker_launch is not None
         self._recent_stderr.clear()
@@ -4038,10 +4040,11 @@ class _CodexAppServerSession:
         finally:
             if liveness_read_fd is not None:
                 os.close(liveness_read_fd)
-        self._reader_task = asyncio.create_task(self._reader_loop())
+        self._reader_task = reader = asyncio.create_task(self._reader_loop())
+        stdin = proc.stdin
         self._stderr_task = asyncio.create_task(self._stderr_loop())
         self._worker_census_task = asyncio.create_task(self._refresh_worker_census())
-        return await self._request(
+        initialized = await self._request(
             "initialize",
             {
                 "clientInfo": {
@@ -4053,6 +4056,7 @@ class _CodexAppServerSession:
                 },
             },
         )
+        return initialized, (proc, stdin, reader)
 
     async def _discard_early_exit_worker(self) -> None:
         """Reap a pre-initialize worker while retaining its prepared sandbox and signer."""

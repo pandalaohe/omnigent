@@ -608,7 +608,14 @@ def test_prepare_managed_pi_agent_dir_links_only_supported_resources(tmp_path: P
         "AGENTS.md",
         "CLAUDE.md",
     ):
-        if name in {"mcp.json", "mcp-auth.json", "keybindings.json"}:
+        if name in {
+            "mcp.json",
+            "mcp-auth.json",
+            "keybindings.json",
+            "AGENTS.override.md",
+            "AGENTS.md",
+            "CLAUDE.md",
+        }:
             assert not (managed / name).is_symlink()
             assert (managed / name).read_bytes() == (global_agent / name).read_bytes()
         else:
@@ -667,7 +674,7 @@ def test_prepare_managed_pi_agent_dir_keeps_links_resolving_to_the_source(tmp_pa
 
 
 @pytest.mark.parametrize("name", ["AGENTS.MD", "CLAUDE.MD"])
-def test_prepare_managed_pi_agent_dir_links_uppercase_context_files(
+def test_prepare_managed_pi_agent_dir_copies_uppercase_context_files(
     tmp_path: Path, name: str
 ) -> None:
     """Pi also reads uppercase context file names from the global agent dir."""
@@ -679,8 +686,10 @@ def test_prepare_managed_pi_agent_dir_links_uppercase_context_files(
 
     prepare_managed_pi_agent_dir(managed, global_agent_dir=global_agent)
 
-    assert (managed / name).is_symlink()
-    assert (managed / name).samefile(global_agent / name)
+    assert not (managed / name).is_symlink()
+    assert (managed / name).read_text() == "global"
+    (managed / name).write_text("session")
+    assert (global_agent / name).read_text() == "global"
 
 
 @pytest.mark.parametrize("parent_relative_root", [False, True])

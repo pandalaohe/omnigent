@@ -1,7 +1,7 @@
 """Give managed Pi sessions the MCP servers the host configures for other harnesses.
 
 Pi reads user-level servers from ``mcp.json`` in its agent dir. A managed agent
-dir links the user's file; when the host inventory (Claude Code, Codex, Cursor)
+dir copies the user's file; when the host inventory (Claude Code, Codex, Cursor)
 knows servers that file lacks, the managed dir gets a merged copy instead. The
 user's own entries win on a name clash, and their agent dir is never written.
 """
@@ -324,6 +324,12 @@ def _is_session_owned(target: Path, digest: Path) -> bool:
         return False
     try:
         recorded = digest.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        from omnigent.inner.pi_settings import _PI_SEED_MANIFEST, _read_settings_file
+
+        seeded = _read_settings_file(target.parent / _PI_SEED_MANIFEST).get(target.name)
+        seeded_hashes = seeded if isinstance(seeded, list) else [seeded]
+        return hashlib.sha256(target.read_bytes()).hexdigest() not in seeded_hashes
     except (OSError, UnicodeDecodeError):
         return True
     return recorded != hashlib.sha256(target.read_bytes()).hexdigest()
@@ -337,6 +343,19 @@ def _restore_user_link(target: Path, source: Path, digest: Path) -> None:
     target.unlink(missing_ok=True)
     if source.exists():
         target.symlink_to(source)
+
+
+def _restore_user_copy(target: Path, source: Path, digest: Path) -> None:
+    """Keep source configuration isolated while tracking an unchanged managed copy."""
+    if target.is_symlink():
+        return
+    if not source.exists():
+        target.unlink(missing_ok=True)
+        digest.unlink(missing_ok=True)
+        return
+    content = source.read_bytes()
+    _write_private_file(target, content)
+    _write_private_file(digest, hashlib.sha256(content).hexdigest().encode())
 
 
 def sync_managed_pi_mcp_config(
@@ -363,7 +382,10 @@ def sync_managed_pi_mcp_config(
             )
         )
         if merged is None:
-            _restore_user_link(target, source, digest)
+            try:
+                _restore_user_copy(target, source, digest)
+            except OSError:
+                _logger.exception("Could not refresh the user's Pi MCP copy at %s", target)
             return
         _write_generated_copy(target, digest, merged)
     except Exception:

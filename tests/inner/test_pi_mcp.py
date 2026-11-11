@@ -311,7 +311,7 @@ def test_only_claude_codex_and_cursor_servers_are_added(harness: str) -> None:
 def test_inventory_pi_entries_do_not_force_a_generated_copy(
     home: Path, pi_agent: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The user's Pi servers listed by the inventory leave the user's file linked."""
+    """Pi inventory entries retain an isolated copy of the user's configuration."""
     _write_json(pi_agent / "mcp.json", {"mcpServers": {"mine": {"command": "my-tool"}}})
     monkeypatch.setattr(
         pi_mcp,
@@ -321,8 +321,8 @@ def test_inventory_pi_entries_do_not_force_a_generated_copy(
 
     managed = _prepare(home, pi_agent)
 
-    assert (managed / "mcp.json").is_symlink()
-    assert (managed / "mcp.json").resolve() == (pi_agent / "mcp.json").resolve()
+    assert not (managed / "mcp.json").is_symlink()
+    assert (managed / "mcp.json").read_bytes() == (pi_agent / "mcp.json").read_bytes()
 
 
 # --- Merging -----------------------------------------------------------------
@@ -432,18 +432,20 @@ def test_user_pi_config_is_merged_into_a_copy_and_left_untouched(
     assert sorted(path.name for path in pi_agent.iterdir()) == ["mcp.json"]
 
 
-def test_user_file_stays_linked_when_it_covers_the_host(home: Path, pi_agent: Path) -> None:
+def test_user_file_stays_isolated_when_it_covers_the_host(home: Path, pi_agent: Path) -> None:
     _write_json(home / ".claude.json", {"mcpServers": {"github": {"command": "host"}}})
     _write_json(pi_agent / "mcp.json", {"mcpServers": {"github": {"command": "mine"}}})
 
     managed = _prepare(home, pi_agent)
 
-    assert (managed / "mcp.json").is_symlink()
-    assert (managed / "mcp.json").resolve() == (pi_agent / "mcp.json").resolve()
+    assert not (managed / "mcp.json").is_symlink()
+    assert (managed / "mcp.json").read_bytes() == (pi_agent / "mcp.json").read_bytes()
+    (managed / "mcp.json").write_text("session change")
+    assert _managed_servers(pi_agent) == {"github": {"command": "mine"}}
 
 
 def test_reused_dir_regenerates_and_relinks(home: Path, pi_agent: Path) -> None:
-    """A copy from an earlier launch is refreshed, then replaced by the link once unneeded."""
+    """Generated copies follow host and source changes without linking the source."""
     claude = home / ".claude.json"
     _write_json(claude, {"mcpServers": {"github": {"command": "v1"}}})
     managed = _prepare(home, pi_agent)
@@ -455,7 +457,8 @@ def test_reused_dir_regenerates_and_relinks(home: Path, pi_agent: Path) -> None:
 
     _write_json(pi_agent / "mcp.json", {"mcpServers": {"github": {"command": "mine"}}})
     _prepare(home, pi_agent)
-    assert (managed / "mcp.json").resolve() == (pi_agent / "mcp.json").resolve()
+    assert not (managed / "mcp.json").is_symlink()
+    assert (managed / "mcp.json").read_bytes() == (pi_agent / "mcp.json").read_bytes()
 
     # Replacing the link with a copy must never write through it to the user's file.
     user_bytes = (pi_agent / "mcp.json").read_bytes()
@@ -505,7 +508,7 @@ def test_undecodable_digest_keeps_the_managed_config(home: Path, pi_agent: Path)
     assert (managed / "mcp.json").read_bytes() == generated
 
 
-def test_unreadable_user_config_is_linked_not_replaced(
+def test_unreadable_user_config_is_copied_not_replaced(
     home: Path, pi_agent: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Pi reports the user's own broken file instead of a copy that hides it."""
@@ -516,7 +519,8 @@ def test_unreadable_user_config_is_linked_not_replaced(
     with caplog.at_level(logging.WARNING, logger="omnigent.inner.pi_mcp"):
         managed = _prepare(home, pi_agent)
 
-    assert (managed / "mcp.json").resolve() == user_file.resolve()
+    assert not (managed / "mcp.json").is_symlink()
+    assert (managed / "mcp.json").read_bytes() == user_file.read_bytes()
     assert user_file.read_text(encoding="utf-8") == "{not json"
     assert "unreadable" in caplog.text
 

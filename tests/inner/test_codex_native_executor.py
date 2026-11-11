@@ -887,7 +887,8 @@ def test_configuration_refusal_retains_input_without_changing_routing(
 
     assert isinstance(failure, ExecutorError)
     assert failure.undelivered is (failure_code is not None)
-    assert failure.preserve_session is (failure_code is not None)
+    # A rejected submission owns no native turn to cancel, regardless of its error code.
+    assert failure.preserve_session is True
     assert failure.retryable is False
     assert failure.code == failure_code
     if failure_code is not None:
