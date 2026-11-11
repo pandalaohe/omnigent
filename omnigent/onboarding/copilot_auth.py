@@ -78,7 +78,15 @@ def gh_cli_github_token(host: str | None = None) -> str | None:
     if host:
         argv += ["--hostname", host]
     try:
-        completed = subprocess.run(argv, capture_output=True, text=True, timeout=10, check=False)
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
     except (OSError, subprocess.TimeoutExpired):
         return None
     token = completed.stdout.strip()

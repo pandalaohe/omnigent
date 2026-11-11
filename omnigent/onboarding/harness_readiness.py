@@ -40,7 +40,6 @@ from omnigent.harness_availability import (
     CODEX_CANONICAL_HARNESSES,
     HARNESS_BINARY_MISSING,
     HARNESS_NEEDS_AUTH,
-    HARNESS_VERSION_TOO_LOW,
     HarnessAvailability,
 )
 from omnigent.harness_plugins import harness_install_keys, valid_harnesses
@@ -57,8 +56,7 @@ from omnigent.onboarding.harness_install import (
     PI_KEY,
     QWEN_KEY,
     READINESS_CLI_PROBE_TIMEOUT_S,
-    harness_cli_binary,
-    harness_cli_installed,
+    harness_cli_readiness,
     required_cli_for_harness,
 )
 from omnigent.onboarding.provider_config import (
@@ -907,11 +905,7 @@ def _binary_availability_reason(install_key: str) -> HarnessAvailability:
     exposed to the web UI as ``"version-too-low"`` so the user sees a prompt
     to upgrade rather than "binary-missing".
     """
-    if harness_cli_installed(install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S):
-        return True
-    if harness_cli_binary(install_key) is not None:
-        return HARNESS_VERSION_TOO_LOW
-    return HARNESS_BINARY_MISSING
+    return harness_cli_readiness(install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S)
 
 
 def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailability:
@@ -961,7 +955,8 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
     if _is_codex_family_harness(canonical):
         from omnigent.harnesses.codex_native.main import _codex_auth_unavailable_reason
 
-        return _codex_auth_unavailable_reason() or True
+        reason = _codex_auth_unavailable_reason()
+        return True if reason is None else reason
     install_key = _AUTH_AWARE_NATIVE_HARNESSES.get(canonical)
     if install_key is not None:
         # Cursor is auth-aware like the other native CLI harnesses, so a missing

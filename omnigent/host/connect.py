@@ -7270,6 +7270,23 @@ def run_host_process(
     # Report here rather than relying on sys.excepthook: the foreground CLI
     # catches crashes itself, so the hook never sees them.
     try:
+        if IS_WINDOWS:
+            from omnigent.terminals.conpty_process import registered_user_environment
+
+            try:
+                registered = registered_user_environment()
+            except OSError:
+                _logger.warning(
+                    "Could not refresh the Windows Host PATH; using its inherited PATH."
+                )
+            else:
+                path = next(
+                    (value for key, value in registered.items() if key.upper() == "PATH"), ""
+                )
+                if path:
+                    os.environ["PATH"] = os.pathsep.join(
+                        value for value in (path, os.environ.get("PATH", "")) if value
+                    )
         lifecycle_lost = _serve_host_until_exit(
             server_url,
             config_path,

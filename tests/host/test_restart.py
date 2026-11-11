@@ -51,6 +51,7 @@ def test_supervisor_admission(monkeypatch, platform, service, parent, invocation
     [(False, True, True), (True, True, True), (False, False, True), (False, True, False)],
 )
 def test_windows_existing_restart_loop(monkeypatch, tmp_path, disabled, ancestor, enabled):
+    tmp_path = tmp_path / "用户"
     root = tmp_path / ".omnigent" / "autostart"
     root.mkdir(parents=True)
     loop = root / "Start-OmnigentHostDefault.ps1"
@@ -72,7 +73,9 @@ def test_windows_existing_restart_loop(monkeypatch, tmp_path, disabled, ancestor
         "run",
         lambda *a, **k: SimpleNamespace(
             returncode=0,
-            stdout=f'<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Actions><Exec><Arguments>"{launcher}"</Arguments></Exec></Actions><Settings><Enabled>{str(enabled).lower()}</Enabled></Settings></Task>',
+            stdout=(
+                f'<?xml version="1.0" encoding="UTF-16"?><Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Actions><Exec><Arguments>"{launcher}"</Arguments></Exec></Actions><Settings><Enabled>{str(enabled).lower()}</Enabled></Settings></Task>'
+            ).encode("utf-16"),
         ),
     )
     assert restart.supervisor_kind() == (

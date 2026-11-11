@@ -62,6 +62,8 @@ def goose_info_config() -> tuple[str | None, str | None]:
             [binary, "info", "-v"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=_INFO_TIMEOUT_S,
         )
     except (OSError, subprocess.SubprocessError):

@@ -203,6 +203,8 @@ def test_gh_cli_github_token_returns_stdout(monkeypatch: pytest.MonkeyPatch) -> 
 
     def _fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
+        assert kwargs["encoding"] == "utf-8"
+        assert kwargs["errors"] == "replace"
         return subprocess.CompletedProcess(argv, 0, stdout="gho_abc\n", stderr="")
 
     monkeypatch.setattr(copilot_auth.subprocess, "run", _fake_run)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,8 @@ from packaging.version import Version
 import omnigent._platform as _platform
 from omnigent.onboarding import harness_install as hi
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
+
+_REAL_SUBPROCESS_RUN = subprocess.run
 
 
 @pytest.fixture(autouse=True)
@@ -1200,6 +1203,8 @@ def test_harness_cli_logged_in_uses_claude_json_verdict(
 
     def _run(argv: list[str], **k: object):
         assert argv == ["/usr/bin/claude", "auth", "status"]  # discovered absolute binary
+        assert k["encoding"] == "utf-8"
+        assert k["errors"] == "replace"
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
@@ -1719,6 +1724,45 @@ def test_harness_cli_version_satisfies_short_circuits_when_binary_missing(
     assert hi.harness_cli_version_satisfies(hi.OPENCODE_KEY) is False
 
 
+@pytest.mark.parametrize("harness", ["pi", "codex"])
+def test_windows_npm_launcher_without_node_names_missing_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    monkeypatch.setattr(hi.sys, "platform", "win32")
+    launcher = tmp_path / f"{harness}.cmd"
+    launcher.write_text("@echo off\nnode cli.js %*\n")
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda _name, **_kwargs: str(launcher))
+    monkeypatch.setattr(hi.shutil, "which", lambda _name: None)
+
+    hint = hi.harness_setup_hint(harness)
+    assert "Node.js" in hint
+    assert "PATH" in hint
+    assert "setup" not in hint
+
+
+def test_node_hint_uses_selected_pi_launcher(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(hi.sys, "platform", "win32")
+    selected = tmp_path / "selected" / "pi.cmd"
+    selected.parent.mkdir()
+    selected.write_text("@echo off\nnode cli.js %*\n")
+    selected.with_name("node.exe").touch()
+    monkeypatch.setenv("OMNIGENT_PI_PATH", str(selected))
+    monkeypatch.setattr(
+        hi.shutil, "which", lambda name: str(selected) if name == str(selected) else None
+    )
+    monkeypatch.setattr(
+        hi,
+        "resolve_cli_binary",
+        lambda name, **_kwargs: (
+            str(selected) if name == str(selected) else str(tmp_path / "pi.cmd")
+        ),
+    )
+
+    assert "Node.js" not in hi.harness_setup_hint("pi")
+
+
 def test_missing_harness_cli_flags_outdated_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1736,3 +1780,27 @@ def test_missing_harness_cli_flags_outdated_version(
     spec = hi.missing_harness_cli("opencode-native")
     assert spec is not None
     assert spec.binary == "opencode"
+
+
+@pytest.mark.parametrize("exit_code,expected", [(0, "1.2.3"), (1, None)])
+def test_version_probe_tolerates_non_utf8_stderr(
+    monkeypatch: pytest.MonkeyPatch, exit_code: int, expected: str | None
+) -> None:
+    diagnostic = b"'\"node\"' " + "不是内部或外部命令".encode("gbk")
+    script = (
+        "import sys; sys.stdout.buffer.write(b'1.2.3\\n'); "
+        f"sys.stderr.buffer.write({diagnostic!r}); sys.exit({exit_code})"
+    )
+    thread_errors: list[BaseException | None] = []
+    monkeypatch.setattr(
+        hi.threading, "excepthook", lambda args: thread_errors.append(args.exc_value)
+    )
+    monkeypatch.setattr(
+        hi.subprocess,
+        "run",
+        lambda _argv, **kwargs: _REAL_SUBPROCESS_RUN([sys.executable, "-c", script], **kwargs),
+    )
+    spec = hi.harness_install_spec(ANTHROPIC_FAMILY)
+    assert spec is not None
+    assert hi._harness_cli_version_string(spec, sys.executable) == expected
+    assert thread_errors == []

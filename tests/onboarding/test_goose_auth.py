@@ -39,6 +39,8 @@ goose Configuration:
 
 def _fake_run(stdout: str, returncode: int = 0):
     def _run(*_args, **_kwargs):
+        assert _kwargs["encoding"] == "utf-8"
+        assert _kwargs["errors"] == "replace"
         return subprocess.CompletedProcess(
             args=["goose"], returncode=returncode, stdout=stdout, stderr=""
         )

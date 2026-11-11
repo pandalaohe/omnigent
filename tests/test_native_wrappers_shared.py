@@ -971,27 +971,41 @@ def test_pi_falls_back_to_deprecated_env_with_a_warning(
 
 
 class _Completed:
-    def __init__(self, stdout: str = "", stderr: str = "") -> None:
+    def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0) -> None:
         self.stdout, self.stderr = stdout, stderr
+        self.returncode = returncode
 
 
 @pytest.mark.parametrize(
-    ("stdout", "stderr", "expected"),
+    ("stdout", "stderr", "returncode", "expected"),
     [
-        ("pi 0.79.10\n", "", (0, 79, 10)),
-        ("", "@earendil-works/pi-coding-agent v1.2.3", (1, 2, 3)),
-        ("no version here", "", None),
-        ("", "", None),
+        ("pi 0.79.10\n", "", 0, (0, 79, 10)),
+        ("", "@earendil-works/pi-coding-agent v1.2.3", 0, (1, 2, 3)),
+        ("no version here", "", 0, None),
+        ("", "", 0, None),
+        (
+            "1.2.3\n",
+            "'\"node\"' 不是内部或外部命令".encode("gbk").decode("utf-8", "replace"),
+            1,
+            None,
+        ),
     ],
 )
 def test_pi_version_parses_cli_output(
-    pi: ModuleType, monkeypatch: pytest.MonkeyPatch, stdout: str, stderr: str, expected: object
+    pi: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: str,
+    stderr: str,
+    returncode: int,
+    expected: object,
 ) -> None:
     calls: list[list[str]] = []
 
     def fake_run(argv: list[str], **kwargs: object) -> _Completed:
         calls.append(argv)
-        return _Completed(stdout, stderr)
+        assert kwargs["encoding"] == "utf-8"
+        assert kwargs["errors"] == "replace"
+        return _Completed(stdout, stderr, returncode)
 
     monkeypatch.setattr("subprocess.run", fake_run)
 

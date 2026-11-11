@@ -37,9 +37,10 @@ for line in sys.stdin:
     if message.get('method') == 'initialize':
         print(json.dumps({'id': message['id'], 'result': {}}), flush=True)
     elif message.get('method') == 'account/read':
+        sys.stderr.buffer.write(bytes([0xd6, 0xd0]))
         print(json.dumps({'id': message['id'], 'result': {'account': {
-            'type': 'chatgpt', 'email': 'person@example.test', 'planType': 'pro'
-        }}}), flush=True)
+            'type': 'chatgpt', 'email': '用户@example.test', 'planType': 'pro'
+        }}}, ensure_ascii=False), flush=True)
 """,
     )
     monkeypatch.setenv("PATH", str(bin_dir))
@@ -47,7 +48,7 @@ for line in sys.stdin:
     assert harness_accounts.harness_account_map() == {
         "codex": {
             "kind": "chatgpt",
-            "email": "person@example.test",
+            "email": "用户@example.test",
             "plan": "pro",
         }
     }
@@ -243,6 +244,8 @@ def test_json_account_probes_do_not_inherit_stdin(monkeypatch: pytest.MonkeyPatc
     assert return_code == 0
     assert payload == {}
     assert captured["stdin"] is harness_accounts.subprocess.DEVNULL
+    assert captured["encoding"] == "utf-8"
+    assert captured["errors"] == "replace"
 
 
 def test_cancelled_claude_probe_kills_descendants(
@@ -477,3 +480,16 @@ def test_opencode_probe_includes_env_and_config_sources(
         ],
     }
     assert "must-not-leak" not in json.dumps(account)
+
+
+def test_json_command_preserves_utf8_with_non_utf8_diagnostics() -> None:
+    script = (
+        "import sys; "
+        "sys.stdout.buffer.write('{\"email\": \"用户@example.test\"}'.encode('utf-8')); "
+        "sys.stderr.buffer.write(bytes([0xd6, 0xd0]))"
+    )
+    code, payload = harness_accounts._run_json_command(
+        [sys.executable, "-c", script], deadline=time.monotonic() + 5, cancel_event=None
+    )
+    assert code == 0
+    assert payload == {"email": "用户@example.test"}

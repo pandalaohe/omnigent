@@ -49,7 +49,6 @@ def _windows_loop_supervises() -> bool:
         task = subprocess.run(
             ["schtasks.exe", "/Query", "/TN", r"\Omnigent Host (default server)", "/XML"],
             capture_output=True,
-            text=True,
             timeout=3,
             check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
