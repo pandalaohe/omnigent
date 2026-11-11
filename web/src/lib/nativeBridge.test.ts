@@ -23,6 +23,8 @@ import {
   supportsArcaConnect,
   supportsBrowser,
   switchServer,
+  signInAgain,
+  supportsSignInAgain,
 } from "./nativeBridge";
 
 // The Electron preload bridge mock, installed on window.omnigentDesktop.
@@ -694,5 +696,22 @@ describe("getServerPicker / switchServer over the iOS bridge", () => {
     setIOS(true, true, true);
     iosGetServerPicker.mockRejectedValueOnce(new Error("bridge down"));
     await expect(getServerPicker()).resolves.toBeNull();
+  });
+});
+
+describe("explicit desktop sign-in recovery", () => {
+  it("calls the preload action and hides recovery on older shells or plain browsers", async () => {
+    setElectron(false);
+    expect(supportsSignInAgain()).toBe(false);
+    expect(await signInAgain()).toBe(false);
+    setElectron(true);
+    expect(supportsSignInAgain()).toBe(false);
+    const invoke = vi.fn().mockResolvedValue(true);
+    (
+      window as unknown as { omnigentDesktop: Record<string, unknown> }
+    ).omnigentDesktop.signInAgain = invoke;
+    expect(supportsSignInAgain()).toBe(true);
+    expect(await signInAgain()).toBe(true);
+    expect(invoke).toHaveBeenCalledOnce();
   });
 });

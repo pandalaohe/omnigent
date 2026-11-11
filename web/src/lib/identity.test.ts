@@ -1428,7 +1428,8 @@ describe("browser authority recovery", () => {
   it("offers desktop reauthentication only for the stable browser-session refusal", async () => {
     const error = vi.fn();
     vi.doMock("sonner", () => ({ toast: { error } }));
-    vi.doMock("./nativeBridge", () => ({ isElectronShell: () => true }));
+    const signInAgain = vi.fn().mockResolvedValue(true);
+    vi.doMock("./nativeBridge", () => ({ supportsSignInAgain: () => true, signInAgain }));
     const { authenticatedFetch } = await import("./identity");
     fetchMock.mockResolvedValue(
       new Response(JSON.stringify({ detail: "server refusal" }), {
@@ -1445,17 +1446,8 @@ describe("browser authority recovery", () => {
         action: { label: "Sign in again", onClick: expect.any(Function) },
       }),
     );
-    const navigate = vi.fn();
-    const location = window.location;
-    vi.stubGlobal(
-      "window",
-      new Proxy(window, {
-        get: (target, key) =>
-          key === "location" ? { ...location, assign: navigate } : Reflect.get(target, key),
-      }),
-    );
     error.mock.calls[0][1].action.onClick();
-    expect(navigate).toHaveBeenCalledWith("/auth/login?native_reauth=1");
+    await vi.waitFor(() => expect(signInAgain).toHaveBeenCalledOnce());
     error.mockClear();
     fetchMock.mockResolvedValue(new Response("forbidden", { status: 403 }));
     await authenticatedFetch("/v1/sessions/test/resources/terminals");
@@ -1467,7 +1459,7 @@ describe("browser authority recovery", () => {
   it("keeps plain-browser refusal handling unchanged", async () => {
     const error = vi.fn();
     vi.doMock("sonner", () => ({ toast: { error } }));
-    vi.doMock("./nativeBridge", () => ({ isElectronShell: () => false }));
+    vi.doMock("./nativeBridge", () => ({ supportsSignInAgain: () => false }));
     const { authenticatedFetch } = await import("./identity");
     fetchMock.mockResolvedValue(
       new Response("refused", {

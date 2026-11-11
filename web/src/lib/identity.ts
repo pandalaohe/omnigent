@@ -17,7 +17,7 @@
 
 import { stripBasePath, withBasePath } from "./basePath";
 import { toast } from "sonner";
-import { isElectronShell } from "./nativeBridge";
+import { signInAgain, supportsSignInAgain } from "./nativeBridge";
 import { PERMISSION_TIERS_PROTOCOL_HEADERS } from "./permissionTierProtocol";
 import { getCachedServerInfo } from "./capabilities";
 import {
@@ -827,7 +827,7 @@ export async function authenticatedFetch(
   if (
     (res.status === 401 || res.status === 403) &&
     res.headers?.get("X-Omnigent-Auth-Recovery") === "browser-session-required" &&
-    isElectronShell() &&
+    supportsSignInAgain() &&
     currentIdentityConnectionId() === dispatchConnectionId
   ) {
     toast.error("A trusted human browser session is required", {
@@ -836,7 +836,11 @@ export async function authenticatedFetch(
         label: "Sign in again",
         onClick: () => {
           if (currentIdentityConnectionId() !== dispatchConnectionId) return;
-          window.location.assign(withBasePath("/auth/login?native_reauth=1"));
+          void signInAgain()
+            .then((signedIn) => {
+              if (!signedIn) toast.error("Sign-in was not completed. Try again.");
+            })
+            .catch(() => toast.error("Sign-in was not completed. Try again."));
         },
       },
     });

@@ -472,7 +472,7 @@ describe("browser authority lifecycle", () => {
       "renewal cannot carry browser authority",
     );
     const refreshCount = h.credentials.refreshSession.mock.callCount();
-    assert.equal(navigate(win, "will-navigate", `${SERVER}/auth/login?native_reauth=1`), true);
+    await h.auth.signInAgain(win);
     await tick();
     await tick();
     assert.equal(
@@ -489,7 +489,7 @@ describe("browser authority lifecycle", () => {
     const h = harness();
     await h.session.cookies.set({ url: SERVER, name: COOKIE, value: "valid" });
     const win = h.connect();
-    navigate(win, "will-navigate", `${SERVER}/auth/login?native_reauth=1`);
+    await h.auth.signInAgain(win);
     await tick();
     await tick();
     assert.equal(h.credentials.signInWithBrowser.mock.callCount(), 1);
@@ -509,11 +509,76 @@ describe("browser authority lifecycle", () => {
     });
     const win = h.connect();
     navigate(win, "will-navigate", `${SERVER}/auth/login`);
-    navigate(win, "will-navigate", `${SERVER}/auth/login?native_reauth=1`);
+    await h.auth.signInAgain(win);
     await tick();
     release({ token: "valid", expiresIn: 3600 });
     await tick();
     await tick();
     assert.equal(h.session.cookies.jar.get(COOKIE).value, browser);
+    assert.equal(h.authRequired.length, 0);
+    assert.equal(h.auth.isAttached(win), true);
+    assert.equal(win.loads.at(-1), `${SERVER}/c/1`);
+  });
+
+  it("does not start a background renewal while interactive recovery is cancelled", async () => {
+    let cancel;
+    const h = harness({
+      signIn: () =>
+        new Promise((_resolve, reject) => {
+          cancel = () => reject(new Error("cancelled"));
+        }),
+    });
+    await h.session.cookies.set({ url: SERVER, name: COOKIE, value: "valid" });
+    const win = h.connect();
+    const recovery = h.auth.signInAgain(win);
+    const rejected = assert.rejects(recovery, /cancelled/);
+    await h.session.cookies.remove(SERVER, COOKIE);
+    cancel();
+    await rejected;
+    await tick();
+    assert.equal(h.credentials.refreshSession.mock.callCount(), 0);
+    assert.equal(h.authRequired.length, 0);
+    assert.equal(h.auth.isAttached(win), true);
+  });
+
+  it("keeps sign-out authoritative during interactive recovery", async () => {
+    let finish;
+    const h = harness({
+      accepted: new Set([browser]),
+      signIn: () =>
+        new Promise((resolve) => {
+          finish = () => resolve({ token: browser, expiresIn: 28800 });
+        }),
+    });
+    const win = h.connect();
+    const recovery = h.auth.signInAgain(win);
+    const rejected = assert.rejects(recovery, (error) => error.code === "SIGNED_OUT");
+    await h.auth.signOutWindow(win);
+    finish();
+    await rejected;
+    assert.equal(h.session.cookies.jar.has(COOKIE), false);
+    assert.equal(h.auth.isAttached(win), false);
+    assert.equal(h.signedOut.length, 1);
+    assert.equal(win.loads.length, 0);
+  });
+
+  it("never treats an external document's old recovery URL as forced sign-in", async () => {
+    const h = harness();
+    const win = h.connect();
+    win.webContents.emit("did-navigate", {}, "https://external.example/");
+    navigate(win, "will-navigate", `${SERVER}/auth/login?native_reauth=1`);
+    await tick();
+    await tick();
+    assert.equal(h.credentials.signInWithBrowser.mock.callCount(), 0);
+  });
+
+  it("never treats a cross-origin redirect chain as forced sign-in", async () => {
+    const h = harness();
+    const win = h.connect();
+    navigate(win, "will-redirect", "https://external.example/redirect", false, true);
+    navigate(win, "will-redirect", `${SERVER}/auth/login?native_reauth=1`, false, true);
+    await tick();
+    await tick();
+    assert.equal(h.credentials.signInWithBrowser.mock.callCount(), 0);
   });
 });

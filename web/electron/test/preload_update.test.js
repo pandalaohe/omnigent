@@ -140,3 +140,11 @@ describe("server-page update bridge", () => {
     );
   });
 });
+
+describe("explicit browser sign-in bridge", () => {
+  it("forwards only the recovery action to main", async () => {
+    const h = loadPreload();
+    await h.desktop.signInAgain();
+    assert.deepEqual(h.invokes.at(-1), { channel: "omnigent:sign-in-again", args: undefined });
+  });
+});
