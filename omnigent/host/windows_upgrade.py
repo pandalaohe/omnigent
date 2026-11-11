@@ -26,7 +26,12 @@ def resolve_uv_executable() -> str:
     found = shutil.which("uv")
     if found:
         return found
-    candidates = [Path.home() / ".local" / "bin" / "uv.exe"]
+    candidates = [
+        Path.home() / ".local" / "bin" / "uv.exe",
+        Path.home() / ".cargo" / "bin" / "uv.exe",
+    ]
+    if explicit := os.environ.get("UV"):
+        candidates.insert(0, Path(explicit))
     if install_dir := os.environ.get("UV_INSTALL_DIR"):
         candidates.insert(0, Path(install_dir) / "uv.exe")
     if local := os.environ.get("LOCALAPPDATA"):
@@ -39,13 +44,15 @@ def resolve_uv_executable() -> str:
     )
 
 
-def installed_launchers() -> list[Path]:
+def installed_launchers(prefix: Path | None = None, bin_dir: Path | None = None) -> list[Path]:
     """Return entrypoints owned by this venv, including uv's external copies."""
-    prefix = Path(sys.prefix)
+    prefix = prefix or Path(sys.prefix)
     scripts = prefix / "Scripts"
     receipt = prefix / "uv-receipt.toml"
     candidates = [scripts / f"{name}.exe" for name in ("omni", "omnigent")]
-    if receipt.is_file():
+    if bin_dir is not None:
+        candidates = [bin_dir / f"{name}.exe" for name in ("omni", "omnigent")]
+    elif receipt.is_file():
         tool = tomllib.loads(receipt.read_text(encoding="utf-8"))["tool"]
         candidates = [
             Path(entry["install-path"])
@@ -73,17 +80,28 @@ def _fresh_processes() -> Iterator[psutil.Process]:
             continue
 
 
-def _inside_install(path: str) -> bool:
-    prefix = str(Path(sys.prefix)).casefold().rstrip("\\/")
-    return path.casefold().startswith(prefix + os.sep)
+def _inside_install(path: str, prefix: Path | None = None) -> bool:
+    prefix_text = str(prefix or Path(sys.prefix)).casefold().rstrip("\\/")
+    return path.casefold().startswith(prefix_text + os.sep)
 
 
-def capture_host_tree(*, include_install_users: bool = False) -> list[psutil.Process]:
+def capture_host_tree(
+    *, include_install_users: bool = False, prefix: Path | None = None, bin_dir: Path | None = None
+) -> list[psutil.Process]:
     """Capture Host trees and, for a forced upgrade, detached install users."""
     from omnigent.host.daemon_lifecycle import read_daemon_records
 
     records = {record.pid: record for record in read_daemon_records()}
-    executables = {str(path).casefold() for path in installed_launchers()}
+    executables = {
+        str(path).casefold()
+        for path in (
+            installed_launchers(prefix, bin_dir) if prefix is not None else installed_launchers()
+        )
+    }
+
+    def inside(path: str) -> bool:
+        return _inside_install(path, prefix)
+
     interpreters = {
         os.path.realpath(sys.executable).casefold(),
         os.path.realpath(getattr(sys, "_base_executable", sys.executable)).casefold(),
@@ -100,9 +118,7 @@ def capture_host_tree(*, include_install_users: bool = False) -> list[psutil.Pro
             continue
         try:
             lowered = [arg.casefold() for arg in args]
-            service_entry = (
-                _inside_install(exe) or bool(args and _inside_install(args[0]))
-            ) and any(
+            service_entry = (inside(exe) or bool(args and inside(args[0]))) and any(
                 lowered[index : index + 2] == ["-m", "omnigent.host.service_entry"]
                 for index in range(1, len(lowered) - 1)
             )
@@ -114,6 +130,8 @@ def capture_host_tree(*, include_install_users: bool = False) -> list[psutil.Pro
             )
             recorded = records.get(proc.pid)
             recorded_host = recorded is not None and proc.create_time() <= recorded.started_at + 5
+            if prefix is not None:
+                recorded_host = recorded_host and (inside(exe) or bool(args and inside(args[0])))
             if proc.pid in protected:
                 runtime = any(
                     lowered[index : index + 2]
@@ -133,22 +151,22 @@ def capture_host_tree(*, include_install_users: bool = False) -> list[psutil.Pro
             if include_install_users:
                 install_user = (
                     exe in executables
-                    or _inside_install(exe)
+                    or inside(exe)
                     or (
                         exe in interpreters
                         and (
-                            bool(args and _inside_install(args[0]))
+                            bool(args and inside(args[0]))
                             or bool(len(args) > 1 and lowered[1] in executables)
                         )
                     )
                 )
                 # uv's Python trampoline can run the base interpreter outside
                 # the venv. Loaded extension paths identify orphaned workers.
-                if not install_user:
+                if not install_user and prefix is None:
                     with contextlib.suppress(psutil.AccessDenied):
                         memory_maps = getattr(proc, "memory_maps", None)
                         install_user = (
-                            any(_inside_install(mapping.path) for mapping in memory_maps())
+                            any(inside(mapping.path) for mapping in memory_maps())
                             if memory_maps is not None
                             else False
                         )

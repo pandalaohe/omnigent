@@ -5,6 +5,9 @@ This file is generated at release time from each PR's `## Changelog` section
 PRs and author credits. The concise, curated highlights live on the website
 under `/releases`.
 
+## Unreleased
+
+- Windows Git upgrades use the target version’s detached upgrade helper, retain a local rollback snapshot, and report progress and the last result.
 ## [v0.21.0] — 2026-11-05
 
 - [Bug fix] ACP-backed sessions now display the model the running harness actually selected, instead of the agent spec's pinned model. ([#5823](https://github.com/omnigent-ai/omnigent/pull/5823), [@omni-resolve-agent[bot]](https://github.com/apps/omni-resolve-agent))

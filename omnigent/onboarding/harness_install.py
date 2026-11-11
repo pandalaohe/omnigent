@@ -65,6 +65,7 @@ from omnigent.harnesses.opencode_native.client import (
 )
 from omnigent.inner import _proc
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
+from omnigent.util.console_output import decode_console_output
 
 _logger = logging.getLogger(__name__)
 
@@ -1134,9 +1135,9 @@ def _harness_cli_version_string(
             [binary, "--version"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            text=sys.platform != "win32",
+            encoding="utf-8" if sys.platform != "win32" else None,
+            errors="replace" if sys.platform != "win32" else None,
             timeout=timeout,
             check=False,
             cwd=probe_cwd,
@@ -1151,7 +1152,9 @@ def _harness_cli_version_string(
     if completed.returncode != 0:
         return None
     version = _parse_harness_cli_version(
-        (completed.stdout or "") + "\n" + (completed.stderr or "")
+        decode_console_output(completed.stdout or b"")
+        + "\n"
+        + decode_console_output(completed.stderr or b"")
     )
     if version is not None and sig is not None:
         with _PROBE_CACHE_LOCK:
@@ -1483,9 +1486,9 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
             # Concurrent probes must not change or restore a shared terminal's input mode.
             stdin=subprocess.DEVNULL,
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            text=sys.platform != "win32",
+            encoding="utf-8" if sys.platform != "win32" else None,
+            errors="replace" if sys.platform != "win32" else None,
             cwd=probe_cwd,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -1500,7 +1503,7 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     logged_in = result.returncode == 0
     if status_key is not None:
         try:
-            payload = json.loads(result.stdout)
+            payload = json.loads(decode_console_output(result.stdout))
         except (json.JSONDecodeError, ValueError):
             payload = None
         if isinstance(payload, dict) and status_key in payload:

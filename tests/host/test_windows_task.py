@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import locale
 import os
 import subprocess
 import sys
@@ -19,7 +20,9 @@ from omnigent.util import private_files
 
 @pytest.fixture
 def scheduler(monkeypatch, tmp_path):
-    state = SimpleNamespace(xml=None, calls=[], failure=None, recorded=[], forgotten=[])
+    state = SimpleNamespace(
+        xml=None, listing=b"", calls=[], failure=None, recorded=[], forgotten=[]
+    )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setattr(service.platform, "system", lambda: "Windows")
     monkeypatch.setattr(windows_task, "windows_user_sid", lambda: "S-1-5-21-1")
@@ -40,7 +43,7 @@ def scheduler(monkeypatch, tmp_path):
         if args[0] == "/Query":
             if "/XML" in args:
                 return subprocess.CompletedProcess(args, 0 if state.xml else 1, state.xml or b"")
-            return subprocess.CompletedProcess(args, 0, b"")
+            return subprocess.CompletedProcess(args, 0, state.listing)
         if args[0] == "/Create":
             state.xml = Path(args[args.index("/XML") + 1]).read_bytes()
         elif args[0] == "/Delete":
@@ -58,7 +61,9 @@ def scheduler(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("target", [None, "https://server.example/work?q=1&b=2"])
-def test_enable_query_start_disable_windows_task(scheduler, target):
+def test_enable_query_start_disable_windows_task(scheduler, target, monkeypatch):
+    monkeypatch.setattr(locale, "getpreferredencoding", lambda _: "utf-8")
+    scheduler.listing = '"\\其他任务","不适用","就绪"\r\n'.encode("gbk")
     environment = {"PATH": r"C:\Tools\node;C:\Tools\uv", "SYSTEMROOT": r"C:\Windows"}
     installed = service.enable_user_host_service(target, environment=environment)
     assert installed.kind == "windows_task"
@@ -187,17 +192,29 @@ def test_supervisor_frozen_before_final_snapshot_and_task_end(scheduler, monkeyp
     assert child in tree
 
 
-def test_query_denied_is_not_absent(monkeypatch, tmp_path):
-    installed = service.HostService("windows_task", tmp_path / "task.xml", r"\test-task")
+@pytest.mark.parametrize("encoding", ["gbk", "cp932", "utf-8"])
+@pytest.mark.parametrize("present", [False, True])
+def test_query_localized_listing_preserves_denial(monkeypatch, tmp_path, encoding, present):
+    installed = service.HostService(
+        "windows_task", tmp_path / "task.xml", r"\Omnigent Host (S-1-5-21-1)"
+    )
+    monkeypatch.setattr(locale, "getpreferredencoding", lambda _: "utf-8")
+    listing = '"\\定期,タスク""確認","N/A","準備"\r\n'
+    listing += f'"{installed.label}-other","N/A","準備"\r\n'
+    if present:
+        listing += f'"{installed.label.upper()}","N/A","準備"\r\n'
 
     def run(args, **_):
         if "/XML" in args:
             return subprocess.CompletedProcess(args, 1, b"")
-        return subprocess.CompletedProcess(args, 0, b'"\\test-task","N/A","Ready"\r\n')
+        return subprocess.CompletedProcess(args, 0, listing.encode(encoding))
 
     monkeypatch.setattr(windows_task, "_run", run)
-    with pytest.raises(service.HostServiceError, match="Cannot read"):
-        windows_task.query(installed)
+    if present:
+        with pytest.raises(service.HostServiceError, match="Cannot read"):
+            windows_task.query(installed)
+    else:
+        assert windows_task.query(installed) is None
 
 
 def test_private_file_acl_precedes_bytes_and_denial_preserves_old_file(monkeypatch, tmp_path):

@@ -47,6 +47,34 @@ _REAL_SUBPROCESS_RUN = subprocess.run
 _REAL_SUBPROCESS_RUN = subprocess.run
 
 
+@pytest.mark.parametrize("invalid", [False, True])
+def test_windows_console_probes_accept_localized_bytes(monkeypatch, invalid):
+    from omnigent.util import console_output
+
+    monkeypatch.setattr(hi.sys, "platform", "win32")
+    monkeypatch.setattr(console_output, "_windows_code_pages", lambda: (936, 1252))
+    monkeypatch.setattr(hi, "_binary_signature", lambda _: None)
+    monkeypatch.setattr(hi.shutil, "which", lambda _: "/opt/tools/claude.exe")
+    monkeypatch.setattr(hi, "_LOGIN_PROBE_CACHE", {})
+    diagnostic = b"bad\x81" if invalid else "就绪".encode("gbk")
+
+    def run(argv, **kwargs):
+        assert kwargs["text"] is False
+        assert kwargs["encoding"] is None
+        output = (
+            b"1.2.3\n" + diagnostic
+            if "--version" in argv
+            else b'{"loggedIn": true, "message": "' + diagnostic + b'"}'
+        )
+        return subprocess.CompletedProcess(argv, 0, output, diagnostic)
+
+    monkeypatch.setattr(hi.subprocess, "run", run)
+    spec = hi.harness_install_spec(ANTHROPIC_FAMILY)
+    assert spec is not None
+    assert hi._harness_cli_version_string(spec, "/opt/tools/claude.exe") == "1.2.3"
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+
+
 @pytest.fixture(autouse=True)
 def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reduce ``resolve_cli_binary`` to a pure ``PATH`` probe under test.

@@ -26,6 +26,7 @@ from omnigent.host.frames import (
 )
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR
 from omnigent.project_context import ManifestError, parse_manifest
+from omnigent.util.console_output import decode_console_output
 
 # Wall-clock cap on one hook run. A module constant so tests can lower it;
 # the server's own wait is longer (it must also cover the round trip).
@@ -324,8 +325,13 @@ def _read_tail(output: IO[bytes]) -> str:
     """Read the tail of the temp file, bounded in bytes and characters.
 
     :param output: The child's output file, positioned anywhere.
-    :returns: The last 2000 characters, UTF-8 with replacement on errors.
+    :returns: The last 2000 characters, with localized console decoding.
     """
     output.seek(0, os.SEEK_END)
-    output.seek(max(0, output.tell() - _OUTPUT_READ_BYTES))
-    return output.read(_OUTPUT_READ_BYTES).decode("utf-8", errors="replace")[-_OUTPUT_TAIL_CHARS:]
+    offset = max(0, output.tell() - _OUTPUT_READ_BYTES)
+    output.seek(offset)
+    raw = output.read(_OUTPUT_READ_BYTES)
+    if offset:
+        # A chopped character must not select a different encoding for the tail.
+        raw = raw.partition(b"\n")[2]
+    return decode_console_output(raw)[-_OUTPUT_TAIL_CHARS:]

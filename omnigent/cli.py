@@ -6305,7 +6305,13 @@ def _upgrade_vcs_install(
     remote_short = remote_sha[:9] if remote_sha else ""
     known_behind = bool(remote_sha and current_sha and remote_sha != current_sha)
 
-    if remote_sha and current_sha and remote_sha == current_sha and not legacy_channel:
+    if (
+        remote_sha
+        and current_sha
+        and remote_sha == current_sha
+        and not legacy_channel
+        and not (IS_WINDOWS and dry_run)
+    ):
         click.echo(f"omnigent is up to date (git {cur_short}, tracking {info.vcs_url}).")
         return
     if known_behind:
@@ -6346,6 +6352,16 @@ def _upgrade_vcs_install(
             f"No automatic upgrade command is known for this install. {suggestion.command}."
         )
 
+    if IS_WINDOWS:
+        from omnigent.host.windows_upgrade_launch import launch
+
+        if not remote_sha:
+            raise click.ClickException("Cannot resolve the target commit; install unchanged.")
+        try:
+            launch(info, remote_sha, extras=extra_overrides, force=force, dry_run=dry_run)
+        except (OSError, RuntimeError, psutil.Error) as exc:
+            raise click.ClickException(str(exc)) from exc
+        return
     if dry_run:
         _echo_upgrade_plan(info, suggestion, extra_overrides)
         return
@@ -6694,14 +6710,20 @@ def upgrade(
     # installs "upgrade" means re-pulling the ref — compared and verified by
     # commit, not by PyPI version.
     if info.vcs_url:
-        _upgrade_vcs_install(
-            info,
-            check_only=check_only,
-            force=force,
-            pre=pre,
-            extra_overrides=extra_overrides,
-            dry_run=dry_run,
-        )
+        try:
+            _upgrade_vcs_install(
+                info,
+                check_only=check_only,
+                force=force,
+                pre=pre,
+                extra_overrides=extra_overrides,
+                dry_run=dry_run,
+            )
+        except click.ClickException as exc:
+            from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+            setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+            raise
         return
 
     # pip / ``uv pip`` do not record which extras were requested for a plain
@@ -11847,6 +11869,11 @@ def host_status(
         click.echo(json.dumps({"daemons": payloads}, indent=2, sort_keys=True))
         return
     _echo_daemon_payloads(payloads)
+    if IS_WINDOWS:
+        from omnigent.host.windows_upgrade_helper import last_upgrade_line
+
+        if line := last_upgrade_line():
+            click.echo(line)
 
 
 def _stop_session_on_server(
