@@ -144,7 +144,7 @@ def test_installed_plugin_survives_marketplace_failure(
     )
 
 
-def test_menu_matches_codex_repo_skill_precedence(
+def test_menu_keeps_user_skill_priority_over_codex_repo_priority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     codex = os.environ.get("OMNIGENT_CODEX_PATH") or shutil.which("codex")
@@ -181,7 +181,7 @@ def test_menu_matches_codex_repo_skill_precedence(
     ctx = SkillSourceContext((workspace,), home, "all", None, codex_home=codex_home)
     for harness in ("codex", "codex-native"):
         menu = {skill.name: skill.skill_dir for skill in resolve_harness_skills(ctx, harness)}
-        assert menu["dup"].resolve() == listed[0]
+        assert menu["dup"].resolve() == (codex_home / "skills" / "dup").resolve()
 
     # A "none" launch links nothing, yet Codex still loads the repo skills.
     private_home = tmp_path / "private-codex-home"
@@ -190,7 +190,4 @@ def test_menu_matches_codex_repo_skill_precedence(
     assert codex_skill_dirs(private_home, "repo-only") == [(repo_skills / "repo-only").resolve()]
     unfiltered = replace(ctx, skills_filter="none")
     for harness in ("codex", "codex-native"):
-        assert {skill.name for skill in resolve_harness_skills(unfiltered, harness)} == {
-            "dup",
-            "repo-only",
-        }
+        assert resolve_harness_skills(unfiltered, harness) == []

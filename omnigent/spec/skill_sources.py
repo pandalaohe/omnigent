@@ -968,11 +968,8 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     but not shown (correct — Codex won't register a malformed skill as a
     command either).
 
-    Native skills come first and ignore ``skills_filter``: Codex loads repo
-    skills whatever the filter and ranks them above the linked user skills.
-    Codex lists every same-named copy, and a plain ``$name`` that matches more
-    than one injects none of them. Codex has no precedence within the repo
-    scope, so the nearest directory wins here.
+    The menu applies ``skills_filter`` to every tier. Linked sources win
+    same-name collisions, followed by the nearest repo directory.
 
     A native ``codex-native`` session honors ``$CODEX_HOME``: its launch seeds
     the per-bridge home from the ``$CODEX_HOME``-resolved host home, so the menu
@@ -998,12 +995,9 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
 
     host_override = ctx.codex_home if ctx.is_native else None
     cwd = ctx.roots[0] if ctx.roots else None
-    sources = codex_skill_sources(
-        ctx.bundle_dir, ctx.home, codex_home=host_override, workspace=cwd
-    )
-    selected = select_codex_skill_dirs("all", sources.native)
-    for name, skill_dir in select_codex_skill_dirs(ctx.skills_filter, sources.linked).items():
-        selected.setdefault(name, skill_dir)
+    sources = codex_skill_sources(ctx.bundle_dir, ctx.home, codex_home=host_override)
+    repo_sources = _codex_repo_agents_skill_dirs(cwd) if cwd is not None else []
+    selected = select_codex_skill_dirs(ctx.skills_filter, sources.linked + repo_sources)
     out: list[SkillSpec] = []
     for name, skill_dir in selected.items():
         try:

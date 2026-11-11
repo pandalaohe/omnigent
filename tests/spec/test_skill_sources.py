@@ -382,8 +382,8 @@ def test_codex_native_honors_codex_home_sdk_keeps_home_codex(
 
 
 @pytest.mark.parametrize("harness", ["codex", "codex-native"])
-def test_codex_repo_skills_outrank_same_named_user_skills(tmp_path: Path, harness: str) -> None:
-    """Like Codex, repo ``.agents`` skills outrank user skills; the nearest repo dir wins."""
+def test_codex_user_skills_outrank_repo_duplicates(tmp_path: Path, harness: str) -> None:
+    """User sources win menu collisions; repo-only duplicates use the nearest dir."""
     home = tmp_path / "home"
     repo = tmp_path / "repo"
     workspace = repo / "app"
@@ -395,19 +395,19 @@ def test_codex_repo_skills_outrank_same_named_user_skills(tmp_path: Path, harnes
     _write_skill(workspace / ".agents" / "skills", "repo-dup")
 
     menu = {s.name: s.skill_dir for s in resolve_harness_skills(_ctx(workspace, home), harness)}
-    assert menu["user-dup"].resolve() == (repo / ".agents" / "skills" / "user-dup").resolve()
+    assert menu["user-dup"].resolve() == (home / ".codex" / "skills" / "user-dup").resolve()
     assert menu["repo-dup"].resolve() == (workspace / ".agents" / "skills" / "repo-dup").resolve()
 
 
 @pytest.mark.parametrize("harness", ["codex", "codex-native"])
 @pytest.mark.parametrize(
     ("skills_filter", "expected"),
-    [("none", {"repo-skill"}), (["picked"], {"repo-skill", "picked"})],
+    [("none", set()), ([], set()), (["picked"], {"picked"})],
 )
-def test_codex_repo_skills_ignore_skills_filter(
+def test_codex_repo_skills_respect_skills_filter(
     tmp_path: Path, harness: str, skills_filter: str | list[str], expected: set[str]
 ) -> None:
-    """Codex loads repo skills whatever the filter, so only the linked host skills are filtered."""
+    """The menu applies the selected names to both repo and linked user skills."""
     home = tmp_path / "home"
     workspace = tmp_path / "ws"
     (workspace / ".git").mkdir(parents=True)
