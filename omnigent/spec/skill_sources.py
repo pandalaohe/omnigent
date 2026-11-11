@@ -952,12 +952,6 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
     Codex bundle, standalone, and enabled plugin skills under the filter.
 
-    ``~/.agents/skills`` reaches the menu through ``codex_skill_sources``
-    like any other seeded source. After those, the menu also lists the repo
-    ``.agents/skills`` tier the Codex CLI loads itself
-    (:func:`_codex_repo_agents_skill_dirs`) — first name wins. The repo tier
-    is not seeded into the private home because the CLI reads it directly.
-
     Reuses the Codex executor's own helpers — ``codex_skill_sources`` (the
     shared source-list builder) and ``select_codex_skill_dirs`` (the shared
     selector) — so the menu draws from the same roots and selection the
@@ -1016,27 +1010,6 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
         discover_codex_plugin_skills(codex_home, ctx.skills_filter, cwd=cwd, warnings=ctx.warnings)
     )
     return out
-
-
-def _codex_repo_agents_skill_dirs(cwd: Path) -> list[Path]:
-    """
-    The repo ``.agents/skills`` dirs the Codex CLI loads for *cwd*.
-
-    Walks ``cwd`` up to the nearest ``.git`` ancestor (``cwd`` alone when
-    none), closest first. ``os.path`` probes count an unreadable path as
-    absent, as Codex skips stat errors.
-
-    :param cwd: The session workspace (the Codex CLI's cwd).
-    :returns: Existing ``<d>/.agents/skills`` dirs, closest first.
-    """
-    chain: list[Path] = []
-    for directory in (cwd, *cwd.parents):
-        chain.append(directory)
-        if os.path.exists(directory / ".git"):
-            break
-    else:
-        chain = [cwd]
-    return [d / ".agents" / "skills" for d in chain if os.path.isdir(d / ".agents" / "skills")]
 
 
 def cursor_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:

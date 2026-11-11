@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -1441,68 +1440,6 @@ def test_codex_repo_agents_tier_is_never_seeded(
     seeded = codex_home / "skills" / "repo-skill"
     assert not seeded.exists()
     assert not seeded.is_symlink()
-
-
-def test_codex_menu_prefers_codex_home_over_agents_tiers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """First source wins: ``~/.codex/skills`` shadows the ``.agents`` tiers."""
-    home = tmp_path / "home"
-    monkeypatch.setattr("pathlib.Path.home", lambda: home)
-    ws = tmp_path / "ws"
-    (ws / ".git").mkdir(parents=True)
-    _write_skill(home / ".codex" / "skills", "dup")
-    _write_skill(home / ".agents" / "skills", "dup")
-    _write_skill(ws / ".agents" / "skills", "dup")
-
-    out = [s for s in resolve_harness_skills(_ctx(ws, home), "codex-native") if s.name == "dup"]
-    assert len(out) == 1
-    assert out[0].skill_dir is not None
-    assert out[0].skill_dir.resolve() == (home / ".codex" / "skills" / "dup").resolve()
-
-
-def test_codex_menu_filter_selects_from_agents_tiers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A list filter selects names from the new tiers; ``none`` is hermetic."""
-    home = tmp_path / "home"
-    monkeypatch.setattr("pathlib.Path.home", lambda: home)
-    ws = tmp_path / "ws"
-    (ws / ".git").mkdir(parents=True)
-    _write_skill(ws / ".agents" / "skills", "repo-skill")
-    _write_skill(home / ".agents" / "skills", "plan")
-
-    names = [
-        s.name for s in resolve_harness_skills(_ctx(ws, home, ["repo-skill"]), "codex-native")
-    ]
-    assert names == ["repo-skill"]
-    none_names = [s.name for s in resolve_harness_skills(_ctx(ws, home, "none"), "codex-native")]
-    assert "repo-skill" not in none_names
-    assert "plan" not in none_names
-
-
-def test_codex_menu_tolerates_unreadable_marker_and_tier(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An unreadable ``.git`` or skills tier counts as absent, like Codex's own stat."""
-    home = tmp_path / "home"
-    monkeypatch.setattr("pathlib.Path.home", lambda: home)
-    ws = tmp_path / "ws"
-    (ws / ".git").mkdir(parents=True)
-    _write_skill(ws / ".agents" / "skills", "ws-skill")
-    _write_skill(home / ".agents" / "skills", "plan")
-
-    real_stat = os.stat
-    denied = {str(ws / ".git"), str(ws / ".agents" / "skills")}
-
-    def _stat(path, *args, **kwargs):
-        if isinstance(path, (str, bytes, os.PathLike)) and os.fspath(path) in denied:
-            raise PermissionError(13, "Permission denied", str(path))
-        return real_stat(path, *args, **kwargs)
-
-    monkeypatch.setattr("os.stat", _stat)
-    names = [s.name for s in resolve_harness_skills(_ctx(ws, home), "codex-native")]
-    assert "plan" in names
 
 
 # ---------------------------------------------------------------------------
