@@ -17,7 +17,7 @@ import io
 import os
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -59,6 +59,47 @@ def _make_exc(msg: str = "boom") -> ValueError:
 # --------------------------------------------------------------------------- #
 # Report building + redaction
 # --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("stamp", [None, "0.21.0-wukong.1"])
+def test_default_crash_repository(monkeypatch: pytest.MonkeyPatch, stamp: str | None) -> None:
+    from omnigent import distribution
+
+    monkeypatch.setattr(distribution, "DISTRIBUTION_VERSION", stamp)
+    ch.install_crash_handler("omnigent", enable_faulthandler=False)
+    url, _ = ch._issue_url(ValueError("failure"))
+    expected = "pandalaohe/omnigent-wukong" if stamp else "omnigent-ai/omnigent"
+    assert url.startswith(f"https://github.com/{expected}/issues/new?")
+
+
+def test_exported_reports_redact_paths_but_local_report_stays_private(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from urllib.parse import parse_qs, urlparse
+
+    home = data_dir.parent / "example-user"
+    windows_home = PureWindowsPath("C:/") / "Users" / "other-user"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    ch.install_crash_handler("omnigent", enable_faulthandler=False)
+    message = f"{home / 'private.py'} {windows_home / 'private.py'}"
+    monkeypatch.setattr(sys, "argv", ["omnigent", str(home / "start.py")])
+    calls: dict[str, str] = {}
+    monkeypatch.setattr(ch, "_copy_to_clipboard", lambda text: calls.update(clipboard=text))
+    monkeypatch.setattr(ch, "_open_browser", lambda url: calls.update(url=url) or True)
+    monkeypatch.setattr(ch, "real_stderr", lambda: io.StringIO())
+    monkeypatch.setattr(sys, "stdin", io.StringIO("y\n"))
+    ch.handle_crash(_make_exc(message), interactive=True)
+    query = parse_qs(urlparse(calls["url"]).query)
+    for exported in (query["title"][0], query["description"][0], calls["clipboard"]):
+        assert home.name not in exported
+        assert windows_home.name not in exported
+        assert str(home) not in exported
+        assert "private.py" in exported
+        assert "~" in exported
+    saved = next((data_dir / "crashes").glob("crash-*.md"))
+    assert message in saved.read_text()
+    if os.name != "nt":
+        assert saved.stat().st_mode & 0o777 == 0o600
+
+
 def test_build_report_contains_required_fields(data_dir: Path) -> None:
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent")
     exc = _make_exc("the frobnicator failed")

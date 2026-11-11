@@ -42,6 +42,7 @@ from types import TracebackType
 from typing import BinaryIO, TextIO, TypedDict
 
 from omnigent.crash_ui import real_stderr, render_crash_screen
+from omnigent.private_file import write_private_text
 from omnigent.process_logging import data_dir
 
 # Saved at install time so we can defer to the originals for
@@ -92,7 +93,7 @@ _MAX_URL_LENGTH = 8000
 # --------------------------------------------------------------------------- #
 def install_crash_handler(
     app_name: str,
-    repo: str,
+    repo: str | None = None,
     *,
     version: str | None = None,
     crashes_dir: str | Path | None = None,
@@ -125,7 +126,11 @@ def install_crash_handler(
                       ``omnigent_ui_sdk``) via the ``<prefix>_`` rule.
     """
     _CONFIG["app_name"] = app_name
-    _CONFIG["repo"] = repo
+    from omnigent.distribution import DISTRIBUTION_VERSION
+
+    _CONFIG["repo"] = repo or (
+        "pandalaohe/omnigent-wukong" if DISTRIBUTION_VERSION else "omnigent-ai/omnigent"
+    )
     _CONFIG["version"] = version if version is not None else _read_version()
     _CONFIG["crashes_dir"] = str(crashes_dir) if crashes_dir else None
     _CONFIG["keep_reports"] = keep_reports
@@ -307,6 +312,17 @@ def _redact(text: str) -> str:
     return text
 
 
+def _sanitize_export(text: str) -> str:
+    """Remove home paths and common tokens from material sent outside the host."""
+    home = str(Path.home())
+    if home not in ("/", "\\"):
+        for spelling in {home, home.replace("\\", "/"), home.replace("\\", "\\\\")}:
+            text = text.replace(spelling, "~")
+    # Also cover paths from another machine included in the same traceback.
+    text = re.sub(r"(?i)(?:[A-Z]:)?[/\\]+(?:Users|home)[/\\]+[^/\\\r\n\"']+", "~", text)
+    return _redact(text)
+
+
 def _command_line() -> str:
     try:
         return _redact(" ".join(sys.argv))
@@ -373,9 +389,7 @@ def _save_report(report_md: str) -> Path:
         while path.exists():
             path = d / f"{base}-{suffix}.md"
             suffix += 1
-    path.write_text(report_md, encoding="utf-8")
-    with contextlib.suppress(OSError):
-        os.chmod(path, 0o600)
+    write_private_text(path, report_md)
     _rotate(d, _CONFIG.get("keep_reports", 10))
     return path
 
@@ -403,7 +417,7 @@ def _interactive_flow(
         "Help us fix it — file a GitHub issue with this report? [Y/n] ",
         stream,
     ):
-        _copy_to_clipboard(report_md)  # always: backup, or primary if body dropped
+        _copy_to_clipboard(_sanitize_export(report_md))
         opened = _open_browser(url)
         _print(stream, "")
         if opened and body_included:
@@ -466,7 +480,7 @@ def _issue_url(exc: BaseException, body: str = "") -> tuple[str, bool]:
     Field IDs (``version``, ``os``, ``description``) come from
     ``.github/ISSUE_TEMPLATE/bug_report.yml``; keep in sync if it changes.
     """
-    first_line = (str(exc).strip().splitlines() or [""])[0]
+    first_line = (_sanitize_export(str(exc)).strip().splitlines() or [""])[0]
     title = f"[Crash] {type(exc).__qualname__}: {first_line[:140]}"
     repo = _CONFIG["repo"]
     version = _CONFIG.get("version", "unknown")
@@ -485,7 +499,7 @@ def _issue_url(exc: BaseException, body: str = "") -> tuple[str, bool]:
     # Try the full body in the URL. If it would exceed the safe limit,
     # drop the description entirely — the clipboard carries the full
     # report and the caller tells the user to paste it. No half-measures.
-    params["description"] = body
+    params["description"] = _sanitize_export(body)
     url = base + urllib.parse.urlencode(params)
     if len(url) <= _MAX_URL_LENGTH:
         return url, True

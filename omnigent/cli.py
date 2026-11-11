@@ -1230,9 +1230,9 @@ def _save_global_config(  # type: ignore[explicit-any]
         cfg.pop(key, None)
     path = _effective_global_config_path()
     _normalize_harness_scalar_on_write(cfg, path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
+    from omnigent.private_file import write_private_text
+
+    write_private_text(path, yaml.safe_dump(cfg, default_flow_style=False, sort_keys=True))
 
 
 def _materialize_bundled_example(name: str) -> Path:
@@ -1318,9 +1318,9 @@ def _save_local_config(
     for key in unset_keys:
         cfg.pop(key, None)
     _normalize_harness_scalar_on_write(cfg, path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
+    from omnigent.private_file import write_private_text
+
+    write_private_text(path, yaml.safe_dump(cfg, default_flow_style=False, sort_keys=True))
 
 
 def _default_db_uri() -> str:
@@ -2309,7 +2309,7 @@ def main() -> None:
     # dispatch, imports — are all caught. See omnigent/crash_handler.py.
     from omnigent.crash_handler import install_crash_handler
 
-    install_crash_handler(app_name="omnigent", repo="omnigent-ai/omnigent")
+    install_crash_handler(app_name="omnigent")
 
     # Operators can force all use through a wrapper (e.g. `isaac omni`) by
     # setting OMNIGENT_REQUIRE_WRAPPER; the wrapper sets OMNIGENT_WRAPPER_BYPASS

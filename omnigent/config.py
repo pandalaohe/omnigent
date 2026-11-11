@@ -22,6 +22,7 @@ from omnigent.preferences import (
     preferences_from_config,
     resolve_preferences,
 )
+from omnigent.private_file import write_private_text
 
 _log = logging.getLogger(__name__)
 _cwd_missing_warned = False
@@ -264,12 +265,7 @@ def save_global_config(
             cfg[key] = merged
         else:
             cfg[key] = value
-    resolved.parent.mkdir(parents=True, exist_ok=True)
-    # Atomic replace so a crash mid-write can't truncate the user's config.
-    tmp = resolved.with_name(resolved.name + ".tmp")
-    with tmp.open("w") as config_file:
-        yaml.safe_dump(cfg, config_file, default_flow_style=False, sort_keys=True)
-    os.replace(tmp, resolved)
+    write_private_text(resolved, yaml.safe_dump(cfg, default_flow_style=False, sort_keys=True))
 
 
 def _github_accounts(cfg: _Config) -> dict[str, object]:
