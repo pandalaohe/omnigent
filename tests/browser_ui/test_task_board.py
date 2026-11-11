@@ -33,7 +33,7 @@ def test_task_board_display_switch_and_source_list(
             "task_board_enabled": True,
         },
     )
-    settings: dict[str, object] = {}
+    settings: dict[str, object] = {"showTaskBoard": False}
 
     def preferences(_: Request) -> dict[str, object]:
         return {

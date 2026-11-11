@@ -482,6 +482,11 @@ def test_page_clearance_uses_shared_threshold(
     }
     swept = {values[2] for values in _PAGE_SCROLL_CALLERS}
     assert callers == swept, "Add every new PageScroll caller to the layout sweep"
+    if route == "/task-board":
+        page.add_init_script(
+            "localStorage.setItem('omnigent:session-navigation', "
+            "JSON.stringify({showTaskBoard: false}))"
+        )
     if route in ("/settings/members", "/settings/sharing"):
         browser_contract.json(
             "/v1/info",
