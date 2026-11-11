@@ -263,7 +263,7 @@ from omnigent.sdk_permission_modes import (
     CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
     CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
 )
-from omnigent.server.permission_tiers import PERMISSION_STATE_LABEL_KEY
+from omnigent.server.permission_tiers import PERMISSION_STATE_LABEL_KEY, TIER_HARNESSES
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
@@ -5092,7 +5092,16 @@ def create_runner_app(
             envelope.recovery_id if envelope is not None else None,
         )
         task = _session_init_tasks.get(key)
-        if task is None:
+        failed_done = (
+            task is not None
+            and task.done()
+            and (
+                task.cancelled()
+                or task.exception() is not None
+                or task.result().status_code >= 400
+            )
+        )
+        if task is None or failed_done:
             task = asyncio.create_task(
                 _initialize_session(body),
                 name=f"session-init-{session_id}",
@@ -5100,7 +5109,12 @@ def create_runner_app(
             _session_init_tasks[key] = task
 
             def _drop_completed_init(done: asyncio.Task[JSONResponse]) -> None:
-                if _session_init_tasks.get(key) is done:
+                if (
+                    _session_init_tasks.get(key) is done
+                    and not done.cancelled()
+                    and done.exception() is None
+                    and done.result().status_code < 400
+                ):
                     _session_init_tasks.pop(key, None)
 
             task.add_done_callback(_drop_completed_init)
@@ -9526,6 +9540,56 @@ def create_runner_app(
                 },
             )
 
+    async def _wait_for_permission_initialization(session_id: str) -> JSONResponse | None:
+        observed: set[asyncio.Task[JSONResponse]] = set()
+        try:
+            async with asyncio.timeout(60.0):
+                while True:
+                    completed = [
+                        task
+                        for key, task in list(_session_init_tasks.items())
+                        if key[0] == session_id and task.done() and task not in observed
+                    ]
+                    if completed:
+                        results = await asyncio.shield(
+                            asyncio.gather(*completed, return_exceptions=True)
+                        )
+                        observed.update(completed)
+                        for result in results:
+                            if isinstance(result, BaseException):
+                                detail = permission_startup_errors.get(session_id) or (
+                                    "Permission tier initialization failed"
+                                )
+                            elif result.status_code >= 400:
+                                payload = json.loads(bytes(result.body))
+                                detail = (
+                                    permission_startup_errors.get(session_id)
+                                    or (
+                                        payload.get("detail") or payload.get("error")
+                                        if isinstance(payload, dict)
+                                        else None
+                                    )
+                                    or "Permission tier initialization failed"
+                                )
+                            else:
+                                continue
+                            return JSONResponse(
+                                status_code=503,
+                                content={"error": "permission_tier_unavailable", "detail": detail},
+                            )
+                    state = permission_tiers.state(session_id)
+                    if state is not None and state.status == "ready":
+                        return None
+                    await asyncio.sleep(0.05)
+        except TimeoutError:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "permission_tier_unavailable",
+                    "detail": "Permission tier initialization timed out",
+                },
+            )
+
     async def _stream_message_to_harness(
         body: _JsonObject,
         conv_id: str,
@@ -9725,6 +9789,12 @@ def create_runner_app(
 
         if harness_name is not None:
             await prepare_capture(server_client, conv_id, harness_name)
+        if harness_name in TIER_HARNESSES:
+            permission_state = permission_tiers.state(conv_id)
+            if permission_state is None or permission_state.status != "ready":
+                init_error = await _wait_for_permission_initialization(conv_id)
+                if init_error is not None:
+                    return init_error
         try:
             client = await manager.get_client(conv_id, harness_name, env=spawn_env)
         except RuntimeError as exc:

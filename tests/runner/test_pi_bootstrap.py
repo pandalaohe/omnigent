@@ -1,6 +1,7 @@
 """Private attestor transport uses the actual relay and existing principal registry."""
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -621,6 +622,162 @@ async def test_runner_initializes_and_rebinds_real_scoped_pi_harness(tmp_path, m
             finally:
                 await client.delete("/v1/sessions/production-pi")
                 await executor.close()
+
+
+def _pi_turn_double(reply: str, order: list[str]):
+    from omnigent.inner.pi_executor import _PiRpcSession
+
+    class Writer:
+        def __init__(self):
+            self.data = []
+
+        def write(self, data):
+            self.data.append(data)
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+        async def wait_closed(self):
+            pass
+
+    class Process:
+        def __init__(self):
+            self.stdin = Writer()
+            self.returncode = None
+
+        async def wait(self):
+            return 0
+
+    rpc = _PiRpcSession()
+    rpc.process = Process()
+    for event in (
+        {"type": "response", "success": True},
+        {
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "delta": reply},
+        },
+        {"type": "agent_end", "messages": []},
+    ):
+        rpc._line_queue.put_nowait(json.dumps(event))
+    prompts = []
+    started, release = asyncio.Event(), asyncio.Event()
+    original_send = rpc.send_command
+
+    async def send(command):
+        if command.get("type") == "prompt":
+            prompts.append(command)
+            order.append("prompt")
+            started.set()
+            await release.wait()
+        await original_send(command)
+
+    rpc.send_command = send
+    return rpc, prompts, started, release
+
+
+async def _first_turn_before_init(tmp_path, monkeypatch, *, init_error: bool):
+    from omnigent.inner import pi_harness
+    from omnigent.inner.pi_executor import PiExecutor, PiPermissionBootstrapError
+    from tests.runner.conftest import _build_app_for_spec, _runner_client
+    from tests.runner.native_helpers import _harness_spec
+
+    session = f"late-init-{'failure' if init_error else 'success'}"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    app, manager = await _build_app_for_spec(_harness_spec("pi"))
+    executor = PiExecutor(
+        cwd=str(workspace), pi_path="/opt/bin/pi", context_files=False, permission_controlled=True
+    )
+    order = []
+    rpc, prompts, prompt_started, release = _pi_turn_double("FIRST_TURN_OK", order)
+    entered = asyncio.Event()
+
+    async def external_process(*_args, **_kwargs):
+        entered.set()
+        return rpc
+
+    monkeypatch.setattr(executor, "_ensure_rpc", external_process)
+    if init_error:
+
+        async def fail_bootstrap(_session_id):
+            raise PiPermissionBootstrapError("missing_ack")
+
+        monkeypatch.setattr(executor, "bootstrap_permission_tier", fail_bootstrap)
+    monkeypatch.setattr(pi_harness, "_build_pi_executor", lambda: executor)
+    harness_app = pi_harness.create_app()
+    harness_app.state.conversation_id = session
+    harness_app.state.harness_auth_token = "nonsecret-fixture"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=harness_app),
+        base_url="http://harness",
+        headers={"Authorization": "Bearer nonsecret-fixture"},
+    ) as harness_client:
+        manager._client = harness_client
+        async with _runner_client(
+            app, permission_harness="pi", permission_snapshot={"workspace": str(workspace)}
+        ) as client:
+            response = await client.post(
+                f"/v1/sessions/{session}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "test-agent",
+                    "content": [{"type": "input_text", "text": "FIRST_TURN_OK"}],
+                },
+            )
+            assert response.status_code == 202, response.text
+            turn = app.state.active_turns[session]
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(prompt_started.wait(), timeout=0.2)
+            try:
+                initialized = await client.post(
+                    "/v1/sessions", json={"session_id": session, "agent_id": "test-agent"}
+                )
+                if init_error:
+                    assert initialized.status_code == 503, initialized.text
+                else:
+                    assert initialized.status_code == 201, initialized.text
+                    order.append("ready")
+                release.set()
+                await asyncio.wait_for(turn, 2)
+            finally:
+                release.set()
+                if not turn.done():
+                    turn.cancel()
+                await asyncio.gather(turn, return_exceptions=True)
+            return app, entered, prompts, prompt_started, order
+
+
+@pytest.mark.asyncio
+async def test_late_initialization_completes_before_first_pi_turn(tmp_path, monkeypatch):
+    app, entered, prompts, _prompt_started, order = await _first_turn_before_init(
+        tmp_path, monkeypatch, init_error=False
+    )
+    assert entered.is_set()
+    assert order == ["ready", "prompt"]
+    assert [prompt["message"] for prompt in prompts] == ["FIRST_TURN_OK"]
+    assert app.state.permission_tiers.state("late-init-success").status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_late_initialization_failure_rejects_first_pi_turn_immediately(
+    tmp_path, monkeypatch
+):
+    app, entered, prompts, _prompt_started, _order = await _first_turn_before_init(
+        tmp_path, monkeypatch, init_error=True
+    )
+    assert not entered.is_set()
+    assert prompts == []
+    queue = app.state.session_event_queues["late-init-failure"]
+    statuses = []
+    while not queue.empty():
+        event = queue.get_nowait()
+        if event.get("type") == "session.status":
+            statuses.append(event["status"])
+    assert statuses[-1] == "failed"
 
 
 @pytest.mark.parametrize(
