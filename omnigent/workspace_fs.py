@@ -45,6 +45,7 @@ from typing import TypeAlias, cast
 from omnigent.artifact_paths import resolved_within
 from omnigent.entities.environment_filesystem import FilesystemEntry, InvalidPath
 from omnigent.entities.pagination import paginate_in_memory
+from omnigent.git_commands import run_git
 from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
 from omnigent.runner import pr_resource
 from omnigent.runner.environment_filesystem import (
@@ -77,7 +78,7 @@ def _repository_branch(url: str, checkout: Path) -> _WorkspacePayload:
         return result
 
     def git(*args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        return run_git(
             ["git", *args],
             cwd=checkout,
             env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"},

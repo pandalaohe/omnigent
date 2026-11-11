@@ -32,6 +32,7 @@ from omnigent._platform import (
     WINDOWS_ENV_PASSTHROUGH,
     posix_shell_path,
 )
+from omnigent.git_commands import run_git
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
@@ -1276,7 +1277,7 @@ def _handle_helper_request(
                 # Baseline reads distinguish missing HEAD paths from other Git failures.
                 git_env["LC_ALL"] = "C"
             with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-                completed = subprocess.run(
+                completed = run_git(
                     argv,
                     cwd=git_cwd,
                     env=git_env,

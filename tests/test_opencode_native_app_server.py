@@ -664,7 +664,7 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert started["stdin"] == subprocess.PIPE
     assert started["env"]["OPENCODE_DB"] == str(tmp_path / "opencode.db")
     assert server.process is not None
-    assert server.process.pid is None
+    assert server.process.pid == 4242
     incarnation_id, process = server.resident_incarnation_id, server.process
     with pytest.raises(RuntimeError, match="exit is not confirmed"):
         await server.start()
