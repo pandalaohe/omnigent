@@ -1243,6 +1243,10 @@ def _handle_helper_request(
         )
 
         args, target, timeout = request.get("argv"), request.get("cwd"), request.get("timeout")
+        if isinstance(args, list) and args[:1] == ["--no-optional-locks"]:
+            args = args[1:]
+        if isinstance(args, list) and args[:2] == ["-c", "diff.autoRefreshIndex=false"]:
+            args = args[2:]
         if (
             not isinstance(args, list)
             or not args

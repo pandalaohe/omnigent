@@ -636,13 +636,18 @@ async def test_sys_session_list_include_archived_lists_archived_rows_on_every_pa
         "created_by_session_id": "conv_caller",
         "archived": True,
         "family": None,
+        "archived_at": None,
+        "project_id": None,
+        "updated_at": None,
+        "last_message_preview": None,
+        "workspace": None,
+        "worktree": None,
     }
     assert first["sessions"][1]["archived"] is False
     assert second["sessions"][0]["archived"] is True
     # The cursor is bound to the archive filter it was minted with.
     assert mismatched == {"error": "sys_session_list: cursor uses different filter arguments"}
-    # Callers that don't ask keep the old row shape.
-    assert "archived" not in default["sessions"][0]
+    assert default["sessions"][0]["archived"] is False
     # Everything not owned is shared, including the ownerless session.
     assert [(row["session_id"], row["owner"]) for row in shared["sessions"]] == [
         (row["id"], row["owner"]) for row in rows if row["owner"] != _VIEWER

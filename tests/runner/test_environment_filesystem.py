@@ -1745,7 +1745,8 @@ async def test_multi_repo_routes_bind_session_git_and_preserve_repository_metada
         argv: list[str], cwd: Path, timeout: float
     ) -> subprocess.CompletedProcess[bytes]:
         assert threading.get_ident() != event_loop_thread
-        calls.append((argv[0], cwd))
+        command = next(arg for arg in argv if arg in {"status", "diff", "show"})
+        calls.append((command, cwd))
         return run_git(argv, cwd, timeout)
 
     monkeypatch.setattr(environment, "run_git", capture_git)
@@ -2238,7 +2239,9 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
     if mode != "missing":
         executable = tmp_path / "rg"
         body = (
-            "import time\ntime.sleep(60)\n"
+            "import os, time\nfrom pathlib import Path\n"
+            f"Path({str(tmp_path / 'pid')!r}).write_text(str(os.getpid()))\n"
+            "time.sleep(60)\n"
             if mode == "timeout"
             else "print('x' * (2 * 1024 * 1024))\n"
         )

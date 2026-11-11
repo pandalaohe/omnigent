@@ -11925,6 +11925,16 @@
       "SessionMessageItem": {
         "description": "`message` item as returned by `GET /v1/sessions/{id}/items`.\n\nMirrors `MessageData` field for field. The entity keeps the blocks\nas free-form dicts, so this variant spells out the typed block shape\ninstead of inheriting it.",
         "properties": {
+          "auto_retry": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AutoRetryMetadata"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "content": {
             "description": "Content blocks in order.",
             "items": {
@@ -11979,6 +11989,17 @@
             ],
             "description": "Agent name; present on assistant messages, absent on user messages.",
             "title": "Model"
+          },
+          "peer_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Peer Message Id"
           },
           "phase": {
             "anyOf": [

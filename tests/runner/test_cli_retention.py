@@ -580,15 +580,16 @@ async def test_scrubbed_opencode_read_failure_has_no_old_credential(tmp_path, mo
 
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "opencode")
     source = tmp_path / "source-auth.json"
-    source.write_text("{}")
-    monkeypatch.setattr(bridge, "user_opencode_auth_path", lambda: source)
+    source.write_text('{"fixture": "nonsecret"}')
+    monkeypatch.setattr("omnigent.onboarding.opencode_auth.opencode_auth_path", lambda: source)
+    monkeypatch.setattr("omnigent.onboarding.opencode_auth.stored_v2_credentials", dict)
     home = bridge.prepare_bridge_dir("conv_scrub")
     target = bridge.seed_opencode_auth(home)
     assert target is not None
     app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
     await app.state.finish_cli_release("conv_scrub")
     assert not target.exists()
-    monkeypatch.setattr(bridge.shutil, "copyfile", Mock(side_effect=PermissionError("fixture")))
+    monkeypatch.setattr(bridge.os, "replace", Mock(side_effect=PermissionError("fixture")))
     assert bridge.seed_opencode_auth(home) is None
     assert not target.exists()
 

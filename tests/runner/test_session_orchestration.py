@@ -104,12 +104,8 @@ async def test_create_placement(placement, monkeypatch, profile, capability, num
     requests = []
 
     def handler(request):
-        if request.method == "GET" and request.url.path.startswith("/v1/sessions/"):
+        if request.method == "GET" and request.url.path == "/v1/sessions/manager":
             return httpx.Response(200, json={"parent_session_id": None})
-        if request.url.path == "/v1/info":
-            return httpx.Response(200, json={"request_managed_sandbox_host_id": True})
-        if request.method == "PATCH":
-            return httpx.Response(200, json={})
         requests.append(request)
         if request.url.path == "/v1/info":
             if capability == "timeout":
@@ -127,6 +123,8 @@ async def test_create_placement(placement, monkeypatch, profile, capability, num
                     "non_bool": {"sandbox_profiles": "true"},
                 }[capability]
             return httpx.Response(200, json=info)
+        if request.method == "PATCH":
+            return httpx.Response(200, json={})
         if request.url.path.endswith("/events"):
             if placement == "child":
                 register.assert_called_once()
@@ -182,10 +180,11 @@ async def test_create_placement(placement, monkeypatch, profile, capability, num
     if placement == "child":
         assert [(request.method, request.url.path) for request in requests] == [
             ("POST", "/v1/sessions"),
-            ("GET", "/v1/sessions/manager"),
+            ("PATCH", f"/v1/sessions/{session_id}"),
             ("GET", f"/v1/sessions/{session_id}"),
             ("PATCH", f"/v1/sessions/{session_id}"),
             ("POST", f"/v1/sessions/{session_id}/events"),
+            ("PATCH", f"/v1/sessions/{session_id}"),
         ]
         assert body["parent_session_id"] == "manager"
         assert register.call_args.kwargs["parent_session_id"] == "manager"
@@ -211,8 +210,8 @@ async def test_create_placement(placement, monkeypatch, profile, capability, num
         assert "initial_items" not in body
     elif placement == "child":
         assert "initial_items" not in body
-        assert requests[-1].url.path == f"/v1/sessions/{result['conversation_id']}/events"
-        assert json.loads(requests[-1].content)["data"]["content"][0]["text"] == "Start"
+        assert requests[-2].url.path == f"/v1/sessions/{result['conversation_id']}/events"
+        assert json.loads(requests[-2].content)["data"]["content"][0]["text"] == "Start"
         assert result["initial_message"] == {"status": "sent"}
     else:
         assert "initial_items" not in body
@@ -255,6 +254,8 @@ async def test_managed_creation_respects_current_host_policy_before_posting():
     requests = []
 
     def respond(request):
+        if request.url.path == "/v1/sessions/manager":
+            return httpx.Response(200, json={"parent_session_id": None})
         requests.append(request)
         return httpx.Response(
             200,
@@ -742,6 +743,8 @@ async def test_independent_creation_supports_disabled_or_missing_sibling_capabil
     family = {"id": "manager"} if capability is True else None
 
     def handle(request):
+        if request.url.path == "/v1/sessions/manager":
+            return httpx.Response(200, json={"parent_session_id": None})
         paths.append(request.url.path)
         if request.url.path == "/v1/info":
             info = {"sibling_session_destinations": "current_host"}

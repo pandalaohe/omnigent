@@ -7,15 +7,30 @@ import uuid
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from omnigent.runner import _entry
 from omnigent.runner.host_terminals import create_host_terminal_app
 from omnigent.runner.identity import RUNNER_PURPOSE_ENV_VAR
 from tests._helpers.polling import poll_until
+
+
+def _receive_binary_frame(websocket: Any) -> bytes:
+    """Skip attach metadata frames and return the next PTY output frame."""
+    while True:
+        message = websocket.receive()
+        if message.get("type") in {"websocket.disconnect", "websocket.close"}:
+            raise WebSocketDisconnect(
+                code=message.get("code", 1000), reason=message.get("reason", "")
+            )
+        data = message.get("bytes")
+        if isinstance(data, bytes):
+            return data
 
 
 class _RecordingTerminalRegistry:
@@ -287,7 +302,7 @@ def test_host_admin_terminal_uses_shared_launcher_and_lifecycle(monkeypatch, tmp
             output = b""
             before = instance.last_input_at
             while b"Password:" not in output:
-                output += websocket.receive_bytes()
+                output += _receive_binary_frame(websocket)
             assert instance.last_input_at == before
             websocket.send_text('{"type":"resize","cols":100,"rows":40}')
             websocket.send_bytes(b"renew")

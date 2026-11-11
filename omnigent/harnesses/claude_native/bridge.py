@@ -10414,6 +10414,8 @@ def _tool_relay_handler_factory(
             :param exc: The exception raised by the upstream policy POST.
             :returns: None.
             """
+            import httpx
+
             reason = str(exc).strip()
             raw_detail = f"{type(exc).__name__}: {reason}" if reason else type(exc).__name__
             detail = redact_pi_authority(raw_detail)
@@ -10432,7 +10434,15 @@ def _tool_relay_handler_factory(
                 self.wfile.write(body)
             finally:
                 # Slow traceback rendering must not delay the fail-closed response.
-                _logger.warning("policy-eval proxy forward failed: %s", detail, exc_info=exc)
+                safe_reason = redact_pi_authority(str(exc))
+                safe_exception = (
+                    httpx.RequestError(safe_reason)
+                    if isinstance(exc, httpx.RequestError)
+                    else RuntimeError(safe_reason)
+                )
+                _logger.warning(
+                    "policy-eval proxy forward failed: %s", detail, exc_info=safe_exception
+                )
 
         def _read_json_body(self) -> _JsonObject | None:
             """

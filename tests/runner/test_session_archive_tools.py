@@ -294,6 +294,10 @@ async def test_session_list_archived_only_maps_to_visibility_archived() -> None:
     global_params: list[httpx.QueryParams] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/me":
+            return httpx.Response(200, json={"user_id": "owner"})
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"session_list_scoped_archives": True})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
             return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
         if (
@@ -307,7 +311,7 @@ async def test_session_list_archived_only_maps_to_visibility_archived() -> None:
                 200,
                 json={
                     "data": [
-                        {"id": "conv_gone", "archived": True, "archived_at": 42},
+                        {"id": "conv_gone", "owner": "owner", "archived": True, "archived_at": 42},
                     ],
                     "has_more": False,
                     "last_id": "conv_gone",
@@ -325,7 +329,7 @@ async def test_session_list_archived_only_maps_to_visibility_archived() -> None:
             )
         )
     assert global_params[0]["visibility"] == "archived"
-    assert "include_archived" not in global_params[0]
+    assert global_params[0]["include_archived"] == "true"
     assert out["sessions"][0]["archived"] is True
     assert out["sessions"][0]["archived_at"] == 42
 
@@ -336,6 +340,8 @@ async def test_session_list_archived_include_adds_include_archived_param() -> No
     global_params: list[httpx.QueryParams] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"session_list_scoped_archives": True})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
             return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
         if (
@@ -357,7 +363,7 @@ async def test_session_list_archived_include_adds_include_archived_param() -> No
                 server_client=client,
             )
         )
-    assert global_params[0]["visibility"] == "all"
+    assert global_params[0]["visibility"] == "mine"
     assert global_params[0]["include_archived"] == "true"
     assert out["sessions"] == []
 

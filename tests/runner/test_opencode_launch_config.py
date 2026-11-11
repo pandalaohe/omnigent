@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -24,6 +25,9 @@ class _StopBeforeBoot(Exception):
 class _FakeServer:
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
+        self.resident_incarnation_id = uuid4().hex
+        self.process_exit_confirmed = False
+        self.exit_confirmed = False
 
     async def start(self) -> None:
         raise _StopBeforeBoot

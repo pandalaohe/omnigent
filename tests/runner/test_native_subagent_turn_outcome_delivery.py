@@ -106,7 +106,10 @@ class _Rig:
 
 
 @pytest.mark.asyncio
-async def test_failed_turn_identity_distinguishes_same_error_and_late_duplicates() -> None:
+@pytest.mark.parametrize("outcome", ["failed", "cancelled"])
+async def test_terminal_turn_identity_distinguishes_same_error_and_late_duplicates(
+    outcome: str,
+) -> None:
     rig = _Rig("claude-native")
     try:
         async with _runner_client(rig.app, permission_harness=rig.harness) as client:
@@ -115,7 +118,8 @@ async def test_failed_turn_identity_distinguishes_same_error_and_late_duplicates
                 response = await rig.post_status(
                     client,
                     {
-                        "status": "failed",
+                        "status": "idle" if outcome == "cancelled" else "failed",
+                        "turn_outcome": outcome,
                         "response_id": f"response-{turn}",
                         "input_id": f"input-{turn}",
                         "input_generation": 1 if turn == "first" else 2,
@@ -125,6 +129,7 @@ async def test_failed_turn_identity_distinguishes_same_error_and_late_duplicates
                 assert response.status_code == 204
         results = rig.drained()
         assert len(results) == 2
+        assert [result["status"] for result in results] == [outcome, outcome]
         assert [result["terminal"]["turn_id"] for result in results] == [
             "response-first",
             "response-second",
@@ -134,6 +139,49 @@ async def test_failed_turn_identity_distinguishes_same_error_and_late_duplicates
             "input-second",
         ]
         assert all(result["terminal"]["event_kind"] == "turn_terminal" for result in results)
+    finally:
+        rig.close()
+
+
+@pytest.mark.parametrize("confirmed_cancel", [False, True], ids=["optimistic", "confirmed"])
+@pytest.mark.parametrize("next_status", ["completed", "failed", "cancelled"])
+def test_new_result_key_after_cancel_delivers_without_terminal_identity(
+    confirmed_cancel: bool, next_status: str
+) -> None:
+    rig = _Rig("cursor-native")
+    try:
+        cancelled = subagent_work.mark_subagent_work_terminal(
+            rig.child_id,
+            status="cancelled",
+            output="first turn",
+            result_key="first-result",
+            confirmed_cancellation=confirmed_cancel,
+        )
+        assert cancelled.delivered_now
+        assert [item["status"] for item in rig.drained()] == ["cancelled"]
+
+        delivered = subagent_work.mark_subagent_work_terminal(
+            rig.child_id,
+            status=next_status,
+            output="next turn",
+            result_key="next-result",
+            confirmed_cancellation=next_status == "cancelled",
+        )
+        assert delivered.delivered and delivered.delivered_now
+        entry = subagent_work.get_subagent_work(rig.child_id)
+        assert entry is not None and entry.delivered_result_key == "next-result"
+        assert entry.terminal is not None and entry.terminal.identity_key is None
+        replay = subagent_work.mark_subagent_work_terminal(
+            rig.child_id,
+            status=next_status,
+            output="next turn",
+            result_key="next-result",
+            confirmed_cancellation=next_status == "cancelled",
+        )
+        assert replay.delivered and not replay.delivered_now
+        assert [(item["status"], item["output"]) for item in rig.drained()] == [
+            (next_status, "next turn")
+        ]
     finally:
         rig.close()
 
@@ -480,7 +528,7 @@ async def test_confirmed_completion_corrects_drained_grace_cancel(
             # drained-delivery tombstone for this child.
             for payload in cancelled:
                 await _cleanup_drained_subagent_work(payload, server_client=None)
-            assert rig.child_id in subagent_work._drained_delivered_subagent_children
+            assert rig.child_id in subagent_work._drained_delivered_subagent_results
 
             resp = await rig.post_status(
                 client, {"status": "idle", "turn_completed": True, "output": "the verdict"}
@@ -532,7 +580,7 @@ async def test_confirmed_stop_blocks_late_completion_after_drain(
                 # The parent drains the cancellation, recording the drained tombstone.
                 for payload in cancelled:
                     await _cleanup_drained_subagent_work(payload, server_client=None)
-                assert rig.child_id in subagent_work._drained_delivered_subagent_children
+                assert rig.child_id in subagent_work._drained_delivered_subagent_results
 
             # The runner confirms the kill, making the cancellation final.
             resp = await client.post(
@@ -544,7 +592,7 @@ async def test_confirmed_stop_blocks_late_completion_after_drain(
             # and a still-registered entry is confirmed in place.
             assert rig.child_id not in subagent_work._provisional_cancelled_subagent_work
             if drain_before_stop:
-                assert rig.child_id in subagent_work._drained_delivered_subagent_children
+                assert rig.child_id in subagent_work._drained_delivered_subagent_results
             else:
                 entry = subagent_work.get_subagent_work(rig.child_id)
                 assert entry is not None and entry.cancellation_confirmed
@@ -560,7 +608,7 @@ async def test_confirmed_stop_blocks_late_completion_after_drain(
         assert rig.child_id not in subagent_work._provisional_cancelled_subagent_work
     finally:
         rig.close()
-        subagent_work._drained_delivered_subagent_children.discard(rig.child_id)
+        subagent_work._drained_delivered_subagent_results.pop(rig.child_id, None)
         subagent_work._provisional_cancelled_subagent_work.pop(rig.child_id, None)
 
 
@@ -750,7 +798,7 @@ def test_parent_teardown_clears_drained_provisional_cancellation() -> None:
         # The parent drains the optimistic cancellation, retaining the record.
         subagent_work.unregister_subagent_work(child_id, remember_drained_delivery=True)
         assert child_id in subagent_work._provisional_cancelled_subagent_work
-        assert child_id in subagent_work._drained_delivered_subagent_children
+        assert child_id in subagent_work._drained_delivered_subagent_results
 
         # The parent session is deleted.
         subagent_work._session_inboxes_ref.pop(parent_id, None)
@@ -766,7 +814,7 @@ def test_parent_teardown_clears_drained_provisional_cancellation() -> None:
         assert parent_id not in subagent_work._subagent_work_by_parent
     finally:
         subagent_work.unregister_subagent_work_for_session(parent_id)
-        subagent_work._drained_delivered_subagent_children.discard(child_id)
+        subagent_work._drained_delivered_subagent_results.pop(child_id, None)
         subagent_work._provisional_cancelled_subagent_work.pop(child_id, None)
         subagent_work._session_inboxes_ref.pop(parent_id, None)
 
@@ -798,7 +846,7 @@ def test_new_send_clears_drained_optimistic_cancellation() -> None:
         assert ack.delivered_now
         subagent_work.unregister_subagent_work(child_id, remember_drained_delivery=True)
         assert child_id in subagent_work._provisional_cancelled_subagent_work
-        assert child_id in subagent_work._drained_delivered_subagent_children
+        assert child_id in subagent_work._drained_delivered_subagent_results
 
         # Dispatch B reuses the same child session, superseding the retained state.
         entry_b = subagent_work.register_subagent_work(
@@ -808,11 +856,11 @@ def test_new_send_clears_drained_optimistic_cancellation() -> None:
             title="B",
         )
         assert child_id not in subagent_work._provisional_cancelled_subagent_work
-        assert child_id not in subagent_work._drained_delivered_subagent_children
+        assert child_id not in subagent_work._drained_delivered_subagent_results
         assert subagent_work.get_subagent_work(child_id) is entry_b
     finally:
         subagent_work.unregister_subagent_work_for_session(parent_id)
-        subagent_work._drained_delivered_subagent_children.discard(child_id)
+        subagent_work._drained_delivered_subagent_results.pop(child_id, None)
         subagent_work._provisional_cancelled_subagent_work.pop(child_id, None)
         subagent_work._session_inboxes_ref.pop(parent_id, None)
 
@@ -876,7 +924,7 @@ def test_corrected_completion_redelivers_when_inbox_returns() -> None:
         assert inbox.empty()
     finally:
         subagent_work.unregister_subagent_work_for_session(parent_id)
-        subagent_work._drained_delivered_subagent_children.discard(child_id)
+        subagent_work._drained_delivered_subagent_results.pop(child_id, None)
         subagent_work._provisional_cancelled_subagent_work.pop(child_id, None)
         subagent_work._session_inboxes_ref.pop(parent_id, None)
 

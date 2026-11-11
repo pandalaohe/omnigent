@@ -399,8 +399,9 @@ def test_tool_call_budget_override_extends_the_outage_wait(
     attempt_times: list[float] = []
 
     class _Client:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, trust_env: bool) -> None:
             del headers, timeout
+            assert trust_env is True
 
         def __enter__(self) -> _Client:
             return self
@@ -1241,8 +1242,9 @@ def test_post_evaluate_with_retry_budget_follows_the_request_phase(
     attempt_times: list[float] = []
 
     class _Client:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, trust_env: bool) -> None:
             del headers, timeout
+            assert trust_env is True
 
         def __enter__(self) -> _Client:
             return self
