@@ -154,27 +154,46 @@ def test_remote_tui_approval_preset_keeps_policy_override_and_literal_values() -
     ]
 
 
-@pytest.mark.parametrize("sandbox", ["--sandbox=read-only", "-sread-only", "--yolo"])
+@pytest.mark.parametrize("sandbox", ["--sandbox=read-only", "-sread-only"])
 def test_remote_tui_approval_preset_keeps_sandbox_override(sandbox: str) -> None:
     args = app_server.build_codex_remote_args(
         codex_args=("--approve-for-me", sandbox),
         thread_id=None,
         remote_url="ws://127.0.0.1:9876",
     )
-    expected = (
-        ["--dangerously-bypass-approvals-and-sandbox"]
-        if sandbox == "--yolo"
-        else ["--ask-for-approval", "on-request", "--sandbox", "read-only"]
-    )
     assert args == [
-        *expected,
+        "--ask-for-approval",
+        "on-request",
+        "--sandbox",
+        "read-only",
         "-c",
         'approvals_reviewer="auto_review"',
         "--remote",
         "ws://127.0.0.1:9876",
     ]
     params = app_server._codex_resume_permission_params(("--approve-for-me", sandbox))
-    assert params["sandbox"] == ("danger-full-access" if sandbox == "--yolo" else "read-only")
+    assert params["sandbox"] == "read-only"
+
+
+@pytest.mark.parametrize("bypass", ["--yolo", "--dangerously-bypass-approvals-and-sandbox"])
+@pytest.mark.parametrize("sandbox", [(), ("--sandbox", "read-only")])
+@pytest.mark.parametrize("preset_first", [True, False])
+def test_remote_tui_approval_preset_rejects_bypass(bypass, sandbox, preset_first) -> None:
+    overrides = (bypass, *sandbox)
+    args = ("--approve-for-me", *overrides) if preset_first else (*overrides, "--approve-for-me")
+    with pytest.raises(
+        ValueError, match="--approve-for-me conflicts with sandbox and bypass flags"
+    ):
+        app_server._codex_resume_permission_params(args)
+    with pytest.raises(
+        ValueError, match="--approve-for-me conflicts with sandbox and bypass flags"
+    ):
+        app_server.build_codex_remote_args(
+            codex_args=args,
+            thread_id=None,
+            remote_url="ws://127.0.0.1:9876",
+            codex_cli_version=(0, 142, 0),
+        )
 
 
 @pytest.mark.parametrize(
@@ -183,7 +202,7 @@ def test_remote_tui_approval_preset_keeps_sandbox_override(sandbox: str) -> None
         ("--ask-for-approval", "never"),
         ("-a=never",),
         ("--ask-for-approval", "never", "--sandbox=read-only"),
-        ("--yolo",),
+        ("--sandbox", "read-only"),
     ],
 )
 def test_remote_tui_approval_override_parses_with_real_cli(overrides: tuple[str, ...]) -> None:

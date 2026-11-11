@@ -404,6 +404,7 @@ def _codex_resume_permission_params(
     args = normalize_codex_permission_launch_args(terminal_launch_args)
     index = 0
     approve_for_me = False
+    bypass_requested = False
     while index < len(args):
         arg = args[index]
         if arg == "--":
@@ -412,6 +413,7 @@ def _codex_resume_permission_params(
         if arg == "--approve-for-me":
             approve_for_me = True
         elif arg == "--dangerously-bypass-approvals-and-sandbox":
+            bypass_requested = True
             typed_params.update(approvalPolicy="never", sandbox="danger-full-access")
         elif arg in {"--ask-for-approval", "-a", "--sandbox", "-s"}:
             if index + 1 < len(args):
@@ -433,6 +435,8 @@ def _codex_resume_permission_params(
             _set_codex_resume_config_param(params, key, value)
         index += 1
     if approve_for_me:
+        if bypass_requested:
+            raise ValueError("--approve-for-me conflicts with sandbox and bypass flags")
         params["approvalsReviewer"] = "auto_review"
         params.setdefault("approvalPolicy", "on-request")
         params.setdefault("sandbox", "workspace-write")
@@ -558,10 +562,9 @@ def expand_codex_approval_preset(args: Sequence[str]) -> list[str]:
         if option != ("--approve-for-me",) and not (option[0] in selectors and len(option) == 2)
         for token in option
     ]
-    if ("--dangerously-bypass-approvals-and-sandbox",) not in options:
-        for field, flag in (("approvalPolicy", "--ask-for-approval"), ("sandbox", "--sandbox")):
-            if field in params:
-                expanded.extend([flag, str(params[field])])
+    for field, flag in (("approvalPolicy", "--ask-for-approval"), ("sandbox", "--sandbox")):
+        if field in params:
+            expanded.extend([flag, str(params[field])])
     expanded.extend(["-c", f"approvals_reviewer={json.dumps(params['approvalsReviewer'])}"])
     return [*expanded, *prompt_tail]
 
