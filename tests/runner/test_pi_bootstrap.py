@@ -792,6 +792,22 @@ def _init_task_registry(app):
     return next(cell.cell_contents for name, cell in cells if name == "_session_init_tasks")
 
 
+def _superseded_init_registry(app):
+    """The per-session superseded-init sets, or None when the runner keeps none."""
+    route = next(
+        route for route in app.routes if route.path == "/v1/sessions" and "POST" in route.methods
+    )
+    cells = zip(
+        route.endpoint.__code__.co_freevars,
+        route.endpoint.__closure__,
+        strict=False,
+    )
+    return next(
+        (cell.cell_contents for name, cell in cells if name == "_session_superseded_init_tasks"),
+        None,
+    )
+
+
 async def _retired_init_task(outcome: str):
     if outcome == "cancelled":
         task = asyncio.create_task(asyncio.sleep(60))
@@ -868,6 +884,34 @@ async def test_init_task_records_are_cleaned_on_replacement_and_delete(cleanup):
         else:
             response = await client.delete(f"/v1/sessions/{session}")
             assert response.status_code == 200, response.text
+    assert not [key for key in registry if key[0] == session]
+
+
+@pytest.mark.asyncio
+async def test_delete_cancels_superseded_running_init():
+    from tests.runner.conftest import _build_app_for_spec, _runner_client
+    from tests.runner.native_helpers import _harness_spec
+
+    session = "superseded-delete"
+    app, _manager = await _build_app_for_spec(_harness_spec("codex"))
+    registry = _init_task_registry(app)
+    superseded = _superseded_init_registry(app)
+    assert superseded is not None, "runner keeps no superseded-init registry"
+    running = asyncio.create_task(asyncio.sleep(60))
+    registry[(session, "old-agent", None, None)] = running
+    async with _runner_client(app) as client:
+        replacement = await client.post(
+            "/v1/sessions", json={"session_id": session, "agent_id": "test-agent"}
+        )
+        assert replacement.status_code == 201, replacement.text
+        # A superseded init that is still running stays reachable for teardown.
+        assert running in superseded[session]
+        assert not running.done()
+        deleted = await client.delete(f"/v1/sessions/{session}")
+        assert deleted.status_code == 200, deleted.text
+    await asyncio.wait_for(asyncio.gather(running, return_exceptions=True), 2)
+    assert running.cancelled()
+    assert session not in superseded
     assert not [key for key in registry if key[0] == session]
 
 

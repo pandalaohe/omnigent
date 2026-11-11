@@ -2177,6 +2177,9 @@ def create_runner_app(
         tuple[str, str, str | None, str | None], asyncio.Task[JSONResponse]
     ] = {}
     _session_current_init_keys: dict[str, tuple[str, str, str | None, str | None]] = {}
+    # Superseded initializations that are still running: no waiter selects them,
+    # but teardown must reach them, so only delete cancels them.
+    _session_superseded_init_tasks: dict[str, set[asyncio.Task[JSONResponse]]] = {}
 
     def _current_init_tasks(session_id: str) -> list[asyncio.Task[JSONResponse]]:
         key = _session_current_init_keys.get(session_id)
@@ -5109,10 +5112,24 @@ def create_runner_app(
             )
         )
         if task is None or failed_done:
-            for old_key in [
-                old_key for old_key in _session_init_tasks if old_key[0] == session_id
-            ]:
+
+            def _discard_superseded_init(done: asyncio.Task[JSONResponse]) -> None:
+                pending = _session_superseded_init_tasks.get(session_id)
+                if pending is None:
+                    return
+                pending.discard(done)
+                if not pending:
+                    _session_superseded_init_tasks.pop(session_id, None)
+
+            for old_key, old_task in list(_session_init_tasks.items()):
+                if old_key[0] != session_id:
+                    continue
                 _session_init_tasks.pop(old_key, None)
+                # Cancelling here would fail a concurrent init request that still
+                # awaits this task; keep it reachable for delete instead.
+                if not old_task.done():
+                    _session_superseded_init_tasks.setdefault(session_id, set()).add(old_task)
+                    old_task.add_done_callback(_discard_superseded_init)
             task = asyncio.create_task(
                 _initialize_session(body),
                 name=f"session-init-{session_id}",
@@ -5394,7 +5411,9 @@ def create_runner_app(
         for key, _task in init_records:
             _session_init_tasks.pop(key, None)
         _session_current_init_keys.pop(session_id, None)
+        superseded_inits = _session_superseded_init_tasks.pop(session_id, set())
         init_tasks = [task for _key, task in init_records if not task.done()]
+        init_tasks.extend(task for task in superseded_inits if not task.done())
         for init_task in init_tasks:
             init_task.cancel()
         if init_tasks:
