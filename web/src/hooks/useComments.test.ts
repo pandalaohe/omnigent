@@ -11,6 +11,7 @@ import { clearQuestionCardInputTarget, setQuestionCardInputTarget } from "@/lib/
 import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { useChatStore } from "@/store/chatStore";
+import { writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import {
   commentsQueryKey,
   fetchComments,
@@ -492,6 +493,7 @@ describe("useSendCommentsToAgent", () => {
   });
 
   it("queues the batch when the agent is busy, then patches the sent ids", async () => {
+    writeAlwaysSteer(false);
     chatState.status = "streaming";
     fetchMock.mockResolvedValue(mockResponse(sendResponse));
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
@@ -500,6 +502,7 @@ describe("useSendCommentsToAgent", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     expect(enqueueMock).toHaveBeenCalledWith("please address these", []);
+    localStorage.removeItem("omnigent:always-steer");
     expect(sendMock).not.toHaveBeenCalled();
     expect(addressedPatchCalls().map(([url]) => String(url))).toEqual([
       "/v1/sessions/conv_1/comments/c1",

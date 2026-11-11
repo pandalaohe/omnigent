@@ -27,7 +27,10 @@ vi.mock("@/pages/settings/sessionChoice/NewChatChoiceNotice", () => ({
 }));
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
-vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => useTestConversations(),
+  useOptionalLoadedConversations: () => useTestConversations().data,
+}));
 
 vi.mock("@/hooks/useSkills", () => ({
   useSkills: ({ target, enabled }: { target: { agentId?: string } | null; enabled?: boolean }) => ({

@@ -64,7 +64,7 @@ describe("permissionModeConcept", () => {
   it("maps Claude and Codex vocabularies onto shared concepts", () => {
     expect(permissionModeConcept("claude-native", "default")).toBe("manual");
     expect(permissionModeConcept("claude-native", "plan")).toBe("read-only");
-    expect(permissionModeConcept("codex-native", "default")).toBe("manual");
+    expect(permissionModeConcept("codex-native", "default")).toBe("automatic");
     expect(permissionModeConcept("codex-native", "ask-for-approval")).toBe("manual");
     expect(permissionModeConcept("codex-native", "approve-for-me")).toBe("automatic");
     expect(permissionModeConcept("codex-native", "read-only")).toBe("read-only");

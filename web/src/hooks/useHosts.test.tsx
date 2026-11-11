@@ -124,7 +124,7 @@ describe("host catalog refresh", () => {
 
   it("sends auto and force to the same endpoint and keeps cached rows after a failed probe", async () => {
     const client = new QueryClient();
-    const key = ["host-model-options", "host_1", "codex-native"];
+    const key = ["host-model-options", "host_1", "codex-native", host.getOmnigentServerIdentity()];
     const first = [
       { id: "gpt-a", isDefault: true, serviceTiers: [{ id: "priority", name: "Fast" }] },
     ];

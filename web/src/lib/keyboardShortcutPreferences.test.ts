@@ -241,7 +241,7 @@ describe("keyboardShortcutPreferences", () => {
       ["selectWorkspaceTab3", []],
       ["selectWorkspaceTab4", []],
       ["newBrowserTab", [{ code: "KeyB", modifiers: ["primary", "alt"] }]],
-      ["newShell", [{ code: "KeyT", modifiers: ["primary", "alt"] }]],
+      ["newShell", [{ code: "Backquote", modifiers: ["control"] }]],
       ["searchWorkspaceContents", [{ code: "KeyF", modifiers: ["primary", "shift"] }]],
       ["toggleAnnotationMode", [{ code: "Period", modifiers: ["primary", "shift"] }]],
     ];

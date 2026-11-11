@@ -763,15 +763,17 @@ describe("Composer status line (branch + context ring)", () => {
       useSessionHostOnlineMock.mockReturnValue(false);
       const onShowReconnectHelp = vi.fn();
       render(
-        <MobileHeaderControlsProvider>
-          <TooltipProvider>
-            <MobileHeaderButtonGroup data-testid="header-actions">
-              <MobileHeaderControlsSlot sessionId="conv_test" />
-              <MobileHeaderButton aria-label="Conversation actions">…</MobileHeaderButton>
-            </MobileHeaderButtonGroup>
-            <Composer {...composerProps({ onShowReconnectHelp })} />
-          </TooltipProvider>
-        </MobileHeaderControlsProvider>,
+        <MemoryRouter>
+          <MobileHeaderControlsProvider>
+            <TooltipProvider>
+              <MobileHeaderButtonGroup data-testid="header-actions">
+                <MobileHeaderControlsSlot sessionId="conv_test" />
+                <MobileHeaderButton aria-label="Conversation actions">…</MobileHeaderButton>
+              </MobileHeaderButtonGroup>
+              <Composer {...composerProps({ onShowReconnectHelp })} />
+            </TooltipProvider>
+          </MobileHeaderControlsProvider>
+        </MemoryRouter>,
       );
 
       const host = screen.getByTestId("composer-host-select");

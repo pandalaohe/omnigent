@@ -199,11 +199,15 @@ describe("TasksPage list", () => {
     vi.mocked(useViewerId).mockReturnValue("alice");
     setTasks([]);
     render(
-      <MemoryRouter>
-        <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
-          <TasksPage />
-        </CapabilitiesProvider>
-      </MemoryRouter>,
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      >
+        <MemoryRouter>
+          <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
+            <TasksPage />
+          </CapabilitiesProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
     );
     fireEvent.click(screen.getByRole("button", { name: "Maybe later" }));
     await waitFor(() => expect(screen.getByTestId("new-task-button")).toHaveFocus());
@@ -221,12 +225,15 @@ describe("TasksPage list", () => {
 
   it("waits for the first task load and keeps the guide's step through a failed refetch", () => {
     vi.mocked(useViewerId).mockReturnValue("alice");
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const content = () => (
-      <MemoryRouter>
-        <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
-          <TasksPage />
-        </CapabilitiesProvider>
-      </MemoryRouter>
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
+            <TasksPage />
+          </CapabilitiesProvider>
+        </MemoryRouter>
+      </QueryClientProvider>
     );
     setTasks(undefined, { isLoading: true });
     const view = render(content());

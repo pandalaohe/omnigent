@@ -5665,7 +5665,7 @@ describe("Composer asynchronous skills", () => {
     setComposerState({ skillsStatus: "error" });
     render(<Composer {...composerProps()} />);
     fireEvent.change(textarea(), { target: { value: "/review" } });
-    fireEvent.click(screen.getByRole("button", { name: "Retry loading skills" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(skillsFixture.getState().refetch).toHaveBeenCalledOnce();
   });
 

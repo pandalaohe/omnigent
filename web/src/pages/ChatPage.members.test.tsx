@@ -9,6 +9,7 @@ import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
@@ -179,7 +180,11 @@ function renderComposer(overrides: Partial<Parameters<typeof Composer>[0]> = {})
   const ui: ReactElement = <Composer {...composerProps(overrides)} />;
   return render(
     <MemoryRouter>
-      <TooltipProvider>{ui}</TooltipProvider>
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      >
+        <TooltipProvider>{ui}</TooltipProvider>
+      </QueryClientProvider>
     </MemoryRouter>,
   );
 }
@@ -318,7 +323,7 @@ describe("2+ member session composer", () => {
     expect(screen.queryByText("@architect")).toBeNull();
     expect(screen.getByTitle("Attach server.ts")).toBeInTheDocument();
     fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(screen.getByText("@src/server.ts")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-mention-token")).toHaveTextContent("@src/server.ts");
   });
 
   it("offers no member row while the drilled directory listing loads", () => {

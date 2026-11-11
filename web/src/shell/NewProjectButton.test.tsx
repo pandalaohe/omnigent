@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { NewProjectButton } from "./NewProjectButton";
 
 const mocks = vi.hoisted(() => ({
@@ -27,6 +28,7 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
 
 vi.mock("@/components/ProjectIconPicker", () => ({
   EmojiPicker: () => null,
+  ProjectIconPicker: () => null,
 }));
 
 vi.mock("./WorkspacePickerDialog", () => ({
@@ -53,7 +55,12 @@ function projectButton(hostId: string | null) {
 }
 
 function renderButton() {
-  const view = render(projectButton("host_1"));
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const view = render(projectButton("host_1"), {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
   fireEvent.click(screen.getByRole("button", { name: "New project" }));
   return {
     rerenderHost: (hostId: string | null) => view.rerender(projectButton(hostId)),

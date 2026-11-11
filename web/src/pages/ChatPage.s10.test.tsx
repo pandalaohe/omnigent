@@ -4,6 +4,8 @@
 // (ChatPage.composer.test.tsx) so the assertions speak the same DOM.
 
 import { create } from "zustand";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
 import type { SkillSummary, SkillsStatus } from "@/lib/types";
 
 import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
@@ -136,9 +138,15 @@ function setComposerState(patch: Partial<ChatState> & { skills?: SkillSummary[] 
 
 function renderComposer(ui: ReactElement) {
   return render(
-    <TooltipProvider>
-      <ImageLightboxProvider>{ui}</ImageLightboxProvider>
-    </TooltipProvider>,
+    <MemoryRouter>
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      >
+        <TooltipProvider>
+          <ImageLightboxProvider>{ui}</ImageLightboxProvider>
+        </TooltipProvider>
+      </QueryClientProvider>
+    </MemoryRouter>,
   );
 }
 

@@ -1471,13 +1471,6 @@ function AppearanceSection() {
             </div>
           </SettingsGroup>
 
-          <SettingsGroup title="Workspace" testId="settings-group-workspace">
-            <WorkspacePanelDefaultControl />
-            <div className="mt-4 border-t border-border pt-4">
-              <WorkspaceTabsControl />
-            </div>
-          </SettingsGroup>
-
           <SettingsGroup title="Workspace layout" testId="settings-group-workspace-layout">
             <div className="mt-4 border-t border-border pt-4">
               <WidenWorkspaceForContentControl />

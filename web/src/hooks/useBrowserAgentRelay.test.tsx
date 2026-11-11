@@ -1695,7 +1695,10 @@ describe("useBrowserAgentRelay — privileged reads", () => {
   it.each([{ exists: true, hostIsThisMachine: false }, { exists: false }])(
     "skips host revalidation for view status %j",
     async (status) => {
-      const bridge = installBridge({ browserHasView: vi.fn().mockResolvedValue(status) });
+      const bridge = installBridge({
+        browserHasView: vi.fn().mockResolvedValue(status),
+        browserPerformAction: vi.fn().mockResolvedValue({ ok: true }),
+      });
       renderRelay();
       emitBrowserActionRequest(actionEvent("screenshot", {}, "screen"), CONV);
       await vi.waitFor(() =>
@@ -1741,7 +1744,7 @@ describe("useBrowserAgentRelay — privileged reads", () => {
       ok: false,
       error: "Current session host is required to read this browser view",
     });
-    const bridge = installBridge({ browserScreenshot });
+    const bridge = installBridge({ browserScreenshot, browserPerformAction: vi.fn() });
     let resolveHost!: (source: unknown) => void;
     getSessionSlim.mockImplementation(
       () =>
