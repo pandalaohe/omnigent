@@ -140,7 +140,7 @@ def test_runaway_banner_leaves_no_dead_band_under_the_header(
             },
         }
     )
-    pill = page.locator('[role="status"][data-testid="background-task-pill"]')
+    pill = page.get_by_test_id("background-task-pill")
     expect(pill).to_be_visible(timeout=10_000)
 
     header = _assert_transcript_starts_under_header(page)
@@ -151,7 +151,13 @@ def test_runaway_banner_leaves_no_dead_band_under_the_header(
     # the transcript or the composer's overlays.
     assert warning["y"] >= header["y"] + header["height"] - TOLERANCE, (warning, header)
     assert warning["y"] + warning["height"] <= viewport["height"] + TOLERANCE, warning
-    assert_no_overlap(warning, box(page.get_by_role("log")))
+    # Mobile paints the transcript behind the composer and reserves trailing padding.
+    transcript = (
+        page.get_by_test_id("message-bubble").last
+        if viewport["width"] < 768
+        else page.get_by_role("log")
+    )
+    assert_no_overlap(warning, box(transcript))
     assert_no_overlap(warning, box(pill))
 
 
@@ -185,10 +191,12 @@ def test_dismissed_warning_collapses_into_the_workspace_bar(
             },
         }
     )
-    pill = page.locator('[role="status"][data-testid="background-task-pill"]')
+    pill = page.get_by_test_id("background-task-pill")
     expect(pill).to_be_visible(timeout=10_000)
 
-    bar = page.get_by_test_id("composer-workspace-controls")
+    bar = page.get_by_test_id(
+        "mobile-header-controls-slot" if viewport["width"] < 768 else "composer-workspace-controls"
+    )
     before = box(bar)
     page.get_by_test_id("runner-log-runaway-dismiss").click()
     expect(page.get_by_test_id("runner-log-runaway-banner")).to_have_count(0)

@@ -314,7 +314,9 @@ def test_dynamic_html_second_selection_survives_reload_and_send(
     with page.expect_response(
         lambda r: r.url.endswith("/comments/send") and r.request.method == "POST"
     ):
-        viewer.get_by_role("button", name=re.compile("^Address all$", re.IGNORECASE)).click()
+        viewer.get_by_role(
+            "button", name=re.compile(r"^Address all(?:\s*\d+| \(\d+\))?$", re.IGNORECASE)
+        ).click()
     assert sent and "occurrence 2" in sent[0] and "Beta" in sent[0]
     assert "characters 0–0" not in sent[0]
 

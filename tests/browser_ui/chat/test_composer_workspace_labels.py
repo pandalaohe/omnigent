@@ -75,7 +75,9 @@ def test_composer_details_wrap_without_clipping(
         expect(controls).to_have_count(0)
         page.get_by_role("button", name=re.compile(r"^(?:Conversation|Session) actions$")).click()
         if has_binding:
-            directory = page.get_by_label(f"Working directory: {_WORKSPACE}", exact=True)
+            directory = page.get_by_role("menu").get_by_label(
+                f"Working directory: {_WORKSPACE}", exact=True
+            )
             expect(directory).to_have_text("checkout")
             expect(directory).to_have_attribute("title", _WORKSPACE)
         else:

@@ -61,9 +61,16 @@ def test_clicking_a_visible_row_leaves_the_list_in_place(
     chat.seed_sidebar_sessions(
         [f"Click demo session {index:02d}" for index in range(1, _SIDEBAR_SESSIONS + 1)]
     )
-    # Sorts below the 17 seeded rows above it, so it starts fully visible near the bottom edge.
+    # Keep rows on both sides of the target, then place it near the viewport's bottom edge.
     chat.update_session(updated_at=_BASE_TIMESTAMP - 17.5)
     open_landing(page, chat)
+    page.locator(f'li[data-sidebar-session-id="{chat.session_id}"]').evaluate(
+        """row => {
+          const list = row.closest('nav.overflow-y-auto');
+          list.scrollTop += row.getBoundingClientRect().bottom
+            - list.getBoundingClientRect().bottom + 24;
+        }"""
+    )
     _wait_for_list_scroll_to_settle(page)
     before = _row_position(page, chat.session_id)
     assert before["listOverflows"]

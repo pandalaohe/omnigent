@@ -147,7 +147,7 @@ def test_terminal_view_recovers_on_open(
                 page.get_by_role("button", name="Conversation actions", exact=True).click()
                 page.get_by_role("menuitem", name="Terminal", exact=True).click()
             else:
-                surface.get_by_role("button", name="Terminal view", exact=True).click()
+                surface.get_by_role("radio", name="Terminal view", exact=True).click()
 
         terminal = page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
         expect(terminal.get_by_role("status")).to_be_visible()
@@ -171,8 +171,8 @@ def test_terminal_view_recovers_on_open(
             expect(terminal.get_by_role("alert")).to_be_visible()
             assert len(pending) == 1
             if entry == "grid":
-                surface.get_by_role("button", name="Chat view", exact=True).click()
-                surface.get_by_role("button", name="Terminal view", exact=True).click()
+                surface.get_by_role("radio", name="Chat view", exact=True).click()
+                surface.get_by_role("radio", name="Terminal view", exact=True).click()
                 expect(terminal.get_by_role("alert")).to_be_visible()
                 expect(resume).to_be_enabled()
                 assert len(pending) == 1

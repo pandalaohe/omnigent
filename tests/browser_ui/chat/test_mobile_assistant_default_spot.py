@@ -32,6 +32,7 @@ def test_first_use_spot_clears_the_composer_band(
 ) -> None:
     """The untouched default must not cover the composer card or queued controls."""
     chat = chat_session_contract
+    page.add_init_script("localStorage.setItem('omnigent:always-steer', 'false')")
     page.set_viewport_size(viewport)
     page.goto(chat.url)
     chat.wait_for_stream()

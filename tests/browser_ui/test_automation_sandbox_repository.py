@@ -154,7 +154,7 @@ def test_automation_sandbox_repository(
         # Standalone server identity persists the initial intro dismissal.
         expect(page.get_by_role("dialog")).to_have_count(0)
         page.get_by_role("button", name="Actions for Repository maintenance").click()
-        page.get_by_role("menuitem", name="Edit", exact=True).click()
+        page.get_by_role("menuitem", name="Edit this automation", exact=True).click()
         page.get_by_role("button", name="Advanced", exact=True).click()
         page.get_by_test_id("task-agent-picker").get_by_role("button").click()
         expect(page.get_by_test_id("new-chat-landing-agent-agent-pi")).to_be_visible()
@@ -167,7 +167,7 @@ def test_automation_sandbox_repository(
         expect(page.get_by_role("dialog")).to_have_count(0)
         assert tasks[0]["workspace"] == catalog[3]["url"]
         page.get_by_role("button", name="Actions for Repository maintenance").click()
-        page.get_by_role("menuitem", name="Edit", exact=True).click()
+        page.get_by_role("menuitem", name="Edit this automation", exact=True).click()
         page.get_by_role("button", name="Advanced", exact=True).click()
         expect(repository).to_have_text("hadron")
         repository.click()
@@ -176,7 +176,7 @@ def test_automation_sandbox_repository(
         expect(page.get_by_role("dialog")).to_have_count(0)
         assert tasks[0]["workspace"] is None
         page.get_by_role("button", name="Actions for Repository maintenance").click()
-        page.get_by_role("menuitem", name="Edit", exact=True).click()
+        page.get_by_role("menuitem", name="Edit this automation", exact=True).click()
         page.get_by_role("button", name="Advanced", exact=True).click()
         expect(repository).to_have_text("Provider default")
         # Portal dismissal needs a browser, without a live scheduler or host process.
@@ -304,7 +304,7 @@ def test_reused_automation_settings(
         page.goto(f"{contract.base_url}/tasks")
         page.get_by_role("button", name="Maybe later", exact=True).click()
         page.get_by_role("button", name="Actions for Repository maintenance").click()
-        page.get_by_role("menuitem", name="Edit", exact=True).click()
+        page.get_by_role("menuitem", name="Edit this automation", exact=True).click()
         if prompt_kind == "trigger":
             worker_agent = page.get_by_test_id("task-worker-agent-trigger")
             expect(worker_agent).to_contain_text("Codex")

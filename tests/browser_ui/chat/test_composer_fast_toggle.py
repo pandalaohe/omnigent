@@ -84,7 +84,8 @@ def test_fast_control_keeps_send_and_stop_inside_phone_composer(
         expect(permission).to_be_visible()
         expect(permission.locator("span")).to_be_hidden()
         card = box(page.locator("[data-composer-card]"))
-        assert right_inset(card, box(submit)) >= 11
+        # Expanded phone controls use 44px targets and an 8px action-row inset.
+        assert right_inset(card, box(submit)) >= 8
         assert_same_vertical_center(box(fast), box(submit))
         assert_no_overlap(box(fast), box(submit))
         assert page.evaluate("document.documentElement.scrollWidth") <= width
@@ -127,7 +128,7 @@ def test_fast_control_keeps_send_and_stop_inside_phone_composer(
         for width in [375, 390, 430]:
             page.set_viewport_size({"width": width, "height": 844})
             card = box(page.locator("[data-composer-card]"))
-            assert right_inset(card, box(stop)) >= 11
+            assert right_inset(card, box(stop)) >= 8
             assert_same_vertical_center(box(fast), box(stop))
             assert_no_overlap(box(fast), box(stop))
         page.set_viewport_size(viewport)

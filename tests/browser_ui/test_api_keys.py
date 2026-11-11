@@ -4,6 +4,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from tests.browser_ui.conftest import BrowserContract
+from tests.browser_ui.test_sessions_appearance import appearance_features as appearance_features
 from tests.browser_ui.test_sessions_appearance import appearance_url as appearance_url
 
 
