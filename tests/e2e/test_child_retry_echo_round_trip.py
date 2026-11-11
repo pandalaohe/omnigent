@@ -481,7 +481,7 @@ async def test_real_codex_retry_echo_identity_and_cold_replay(
                         "turn/start",
                         {"threadId": thread_id, "input": [{"type": "text", "text": "retry"}]},
                         state,
-                        directory,
+                        bridge_dir=directory,
                     )
                 )
             record_protocol({"phase": "wait-first-user"})
