@@ -3,8 +3,8 @@
 The instructions a native session starts under — author text, framework
 instructions, the server-held global text — are staged in the session's bridge
 dir at terminal launch, then prefixed to the first message the executor injects.
-Cursor / kiro / goose / hermes / qwen / kimi / antigravity reach the
-channel through their launch adapters.
+Cursor / kiro / goose / hermes / qwen / kimi use the preamble channel.
+Antigravity delivers the same instructions through its isolated home.
 """
 
 from __future__ import annotations
@@ -60,11 +60,10 @@ def _spec() -> AgentSpec:
 
 
 def _stub_launch(harness: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Patch one harness's launch to stop right after the preamble write.
+    """Stop each launch after its startup instruction channel is prepared.
 
-    Each launch resolves its bridge dir first and stages the preamble straight
-    after, so short-circuiting the call that follows proves the write happened
-    during launch prep without standing up a terminal.
+    Short-circuit the next launch step after writing the bridge preamble or
+    isolated home, so no terminal needs to start.
     """
     from omnigent.runner.native import orchestration
 
@@ -131,7 +130,7 @@ def _stub_launch(harness: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
         monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", _fake_snapshot)
         monkeypatch.setattr(antigravity_bridge, "prepare_bridge_dir", lambda bridge_id: bridge_dir)
-        monkeypatch.setattr(antigravity_bridge, "clear_bridge_state", _raise_stop)
+        monkeypatch.setattr(antigravity_bridge, "ensure_agy_feedback_survey_disabled", _raise_stop)
     return bridge_dir
 
 
@@ -154,13 +153,18 @@ def _context(harness: str, agent_spec: AgentSpec | None, global_instructions: st
 async def test_launch_stages_startup_preamble(
     harness: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A spec plus the global text stage one preamble, global text last."""
+    """Author, framework and global text reach the harness's startup channel."""
     bridge_dir = _stub_launch(harness, tmp_path, monkeypatch)
 
     with pytest.raises(_StopAfterStaging):
         await _LAUNCHERS[harness](_context(harness, _spec(), "GLOBAL-MARKER"))
 
     preamble = read_agent_instructions_preamble(bridge_dir)
+    if harness == "antigravity":
+        from omnigent.harnesses.antigravity_native.bridge import agy_gemini_dir
+
+        assert preamble is None
+        preamble = (agy_gemini_dir(bridge_dir) / "AGENTS.md").read_text()
     assert preamble is not None
     assert "Author brief." in preamble
     assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION in preamble
@@ -179,3 +183,7 @@ async def test_launch_without_spec_or_global_text_stages_nothing(
         await _LAUNCHERS[harness](_context(harness, None, None))
 
     assert read_agent_instructions_preamble(bridge_dir) is None
+    if harness == "antigravity":
+        from omnigent.harnesses.antigravity_native.bridge import agy_gemini_dir
+
+        assert not (agy_gemini_dir(bridge_dir) / "AGENTS.md").exists()
