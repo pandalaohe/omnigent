@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING
 
 from omnigent._platform import IS_WINDOWS
 from omnigent.git_commands import run_git
+from omnigent.util.console_output import decode_console_output
 
 if TYPE_CHECKING:
     # Imported only for type hints; the heavy/optional imports remain lazy
@@ -846,9 +847,9 @@ def _fetch_and_count(repo_root: Path, branch: str) -> int | None:
             timeout=_GIT_TIMEOUT_SECONDS,
             capture_output=True,
             check=True,
-            text=True,
+            text=False,
         )
-        return int(result.stdout.strip())
+        return int(decode_console_output(result.stdout).strip())
     except (subprocess.SubprocessError, OSError, ValueError):
         return None
 
@@ -865,9 +866,9 @@ def _get_head_sha(repo_root: Path) -> str | None:
             timeout=_GIT_TIMEOUT_SECONDS,
             capture_output=True,
             check=True,
-            text=True,
+            text=False,
         )
-        return result.stdout.strip()
+        return decode_console_output(result.stdout).strip()
     except (subprocess.SubprocessError, OSError):
         return None
 
@@ -895,9 +896,9 @@ def _local_rev_list_count(repo_root: Path) -> int | None:
                 timeout=_GIT_TIMEOUT_SECONDS,
                 capture_output=True,
                 check=True,
-                text=True,
+                text=False,
             )
-            return int(result.stdout.strip())
+            return int(decode_console_output(result.stdout).strip())
         except (subprocess.SubprocessError, OSError, ValueError):
             continue
     return None
@@ -1671,13 +1672,13 @@ def _latest_nightly_version(repo_url: str = _NIGHTLY_REPO_URL) -> str | None:
         result = run_git(
             ["git", "ls-remote", "--tags", repo_url, "refs/tags/v*.dev*"],
             capture_output=True,
-            text=True,
+            text=False,
             timeout=_GIT_TIMEOUT_SECONDS,
             check=True,
         )
     except (subprocess.SubprocessError, OSError):
         return None
-    return _newest_nightly_version(result.stdout)
+    return _newest_nightly_version(decode_console_output(result.stdout))
 
 
 def _build_nightly_upgrade_suggestion(
@@ -1821,7 +1822,9 @@ def upgrade_command_for_installed() -> _UpgradeSuggestion | None:
     return _build_upgrade_suggestion(info)
 
 
-def _probe_installed_distribution() -> tuple[str | None, str | None]:
+def _probe_installed_distribution(
+    python_executable: str | None = None, *, env: dict[str, str] | None = None
+) -> tuple[str | None, str | None]:
     """Read the freshly-installed version and VCS commit in a subprocess.
 
     ``omni upgrade`` swaps the on-disk install while *this* process is
@@ -1861,9 +1864,11 @@ def _probe_installed_distribution() -> tuple[str | None, str | None]:
     )
     try:
         result = subprocess.run(
-            [sys.executable, "-c", probe],
+            [python_executable or sys.executable, "-I", "-c", probe],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            env=env,
             # A metadata lookup is sub-second; the git timeout is reused only as
             # a generous upper bound so a wedged interpreter can't hang the CLI.
             timeout=_GIT_TIMEOUT_SECONDS,
@@ -1974,13 +1979,13 @@ def _remote_git_head(vcs_url: str) -> str | None:
         result = run_git(
             ["git", "ls-remote", url, revision, f"{revision}^{{}}"],
             capture_output=True,
-            text=True,
+            text=False,
             timeout=_GIT_TIMEOUT_SECONDS,
             check=True,
         )
     except (subprocess.SubprocessError, OSError):
         return None
-    lines = result.stdout.splitlines()
+    lines = decode_console_output(result.stdout).splitlines()
     remote_refs: dict[str, str] = {}
     for line in lines:
         sha, _, name = line.strip().partition("\t")

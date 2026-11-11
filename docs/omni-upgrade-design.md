@@ -1,5 +1,24 @@
 # Upgrade experience: `omni upgrade` + release-available notices
 
+Windows Git installs launch the target commit's
+`omnigent.host.windows_upgrade_helper` using `uv run --no-project --with`.
+The helper runs outside the replaced tool environment and waits for the CLI
+and launcher chain to exit. Run `omni up` from desktop PowerShell outside
+Omnigent. The shim prints the affected process IDs and log path; a separate
+PowerShell log viewer can be closed without interrupting the hidden helper.
+
+The helper retains the tool directory by rename and copies its launchers before
+installing. It verifies the full commit using the installed Python, registers
+the standard per-user task with the original server target, and checks that
+the Host process starts. A delayed server connection is a warning. Installation,
+commit or Host startup failure restores the retained install without network;
+if local restore fails, the log includes a recovery command. Persistent service
+environment uses the caller's PATH rather than the temporary uv environment.
+`omni host status` shows the last upgrade result and log path, including an
+unfinished step. `omni up --dry-run` launches the helper but stops before any
+service or install changes. Registry and nightly upgrades retain their existing
+in-process path.
+
 How Omnigent keeps a user's CLI — and the local processes it spawns — current
 across PyPI releases. Three pieces ship together:
 

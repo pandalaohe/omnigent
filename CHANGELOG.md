@@ -5,6 +5,10 @@ This file is generated at release time from each PR's `## Changelog` section
 PRs and author credits. The concise, curated highlights live on the website
 under `/releases`.
 
+## Unreleased
+
+- Windows Git upgrades use the target version’s detached upgrade helper, retain a local rollback snapshot, and report progress and the last result.
+
 ## [v0.20.0] — 2026-10-27
 
 - [Bug fix] Claude Code plugin commands now appear in the composer's `/` menu next to the plugin's skills, including commands in subdirectories and those declared in the plugin manifest. ([#6512](https://github.com/omnigent-ai/omnigent/pull/6512), [@omni-resolve-agent[bot]](https://github.com/apps/omni-resolve-agent))

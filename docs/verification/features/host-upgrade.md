@@ -3,6 +3,24 @@
 Use a disposable uv tool install and isolated application data for automated trials.
 Record the source revision, OS, Python and uv versions with the result.
 
+For the Windows Git helper, run the related tests in
+`tests/host/test_windows_upgrade_helper.py` and
+`tests/cli/test_update_check_console.py` too. They simulate process/job boundaries,
+snapshot restore, commit mismatch, task startup and localized console bytes.
+They do not prove native Windows detach or file-sharing behavior.
+
+On Windows, start with a disposable Git tool install containing the helper and
+an isolated application data directory. From desktop PowerShell outside Omnigent,
+run `omni up --dry-run` against a newer test commit. Expect a log viewer, the exact
+target and process IDs, then `dry-run-ok` in `updates/last-upgrade.json`; no Host
+is stopped. Close the viewer and confirm the helper completes. With a verified
+snapshot available, run `omni up`, then `omni host status`: expect the target
+commit, a running standard task and Host, and `last upgrade: ... ok`. For a remote
+Host, its registered server must stay the same; delayed connection is a warning.
+Confirm the task's environment PATH contains no uv cache directory. Capture the
+log and last-upgrade record on failure. Recover only the disposable trial's files
+and processes. A real-host first hop is supplied separately by the release owner.
+
 The related component checks are `tests/cli/test_update_check.py`,
 `tests/cli/test_upgrade_command.py`, `tests/host/test_windows_upgrade.py`,
 `tests/host/test_windows_task.py`, `tests/host/test_service.py`,

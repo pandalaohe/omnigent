@@ -174,53 +174,54 @@ def test_upgrade_preview_does_not_inspect_services(
     assert "Running:" not in result.output
 
 
-@pytest.mark.parametrize("outcome", ["success", "locked", "stop-failed", "start-failed"])
-def test_windows_upgrade_uses_service_backend_and_external_recovery(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _wheel_install: None, outcome: str
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("failure", [False, True])
+def test_windows_git_upgrade_launches_target_helper(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None, dry_run: bool, failure: bool
 ) -> None:
     from dataclasses import replace
 
-    from omnigent.host import service
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+    from omnigent.host import windows_upgrade_launch
 
-    installed = service.HostService("windows_task", tmp_path / "task.xml", "test-task")
-    source = "git+ssh://build-host/srv/git/omnigent.git@release/stable"
-    info = replace(_git_install_info(), vcs_url=source, extras=("all",))
-    monkeypatch.setattr("omnigent.cli.IS_WINDOWS", True)
-    monkeypatch.setattr("omnigent.update_check.IS_WINDOWS", True)
-    monkeypatch.setattr(
-        service, "installed_user_host_service", lambda: (installed, "https://remote.example")
+    info = replace(
+        _git_install_info(),
+        vcs_url="git+https://example.test/repo.git@release/stable",
+        extras=("all",),
     )
-    monkeypatch.setattr("omnigent.host.windows_upgrade.capture_host_tree", lambda **_: [])
+    monkeypatch.setattr("omnigent.cli.IS_WINDOWS", True)
     monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", lambda: info)
     monkeypatch.setattr("omnigent.update_check._remote_git_head", lambda _: "b" * 40)
-    monkeypatch.setattr("omnigent.cli._find_daemon_record", lambda _: None)
-    events = []
+    calls = []
 
-    def manage(action):
-        events.append(action)
-        if outcome == action + "-failed":
-            raise service.HostServiceError(action + " failed")
+    def launch(received, target, **options):
+        calls.append((received, target, options))
+        if failure:
+            raise RuntimeError("breakaway refused")
 
-    monkeypatch.setattr(service, "stop_user_host_service", lambda _: manage("stop"))
-    monkeypatch.setattr(service, "start_user_host_service", lambda _: manage("start"))
+    monkeypatch.setattr(windows_upgrade_launch, "launch", launch)
+    result = CliRunner().invoke(cli, ["up", *(["--dry-run"] if dry_run else [])])
+    assert result.exit_code == int(failure), result.output
+    assert calls == [(info, "b" * 40, {"extras": (), "force": False, "dry_run": dry_run})]
+    if failure:
+        assert "breakaway refused" in result.output
+        # Invoke the callback directly to inspect the exception before Click renders it.
+        import click
 
-    def install(command, console):
-        assert command == f"uv tool install --reinstall{_UV_PY} {source}#egg=omnigent[all]"
-        events.append("install")
-        return 2 if outcome == "locked" else 0
+        from omnigent.cli import upgrade
 
-    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", install)
-    monkeypatch.setattr(
-        "omnigent.update_check._probe_installed_distribution", lambda: ("0.2.0", "b" * 40)
-    )
-    result = CliRunner().invoke(cli, ["up"])
-    assert result.exit_code == (0 if outcome == "success" else 1), result.output
-    assert events == (
-        ["stop", "start"] if outcome == "stop-failed" else ["stop", "install", "start"]
-    )
-    if outcome == "locked":
-        assert "Close this CLI" in result.output
-        assert "curl" not in result.output
+        with pytest.raises(click.ClickException) as raised:
+            assert upgrade.callback is not None
+            upgrade.callback(
+                check_only=False,
+                target_version=None,
+                force=False,
+                pre=False,
+                nightly=False,
+                extra_overrides=(),
+                dry_run=dry_run,
+            )
+        assert getattr(raised.value, SUPPRESS_RECOVERY_HINT_ATTR)
 
 
 def test_upgrade_up_to_date(monkeypatch: pytest.MonkeyPatch, _wheel_install: None) -> None:
@@ -413,9 +414,9 @@ def test_count_running_sessions_ignores_idle_connected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Only ``status == "running"`` sessions count; idle-connected ones don't."""
-    from omnigent.cli import _count_running_sessions, _SessionPagesResult
+    from omnigent.cli import _count_running_sessions, _HostJsonValue, _SessionPagesResult
 
-    sessions = [
+    sessions: list[dict[str, _HostJsonValue]] = [
         {"id": "a", "status": "idle"},
         {"id": "b", "status": "running"},
         {"id": "c", "status": "idle"},
@@ -710,7 +711,7 @@ def test_legacy_custom_pin_moves_once_to_configured_branch(
     )
     receipt = tmp_path / "updates/custom-host-rollback.json"
     receipt.parent.mkdir()
-    original = {
+    original: dict[str, object] = {
         "schema_version": 2,
         "commit_sha": "c" * 40,
         "source_url": source if mode != "other-repo" else "git+https://other.test/repo.git",
