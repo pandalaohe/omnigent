@@ -1695,6 +1695,8 @@ describe("HtmlCommentViewer zoom", () => {
   it("places the Add-comment button over a selection at the zoomed position", async () => {
     renderViewer({ content: "<body><p>Quarterly revenue</p></body>" });
     const { iframe, zoomBox } = previewParts();
+    // jsdom has no layout; give the selection action's edge clamp a visible preview.
+    vi.spyOn(iframe, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 0, 800, 600));
     const { port, send } = await connectHtmlPreviewBridge(iframe);
     const selectRevenue = (reflow = false) =>
       send({
@@ -1723,7 +1725,7 @@ describe("HtmlCommentViewer zoom", () => {
 
     selectRevenue(true);
     const button = await screen.findByRole("button", { name: "Add comment" });
-    // jsdom puts the frame at the origin, so the button sits at the scaled rect.
+    // The frame is at the origin, so the button sits at the scaled rect.
     expect(button.style.left).toBe("80px");
     expect(button.style.top).toBe("54px");
 
