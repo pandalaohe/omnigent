@@ -140,7 +140,7 @@ async def test_descendant_without_inherited_policies_gets_allow_window(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A sub-agent whose root has no session policies gets the no-policy window.
+    """An empty root policy list cannot cache away mandatory runtime checks.
 
     Once the root attaches a policy, the child's gate evaluates it and grants
     no window, so its native hooks ask the server again.
@@ -159,7 +159,7 @@ async def test_descendant_without_inherited_policies_gets_allow_window(
 
     allowed = await _evaluate(client, child.id, "PHASE_TOOL_CALL")
     assert allowed["result"] == "POLICY_ACTION_ALLOW", allowed
-    assert 0 < allowed["allow_cache_seconds"] <= 60.0
+    assert "allow_cache_seconds" not in allowed
 
     attached = await client.post(
         f"/v1/sessions/{root_id}/policies",

@@ -3161,10 +3161,6 @@ def register_core_routes(
                 "permission_tier is only supported by Pi and Antigravity sessions",
                 code=ErrorCode.INVALID_INPUT,
             )
-        if not (
-            spec.executor.harness_kind == "acp" or spec.executor.harness_kind.startswith("acp:")
-        ):
-            parsed_metadata = parsed_metadata.model_copy(update={"model_override": None})
         _, effort = validate_session_model_metadata(
             model_override=parsed_metadata.model_override,
             reasoning_effort=(
@@ -3724,9 +3720,13 @@ def register_core_routes(
             agent_id=result.agent_id,
             harness=spec_harness(spec),
         )
-        created_conversation = await asyncio.to_thread(
-            conversation_store.get_conversation, result.session_id
-        )
+        created_conversation = None
+        try:
+            created_conversation = await asyncio.to_thread(
+                conversation_store.get_conversation, result.session_id
+            )
+        except Exception:
+            _logger.warning("Could not read created session labels", exc_info=True)
         if created_conversation is not None:
             result = result.model_copy(update={"labels": dict(created_conversation.labels or {})})
         # Top-level creates (no inherited runner) skip the notify —
@@ -3742,14 +3742,12 @@ def register_core_routes(
             # Full session-init envelope, not the legacy id-only body, so the
             # runner stores the global instructions and the rest of the
             # session state the child's terminal launch reads.
-            child_conv = await asyncio.to_thread(
-                conversation_store.get_conversation, result.session_id
-            )
-            notify_body = (
-                await _session_init_notify_body(child_conv, request)
-                if child_conv is not None
-                else None
-            )
+            notify_body = None
+            try:
+                if created_conversation is not None:
+                    notify_body = await _session_init_notify_body(created_conversation, request)
+            except Exception:
+                _logger.warning("Could not build bundled session notification", exc_info=True)
             await _notify_runner_of_bundled_child(
                 result.session_id,
                 result.agent_id,
@@ -4404,6 +4402,11 @@ def register_core_routes(
             archived_only=archived_only,
         )
         items: list[SessionListItem] = []
+        user_is_admin = (
+            await asyncio.to_thread(permission_store.is_admin, user_id)
+            if permission_store is not None and user_id is not None
+            else False
+        )
         for list_batch in batched(page.data, _SESSION_LIST_BATCH_SIZE):
             # list_conversations may return rows with agent_id=None for
             # legacy conversations; skip them before building the batch IDs.
@@ -4426,11 +4429,6 @@ def register_core_routes(
                         conversation_store.list_child_conversation_ids_by_parent,
                         conv_ids,
                     ),
-                )
-                user_is_admin = (
-                    await asyncio.to_thread(permission_store.is_admin, user_id)
-                    if user_id is not None
-                    else False
                 )
             else:
                 agent_metadata, child_ids_by_parent = await asyncio.gather(
@@ -7142,7 +7140,7 @@ def register_core_routes(
                     )
                     if owned is None:
                         raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-        if body.archived is False and set_project:
+        if body.archived is not None and set_project:
             target_project_id = body.project_id or None
             if target_project_id is not None:
                 owned = (

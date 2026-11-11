@@ -11640,7 +11640,11 @@ def _parse_session_create_metadata(metadata: str) -> SessionCreateMetadata:
         # Bounds-check the native-terminal args; raises ValueError
         # (wrapped below) on a malformed or oversized list.
         _validate_terminal_launch_args(parsed.terminal_launch_args)
-        return parsed.model_copy(update={"model_override": model_override})
+        return (
+            parsed.model_copy(update={"model_override": model_override})
+            if "model_override" in parsed.model_fields_set
+            else parsed
+        )
     except (ValidationError, ValueError) as exc:
         raise OmnigentError(
             f"invalid session metadata: {exc}",

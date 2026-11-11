@@ -1190,6 +1190,15 @@ async def test_acp_bundle_inherits_its_row_without_overwriting_explicit_values(
     assert snapshot.json()["model_override"] == "model-b"
 
 
+@pytest.mark.parametrize("metadata", [{}, {"model_override": None}, {"model_override": "model-b"}])
+def test_bundle_metadata_preserves_model_field_presence(metadata):
+    from omnigent.server.routes._sessions.helpers import _parse_session_create_metadata
+
+    parsed = _parse_session_create_metadata(json.dumps(metadata))
+    assert ("model_override" in parsed.model_fields_set) == ("model_override" in metadata)
+    assert parsed.model_override == metadata.get("model_override")
+
+
 @pytest.mark.asyncio
 async def test_non_acp_bundle_still_rejects_opaque_effort(client):
     uploaded = await client.post(
@@ -1202,7 +1211,7 @@ async def test_non_acp_bundle_still_rejects_opaque_effort(client):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("harness", ["claude-sdk", "codex", "pi-native"])
-async def test_review_minor6_non_acp_bundle_ignores_new_model_field(client, harness):
+async def test_non_acp_bundle_preserves_model_override(client, harness):
     uploaded = await client.post(
         "/v1/sessions",
         data={"metadata": json.dumps({"model_override": "unoffered-model"})},
@@ -1210,7 +1219,7 @@ async def test_review_minor6_non_acp_bundle_ignores_new_model_field(client, harn
     )
     assert uploaded.status_code == 201, uploaded.text
     snapshot = await client.get(f"/v1/sessions/{uploaded.json()['session_id']}")
-    assert snapshot.json()["model_override"] is None
+    assert snapshot.json()["model_override"] == "unoffered-model"
 
 
 @pytest.mark.asyncio

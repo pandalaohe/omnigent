@@ -105,7 +105,7 @@ def test_sub_agent_window_counts_from_the_root_policy_list(db_uri: str) -> None:
     _SESSION_POLICY_SPECS_CACHE[root_id] = (specs, loaded_at - 25.0)
     caps = RuntimeCaps(native_hook_allow_cache_seconds=lambda: 60.0)
 
-    body = _no_policy_allow_body(caps, _SESSION_ID, store, root_id)
+    body = _no_policy_allow_body(caps, _SESSION_ID, store, root_id, runtime_checks_apply=False)
 
     assert 34.0 < body["allow_cache_seconds"] <= 35.0
     _DEFAULT_POLICY_SPECS_CACHE.clear()

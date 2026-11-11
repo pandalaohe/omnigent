@@ -14942,7 +14942,7 @@ async def _create_session_from_existing_agent_impl(
     if (
         project_id is None
         and created_by_project_id is not None
-        and "project_id" not in body.model_fields_set
+        and "project_id" not in request_fields_set
         and project_store is not None
     ):
         # Only the filing carries over, not the project's agent or workspace
@@ -18344,9 +18344,13 @@ async def _get_session_snapshot(
         known = {item["pending_id"] for item in response.pending_inputs}
         response.pending_inputs.extend(item for item in queued if item["pending_id"] not in known)
     if response.startup_hold is not None and request is not None:
-        queued = await request.app.state.host_load_inputs.pending_snapshot(session_id)
+        queued, failed = await request.app.state.host_load_inputs.snapshot(session_id)
         known = {item["pending_id"] for item in response.pending_inputs}
         response.pending_inputs.extend(item for item in queued if item["pending_id"] not in known)
+        known_failed = {item["pending_id"] for item in response.failed_inputs}
+        response.failed_inputs.extend(
+            item for item in failed if item["pending_id"] not in known_failed
+        )
     return response
 
 

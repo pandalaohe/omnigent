@@ -294,7 +294,7 @@ def test_retry_identity_storage_failure_settles_the_actual_delivery_boundary(
 
 
 @pytest.mark.asyncio
-async def test_side_command_attachment_is_undelivered(
+async def test_side_command_unsupported_attachment_is_undelivered(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _FakeCodexNativeClient.requests = []
@@ -312,7 +312,7 @@ async def test_side_command_attachment_is_undelivered(
                     "role": "user",
                     "content": [
                         {"type": "input_text", "text": "/side explain this"},
-                        {"type": "input_image", "image_url": _PNG_DATA_URI},
+                        {"type": "image", "image_url": _PNG_DATA_URI},
                     ],
                 }
             ],
@@ -2106,9 +2106,11 @@ def test_system_prompt_does_not_override_collaboration_mode(
     ]
 
 
+@pytest.mark.parametrize("text", ["what is this?", "/side what is this?"])
 def test_image_block_is_sent_as_local_image_not_inline_base64(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    text: str,
 ) -> None:
     """
     An image attachment is sent as a ``localImage`` item, not inline text.
@@ -2155,7 +2157,7 @@ def test_image_block_is_sent_as_local_image_not_inline_base64(
                     "role": "user",
                     "content": [
                         {"type": "input_image", "image_url": _PNG_DATA_URI},
-                        {"type": "input_text", "text": "what is this?"},
+                        {"type": "input_text", "text": text},
                     ],
                 }
             ],
@@ -2171,6 +2173,8 @@ def test_image_block_is_sent_as_local_image_not_inline_base64(
     assert len(_FakeCodexNativeClient.requests) == 1
     method, params = _FakeCodexNativeClient.requests[0]
     assert method == "turn/start"
+    assert params["threadId"] == "thread_123"
+    assert codex_native_executor.side_chat.peek_side_chat_requests(tmp_path) == []
     items = params["input"]
 
     local_images = [item for item in items if item["type"] == "localImage"]
@@ -2180,7 +2184,7 @@ def test_image_block_is_sent_as_local_image_not_inline_base64(
     assert len(local_images) == 1, f"expected one localImage item, got {items}"
     # The accompanying prompt survives as its own text item.
     assert len(texts) == 1
-    assert texts[0]["text"] == "what is this?"
+    assert texts[0]["text"] == text
     # The path points at a real file holding the decoded PNG bytes — so
     # the Codex app-server can open it. Mismatch means we wrote the wrong
     # bytes (e.g. the base64 text instead of the decoded image).

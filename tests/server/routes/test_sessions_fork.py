@@ -829,10 +829,10 @@ async def test_only_the_owner_starts_and_lists_side_chats(
     assert refused.status_code == 403, refused.text
     assert await _side_chat_ids(auth_client, parent.id, headers=headers[owner]) == set()
 
-    # Reject before forwarding, including when the owner's runner is older.
+    # Unsupported block types are rejected before reaching an older runner.
     for attachment in (
-        {"type": "input_file", "file_id": "unresolved-file"},
-        {"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="},
+        {"type": "unsupported_attachment", "file_id": "unresolved-file"},
+        {"type": "image", "image_url": "data:image/png;base64,aGVsbG8="},
     ):
         refused = await auth_client.post(
             f"/v1/sessions/{parent.id}/events",

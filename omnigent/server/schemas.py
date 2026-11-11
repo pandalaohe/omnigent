@@ -4069,6 +4069,8 @@ class SessionMessageItem(_SessionItemCommon):
     is_meta: bool = False
     user_authored: bool = False
     subagent_return_id: str | None = None
+    peer_message_id: str | None = None
+    auto_retry: AutoRetryMetadata | None = None
     interrupted: bool = False
     stream_message_id: str | None = None
     phase: str | None = None

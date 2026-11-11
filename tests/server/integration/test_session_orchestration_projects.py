@@ -40,8 +40,11 @@ def orchestration_environment(monkeypatch, request):
 def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
     """An auth-enabled app with projects and managed sandboxes."""
     from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    preferences = SqlAlchemyUserPreferencesStore(db_uri)
+    preferences.patch_namespace("alice", "session_collab", {"sessionRestrictions": "off"})
     return create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
@@ -52,6 +55,7 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         project_store=SqlAlchemyProjectStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header"),
         host_store=HostStore(db_uri),
+        user_preferences_store=preferences,
         sandbox_config=parse_sandbox_config(
             {
                 "provider": "modal",
@@ -88,9 +92,14 @@ async def _start_worker(
                     conversation_id=source["id"],
                 )
             )
-            assert "error" not in result, result
-            worker_id = result["conversation_id"]
-        else:
+            if source.get("parent_session_id"):
+                assert result["error"] == "child_session_create_refused", result
+                assert not launched.is_set()
+                body = {}
+            else:
+                assert "error" not in result, result
+                worker_id = result["conversation_id"]
+        if body is not None:
             response = await auth_client.post(
                 "/v1/sessions/orchestrated",
                 headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
@@ -152,9 +161,7 @@ async def test_worker_is_filed_in_the_project_of_the_session_that_started_it(
     assert worker.labels[CREATED_BY_SESSION_LABEL_KEY] == sender["id"]
     assert worker.family_id == (source["id"] if orchestration_environment else None)
     assert worker.parent_conversation_id is None
-    assert worker.project_id == (
-        project_id if orchestration_environment or not child_sender else None
-    )
+    assert worker.project_id == project_id
     # Only the filing carries over: the worker keeps its own agent and placement.
     assert worker.agent_id == source["agent_id"]
     assert worker.workspace != "/project-default"

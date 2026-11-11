@@ -1211,7 +1211,7 @@ async def test_session_snapshot_preserves_status_published_during_probe(
     monkeypatch.setattr(
         helpers.session_live_state,
         "persist_live_status",
-        lambda key, status: persisted.append((key, status)),
+        lambda key, status, **kwargs: persisted.append((key, status)),
     )
     monkeypatch.setattr(
         helpers.session_live_state,
@@ -1260,7 +1260,9 @@ async def test_session_status_edge_before_probe_task_starts_takes_precedence(
     session_id = "b9dfc503c89441fdbfcf9db877ae361b"
     _sessions_mod._session_status_cache.pop(session_id, None)
     _sessions_mod._runner_status_probe_backoff.pop(session_id, None)
-    monkeypatch.setattr(helpers.session_live_state, "persist_live_status", lambda *args: None)
+    monkeypatch.setattr(
+        helpers.session_live_state, "persist_live_status", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(
         helpers.session_live_state,
         "persist_scheduled_run_completion",

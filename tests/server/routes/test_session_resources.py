@@ -10714,9 +10714,9 @@ async def test_offline_environment_reach_does_not_require_server_sandbox(
         "roots": [{"path": _OFFLINE_WORKSPACE, "access": "write", "origin": "cwd"}]
         + (
             [
-                {"path": "/Users/dev/scratch", "access": "write", "origin": "write_paths"},
-                {"path": "/Users/dev/notes.txt", "access": "write", "origin": "write_files"},
-                {"path": "/Users/dev/reference", "access": "read", "origin": "read_paths"},
+                {"path": "/opt/work/scratch", "access": "write", "origin": "write_paths"},
+                {"path": "/opt/work/notes.txt", "access": "write", "origin": "write_files"},
+                {"path": "/opt/work/reference", "access": "read", "origin": "read_paths"},
             ]
             if sandbox_type is not None
             else []
@@ -10760,9 +10760,9 @@ async def test_offline_confined_browsing_preserves_declared_grants(
 
     monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read_from_host)
     prefix = f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default/filesystem"
-    allowed_path = "/Users/dev/reference" if sandbox_type is not None else _OFFLINE_WORKSPACE
+    allowed_path = "/opt/work/reference" if sandbox_type is not None else _OFFLINE_WORKSPACE
     allowed = await offline_env_client.get(f"{prefix}{allowed_path}?base=host")
-    denied = await offline_env_client.get(f"{prefix}/Users/dev/unrelated?base=host")
+    denied = await offline_env_client.get(f"{prefix}/opt/work/unrelated?base=host")
 
     assert allowed.status_code == 200, allowed.text
     assert denied.status_code == 403, denied.text
