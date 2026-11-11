@@ -3107,7 +3107,9 @@ function ConversationList({
       tabScoped.filter(
         (c) =>
           !filedIds.has(c.id) &&
-          (!hidePinnedHomeCopies || (!pinnedSet.has(c.id) && !c.family?.pinned)),
+          (!hidePinnedHomeCopies ||
+            c.archived === true ||
+            (!pinnedSet.has(c.id) && !c.family?.pinned)),
       ),
       activeOverride,
       frozenKeys,

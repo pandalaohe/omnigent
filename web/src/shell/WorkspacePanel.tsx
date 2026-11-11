@@ -1552,19 +1552,21 @@ function WorkspacePanelImpl({
       action && isShortcutActionEnabled(action) ? resolveShortcutBindings(action)[0] : undefined;
     return binding ? shortcutAriaKeys(binding) : undefined;
   };
-  const selectPermanentTab = (tab: RightRailTab) => {
+  const selectPermanentTab = (
+    tab: RightRailTab,
+    onSelect: (tab: RightRailTab) => void = onRightRailTabChange,
+  ) => {
     // Files, Changes and Pull Requests need the session's host, so picking one wakes
     // an asleep sandbox.
     if ((tab === "files" || tab === "changes" || tab === "github") && conversationId) {
       requestSandboxWake(conversationId);
     }
-    onRightRailTabChange(tab);
+    onSelect(tab);
   };
   useWorkspaceTabHotkeys((tabNumber) => {
     const tab = visiblePermanentTabs[tabNumber - 1];
     if (!tab) return;
-    if (onTabShortcut) onTabShortcut(tab);
-    else selectPermanentTab(tab);
+    selectPermanentTab(tab, onTabShortcut);
   }, !pending && keyboardTarget);
   const handlePermanentTabNumber = (event: KeyboardEvent<HTMLDivElement>) => {
     if (

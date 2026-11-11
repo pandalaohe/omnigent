@@ -396,7 +396,7 @@ describe("header, prompt, configuration", () => {
   it.each([
     ["codex-native", "default", "Agent default"],
     ["cursor-native", "default", "Agent default"],
-    ["antigravity-native", "default", "Agent default"],
+    ["antigravity-native", "default", "Auto"],
     ["native-codex", "read-only", "Read Only"],
     ["cursor-native", "auto-review", "Auto-review"],
     ["antigravity-native", "skip", "Full access"],

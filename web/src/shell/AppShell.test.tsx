@@ -13,12 +13,23 @@ import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as UseHostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 import { useCallback, useContext, useLayoutEffect, useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import {
   Link,
   MemoryRouter,
@@ -56,6 +67,7 @@ import {
 import { writePinnedWorkspaceTabs } from "@/lib/workspaceTabPreferences";
 import { dispatchMobileAssistantButton } from "@/lib/mobileAssistantPreferences";
 import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
+import { SANDBOX_AUTO_WAKE_DWELL_MS, useSandboxAutoWake } from "@/hooks/useSandboxAutoWake";
 
 const runnerHealthState = vi.hoisted(() => ({
   runnerOnline: undefined as boolean | undefined,
@@ -94,7 +106,8 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   useCreateTerminal: vi.fn(() => ({ mutate: vi.fn(), launch: vi.fn(), isPending: false })),
 }));
 
-vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseWorkspaceChangedFilesModule>()),
   useWorkspaceEnvironment: vi.fn(() => ({ data: undefined, isLoading: true })),
   useWorkspaceChangedFiles: vi.fn(() => ({ data: undefined, isLoading: true })),
 }));
@@ -108,7 +121,8 @@ vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
 // loading here (tab visible, matching the Files gate's no-flash default) so
 // no network-backed query fires. Tab visibility itself is covered in
 // AppShell.pullRequestTabVisibility.test.tsx.
-vi.mock("@/hooks/usePullRequests", () => ({
+vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
+  ...(await importOriginal<typeof UsePullRequestsModule>()),
   usePullRequestInfo: vi.fn(() => ({ data: undefined, isLoading: true })),
 }));
 
@@ -3502,6 +3516,49 @@ describe("Right workspace card visibility", () => {
     fireEvent.click(screen.getByRole("link", { name: "First card" }));
     expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
   });
+
+  it.each([
+    { digit: 1, name: "Files", needsHost: true },
+    { digit: 2, name: "Changes", needsHost: true },
+    { digit: 3, name: "Pull Requests", needsHost: true },
+    { digit: 4, name: "Agents", needsHost: false },
+  ] as const)(
+    "picks $name through the shell digit shortcut after the sandbox sleeps again",
+    ({ digit, name, needsHost }) => {
+      const baseMatchMedia = window.matchMedia;
+      const viewport = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+        ...baseMatchMedia(query),
+        matches: query === "(min-width: 768px)",
+      }));
+      onTestFinished(() => viewport.mockRestore());
+      // The opening's check ran while awake; a later sleep needs an explicit tab pick.
+      vi.useFakeTimers();
+      const wake = vi.fn();
+      const autoWake = renderHook(
+        ({ canWake }) => useSandboxAutoWake("conv_hotkey", canWake, wake),
+        { initialProps: { canWake: false } },
+      );
+      act(() => vi.advanceTimersByTime(SANDBOX_AUTO_WAKE_DWELL_MS));
+      autoWake.rerender({ canWake: true });
+      vi.useRealTimers();
+      writePinnedWorkspaceTabs(["files", "changes", "github", "subagents"]);
+      writeShortcutPreference(`selectWorkspaceTab${digit}`, {
+        common: [{ code: `Digit${digit}`, modifiers: ["alt"] }],
+      });
+      writeWorkspacePanelDefault("collapsed");
+      mockConversations([{ id: "conv_hotkey", permission_level: null }]);
+      renderShell("/c/conv_hotkey");
+      expect(wake).not.toHaveBeenCalled();
+
+      fireEvent.keyDown(document, { code: `Digit${digit}`, key: String(digit), altKey: true });
+
+      expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+      expect(
+        screen.getByRole("tab", { name: name === "Agents" ? /^Agents / : name }),
+      ).toHaveAttribute("aria-selected", "true");
+      expect(wake).toHaveBeenCalledTimes(needsHost ? 1 : 0);
+    },
+  );
 
   it("toggles the rail in one press and picks its fixed tabs by number from anywhere", async () => {
     const baseMatchMedia = window.matchMedia;

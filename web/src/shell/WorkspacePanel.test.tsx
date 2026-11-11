@@ -277,8 +277,6 @@ function renderWorkspace(
   const onBrowserTabOpened = vi.fn();
   const onTabShortcut = vi.fn((tab) => {
     if (!initialOverrides.reportTabShortcutOnly) {
-      if (tab === "files" || tab === "changes" || tab === "github")
-        requestSandboxWakeMock("conv_ws");
       onRightRailTabChange(tab);
       onReveal();
     }

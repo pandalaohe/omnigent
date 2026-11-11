@@ -133,6 +133,28 @@ afterEach(() => {
 });
 
 describe("Sidebar open session reveal", () => {
+  it.each(["all", "archived"] as const)(
+    "keeps an archived pinned-family sibling in the %s session list",
+    async (filter) => {
+      writeSessionFilter(filter);
+      const archived = conversation("conv_archived", {
+        title: "Archived family sibling",
+        archived: true,
+        owner: "me",
+        family: { id: "conv_recent", representative_id: "conv_recent", pinned: true },
+      });
+      renderOpenSession(
+        filter === "all" ? archived.id : "conv_recent",
+        [...LOADED, archived],
+        null,
+      );
+
+      const row = await screen.findByRole("link", { name: /Archived family sibling/ });
+      expect(sessionsSection()).toContainElement(row);
+      expect(screen.getByRole("button", { name: "Unarchive conversation" })).toBeInTheDocument();
+    },
+  );
+
   it("lists an archived open session on the default view with its Unarchive button", async () => {
     const archived = conversation("conv_archived", {
       title: "Archived work",

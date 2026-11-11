@@ -295,15 +295,17 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const { userPrompt, systemPrompt } = splitTriggerPrompt(task.prompt);
   const permissionMode =
     harness === "antigravity-native"
-      ? normalizeAgyPermissionTier(task.permissionMode)
+      ? task.permissionMode === "default"
+        ? "auto"
+        : normalizeAgyPermissionTier(task.permissionMode)
       : task.permissionMode;
   const permissionOption = nativePermissionOptions(harness).find(
     (option) => option.value === permissionMode,
   );
-  // Outside Claude, the default permission choice leaves the CLI configuration unchanged.
+  // AG automations resolve the legacy default to Auto; other non-Claude defaults inherit.
   const permissionLabel =
     !task.permissionMode ||
-    (task.permissionMode === "default" && harness != null && harness !== "claude-native")
+    (permissionMode === "default" && harness != null && harness !== "claude-native")
       ? "Agent default"
       : (permissionOption?.label ?? task.permissionMode);
   const scheduleSummary = describeSchedule(task.rrule);
