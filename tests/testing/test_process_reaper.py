@@ -88,7 +88,8 @@ def test_permission_wrapped_system_error_does_not_attribute_process(
         raise SystemError("proc_cmdline returned with an exception set") from cause
 
     proc.cmdline.side_effect = unreadable
-    monkeypatch.setattr(psutil, "process_iter", lambda: [proc])
+    monkeypatch.setattr(psutil, "pids", lambda: [proc.pid])
+    monkeypatch.setattr(psutil, "Process", lambda _pid: proc)
     assert reap_leaked_omnigent_processes(data_dir) == ([], [])
     proc.environ.assert_not_called()
     proc.terminate.assert_not_called()
@@ -100,17 +101,35 @@ def test_unrelated_system_error_remains_visible(
 ) -> None:
     proc = Mock(spec=psutil.Process, pid=12345)
     proc.cmdline.side_effect = SystemError("unexpected process inspection failure")
-    monkeypatch.setattr(psutil, "process_iter", lambda: [proc])
+    monkeypatch.setattr(psutil, "pids", lambda: [proc.pid])
+    monkeypatch.setattr(psutil, "Process", lambda _pid: proc)
     with pytest.raises(SystemError, match="unexpected process inspection failure"):
         reap_leaked_omnigent_processes(data_dir)
     proc.terminate.assert_not_called()
     proc.kill.assert_not_called()
 
 
-def test_matches_by_cmdline_reference(data_dir: Path) -> None:
-    """A process whose argv references the data dir is attributed."""
+@pytest.mark.parametrize(
+    "unreadable_error",
+    [None, IndexError("empty stat"), psutil.NoSuchProcess(1), psutil.AccessDenied(1), OSError()],
+    ids=["readable", "empty-stat", "vanished", "denied", "os-error"],
+)
+def test_matches_by_cmdline_reference(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, unreadable_error: Exception | None
+) -> None:
+    """An unreadable earlier PID does not hide a process referencing the data dir."""
     child = _spawn(_SLEEP_CHILD, "omnigent-server", f"sqlite:///{data_dir}/chat.db")
     try:
+        if unreadable_error is not None:
+            process_class = psutil.Process
+
+            def read_process(pid: int) -> psutil.Process:
+                if pid == 1:
+                    raise unreadable_error
+                return process_class(pid)
+
+            monkeypatch.setattr(psutil, "pids", lambda: [1, child.pid])
+            monkeypatch.setattr(psutil, "Process", read_process)
         found = find_leaked_omnigent_processes(data_dir)
         assert child.pid in {p.pid for p in found}
     finally:

@@ -253,8 +253,8 @@ settings and compare Session orchestration with the stored project config.
 - Requests have bounded bodies and worker admission. Managed rollout and task
   ownership still require deployment wiring; the OSS process recipe does not
   validate managed authentication or MySQL concurrency.
-- Managed deployment, Universe wiring, Arclet startup, automatic outbox/reconnect,
-  and native plugin isolation remain unverified follow-ups.
+- Managed deployment wiring, Arclet startup, automatic outbox/reconnect, and
+  native plugin isolation remain unverified follow-ups.
 - `--global` means this machine's user YAML, not a shared workspace write.
   Reading or editing YAML does not opt into shared preferences.
 - `config list` displays user and project defaults under their file paths;

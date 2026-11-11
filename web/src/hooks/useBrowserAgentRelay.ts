@@ -16,15 +16,18 @@ import {
   surfacesBrowserPane,
 } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
-import { supportsBrowser } from "@/lib/nativeBridge";
+import {
+  navigationHostOptions,
+  SESSION_HOST_PROTOCOL,
+  supportsBrowser,
+  type BrowserHostOptions,
+} from "@/lib/nativeBridge";
+import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import { beginBrowserActivity } from "@/lib/browserActivity";
 import { authenticatedFetch } from "@/lib/identity";
 import { useQueryClient } from "@tanstack/react-query";
-import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
-import { getSessionSlim } from "@/lib/sessionsApi";
 import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import type { Host } from "@/hooks/useHosts";
-import type { Session } from "@/lib/types";
 import {
   AGENT_BROWSER_TAB_ID,
   browserViewId,
@@ -47,24 +50,26 @@ interface BrowserDesktopBridge {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: {
+    opts?: BrowserHostOptions & {
       force?: boolean;
       agent?: boolean;
-      sourceHostId?: string;
       rememberedArcaHostId?: string;
       sourceIsArcaHost?: boolean;
     },
-  ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+  ) => Promise<{ ok: boolean; created?: boolean; hostIsThisMachine?: boolean; error?: string }>;
   browserScreenshot?: (
     conversationId: string,
+    opts?: BrowserHostOptions,
   ) => Promise<{ ok: boolean; dataUrl?: string; error?: string; noSurface?: boolean }>;
   /** @deprecated Compatibility with pre-typed desktops until v0.21. */
   browserExecute?: (
     conversationId: string,
     script: string,
+    opts?: BrowserHostOptions,
   ) => Promise<{ ok: boolean; result?: string; error?: string }>;
   browserHasView?: (viewId: string) => Promise<{
     exists: boolean;
+    hostIsThisMachine?: boolean;
     url?: string;
     title?: string;
   }>;
@@ -72,6 +77,7 @@ interface BrowserDesktopBridge {
     conversationId: string,
     action: "snapshot" | "click" | "type",
     args?: Record<string, unknown>,
+    opts?: BrowserHostOptions,
   ) => Promise<{ ok: boolean; result?: string; error?: string }>;
 }
 
@@ -200,12 +206,18 @@ async function performAction(
   viewId: string,
   action: "snapshot" | "click" | "type",
   args?: Record<string, unknown>,
+  opts?: BrowserHostOptions,
 ) {
   if (desktop.browserPerformAction) {
-    return desktop.browserPerformAction(viewId, action, args);
+    return opts
+      ? desktop.browserPerformAction(viewId, action, args, opts)
+      : desktop.browserPerformAction(viewId, action, args);
   }
   if (desktop.browserExecute) {
-    return desktop.browserExecute(viewId, buildBrowserActionScriptForExecution(action, args));
+    const script = buildBrowserActionScriptForExecution(action, args);
+    return opts
+      ? desktop.browserExecute(viewId, script, opts)
+      : desktop.browserExecute(viewId, script);
   }
   return { ok: false, error: "this desktop shell does not support the browser pane" };
 }
@@ -233,6 +245,7 @@ async function dispatch(
   sourceHostId: string | null,
   rememberedArcaHostId: string | null,
   sourceIsArcaHost: boolean,
+  readHostOptions?: BrowserHostOptions,
 ): Promise<ActionResult> {
   try {
     const pageArgs = { ...args };
@@ -266,7 +279,7 @@ async function dispatch(
         const r = await desktop.browserOpenOrNavigate(target.viewId, url, undefined, {
           force: true,
           agent: true,
-          ...(sourceHostId ? { sourceHostId } : {}),
+          ...navigationHostOptions(sourceHostId),
           ...(rememberedArcaHostId ? { rememberedArcaHostId } : {}),
           ...(sourceIsArcaHost ? { sourceIsArcaHost: true } : {}),
         });
@@ -289,7 +302,9 @@ async function dispatch(
         }
         const deadline = Date.now() + SCREENSHOT_SURFACE_TIMEOUT_MS;
         const capture = async (): Promise<ActionResult> => {
-          const r = await screenshot(target.viewId);
+          const r = readHostOptions
+            ? await screenshot(target.viewId, readHostOptions)
+            : await screenshot(target.viewId);
           const noSurface =
             (!r?.ok && !!r?.noSurface) ||
             (!!r?.ok && (!r.dataUrl || r.dataUrl === EMPTY_SCREENSHOT_DATA_URL));
@@ -314,7 +329,13 @@ async function dispatch(
             tabs: await tabMetadata(conversationId, desktop, target),
           },
         });
-        const r = await performAction(desktop, target.viewId, "snapshot");
+        const r = await performAction(
+          desktop,
+          target.viewId,
+          "snapshot",
+          undefined,
+          readHostOptions,
+        );
         if (!r?.ok) return snapshotFailure(r?.error ?? "snapshot failed");
         try {
           const parsed = JSON.parse(r.result ?? "{}") as Record<string, unknown>;
@@ -341,7 +362,7 @@ async function dispatch(
             error: "snapshot_id is required with ref; call browser_snapshot again",
           };
         }
-        const r = await performAction(desktop, target.viewId, "click", pageArgs);
+        const r = await performAction(desktop, target.viewId, "click", pageArgs, readHostOptions);
         if (!r?.ok) return { ok: false, error: r?.error ?? "click failed" };
         const error = lookupError(r.result);
         if (error) return { ok: false, error };
@@ -357,7 +378,7 @@ async function dispatch(
             error: "snapshot_id is required with ref; call browser_snapshot again",
           };
         }
-        const r = await performAction(desktop, target.viewId, "type", pageArgs);
+        const r = await performAction(desktop, target.viewId, "type", pageArgs, readHostOptions);
         if (!r?.ok) return { ok: false, error: r?.error ?? "type failed" };
         const error = lookupError(r.result);
         if (error) return { ok: false, error };
@@ -480,34 +501,26 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
         await postResult(sourceConversationId, evt.actionId, claimToken, target);
         return;
       }
-      let sourceHostId: string | null = null;
-      if (evt.action === "navigate") {
+      const needsHostRevalidation = ["screenshot", "snapshot", "click", "type"].includes(
+        evt.action,
+      );
+      let privilegedView = true;
+      if (needsHostRevalidation && desktop.browserHasView) {
         try {
-          // Parent hints cannot establish which ancestor has the nearest own host binding.
-          const visited = new Set<string>();
-          let id: string | null = sourceConversationId;
-          while (id !== null && !visited.has(id)) {
-            visited.add(id);
-            const hopId: string = id;
-            // oxlint-disable-next-line no-await-in-loop -- Each parent comes from the previous snapshot.
-            const source: Session = await queryClient.fetchQuery({
-              queryKey: ["session", hopId],
-              queryFn: () => getSessionSlim(hopId),
-              staleTime: Infinity,
-              retry: false,
-            });
-            setSessionHost(source.id, sessionRoutingHostId(source.hostId, source.labels));
-            setSessionParent(source.id, source.parentSessionId);
-            if (source.hostId) {
-              sourceHostId = source.hostId;
-              break;
-            }
-            id = source.parentSessionId;
-          }
+          const view = await desktop.browserHasView(target.viewId);
+          privilegedView = view.hostIsThisMachine === true;
         } catch {
-          // Unknown provenance stays denied for localhost; public browsing still works.
+          // A failed probe requires current host metadata before acting.
         }
       }
+      const revalidateHost = needsHostRevalidation && privilegedView;
+      const sourceHostId =
+        evt.action === "navigate" || revalidateHost
+          ? await fetchSessionHostId(sourceConversationId, { queryClient })
+          : null;
+      const readHostOptions = revalidateHost
+        ? { sessionHostProtocol: SESSION_HOST_PROTOCOL, sourceHostId }
+        : undefined;
       if (cancelled) {
         await postResult(sourceConversationId, evt.actionId, claimToken, {
           ok: false,
@@ -577,16 +590,42 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
           : false;
       const finishActivity = beginBrowserActivity(target.viewId);
       try {
-        const result = await dispatch(
-          sourceConversationId,
-          target,
-          evt.action,
-          evt.args,
-          desktop,
-          sourceHostId,
-          rememberedArcaHostId,
-          sourceIsArcaHost,
-        );
+        let result = cancelled
+          ? { ok: false, error: "browser relay context changed" }
+          : await dispatch(
+              sourceConversationId,
+              target,
+              evt.action,
+              evt.args,
+              desktop,
+              sourceHostId,
+              rememberedArcaHostId,
+              sourceIsArcaHost,
+              readHostOptions,
+            );
+        if (
+          !cancelled &&
+          needsHostRevalidation &&
+          !readHostOptions &&
+          !result.ok &&
+          result.error === "Current session host is required to read this browser view"
+        ) {
+          // A view can become host-local after the probe; retry once with fresh provenance.
+          const currentHostId = await fetchSessionHostId(sourceConversationId, { queryClient });
+          result = cancelled
+            ? { ok: false, error: "browser relay context changed" }
+            : await dispatch(
+                sourceConversationId,
+                target,
+                evt.action,
+                evt.args,
+                desktop,
+                currentHostId,
+                rememberedArcaHostId,
+                sourceIsArcaHost,
+                { sessionHostProtocol: SESSION_HOST_PROTOCOL, sourceHostId: currentHostId },
+              );
+        }
         await postResult(sourceConversationId, evt.actionId, claimToken, result);
       } finally {
         finishActivity();

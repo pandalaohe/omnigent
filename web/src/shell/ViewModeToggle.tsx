@@ -177,7 +177,7 @@ export function ViewModeMenuItems() {
   return (
     <>
       <DropdownMenuItem
-        className="gap-2.5 px-2.5 py-2 text-ui"
+        className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
         onSelect={() => setView("chat")}
         data-testid="view-mode-menu-chat"
       >
@@ -186,7 +186,7 @@ export function ViewModeMenuItems() {
         {view === "chat" && <CheckIcon className="ml-auto size-4" />}
       </DropdownMenuItem>
       <DropdownMenuItem
-        className="gap-2.5 px-2.5 py-2 text-ui"
+        className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
         onSelect={() => setView("terminal")}
         data-testid="view-mode-menu-terminal"
       >

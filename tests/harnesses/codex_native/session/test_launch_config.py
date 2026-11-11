@@ -16,7 +16,6 @@ from omnigent.spec import load
 
 # The default-stance auto-review override normalize_codex_permission_launch_args
 # adds when no explicit approval/sandbox/reviewer/profile choice is present.
-_AUTO_REVIEW_ARGS = ["-c", 'approvals_reviewer="auto_review"']
 
 
 def test_native_spawn_env_uses_own_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -113,7 +112,7 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             (),
             None,
             "unix:///tmp/app-server.sock",
-            [*_AUTO_REVIEW_ARGS, "--remote", "unix:///tmp/app-server.sock"],
+            ["--remote", "unix:///tmp/app-server.sock"],
         ),
         # Resume an existing thread over a Unix socket (local reattach).
         (
@@ -132,7 +131,7 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             (),
             None,
             "ws://127.0.0.1:9876",
-            [*_AUTO_REVIEW_ARGS, "--remote", "ws://127.0.0.1:9876"],
+            ["--remote", "ws://127.0.0.1:9876"],
         ),
         # Resume over the host-spawned runner's ws:// endpoint; hardcoding
         # unix:// would prevent the terminal from attaching to its server.
@@ -165,7 +164,6 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
                 "--model",
                 "gpt-5.4-mini",
                 "Reply with INITIAL_ONCE",
-                *_AUTO_REVIEW_ARGS,
                 "--remote",
                 "ws://127.0.0.1:9876",
             ],
@@ -210,7 +208,6 @@ def test_build_codex_remote_args_passes_transport_verbatim(
                 'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
-                *_AUTO_REVIEW_ARGS,
                 "--remote",
                 "ws://127.0.0.1:9876",
             ],
@@ -465,7 +462,7 @@ def test_build_codex_remote_args_default_keeps_approval_flags_no_bypass() -> Non
     Default (``bypass_sandbox=False``) emits NO bypass flag and preserves the
     approval/sandbox flags the approval-mode presets pass through.
 
-    The web "Full access" / "Read only" presets are sent as
+    The web "Full Access" / "Read Only" presets are sent as
     ``--sandbox`` / ``--ask-for-approval`` pairs inside ``codex_args``. With
     bypass off those must reach the TUI verbatim and the dangerous bypass
     flag must never appear — a regression here would either drop a user's

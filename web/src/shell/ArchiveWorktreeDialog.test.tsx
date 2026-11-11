@@ -9,7 +9,7 @@ import {
   saveArchiveWorktreePreference,
 } from "@/lib/archiveWorktreePreferences";
 import { getOmnigentHostGeneration } from "@/lib/host";
-import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
+import { useArchivePrompt } from "./ArchivePrompt";
 
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => ({ worktree_status: true }) }));
 vi.mock("@/hooks/useWorktreeStatus", () => ({ fetchSessionWorktreeStatus: vi.fn() }));
@@ -36,7 +36,7 @@ const proceed = vi.fn();
 const cancel = vi.fn();
 
 function Harness({ scope = "one", bound = true }: { scope?: string; bound?: boolean }) {
-  const prompt = useArchiveWorktreePrompt(scope);
+  const prompt = useArchivePrompt(scope);
   return (
     <>
       <button

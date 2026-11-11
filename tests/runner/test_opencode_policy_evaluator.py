@@ -1,7 +1,7 @@
 """Unit tests for the OpenCode permission policy evaluator wiring.
 
 The runner wires this evaluator into the OpenCode permission forwarder so
-every ``permission.v2.asked`` request is decided by the SAME server-side
+every ``permission.asked`` request is decided by the SAME server-side
 policy/approval gate codex-native uses (``POST /policies/evaluate``), not
 silently auto-approved. These tests pin the request shape, the verdict
 mapping, and — critically — that every failure mode fails CLOSED.
@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.harnesses.opencode_native.permissions import evaluate_elicitation_id
 from omnigent.native import native_policy_hook
 from omnigent.runner.app import _build_opencode_policy_evaluator
 
@@ -58,24 +59,23 @@ class _FakeServerClient:
 
 
 async def test_evaluator_posts_tool_call_event_and_maps_allow() -> None:
-    """ALLOW maps to the ``allow`` verdict; the POST carries a tool-call event."""
+    """ALLOW maps to ``allow``; the POST carries the v2 action as the tool name."""
     client = _FakeServerClient(body={"result": "POLICY_ACTION_ALLOW"})
     evaluate = _build_opencode_policy_evaluator(
         server_client=client,  # type: ignore[arg-type]
         conversation_id="conv_1",
     )
     verdict = await evaluate(
-        {"action": "bash", "command": "ls", "path": None, "url": None, "metadata": {}}
+        {"action": "shell", "command": "ls", "path": None, "url": None, "metadata": {}}
     )
     assert verdict == {"decision": "allow"}
     url, body, _timeout = client.calls[0]
     assert url == "/v1/sessions/conv_1/policies/evaluate"
     event = body["event"]
     assert event["type"] == "PHASE_TOOL_CALL"
-    assert event["data"]["name"] == "bash"
-    # Only the concrete, present resources reach the policy engine.
+    assert event["data"]["name"] == "shell"
     assert event["data"]["arguments"] == {"command": "ls"}
-    assert event["context"]["harness"] == "opencode-native"
+    assert event["context"] == {"harness": "opencode-native"}
 
 
 async def test_evaluator_maps_deny_and_ask() -> None:
@@ -187,3 +187,61 @@ async def test_evaluator_persistent_outage_stops_within_the_budget(
     assert (await evaluate({"action": "bash"})) == {"decision": "deny"}
     assert len(client.calls) == 3, "attempts must stop once the next start passes the budget"
     assert sleeps == [1.0, 2.0], "backoff must double from 1s and stop at the budget"
+
+
+async def test_evaluator_posts_normalized_arguments() -> None:
+    """v2 action arguments (e.g. a grep ``pattern``) reach the policy engine."""
+    client = _FakeServerClient(body={"result": "POLICY_ACTION_ALLOW"})
+    evaluate = _build_opencode_policy_evaluator(
+        server_client=client,  # type: ignore[arg-type]
+        conversation_id="conv_1",
+    )
+    await evaluate(
+        {
+            "action": "grep",
+            "arguments": {"pattern": "secret", "path": "src"},
+            "command": None,
+            "path": "src",
+            "url": None,
+            "metadata": {},
+        }
+    )
+    _url, body, _timeout = client.calls[0]
+    assert body["event"]["data"] == {
+        "name": "grep",
+        "arguments": {"pattern": "secret", "path": "src"},
+    }
+
+
+async def test_evaluator_names_v2_shell_action() -> None:
+    client = _FakeServerClient(body={"result": "POLICY_ACTION_ALLOW"})
+    evaluate = _build_opencode_policy_evaluator(
+        server_client=client,  # type: ignore[arg-type]
+        conversation_id="c",
+    )
+    await evaluate({"action": "shell", "arguments": {"command": "ls"}, "metadata": {}})
+    assert client.calls[0][1]["event"]["data"] == {"name": "shell", "arguments": {"command": "ls"}}
+
+
+async def test_evaluator_stamps_elicitation_id_derived_from_request_id() -> None:
+    """The parked card is addressable by the id the forwarder posts on a TUI answer."""
+    client = _FakeServerClient(body={"result": "POLICY_ACTION_ALLOW"})
+    evaluate = _build_opencode_policy_evaluator(
+        server_client=client,  # type: ignore[arg-type]
+        conversation_id="c",
+    )
+    await evaluate({"action": "shell", "arguments": {"command": "ls"}, "request_id": "per_1"})
+    body = client.calls[0][1]
+    assert body["_omnigent_elicitation_id"] == evaluate_elicitation_id("per_1")
+    assert body["_omnigent_elicitation_id"].startswith("elicit_evaluate_")
+    assert len(body["_omnigent_elicitation_id"]) == len("elicit_evaluate_") + 32
+
+    client = _FakeServerClient(body={"result": "POLICY_ACTION_ALLOW"})
+    evaluate = _build_opencode_policy_evaluator(
+        server_client=client,  # type: ignore[arg-type]
+        conversation_id="c",
+    )
+    await evaluate({"action": "shell", "arguments": {"command": "ls"}})
+    assert re.fullmatch(
+        r"elicit_evaluate_[0-9a-f]{32}", client.calls[0][1]["_omnigent_elicitation_id"]
+    )

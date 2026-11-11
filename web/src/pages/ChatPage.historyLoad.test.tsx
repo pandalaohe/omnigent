@@ -7,7 +7,7 @@ import { useChatStore } from "@/store/chatStore";
 import {
   HistoryAutoLoader,
   JumpToTopButton,
-  KeepBottomOnViewportResize,
+  KeepBottomOnResize,
   LatestTurnSpacer,
   ScrollToBottomOnSessionOpen,
 } from "./ChatPage";
@@ -154,7 +154,7 @@ function setScrollMetrics(
   });
 }
 
-describe("KeepBottomOnViewportResize", () => {
+describe("KeepBottomOnResize", () => {
   let resize: (() => void) | null;
   let observed: Element[];
   let disconnectSpy = vi.fn<() => void>();
@@ -245,7 +245,7 @@ describe("KeepBottomOnViewportResize", () => {
     stickContext.isAtBottom = true;
     stickContext.state.isAtBottom = true;
     stickContext.state.escapedFromLock = false;
-    render(<KeepBottomOnViewportResize />);
+    render(<KeepBottomOnResize />);
 
     metrics.clientHeight = 650;
     act(() => resize?.());
@@ -260,7 +260,7 @@ describe("KeepBottomOnViewportResize", () => {
 
   it("leaves an escaped reader anchored by the browser", () => {
     const { metrics } = makeScrollRoot(800);
-    render(<KeepBottomOnViewportResize />);
+    render(<KeepBottomOnResize />);
 
     metrics.clientHeight = 650;
     act(() => resize?.());
@@ -273,7 +273,7 @@ describe("KeepBottomOnViewportResize", () => {
   it("does not repin a touch escape before its first scroll event on viewport resize", () => {
     const { metrics } = makeScrollRoot();
     lockToBottom();
-    render(<KeepBottomOnViewportResize />);
+    render(<KeepBottomOnResize />);
     stickContext.state.isAtBottom = false;
     stickContext.state.escapedFromLock = true;
     metrics.clientHeight = 650;
@@ -287,7 +287,7 @@ describe("KeepBottomOnViewportResize", () => {
     stickContext.isAtBottom = true;
     stickContext.state.isAtBottom = false;
     stickContext.state.escapedFromLock = true;
-    render(<KeepBottomOnViewportResize />);
+    render(<KeepBottomOnResize />);
 
     metrics.clientHeight = 650;
     act(() => resize?.());
@@ -302,7 +302,7 @@ describe("KeepBottomOnViewportResize", () => {
     stickContext.isAtBottom = true;
     stickContext.state.isAtBottom = true;
     stickContext.state.escapedFromLock = false;
-    render(<KeepBottomOnViewportResize />);
+    render(<KeepBottomOnResize />);
 
     metrics.scrollTop = 1250;
     stickContext.state.isAtBottom = false;
@@ -323,7 +323,7 @@ describe("KeepBottomOnViewportResize", () => {
     const { metrics, scrollRoot } = makeScrollRoot();
     const content = makeContentRoot();
     lockToBottom();
-    render(<KeepBottomOnViewportResize />);
+    render(<KeepBottomOnResize />);
 
     metrics.scrollHeight = 2900;
     act(() => resize?.());
@@ -341,7 +341,7 @@ describe("KeepBottomOnViewportResize", () => {
     const { metrics, scrollRoot } = makeScrollRoot();
     makeContentRoot();
     lockToBottom();
-    render(<KeepBottomOnViewportResize />);
+    render(<KeepBottomOnResize />);
 
     metrics.scrollHeight = 2400;
     act(() => resize?.());
@@ -363,7 +363,7 @@ describe("KeepBottomOnViewportResize", () => {
     makeContentRoot();
     lockToBottom();
     const pinRef = { current: null as (() => void) | null };
-    const { unmount } = render(<KeepBottomOnViewportResize pinRef={pinRef} />);
+    const { unmount } = render(<KeepBottomOnResize pinRef={pinRef} />);
 
     metrics.scrollHeight = 2900;
     act(() => pinRef.current?.());
@@ -380,7 +380,7 @@ describe("KeepBottomOnViewportResize", () => {
     const { metrics, scrollRoot } = makeScrollRoot();
     makeContentRoot();
     lockToBottom();
-    render(<KeepBottomOnViewportResize />);
+    render(<KeepBottomOnResize />);
 
     metrics.scrollHeight = 2900;
     act(() => resize?.());
@@ -401,7 +401,7 @@ describe("KeepBottomOnViewportResize", () => {
     const { metrics, scrollRoot } = makeScrollRoot();
     makeContentRoot();
     lockToBottom();
-    render(<KeepBottomOnViewportResize />);
+    render(<KeepBottomOnResize />);
 
     metrics.scrollTop = 900;
     fireEvent.scroll(scrollRoot);
@@ -419,7 +419,7 @@ describe("KeepBottomOnViewportResize", () => {
     const { metrics } = makeScrollRoot();
     makeContentRoot();
     lockToBottom();
-    render(<KeepBottomOnViewportResize />);
+    render(<KeepBottomOnResize />);
 
     stickContext.state.isAtBottom = false;
     stickContext.state.escapedFromLock = true;
@@ -435,7 +435,7 @@ describe("KeepBottomOnViewportResize", () => {
     const { metrics } = makeScrollRoot();
     makeContentRoot();
     lockToBottom();
-    render(<KeepBottomOnViewportResize />);
+    render(<KeepBottomOnResize />);
 
     metrics.scrollHeight = 1961;
     act(() => resize?.());
@@ -451,12 +451,13 @@ describe("KeepBottomOnViewportResize", () => {
     scrollRoot.append("reply text");
     document.body.append(scrollRoot);
     lockToBottom();
-    render(<KeepBottomOnViewportResize />);
+    render(<KeepBottomOnResize />);
     const selection = document.getSelection()!;
     const range = document.createRange();
     range.selectNodeContents(scrollRoot);
     selection.removeAllRanges();
     selection.addRange(range);
+    fireEvent.pointerDown(scrollRoot);
 
     try {
       metrics.scrollHeight = 2900;
@@ -465,6 +466,7 @@ describe("KeepBottomOnViewportResize", () => {
       expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
 
       selection.removeAllRanges();
+      fireEvent.pointerUp(scrollRoot);
       metrics.scrollHeight = 3000;
       act(() => resize?.());
       expect(metrics.scrollTop).toBe(3000 - 700 - 1);
@@ -475,22 +477,141 @@ describe("KeepBottomOnViewportResize", () => {
     }
   });
 
-  it("disconnects the observer and cancels a queued follow-up frame", () => {
+  it("keeps following after a shrink clamps the reader before its resize callback", () => {
+    const { metrics, scrollRoot } = makeScrollRoot();
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    render(<KeepBottomOnResize />);
+
+    metrics.scrollHeight = 1950;
+    metrics.scrollTop = 1250;
+    fireEvent.scroll(scrollRoot);
+    act(() => resize?.());
+    metrics.scrollHeight = 1971;
+    act(() => resize?.());
+
+    expect(metrics.scrollTop).toBe(1270);
+  });
+
+  it.each([
+    { change: "the transcript grows", scrollHeight: 2021, clientHeight: 700, scrollTop: 1100 },
+    // Both layouts end at 1300, so the reader is 50px above either end.
+    {
+      change: "the transcript grows as the viewport expands",
+      scrollHeight: 2100,
+      clientHeight: 800,
+      scrollTop: 1250,
+    },
+  ])(
+    "leaves the reader alone once they scroll up, before the library notices, as $change",
+    ({ scrollHeight, clientHeight, scrollTop }) => {
+      const { metrics, scrollRoot } = makeScrollRoot();
+      stickContext.state.isAtBottom = true;
+      stickContext.state.escapedFromLock = false;
+      render(<KeepBottomOnResize />);
+
+      metrics.scrollHeight = scrollHeight;
+      metrics.clientHeight = clientHeight;
+      metrics.scrollTop = scrollTop;
+      fireEvent.scroll(scrollRoot);
+      act(() => resize?.());
+
+      expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+      expect(metrics.scrollTop).toBe(scrollTop);
+    },
+  );
+
+  it("leaves transcript growth alone once the library releases a reader at the end", () => {
+    const { metrics } = makeScrollRoot();
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    render(<KeepBottomOnResize />);
+
+    metrics.scrollHeight = 2021;
+    act(() => resize?.());
+    expect(metrics.scrollTop).toBe(1320);
+
+    // A wheel up releases the lock before any scroll event moves the reader:
+    // neither the pending follow-up frame nor the next line moves the view.
+    stickContext.state.isAtBottom = false;
+    stickContext.state.escapedFromLock = true;
+    metrics.scrollHeight = 2042;
+    flushFrames();
+    act(() => resize?.());
+
+    expect(stickContext.scrollToBottom).toHaveBeenCalledOnce();
+    expect(frames.size).toBe(0);
+    expect(metrics.scrollTop).toBe(1320);
+  });
+
+  it("holds still while the reader drags a selection in the transcript", () => {
+    const { metrics, scrollRoot } = makeScrollRoot();
+    scrollRoot.textContent = "streamed reply";
+    document.body.append(scrollRoot);
+    document.getSelection()!.selectAllChildren(scrollRoot);
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    try {
+      render(<KeepBottomOnResize />);
+
+      fireEvent.pointerDown(scrollRoot);
+      metrics.scrollHeight = 2021;
+      act(() => resize?.());
+      metrics.clientHeight = 650;
+      act(() => resize?.());
+      expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+      expect(metrics.scrollTop).toBe(1300);
+
+      // A finished selection stays in place but no longer holds the view.
+      fireEvent.pointerUp(scrollRoot);
+      metrics.scrollHeight = 2042;
+      act(() => resize?.());
+      expect(metrics.scrollTop).toBe(1391);
+
+      // A drag that starts before the follow-up frame runs holds that frame too.
+      fireEvent.pointerDown(scrollRoot);
+      metrics.scrollHeight = 2063;
+      flushFrames();
+      expect(metrics.scrollTop).toBe(1391);
+    } finally {
+      document.getSelection()!.removeAllRanges();
+      scrollRoot.remove();
+    }
+  });
+
+  it("disconnects the observer, removes its listeners and cancels a queued follow-up frame", () => {
     const { metrics } = makeScrollRoot();
     stickContext.isAtBottom = true;
     stickContext.state.isAtBottom = true;
     stickContext.state.escapedFromLock = false;
-    const { unmount } = render(<KeepBottomOnViewportResize />);
+    const addListener = vi.spyOn(document, "addEventListener");
+    const removeListener = vi.spyOn(document, "removeEventListener");
+    try {
+      const { unmount } = render(<KeepBottomOnResize />);
 
-    metrics.clientHeight = 650;
-    act(() => resize?.());
-    expect(frames.size).toBe(1);
+      metrics.clientHeight = 650;
+      act(() => resize?.());
+      expect(frames.size).toBe(1);
 
-    unmount();
+      unmount();
 
-    expect(disconnectSpy).toHaveBeenCalledOnce();
-    expect(cancelAnimationFrame).toHaveBeenCalled();
-    expect(frames.size).toBe(0);
+      expect(disconnectSpy).toHaveBeenCalledOnce();
+      expect(cancelAnimationFrame).toHaveBeenCalled();
+      expect(frames.size).toBe(0);
+      const pointerListeners = addListener.mock.calls.filter(([type]) =>
+        type.startsWith("pointer"),
+      );
+      expect(pointerListeners.map(([type]) => type)).toEqual([
+        "pointerdown",
+        "pointerup",
+        "pointercancel",
+      ]);
+      for (const [type, listener, options] of pointerListeners)
+        expect(removeListener).toHaveBeenCalledWith(type, listener, options);
+    } finally {
+      addListener.mockRestore();
+      removeListener.mockRestore();
+    }
   });
 });
 

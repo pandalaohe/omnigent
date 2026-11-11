@@ -37,6 +37,7 @@ from omnigent.spec.parser import (
     discover_host_skills,
     skill_matches_names,
 )
+from omnigent.spec.repo_scope import repo_scope_dirs
 from omnigent.spec.types import AgentSpec, SkillSpec
 
 _log = logging.getLogger(__name__)
@@ -108,6 +109,10 @@ class SkillSourceContext:
     :param claude_portable_skills: Whether Claude-family discovery may include
         ``.agents/skills`` tiers; the host's ``skills.claude_portable_skills``
         setting.
+    :param warnings: When not ``None``, providers append a user-facing note
+        for each source they could not read (for example a failed
+        ``codex plugin list``), so callers can show an incomplete catalog as
+        incomplete rather than empty.
     """
 
     roots: tuple[Path, ...]
@@ -118,6 +123,7 @@ class SkillSourceContext:
     codex_home: Path | None = None
     is_native: bool = False
     claude_portable_skills: bool = True
+    warnings: list[str] | None = None
 
 
 SkillSource = Callable[[SkillSourceContext], list[SkillSpec]]
@@ -129,6 +135,7 @@ def skill_source_context_from_env(
     harness: str | None,
     skills_filter: str | list[str] = "all",
     bundle_dir: Path | None = None,
+    warnings: list[str] | None = None,
 ) -> SkillSourceContext:
     """Use the same ambient harness configuration for host and runner discovery."""
     configured_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
@@ -148,6 +155,7 @@ def skill_source_context_from_env(
         ),
         codex_home=codex_home,
         claude_portable_skills=host_skill_settings().claude_portable_skills,
+        warnings=warnings,
     )
 
 
@@ -327,6 +335,7 @@ def _session_skills(
     harness: str | None,
     *,
     invocable_only: bool,
+    warnings: list[str] | None = None,
 ) -> list[SkillSpec]:
     """One assembly shared by the menu and the loadable registry."""
     from omnigent.harness_aliases import canonicalize_harness
@@ -336,7 +345,11 @@ def _session_skills(
     seen = {s.name for s in spec.skills}
     seen_dirs = {s.skill_dir.resolve() for s in spec.skills if s.skill_dir is not None}
     ctx = skill_source_context_from_env(
-        roots=roots, harness=harness, skills_filter=spec.skills_filter, bundle_dir=bundle_dir
+        roots=roots,
+        harness=harness,
+        skills_filter=spec.skills_filter,
+        bundle_dir=bundle_dir,
+        warnings=warnings,
     )
     if not roots:
         host_skills: list[SkillSpec] = []
@@ -373,13 +386,16 @@ def resolve_session_skills(
     bundle_dir: Path | None,
     *,
     harness: str | None = None,
+    warnings: list[str] | None = None,
 ) -> list[SkillSpec]:
     """Use identical precedence and filters for menu discovery and invocation.
 
     :param harness: The harness whose sources to use; ``None`` means the
         spec's declared harness.
     """
-    return _session_skills(spec, roots, bundle_dir, harness, invocable_only=True)
+    return _session_skills(
+        spec, roots, bundle_dir, harness, invocable_only=True, warnings=warnings
+    )
 
 
 def resolve_session_skill_registry(
@@ -753,15 +769,8 @@ def _claude_command_roots(ctx: SkillSourceContext) -> list[Path]:
     roots = [_claude_user_dir(ctx) / "commands"]
     if not ctx.roots:
         return roots
-    home = ctx.home.resolve()
-    workspace = ctx.roots[0].resolve()
-    for directory in (workspace, *workspace.parents):
-        if directory == home:
-            break
-        roots.append(directory / ".claude" / "commands")
-        if (directory / ".git").exists():
-            break
-    return roots
+    project = repo_scope_dirs(ctx.roots[0], home=ctx.home, outside_repo="ancestors")
+    return roots + [directory / ".claude" / "commands" for directory in project]
 
 
 def _discover_claude_commands(
@@ -952,10 +961,18 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     Reuses the Codex executor's own helpers — ``codex_skill_sources`` (the
     shared source-list builder) and ``select_codex_skill_dirs`` (the shared
     selector) — so the menu draws from the same roots and selection the
-    executor symlinks into ``$CODEX_HOME/skills/``. The menu is the subset of
-    that selection whose ``SKILL.md`` parses: the executor links by existence,
-    so a present-but-unparseable skill is linked but not shown (correct — Codex
-    won't register a malformed skill as a command either).
+    executor symlinks into ``$CODEX_HOME/skills/``, plus the native repo-scope
+    ``.agents/skills`` dirs Codex reads from its workspace cwd (first root).
+    The menu is the subset of that selection whose ``SKILL.md`` parses: the
+    executor links by existence, so a present-but-unparseable skill is linked
+    but not shown (correct — Codex won't register a malformed skill as a
+    command either).
+
+    Native skills come first and ignore ``skills_filter``: Codex loads repo
+    skills whatever the filter and ranks them above the linked user skills.
+    Codex lists every same-named copy, and a plain ``$name`` that matches more
+    than one injects none of them. Codex has no precedence within the repo
+    scope, so the nearest directory wins here.
 
     A native ``codex-native`` session honors ``$CODEX_HOME``: its launch seeds
     the per-bridge home from the ``$CODEX_HOME``-resolved host home, so the menu
@@ -980,24 +997,24 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     from omnigent.spec.codex_plugin_skills import discover_codex_plugin_skills
 
     host_override = ctx.codex_home if ctx.is_native else None
-    sources = codex_skill_sources(ctx.bundle_dir, ctx.home, codex_home=host_override)
     cwd = ctx.roots[0] if ctx.roots else None
-    # Tiers the Codex CLI reads itself: listed, never seeded into its private home.
-    extra: list[Path] = []
-    if cwd is not None:
-        extra.extend(_codex_repo_agents_skill_dirs(cwd))
-    for tier in extra:
-        if tier not in sources and os.path.isdir(tier):
-            sources.append(tier)
+    sources = codex_skill_sources(
+        ctx.bundle_dir, ctx.home, codex_home=host_override, workspace=cwd
+    )
+    selected = select_codex_skill_dirs("all", sources.native)
+    for name, skill_dir in select_codex_skill_dirs(ctx.skills_filter, sources.linked).items():
+        selected.setdefault(name, skill_dir)
     out: list[SkillSpec] = []
-    for name, skill_dir in select_codex_skill_dirs(ctx.skills_filter, sources).items():
+    for name, skill_dir in selected.items():
         try:
             spec = _parse_skill(skill_dir / "SKILL.md")
         except (OmnigentError, OSError):  # best-effort discovery
             continue
         out.append(replace(spec, name=name))
     codex_home = host_override if host_override is not None else ctx.home / ".codex"
-    out.extend(discover_codex_plugin_skills(codex_home, ctx.skills_filter, cwd=cwd))
+    out.extend(
+        discover_codex_plugin_skills(codex_home, ctx.skills_filter, cwd=cwd, warnings=ctx.warnings)
+    )
     return out
 
 

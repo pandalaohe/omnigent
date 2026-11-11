@@ -20,8 +20,10 @@ import asyncio
 import contextlib
 import logging
 import secrets
+import time
 import weakref
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
@@ -933,11 +935,17 @@ class LaunchRunnerRequest(BaseModel):
         as the session's ``git_branch`` for display and opt-in cleanup.
         ``None`` binds ``workspace`` directly. ``host_id`` is always
         present (it is in the path), so no host check is needed here.
+    :param session_env_handoff_id: Opaque, non-secret ID of the launching
+        CLI's local forwarded-environment file, relayed to the host so only
+        this launch's runner consumes it. ``None`` when nothing is forwarded.
     """
 
     session_id: str
     workspace: str
     git: SessionGitOptions | None = None
+    session_env_handoff_id: str | None = Field(
+        default=None, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"
+    )
 
 
 async def _resolve_agent_spec_cwd(
@@ -1189,7 +1197,9 @@ def create_hosts_router(
         return {"hosts": result}
 
     @router.get("/hosts/{host_id}")
-    async def get_host(request: Request, host_id: str) -> dict[str, Any]:
+    async def get_host(
+        request: Request, host_id: str, include: str | None = Query(default=None)
+    ) -> dict[str, Any]:
         """Get details for a single host.
 
         :param request: The incoming request (for auth).
@@ -1254,6 +1264,22 @@ def create_hosts_router(
             result["harness_login_supported"] = bool(
                 conn is not None and CAP_HARNESS_LOGIN in conn.hello.capabilities
             )
+        catalog = getattr(request.app.state, "sandbox_profiles", None)
+        if include == "sandbox_profile" and catalog is not None:
+            try:
+                snapshot = await asyncio.to_thread(catalog.get_host_snapshot, host_id)
+                result["sandbox_profile"] = (
+                    {
+                        key: value
+                        for key, value in snapshot.items()
+                        if key not in ("user_id", "workspace_id")
+                    }
+                    if snapshot
+                    else None
+                )
+            except HTTPException as exc:
+                result["sandbox_profile"] = None
+                result["sandbox_profile_error"] = exc.detail
         return result
 
     @router.patch("/hosts/{host_id}")
@@ -1728,8 +1754,19 @@ def create_hosts_router(
             host_registry=host_registry,
             conversation_store=conversation_store,
             permission_store=permission_store,
+            sandbox_profiles=getattr(request.app.state, "sandbox_profiles", None),
         )
         conn = target.conn
+        if target.conv.family_id is not None and flags.enabled(Feature.SIBLING_SESSIONS):
+            from omnigent.server.session_families import require_sibling_destination
+
+            await asyncio.to_thread(
+                require_sibling_destination,
+                request,
+                target.conv.host_id,
+                host_id=host_id,
+                host_type="external",
+            )
         admission = getattr(request.app.state, "startup_admission", None)
         if admission is not None and not admission.dispatching(body.session_id):
             startup = await admission.queue_preparation(
@@ -1880,6 +1917,16 @@ def create_hosts_router(
                     exc_info=True,
                 )
 
+        from omnigent.stores.conversation_store import ProfileHostBinding
+
+        profile_binding: ProfileHostBinding | None = None
+        profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
+        host_profile = (
+            await asyncio.to_thread(profile_catalog.get_host_snapshot, host_id)
+            if profile_catalog is not None
+            else None
+        )
+
         async def _rollback_failed_launch() -> None:
             """Clear state created by a failed runner launch."""
             _logger.error(
@@ -1891,7 +1938,32 @@ def create_hosts_router(
                     stage="runner_launch",
                 ),
             )
-            await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
+            if profile_binding is not None:
+                restored = await asyncio.to_thread(
+                    conversation_store.rollback_profiled_host,
+                    profile_binding,
+                    expected_host_id=host_id,
+                    expected_runner_id=runner_id,
+                )
+                if not restored and host_profile is None:
+                    # The runner can bind before the host write fails. Clear only
+                    # this attempt while retaining the current host and workspace.
+                    current = await asyncio.to_thread(
+                        conversation_store.get_conversation, body.session_id
+                    )
+                    if current is not None and current.runner_id == runner_id:
+                        with contextlib.suppress(ValueError):
+                            await asyncio.to_thread(
+                                conversation_store.clear_runner_id,
+                                body.session_id,
+                                expected_binding=current,
+                            )
+                            restored = True
+                if not restored:
+                    await _rollback_worktree()
+                    return
+            elif host_profile is None:
+                await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
             try:
                 if (
                     worktree is not None
@@ -1934,6 +2006,34 @@ def create_hosts_router(
                         status_code=400,
                         detail="session already has a runner bound",
                     )
+                target = replace(target, conv=current)
+                if current.family_id is not None and flags.enabled(Feature.SIBLING_SESSIONS):
+                    from omnigent.server.session_families import require_sibling_destination
+
+                    await asyncio.to_thread(
+                        require_sibling_destination,
+                        request,
+                        current.host_id,
+                        host_id=host_id,
+                        host_type="external",
+                    )
+
+            legacy_continuation = (
+                profile_catalog is not None
+                and target.conv.host_id == target.host.host_id
+                and target.host.sandbox_provider is not None
+                and target.host.sandbox_provider
+                in profile_catalog.managed_providers(target.host.sandbox_provider)
+            )
+            if host_profile is None and (
+                legacy_continuation
+                or (target.conv.family_id is not None and flags.enabled(Feature.SIBLING_SESSIONS))
+            ):
+                # Capture the binding after any preceding launch has finished.
+                profile_binding = await asyncio.to_thread(
+                    conversation_store.get_profile_host_binding,
+                    body.session_id,
+                )
 
             if body.git is not None:
                 if body.git.existing_worktree:
@@ -2106,7 +2206,7 @@ def create_hosts_router(
                 retained = await asyncio.to_thread(
                     retained_runner_ids, conversation_store, host_id, body.session_id
                 )
-                bound = await asyncio.to_thread(
+                bound = host_profile is not None or await asyncio.to_thread(
                     conversation_store.set_runner_id,
                     body.session_id,
                     runner_id,
@@ -2125,6 +2225,7 @@ def create_hosts_router(
 
             async def persist_binding() -> None:
                 """Record cleanup identity before making the new binding visible."""
+                nonlocal profile_binding
                 if worktree is not None or worktree_root is not None:
                     from omnigent.server.routes._host_worktree import (
                         WORKTREE_ROOT_LABEL_KEY,
@@ -2159,14 +2260,43 @@ def create_hosts_router(
                             body.session_id,
                             WORKTREE_ROOT_LABEL_KEY,
                         )
-                await asyncio.to_thread(
-                    conversation_store.set_host_id,
-                    body.session_id,
-                    host_id,
-                    workspace,
-                    git_branch,
-                    placed_worktree,
-                )
+                if host_profile is not None:
+                    try:
+                        profile_binding = await asyncio.to_thread(
+                            conversation_store.get_profile_host_binding, body.session_id
+                        )
+                        tunnels = getattr(request.app.state, "tunnel_registry", None)
+                        if (
+                            profile_binding.runner_id is not None
+                            and tunnels is not None
+                            and tunnels.get(profile_binding.runner_id) is not None
+                        ):
+                            raise HTTPException(
+                                status_code=409, detail="The previous runner is still connected"
+                            )
+                        await asyncio.to_thread(
+                            conversation_store.bind_profiled_host,
+                            body.session_id,
+                            host_id,
+                            workspace,
+                            host_profile,
+                            runner_id=runner_id,
+                            git_branch=git_branch,
+                            worktree=placed_worktree,
+                            expected_binding=profile_binding,
+                            replace_stale_runner=True,
+                        )
+                    except ValueError as exc:
+                        raise HTTPException(status_code=409, detail=str(exc)) from exc
+                else:
+                    await asyncio.to_thread(
+                        conversation_store.set_host_id,
+                        body.session_id,
+                        host_id,
+                        workspace,
+                        git_branch,
+                        placed_worktree,
+                    )
 
             persist_task = asyncio.create_task(persist_binding())
             try:
@@ -2210,14 +2340,19 @@ def create_hosts_router(
                 startup=startup,
                 startup_required=startup is not None,
                 harness=harness,
+                mcp_disabled_servers_active_harnesses=host_registry.mcp_disabled_servers_active_harnesses(),
                 inference_config=(
                     target.conv.inference_snapshot["runtime_config"]
                     if target.conv.inference_snapshot
                     else None
                 ),
                 retain_runner_ids=retained,
-                # The session had no runner bound, so nothing is superseded.
-                superseded_runner_ids=(),
+                superseded_runner_ids=(
+                    (profile_binding.runner_id,)
+                    if profile_binding is not None and profile_binding.runner_id is not None
+                    else ()
+                ),
+                session_env_handoff_id=body.session_env_handoff_id,
             )
         )
         try:
@@ -2231,11 +2366,13 @@ def create_hosts_router(
             ) from None
 
         launch_timeout_s = resolve_launch_timeout_s()
+        launch_sent_at = time.monotonic()
         try:
             result = await asyncio.wait_for(
                 future,
                 timeout=launch_timeout_s,
             )
+            add_audit_attrs(host_launch_ack_ms=round((time.monotonic() - launch_sent_at) * 1000))
         except TimeoutError:
             conn.pending_launches.pop(request_id, None)
             # An unacknowledged admitted runner may still start. Retain its binding

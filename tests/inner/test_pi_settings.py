@@ -564,7 +564,7 @@ def test_scoped_inline_launch_admits_only_reviewed_versions(tmp_path, monkeypatc
 
 
 def test_prepare_managed_pi_agent_dir_links_only_supported_resources(tmp_path: Path) -> None:
-    """Supported resources are linked; instructions and session state stay isolated."""
+    """Supported resources and context files are linked; prompts and session state are not."""
     global_agent = tmp_path / "global-agent"
     for directory in (
         "npm",
@@ -582,7 +582,9 @@ def test_prepare_managed_pi_agent_dir_links_only_supported_resources(tmp_path: P
         "keybindings.json",
         "auth.json",
         "models.json",
+        "AGENTS.override.md",
         "AGENTS.md",
+        "CLAUDE.md",
         "SYSTEM.md",
         "APPEND_SYSTEM.md",
     ):
@@ -602,6 +604,9 @@ def test_prepare_managed_pi_agent_dir_links_only_supported_resources(tmp_path: P
         "prompts",
         "themes",
         "keybindings.json",
+        "AGENTS.override.md",
+        "AGENTS.md",
+        "CLAUDE.md",
     ):
         if name in {"mcp.json", "mcp-auth.json", "keybindings.json"}:
             assert not (managed / name).is_symlink()
@@ -643,6 +648,39 @@ def test_prepare_managed_pi_agent_dir_preserves_unowned_entries_on_reuse(tmp_pat
     assert (managed / "mcp-auth.json").readlink() == tmp_path / "removed-auth.json"
     assert (managed / "git").readlink() == global_agent / "git"
     assert not (managed / "npm").is_symlink() and (managed / "npm").is_dir()
+
+
+def test_prepare_managed_pi_agent_dir_keeps_links_resolving_to_the_source(tmp_path: Path) -> None:
+    """A link to an alias of its source (as AGENTS.MD is on macOS) is not replaced."""
+    global_agent = tmp_path / "global-agent"
+    global_agent.mkdir()
+    (global_agent / "AGENTS.md").write_text("global", encoding="utf-8")
+    alias = tmp_path / "alias.md"
+    alias.symlink_to(global_agent / "AGENTS.md")
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "AGENTS.md").symlink_to(alias)
+
+    prepare_managed_pi_agent_dir(managed, global_agent_dir=global_agent)
+
+    assert (managed / "AGENTS.md").readlink() == alias
+
+
+@pytest.mark.parametrize("name", ["AGENTS.MD", "CLAUDE.MD"])
+def test_prepare_managed_pi_agent_dir_links_uppercase_context_files(
+    tmp_path: Path, name: str
+) -> None:
+    """Pi also reads uppercase context file names from the global agent dir."""
+    global_agent = tmp_path / "global-agent"
+    global_agent.mkdir()
+    (global_agent / name).write_text("global", encoding="utf-8")
+    managed = tmp_path / "managed"
+    managed.mkdir()
+
+    prepare_managed_pi_agent_dir(managed, global_agent_dir=global_agent)
+
+    assert (managed / name).is_symlink()
+    assert (managed / name).samefile(global_agent / name)
 
 
 @pytest.mark.parametrize("parent_relative_root", [False, True])

@@ -1,6 +1,7 @@
 import { appConfig } from "./appConfig";
 import { IdentityAwareSidebarDataProvider } from "./hooks/useSidebarData";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { APP_QUERY_DEFAULTS } from "./lib/queryRetry";
 import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
@@ -22,6 +23,7 @@ import { isLoginRedirectPending, resolveIdentity, setSessionHostResolver } from 
 import { installKeepWarmSessionRefresh } from "./lib/keepWarmSessionRefresh";
 import { hideNativeChatTerminalBar } from "./lib/nativeChatTerminalBar";
 import { applyMacElectronShellAttribute } from "./lib/nativeBridge";
+import { applyMobileAppTargetAttribute } from "./lib/mobileAppTargets";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
 import {
@@ -29,6 +31,7 @@ import {
   applyUiFontFamily,
   readUiFontFamily,
 } from "./lib/uiFontPreferences";
+import { migrateLegacyProjectFolderPagination } from "./lib/projectFolderPaginationPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
 import { initChatStore } from "./store/chatStore";
@@ -49,7 +52,7 @@ initBrowserTelemetry();
 // `refetchOnWindowFocus: true` on that specific `useQuery`.
 const queryClient = new QueryClient({
   defaultOptions: {
-    queries: { staleTime: 30_000, refetchOnWindowFocus: false },
+    queries: APP_QUERY_DEFAULTS,
   },
 });
 
@@ -89,6 +92,7 @@ initNativeInsets();
 
 // Scope the macOS frameless-window CSS from <html> before first paint.
 applyMacElectronShellAttribute();
+applyMobileAppTargetAttribute();
 
 // The Chat/Terminal switcher lives in the header (ViewModeToggle) on every
 // shell; assert the iOS shell's legacy bottom pill hidden before the router
@@ -110,6 +114,7 @@ if (typeof window !== "undefined") {
     // localStorage access errors are non-fatal.
   }
 }
+migrateLegacyProjectFolderPagination();
 
 // Apply the saved color palette (data-theme on <html>) before first paint too,
 // so the app renders in the chosen theme rather than flashing the brand default.

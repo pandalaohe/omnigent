@@ -21,6 +21,8 @@ _KINDS = {"permission", "question", "auth"}
 _VALUE = re.compile(r"[A-Za-z0-9_.,+/=-]*")
 _SEGMENT = re.compile(r"[A-Za-z0-9_.+-]{1,32}")
 _REPLY = b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\"
+# A child that stops reading its input cannot queue query replies without bound.
+_UNSENT_INPUT_LIMIT = 1 << 20
 
 
 @dataclass(frozen=True)
@@ -325,7 +327,8 @@ def relay(path: Path, app: str, command: list[str], *, owner_pid: int | None = N
             save()
 
     def reply() -> None:
-        pending_input.extend(_REPLY)
+        if len(pending_input) < _UNSENT_INPUT_LIMIT:
+            pending_input.extend(_REPLY)
 
     def resize(_signum: int, _frame: object) -> None:
         with contextlib.suppress(OSError):
@@ -340,6 +343,7 @@ def relay(path: Path, app: str, command: list[str], *, owner_pid: int | None = N
 
     parser = ProgramStatusParser(on_report=record, on_query=reply, on_reset=reset)
     try:
+        os.set_blocking(master, False)
         tty.setraw(0)
         for fd in (0, 1, master):
             os.set_blocking(fd, False)
@@ -364,9 +368,9 @@ def relay(path: Path, app: str, command: list[str], *, owner_pid: int | None = N
             if stopping_at is not None and time.monotonic() - stopping_at > 2:
                 break
             readers = []
-            if stdin_open and len(pending_input) < 65536:
+            if stdin_open and not pending_input:
                 readers.append(0)
-            if master_open and len(pending_output) < 65536 and len(pending_input) < 65536:
+            if master_open and len(pending_output) < 65536:
                 readers.append(master)
             writers = ([master] if pending_input else []) + ([1] if pending_output else [])
             readable, writable, _ = select.select(readers, writers, [], 0.2)
@@ -381,8 +385,14 @@ def relay(path: Path, app: str, command: list[str], *, owner_pid: int | None = N
                     drain_deadline = None
             for fd, pending in ((master, pending_input), (1, pending_output)):
                 if fd in writable:
-                    with contextlib.suppress(BlockingIOError):
+                    try:
                         del pending[: os.write(fd, pending)]
+                    except BlockingIOError:
+                        pass
+                    except OSError as exc:
+                        if fd != master or exc.errno != errno.EIO:
+                            raise
+                        pending_input.clear()
             if master_open and master in readable:
                 try:
                     data = os.read(master, 65536)
@@ -423,6 +433,9 @@ def relay(path: Path, app: str, command: list[str], *, owner_pid: int | None = N
                 break
     finally:
         try:
+            if stopping_at is not None and exit_status is None:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pid, signal.SIGKILL)
             # A child exiting its controlling PTY may wait for the master to close.
             os.close(master)
             # PTY EOF can precede waitpid readiness; allow the child's real exit to arrive.

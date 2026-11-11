@@ -75,7 +75,7 @@ def test_cockroachdb_upgrades_from_supported_baseline(db_uri: str) -> None:
         connection.commit()
 
     # Upstream's lineage stays at its own head, which the current head joins.
-    assert set(_get_current_db_heads(engine)) == {baseline, "d0a1f879a01d"}
+    assert set(_get_current_db_heads(engine)) == {baseline, "f9b3e6c2a401"}
 
     _initialize_or_verify_schema(engine, db_uri)
 

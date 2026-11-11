@@ -36,10 +36,19 @@ export function useWorkspaceTabHotkeys(
 
   useEffect(() => {
     if (!enabled) return;
+    let held: string | null = null;
     const onKeyDown = (event: globalThis.KeyboardEvent): void => {
-      if (event.repeat) return;
+      if (event.repeat) {
+        if (held === event.code) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        return;
+      }
+      held = null;
       for (const tabNumber of [1, 2, 3, 4] as const) {
         if (!eventMatchesShortcutAction(event, TAB_ACTION_IDS[tabNumber])) continue;
+        held = event.code;
         event.preventDefault();
         event.stopPropagation();
         latest.current(tabNumber);
@@ -52,10 +61,10 @@ export function useWorkspaceTabHotkeys(
         latest.current(tabNumber);
       }
     };
-    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keydown", onKeyDown, true);
     window.addEventListener(SELECT_WORKSPACE_TAB_ACTION_EVENT, onAction);
     return () => {
-      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keydown", onKeyDown, true);
       window.removeEventListener(SELECT_WORKSPACE_TAB_ACTION_EVENT, onAction);
     };
   }, [enabled]);

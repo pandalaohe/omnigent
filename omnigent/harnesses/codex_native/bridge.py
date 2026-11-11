@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Literal
 from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR
 from omnigent.harnesses.codex_egress import CertificateFailure
 from omnigent.native import native_bridge_common, policy_allow_cache
+from omnigent.process_logging import DATA_DIR_ENV_VAR
 
 if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
@@ -101,7 +102,7 @@ _MCP_CONFIG_FILE = "bridge.json"
 # prep time (the Omnigent URL + auth do not change across thread rotations),
 # whereas ``state.json`` mutates on every turn/thread change.
 _POLICY_HOOK_FILE = "policy_hook.json"
-_BRIDGE_ROOT = Path.home() / ".omnigent" / "codex-native"
+_BRIDGE_ROOT = native_bridge_common.native_bridge_data_dir() / "codex-native"
 _ORPHAN_RETENTION_SECONDS = native_bridge_common.ORPHAN_RETENTION_SECONDS
 _ORPHAN_CACHE_TRIM_SECONDS = 7 * 24 * 60 * 60
 #: Regenerable ``codex-home`` entries safe to drop from a resumable bridge.
@@ -204,6 +205,11 @@ class CodexNativeBridgeState:
         ``"/home/user/project"``.
     :param active_turn_id: Current Codex turn id, if one is running,
         e.g. ``"turn_abc123"``.
+    :param pending_shell_command_id: Submission awaiting authoritative turn reconciliation.
+    :param pending_shell_parent_turn_id: Turn that was active before that submission.
+    :param active_shell_turn_id: Standalone shell turn that cannot process prompts.
+    :param active_turn_revision: Incremented whenever the active turn is set or
+        cleared, so a late acknowledgement can tell that turns changed meanwhile.
     """
 
     session_id: str
@@ -220,6 +226,10 @@ class CodexNativeBridgeState:
     input_turn_id: str | None = None
     retry_inputs: dict[str, str | None] = dataclass_field(default_factory=dict)
     retry_sources: dict[str, str] = dataclass_field(default_factory=dict)
+    pending_shell_command_id: str | None = None
+    pending_shell_parent_turn_id: str | None = None
+    active_shell_turn_id: str | None = None
+    active_turn_revision: int = 0
 
 
 @dataclass(frozen=True)
@@ -635,6 +645,7 @@ def codex_mcp_config_overrides(
     return [
         f'mcp_servers.omnigent.command="{python}"',
         f"mcp_servers.omnigent.args={args_toml}",
+        f"mcp_servers.omnigent.env.{DATA_DIR_ENV_VAR}={json.dumps(str(native_bridge_common.native_bridge_data_dir()))}",
     ]
 
 
@@ -1426,6 +1437,10 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                         if state.permission_profile is not None
                         else {}
                     ),
+                    "pending_shell_command_id": state.pending_shell_command_id,
+                    "pending_shell_parent_turn_id": state.pending_shell_parent_turn_id,
+                    "active_shell_turn_id": state.active_shell_turn_id,
+                    "active_turn_revision": state.active_turn_revision,
                 },
                 handle,
                 sort_keys=True,
@@ -1457,6 +1472,21 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
                 state,
                 retry_inputs={**state.retry_inputs, **previous.retry_inputs},
                 retry_sources={**state.retry_sources, **previous.retry_sources},
+            )
+        current = previous
+        if current is not None and (
+            current.session_id == state.session_id
+            and current.thread_id == state.thread_id
+            and current.socket_path == state.socket_path
+            and current.codex_home == state.codex_home
+        ):
+            state = replace(
+                state,
+                active_turn_revision=max(
+                    current.active_turn_revision
+                    + int(state.active_turn_id != current.active_turn_id),
+                    state.active_turn_revision,
+                ),
             )
         _write_bridge_state_unlocked(bridge_dir, state)
     # A new or rotated session's policies were never checked.
@@ -2065,6 +2095,20 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
             if isinstance(permission_profile, str) and permission_profile
             else None,
             helper_stop_pending=raw.get("helper_stop_pending") is True,
+            pending_shell_command_id=(
+                value if isinstance(value := raw.get("pending_shell_command_id"), str) else None
+            ),
+            pending_shell_parent_turn_id=(
+                value
+                if isinstance(value := raw.get("pending_shell_parent_turn_id"), str)
+                else None
+            ),
+            active_shell_turn_id=(
+                value if isinstance(value := raw.get("active_shell_turn_id"), str) else None
+            ),
+            active_turn_revision=(
+                value if isinstance(value := raw.get("active_turn_revision"), int) else 0
+            ),
         ),
         "ready",
     )
@@ -2157,18 +2201,84 @@ def update_active_turn_id(
     """
     with _bridge_state_lock(bridge_dir):
         state = read_bridge_state(bridge_dir)
+        if state is not None:
+            _replace_active_turn_id_unlocked(bridge_dir, state, active_turn_id, input_id=input_id)
+
+
+def record_acknowledged_turn_id(
+    bridge_dir: Path,
+    sent_state: CodexNativeBridgeState,
+    turn_id: str,
+    *,
+    input_id: str | None = None,
+) -> bool:
+    """
+    Record the turn a ``turn/start`` or ``turn/steer`` response acknowledged.
+
+    While the request is in flight the forwarder may record a turn starting or
+    ending, and Codex can acknowledge ``turn/start`` on a busy thread with a
+    turn id that never starts. The forwarder's newer state wins in each case,
+    as does a relaunch, resume or thread rotation, which resets the revision.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param sent_state: Bridge state the request was sent against.
+    :param turn_id: Turn id from the response, e.g. ``"turn_abc123"``.
+    :returns: ``True`` when bridge state names *turn_id*, ``False`` when it
+        was missing or the session, thread, app-server or active turn changed
+        after *sent_state*.
+    """
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
         if state is None:
-            return
-        updated = replace(
+            return False
+        if state.active_turn_id == turn_id:
+            _replace_active_turn_id_unlocked(bridge_dir, state, turn_id, input_id=input_id)
+            return True
+        if (
+            state.session_id != sent_state.session_id
+            or state.thread_id != sent_state.thread_id
+            or state.socket_path != sent_state.socket_path
+            or state.codex_home != sent_state.codex_home
+            or state.active_turn_id != sent_state.active_turn_id
+            or state.active_turn_revision != sent_state.active_turn_revision
+        ):
+            return False
+        _replace_active_turn_id_unlocked(bridge_dir, state, turn_id, input_id=input_id)
+        return True
+
+
+def _replace_active_turn_id_unlocked(
+    bridge_dir: Path,
+    state: CodexNativeBridgeState,
+    active_turn_id: str | None,
+    *,
+    input_id: str | None = None,
+) -> None:
+    """Set the active turn id while the caller holds the bridge state lock."""
+    # An accepted steer often returns the turn already saved here. Rewriting
+    # it can fail on a full disk after Codex has accepted the message.
+    if (
+        (
+            input_id is None
+            or (state.input_id == input_id and state.input_turn_id == active_turn_id)
+        )
+        and state.active_turn_id == active_turn_id
+        and (active_turn_id is not None or state.active_shell_turn_id is None)
+    ):
+        return
+    _write_bridge_state_unlocked(
+        bridge_dir,
+        replace(
             state,
             active_turn_id=active_turn_id,
+            active_shell_turn_id=(
+                active_turn_id if state.active_shell_turn_id == active_turn_id else None
+            ),
             input_id=input_id if input_id is not None else state.input_id,
             input_turn_id=active_turn_id if input_id is not None else state.input_turn_id,
-        )
-        # Avoid rewriting an accepted steer on a full disk, while still binding
-        # a newly accepted input to a turn that was already active.
-        if updated != state:
-            _write_bridge_state_unlocked(bridge_dir, updated)
+            active_turn_revision=state.active_turn_revision + 1,
+        ),
+    )
 
 
 def record_usage_admission(
@@ -2224,6 +2334,86 @@ def ack_usage_completion(bridge_dir: Path, session_id: str, admission_id: str) -
         )
 
 
+def mark_shell_command_pending(
+    bridge_dir: Path, state: CodexNativeBridgeState, request_id: str
+) -> bool:
+    """Record a shell submission before its empty RPC acknowledgement can arrive."""
+    with _bridge_state_lock(bridge_dir):
+        current = read_bridge_state(bridge_dir)
+        if (
+            current is None
+            or current.session_id != state.session_id
+            or current.thread_id != state.thread_id
+            or current.socket_path != state.socket_path
+            or current.pending_shell_command_id is not None
+        ):
+            return False
+        _write_bridge_state_unlocked(
+            bridge_dir,
+            replace(
+                current,
+                pending_shell_command_id=request_id,
+                pending_shell_parent_turn_id=current.active_turn_id,
+            ),
+        )
+        return True
+
+
+def clear_pending_shell_command(bridge_dir: Path, request_id: str) -> None:
+    """Clear only a shell request whose non-delivery has been established."""
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is None or state.pending_shell_command_id != request_id:
+            return
+        _write_bridge_state_unlocked(
+            bridge_dir,
+            replace(state, pending_shell_command_id=None, pending_shell_parent_turn_id=None),
+        )
+
+
+def reconcile_shell_command_state(
+    bridge_dir: Path, observed: CodexNativeBridgeState, active_turn_id: str | None
+) -> None:
+    """Clear captured shell markers only after Codex's submission queue has drained."""
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if (
+            state is None
+            or state.session_id != observed.session_id
+            or state.thread_id != observed.thread_id
+            or state.socket_path != observed.socket_path
+        ):
+            return
+        updated = state
+        if (
+            observed.pending_shell_command_id is not None
+            and state.pending_shell_command_id == observed.pending_shell_command_id
+            and (active_turn_id is None or active_turn_id == observed.pending_shell_parent_turn_id)
+        ):
+            updated = replace(
+                state,
+                pending_shell_command_id=None,
+                pending_shell_parent_turn_id=None,
+            )
+        # Older bridges persisted an observed standalone shell separately.
+        if (
+            observed.active_shell_turn_id is not None
+            and state.active_shell_turn_id == observed.active_shell_turn_id
+            and active_turn_id != observed.active_shell_turn_id
+        ):
+            updated = replace(
+                updated,
+                active_shell_turn_id=None,
+                active_turn_id=(
+                    None
+                    if state.active_turn_id == observed.active_shell_turn_id
+                    else state.active_turn_id
+                ),
+            )
+        if updated != state:
+            _write_bridge_state_unlocked(bridge_dir, updated)
+
+
 def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | None = None) -> None:
     """
     Update the Codex thread id in bridge state.
@@ -2249,6 +2439,8 @@ def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | Non
                 active_turn_id=active_turn_id,
                 retry_inputs=state.retry_inputs if state.thread_id == thread_id else {},
                 retry_sources=state.retry_sources if state.thread_id == thread_id else {},
+                cwd=state.cwd,
+                active_turn_revision=state.active_turn_revision + 1,
             ),
         )
 
@@ -2311,11 +2503,18 @@ def clear_active_turn_id_if_matches(
             # No-id terminal mid-turn is ambiguous — ignore (clearing posts a premature idle).
             if state.active_turn_id is not None:
                 return False
-        elif state.active_turn_id != completed_turn_id:
+        elif state.active_turn_id != completed_turn_id and not (
+            state.active_turn_id is None and state.active_shell_turn_id == completed_turn_id
+        ):
             return False
         _write_bridge_state_unlocked(
             bridge_dir,
-            replace(state, active_turn_id=None),
+            replace(
+                state,
+                active_turn_id=None,
+                active_shell_turn_id=None,
+                active_turn_revision=state.active_turn_revision + 1,
+            ),
         )
         _run_on_cleared()
         return True

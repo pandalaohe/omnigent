@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -39,7 +40,9 @@ from omnigent.harness_aliases import HARNESS_ALIASES, NATIVE_HARNESSES, canonica
 from omnigent.harness_availability import (
     CODEX_CANONICAL_HARNESSES,
     HARNESS_BINARY_MISSING,
+    HARNESS_CLI_UNRESPONSIVE,
     HARNESS_NEEDS_AUTH,
+    HARNESS_TMUX_UNAVAILABLE,
     HarnessAvailability,
 )
 from omnigent.harness_plugins import harness_install_keys, valid_harnesses
@@ -73,6 +76,7 @@ from omnigent.onboarding.provider_config import (
     default_provider_for_harness,
     load_config,
 )
+from omnigent.util.tmux_compat import tmux_unavailable_reason
 
 # In-process SDK harnesses: no CLI binary to gate on. The launch gate never
 # blocks them (spec-level auth is invisible here), but the picker map reports
@@ -212,7 +216,7 @@ def _install_key(canonical: str) -> str:
     return _HARNESS_FAMILY.get(canonical) or PI_KEY
 
 
-def _harness_availability_core(harness: str) -> HarnessAvailability:
+def _harness_availability_core(harness: str, *, launch: bool = False) -> HarnessAvailability:
     """Return the detailed availability state for *harness*.
 
     Mirrors :func:`harness_is_configured` but preserves the distinction
@@ -251,15 +255,15 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         # on that binary. Keep the missing-binary case as the historical bare
         # ``False`` sentinel, surfacing an outdated version only as
         # ``"version-too-low"``.
-        return _installer_only_availability(CURSOR_KEY)
+        return _installer_only_availability(CURSOR_KEY, launch=launch)
     if canonical in _KIRO_NATIVE_HARNESSES:
-        return _installer_only_availability(KIRO_KEY)
+        return _installer_only_availability(KIRO_KEY, launch=launch)
     if canonical in _GOOSE_NATIVE_HARNESSES or canonical == GOOSE_KEY:
-        return _installer_only_availability(GOOSE_KEY)
+        return _installer_only_availability(GOOSE_KEY, launch=launch)
     if canonical in _HERMES_NATIVE_HARNESSES or canonical == HERMES_KEY:
-        return _installer_only_availability(HERMES_KEY)
+        return _installer_only_availability(HERMES_KEY, launch=launch)
     if canonical in _DEVIN_NATIVE_HARNESSES:
-        return _installer_only_availability(DEVIN_KEY)
+        return _installer_only_availability(DEVIN_KEY, launch=launch)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -315,17 +319,17 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         # version skew).
         return True
     install_key = _install_key(canonical)
-    availability = _installer_only_availability(install_key)
+    availability = _installer_only_availability(install_key, launch=launch)
     # Families that authenticate via file-based credentials (not a CLI login
     # command) require both the binary AND a stored credential. The ``agy`` CLI
     # falls into this category: it has no ``agy login`` subcommand and writes
     # OAuth creds on the first interactive browser run instead.
-    if availability is not True:
+    if availability is not True and availability != HARNESS_CLI_UNRESPONSIVE:
         return availability
     credential_check = _FAMILY_CREDENTIAL_CHECK.get(install_key)
-    if credential_check is not None:
-        return credential_check()
-    return True
+    if credential_check is not None and not credential_check():
+        return False
+    return availability
 
 
 # Native CLI harnesses that authenticate via their own login command and can
@@ -883,7 +887,7 @@ def _sdk_harness_availability(canonical: str) -> HarnessAvailability:
     return HARNESS_NEEDS_AUTH
 
 
-def _installer_only_availability(install_key: str) -> HarnessAvailability:
+def _installer_only_availability(install_key: str, *, launch: bool = False) -> HarnessAvailability:
     """Return availability for a binary-gated harness without login commands.
 
     Mirrors :func:`_binary_availability_reason` but keeps the historical bare
@@ -891,7 +895,12 @@ def _installer_only_availability(install_key: str) -> HarnessAvailability:
     simple boolean get that and only learn about structured reasons when the
     binary is present but on an unsupported version.
     """
-    state = _binary_availability_reason(install_key)
+    try:
+        state = harness_cli_readiness(
+            install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S, raise_on_timeout=True
+        )
+    except subprocess.TimeoutExpired:
+        state = HARNESS_CLI_UNRESPONSIVE
     if state == HARNESS_BINARY_MISSING:
         return False
     return state
@@ -903,9 +912,16 @@ def _binary_availability_reason(install_key: str) -> HarnessAvailability:
     Distinguishes a genuinely missing CLI from a selected executable that is
     outside the version range the native harness requires. The latter is
     exposed to the web UI as ``"version-too-low"`` so the user sees a prompt
-    to upgrade rather than "binary-missing".
+    to upgrade rather than "binary-missing". A resolved executable whose
+    ``--version`` probe times out reports ``"cli-unresponsive"``: its version
+    is unknown, not outdated.
     """
-    return harness_cli_readiness(install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S)
+    try:
+        return harness_cli_readiness(
+            install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S, raise_on_timeout=True
+        )
+    except subprocess.TimeoutExpired:
+        return HARNESS_CLI_UNRESPONSIVE
 
 
 def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailability:
@@ -913,6 +929,7 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
 
     :returns: ``"binary-missing"`` when the CLI isn't installed,
         ``"version-too-low"`` when the CLI is present but too old,
+        ``"cli-unresponsive"`` when its version probe timed out,
         ``"needs-auth"`` when installed but neither a configured provider
         credential nor a CLI login is present, else ``True``.
     """
@@ -920,9 +937,8 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
     if binary_state is not True:
         return binary_state
     if install_key == OPENCODE_KEY:
-        from omnigent.onboarding.opencode_auth import opencode_auth_summary
-
-        return True if opencode_auth_summary().has_provider else "needs-auth"
+        # OpenCode's built-in free models run without any provider sign-in.
+        return True
     # claude: ready when EITHER an omnigent-managed provider serves the family
     # (an API key / gateway the user set, incl. from the UI) OR the harness's
     # own subscription login is present (`claude auth status`, a subprocess —
@@ -1009,7 +1025,8 @@ def harness_is_configured(harness: str) -> bool:
 
     The check is binary-only: an installed-but-not-logged-in CLI still
     returns ``True`` because auth failures surface at run time rather than
-    blocking dispatch.
+    blocking dispatch. A resolved CLI whose ``--version`` probe timed out
+    also returns ``True``; the launch, not this probe, reports a real failure.
 
     :param harness: A harness id, e.g. ``"claude-native"``, ``"codex"``,
         ``"openai-agents"``, ``"agents_sdk"``, ``"kiro-native"``, ``"pi"``,
@@ -1018,7 +1035,13 @@ def harness_is_configured(harness: str) -> bool:
         daemon doesn't gate); ``False`` when the binary is missing or on
         an unsupported version.
     """
-    return _harness_availability_core(harness) is True
+    availability = _harness_availability_core(harness, launch=True)
+    if availability == HARNESS_CLI_UNRESPONSIVE:
+        _logger.warning(
+            "harness %r CLI did not respond to --version; launching unverified", harness
+        )
+        return True
+    return availability is True
 
 
 def _is_codex_family_harness(canonical: str) -> bool:
@@ -1026,6 +1049,21 @@ def _is_codex_family_harness(canonical: str) -> bool:
     return (
         canonical in CODEX_CANONICAL_HARNESSES and _HARNESS_FAMILY.get(canonical) == OPENAI_FAMILY
     )
+
+
+def _with_tmux_requirement(
+    canonical: str, availability: HarnessAvailability, tmux_usable: bool
+) -> HarnessAvailability:
+    """Report a ready native harness as blocked on an unusable tmux.
+
+    Every other state keeps precedence and is fixed first. ``needs-auth``
+    stays so sign-in status stays visible. Because only ``True`` is replaced,
+    ``"tmux-unavailable"`` also means the CLI is installed and signed in, and
+    an older server can be sent ``True`` in its place.
+    """
+    if tmux_usable or canonical not in NATIVE_HARNESSES or availability is not True:
+        return availability
+    return HARNESS_TMUX_UNAVAILABLE
 
 
 def configured_harness_map() -> dict[str, HarnessAvailability]:
@@ -1037,7 +1075,9 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     harnesses map to ``True``; CLI wrappers report local binary/auth readiness; SDK
     harnesses report ``"needs-auth"`` when no local credential source is
     visible. Codex entries distinguish ``"binary-missing"`` from
-    ``"needs-auth"``.
+    ``"needs-auth"``. Ready native (tmux-backed) harnesses report
+    ``"tmux-unavailable"`` when this host's tmux is missing or too old; tmux is
+    probed once per call.
 
     :returns: Mapping of harness spelling to readiness, e.g.
         ``{"claude-native": False, "codex-native": "needs-auth",
@@ -1089,14 +1129,19 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
         max_workers=min(_READINESS_PROBE_MAX_WORKERS, len(canonical_by_cache_key)),
         thread_name_prefix="harness-readiness",
     ) as executor:
+        # Windows natives already report False, so there is no tmux to probe.
+        tmux_future = None if IS_WINDOWS else executor.submit(tmux_unavailable_reason)
         futures = {
             cache_key: executor.submit(_harness_availability, canonical)
             for cache_key, canonical in canonical_by_cache_key.items()
         }
         availability_cache = {cache_key: future.result() for cache_key, future in futures.items()}
+        tmux_usable = tmux_future is None or tmux_future.result() is None
 
     result = {
-        spelling: availability_cache[cache_key]
+        spelling: _with_tmux_requirement(
+            _canonical_harness(spelling), availability_cache[cache_key], tmux_usable
+        )
         for spelling, cache_key in cache_key_by_spelling.items()
     }
     for slug in acp_slugs:

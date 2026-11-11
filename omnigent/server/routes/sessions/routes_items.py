@@ -14,7 +14,7 @@ from fastapi import (
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation
 from omnigent.entities.pagination import PagedList
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -31,6 +31,9 @@ from omnigent.server.auth import (
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
+)
+from omnigent.server.routes._auth_helpers import (
+    is_session_owner as _is_session_owner,
 )
 from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
@@ -59,7 +62,10 @@ from omnigent.server.routes._sessions.subagent_reconciliation import (
 from omnigent.server.schemas import (
     ChildSessionList,
     PaginatedList,
+    SessionItemList,
     SessionItemsWindow,
+    SideChatList,
+    SideChatSummary,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
@@ -144,6 +150,15 @@ async def _lazy_reconcile_native_children(
             _subagent_reconcile_locks.pop(session_id, None)
 
 
+# ``?descendants=true`` depth: the default matches the CLI tree and the web
+# Agents rail; the cap bounds the in-memory walk.
+_DEFAULT_DESCENDANT_DEPTH = 3
+_MAX_DESCENDANT_DEPTH = 10
+# ``?descendants=true`` reads at most this many sub-agents of one spawn tree;
+# a bigger tree gets the one-level listing instead, which clients walk.
+_SPAWN_TREE_READ_CAP = 2000
+
+
 def register_items_routes(
     router: APIRouter,
     *,
@@ -157,7 +172,7 @@ def register_items_routes(
     @router.get(
         "/sessions/{session_id}/items",
         response_model=None,
-        responses={200: {"model": PaginatedList}, **STALE_CURSOR_RESPONSE},
+        responses={200: {"model": SessionItemList}, **STALE_CURSOR_RESPONSE},
     )
     async def list_session_items(
         request: Request,
@@ -183,7 +198,8 @@ def register_items_routes(
         :param before: Cursor — return items before this item ID.
         :param order: Sort order, ``"asc"`` (chronological,
             default) or ``"desc"``.
-        :returns: A :class:`PaginatedList` of conversation items.
+        :returns: A page of flattened conversation items, documented as
+            :class:`SessionItemList`.
         :raises OmnigentError: 404 if no session exists.
         """
         user_id = _get_user_id(request, auth_provider)
@@ -427,6 +443,8 @@ def register_items_routes(
         include_archived: bool = Query(default=False),
         zone: str | None = Query(default=None, pattern="^(active|past)$"),
         exclude_label: tuple[str, ...] = Query(default=()),
+        descendants: bool = Query(default=False),
+        max_depth: int = Query(default=_DEFAULT_DESCENDANT_DEPTH, ge=1, le=_MAX_DESCENDANT_DEPTH),
     ) -> PaginatedList:
         """
         List sub-agent (child) sessions under a parent session.
@@ -479,6 +497,18 @@ def register_items_routes(
             sub-agent mirrors) without server-side knowledge of what the
             label means. A value missing ``"="`` or with an empty key is
             rejected as invalid input.
+        :param descendants: Return the whole subtree down to *max_depth*
+            in one response instead of one level, so a client drawing the
+            sub-agent tree makes one request rather than one per node.
+            Rows come breadth-first, each parent's children newest-first
+            (the order a per-level walk sees), with ``parent_session_id``
+            set to the row's own parent and ``depth`` set. *limit* and
+            *after* page through that order. A spawn tree of more than
+            2000 sub-agents gets the one-level listing instead (rows without
+            ``depth``), as from a server without this flag. *before*,
+            *order* and the title filters do not apply.
+        :param max_depth: Levels to return with *descendants*, ``1`` for
+            direct children only.
         :returns: A :class:`PaginatedList` of
             :class:`ChildSessionSummary` objects.
         :raises OmnigentError: 403 if the caller lacks READ on
@@ -518,6 +548,12 @@ def register_items_routes(
             parent = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if parent is None:
             raise _session_not_found()
+        if descendants:
+            subtree = await _list_descendant_sessions(
+                parent, limit=limit, after=after, max_depth=max_depth
+            )
+            if subtree is not None:
+                return subtree
         title_filter: str | None = None
         if tool and session_name:
             title_filter = f"{tool}:{session_name}"
@@ -563,4 +599,147 @@ def register_items_routes(
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,
+        )
+
+    async def _list_descendant_sessions(
+        parent: Conversation, *, limit: int, after: str | None, max_depth: int
+    ) -> PaginatedList | None:
+        """Return a page of *parent*'s sub-agent subtree, breadth-first.
+
+        Every sub-agent records the root of its spawn tree, so one bounded
+        read (:meth:`ConversationStore.list_spawn_tree`) returns the whole
+        tree and the subtree is cut out in memory. READ on *parent* covers
+        its descendants: a sub-agent's access is its parent chain's.
+
+        :param parent: The session the caller was authorized on.
+        :param limit: Maximum rows in the page.
+        :param after: Id of the last row of the previous page, or ``None``.
+        :param max_depth: Levels below *parent* to include.
+        :returns: The page with ``depth`` set, or ``None`` when the spawn tree
+            is too big for one read, in which case the caller answers with
+            the one-level listing a server without ``descendants`` gives.
+        :raises StaleCursorError: If *after* is not a row of the subtree, or
+            the tree outgrew one read since the page it came from.
+        """
+        page = await asyncio.to_thread(
+            conversation_store.list_spawn_tree,
+            parent.root_conversation_id or parent.id,
+            # The tree's root row plus up to the cap of sub-agents.
+            limit=_SPAWN_TREE_READ_CAP + 1,
+        )
+        if page.has_more:
+            if after is not None:
+                # The tree outgrew one read since the first page: this cursor
+                # cannot continue, so the client restarts.
+                raise StaleCursorError(after)
+            return None
+        # Rows come in the store's one-level listing order, so grouping keeps
+        # each parent's children in the order a per-level walk reads them.
+        children_of: dict[str, list[Conversation]] = {}
+        for row in page.data:
+            # An archived sub-agent hides its subtree, as in a per-level walk.
+            if row.parent_conversation_id and not row.archived:
+                children_of.setdefault(row.parent_conversation_id, []).append(row)
+        ordered: list[Conversation] = []
+        depths: dict[str, int] = {}
+        parent_ids: dict[str, str] = {}
+        frontier = [parent.id]
+        seen = {parent.id}
+        depth = 0
+        while frontier and depth < max_depth:
+            depth += 1
+            next_frontier: list[str] = []
+            for node_id in frontier:
+                for child in children_of.get(node_id, ()):
+                    if child.id in seen:
+                        continue
+                    seen.add(child.id)
+                    ordered.append(child)
+                    depths[child.id] = depth
+                    parent_ids[child.id] = node_id
+                    next_frontier.append(child.id)
+            frontier = next_frontier
+        start = 0
+        if after is not None:
+            position = next((i for i, c in enumerate(ordered) if c.id == after), None)
+            if position is None:
+                raise StaleCursorError(after)
+            start = position + 1
+        window = ordered[start : start + limit]
+        summaries = await _child_session_summaries_from_conversations(
+            window, parent.id, conversation_store, parent_ids=parent_ids
+        )
+        data = [s.model_copy(update={"depth": depths[s.id]}) for s in summaries]
+        return PaginatedList(
+            data=data,
+            first_id=data[0].id if data else None,
+            last_id=data[-1].id if data else None,
+            has_more=start + limit < len(ordered),
+        )
+
+    # ── GET /sessions/{session_id}/side_chats ────────────────────
+
+    @router.get(
+        "/sessions/{session_id}/side_chats",
+        response_model=None,
+        responses={200: {"model": SideChatList}},
+    )
+    async def list_side_chats(
+        request: Request,
+        session_id: str,
+        limit: int = Query(default=20, ge=1, le=20),
+        after: str | None = Query(default=None),
+    ) -> PaginatedList:
+        """
+        List the side chats available in a session's Workspace rail.
+
+        Only the owner of the session's root starts side chats there, so only
+        that owner gets any, in id order; anyone else, admins included, gets an
+        empty page. Opening and closing tabs is local to each device.
+
+        :param request: Inbound HTTP request; carries the caller identity.
+        :param session_id: Parent session id, e.g. ``"conv_abc123"``.
+        :param limit: Maximum side chats to return (1-20, default 20).
+        :param after: Cursor: the previous page's ``last_id``.
+        :returns: A :class:`PaginatedList` of :class:`SideChatSummary`.
+        :raises OmnigentError: 403 if the caller lacks READ on
+            ``session_id``; 404 if no session exists there.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        parent = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if parent is None:
+            raise _session_not_found()
+        # Only the owner of the parent's root starts its side chats, so they are all theirs.
+        if not await asyncio.to_thread(
+            _is_session_owner,
+            user_id,
+            parent,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ):
+            return PaginatedList(data=[], has_more=False)
+        ids = await asyncio.to_thread(
+            conversation_store.list_side_chat_ids, parent.id, after=after, limit=limit + 1
+        )
+        has_more = len(ids) > limit
+        ids = ids[:limit]
+        rows = await asyncio.to_thread(conversation_store.get_conversations, ids)
+        return PaginatedList(
+            data=[
+                SideChatSummary(
+                    id=side_id,
+                    created_at=rows[side_id].created_at,
+                    title=rows[side_id].title,
+                )
+                for side_id in ids
+                if side_id in rows
+            ],
+            first_id=ids[0] if ids else None,
+            last_id=ids[-1] if ids else None,
+            has_more=has_more,
         )

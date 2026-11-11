@@ -1771,7 +1771,7 @@ function hasInferenceBinding() {
   return process.env.OMNIGENT_PI_INFERENCE_BOUND === "1";
 }
 
-async function applyModelChange(pi, config, ctx, modelId) {
+async function applyModelChange(pi, config, ctx, modelId, thinkingLevel) {
   const id = typeof modelId === "string" ? modelId.trim() : "";
   if (!id) return false;
   const registry = ctx ? ctx.modelRegistry : undefined;
@@ -1852,6 +1852,10 @@ async function applyModelChange(pi, config, ctx, modelId) {
           "configured for it.",
       );
       return false;
+    }
+    // setModel restores Pi defaults; apply the composer's effort afterward.
+    if (typeof thinkingLevel === "string") {
+      await pi.setThinkingLevel(thinkingLevel);
     }
     return true;
   } catch (_err) {
@@ -2132,6 +2136,7 @@ function startInboxPoller(
         // back — so the returned promise is intentionally discarded.
         handleModelChange(
           typeof payload.model === "string" ? payload.model : undefined,
+          payload.thinkingLevel,
         );
       }
       if (payload.type === "thinking_level_change") {
@@ -2245,8 +2250,14 @@ module.exports = function (pi) {
     });
     return thinkingLevelReport;
   }
-  // Promise of the last inbox model_change, awaited by ``input``.
-  let pendingModelChange = null;
+  // Input waits for ordered model/effort changes, including Pi's async auth check.
+  let pendingSettingsChange = Promise.resolve();
+  function queueSettingsChange(change) {
+    pendingSettingsChange = pendingSettingsChange.then(change).catch(async () => {
+      await postModelChangeError(config, "Omnigent: updating Pi settings failed.");
+    });
+    return pendingSettingsChange;
+  }
   // Set once route-turn gives a final answer for this session (see ``input``).
   let turnRoutingDone = false;
   let pendingInterruptUntil = 0;
@@ -3231,12 +3242,11 @@ module.exports = function (pi) {
           compacting = false;
         }
       },
-      (model) => {
-        // Await the composer's async model switch before input binds the turn's model.
-        pendingModelChange = applyModelChange(pi, config, latestContext, model);
-        return pendingModelChange;
-      },
-      (level) => {
+      (model, thinkingLevel) =>
+        queueSettingsChange(() =>
+          applyModelChange(pi, config, latestContext, model, thinkingLevel),
+        ),
+      (level) => queueSettingsChange(() => {
         settingThinkingLevel = true;
         try {
           pi.setThinkingLevel(level);
@@ -3247,7 +3257,7 @@ module.exports = function (pi) {
         }
         // A clamped request can leave Pi unchanged and emit no native event.
         return reportThinkingLevel(true);
-      },
+      }),
       () => {
         // Prefer the SDK's live idle signal; fall back to the agent loop
         // state on SDK versions that don't expose isIdle() (same fallback
@@ -3657,11 +3667,7 @@ module.exports = function (pi) {
     setOmnigentStatus(config, ctx, "running");
     const text = event && typeof event.text === "string" ? event.text : "";
     if (!text) return;
-    if (pendingModelChange) {
-      const pending = pendingModelChange;
-      pendingModelChange = null;
-      await pending.catch(() => {});
-    }
+    await pendingSettingsChange;
     // Route TUI input once. Stop after a final decision or failure so later
     // prompts do not repeatedly wait for an unreachable server.
     if (!turnRoutingDone && event.source !== "extension" && !text.startsWith("/")) {

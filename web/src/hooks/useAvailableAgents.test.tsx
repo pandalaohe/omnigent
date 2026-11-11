@@ -11,7 +11,11 @@ import { SidebarDataProvider } from "./useSidebarData";
 import { useAgents } from "./useAgents";
 import { refreshScopeWindow } from "@/lib/sidebarData";
 import type { Conversation } from "./useConversations";
-import { useAvailableAgents, prefetchAvailableAgentDetails } from "./useAvailableAgents";
+import {
+  useAgentCatalog,
+  useAvailableAgents,
+  prefetchAvailableAgentDetails,
+} from "./useAvailableAgents";
 
 // The template catalog and sidebar Mine cache load through authenticatedFetch.
 // URL-keyed stubs exercise the real fetch and mapping path.
@@ -27,7 +31,8 @@ function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): 
 const fetchMock = vi.fn();
 
 const BUILTINS_URL = "/v1/agents";
-const MINE_URL = "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=mine";
+const MINE_URL =
+  "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=mine&expand_families=true";
 const HARNESSES_URL = "/v1/harnesses";
 
 /**
@@ -47,9 +52,10 @@ function routeFetch(routes: Record<string, Response>) {
 
 function wrapper({ children }: { children: ReactNode }) {
   // retry off so the no-network/error case resolves on the first
-  // attempt instead of stalling the test on TanStack's backoff.
+  // attempt instead of stalling the test on TanStack's backoff. Queries
+  // that set their own retry policy still retry, so make that immediate.
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
+    defaultOptions: { queries: { retry: false, retryDelay: 0 } },
   });
   return (
     <QueryClientProvider client={client}>
@@ -158,10 +164,11 @@ describe("useAvailableAgents", () => {
     client.setQueryData(mineKey, cache(rows));
     routeFetch({
       [BUILTINS_URL]: mockResponse({ data: [], has_more: false }),
-      "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=shared": mockResponse({
-        data: [{ ...rows[0], id: "shared", agent_id: "ag_shared", permission_level: 1 }],
-        has_more: false,
-      }),
+      "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=shared&expand_families=true":
+        mockResponse({
+          data: [{ ...rows[0], id: "shared", agent_id: "ag_shared", permission_level: 1 }],
+          has_more: false,
+        }),
     });
     const { result } = renderHook(
       () => ({
@@ -1694,5 +1701,72 @@ describe("useAvailableAgents user agents (scope=user)", () => {
 
     expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion"]);
     expect(fetchMock.mock.calls.some(([url]) => url === USER_AGENTS_URL)).toBe(true);
+  });
+});
+
+describe("useAgentCatalog", () => {
+  it("lists the caller's agents and flags ACP harnesses without a sidebar provider", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        data: [
+          { id: "ag_jcode", name: "jcode", harness: "jcode", builtin: true },
+          { id: "ag_polly", name: "polly", harness: "claude-sdk", builtin: true },
+        ],
+        has_more: false,
+      }),
+      "/v1/agents?scope=user&limit=50": mockResponse({
+        data: [{ id: "ag_helper", name: "my-helper", harness: "claude-sdk", builtin: false }],
+        has_more: false,
+      }),
+      [HARNESSES_URL]: mockResponse({
+        data: [
+          { id: "jcode", label: "Jcode", capabilities: { integration_mode: "acp-subprocess" } },
+        ],
+      }),
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(() => useAgentCatalog(), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>
+          <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, agent_install: true }}>
+            {children}
+          </CapabilitiesProvider>
+        </QueryClientProvider>
+      ),
+    });
+
+    await waitFor(() => {
+      expect(result.current.data?.find((a) => a.name === "my-helper")?.mine).toBe(true);
+      expect(result.current.data?.find((a) => a.name === "jcode")?.acpHarness).toBe(true);
+    });
+  });
+
+  it("reports a failed catalog and loads it on retry", async () => {
+    const harnesses = mockResponse({ data: [] });
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({ detail: "down" }, { ok: false, status: 503 }),
+      [HARNESSES_URL]: harnesses,
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(() => useAgentCatalog(), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>
+          <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>{children}</CapabilitiesProvider>
+        </QueryClientProvider>
+      ),
+    });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.data).toBeUndefined();
+
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        data: [{ id: "ag_polly", name: "polly", harness: "claude-sdk", builtin: true }],
+        has_more: false,
+      }),
+      [HARNESSES_URL]: harnesses,
+    });
+    act(() => result.current.retry());
+    await waitFor(() => expect(result.current.data?.map((a) => a.name)).toEqual(["polly"]));
+    expect(result.current.isError).toBe(false);
   });
 });

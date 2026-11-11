@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 
 import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { supportsDesktopCommands } from "@/lib/nativeBridge";
 import { useNavigate } from "@/lib/routing";
 import {
   eventMatchesShortcutAction,
@@ -9,16 +10,21 @@ import {
   isShortcutRecordingActive,
 } from "@/lib/keyboardShortcutPreferences";
 
-/** True for Cmd+Alt+, on Apple platforms or Ctrl+Alt+, elsewhere. */
+/**
+ * True for Cmd+Alt+, on Apple platforms or Ctrl+Alt+, elsewhere. Never in the
+ * desktop app, whose Settings menu item owns Cmd/Ctrl+, instead.
+ */
 export function isSettingsHotkey(
   event: globalThis.KeyboardEvent,
   isMac = isMacPlatform(),
+  desktopMenu = supportsDesktopCommands(),
 ): boolean {
   if (typeof event.getModifierState === "function" && event.getModifierState("AltGraph")) {
     return false;
   }
   if (isShortcutRecordingActive() || !isShortcutActionEnabled("openSettings")) return false;
   if (!hasCustomShortcutBindings("openSettings")) {
+    if (desktopMenu) return false;
     if (!hasCommandModifier(event, isMac) || !event.altKey || event.shiftKey) return false;
     return event.code === "Comma";
   }

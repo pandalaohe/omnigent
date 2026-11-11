@@ -26,6 +26,9 @@ _logger = logging.getLogger(__name__)
 
 SKILLS_DISCOVERY_WAIT_SECONDS = 2.0
 SKILLS_CACHE_TTL_SECONDS = 60.0
+# Incomplete catalogs stay cached just long enough to absorb bursts of requests
+# while a source keeps failing, and short enough that Retry rescans soon.
+INCOMPLETE_CATALOG_TTL_SECONDS = 5.0
 _MAX_CACHED_CATALOGS = 128
 
 
@@ -50,9 +53,11 @@ class HostSkillDiscovery:
     def __init__(self, fetch_bundle: Callable[[HostSkillsFrame], httpx.Response]) -> None:
         self._fetch_bundle = fetch_bundle
         self._lock = threading.Lock()
-        self._inflight: dict[tuple, asyncio.Task[list[dict[str, str]]]] = {}
+        self._inflight: dict[tuple, asyncio.Task[tuple[list[dict[str, str]], list[str]]]] = {}
+        # Each entry: expiry, catalog, and the warnings that make the catalog incomplete.
         self._cache: OrderedDict[
-            tuple[str | tuple[str, ...] | None, ...], tuple[float, list[dict[str, str]]]
+            tuple[str | tuple[str, ...] | None, ...],
+            tuple[float, list[dict[str, str]], list[str]],
         ] = OrderedDict()
 
     @staticmethod
@@ -69,7 +74,9 @@ class HostSkillDiscovery:
             else frame.skills_filter,
         )
 
-    async def discover_cached(self, frame: HostSkillsFrame, root: Path) -> list[dict[str, str]]:
+    async def discover_cached(
+        self, frame: HostSkillsFrame, root: Path, *, warnings: list[str] | None = None
+    ) -> list[dict[str, str]]:
         """Refresh once per target, bounding the wait only for opted-in pickers."""
         key = self._key(frame, root)
         with self._lock:
@@ -77,23 +84,40 @@ class HostSkillDiscovery:
             if cached is not None:
                 self._cache.move_to_end(key)
         if cached is not None and cached[0] > time.monotonic():
+            if warnings is not None:
+                warnings.extend(cached[2])
             return list(cached[1])
         task = self._inflight.get(key)
         if task is None:
-            task = asyncio.create_task(asyncio.to_thread(self.discover, frame, root))
+
+            def scan() -> tuple[list[dict[str, str]], list[str]]:
+                problems: list[str] = []
+                return self.discover(frame, root, warnings=problems), problems
+
+            task = asyncio.create_task(asyncio.to_thread(scan))
             self._inflight[key] = task
 
-            def finished(done: asyncio.Task[list[dict[str, str]]]) -> None:
+            def finished(
+                done: asyncio.Task[tuple[list[dict[str, str]], list[str]]],
+            ) -> None:
                 self._inflight.pop(key, None)
                 if not done.cancelled() and done.exception() is not None:
                     _logger.warning("Background skill discovery failed for %s", frame.harness)
 
             task.add_done_callback(finished)
         if cached is not None and frame.allow_pending:
+            if warnings is not None:
+                warnings.extend(cached[2])
             return list(cached[1])
         if frame.allow_pending:
-            return await asyncio.wait_for(asyncio.shield(task), SKILLS_DISCOVERY_WAIT_SECONDS)
-        return await asyncio.shield(task)
+            result, problems = await asyncio.wait_for(
+                asyncio.shield(task), SKILLS_DISCOVERY_WAIT_SECONDS
+            )
+        else:
+            result, problems = await asyncio.shield(task)
+        if warnings is not None:
+            warnings.extend(problems)
+        return result
 
     async def shutdown(self) -> None:
         """Drain task wrappers; running filesystem scans finish on their worker."""
@@ -103,17 +127,25 @@ class HostSkillDiscovery:
         await asyncio.gather(*tasks, return_exceptions=True)
         self._inflight.clear()
 
-    def discover(self, frame: HostSkillsFrame, root: Path) -> list[dict[str, str]]:
+    def discover(
+        self, frame: HostSkillsFrame, root: Path, *, warnings: list[str] | None = None
+    ) -> list[dict[str, str]]:
         """Return metadata for the exact launch target or effective session bundle."""
         key = self._key(frame, root)
         with self._lock:
             cached = self._cache.get(key)
             if cached is not None and cached[0] > time.monotonic():
                 self._cache.move_to_end(key)
+                if warnings is not None:
+                    warnings.extend(cached[2])
                 return list(cached[1])
+        problems: list[str] = []
         if frame.session_id is None:
             ctx = skill_source_context_from_env(
-                roots=(root,), harness=frame.harness, skills_filter=frame.skills_filter
+                roots=(root,),
+                harness=frame.harness,
+                skills_filter=frame.skills_filter,
+                warnings=problems,
             )
             skills = resolve_harness_skills(ctx, frame.harness)
         else:
@@ -135,14 +167,19 @@ class HostSkillDiscovery:
                 )
                 if frame.sub_agent_name:
                     spec, directory = _subagent_bundle(spec, directory, frame.sub_agent_name)
-                skills = resolve_session_skills(spec, (root, directory), directory)
+                skills = resolve_session_skills(
+                    spec, (root, directory), directory, warnings=problems
+                )
         result = [
             {"name": skill.name, "description": skill.description}
             | ({"display_name": skill.display_name} if skill.display_name else {})
             for skill in skills
         ]
+        if warnings is not None:
+            warnings.extend(problems)
+        ttl = INCOMPLETE_CATALOG_TTL_SECONDS if problems else SKILLS_CACHE_TTL_SECONDS
         with self._lock:
-            self._cache[key] = (time.monotonic() + SKILLS_CACHE_TTL_SECONDS, result)
+            self._cache[key] = (time.monotonic() + ttl, result, problems)
             self._cache.move_to_end(key)
             while len(self._cache) > _MAX_CACHED_CATALOGS:
                 self._cache.popitem(last=False)

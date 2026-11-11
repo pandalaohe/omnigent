@@ -115,6 +115,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
     terminals: list[str] = []
     members: list[dict[str, Any]] | None = None
     harness: str | None = None
+    loads_user_settings = True
     # Prefer the stored entity's description; fall back to the spec's
     # top-level description when the stored value is unset (single-file
     # YAML agents don't persist it at registration today). Lets the
@@ -155,6 +156,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         # Joint-Agent roster (lead first, then sub-agents), the same
         # projection custom agents report. None when unloadable.
         members = project_members(loaded.spec)
+        loads_user_settings = loaded.spec.loads_user_settings
     except Exception:
         _logger.debug(
             "Failed to load spec for agent %s; mcp_servers/skills/members will be empty",
@@ -178,6 +180,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         product_of=product_of,
         mcp_servers=mcp_servers,
         mcp_servers_editable=False,
+        loads_user_settings=loads_user_settings,
         skills=skills,
         terminals=terminals,
         members=members,

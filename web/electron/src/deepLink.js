@@ -19,14 +19,9 @@
 const { defaultSchemeFor } = require("./url");
 
 /**
- * Accepted SPA paths. `/c/<conversationId>` and `/archive/<conversationId>` —
- * a single path segment after the route, with an optional trailing slash.
- * Anything else (other routes,
- * nested paths, empty id) is dropped silently: an unrecognized deep link
- * must never crash or mis-navigate, and the SPA's own router stays the
- * authority on what a valid conversation id is.
+ * Accepts the server root and one-segment conversation/archive routes.
  */
-const DEEP_LINK_PATH_RE = /^\/(?:c|archive)\/[^/]+\/?$/;
+const DEEP_LINK_PATH_RE = /^\/$|^\/(?:c|archive)\/[^/]+\/?$/;
 const REFERENCE_ID_RE = /^[A-Za-z0-9_-]{1,256}$/;
 
 function archiveLocatorSearch(url) {
@@ -56,8 +51,8 @@ function archiveLocatorSearch(url) {
  *
  * @param {string} raw e.g. ``"omnigent://localhost:8000/c/conv_abc"``.
  * @returns {{ origin: string, path: string } | null} ``null`` for anything
- *   that isn't a valid `omnigent://.../c/<id>` link (wrong scheme, no host,
- *   non-`/c/` path, unparseable input).
+ *   that isn't a valid `omnigent://.../c/<id>` or `omnigent://.../` link
+ *   (wrong scheme, no host, other path, unparseable input).
  */
 function parseOmnigentDeepLink(raw) {
   let url;
@@ -69,7 +64,9 @@ function parseOmnigentDeepLink(raw) {
   if (url.protocol !== "omnigent:") return null;
   // No host → a bare `omnigent://` or `omnigent:`; nothing to connect to.
   if (url.host === "") return null;
-  const path = url.pathname;
+  // A non-special scheme keeps an EMPTY pathname for `omnigent://host` —
+  // treat it as the server-home root so host-only links work.
+  const path = url.pathname === "" ? "/" : url.pathname;
   if (!DEEP_LINK_PATH_RE.test(path)) return null;
   const archiveSearch = path.startsWith("/archive/") ? archiveLocatorSearch(url) : "";
   if (archiveSearch === null) return null;
@@ -151,4 +148,35 @@ function chooseDeepLinkStrategy(state) {
   return { strategy: "consent-unknown" };
 }
 
-module.exports = { parseOmnigentDeepLink, chooseDeepLinkStrategy, DEEP_LINK_PATH_RE };
+/**
+ * Claim a CLI navigation before its browser fallback deadline. Ordinary links
+ * need no acknowledgment. The endpoint is always loopback, never a supplied URL.
+ * @param {string} raw A parsed Omnigent deep link.
+ * @returns {Promise<boolean>} Whether the desktop should handle the request.
+ */
+async function acceptCliDeepLink(raw) {
+  if (!parseOmnigentDeepLink(raw)) return false;
+  const acknowledgments = new URL(raw).searchParams.getAll("desktop_ack");
+  if (acknowledgments.length === 0) return true;
+  if (acknowledgments.length !== 1) return false;
+  const match = acknowledgments[0].match(/^([1-9][0-9]{0,4}):([a-f0-9]{64})$/);
+  if (!match || Number(match[1]) > 65535) return false;
+  try {
+    const response = await fetch(`http://127.0.0.1:${match[1]}/desktop-open/${match[2]}`, {
+      method: "POST",
+      redirect: "error",
+      signal: AbortSignal.timeout(2000),
+    });
+    return response.status === 204;
+  } catch {
+    // The CLI already fell back, or the acknowledgment endpoint is unavailable.
+    return false;
+  }
+}
+
+module.exports = {
+  parseOmnigentDeepLink,
+  chooseDeepLinkStrategy,
+  acceptCliDeepLink,
+  DEEP_LINK_PATH_RE,
+};

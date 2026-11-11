@@ -3,6 +3,7 @@
 // runs in the artifact's opaque-origin frame and no-ops without a nonce.
 
 (function () {
+  var script = document.currentScript;
   var NONCE = (document.currentScript && document.currentScript.dataset.omniNonce) || "";
   if (!NONCE) return;
 
@@ -17,6 +18,9 @@
     selectionCleared: "omni:selectionCleared",
     openPath: "omni:openPath",
     orphans: "omni:orphans",
+    zoom: "omni:zoom",
+    scroll: "omni:scroll",
+    restoreScroll: "omni:restoreScroll",
   };
 
   // The highlight styles live here rather than in the injected markup so the
@@ -33,6 +37,7 @@
   var VISIT = false;
   var comments = [];
   var active = null;
+  var activeSynced = false;
   var activeRanges = []; // ranges matching the active comment (for scroll-into-view)
   var ranges = []; // [{ id, range }] for click hit-testing
 
@@ -379,17 +384,185 @@
     }
   }
 
-  // Scroll the first active-comment range into view. Uses the range's client
-  // rect (Ranges have no scrollIntoView) to center it in the viewport, but only
-  // when off-screen so an already-visible highlight doesn't jump.
+  // Restore the saved offset after a remount, re-asserting it each frame because late content
+  // can clamp it. Scroll input ends it early, as does any scroll the layout didn't cause, the
+  // artifact's own included; a click doesn't. Reports stay off so clamps can't overwrite it.
+  const USER_SCROLL_EVENTS = ["wheel", "touchmove", "keydown"];
+  const SCROLL_KEYS = ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "];
+  let scrollRestore = null; // { top, deadline, y, layout, anchoring, inputs } while restoring
+  let scrollRestoreFrame = 0;
+  let restoreHide = null; // the injected style hiding the page until the restore ends
+  let spentRestoreTop = null; // where a spent budget left the page, until its scroll event arrives
+
+  function revealPage() {
+    if (restoreHide) restoreHide.remove();
+    restoreHide = null;
+  }
+
+  // `report` saves the offset the page shows when the reader or a comment pick ends the
+  // restore. A spent budget doesn't, so a page that loads slowly keeps the reader's offset.
+  function settleScrollRestore(report) {
+    revealPage();
+    if (!scrollRestore) return;
+    const anchoring = scrollRestore.anchoring;
+    scrollRestore = null;
+    cancelAnimationFrame(scrollRestoreFrame);
+    document.documentElement.style.setProperty(
+      "overflow-anchor",
+      anchoring.value,
+      anchoring.priority,
+    );
+    for (let i = 0; i < USER_SCROLL_EVENTS.length; i++) {
+      window.removeEventListener(USER_SCROLL_EVENTS[i], onRestoreInput, true);
+    }
+    if (report) onScroll();
+    else spentRestoreTop = window.scrollY;
+  }
+
+  // Keys typed into a form field or editable text move its caret or value, not the page.
+  function isEditableTarget(target) {
+    return (
+      !!target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))
+    );
+  }
+
+  // Space presses a focused button or toggles a <summary> instead of scrolling.
+  function spaceActivates(key, target) {
+    return key === " " && !!target && /^(BUTTON|SUMMARY)$/.test(target.tagName);
+  }
+
+  // Capture runs before the page's own handlers, so the next frame judges whether they
+  // consumed the input; a Ctrl+wheel or a multi-touch move is a pinch, not a scroll.
+  function onRestoreInput(e) {
+    // At `window`, a key pressed inside a web component's shadow root targets its host.
+    const target = e.composedPath()[0] || e.target;
+    const scrollKey =
+      SCROLL_KEYS.indexOf(e.key) !== -1 &&
+      !isEditableTarget(target) &&
+      !spaceActivates(e.key, target);
+    const pinch =
+      (e.type === "wheel" && e.ctrlKey) ||
+      (e.type === "touchmove" && !!e.touches && e.touches.length > 1);
+    if (e.type === "keydown" ? scrollKey : !pinch) scrollRestore.inputs.push(e);
+  }
+
+  function inputScrolledDuringRestore() {
+    return scrollRestore.inputs.some(function (e) {
+      return !e.defaultPrevented;
+    });
+  }
+
+  // The document and viewport sizes, which bound the offset the page can reach.
+  function layoutSize() {
+    return [document.documentElement.scrollHeight, window.innerWidth, window.innerHeight].join();
+  }
+
+  // Scrollbar drags fire no input events, so any move the layout didn't cause (the document
+  // and viewport keep their sizes) ends the restore, a scroll by the artifact's script included.
+  function readerMovedDuringRestore() {
+    const moved = Math.abs(window.scrollY - scrollRestore.y) >= 1;
+    return moved && layoutSize() === scrollRestore.layout;
+  }
+
+  function applyScrollRestore() {
+    if (!scrollRestore) return;
+    const readerMoved = readerMovedDuringRestore() || inputScrolledDuringRestore();
+    // "instant" overrides an artifact's `scroll-behavior: smooth`. A frame throttled past the
+    // deadline still re-asserts once, since the page may have grown in the meantime.
+    if (!readerMoved) {
+      window.scrollTo({ left: window.scrollX, top: scrollRestore.top, behavior: "instant" });
+    }
+    if (readerMoved || performance.now() >= scrollRestore.deadline) {
+      settleScrollRestore(readerMoved);
+      return;
+    }
+    scrollRestore.inputs = [];
+    scrollRestore.y = window.scrollY;
+    if (Math.abs(scrollRestore.y - scrollRestore.top) <= 1) revealPage();
+    scrollRestore.layout = layoutSize();
+    scrollRestoreFrame = requestAnimationFrame(applyScrollRestore);
+  }
+
+  function startScrollRestore(override) {
+    const styles = document.querySelectorAll("style[data-omni-restore-hide]");
+    for (let i = 0; i < styles.length; i++) {
+      if (styles[i].getAttribute("data-omni-restore-hide") === NONCE) restoreHide = styles[i];
+    }
+    let saved = null;
+    try {
+      saved = override || JSON.parse(script.getAttribute("data-omni-restore-scroll") || "null");
+    } catch {
+      // A malformed request restores nothing.
+    }
+    const valid =
+      saved &&
+      typeof saved.top === "number" &&
+      saved.top > 0 &&
+      typeof saved.budgetMs === "number" &&
+      saved.budgetMs > 0;
+    if (!valid) {
+      revealPage();
+      return;
+    }
+    const rootStyle = document.documentElement.style;
+    scrollRestore = {
+      top: saved.top,
+      deadline: performance.now() + saved.budgetMs,
+      y: window.scrollY,
+      layout: layoutSize(),
+      inputs: [],
+      anchoring: {
+        value: rootStyle.getPropertyValue("overflow-anchor"),
+        priority: rootStyle.getPropertyPriority("overflow-anchor"),
+      },
+    };
+    // Scroll anchoring follows late layout above the reader without resizing the page,
+    // which would look like the reader's own scroll.
+    rootStyle.setProperty("overflow-anchor", "none", "important");
+    for (let i = 0; i < USER_SCROLL_EVENTS.length; i++) {
+      window.addEventListener(USER_SCROLL_EVENTS[i], onRestoreInput, {
+        capture: true,
+        passive: true,
+      });
+    }
+    applyScrollRestore();
+  }
+
+  // Report the reader's offset, at most once per frame, so the parent can
+  // restore it on the next mount. A report made before the channel connects
+  // is replayed on connect.
+  let scrollReportFrame = 0;
+  let scrollReportMissed = false;
+  function onScroll() {
+    if (scrollRestore && readerMovedDuringRestore()) settleScrollRestore(true);
+    if (spentRestoreTop !== null) {
+      // The browser delivers the spent restore's last write after it ends; that isn't the reader's.
+      const restoreWrite = Math.abs(window.scrollY - spentRestoreTop) < 1;
+      spentRestoreTop = null;
+      if (restoreWrite) return;
+    }
+    if (scrollRestore || scrollReportFrame) return;
+    scrollReportFrame = requestAnimationFrame(function () {
+      scrollReportFrame = 0;
+      if (scrollRestore) return;
+      scrollReportMissed = !port;
+      send({ type: T.scroll, top: window.scrollY });
+    });
+  }
+
+  // Center the first active range (Ranges have no scrollIntoView) only if it is
+  // off-screen; during a restore, judge that at the saved offset, not a clamp.
   function scrollActiveIntoView() {
-    var r = activeRanges && activeRanges[0];
+    const r = activeRanges && activeRanges[0];
     if (!r) return;
-    var rect = r.getBoundingClientRect();
+    const rect = r.getBoundingClientRect();
     if (!rect || (rect.width === 0 && rect.height === 0)) return;
-    var vh = window.innerHeight || document.documentElement.clientHeight;
-    if (rect.top >= 0 && rect.bottom <= vh) return; // already fully visible
-    var target = window.pageYOffset + rect.top - vh / 2 + rect.height / 2;
+    const vh = window.innerHeight || document.documentElement.clientHeight;
+    const top = window.scrollY + rect.top;
+    const viewTop = scrollRestore ? scrollRestore.top : window.scrollY;
+    if (top >= viewTop && top + rect.height <= viewTop + vh) return; // already fully visible
+    const target = top - vh / 2 + rect.height / 2;
+    settleScrollRestore(true);
     window.scrollTo({ top: target < 0 ? 0 : target, behavior: "smooth" });
   }
 
@@ -421,7 +594,7 @@
     return { range: sel.getRangeAt(0), text: text };
   }
 
-  function emitSelection() {
+  function emitSelection(reflow) {
     var s = currentSelection();
     if (s) {
       var anchor = selectionAnchor(s.range, s.text);
@@ -434,6 +607,7 @@
         suffix: anchor.suffix,
         selector: anchor.selector,
         rect: rectOf(s.range),
+        reflow: reflow,
       });
     }
   }
@@ -569,10 +743,39 @@
   // Debounced; only emits for a non-empty selection so a collapse here never
   // clears the active comment (mouseup owns the clear path).
   var selTimer = null;
-  document.addEventListener("selectionchange", function () {
+  var reflowOnly = true;
+  function scheduleSelection(reflow) {
+    if (!reflow) reflowOnly = false;
     if (selTimer) clearTimeout(selTimer);
-    selTimer = setTimeout(emitSelection, 150);
+    selTimer = setTimeout(function () {
+      var onlyReflowed = reflowOnly;
+      selTimer = null;
+      reflowOnly = true;
+      emitSelection(onlyReflowed);
+    }, 150);
+  }
+  document.addEventListener("selectionchange", function () {
+    scheduleSelection(false);
   });
+  window.addEventListener("resize", function () {
+    scheduleSelection(true);
+  });
+
+  function zoomAction(e) {
+    if (!(e.metaKey || e.ctrlKey) || e.altKey) return null;
+    if (e.key === "=" || e.key === "+" || e.code === "NumpadAdd") return "in";
+    if (e.key === "-" || e.key === "_" || e.code === "NumpadSubtract") return "out";
+    if (e.key === "0" || e.code === "Numpad0") return "reset";
+    return null;
+  }
+
+  function onZoomKey(e) {
+    if (e.defaultPrevented) return;
+    var action = zoomAction(e);
+    if (!action) return;
+    e.preventDefault();
+    send({ type: T.zoom, action: action });
+  }
 
   window.addEventListener("message", function (e) {
     var d = e.data;
@@ -580,10 +783,13 @@
     if (d.type === T.init && e.ports && e.ports[0]) {
       VISIT = d.visit === true;
       port = e.ports[0];
+      if (!VISIT) window.addEventListener("keydown", onZoomKey);
       port.onmessage = function (ev) {
         var m = ev.data;
         if (!m) return;
-        if (m.type === T.setComments) {
+        if (m.type === T.restoreScroll) {
+          startScrollRestore(m.restoreScroll);
+        } else if (m.type === T.setComments) {
           comments = Array.isArray(m.comments) ? m.comments : [];
           // If a newly-arrived comment covers the still-active native selection
           // (i.e. the user just saved a comment on it), drop that selection.
@@ -604,13 +810,22 @@
           // Only scroll when a comment becomes newly active (e.g. clicked in the
           // panel), so list refreshes that keep the same active comment don't
           // yank the reader's scroll position.
-          if (nextKey && nextKey !== prevKey) scrollActiveIntoView();
+          const explicit = activeSynced;
+          activeSynced = true;
+          if (nextKey && nextKey !== prevKey) {
+            if (explicit) settleScrollRestore(true);
+            scrollActiveIntoView();
+          }
         }
       };
+      if (e.data.restoreScroll && !scrollRestore) startScrollRestore(e.data.restoreScroll);
       send({ type: T.ready, pathname: location.pathname });
+      if (scrollReportMissed) onScroll();
     }
   });
 
   document.addEventListener("click", onDocumentClick, true);
   document.addEventListener("mouseup", onMouseUp, true);
+  window.addEventListener("scroll", onScroll, { passive: true });
+  startScrollRestore();
 })();

@@ -79,6 +79,7 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
         status: str,
         output: str | None,
         only_if_work_id: str | None = None,
+        confirmed_cancellation: bool = False,
     ) -> _FakeAck:
         if only_if_work_id is not None and only_if_work_id != captured["current_work_id"]:
             # A newer dispatch replaced the entry: drop the delayed op untouched.
@@ -91,6 +92,7 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
                 "status": status,
                 "output": output,
                 "only_if_work_id": only_if_work_id,
+                "confirmed_cancellation": confirmed_cancellation,
             }
         )
         return _FakeAck()
@@ -509,15 +511,15 @@ _OPENCODE_STATE = SimpleNamespace(
 
 
 class _FakeOpenCodeClient:
-    """Records the native abort, raising *error* when one is given."""
+    """Records the native interrupt, raising *error* when one is given."""
 
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
-        self.abort_calls: list[str] = []
+        self.interrupt_calls: list[str] = []
         self.closed = False
 
-    async def abort(self, session_id: str) -> bool:
-        self.abort_calls.append(session_id)
+    async def interrupt(self, session_id: str) -> bool:
+        self.interrupt_calls.append(session_id)
         if self.error is not None:
             raise self.error
         return True
@@ -542,8 +544,11 @@ def _patch_opencode_bridge(
 
 
 @pytest.mark.asyncio
-async def test_opencode_interrupt_aborts_native_turn(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Interrupt aborts the turn on OpenCode's own server and records it for the dispatch.
+@pytest.mark.parametrize("method", ["interrupt", "stop"])
+async def test_opencode_interrupt_stops_native_turn(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """Interrupt and stop end the turn on OpenCode's own server and record it for the dispatch.
 
     The pending record lets a bare idle or the grace timer settle the dispatch as
     cancelled; the handler itself wakes nothing.
@@ -553,10 +558,10 @@ async def test_opencode_interrupt_aborts_native_turn(monkeypatch: pytest.MonkeyP
     runner, captured = _make_runner()
     captured["current_work_id"] = "work_oc"
 
-    resp = await runner.interrupt("opencode-native", "conv_oc")
+    resp = await getattr(runner, method)("opencode-native", "conv_oc")
 
     assert isinstance(resp, Response) and resp.status_code == 204
-    assert client.abort_calls == ["ses_oc"] and client.closed
+    assert client.interrupt_calls == ["ses_oc"] and client.closed
     assert routed == {
         "base_url": "http://127.0.0.1:9999/",
         "auth_secret": "secret",
@@ -583,7 +588,7 @@ async def test_opencode_interrupt_fallbacks(
     error: Exception | None,
     expected_status: int | None,
 ) -> None:
-    """Missing bridge state falls through; a failed abort is a 503."""
+    """Missing bridge state falls through; a failed interrupt is a 503."""
     client = _FakeOpenCodeClient(error)
     _patch_opencode_bridge(monkeypatch, state=state, client=client)
     runner, captured = _make_runner()
@@ -880,6 +885,7 @@ async def test_uniform_stop_kills_tears_down_and_goes_idle(
     idle = [e for _, e in captured["published"] if e.get("status") == "idle"]
     assert idle == [{"type": "session.status", "status": "idle"}]
     assert captured["wakes"] == [("conv_c", "cancelled", None)]
+    assert captured["wake_calls"][-1]["confirmed_cancellation"] is True
 
 
 @pytest.mark.asyncio
@@ -978,6 +984,7 @@ async def test_claude_stop_is_idempotent_without_advertised_tmux(
 
     assert isinstance(resp, Response) and resp.status_code == 204
     assert captured["wakes"] == [("conv_cn", "cancelled", None)]
+    assert captured["wake_calls"][-1]["confirmed_cancellation"] is True
 
 
 @pytest.mark.asyncio

@@ -197,6 +197,7 @@ def ordered_pi_launch(
     return str(launcher), remaining
 
 
+PI_CONTEXT_FILE_NAMES = ("AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD")
 _PI_RESOURCE_SETTINGS = ("extensions", "skills", "prompts", "themes")
 _PI_AGENT_RESOURCE_DIRS = ("npm", "git", *_PI_RESOURCE_SETTINGS)
 _PI_AGENT_RESOURCE_FILES = (
@@ -400,6 +401,7 @@ def prepare_managed_pi_agent_dir(
     *,
     overlay: Mapping[str, object] | None = None,
     global_agent_dir: Path | None = None,
+    pi_env: Mapping[str, str] | None = None,
 ) -> None:
     """
     Seed a managed ``PI_CODING_AGENT_DIR`` with the user's global Pi settings.
@@ -408,6 +410,8 @@ def prepare_managed_pi_agent_dir(
     resource/install trees. Relative settings paths retain their original root.
     Unchanged seeded copies follow source edits/removals on relaunch. Managed
     resource edits and model/auth files are preserved.
+    Host MCP servers are merged into the managed MCP configuration when the
+    user has no entry for them; see sync_managed_pi_mcp_config.
 
     Project-scoped ``.pi/settings.json`` at the session cwd is still read by
     Pi at runtime and overrides these global settings per Pi's normal rules.
@@ -416,6 +420,8 @@ def prepare_managed_pi_agent_dir(
     :param overlay: Settings merged on top of the copied global file.
     :param global_agent_dir: Explicit source; otherwise ``PI_CODING_AGENT_DIR``
         or :data:`DEFAULT_PI_AGENT_DIR`.
+    :param pi_env: Environment the Pi process will receive, used to resolve host
+        MCP placeholders; defaults to ``os.environ``.
     """
     source = (
         str(global_agent_dir)
@@ -444,3 +450,6 @@ def prepare_managed_pi_agent_dir(
         return
 
     _seed_agent_resources(managed_dir, agent_root)
+    from omnigent.inner.pi_mcp import sync_managed_pi_mcp_config
+
+    sync_managed_pi_mcp_config(managed_dir, agent_root, pi_env)

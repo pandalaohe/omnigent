@@ -10,6 +10,7 @@
 // the chat store's `session.title` handler (a terminal-side `/rename`).
 
 import type { InfiniteData, QueryClient } from "@tanstack/react-query";
+import { scopeBoundaryRow } from "@/lib/sidebarData";
 import type { Conversation, ConversationsPage, SessionSortBy } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
 
@@ -69,6 +70,8 @@ export interface ConversationListFilters {
    * only archived sessions. ``undefined`` is the default all-sessions list.
    */
   visibility?: "mine" | "shared" | "archived";
+  /** Sort order, present only when it isn't the default `updated_at`. */
+  sortBy?: SessionSortBy;
 }
 
 /**
@@ -141,7 +144,7 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
     const current = row[key];
     if (key === "labels") {
       if (labelsChanged(current, value)) changed.add(key);
-    } else if (key === "pull_request" || key === "keep_warm") {
+    } else if (key === "pull_request" || key === "keep_warm" || key === "family") {
       // Each parsed frame yields a fresh object; compare structurally so an
       // unchanged status doesn't rewrite the row on every snapshot.
       if (JSON.stringify(current ?? null) !== JSON.stringify(value ?? null)) changed.add(key);
@@ -200,6 +203,7 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
     // Treat null (visibility-scoped key) the same as undefined (no project filter).
     project: project ?? undefined,
     visibility: visibility as ConversationListFilters["visibility"],
+    ...(key[5] === "created_at" ? { sortBy: "created_at" as const } : {}),
   };
 }
 
@@ -297,6 +301,30 @@ function changedFieldsNeedRefetch(
   return false;
 }
 
+/** Query-key namespaces whose pages hold sidebar list rows. */
+export const LIST_ROW_QUERY_ROOTS = ["conversations", "project-sessions"] as const;
+
+/**
+ * A cached copy of one session's row from a list response: any
+ * `["conversations", ...]` variant or a project folder's
+ * `["project-sessions", ...]` pages.
+ *
+ * @param queryClient - The app QueryClient.
+ * @param id - Conversation id to find.
+ */
+export function findCachedListRow(queryClient: QueryClient, id: string): Conversation | undefined {
+  for (const root of LIST_ROW_QUERY_ROOTS) {
+    const caches = queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: [root] });
+    for (const [, data] of caches) {
+      for (const page of data?.pages ?? []) {
+        const row = page.data.find((c) => c.id === id);
+        if (row) return row;
+      }
+    }
+  }
+  return undefined;
+}
+
 /**
  * Overlay incoming wire items onto matching rows of one infinite query's
  * cached pages.
@@ -335,6 +363,11 @@ export function mergeItemsIntoPages(
   let anyPageChanged = false;
   let needsRefetch = false;
   let orderStale = false;
+  // The row the next page is fetched after, or the last loaded row when the
+  // server filtered the cursor row out (the sidebar's same fallback). Moving it
+  // up leaves "load more" restarting near the top, so it reconciles.
+  const tail = data.pages.at(-1);
+  const cursorId = tail?.has_more ? scopeBoundaryRow(tail.data, tail.last_id)?.id : null;
   const pages = data.pages.map((page) => {
     let rowChanged = false;
     const nextData: Conversation[] = [];
@@ -362,7 +395,8 @@ export function mergeItemsIntoPages(
           changed,
           searchListCached,
           changed.has("labels") && membershipLabelChanged(conv.labels, wire.labels),
-        )
+        ) ||
+        (conv.id === cursorId && changed.has(filters.sortBy ?? "updated_at"))
       ) {
         needsRefetch = true;
       }
@@ -540,11 +574,12 @@ export function parseProjectSessionsQueryKey(key: readonly unknown[]): {
 
 /** Membership filters for an unsearched project-folder query. */
 export function filtersFromProjectQueryKey(key: readonly unknown[]): ConversationListFilters {
-  const { archived } = parseProjectSessionsQueryKey(key);
+  const { archived, sortBy } = parseProjectSessionsQueryKey(key);
   return {
     searchQuery: "",
     includeArchived: archived,
     visibility: archived ? "archived" : "mine",
+    ...(sortBy === "created_at" ? { sortBy } : {}),
   };
 }
 
@@ -647,4 +682,39 @@ export function overlayArchivedIntoCaches(
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
     old ? { ...old, archived } : old,
   );
+}
+
+/**
+ * Settle server-known fields on the open session's fetched sidebar row, merged
+ * as the lists merge a streamed row but keeping the fetched owner and access
+ * level, which a streamed shared row may not carry. A detail request in flight
+ * may have been served before they changed, so it is cancelled and restarted
+ * rather than left to land.
+ *
+ * @param queryClient - The app QueryClient.
+ * @param id - The session whose fields are known.
+ * @param fields - Fields from the server, as a wire item; omitted ones are kept.
+ */
+export function settleOpenSessionRow(
+  queryClient: QueryClient,
+  id: string,
+  fields: Omit<SessionListWireItem, "id">,
+): void {
+  const queryKey = ["conversation-backfill", id];
+  if (queryClient.getQueryState(queryKey) === undefined) return;
+  const fetching = queryClient.isFetching({ queryKey, exact: true }) > 0;
+  // invalidateQueries only joins a first fetch (no data yet), so cancel explicitly.
+  if (fetching) void queryClient.cancelQueries({ queryKey, exact: true });
+  const row = queryClient.getQueryData<Conversation | null>(queryKey);
+  if (row) {
+    const wire: SessionListWireItem = { ...fields, id };
+    delete wire.owner;
+    delete wire.permission_level;
+    // A fetched row keeps the detail response's nulls, which wire items carry as undefined.
+    if (changedWireFields(nullsToUndefined(row) as Conversation, wire).size > 0) {
+      const settledRow: Conversation = { ...row, ...wire };
+      queryClient.setQueryData<Conversation | null>(queryKey, settledRow);
+    }
+  }
+  if (fetching) void queryClient.invalidateQueries({ queryKey, exact: true });
 }

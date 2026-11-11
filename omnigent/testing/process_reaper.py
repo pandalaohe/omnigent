@@ -177,9 +177,12 @@ def find_leaked_omnigent_processes(data_dir: Path | str) -> list[psutil.Process]
     me = os.getpid()
     leaked: list[psutil.Process] = []
     try:
-        processes = psutil.process_iter()
-        for proc in processes:
-            if proc.pid == me:
+        for pid in psutil.pids():
+            if pid == me:
+                continue
+            try:
+                proc = psutil.Process(pid)
+            except (psutil.Error, OSError, IndexError):
                 continue
             argv = _proc_argv(proc)
             cmdline = " ".join(argv)

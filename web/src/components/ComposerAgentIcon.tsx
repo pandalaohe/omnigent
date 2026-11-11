@@ -1,10 +1,22 @@
 import claudeCodeLogo from "@/assets/claude-code-logo.svg";
 import { iconForAgent } from "@/components/AgentCard";
+import { SdkMark } from "@/components/composer/SdkMark";
+import { useAgentBadgePreferences } from "@/hooks/useAgentBadgePreferences";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
+import { agentBadgeFor } from "@/lib/agentBadgePreferences";
+import { sdkProductVendor } from "@/lib/agentGrouping";
 import { nativeCodingAgentForAvailableAgent } from "@/lib/nativeCodingAgents";
 import { cn } from "@/lib/utils";
 
-const HARNESS_ICONS: Record<string, { src: string; invertInDark: boolean; className?: string }> = {
+/**
+ * Product marks for the native wrappers that ship one. An SDK product draws
+ * the SDK mark followed by its vendor's logo from this same table; everything
+ * else falls back to the catalog glyph (`iconForAgent`).
+ */
+const COMPOSER_HARNESS_ICONS: Record<
+  string,
+  { src: string; invertInDark: boolean; className?: string }
+> = {
   claude: {
     src: claudeCodeLogo,
     invertInDark: false,
@@ -28,13 +40,46 @@ const HARNESS_ICONS: Record<string, { src: string; invertInDark: boolean; classN
   },
 };
 
+type ComposerAgentIconAgent = Pick<AvailableAgent, "name" | "harness"> & {
+  /** The row's Agent id, when known: a user badge on this id takes the badge
+   *  slot, so the SDK mark yields to it. */
+  id?: string;
+};
+
 export function ComposerAgentIcon({
   agent,
+  sdkMarkClassName,
   className,
 }: {
-  agent: Pick<AvailableAgent, "name" | "harness">;
+  agent: ComposerAgentIconAgent;
+  /** Size override for the SDK mark (the 15px member trigger). */
+  sdkMarkClassName?: string;
   className?: string;
 }) {
+  const badgePreferences = useAgentBadgePreferences();
+  const sdkVendor = sdkProductVendor(agent);
+  if (sdkVendor) {
+    const product = COMPOSER_HARNESS_ICONS[sdkVendor];
+    return (
+      <span className="flex shrink-0 items-center gap-1">
+        {agentBadgeFor(badgePreferences, agent.id) ? null : (
+          <SdkMark className={sdkMarkClassName} />
+        )}
+        <img
+          src={product.src}
+          alt=""
+          aria-hidden="true"
+          data-harness-icon={sdkVendor}
+          className={cn(
+            "size-4 shrink-0 object-contain",
+            product.className,
+            product.invertInDark && "dark:invert",
+            className,
+          )}
+        />
+      </span>
+    );
+  }
   if (agent.name === "polly" || agent.name === "debby") {
     return (
       <svg viewBox="0 0 16 16" className={cn("size-4 shrink-0", className)} aria-hidden="true">
@@ -46,7 +91,7 @@ export function ComposerAgentIcon({
     );
   }
   const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
-  const product = nativeAgent ? HARNESS_ICONS[nativeAgent.iconKind] : undefined;
+  const product = nativeAgent ? COMPOSER_HARNESS_ICONS[nativeAgent.iconKind] : undefined;
   const FallbackIcon = iconForAgent(agent);
   return product ? (
     <img
