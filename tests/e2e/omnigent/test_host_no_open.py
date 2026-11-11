@@ -12,6 +12,7 @@ import pytest
 from tests.e2e.omnigent.test_host_ctrl_c_stop_server import (
     _BOOT_TIMEOUT,
     _EXIT_TIMEOUT,
+    _HOST_CLI_BOOTSTRAP,
     _PROMPT_MARKER,
     _PROMPT_TIMEOUT,
     _boot_connect_and_get_server,
@@ -60,7 +61,7 @@ def test_host_browser_preference(
 
     child = pexpect.spawn(
         str(omnigent_python),
-        ["-m", "omnigent", "host", "", *extra_args],
+        ["-c", _HOST_CLI_BOOTSTRAP, "host", "", *extra_args],
         env=env,
         cwd=str(omnigent_repo_root),
         encoding="utf-8",

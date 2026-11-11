@@ -70,6 +70,29 @@ _LEFT_RUNNING_MARKER = "Left the local server running"
 # raw time.sleep — see omnigent-testing rule 13).
 _POLL_PAUSE = threading.Event()
 
+# pick_local_port(0) returns 0 rather than the assigned port, so obtain an
+# ephemeral candidate first and keep the production availability check.
+_EPHEMERAL_PORT_BOOTSTRAP = """\
+from omnigent.host import local_server
+_pick_local_port = local_server.pick_local_port
+_find_free_local_port = local_server._find_free_local_port
+def _find_ephemeral_port():
+    while True:
+        port = _find_free_local_port()
+        if port != 6767:
+            return port
+local_server._find_free_local_port = _find_ephemeral_port
+def _pick_ephemeral_port():
+    while True:
+        port = _pick_local_port(preferred=local_server._find_free_local_port())
+        if port != 6767:
+            return port
+local_server.pick_local_port = _pick_ephemeral_port
+"""
+_HOST_CLI_BOOTSTRAP = _EPHEMERAL_PORT_BOOTSTRAP + (
+    "import runpy\nrunpy.run_module('omnigent', run_name='__main__')\n"
+)
+
 
 def _connect_env(base_env: Mapping[str, str], home: Path) -> dict[str, str]:
     """
@@ -129,7 +152,7 @@ def _spawn_connect(
     """
     return pexpect.spawn(
         str(omnigent_python),
-        ["-m", "omnigent", "host", ""],
+        ["-c", _HOST_CLI_BOOTSTRAP, "host", ""],
         env=dict(env),
         cwd=str(repo_root),
         encoding="utf-8",
@@ -278,7 +301,7 @@ def _prespawn_persistent_server(
         :func:`_connect_env`.
     :returns: ``(pid, port)`` of the running detached server.
     """
-    code = (
+    code = _EPHEMERAL_PORT_BOOTSTRAP + (
         "from omnigent.host.local_server import ensure_local_omnigent_server;"
         "print(ensure_local_omnigent_server().url)"
     )
