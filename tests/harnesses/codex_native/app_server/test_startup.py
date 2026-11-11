@@ -102,6 +102,7 @@ async def test_start_reuses_initialized_readiness_client_for_hook_trust(
     """Startup trusts hooks over the readiness connection, then closes it."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 
+    _disable_codex_startup_rpc(monkeypatch)
     source_home = tmp_path / "source-codex-home"
     source_home.mkdir()
     workspace = tmp_path / "workspace"

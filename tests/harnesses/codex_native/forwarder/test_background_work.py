@@ -33,6 +33,27 @@ from tests.harnesses.codex_native.forwarder._support import (
 )
 
 _EVENTS_URL = "/v1/sessions/conv_x/events"
+_RESUME_PERMISSION_POST = (
+    _EVENTS_URL,
+    {
+        "type": "external_codex_approval_mode_change",
+        "data": {
+            "approval_mode": "unknown",
+            "permission_observation": {
+                "version": 1,
+                "source": "native-settings",
+                "origin": "resume",
+                "mode": "unknown",
+                "approval": None,
+                "reviewer": None,
+                "sandbox": None,
+                "profile": None,
+                "uncertainty": "no-settings",
+                "requested_mode": None,
+            },
+        },
+    },
+)
 
 
 def _goal_updated(
@@ -89,6 +110,10 @@ def _failed_status_post(output: str, **data: Any) -> tuple[str, dict[str, Any]]:
             "data": {"status": "failed", "output": output, **data},
         },
     )
+
+
+def _goal_state_post(state: str | None) -> tuple[str, dict[str, Any]]:
+    return (_EVENTS_URL, {"type": "external_goal_state", "data": {"state": state}})
 
 
 class _AppServerStub:
@@ -201,19 +226,29 @@ async def test_active_goal_keeps_the_session_working_until_it_ends(tmp_path: Pat
     await _deliver_to_parent(client, tmp_path, state, _goal_updated("active", turn_id="turn_1"))
     await _deliver_to_parent(client, tmp_path, state, _goal_updated("complete"))
 
-    assert client.posts == [_background_work_post(True), _background_work_post(False)]
+    assert client.posts == [
+        _background_work_post(True),
+        _goal_state_post("active"),
+        _background_work_post(False),
+        _goal_state_post(None),
+    ]
 
 
 @pytest.mark.asyncio
 async def test_cleared_goal_stops_the_session_working(tmp_path: Path) -> None:
-    """Clearing an active goal drops the flag, and nothing else is posted."""
+    """Clearing an active goal clears both sidebar states."""
     client = _RecordingClient()
     state = fwd._CodexForwarderState()
 
     await _deliver_to_parent(client, tmp_path, state, _goal_updated("active"))
     await _deliver_to_parent(client, tmp_path, state, _goal_cleared())
 
-    assert client.posts == [_background_work_post(True), _background_work_post(False)]
+    assert client.posts == [
+        _background_work_post(True),
+        _goal_state_post("active"),
+        _background_work_post(False),
+        _goal_state_post(None),
+    ]
 
 
 @pytest.mark.asyncio
@@ -278,7 +313,11 @@ async def test_goal_cleared_during_a_resync_post_ends_not_working(tmp_path: Path
     client.release_true_post.set()
     await asyncio.gather(resync, cleared)
 
-    assert client.posts == [_background_work_post(True, []), _background_work_post(False)]
+    assert client.posts == [
+        _background_work_post(True, []),
+        _background_work_post(False),
+        _goal_state_post(None),
+    ]
     assert state.posted_background_work_running is False
 
 
@@ -305,7 +344,11 @@ async def test_goal_read_overtaken_by_a_notification_is_dropped(tmp_path: Path) 
     )
 
     assert state.goal_status is None
-    assert client.posts == [_background_work_post(False), _background_work_post(None, [])]
+    assert client.posts == [
+        _background_work_post(False),
+        _goal_state_post(None),
+        _background_work_post(None, []),
+    ]
 
 
 class _OldServerClient(_RecordingClient):
@@ -348,7 +391,7 @@ class _OldServerClient(_RecordingClient):
 
 @pytest.mark.asyncio
 async def test_server_without_the_flag_is_not_asked_again(tmp_path: Path) -> None:
-    """An older server rejects the flag once; later goal changes neither post nor add failures."""
+    """An older server rejects the flag once while goal state continues without new failures."""
     client = _OldServerClient()
     state = fwd._CodexForwarderState()
 
@@ -357,7 +400,12 @@ async def test_server_without_the_flag_is_not_asked_again(tmp_path: Path) -> Non
     await _deliver_to_parent(client, tmp_path, state, _goal_updated("complete"))
     await _deliver_to_parent(client, tmp_path, state, _goal_updated("active"))
 
-    assert client.posts == [_background_work_post(True)]
+    assert client.posts == [
+        _background_work_post(True),
+        _goal_state_post("active"),
+        _goal_state_post(None),
+        _goal_state_post("active"),
+    ]
     assert fwd._forward_health.consecutive_failures == failures
 
 
@@ -377,7 +425,10 @@ async def test_goal_that_is_not_active_reports_idle_without_a_failure(
 
     await _deliver_to_parent(client, tmp_path, state, _goal_updated(status))
 
-    assert client.posts == [_background_work_post(False)]
+    assert client.posts == [
+        _background_work_post(False),
+        _goal_state_post(None if status == "complete" else "paused"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -405,8 +456,10 @@ async def test_goal_stopped_by_a_limit_fails_the_session_once(
 
     assert client.posts == [
         _background_work_post(True),
+        _goal_state_post("active"),
         _background_work_post(False),
         _failed_status_post(output),
+        _goal_state_post("paused"),
     ]
 
 
@@ -451,6 +504,7 @@ async def test_goal_limit_does_not_repeat_a_failure_the_turn_already_reported(
             response_id="codex_turn_1",
         ),
         _background_work_post(False),
+        _goal_state_post("paused"),
     ]
 
 
@@ -591,7 +645,7 @@ async def test_reconnect_reads_the_thread_goal_and_reports_it(tmp_path: Path) ->
     )
 
     assert ("thread/goal/get", {"threadId": "thread_123"}) in app_server.requests
-    assert client.posts == [_background_work_post(True, [])]
+    assert client.posts == [_background_work_post(True, []), _RESUME_PERMISSION_POST]
 
 
 @pytest.mark.asyncio
@@ -620,7 +674,7 @@ async def test_reconnect_reading_a_stopped_goal_still_fails_on_its_notification(
         elicitation_tracker=fwd._CodexElicitationTaskTracker(),
         forwarder_state=state,
     )
-    assert client.posts == [_background_work_post(False)]
+    assert client.posts == [_background_work_post(False), _RESUME_PERMISSION_POST]
     for _ in range(2):
         await _deliver_to_parent(
             client, tmp_path, state, _goal_updated("budgetLimited", turn_id="turn_1")
@@ -634,8 +688,10 @@ async def test_reconnect_reading_a_stopped_goal_still_fails_on_its_notification(
 
     assert client.posts == [
         _background_work_post(False),
+        _RESUME_PERMISSION_POST,
         _failed_status_post("Codex stopped the goal: token budget reached."),
         # The failure cleared the server's terminal list, so the turn's listing resends it.
+        _goal_state_post("paused"),
         _background_work_post(None, []),
     ]
 
@@ -667,7 +723,7 @@ async def test_codex_without_goals_reconnects_as_goal_free(
         forwarder_state=state,
     )
 
-    assert client.posts == [_background_work_post(False, [])]
+    assert client.posts == [_background_work_post(False, []), _RESUME_PERMISSION_POST]
 
 
 @pytest.mark.asyncio
@@ -693,7 +749,7 @@ async def test_failed_goal_read_keeps_the_goal_the_forwarder_last_saw(tmp_path: 
         forwarder_state=state,
     )
 
-    assert client.posts == [_background_work_post(None, [])]
+    assert client.posts == [_background_work_post(None, []), _RESUME_PERMISSION_POST]
 
 
 @pytest.mark.asyncio
@@ -731,10 +787,15 @@ async def test_failed_goal_read_on_a_fresh_connection_does_not_clear_the_flag(
         timeout=5.0,
     )
 
-    assert client.posts == [_background_work_post(None, [])]
+    assert client.posts == [_background_work_post(None, []), _RESUME_PERMISSION_POST]
     # A goal notification makes the goal known again, so its end clears the flag.
     await _deliver_to_parent(client, tmp_path, state, _goal_updated("complete"))
-    assert client.posts == [_background_work_post(None, []), _background_work_post(False)]
+    assert client.posts == [
+        _background_work_post(None, []),
+        _RESUME_PERMISSION_POST,
+        _background_work_post(False),
+        _goal_state_post(None),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1191,10 +1252,12 @@ async def test_goal_and_terminal_share_one_flag(
 
     assert client.posts == [
         _background_work_post(True),
+        _goal_state_post("active"),
         _status_post({"status": "idle", "response_id": "codex_turn_1"}),
         _background_work_post(None, _terminal_tasks("npm run dev")),
         _background_work_post(None, []),
         _background_work_post(False),
+        _goal_state_post(None),
     ]
 
 
@@ -1339,7 +1402,7 @@ async def test_reconnect_during_a_turn_does_not_list_terminals(tmp_path: Path) -
     )
 
     assert "thread/backgroundTerminals/list" not in [method for method, _ in app_server.requests]
-    assert client.posts == [_background_work_post(False)]
+    assert client.posts == [_background_work_post(False), _RESUME_PERMISSION_POST]
 
 
 @pytest.mark.asyncio
@@ -1370,6 +1433,7 @@ async def test_reconnect_after_a_settled_turn_reports_running_terminals(
 
     assert client.posts == [
         _background_work_post(True, _terminal_tasks("npm run dev")),
+        _RESUME_PERMISSION_POST,
         _background_work_post(False, []),
     ]
     assert delays == [fwd._BACKGROUND_TERMINAL_POLL_SECONDS] * 2

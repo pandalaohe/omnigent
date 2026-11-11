@@ -2141,7 +2141,7 @@ function startInboxPoller(
       }
       if (payload.type === "thinking_level_change") {
         // Point-in-time: one delivery attempt, then always consume the file.
-        // The callback reads back Pi's effective level after its synchronous setter.
+        // The callback reads back Pi's effective level after its setter settles.
         if (
           typeof handleThinkingLevelChange === "function" &&
           typeof payload.thinkingLevel === "string"
@@ -3246,10 +3246,10 @@ module.exports = function (pi) {
         queueSettingsChange(() =>
           applyModelChange(pi, config, latestContext, model, thinkingLevel),
         ),
-      (level) => queueSettingsChange(() => {
+      (level) => queueSettingsChange(async () => {
         settingThinkingLevel = true;
         try {
-          pi.setThinkingLevel(level);
+          await pi.setThinkingLevel(level);
         } catch (_err) {
           // Report the unchanged effective value if Pi rejects the request.
         } finally {

@@ -143,7 +143,7 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
   if(url.protocol!=="http:" || !["127.0.0.1","[::1]"].includes(url.hostname) || !url.port ||
     url.username || url.password || url.search || url.hash || !["","/"].includes(url.pathname))
     throw new Error("Scoped Pi endpoint is not trusted loopback");
-  let live=true, ready=false, sequence=0, queue=Promise.resolve();
+  let live=true, ready=false, sequence=0, queue=Promise.resolve(), attestQueueSealed=false;
   const listeners=new Set(), scopeListeners=new Map(), revoked=new Set();
   const lose=cause=>{
     if(!live)return;
@@ -208,6 +208,7 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
     // at 15s, well below the RPC caller's 120s idle budget. Bind/revoke stay short.
     const signal=op==="attest"?AbortSignal.timeout(15000):undefined;
     const task=queue.then(async()=>{
+      if(op==="attest" && attestQueueSealed) throw new Error("Scoped Pi attestation queue sealed");
       signal?.throwIfAborted();
       if(!live||!ready)throw new Error("Scoped Pi continuity unavailable");
       const reply=await request("/pi/bootstrap",{protocol:1,sequence:++sequence,op,...values},credential,undefined,signal);
@@ -217,7 +218,10 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
     queue=task.catch(()=>{});
     if(!signal)return task;
     return new Promise((resolve,reject)=>{
-      const abort=()=>reject(new Error("Scoped Pi attestation deadline"));
+      const abort=()=>{
+        attestQueueSealed=true;
+        reject(new Error("Scoped Pi attestation deadline"));
+      };
       signal.addEventListener("abort",abort,{once:true});
       task.then(resolve,reject).finally(()=>signal.removeEventListener("abort",abort));
     });

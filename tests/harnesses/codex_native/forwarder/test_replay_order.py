@@ -20,6 +20,7 @@ from omnigent.harnesses.codex_native.bridge import (
     write_bridge_state,
 )
 from tests.harnesses.codex_native.forwarder._support import (
+    _background_work_post,
     _RecordingClient,
 )
 
@@ -364,7 +365,7 @@ async def test_subscribe_reserves_delivery_order_before_post_resume_sync(
         )
         await asyncio.sleep(0)
         assert not live.done()
-        assert client.posts == []
+        assert client.posts == [_background_work_post(False)]
 
         release_sync.set()
         await asyncio.gather(subscribe, live)

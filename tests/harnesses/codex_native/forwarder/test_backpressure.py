@@ -451,7 +451,7 @@ async def test_parent_rotation_settles_queued_child_questions_first(tmp_path: Pa
         if request.method == "GET" and path == f"/v1/sessions/{_SESSION_ID}":
             snapshot = {"id": _SESSION_ID, "agent_id": "ag_codex", "runner_id": "runner_1"}
             return httpx.Response(200, json=snapshot, request=request)
-        if request.method == "POST" and path == "/v1/sessions":
+        if request.method == "POST" and path == f"/v1/sessions/{_SESSION_ID}/successor":
             return httpx.Response(200, json={"id": "conv_rotated"}, request=request)
         return httpx.Response(200, json={}, request=request)
 

@@ -5644,8 +5644,10 @@ def test_augment_claude_args_keeps_text_inline_beside_caller_prompt_flag(
 
     if where == "pass-through" and "file" not in caller_prompt[0]:
         assert args[:2] == ["--model", "claude-new"]
-        assert args[2] == caller_prompt[0]
-        assert "ours\n\ncaller" in args[2:4] or args[2].endswith("ours\n\ncaller")
+        if len(caller_prompt) == 2:
+            assert args[2:4] == ["--append-system-prompt", "ours\n\ncaller"]
+        else:
+            assert args[2] == "--append-system-prompt=ours\n\ncaller"
     else:
         assert args[: len(claude_args)] == list(claude_args)
         assert args[args.index("ours") - 1] == "--append-system-prompt"
@@ -7598,7 +7600,7 @@ def test_first_submit_observes_terminal_exit_cancellation_and_repaint(
         if cmd[-1] == "Enter":
             entered = True
             enters += 1
-        if "list-panes" in cmd:
+        if cmd[-1] == "#{?pane_id,#{pane_dead} #{pane_dead_status},missing}":
             stdout = "1 7" if entered and outcome == "exit" else "0"
         if "capture-pane" in cmd:
             stdout = _composer_pane("original first message" if pasted else "")
@@ -9289,7 +9291,7 @@ async def test_session_create_relay_waits_for_created_handle(
 
         relay = start_tool_relay(
             bridge_dir=tmp_path / "bridge",
-            tools=[],
+            tools=[{"name": "sys_session_create", "parameters": {}}],
             tool_executor=execute,
             loop=asyncio.get_running_loop(),
         )
@@ -9314,6 +9316,10 @@ async def test_session_create_relay_waits_for_created_handle(
                     "status": "failed",
                     "error": "child_not_ready",
                     "detail": f"503 {detail}",
+                    "guidance": (
+                        "inspect this session before continuing. Do not create a replacement; "
+                        "do not automatically resend the task."
+                    ),
                 }
             assert creates == posts == 1
         finally:
@@ -9543,7 +9549,7 @@ async def test_serve_mcp_cancel_create_releases_slot_and_heartbeat(
             assert operation_results[0]["status"] == "unknown"
         interrupted = await asyncio.to_thread(relay_results.get, True, 5)
         outcome = json.loads(interrupted["content"][0]["text"])
-        assert outcome["status"] == "detached"
+        assert outcome["status"] == "detached", outcome
         assert "sys_session_list" in outcome["detail"]
     finally:
         requests.put(b"")
@@ -17508,6 +17514,14 @@ async def test_tool_relay_runs_only_advertised_tools(
             )
             updated = await client.post("/tool", json=shell_call)
             withdrawn = await client.post("/tool", json={"name": "list_comments", "arguments": {}})
+            relay.update_tools([{"name": "sys_standing_approval"}], _executor)
+            legacy = await client.post(
+                "/tool", json={"name": "sys_standing_pass", "arguments": {}}
+            )
+            relay.update_tools([], _executor)
+            legacy_withdrawn = await client.post(
+                "/tool", json={"name": "sys_standing_pass", "arguments": {}}
+            )
     finally:
         relay.close()
 
@@ -17518,7 +17532,9 @@ async def test_tool_relay_runs_only_advertised_tools(
     }
     assert "isError" not in updated.json()
     assert withdrawn.json()["isError"] is True
-    assert dispatched == ["list_comments", "sys_os_shell"]
+    assert "isError" not in legacy.json()
+    assert legacy_withdrawn.json()["isError"] is True
+    assert dispatched == ["list_comments", "sys_os_shell", "sys_standing_pass"]
 
 
 @pytest.mark.asyncio
@@ -18346,14 +18362,22 @@ def test_inject_user_message_whitespace_only_content_submits_blind(
 def unaccepting_relay_url() -> Iterator[str]:
     """Yield the URL of a relay that accepts no connections, like one whose runner is stuck.
 
-    One unaccepted connection fills the listener's accept queue, so the kernel
-    drops later connection attempts and curl's connect hangs.
+    Fill the platform's accept queue so later connection attempts hang.
     """
     with socket.socket() as server:
         server.bind(("127.0.0.1", 0))
         server.listen(0)
-        with socket.create_connection(server.getsockname()):
+        connections: list[socket.socket] = []
+        try:
+            while True:
+                try:
+                    connections.append(socket.create_connection(server.getsockname(), timeout=0.1))
+                except TimeoutError:
+                    break
             yield f"http://127.0.0.1:{server.getsockname()[1]}"
+        finally:
+            for connection in connections:
+                connection.close()
 
 
 def test_policy_hook_runs_python_soon_when_the_relay_accepts_no_connections(
@@ -18655,8 +18679,8 @@ def test_lifecycle_hook_runs_python_after_a_timeout_that_sent_nothing(
 ) -> None:
     """curl exits 28 for a connect timeout too; only a timeout after sending skips Python.
 
-    The stand-in curl answers like a real timeout: no body, the ``-w`` request
-    size, exit 28. Request bytes sent mean the relay may have recorded the event.
+    The stand-in curl answers like a real timeout: no body, the ``-w`` upload
+    size, exit 28. Uploaded bytes mean the relay may have recorded the event.
     """
     if shutil.which(shell) is None:
         pytest.skip(f"{shell} is not installed")
@@ -22038,9 +22062,7 @@ async def test_relay_mcp_cancellation_releases_pending_approval(
         assert not pending_approvals.resolve("elicit_cancel_relay", True)
         if stop == "notification":
             assert proc.stdout is not None
-            cancelled_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=3)
-            assert cancelled_result["id"] == 51
-            assert cancelled_result["result"]["isError"]
+            # Cancellation releases the approval and suppresses its late result.
             _write_json_line(proc.stdin, {"jsonrpc": "2.0", "id": 52, "method": "ping"})
             ping_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=3)
             assert ping_result == {"jsonrpc": "2.0", "id": 52, "result": {}}

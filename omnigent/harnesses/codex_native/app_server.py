@@ -3448,7 +3448,7 @@ class CodexNativeAppServer:
                     ):
                         raise
                     _logger.warning(RELAUNCH_WITHOUT_OVERRIDES_EVENT)
-                    await self.close()
+                    await self._close_locked()
                     self.certificate_failure = None
                     clear_certificate_failure(self.bridge_dir)
                     self.config_overrides = list(fallback)
@@ -6110,11 +6110,9 @@ async def preload_codex_thread_for_resume(
         try:
             await client.request("thread/resume", resume_params)
         except CodexAppServerResponseError as exc:
-            if rollout_path is None:
-                raise
             current_provider = codex_resume_current_model_provider(exc)
             unconfigured_provider = codex_resume_unconfigured_model_provider(exc)
-            if unconfigured_provider is not None:
+            if rollout_path is not None and unconfigured_provider is not None:
                 # The refusal names only the thread's missing provider; move the
                 # thread to the one this launch runs so the session stays resumable.
                 current_provider = model_provider or await _codex_effective_model_provider(
@@ -6122,7 +6120,14 @@ async def preload_codex_thread_for_resume(
                 )
                 if current_provider == unconfigured_provider:
                     current_provider = None
-            if current_provider is None:
+            if current_provider is None or rollout_path is None:
+                if unconfigured_provider is not None:
+                    raise OmnigentError(
+                        f"Cannot resume Codex thread: provider {unconfigured_provider!r} is no "
+                        "longer configured. Restore its provider configuration and retry "
+                        "this session.",
+                        code=ErrorCode.HARNESS_NOT_CONFIGURED,
+                    ) from exc
                 raise
             _logger.warning(
                 "Codex resumes thread %s only under its effective provider %r "

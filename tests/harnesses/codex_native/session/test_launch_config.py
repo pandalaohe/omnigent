@@ -112,7 +112,7 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             (),
             None,
             "unix:///tmp/app-server.sock",
-            ["--remote", "unix:///tmp/app-server.sock"],
+            ["-c", 'approvals_reviewer="auto_review"', "--remote", "unix:///tmp/app-server.sock"],
         ),
         # Resume an existing thread over a Unix socket (local reattach).
         (
@@ -131,7 +131,7 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             (),
             None,
             "ws://127.0.0.1:9876",
-            ["--remote", "ws://127.0.0.1:9876"],
+            ["-c", 'approvals_reviewer="auto_review"', "--remote", "ws://127.0.0.1:9876"],
         ),
         # Resume over the host-spawned runner's ws:// endpoint; hardcoding
         # unix:// would prevent the terminal from attaching to its server.
@@ -164,6 +164,8 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
                 "--model",
                 "gpt-5.4-mini",
                 "Reply with INITIAL_ONCE",
+                "-c",
+                'approvals_reviewer="auto_review"',
                 "--remote",
                 "ws://127.0.0.1:9876",
             ],
@@ -208,6 +210,8 @@ def test_build_codex_remote_args_passes_transport_verbatim(
                 'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
+                "-c",
+                'approvals_reviewer="auto_review"',
                 "--remote",
                 "ws://127.0.0.1:9876",
             ],
