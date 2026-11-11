@@ -106,7 +106,10 @@ class _Rig:
 
 
 @pytest.mark.asyncio
-async def test_failed_turn_identity_distinguishes_same_error_and_late_duplicates() -> None:
+@pytest.mark.parametrize("outcome", ["failed", "cancelled"])
+async def test_terminal_turn_identity_distinguishes_same_error_and_late_duplicates(
+    outcome: str,
+) -> None:
     rig = _Rig("claude-native")
     try:
         async with _runner_client(rig.app, permission_harness=rig.harness) as client:
@@ -115,7 +118,8 @@ async def test_failed_turn_identity_distinguishes_same_error_and_late_duplicates
                 response = await rig.post_status(
                     client,
                     {
-                        "status": "failed",
+                        "status": "idle" if outcome == "cancelled" else "failed",
+                        "turn_outcome": outcome,
                         "response_id": f"response-{turn}",
                         "input_id": f"input-{turn}",
                         "input_generation": 1 if turn == "first" else 2,
@@ -125,6 +129,7 @@ async def test_failed_turn_identity_distinguishes_same_error_and_late_duplicates
                 assert response.status_code == 204
         results = rig.drained()
         assert len(results) == 2
+        assert [result["status"] for result in results] == [outcome, outcome]
         assert [result["terminal"]["turn_id"] for result in results] == [
             "response-first",
             "response-second",
@@ -134,6 +139,49 @@ async def test_failed_turn_identity_distinguishes_same_error_and_late_duplicates
             "input-second",
         ]
         assert all(result["terminal"]["event_kind"] == "turn_terminal" for result in results)
+    finally:
+        rig.close()
+
+
+@pytest.mark.parametrize("confirmed_cancel", [False, True], ids=["optimistic", "confirmed"])
+@pytest.mark.parametrize("next_status", ["completed", "failed", "cancelled"])
+def test_new_result_key_after_cancel_delivers_without_terminal_identity(
+    confirmed_cancel: bool, next_status: str
+) -> None:
+    rig = _Rig("cursor-native")
+    try:
+        cancelled = subagent_work.mark_subagent_work_terminal(
+            rig.child_id,
+            status="cancelled",
+            output="first turn",
+            result_key="first-result",
+            confirmed_cancellation=confirmed_cancel,
+        )
+        assert cancelled.delivered_now
+        assert [item["status"] for item in rig.drained()] == ["cancelled"]
+
+        delivered = subagent_work.mark_subagent_work_terminal(
+            rig.child_id,
+            status=next_status,
+            output="next turn",
+            result_key="next-result",
+            confirmed_cancellation=next_status == "cancelled",
+        )
+        assert delivered.delivered and delivered.delivered_now
+        entry = subagent_work.get_subagent_work(rig.child_id)
+        assert entry is not None and entry.delivered_result_key == "next-result"
+        assert entry.terminal is not None and entry.terminal.identity_key is None
+        replay = subagent_work.mark_subagent_work_terminal(
+            rig.child_id,
+            status=next_status,
+            output="next turn",
+            result_key="next-result",
+            confirmed_cancellation=next_status == "cancelled",
+        )
+        assert replay.delivered and not replay.delivered_now
+        assert [(item["status"], item["output"]) for item in rig.drained()] == [
+            (next_status, "next turn")
+        ]
     finally:
         rig.close()
 

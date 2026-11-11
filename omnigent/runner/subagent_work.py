@@ -1435,6 +1435,7 @@ def mark_subagent_work_terminal(
         and entry.delivered
         and not confirms_cancellation
         and identity_key is None
+        and result_key is None
         and (entry.cancellation_confirmed or not corrects_cancellation)
     ):
         return _SubagentDeliveryAck(
@@ -1448,7 +1449,7 @@ def mark_subagent_work_terminal(
             # A confirmed kill makes the delivered optimistic cancellation
             # final; a late survivor completion can no longer correct it.
             entry.cancellation_confirmed = True
-            if entry.delivered:
+            if entry.delivered and not new_terminal_identity and result_key is None:
                 return _SubagentDeliveryAck(
                     entry=entry,
                     delivered=True,
