@@ -1781,7 +1781,16 @@ def test_multi_repo_git_command_bounds_and_cold_scoped_read(
 
     def run_git(argv: list[str], cwd: Path, timeout: float) -> subprocess.CompletedProcess[bytes]:
         assert 0 < timeout <= 8
-        calls.append((argv[0], cwd))
+        if argv[0] == "--no-optional-locks":
+            assert argv[1] == "status"
+            command = argv[1]
+        elif argv[0] == "-c":
+            assert argv[1:3] == ["diff.autoRefreshIndex=false", "diff"]
+            command = argv[2]
+        else:
+            assert argv[0] == "show"
+            command = argv[0]
+        calls.append((command, cwd))
         return _trusted_test_git(argv, cwd, timeout)
 
     reader = MultiRepositoryFilesystemRegistry(tmp_path).with_git_runner(run_git)

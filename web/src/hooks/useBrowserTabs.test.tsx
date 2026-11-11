@@ -202,7 +202,7 @@ describe("browser soft tabs", () => {
     expect(isBrowserTabClosing("session-a", tabId)).toBe(true);
     await act(async () => {
       finishClose({ ok: false });
-      expect(await pending).toBe(false);
+      expect(await pending).toBe("failed");
     });
     expect(isBrowserTabClosing("session-a", tabId)).toBe(false);
     expect(readSessionWorkspaceState("session-a").openBrowsers).toEqual([tabId]);
@@ -365,7 +365,7 @@ describe("browser soft tabs", () => {
       { initialProps: { id: "session-a" } },
     );
     rerender({ id: "session-b" });
-    expect(committed).toEqual(["a-tab", "b-tab"]);
+    expect(committed).toEqual(["a-tab", "a-tab", "b-tab", "b-tab"]);
   });
 
   it("keeps a reopen that finishes after a session switch out of the session on screen", async () => {
@@ -796,19 +796,18 @@ describe("browser soft tabs", () => {
     const browserClose = vi.fn().mockResolvedValue({ ok: true });
     Object.assign(window, { omnigentDesktop: { browserClose } });
     const { result } = renderHook(() => useBrowserTabs("session-a"));
-    const navigate = (actionId: string) =>
-      emitBrowserActionRequest(
-        { type: "browser_action_request", actionId, action: "navigate", args: {} },
-        "session-a",
-      );
-    act(() => navigate("navigate-1"));
+    const navigate = () => {
+      openAgentBrowserTab("session-a");
+      emitBrowserActionClaimed("session-a", AGENT_BROWSER_TAB_ID);
+    };
+    act(navigate);
     let finishLookup: () => void = () => {};
     const lookup = new Promise<void>((resolve) => {
       finishLookup = resolve;
     });
 
     const pendingClose = result.current.close(AGENT_BROWSER_TAB_ID, { beforeClose: () => lookup });
-    act(() => navigate("navigate-2"));
+    act(navigate);
     let closed = "";
     await act(async () => {
       finishLookup();

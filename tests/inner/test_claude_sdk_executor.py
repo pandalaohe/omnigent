@@ -3788,7 +3788,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             executor._elicitation_handler = _allow_elicitation
             original_build_prompt = executor._build_prompt
 
-            def _checked_prompt(messages, *, resume_session):
+            def _checked_prompt(messages, *, resume_session, history_token_budget=None):
                 if len(prompts) == 2:
                     self.assertTrue(clients[0].closed)
                     self.assertFalse(resume_session)
@@ -3798,7 +3798,11 @@ class TestStreamEventStreaming(unittest.TestCase):
                 if len(prompts) == 5:
                     self.assertTrue(clients[2].closed)
                     self.assertFalse(resume_session)
-                return original_build_prompt(messages, resume_session=resume_session)
+                return original_build_prompt(
+                    messages,
+                    resume_session=resume_session,
+                    history_token_budget=history_token_budget,
+                )
 
             first = [{"role": "user", "content": "hello", "session_id": "session-a"}]
             second = [

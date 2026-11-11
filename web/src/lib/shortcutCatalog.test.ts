@@ -29,6 +29,7 @@ describe("shortcutGroupsFor", () => {
       "Navigation",
       "View",
       "Slash commands",
+      "Question cards",
     ]);
     expect(
       shortcutGroupsFor({ ...BROWSER_TAB, grids: true }).map((group) => group.title),

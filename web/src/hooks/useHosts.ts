@@ -556,7 +556,7 @@ export async function refreshHostModelOptions(
   mode: "auto" | "force",
   { timeoutMs = 8_000 }: { timeoutMs?: number } = {},
 ): Promise<NativeModelOption[]> {
-  const queryKey = ["host-model-options", hostId, harness];
+  const queryKey = ["host-model-options", hostId, harness, getOmnigentServerIdentity()];
   await queryClient.cancelQueries({ queryKey, exact: true });
   try {
     const models = await fetchHostModelOptions(hostId, harness, mode, timeoutMs);

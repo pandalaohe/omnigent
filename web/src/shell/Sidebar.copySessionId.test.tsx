@@ -11,6 +11,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 
 vi.mock("@/hooks/useConversations", () => ({
+  useAutomationsEnabled: () => true,
   useConversations: vi.fn(),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => ({

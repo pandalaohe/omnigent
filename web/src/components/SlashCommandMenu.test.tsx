@@ -118,7 +118,7 @@ describe("skill discovery state", () => {
     );
     expect(screen.getByTestId("slash-menu-item-review")).toBeVisible();
     expect(screen.queryByText("Loading skills…")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Retry loading skills" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(onRetrySkills).toHaveBeenCalledOnce();
   });
 
@@ -128,7 +128,7 @@ describe("skill discovery state", () => {
       <SlashCommandMenu {...props} commands={{}} skillsStatus="error" onRetrySkills={retry} />,
     );
     expect(screen.queryByText("Loading skills…")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Retry loading skills" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(retry).toHaveBeenCalledOnce();
   });
 

@@ -160,9 +160,16 @@ function focusCard(): void {
 
 /** Which label row carries the keyboard highlight (options then custom row). */
 function highlightedIndex(): number {
-  return Array.from(card().querySelectorAll("label")).findIndex(
-    (label) => label.getAttribute("data-highlighted") === "true",
-  );
+  return Array.from(
+    card().querySelectorAll('input[type="radio"], input[type="checkbox"]'),
+  ).findIndex((input) => {
+    const label = input.closest("label");
+    const row =
+      input.getAttribute("data-testid") === "ask-user-question-custom-toggle"
+        ? label?.parentElement
+        : label;
+    return row?.getAttribute("data-highlighted") === "true";
+  });
 }
 
 function pressCard(init: KeyboardEventInit): boolean {
@@ -388,7 +395,9 @@ describe("AskUserQuestionForm — keyboard", () => {
     pressCard({ key: "ArrowDown", code: "ArrowDown" });
     pressCard({ key: " ", code: "Space" });
     const textarea = screen.getByTestId("ask-user-question-custom-input");
-    const customLabel = textarea.closest("label");
+    const customLabel = screen
+      .getByTestId("ask-user-question-custom-toggle")
+      .closest("label")?.parentElement;
     fireEvent.change(textarea, { target: { value: "custom answer" } });
 
     // Esc from the box returns to the options, the next Esc leaves to the composer.
