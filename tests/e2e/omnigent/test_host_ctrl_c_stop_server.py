@@ -42,6 +42,7 @@ from pathlib import Path
 import httpx
 import pexpect
 import psutil
+import pytest
 
 from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 
@@ -68,6 +69,29 @@ _LEFT_RUNNING_MARKER = "Left the local server running"
 # Shared, interruptible sleep handle for bounded external-state polling (no
 # raw time.sleep — see omnigent-testing rule 13).
 _POLL_PAUSE = threading.Event()
+
+# pick_local_port(0) returns 0 rather than the assigned port, so obtain an
+# ephemeral candidate first and keep the production availability check.
+_EPHEMERAL_PORT_BOOTSTRAP = """\
+from omnigent.host import local_server
+_pick_local_port = local_server.pick_local_port
+_find_free_local_port = local_server._find_free_local_port
+def _find_ephemeral_port():
+    while True:
+        port = _find_free_local_port()
+        if port != 6767:
+            return port
+local_server._find_free_local_port = _find_ephemeral_port
+def _pick_ephemeral_port():
+    while True:
+        port = _pick_local_port(preferred=local_server._find_free_local_port())
+        if port != 6767:
+            return port
+local_server.pick_local_port = _pick_ephemeral_port
+"""
+_HOST_CLI_BOOTSTRAP = _EPHEMERAL_PORT_BOOTSTRAP + (
+    "import runpy\nrunpy.run_module('omnigent', run_name='__main__')\n"
+)
 
 
 def _connect_env(base_env: Mapping[str, str], home: Path) -> dict[str, str]:
@@ -97,10 +121,21 @@ def _connect_env(base_env: Mapping[str, str], home: Path) -> dict[str, str]:
     return env
 
 
+def _restore_sigint() -> None:
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
+
+def _ignore_then_restore_sigint() -> None:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    _restore_sigint()
+
+
 def _spawn_connect(
     omnigent_python: Path,
     repo_root: Path,
     env: Mapping[str, str],
+    *,
+    inherited_sigint_ignored: bool = False,
 ) -> pexpect.spawn:
     """
     Spawn ``omnigent host ""`` (local mode) under a real PTY.
@@ -117,13 +152,14 @@ def _spawn_connect(
     """
     return pexpect.spawn(
         str(omnigent_python),
-        ["-m", "omnigent", "host", ""],
+        ["-c", _HOST_CLI_BOOTSTRAP, "host", ""],
         env=dict(env),
         cwd=str(repo_root),
         encoding="utf-8",
         codec_errors="replace",
         timeout=_BOOT_TIMEOUT,
         dimensions=(40, 120),
+        preexec_fn=_ignore_then_restore_sigint if inherited_sigint_ignored else _restore_sigint,
     )
 
 
@@ -265,7 +301,7 @@ def _prespawn_persistent_server(
         :func:`_connect_env`.
     :returns: ``(pid, port)`` of the running detached server.
     """
-    code = (
+    code = _EPHEMERAL_PORT_BOOTSTRAP + (
         "from omnigent.host.local_server import ensure_local_omnigent_server;"
         "print(ensure_local_omnigent_server().url)"
     )
@@ -294,11 +330,13 @@ def _prespawn_persistent_server(
         raise
 
 
+@pytest.mark.parametrize("inherited_sigint_ignored", [False, True])
 def test_host_ctrl_c_yes_stops_local_server(
     omnigent_python: Path,
     omnigent_repo_root: Path,
     mock_credentials_env: dict[str, str],
     tmp_path: Path,
+    inherited_sigint_ignored: bool,
 ) -> None:
     """
     Ctrl+C then ``y`` stops the detached local server.
@@ -311,7 +349,9 @@ def test_host_ctrl_c_yes_stops_local_server(
     """
     home = tmp_path / "home"
     env = _connect_env(mock_credentials_env, home)
-    child = _spawn_connect(omnigent_python, omnigent_repo_root, env)
+    child = _spawn_connect(
+        omnigent_python, omnigent_repo_root, env, inherited_sigint_ignored=inherited_sigint_ignored
+    )
     server = None
     try:
         server_pid, port = _boot_connect_and_get_server(child, home)

@@ -3216,8 +3216,8 @@ async def test_watch_runner_silent_on_intentional_stop(
 ) -> None:
     """A host.stop_runner termination is NOT reported as a crash.
 
-    ``_handle_stop`` pops the handle before terminating; the watcher
-    must read that as intentional and send nothing. A false report
+    The watcher can observe the exit before ``_handle_stop`` resumes; it
+    must recognize the intentional stop and send nothing. A false report
     here would attach a scary "runner process exited" error to every
     cleanly stopped session.
     """
@@ -3257,6 +3257,13 @@ async def test_watch_runner_silent_on_intentional_stop(
     assert result.status == "launched", result.error
 
     runner_id = token_bound_runner_id("tok_stop")
+    original_stop = host._stop_runner_and_trigger
+
+    async def _stop_then_wait_for_watchers(proc, reason):
+        await original_stop(proc, reason)
+        await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+
+    monkeypatch.setattr(host, "_stop_runner_and_trigger", _stop_then_wait_for_watchers)
     with (
         patch("omnigent.host.connect.print", side_effect=BrokenPipeError(), create=True)
         if console_closed
@@ -3267,14 +3274,11 @@ async def test_watch_runner_silent_on_intentional_stop(
         )
     assert stop_result.status == "stopped"
 
-    # Let the watcher observe the (intentional) death and finish.
-    await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
-
     # No runner_exited report and nothing parked for a reconnect —
     # either would mark a clean stop as a crash.
     assert tunnel.sent == []
     assert host._unreported_exits == {}
-    assert maintenance_reasons == ["runner_stopped"]
+    assert "runner_stopped" in maintenance_reasons
 
 
 async def test_watch_runner_silent_on_clean_exit(

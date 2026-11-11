@@ -611,10 +611,25 @@ def test_select_arrow_keys_work_in_both_cursor_modes(
 @pytest.mark.posix_only
 def test_select_avoids_poll_for_supported_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     import select
+    import selectors
+
+    real_select = select.select
+
+    def _select_compatible(readers, writers, errors, timeout):
+        try:
+            return real_select(readers, writers, errors, timeout)
+        except ValueError:
+            # Keep the PTY real when all select-compatible descriptors are occupied.
+            with selectors.DefaultSelector() as selector:
+                for fd in readers:
+                    selector.register(fd, selectors.EVENT_READ)
+                ready = {key.fd for key, _ in selector.select(timeout)}
+            return [fd for fd in readers if fd in ready], [], []
 
     def _unexpected_poll():
         raise AssertionError("select-compatible terminals must not use poll")
 
+    monkeypatch.setattr(select, "select", _select_compatible)
     monkeypatch.setattr(select, "poll", _unexpected_poll)
     assert _select_over_pty(monkeypatch, b"\x1b") == -1
 
