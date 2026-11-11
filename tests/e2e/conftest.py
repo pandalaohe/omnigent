@@ -600,6 +600,134 @@ def openai_judge_api_key(
 
 _live_runner_state: dict[str, Any] = {}
 
+# URL of the ``live_server`` this conftest spawned, or ``None`` when a test
+# overrides the fixture with an external server. Only an owned server's
+# sessions are ours to delete.
+_owned_live_server_url: str | None = None
+
+_SESSION_DELETE_TIMEOUT_S = 65.0
+_SESSION_PAGE_SIZE = 200
+
+
+def _owned_server_client(server_url: str) -> httpx.Client:
+    """Build a short-timeout client for lifecycle requests to our own server.
+
+    :param server_url: Base URL of the session's spawned server.
+    :returns: A client sending the first-party sentinel Origin.
+    """
+    return httpx.Client(
+        base_url=server_url,
+        timeout=_SESSION_DELETE_TIMEOUT_S,
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, "X-Omnigent-Permission-Tiers": "1"},
+    )
+
+
+def _list_server_sessions(client: httpx.Client) -> dict[str, dict[str, Any]]:
+    """Return session summaries keyed by id for every session on the server.
+
+    Includes sub-agent sessions and archived sessions so a test that archives
+    or forks before teardown still has its created sessions found.
+
+    :param client: Client pointed at the session's spawned server.
+    :returns: Session mapping; HTTP/JSON failures raise.
+    """
+    sessions: dict[str, dict[str, Any]] = {}
+    after: str | None = None
+    seen_cursors: set[str] = set()
+    while True:
+        params: dict[str, str | int] = {
+            "visibility": "all",
+            "limit": _SESSION_PAGE_SIZE,
+            "kind": "any",
+            "include_archived": "true",
+            "include_side_chats": "true",
+            "order": "asc",
+        }
+        if after is not None:
+            params["after"] = after
+        response = client.get("/v1/sessions", params=params)
+        response.raise_for_status()
+        body = response.json()
+        for row in body.get("data") or []:
+            sessions[row["id"]] = row
+        last_id = body.get("last_id")
+        if not body.get("has_more") or not isinstance(last_id, str) or last_id in seen_cursors:
+            return sessions
+        seen_cursors.add(last_id)
+        after = last_id
+
+
+def _delete_new_runner_sessions(server_url: str, baseline_ids: frozenset[str]) -> None:
+    """Delete sessions bound to a runner that this test created.
+
+    Registration-only sessions are unbound and stay: agent fixtures reuse them
+    to resolve a durable agent id, and they own no runner resources. Bound
+    sessions own the runner-side harness processes that accumulate.
+
+    :param server_url: Base URL of the server this conftest spawned.
+    :param baseline_ids: Session ids present before the test's own fixtures.
+    :raises RuntimeError: When a delete did not release its session (a 409 can
+        mean a worktree hold or archived lock whose resources are still live).
+    """
+    failures: list[str] = []
+    with _owned_server_client(server_url) as client:
+        current = _list_server_sessions(client)
+
+        def depth(session_id: str) -> int:
+            ancestors: set[str] = set()
+            parent = current[session_id].get("parent_session_id")
+            while parent in current and parent not in ancestors:
+                ancestors.add(parent)
+                parent = current[parent].get("parent_session_id")
+            return len(ancestors)
+
+        # Parent deletion cascades DB rows without releasing child runners.
+        targets = sorted(
+            (
+                session_id
+                for session_id, row in current.items()
+                if session_id not in baseline_ids and row.get("runner_id") is not None
+            ),
+            key=depth,
+            reverse=True,
+        )
+        for session_id in targets:
+            try:
+                response = client.delete(f"/v1/sessions/{session_id}")
+            except httpx.HTTPError as error:
+                failures.append(f"{session_id}: {type(error).__name__}")
+                continue
+            if response.status_code not in (200, 204, 404):
+                failures.append(f"{session_id}: HTTP {response.status_code} {response.text[:200]}")
+    if failures:
+        raise RuntimeError(
+            "e2e per-test session cleanup failed; sessions created by this test "
+            f"may still hold runner resources: {'; '.join(failures)}"
+        )
+
+
+@pytest.fixture(autouse=True)
+def _reap_sessions_created_by_test(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Delete runner-bound sessions a test creates on this conftest's server.
+
+    Autouse so the baseline is captured before other function-scoped fixtures
+    create their sessions; explicitly resolving ``live_server`` keeps the
+    server (and its runner) alive through cleanup and boots it before the first
+    baseline. External/overridden servers are left untouched.
+    """
+    if "live_server" not in request.fixturenames:
+        yield
+        return
+    requested_url = request.getfixturevalue("live_server")
+    server_url = _owned_live_server_url
+    if server_url is None or requested_url != server_url:
+        yield
+        return
+    with _owned_server_client(server_url) as client:
+        baseline_ids = frozenset(_list_server_sessions(client))
+    yield
+    _delete_new_runner_sessions(server_url, baseline_ids)
+
 
 @pytest.fixture(scope="session")
 def live_runner_id() -> str:
@@ -656,6 +784,8 @@ def live_server(
         when using a real LLM.
     :returns: The server's base URL, e.g. ``"http://localhost:18501"``.
     """
+    global _owned_live_server_url
+
     # Dynamic free port so back-to-back test sessions don't race
     # on a hard-coded port (which produced
     # "address already in use" → server death → ConnectError in
@@ -872,8 +1002,10 @@ def live_server(
 
     try:
         with operator_agent_store(base_url, f"sqlite:///{db_path}", artifact_dir):
+            _owned_live_server_url = base_url
             yield base_url
     finally:
+        _owned_live_server_url = None
         runner_proc = _live_runner_state.get("process", runner_proc)
         if runner_proc.poll() is None:
             runner_proc.send_signal(signal.SIGTERM)

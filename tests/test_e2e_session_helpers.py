@@ -146,3 +146,130 @@ def test_pending_tool_poll_waits_for_this_turn(monkeypatch, previous_call) -> No
             client, "input-new", session_id="session", timeout=1
         )
     assert [item["call_id"] for item in output] == ["new"]
+
+
+def test_cleanup_owns_only_new_bound_sessions_after_server_start(monkeypatch) -> None:
+    server_url = "http://owned"
+    monkeypatch.setattr(helpers, "_owned_live_server_url", None)
+    listings = iter(
+        [
+            [{"id": "shared", "runner_id": "runner"}],
+            [
+                {"id": "shared", "runner_id": "runner"},
+                {"id": "registration"},
+                {"id": "test-session", "runner_id": "runner"},
+            ],
+        ]
+    )
+    deleted = []
+
+    def handle(request):
+        assert helpers._owned_live_server_url == server_url
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": next(listings), "has_more": False})
+        deleted.append(request.url.path)
+        return httpx.Response(204)
+
+    monkeypatch.setattr(
+        helpers,
+        "_owned_server_client",
+        lambda url: httpx.Client(
+            transport=httpx.MockTransport(handle),
+            base_url=url,
+        ),
+    )
+    request = Mock(fixturenames=["live_server"])
+
+    def start_server(name):
+        assert name == "live_server"
+        monkeypatch.setattr(helpers, "_owned_live_server_url", server_url)
+        return server_url
+
+    request.getfixturevalue.side_effect = start_server
+    cleanup = helpers._reap_sessions_created_by_test.__wrapped__(request)
+    next(cleanup)
+    # A function fixture can create its bound session after this baseline.
+    with pytest.raises(StopIteration):
+        next(cleanup)
+    assert deleted == ["/v1/sessions/test-session"]
+
+
+def test_cleanup_reports_conflict_instead_of_claiming_resource_release(monkeypatch) -> None:
+    def handle(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": [{"id": "locked", "runner_id": "r"}]})
+        return httpx.Response(409, json={"detail": "worktree hold"})
+
+    monkeypatch.setattr(
+        helpers,
+        "_owned_server_client",
+        lambda url: httpx.Client(
+            transport=httpx.MockTransport(handle),
+            base_url=url,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="locked: HTTP 409"):
+        helpers._delete_new_runner_sessions("http://owned", frozenset())
+
+
+def test_cleanup_leaves_external_server_untouched(monkeypatch) -> None:
+    monkeypatch.setattr(helpers, "_owned_live_server_url", "http://owned")
+    client = Mock(side_effect=AssertionError("external server must not be queried"))
+    monkeypatch.setattr(helpers, "_owned_server_client", client)
+    request = Mock(fixturenames=["live_server"])
+    request.getfixturevalue.return_value = "http://external"
+    cleanup = helpers._reap_sessions_created_by_test.__wrapped__(request)
+    next(cleanup)
+    with pytest.raises(StopIteration):
+        next(cleanup)
+    client.assert_not_called()
+
+
+def test_cli_fixture_reaps_its_fixed_data_directory_on_failure(monkeypatch, tmp_path) -> None:
+    from tests.e2e.omnigent import conftest as cli_helpers
+
+    reap = Mock(return_value=([], []))
+    monkeypatch.setattr(cli_helpers, "reap_leaked_omnigent_processes", reap)
+    cleanup = cli_helpers.mock_credentials_env.__wrapped__("http://mock", tmp_path)
+    env = next(cleanup)
+    data_dir = Path(env["OMNIGENT_DATA_DIR"])
+    assert data_dir.is_relative_to(tmp_path)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "unrelated"))
+    with pytest.raises(RuntimeError, match="test failed"):
+        cleanup.throw(RuntimeError("test failed"))
+    reap.assert_called_once_with(data_dir)
+
+
+def test_cleanup_lists_side_chats_and_releases_children_even_after_timeout(monkeypatch) -> None:
+    deleted = []
+
+    def handle(request):
+        if request.method == "GET":
+            assert request.url.params["include_side_chats"] == "true"
+            assert request.url.params["order"] == "asc"
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "parent", "runner_id": "r"},
+                        {"id": "child", "runner_id": "r", "parent_session_id": "parent"},
+                        {"id": "side-chat", "runner_id": "r", "parent_session_id": "child"},
+                    ]
+                },
+            )
+        deleted.append(request.url.path)
+        if request.url.path.endswith("side-chat"):
+            raise httpx.ReadTimeout("slow runner", request=request)
+        return httpx.Response(200)
+
+    monkeypatch.setattr(
+        helpers,
+        "_owned_server_client",
+        lambda url: httpx.Client(
+            transport=httpx.MockTransport(handle),
+            base_url=url,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="side-chat: ReadTimeout"):
+        helpers._delete_new_runner_sessions("http://owned", frozenset())
+    assert deleted == ["/v1/sessions/side-chat", "/v1/sessions/child", "/v1/sessions/parent"]
