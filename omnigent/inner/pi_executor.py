@@ -4847,6 +4847,25 @@ class PiExecutor(Executor):
         state._has_sent_prompt = False
         return rpc
 
+    async def _await_permission_state_ready(self, session_key: str) -> None:
+        """Wait for the runner-owned permission fence before starting Pi."""
+        state_path = bridge_dir_for_session_id(session_key) / HOST_PERMISSION_STATE_FILE
+        deadline = asyncio.get_running_loop().time() + (30.0 if IS_WINDOWS else 8.0)
+        while True:
+            try:
+                state = read_host_permission_state(state_path)
+            except FileNotFoundError:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("timed out waiting for permission state") from None
+            else:
+                if state.session_id != session_key:
+                    raise ValueError("Pi permission state has wrong session")
+                if state.status == "ready":
+                    return
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise ValueError(f"Pi permission state is {state.status}")
+            await asyncio.sleep(0.05)
+
     async def _await_permission_installation(
         self, session_key: str, rpc: _PiRpcSession, *, deadline: float | None = None
     ) -> None:
@@ -4969,6 +4988,13 @@ class PiExecutor(Executor):
         except ValueError as exc:
             yield ExecutorError(message=str(exc), retryable=False)
             return
+
+        if self._permission_controlled:
+            try:
+                await self._await_permission_state_ready(session_key)
+            except (OSError, ValueError, TypeError) as exc:
+                yield ExecutorError(message=f"Pi permission state unavailable: {exc}")
+                return
 
         prior_rpc = (self._session_states.get(session_key) or _PiSessionState()).rpc
         try:
