@@ -2926,7 +2926,14 @@ class HostProcess:
         # zygote-forked one — run them off the loop so a wedged zygote can't
         # freeze the daemon's control handler.
         await self._stop_runner_and_trigger(handle.proc, "runner_stopped")
-        if await asyncio.to_thread(handle.proc.poll) is None:
+        if isinstance(handle.proc, ZygoteRunnerProc):
+            # Stop must not reacquire the forkserver lock to confirm OS exit.
+            exited = handle.proc.returncode is not None or not await asyncio.to_thread(
+                _proc.process_alive, handle.proc.pid
+            )
+        else:
+            exited = await asyncio.to_thread(handle.proc.poll) is not None
+        if not exited:
             return HostStopRunnerResultFrame(
                 request_id=frame.request_id,
                 status="failed",

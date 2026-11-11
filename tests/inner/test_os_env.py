@@ -1043,11 +1043,23 @@ def test_git_reads_preserve_filters_inside_the_session_sandbox(
     monkeypatch.setenv("GIT_DIR", str(tmp_path / "missing-git-dir"))
     os_env = _helper_env(workspace, backend)
     try:
-        result = os_env.run_git(["status", "--porcelain", "--", "file"], repo, 5)
-        assert result.returncode == 0 and result.stdout == b"", result.stderr
+        # User Git retains filters inside containment; internal reads disable callbacks.
+        user_result = asyncio.run(
+            os_env.shell(
+                "git -C repo --no-optional-locks -c diff.autoRefreshIndex=false "
+                "-c core.fsmonitor=false status --porcelain -- file",
+                timeout=5,
+                env_overrides={"GIT_DIR": None},
+            )
+        )
+        assert user_result["exit_code"] == 0 and user_result["stdout"] == "", user_result
         assert (workspace / "attempt").read_text().strip() == (
             "readable" if backend == "none" else "blocked"
         )
+        (workspace / "attempt").unlink()
+        result = os_env.run_git(["status", "--porcelain", "--", "file"], repo, 5)
+        assert result.returncode == 0 and result.stdout == b" M file\n", result.stderr
+        assert not (workspace / "attempt").exists()
         assert not (workspace / "fsmonitor-ran").exists()
         assert (repo / ".git/index").read_bytes() == index
         (repo / "file").write_text("different\n")
@@ -1065,7 +1077,8 @@ def test_git_reads_preserve_filters_inside_the_session_sandbox(
             redirect = workspace / "redirect"
             redirect.mkdir()
             (redirect / ".git").write_text(f"gitdir: {tmp_path}/outside-git\n")
-            assert os_env.run_git(["show", "HEAD:binary"], redirect, 5).returncode != 0
+            with pytest.raises(OSError, match="Git callback configuration snapshot"):
+                os_env.run_git(["show", "HEAD:binary"], redirect, 5)
     finally:
         os_env.close()
 

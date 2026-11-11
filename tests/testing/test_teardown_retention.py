@@ -54,12 +54,12 @@ def _assert_no_signals(proc: Mock) -> None:
 def test_denied_at_call_time_is_typed_without_signalling(
     monkeypatch: pytest.MonkeyPatch, data_dir: Path, cause: Exception
 ) -> None:
-    """``psutil.process_iter()`` itself raising must surface, not read as clean."""
+    """``psutil.pids()`` itself raising must surface, not read as clean."""
 
     def denied(*_args: object, **_kwargs: object) -> object:
         raise cause
 
-    monkeypatch.setattr(psutil, "process_iter", denied)
+    monkeypatch.setattr(psutil, "pids", denied)
     with pytest.raises(ProcessScanUnavailable) as failure:
         reap_leaked_omnigent_processes(data_dir)
     assert "process table enumeration denied" in str(failure.value)
@@ -73,12 +73,13 @@ def test_denied_mid_iteration_after_one_owned_process_signals_nothing(
     """Attribution succeeding for one process must not signal it if the scan dies."""
 
     proc = _owned_proc(data_dir)
+    monkeypatch.setattr(psutil, "Process", lambda pid: proc)
 
     def half_visible():
-        yield proc
+        yield proc.pid
         raise cause
 
-    monkeypatch.setattr(psutil, "process_iter", half_visible)
+    monkeypatch.setattr(psutil, "pids", half_visible)
     with pytest.raises(ProcessScanUnavailable) as failure:
         reap_leaked_omnigent_processes(data_dir)
     assert "process table enumeration denied" in str(failure.value)

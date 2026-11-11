@@ -63,10 +63,54 @@ def _configure_callback(repo: Path, kind: str) -> Path:
 
 
 @pytest.mark.parametrize("kind", ["clean", "fsmonitor"])
-def test_omnigent_status_does_not_run_repo_callbacks(callback_repo: Path, kind: str) -> None:
+@pytest.mark.parametrize("reader", ["worktree", "sandbox"])
+def test_omnigent_status_does_not_run_repo_callbacks(
+    callback_repo: Path, kind: str, reader: str
+) -> None:
     marker = _configure_callback(callback_repo, kind)
-    read_worktree_status(str(callback_repo))
+    if reader == "worktree":
+        read_worktree_status(str(callback_repo))
+    else:
+        from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+        from omnigent.inner.os_env import create_os_environment
+
+        environment = create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(callback_repo),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+        assert environment is not None
+        try:
+            result = environment.run_git(["status", "--porcelain"], callback_repo, 5)
+            assert result.returncode == 0
+            assert b"tracked" in result.stdout
+        finally:
+            environment.close()
     assert not marker.exists(), f"Omnigent status executed repository {kind}"
+
+
+def test_workspace_branch_read_does_not_run_repo_upload_pack(callback_repo: Path) -> None:
+    from omnigent.workspace_fs import read_repository_branches
+
+    marker = callback_repo / "upload-pack-ran"
+    script = callback_repo.parent / "upload-pack"
+    script.write_text("#!/bin/sh\ntouch " + shlex.quote(str(marker)) + "\nexit 1\n")
+    script.chmod(0o755)
+    subprocess.run(
+        ["git", "-C", str(callback_repo), "remote", "add", "origin", str(callback_repo)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(callback_repo), "config", "remote.origin.uploadpack", str(script)],
+        check=True,
+    )
+
+    assert read_repository_branches(callback_repo, [{"url": "origin", "path": ""}]) == {
+        "repositories": [{"url": "origin", "branch": "main", "pushed": True}]
+    }
+    assert not marker.exists()
 
 
 def test_checkout_hook_is_disabled_only_for_internal_git(callback_repo: Path) -> None:

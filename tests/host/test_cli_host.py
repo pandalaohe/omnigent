@@ -966,9 +966,14 @@ def _patch_background_host_spawn(
     :returns: The recorded spawn argv list and the fake daemon log path.
     """
     from omnigent.cli import _SpawnedDaemonProcess
+    from omnigent.host import local_server
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_PID_PATH", tmp_path / "local_server.pid")
+    monkeypatch.setattr(
+        local_server, "_LOCAL_SERVER_BASE_PATH_PATH", tmp_path / "local_server.base_path"
+    )
     # No fixed grace: the stubbed pid is trivially "alive", so waiting for it
     # only slows the test down.
     monkeypatch.setattr("omnigent.cli._BACKGROUND_HOST_GRACE_S", 0.0)

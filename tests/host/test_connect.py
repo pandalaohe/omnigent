@@ -321,7 +321,7 @@ async def test_host_skills_distinguishes_empty_and_failure(
 
     monkeypatch.setattr(skill_sources, "resolve_harness_skills", incomplete)
     host = _make_host_process()
-    assert host._handle_skills(frame) == HostSkillsResultFrame(
+    assert await host._handle_skills(frame) == HostSkillsResultFrame(
         request_id="r", status="ok", warnings=[warning]
     )
 
@@ -5469,12 +5469,16 @@ async def test_handle_stop_unknown_runner() -> None:
 
 
 @pytest.mark.parametrize("exit_confirmed", [False, True])
+@pytest.mark.parametrize("forked", [False, True])
 async def test_runner_status_retains_stopping_process_until_confirmed_exit(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, exit_confirmed: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, exit_confirmed: bool, forked: bool
 ) -> None:
     host = _make_host_process()
-    proc = Mock(spec=subprocess.Popen, pid=1234)
+    proc = Mock(spec=ZygoteRunnerProc if forked else subprocess.Popen, pid=1234, returncode=None)
     proc.poll.return_value = None
+    monkeypatch.setattr(
+        "omnigent.host.connect._proc.process_alive", lambda _pid: proc.poll() is None
+    )
     host._runners["runner_stopping"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner.log")
     started, release = threading.Event(), threading.Event()
 
@@ -11415,10 +11419,12 @@ async def test_slow_runner_exit_does_not_hold_back_later_launches(
     exit_started = threading.Event()
     release_exit = threading.Event()
     launched = asyncio.Event()
+    proc = SimpleNamespace(poll=lambda: None)
 
     def _slow_exit(_proc: object) -> None:
         exit_started.set()
         release_exit.wait(5.0)
+        proc.poll = lambda: 0
 
     async def _instant_launch(
         self_: HostProcess, frame: HostLaunchRunnerFrame
@@ -11431,7 +11437,7 @@ async def test_slow_runner_exit_does_not_hold_back_later_launches(
     monkeypatch.setattr(host, "_stop_runner_proc", _slow_exit)
     monkeypatch.setattr(HostProcess, "_handle_launch", _instant_launch)
     host._runners["runner_old"] = _RunnerHandle(
-        proc=SimpleNamespace(),  # type: ignore[arg-type] — only the patched exit sees it
+        proc=proc,  # type: ignore[arg-type] — the fake exit updates poll()
         log_path=tmp_path / "runner-old.log",
     )
 
@@ -11448,12 +11454,13 @@ async def test_slow_runner_exit_does_not_hold_back_later_launches(
     )
     try:
         await asyncio.wait_for(launched.wait(), timeout=2.0)
-        assert "runner_old" not in host._runners
+        assert host._runners["runner_old"].stop_requested
         assert [decode_host_frame(sent).request_id for sent in ws.sent] == ["rq_launch"]
     finally:
         release_exit.set()
     await _drain_frame_tasks(host)
 
+    assert "runner_old" not in host._runners
     stop_result = decode_host_frame(ws.sent[-1])
     assert isinstance(stop_result, HostStopRunnerResultFrame)
     assert (stop_result.request_id, stop_result.status) == ("rq_stop", "stopped")
