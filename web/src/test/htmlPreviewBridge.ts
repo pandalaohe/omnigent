@@ -19,7 +19,7 @@ export async function connectHtmlPreviewBridge(iframe: HTMLIFrameElement) {
     );
   await waitFor(() => expect(commentInits().length).toBeGreaterThan(0));
   const [init, , transfer] = commentInits().at(-1) as unknown as [
-    { nonce: string; restoreScroll?: { top: number; budgetMs: number } },
+    { nonce: string; restoreScroll?: { top: number; budgetMs: number } | null },
     string,
     MessagePort[],
   ];

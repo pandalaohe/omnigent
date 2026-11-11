@@ -13,10 +13,15 @@ import { HTML_PANEL_SANDBOX, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers
 import { BRIDGE_MSG } from "./htmlCommentBridge";
 import { connectHtmlPreviewBridge } from "@/test/htmlPreviewBridge";
 import { highlightCode } from "@/components/ai-elements/code-block";
+import * as host from "@/lib/host";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
+vi.mock("@/lib/host", async (importOriginal) => ({
+  ...(await importOriginal<typeof host>()),
+  hasOmnigentHostFetcher: vi.fn(() => false),
+}));
 const slugRuns = vi.hoisted(() => ({ count: 0 }));
 vi.mock("rehype-slug", async (importOriginal) => {
   const actual = await importOriginal<typeof rehypeSlugModule>();
@@ -933,6 +938,7 @@ describe("CodeViewer HTML preview sandbox", () => {
   ])(
     "opens %s at 100% zoom and without the first preview's scroll offset",
     async (_, path, nextPath, nextConversationId) => {
+      vi.mocked(host.hasOmnigentHostFetcher).mockReturnValue(true);
       const html = "<html><head></head><body><p>report</p></body></html>";
       const opened = (filePath: string, conversationId: string) =>
         viewerElement(html, true, filePath, { viewMode: "preview", conversationId });

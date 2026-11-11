@@ -917,19 +917,26 @@ describe("SubagentsPanel", () => {
     expect(within(childRow(container, "conv_agent")).queryByTestId("rail-agent-badge")).toBeNull();
   });
 
-  it("gives children without a harness identity role/bot icons", () => {
+  it("gives native sub-agent children role/bot icons, not the brand logo", () => {
     mockChildTree({
       conv_root: [
-        childInfo({ id: "conv_generic", tool: "general-purpose" }),
+        childInfo({
+          id: "conv_generic",
+          title: "claude:tell-a-joke",
+          tool: "claude",
+          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+        }),
         childInfo({
           id: "conv_explore",
           title: "Explore:find-the-bug",
           tool: "Explore",
+          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
         }),
       ],
     });
 
     const { container } = renderPanel({ rootSessionId: "conv_root" });
+    expandSubagentsZone(container);
 
     const genericRow = childRow(container, "conv_generic");
     expect(genericRow.querySelector(".lucide-bot")).not.toBeNull();
@@ -971,7 +978,7 @@ describe("SubagentsPanel", () => {
     expect(within(childRow(container, "conv_member")).queryByTestId("rail-agent-badge")).toBeNull();
   });
 
-  it("uses native harness icons while keeping sub-agent nicknames as labels", () => {
+  it("uses a native sub-agent's role for its icon while keeping its nickname as the label", () => {
     mockChildTree({
       conv_root: [
         childInfo({
@@ -996,14 +1003,14 @@ describe("SubagentsPanel", () => {
     expandSubagentsZone(container);
 
     const claudeRow = childRow(container, "conv_claude_explore");
-    expect(claudeRow.querySelector('[data-harness-icon="claude"]')).not.toBeNull();
-    expect(claudeRow.querySelector(".lucide-search")).toBeNull();
+    expect(claudeRow.querySelector('[data-harness-icon="claude"]')).toBeNull();
+    expect(claudeRow.querySelector(".lucide-search")).not.toBeNull();
 
     const codexRow = childRow(container, "conv_codex_researcher");
     expect(codexRow).toHaveTextContent("Archimedes");
-    expect(codexRow.querySelector('[data-harness-icon="codex"]')).not.toBeNull();
+    expect(codexRow.querySelector('[data-harness-icon="codex"]')).toBeNull();
     expect(codexRow.querySelector(".lucide-bot")).toBeNull();
-    expect(codexRow.querySelector(".lucide-book-open")).toBeNull();
+    expect(codexRow.querySelector(".lucide-book-open")).not.toBeNull();
   });
 
   it("uses a user-picked host colour on the row bar and an automatic one otherwise", () => {
