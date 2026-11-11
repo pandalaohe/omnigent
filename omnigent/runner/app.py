@@ -263,7 +263,7 @@ from omnigent.sdk_permission_modes import (
     CLAUDE_SDK_PERMISSION_MODE_LABEL_KEY,
     CODEX_SDK_APPROVAL_MODE_LABEL_KEY,
 )
-from omnigent.server.permission_tiers import PERMISSION_STATE_LABEL_KEY
+from omnigent.server.permission_tiers import PERMISSION_STATE_LABEL_KEY, TIER_HARNESSES
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
@@ -2176,6 +2176,16 @@ def create_runner_app(
     _session_init_tasks: dict[
         tuple[str, str, str | None, str | None], asyncio.Task[JSONResponse]
     ] = {}
+    _session_current_init_keys: dict[str, tuple[str, str, str | None, str | None]] = {}
+    # Superseded initializations that are still running: no waiter selects them,
+    # but teardown must reach them, so only delete cancels them.
+    _session_superseded_init_tasks: dict[str, set[asyncio.Task[JSONResponse]]] = {}
+
+    def _current_init_tasks(session_id: str) -> list[asyncio.Task[JSONResponse]]:
+        key = _session_current_init_keys.get(session_id)
+        task = _session_init_tasks.get(key) if key is not None else None
+        return [task] if task is not None else []
+
     _recovery_turn_ids: dict[str, set[str]] = {}
     # Dropping the server's forward of an item a replay turn already started is
     # what keeps one posted message from running twice.
@@ -5092,16 +5102,51 @@ def create_runner_app(
             envelope.recovery_id if envelope is not None else None,
         )
         task = _session_init_tasks.get(key)
-        if task is None:
+        failed_done = (
+            task is not None
+            and task.done()
+            and (
+                task.cancelled()
+                or task.exception() is not None
+                or task.result().status_code >= 400
+            )
+        )
+        if task is None or failed_done:
+
+            def _discard_superseded_init(done: asyncio.Task[JSONResponse]) -> None:
+                pending = _session_superseded_init_tasks.get(session_id)
+                if pending is None:
+                    return
+                pending.discard(done)
+                if not pending:
+                    _session_superseded_init_tasks.pop(session_id, None)
+
+            for old_key, old_task in list(_session_init_tasks.items()):
+                if old_key[0] != session_id:
+                    continue
+                _session_init_tasks.pop(old_key, None)
+                # Cancelling here would fail a concurrent init request that still
+                # awaits this task; keep it reachable for delete instead.
+                if not old_task.done():
+                    _session_superseded_init_tasks.setdefault(session_id, set()).add(old_task)
+                    old_task.add_done_callback(_discard_superseded_init)
             task = asyncio.create_task(
                 _initialize_session(body),
                 name=f"session-init-{session_id}",
             )
             _session_init_tasks[key] = task
+            _session_current_init_keys[session_id] = key
 
             def _drop_completed_init(done: asyncio.Task[JSONResponse]) -> None:
-                if _session_init_tasks.get(key) is done:
+                if (
+                    _session_init_tasks.get(key) is done
+                    and not done.cancelled()
+                    and done.exception() is None
+                    and done.result().status_code < 400
+                ):
                     _session_init_tasks.pop(key, None)
+                    if _session_current_init_keys.get(session_id) == key:
+                        _session_current_init_keys.pop(session_id, None)
 
             task.add_done_callback(_drop_completed_init)
         response = await asyncio.shield(task)
@@ -5360,11 +5405,15 @@ def create_runner_app(
             _sdk_peer_attempts.pop(key)
         _session_message_buffers.pop(session_id, None)
         # Stop initialization before it can recreate resources during teardown.
-        init_tasks = [
-            task
-            for key, task in list(_session_init_tasks.items())
-            if key[0] == session_id and not task.done()
+        init_records = [
+            (key, task) for key, task in list(_session_init_tasks.items()) if key[0] == session_id
         ]
+        for key, _task in init_records:
+            _session_init_tasks.pop(key, None)
+        _session_current_init_keys.pop(session_id, None)
+        superseded_inits = _session_superseded_init_tasks.pop(session_id, set())
+        init_tasks = [task for _key, task in init_records if not task.done()]
+        init_tasks.extend(task for task in superseded_inits if not task.done())
         for init_task in init_tasks:
             init_task.cancel()
         if init_tasks:
@@ -8816,9 +8865,7 @@ def create_runner_app(
                 permission_state = permission_tiers.state(conv)
                 if permission_state is None or permission_state.status != "ready":
                     # Initialization owns the deny-safe fence until bootstrap settles.
-                    initializations = [
-                        task for key, task in list(_session_init_tasks.items()) if key[0] == conv
-                    ]
+                    initializations = _current_init_tasks(conv)
                     if initializations:
                         try:
                             await asyncio.wait_for(
@@ -9526,6 +9573,56 @@ def create_runner_app(
                 },
             )
 
+    async def _wait_for_permission_initialization(session_id: str) -> JSONResponse | None:
+        observed: set[asyncio.Task[JSONResponse]] = set()
+        try:
+            async with asyncio.timeout(60.0):
+                while True:
+                    completed = [
+                        task
+                        for task in _current_init_tasks(session_id)
+                        if task.done() and task not in observed
+                    ]
+                    if completed:
+                        results = await asyncio.shield(
+                            asyncio.gather(*completed, return_exceptions=True)
+                        )
+                        observed.update(completed)
+                        for result in results:
+                            if isinstance(result, BaseException):
+                                detail = permission_startup_errors.get(session_id) or (
+                                    "Permission tier initialization failed"
+                                )
+                            elif result.status_code >= 400:
+                                payload = json.loads(bytes(result.body))
+                                detail = (
+                                    permission_startup_errors.get(session_id)
+                                    or (
+                                        payload.get("detail") or payload.get("error")
+                                        if isinstance(payload, dict)
+                                        else None
+                                    )
+                                    or "Permission tier initialization failed"
+                                )
+                            else:
+                                continue
+                            return JSONResponse(
+                                status_code=503,
+                                content={"error": "permission_tier_unavailable", "detail": detail},
+                            )
+                    state = permission_tiers.state(session_id)
+                    if state is not None and state.status == "ready":
+                        return None
+                    await asyncio.sleep(0.05)
+        except TimeoutError:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "permission_tier_unavailable",
+                    "detail": "Permission tier initialization timed out",
+                },
+            )
+
     async def _stream_message_to_harness(
         body: _JsonObject,
         conv_id: str,
@@ -9725,6 +9822,12 @@ def create_runner_app(
 
         if harness_name is not None:
             await prepare_capture(server_client, conv_id, harness_name)
+        if harness_name in TIER_HARNESSES:
+            permission_state = permission_tiers.state(conv_id)
+            if permission_state is None or permission_state.status != "ready":
+                init_error = await _wait_for_permission_initialization(conv_id)
+                if init_error is not None:
+                    return init_error
         try:
             client = await manager.get_client(conv_id, harness_name, env=spawn_env)
         except RuntimeError as exc:
