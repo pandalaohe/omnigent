@@ -2026,15 +2026,15 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
                     model_catalog_store.read_catalog("codex-native", current_fingerprint) is None
                 )
             else:
-                # Alias reuse requires a catalog for the unchanged route.
-                for provider, host in (
-                    ("default", "https://a.example"),
-                    ("other", "https://b.example"),
-                ):
+                # Shared picker reads retain each provider's alias mapping.
+                for provider in ("default", "other"):
+                    rows = codex.fresh_codex_launch_catalog(
+                        codex_path=sys.executable,
+                        launch=codex.NativeCodexLaunch([], None, provider),
+                    )
+                    assert rows is not None
                     assert (
-                        codex._resolve_databricks_codex_model(
-                            host, provider, "shared-picker", codex_path=sys.executable
-                        )
+                        next(row["model"] for row in rows if row["id"] == "shared-picker")
                         == f"{provider}.schema.model"
                     )
             credentials.assert_not_called()
@@ -5905,16 +5905,41 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "command,inherited,attachment",
-    [(False, False, False), (False, True, False), (True, False, False), (True, False, True)],
-    ids=["follow-up", "inherited-default", "side-command", "side-command-attachment"],
+    [
+        (False, False, None),
+        (False, True, None),
+        (True, False, None),
+        (True, False, {"type": "image", "file_id": "attached-file"}),
+        (True, False, {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="}),
+        (
+            True,
+            False,
+            {"type": "input_file", "file_data": "data:text/plain;base64,ZmlsZQ=="},
+        ),
+        (
+            True,
+            False,
+            {"type": "input_audio", "input_audio": {"data": "YXVkaW8=", "format": "wav"}},
+        ),
+    ],
+    ids=[
+        "follow-up",
+        "inherited-default",
+        "side-command",
+        "side-command-attachment",
+        "side-command-image",
+        "side-command-file",
+        "side-command-audio",
+    ],
 )
 async def test_events_codex_side_chat_preserves_indentation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     command: bool,
     inherited: bool,
-    attachment: bool,
+    attachment: dict[str, Any] | None,
 ) -> None:
+    """Keep command indentation and route supported attachments through the parent turn."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.harnesses.codex_native import side_chat
 
@@ -5956,7 +5981,11 @@ async def test_events_codex_side_chat_preserves_indentation(
     monkeypatch.setattr(
         codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
     )
-    app, _ = await _build_app_for_spec(_harness_spec("codex-native"))
+    app, pm = await _build_app_for_spec(_harness_spec("codex-native"))
+    stream_finished = asyncio.Event()
+    harness_client = _ScriptedHarnessClient([], stream_finished=stream_finished)
+    pm._client = harness_client
+    multimodal = attachment is not None and attachment["type"].startswith("input_")
     question = "  - First\n  - Second"
     payload: dict[str, Any] = {
         "type": "message",
@@ -5970,24 +5999,38 @@ async def test_events_codex_side_chat_preserves_indentation(
         if not inherited:
             payload["reasoning_effort"] = "max"
     if attachment:
-        payload["content"].append({"type": "image", "file_id": "attached-file"})
+        payload["content"].append(attachment)
     async with _runner_client(app) as client:
         created = await client.post(
             "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_side"}
         )
         assert created.status_code == 201, created.text
         response = await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
+        if multimodal:
+            assert response.status_code == 202, response.text
+            await asyncio.wait_for(stream_finished.wait(), timeout=5)
         if not command:
             repeated = await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
             assert repeated.status_code == 202, repeated.text
-    if attachment:
+    if attachment and not multimodal:
         assert response.status_code == 400, response.text
         assert "attachments" in response.json()["error"]["message"]
         assert side_chat.peek_side_chat_requests(bridge_dir) == []
         assert fake_client.requests == []
         return
     assert response.status_code == 202, response.text
-    if command:
+    if multimodal:
+        assert side_chat.peek_side_chat_requests(bridge_dir) == []
+        assert fake_client.requests == []
+        assert len(harness_client.posted_bodies) == 1
+        sent_message = harness_client.posted_bodies[0]["content"][-1]
+        assert sent_message["role"] == "user"
+        assert sent_message["content"] == payload["content"]
+        assert any(
+            session_id == conv_id and harness == "codex-native"
+            for session_id, harness, _ in pm.get_client_calls
+        )
+    elif command:
         assert [request.question for request in side_chat.peek_side_chat_requests(bridge_dir)] == [
             question
         ]
