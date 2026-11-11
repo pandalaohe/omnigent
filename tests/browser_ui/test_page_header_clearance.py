@@ -536,6 +536,8 @@ def test_page_clearance_uses_shared_threshold(
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.set_viewport_size({"width": 768, "height": 390})
     page.goto(f"{pages_url}{route}")
+    if route == "/tasks":
+        page.get_by_role("button", name="Maybe later", exact=True).click()
     if route == "/settings/system-status":
         expect(page).to_have_url(f"{pages_url}/system?monitor=1")
         monitor = page.get_by_role("dialog", name="Monitor settings", exact=True)

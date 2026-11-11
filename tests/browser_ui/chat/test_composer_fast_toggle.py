@@ -20,6 +20,7 @@ def test_fast_control_keeps_send_and_stop_inside_phone_composer(
     page: Page, chat_session_contract: ChatSessionContract, surface: str, menu: bool
 ) -> None:
     chat = chat_session_contract
+    page.emulate_media(reduced_motion="reduce")
     model = model_option(
         "gpt-long-model",
         display_name="GPT Long Model (maximum context)",
