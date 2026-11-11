@@ -2,6 +2,8 @@
 
 import ntpath
 import os
+import shutil
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -141,8 +143,6 @@ def test_remote_tui_approval_preset_keeps_policy_override_and_literal_values() -
     assert args[:2] == ["--model", "--approve-for-me"]
     assert args[-4:] == ["--remote", "ws://127.0.0.1:9876", "--", "--approve-for-me"]
     assert args[2:-4] == [
-        "--ask-for-approval",
-        "never",
         "-c",
         "approvals_reviewer=user",
         "--ask-for-approval",
@@ -154,14 +154,52 @@ def test_remote_tui_approval_preset_keeps_policy_override_and_literal_values() -
     ]
 
 
-@pytest.mark.parametrize("sandbox", ["--sandbox=read-only", "--yolo"])
-def test_remote_tui_approval_preset_rejects_conflicting_sandbox(sandbox: str) -> None:
-    with pytest.raises(ValueError, match="conflicts with sandbox and bypass flags"):
-        app_server.build_codex_remote_args(
-            codex_args=("--approve-for-me", sandbox),
-            thread_id=None,
-            remote_url="ws://127.0.0.1:9876",
-        )
+@pytest.mark.parametrize("sandbox", ["--sandbox=read-only", "-sread-only", "--yolo"])
+def test_remote_tui_approval_preset_keeps_sandbox_override(sandbox: str) -> None:
+    args = app_server.build_codex_remote_args(
+        codex_args=("--approve-for-me", sandbox),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+    )
+    expected = (
+        ["--dangerously-bypass-approvals-and-sandbox"]
+        if sandbox == "--yolo"
+        else ["--ask-for-approval", "on-request", "--sandbox", "read-only"]
+    )
+    assert args == [
+        *expected,
+        "-c",
+        'approvals_reviewer="auto_review"',
+        "--remote",
+        "ws://127.0.0.1:9876",
+    ]
+    params = app_server._codex_resume_permission_params(("--approve-for-me", sandbox))
+    assert params["sandbox"] == ("danger-full-access" if sandbox == "--yolo" else "read-only")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        ("--ask-for-approval", "never"),
+        ("-a=never",),
+        ("--ask-for-approval", "never", "--sandbox=read-only"),
+        ("--yolo",),
+    ],
+)
+def test_remote_tui_approval_override_parses_with_real_cli(overrides: tuple[str, ...]) -> None:
+    binary = shutil.which("codex")
+    if binary is None:
+        pytest.skip("requires Codex CLI")
+    args = app_server.build_codex_remote_args(
+        codex_args=("--approve-for-me", *overrides),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+        codex_cli_version=(0, 142, 0),
+    )
+    result = subprocess.run(
+        [binary, *args, "--help"], capture_output=True, text=True, timeout=15, check=False
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize(
