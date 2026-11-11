@@ -81,6 +81,7 @@ from omnigent.harnesses.codex_native.launch_args import (
     codex_config_profile,
     codex_workspace_profile,
     codex_workspace_roots,
+    expand_codex_approval_preset,
     materialize_codex_config_profile,
     normalize_codex_permission_launch_args,
     read_codex_mcp_servers,
@@ -6568,7 +6569,9 @@ def build_codex_remote_args(
         # bypass flag (a global flag, so it precedes any ``resume``).
         passthrough = [_CODEX_BYPASS_SANDBOX_FLAG, *_strip_approval_sandbox_flags(codex_args)]
     else:
-        passthrough = normalize_codex_permission_launch_args(codex_args)
+        passthrough = expand_codex_approval_preset(
+            normalize_codex_permission_launch_args(codex_args)
+        )
     passthrough = without_codex_config_profile(passthrough)
     if bypass_hook_trust:
         passthrough = [_CODEX_BYPASS_HOOK_TRUST_FLAG, *passthrough]

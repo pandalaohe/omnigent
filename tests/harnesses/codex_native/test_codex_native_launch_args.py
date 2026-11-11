@@ -21,6 +21,7 @@ from omnigent.harnesses.codex_native.launch_args import (
     redact_codex_launch_args,
     without_codex_positional_prompt,
 )
+from omnigent.session_default_modes import apply_mode
 
 
 def test_codex_paths_expand_home_without_resolving_symlinks(
@@ -90,6 +91,77 @@ def test_remote_resume_option_spellings(args: tuple[str, ...], expected: dict) -
     assert app_server.build_codex_remote_args(
         codex_args=args, thread_id="thread-test", remote_url="ws://127.0.0.1:9876"
     ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread-test"]
+
+
+@pytest.mark.parametrize("thread_id", [None, "thread-test"])
+@pytest.mark.parametrize("version", [(0, 142, 0), (0, 162, 0)])
+@pytest.mark.parametrize("alias", [False, True])
+def test_remote_tui_applies_saved_approval_preset(thread_id, version, alias) -> None:
+    saved = apply_mode("codex-native", "permission", "approve-for-me").args
+    args = app_server.build_codex_remote_args(
+        codex_args=("--not-so-yolo",) if alias else saved,
+        thread_id=thread_id,
+        remote_url="ws://127.0.0.1:9876",
+        codex_cli_version=version,
+    )
+    expected = []
+    if thread_id is None or version < (0, 154, 0):
+        expected = [
+            "--ask-for-approval",
+            "on-request",
+            "--sandbox",
+            "workspace-write",
+            "-c",
+            'approvals_reviewer="auto_review"',
+        ]
+    assert args == [
+        *expected,
+        *(["resume"] if thread_id else []),
+        "--remote",
+        "ws://127.0.0.1:9876",
+        *([thread_id] if thread_id else []),
+    ]
+
+
+def test_remote_tui_approval_preset_keeps_policy_override_and_literal_values() -> None:
+    args = app_server.build_codex_remote_args(
+        codex_args=(
+            "--model",
+            "--approve-for-me",
+            "--approve-for-me",
+            "--ask-for-approval",
+            "never",
+            "-capprovals_reviewer=user",
+            "--",
+            "--approve-for-me",
+        ),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+    )
+    assert args[:2] == ["--model", "--approve-for-me"]
+    assert args[-4:] == ["--remote", "ws://127.0.0.1:9876", "--", "--approve-for-me"]
+    assert args[2:-4] == [
+        "--ask-for-approval",
+        "never",
+        "-c",
+        "approvals_reviewer=user",
+        "--ask-for-approval",
+        "never",
+        "--sandbox",
+        "workspace-write",
+        "-c",
+        'approvals_reviewer="auto_review"',
+    ]
+
+
+@pytest.mark.parametrize("sandbox", ["--sandbox=read-only", "--yolo"])
+def test_remote_tui_approval_preset_rejects_conflicting_sandbox(sandbox: str) -> None:
+    with pytest.raises(ValueError, match="conflicts with sandbox and bypass flags"):
+        app_server.build_codex_remote_args(
+            codex_args=("--approve-for-me", sandbox),
+            thread_id=None,
+            remote_url="ws://127.0.0.1:9876",
+        )
 
 
 @pytest.mark.parametrize(

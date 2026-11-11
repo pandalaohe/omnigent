@@ -546,6 +546,21 @@ def _workspace_profile_options(args: Sequence[str]) -> Iterator[tuple[str, ...]]
         index += 1
 
 
+def expand_codex_approval_preset(args: Sequence[str]) -> list[str]:
+    """Translate the wrapper's approval preset into native CLI policy flags."""
+    options = list(_workspace_profile_options(args))
+    if ("--approve-for-me",) not in options:
+        return list(args)
+    params = _codex_resume_permission_params(args)
+    prompt_tail = options.pop() if options[-1][0] == "--" else ()
+    expanded = [token for option in options if option != ("--approve-for-me",) for token in option]
+    for field, flag in (("approvalPolicy", "--ask-for-approval"), ("sandbox", "--sandbox")):
+        if field in params:
+            expanded.extend([flag, str(params[field])])
+    expanded.extend(["-c", f"approvals_reviewer={json.dumps(params['approvalsReviewer'])}"])
+    return [*expanded, *prompt_tail]
+
+
 def codex_stance_is_workspace_write(
     args: Sequence[str], *, configured_sandbox_mode: str | None, bypass_sandbox: bool
 ) -> bool:
