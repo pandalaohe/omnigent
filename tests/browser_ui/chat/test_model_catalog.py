@@ -558,6 +558,8 @@ def test_side_chat_model_settings_before_and_after_first_message(
     )
     expect(picker).to_contain_text("Opus")
     expect(page.get_by_test_id("composer-config-gear")).to_contain_text("Sonnet")
+    # Finish the previous dismissal before toggling the menu open again.
+    expect(picker).to_have_attribute("aria-expanded", "false")
     picker.click()
     page.get_by_test_id("side-chat-model-edit").click()
     expect(page.get_by_role("menuitemcheckbox", name="Opus", exact=True)).to_have_attribute(

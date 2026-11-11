@@ -18,6 +18,7 @@ from tests.e2e.omnigent.test_host_ctrl_c_stop_server import (
     _connect_env,
     _force_stop_server,
     _read_local_server_record,
+    _restore_sigint,
 )
 
 
@@ -64,6 +65,7 @@ def test_host_browser_preference(
         cwd=str(omnigent_repo_root),
         encoding="utf-8",
         timeout=_BOOT_TIMEOUT,
+        preexec_fn=_restore_sigint,
     )
     try:
         _, port = _boot_connect_and_get_server(child, home)

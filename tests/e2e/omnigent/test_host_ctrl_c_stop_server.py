@@ -42,6 +42,7 @@ from pathlib import Path
 import httpx
 import pexpect
 import psutil
+import pytest
 
 from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 
@@ -97,10 +98,21 @@ def _connect_env(base_env: Mapping[str, str], home: Path) -> dict[str, str]:
     return env
 
 
+def _restore_sigint() -> None:
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
+
+def _ignore_then_restore_sigint() -> None:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    _restore_sigint()
+
+
 def _spawn_connect(
     omnigent_python: Path,
     repo_root: Path,
     env: Mapping[str, str],
+    *,
+    inherited_sigint_ignored: bool = False,
 ) -> pexpect.spawn:
     """
     Spawn ``omnigent host ""`` (local mode) under a real PTY.
@@ -124,6 +136,7 @@ def _spawn_connect(
         codec_errors="replace",
         timeout=_BOOT_TIMEOUT,
         dimensions=(40, 120),
+        preexec_fn=_ignore_then_restore_sigint if inherited_sigint_ignored else _restore_sigint,
     )
 
 
@@ -294,11 +307,13 @@ def _prespawn_persistent_server(
         raise
 
 
+@pytest.mark.parametrize("inherited_sigint_ignored", [False, True])
 def test_host_ctrl_c_yes_stops_local_server(
     omnigent_python: Path,
     omnigent_repo_root: Path,
     mock_credentials_env: dict[str, str],
     tmp_path: Path,
+    inherited_sigint_ignored: bool,
 ) -> None:
     """
     Ctrl+C then ``y`` stops the detached local server.
@@ -311,7 +326,9 @@ def test_host_ctrl_c_yes_stops_local_server(
     """
     home = tmp_path / "home"
     env = _connect_env(mock_credentials_env, home)
-    child = _spawn_connect(omnigent_python, omnigent_repo_root, env)
+    child = _spawn_connect(
+        omnigent_python, omnigent_repo_root, env, inherited_sigint_ignored=inherited_sigint_ignored
+    )
     server = None
     try:
         server_pid, port = _boot_connect_and_get_server(child, home)
