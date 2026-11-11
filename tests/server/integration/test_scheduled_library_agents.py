@@ -631,7 +631,7 @@ async def test_plugin_mode_interactive_and_stored_agent_schedule(
     deps = replace(_fire_deps(library_server), agent_cache=library_server.app.state.agent_cache)
     scheduled = library_server.tasks.get(task.json()["id"])
     assert scheduled is not None
-    fired = await _create_session(deps, scheduled)
+    fired = await _create_session(deps, scheduled, labels={})
     assert fired.terminal_launch_args == expected_args
     assert fired.labels[
         "plugin.mode" if harness == _PLUGIN_HARNESS else "omnigent.codex_sdk.approval_mode"

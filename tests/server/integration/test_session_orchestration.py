@@ -497,7 +497,7 @@ async def test_sharing_during_receiver_startup_blocks_delivery(
     refusal = (
         "shared with edit access cannot"
         if restriction == "sharing"
-        else "Peer session messaging is disabled"
+        else "Messaging other sessions is disabled"
     )
     assert refusal in json.dumps(result), result
     assert result.get("disposition") != "delivered", result
@@ -2044,6 +2044,7 @@ async def test_sibling_destination_policy_checks_runner_reassignment(
         target_host = uuid4().hex if binding == "other" else host_id
         store.set_host_id(target["id"], target_host, workspace="/target")
     runner_id = store.get_conversation(source["id"]).runner_id
+    store.replace_runner_id(target["id"], "previous-runner")
     if binding == "ambiguous":
         store.create_conversation(
             agent_id=None, host_id=uuid4().hex, workspace="/other", runner_id=runner_id

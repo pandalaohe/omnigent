@@ -366,6 +366,17 @@ async def test_agent_create_held_without_notify_or_launch_and_first_inputs_pendi
     )
     assert forged.status_code == 400, forged.text
     assert not app.state.host_load_inputs._workers
+    saved = store.list_pending_inputs(session_id)
+    assert saved
+    assert store.transition_pending_input(
+        session_id, saved[0].id, expected="in_progress", status="failed"
+    )
+    snapshot = await client.get(f"/v1/sessions/{session_id}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert [entry["content"] for entry in snapshot.json()["failed_inputs"]] == [
+        saved[0].data.content
+    ]
+    assert len(snapshot.json()["pending_inputs"]) == len(saved) - 1
 
 
 @pytest.mark.asyncio

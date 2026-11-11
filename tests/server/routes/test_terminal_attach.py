@@ -917,7 +917,7 @@ async def test_attach_terminal_local_fallback_await_launch_waits_for_registratio
         await websocket.close()
 
     monkeypatch.setattr(
-        "omnigent.server.routes.terminal_attach.bridge_tmux_control_to_websocket",
+        "omnigent.terminals.conpty_bridge.bridge_tmux_control_to_websocket",
         fake_control,
     )
     from omnigent.entities import session_resources

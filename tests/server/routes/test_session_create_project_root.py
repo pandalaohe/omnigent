@@ -287,6 +287,9 @@ async def test_json_filled_host_reaches_launch(
         def get(self, _host_id: str) -> object:
             return conn
 
+        def mcp_disabled_servers_active_harnesses(self) -> None:
+            return None
+
         async def admit_launch(self, connection: object, session_id: str) -> None:
             assert connection is conn
 
@@ -928,6 +931,9 @@ class _WorkspaceHost:
     def get(self, host_id: str) -> object | None:
         """The fake connection for the test host, ``None`` for other hosts."""
         return self.conn if host_id == _HOST else None
+
+    def mcp_disabled_servers_active_harnesses(self) -> None:
+        return None
 
     async def admit_launch(self, conn: object, session_id: str) -> None:
         """Accept the runner launch admission for the fake host."""

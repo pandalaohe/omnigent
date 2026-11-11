@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -590,7 +591,7 @@ async def test_loop_reaps_idle_pane() -> None:
 
 async def test_loop_disabled_when_timeout_non_positive() -> None:
     f = _Fakes()
-    f.panes = [_pane("conv_a"), _pane("conv_child")._replace(sub_agent=True)]
+    f.panes = [_pane("conv_a"), replace(_pane("conv_child"), sub_agent=True)]
     r = _make(f, timeout=0.0, interval=0.01)  # 0 disables
     await r.start()
     try:

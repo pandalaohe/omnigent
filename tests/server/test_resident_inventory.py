@@ -593,6 +593,7 @@ async def host_owner_control(monkeypatch):
 
     socket = HostSocket()
     host = object.__new__(HostProcess)
+    host._server_capabilities = frozenset()
     host._ws = socket
     host._startup_generation = "connection-one"
     host._runner_lifecycle_lock = asyncio.Lock()

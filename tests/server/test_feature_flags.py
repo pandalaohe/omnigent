@@ -214,8 +214,12 @@ def test_session_peer_messaging_flag_resolves() -> None:
     assert flags.frontend_dict()["session_peer_messaging"] is True
     assert flags.enabled_names() == (
         "claude_osc_status",
+        "codex_plan_at_launch",
+        "custom_agents_settings_ui",
+        "peer_session_messaging",
         "session_orchestration",
         "session_peer_messaging",
+        "sidebar_grouping_ui",
     )
 
 
