@@ -1,33 +1,7 @@
-// Interactive form for Claude Code's built-in ``AskUserQuestion``
-// tool. Rendered inside the existing ``ApprovalCard`` when the
-// PermissionRequest carries a structured ``ask_user_question``
-// payload — see :file:`@/lib/askUserQuestion`.
+// Question carousel for structured elicitation, with single- or multi-select answers.
+// isOther controls custom input; submit requires an answer to every question.
 //
-// **Carousel** layout: only one question is visible at a time with
-// Prev / Next / Submit navigation. ``Question N of M`` indicator
-// keeps progress legible without stacking N fieldsets vertically.
-//
-// Each question section renders:
-//   - the question text in primary foreground color + an optional
-//     ``header`` badge in muted text
-//   - radio inputs (single-select) or checkboxes (multi-select)
-//     for the predefined options, with each option's description
-//     under the label in muted text
-//   - a "Type something" custom-input row at the bottom of the
-//     option list — same radio/checkbox prefix as the real
-//     options, so visually it's "one more option" whose value the
-//     user types. The radio/checkbox is part of the same group
-//     as the predefined options (single-select mutex; multi-select
-//     independent toggle).
-//   - <pre> blocks showing the ``preview`` of any currently-selected
-//     option that has one (single-select: 0 or 1; multi-select:
-//     one per selected option with a preview).
-//
-// Submit is gated on EVERY question having an answer (a predefined
-// option selected, custom text, or an async-card image).
-// Selections are gathered into a flat ``{[question id or text]:
-// answer}`` map matching MCP's ``ElicitResult.content`` shape and
-// passed to ``onSubmit``.
+// Unsent answers are restored on remount (see ``@/lib/askUserQuestionDrafts``).
 
 import {
   CheckIcon,
@@ -42,10 +16,12 @@ import {
   type FocusEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   useEffect,
+  useId,
   useLayoutEffect,
   useRef,
   useState,
 } from "react";
+import { isKeyOwningOverlayOpen } from "@/lib/hotkeys";
 import { Button } from "@/components/ui/button";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { leaveQuestionCard, useQuestionCardTarget } from "@/hooks/useQuestionCardHotkeys";
@@ -69,6 +45,13 @@ import {
   type ShortcutActionId,
 } from "@/lib/keyboardShortcutPreferences";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
+import {
+  type AskUserQuestionDraft,
+  askUserQuestionSignature,
+  clearAskUserQuestionDraft,
+  getAskUserQuestionDraft,
+  saveAskUserQuestionDraft,
+} from "@/lib/askUserQuestionDrafts";
 
 /**
  * Map from question id/text → either a single selected label
@@ -83,6 +66,9 @@ interface StagedCommentBlock {
 }
 
 interface AskUserQuestionFormProps {
+  /** Pending elicitation the questions belong to; keys the unsent draft. */
+  elicitationId?: string;
+  keyboardActive?: boolean;
   questions: ClaudeQuestion[];
   onSubmit: (
     answers: AskUserQuestionAnswers,
@@ -145,6 +131,26 @@ function questionKey(question: ClaudeQuestion): string {
   return question.id && question.id.length > 0 ? question.id : question.question;
 }
 
+/** Answers on a freshly opened card, before the user touches it. */
+function initialAnswers(questions: ClaudeQuestion[]): Omit<AskUserQuestionDraft, "currentIndex"> {
+  const answers: Omit<AskUserQuestionDraft, "currentIndex"> = {
+    selections: {},
+    customSelected: {},
+    customInputs: {},
+  };
+  for (const q of questions) {
+    const key = questionKey(q);
+    answers.selections[key] = q.multiSelect
+      ? []
+      : q.isOther === false
+        ? ""
+        : (q.options[0]?.label ?? "");
+    answers.customSelected[key] = q.textInput !== undefined;
+    answers.customInputs[key] = q.textInput?.default ?? "";
+  }
+  return answers;
+}
+
 /** In-card actions in the order a key event resolves against them. */
 const CARD_ACTION_IDS: ShortcutActionId[] = [
   "questionCardPreviousOption",
@@ -197,6 +203,7 @@ function plainEnterIsBoundToCardAction(): boolean {
 }
 
 export function AskUserQuestionForm({
+  elicitationId: savedElicitationId,
   questions,
   onSubmit,
   onReject,
@@ -205,37 +212,30 @@ export function AskUserQuestionForm({
   asyncTarget,
 }: AskUserQuestionFormProps) {
   const serverInfo = useServerInfo();
+  const localElicitationId = useId();
+  const elicitationId = savedElicitationId ?? localElicitationId;
+  // Form state belongs to the first questions; ApprovalCard remounts the form for new ones.
+  const [draftQuestions] = useState(questions);
+  const [signature] = useState(() => askUserQuestionSignature(questions));
+  const [draft] = useState(() => getAskUserQuestionDraft(elicitationId, signature));
+  const [initial] = useState(() => initialAnswers(questions));
+
   // Currently-visible question (carousel index).
-  const [currentIndex, setCurrentIndex] = useState(0);
+  const [currentIndex, setCurrentIndex] = useState(draft?.currentIndex ?? 0);
 
-  // Per-question option selection. Single-select stores a string and starts
-  // on its first option; multi-select stores a deduped array and starts empty.
-  const [selections, setSelections] = useState<Record<string, string | string[]>>(() => {
-    const initial: Record<string, string | string[]> = {};
-    for (const q of questions) {
-      initial[questionKey(q)] = q.multiSelect
-        ? []
-        : q.isOther === false
-          ? ""
-          : (q.options[0]?.label ?? "");
-    }
-    return initial;
-  });
+  // Per-question option selection. Single-select stores a string;
+  // multi-select stores a deduped array.
+  const [selections, setSelections] = useState(draft?.selections ?? initial.selections);
 
-  // Per-question custom-input state. ``text`` is what the user
-  // typed; ``selected`` is whether the custom row's radio/checkbox
+  // Per-question custom-input state. ``customInputs`` is what the user
+  // typed; ``customSelected`` is whether the custom row's radio/checkbox
   // is checked (which determines whether the typed text is part of
   // the answer).
-  const [customSelected, setCustomSelected] = useState<Record<string, boolean>>(() => {
-    const initial: Record<string, boolean> = {};
-    for (const q of questions) initial[questionKey(q)] = q.textInput !== undefined;
-    return initial;
-  });
-  const [customInputs, setCustomInputs] = useState<Record<string, string>>(() => {
-    const initial: Record<string, string> = {};
-    for (const q of questions) initial[questionKey(q)] = q.textInput?.default ?? "";
-    return initial;
-  });
+  const [customSelected, setCustomSelected] = useState(
+    draft?.customSelected ?? initial.customSelected,
+  );
+  const [customInputs, setCustomInputs] = useState(draft?.customInputs ?? initial.customInputs);
+
   const customInputsRef = useRef(customInputs);
   customInputsRef.current = customInputs;
   const [images, setImages] = useState<Record<string, File[]>>({});
@@ -382,6 +382,36 @@ export function AskUserQuestionForm({
       ?.scrollIntoView({ block: "nearest" });
   }, [keyboardActive, highlight, currentIndex]);
 
+  useEffect(() => {
+    const answers = {
+      selections: { ...selections },
+      customSelected: { ...customSelected },
+      customInputs: { ...customInputs },
+    };
+    // Answers to a secret question are never kept past this mount.
+    for (const q of draftQuestions) {
+      if (!q.isSecret) continue;
+      const key = questionKey(q);
+      answers.selections[key] = initial.selections[key]!;
+      answers.customSelected[key] = initial.customSelected[key]!;
+      answers.customInputs[key] = initial.customInputs[key]!;
+    }
+    // Untouched cards keep no draft, so they cannot evict real ones.
+    if (currentIndex === 0 && JSON.stringify(answers) === JSON.stringify(initial)) {
+      clearAskUserQuestionDraft(elicitationId, signature);
+      return;
+    }
+    saveAskUserQuestionDraft(elicitationId, signature, { currentIndex, ...answers });
+  }, [
+    elicitationId,
+    draftQuestions,
+    signature,
+    initial,
+    currentIndex,
+    selections,
+    customSelected,
+    customInputs,
+  ]);
   if (!current) return null;
   const currentKey = questionKey(current);
   const isFirst = currentIndex === 0;
@@ -695,7 +725,7 @@ export function AskUserQuestionForm({
       e.stopPropagation();
       return;
     }
-    if (e.nativeEvent.isComposing) return;
+    if (e.nativeEvent.isComposing || isKeyOwningOverlayOpen(rootRef.current)) return;
     const isCustomTextarea = e.target instanceof HTMLTextAreaElement;
     const isButtonLike = e.target instanceof Element && e.target.closest("button, a") !== null;
     const isOptionInput =
@@ -815,6 +845,7 @@ export function AskUserQuestionForm({
       ref={rootRef}
       tabIndex={-1}
       data-question-card
+      data-ask-user-question-form=""
       className="flex flex-col gap-2 text-foreground"
       data-testid="ask-user-question-form"
       onKeyDown={handleCardKeyDown}
@@ -857,7 +888,7 @@ export function AskUserQuestionForm({
           {current.options.map((opt, index) => {
             const inputId = `${currentKey}-${opt.label}`;
             const rowClassName =
-              "flex items-start gap-2 cursor-pointer rounded-sm text-ui text-foreground data-[highlighted=true]:bg-muted data-[highlighted=true]:ring-1 data-[highlighted=true]:ring-ring/60";
+              "flex items-start gap-2 cursor-pointer mobile-touch-target mobile-app:grid mobile-app:grid-cols-[44px_minmax(0,1fr)] mobile-app:items-center rounded-sm text-ui text-foreground data-[highlighted=true]:bg-muted data-[highlighted=true]:ring-1 data-[highlighted=true]:ring-ring/60";
             const rowHighlighted = keyboardActive && highlight === index ? true : undefined;
             if (current.multiSelect) {
               const sel = selections[currentKey];
@@ -875,7 +906,7 @@ export function AskUserQuestionForm({
                     checked={checked}
                     onChange={() => handleMultiToggle(currentKey, opt.label)}
                     onFocus={() => setHighlight(index)}
-                    className="mt-1"
+                    className="mt-1 mobile-app:mt-0 mobile-app:justify-self-center"
                   />
                   <span className="flex flex-col">
                     <span>{opt.label}</span>
@@ -902,7 +933,7 @@ export function AskUserQuestionForm({
                   checked={checked}
                   onChange={() => handleSingleSelect(currentKey, opt.label)}
                   onFocus={() => setHighlight(index)}
-                  className="mt-1"
+                  className="mt-1 mobile-app:mt-0 mobile-app:justify-self-center"
                 />
                 <span className="flex flex-col">
                   <span>{opt.label}</span>
@@ -919,27 +950,32 @@ export function AskUserQuestionForm({
               matching radio/checkbox prefix, so the user picks
               between predefined options and free-form input the
               same way. */}
-              <label
-                htmlFor={customRowId}
+              <div
                 data-highlighted={
                   keyboardActive && highlight === current.options.length ? true : undefined
                 }
-                className="flex items-start gap-2 cursor-pointer rounded-sm text-ui text-foreground data-[highlighted=true]:bg-muted data-[highlighted=true]:ring-1 data-[highlighted=true]:ring-ring/60"
+                className="flex items-start gap-2 mobile-app:grid mobile-app:grid-cols-[44px_minmax(0,1fr)] mobile-app:items-center rounded-sm text-ui text-foreground data-[highlighted=true]:bg-muted data-[highlighted=true]:ring-1 data-[highlighted=true]:ring-ring/60"
               >
-                <input
-                  type={current.multiSelect ? "checkbox" : "radio"}
-                  id={customRowId}
-                  name={current.multiSelect ? undefined : currentKey}
-                  checked={customRowChecked}
-                  onChange={() =>
-                    current.multiSelect
-                      ? handleCustomToggleMulti(currentKey)
-                      : handleCustomToggleSingle(currentKey)
-                  }
-                  onFocus={() => setHighlight(current.options.length)}
-                  className="mt-1"
-                  data-testid="ask-user-question-custom-toggle"
-                />
+                <label
+                  htmlFor={customRowId}
+                  className="flex shrink-0 cursor-pointer mobile-touch-target mobile-app:items-center mobile-app:justify-center"
+                >
+                  <input
+                    type={current.multiSelect ? "checkbox" : "radio"}
+                    id={customRowId}
+                    name={current.multiSelect ? undefined : currentKey}
+                    checked={customRowChecked}
+                    onChange={() =>
+                      current.multiSelect
+                        ? handleCustomToggleMulti(currentKey)
+                        : handleCustomToggleSingle(currentKey)
+                    }
+                    onFocus={() => setHighlight(current.options.length)}
+                    aria-label="Select custom answer"
+                    className="mt-1 mobile-app:mt-0"
+                    data-testid="ask-user-question-custom-toggle"
+                  />
+                </label>
                 {/* ``field-sizing-content`` (Tailwind v4 / CSS) auto-grows
                 the textarea to fit its content, so typing past the
                 first line wraps and expands downward instead of
@@ -1007,9 +1043,10 @@ export function AskUserQuestionForm({
                       : undefined
                   }
                   data-testid="ask-user-question-custom-input"
-                  className="field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
+                  aria-label="Custom answer"
+                  className="mobile-touch-target mobile-app:min-w-0 mobile-app:py-3 field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
                 />
-              </label>
+              </div>
               {asyncTarget && (
                 <div className="flex flex-col gap-2 pl-6">
                   <input
@@ -1094,6 +1131,7 @@ export function AskUserQuestionForm({
           variant="outline"
           onClick={(event) => goToQuestion(currentIndex - 1, event.detail === 0)}
           disabled={isFirst || submitting}
+          className="mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal"
           data-testid="ask-user-question-prev"
           componentId="question.prev"
         >
@@ -1106,6 +1144,7 @@ export function AskUserQuestionForm({
             variant="outline"
             onClick={(event) => goToQuestion(currentIndex + 1, event.detail === 0)}
             disabled={submitting}
+            className="mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal"
             data-testid="ask-user-question-next"
             componentId="question.next"
           >
@@ -1118,6 +1157,7 @@ export function AskUserQuestionForm({
             size="sm"
             onClick={(event) => void (event.detail === 0 ? submitAndLeave() : handleSubmit())}
             disabled={!allAnswered || submitting}
+            className="mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal"
             data-testid="ask-user-question-submit"
             componentId="question.submit"
           >
@@ -1134,7 +1174,7 @@ export function AskUserQuestionForm({
             else void reject();
           }}
           disabled={submitting}
-          className="ml-auto"
+          className="ml-auto mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal"
           componentId="question.cancel"
         >
           <XIcon className="mr-1 size-3.5" />

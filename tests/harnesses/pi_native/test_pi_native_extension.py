@@ -1479,6 +1479,75 @@ def test_assistant_delivery_failure_is_reported_and_400_is_not_retried(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize(
+    "path", ["interactive", "extension", "queued-without-input", "expanded-template"]
+)
+def test_terminal_prompts_appear_in_chat_exactly_once(tmp_path: Path, path: str) -> None:
+    """A prompt appears once whether Pi fired ``input``, skipped it, or expanded the text."""
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const path = process.argv[3];
+  const typed = path === 'expanded-template' ? '/review same prompt' : 'same prompt';
+  const consumed = 'same prompt';
+  const hasInputEvent = path !== 'queued-without-input';
+  const source = path === 'extension' ? 'extension' : 'interactive';
+  for (let timestamp = 1; timestamp <= 2; timestamp++) {
+    if (hasInputEvent) await handlers.input({text: typed, source}, ctx);
+    const message = {role: 'user', timestamp, content: [{type: 'text', text: consumed}]};
+    await handlers.message_start?.({message}, ctx);
+    await handlers.message_end({message}, ctx);
+  }
+  // Assistant starts never create user bubbles.
+  await handlers.message_start?.({message: {role: 'assistant',
+    content: [{type: 'text', text: 'answer'}]}}, ctx);
+  await handlers.session_shutdown();
+  const users = posted.filter(event => event.type === 'external_conversation_item' &&
+    event.data.item_data.role === 'user');
+  assert.equal(users.length, 2, 'every prompt must appear exactly once');
+  assert.deepEqual(users.map(event => event.data.item_data.content), [
+    [{type: 'input_text', text: consumed}],
+    [{type: 'input_text', text: consumed}],
+  ]);
+  assert.notEqual(users[0].data.source_id, users[1].data.source_id);
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), path)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_unconsumed_prompts_never_confirm_delivery_when_pi_goes_idle(tmp_path: Path) -> None:
+    """A prompt Pi accepted but never consumed must not hide a later prompt."""
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  // Accepted, then discarded from Pi's queue (or handled as an extension command).
+  await handlers.input({text: 'discarded prompt', source: 'interactive'}, ctx);
+  await handlers.agent_start({}, ctx);
+  await handlers.agent_end({}, ctx);
+  await handlers.message_end({message: {role: 'user',
+    content: [{type: 'text', text: 'later prompt'}]}}, ctx);
+  // A queued follow-up at agent_end is still pending, so it is not forgotten.
+  await handlers.input({text: 'queued follow-up', source: 'interactive'}, ctx);
+  await handlers.agent_start({}, ctx);
+  ctx.hasPendingMessages = () => true;
+  await handlers.agent_end({}, ctx);
+  await handlers.message_end({message: {role: 'user',
+    content: [{type: 'text', text: 'queued follow-up'}]}}, ctx);
+  await handlers.session_shutdown();
+  const users = posted.filter(event => event.type === 'external_conversation_item' &&
+    event.data.item_data.role === 'user').map(event => event.data.item_data.content[0].text);
+  assert.deepEqual(users, ['later prompt', 'queued follow-up']);
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("kind", ["tool_call", "tool_result", "reasoning", "user", "compaction"])
 def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) -> None:
     script = (
@@ -1674,6 +1743,25 @@ def test_compaction_snapshot_orders_history_and_tolerates_receipts(
   assert.deepEqual(retryDelays, []);
   assert.deepEqual(diagnostics, []);
   assert.deepEqual(notices, []);
+  // Consumed prompts arriving after compaction stay ordered, including a skipped input hook.
+  const items = () => posted.filter((event) => event.type === "external_conversation_item");
+  const releaseOnce = async (count) => {
+    while (items().length < count) await settleHistory();
+    release();
+  };
+  await consumeInput({text: "flushed via prompt", source: "interactive"}, ctx);
+  await releaseOnce(3);
+  await handlers.message_end({message: {role: "user", timestamp: 20002,
+    content: [{type: "text", text: "flushed via steer"}]}}, ctx);
+  await releaseOnce(4);
+  await settleHistory();
+  const flushed = items().slice(2);
+  assert.deepEqual(
+    flushed.map((event) => [event.data.item_type, event.data.item_data.content[0].text]),
+    [["message", "flushed via prompt"], ["message", "flushed via steer"]],
+    JSON.stringify(posted.map((event) => [event.type, event.data && event.data.item_type])),
+  );
+  assert.notEqual(flushed[0].data.source_id, flushed[1].data.source_id);
 })().catch((error) => { process.stderr.write(error.stack || String(error)); process.exit(1); });
 """
     )
@@ -4766,7 +4854,10 @@ def test_inbox_model_change_unknown_model_posts_error(tmp_path: Path) -> None:
     _run_extension_script(node, _extension_path(), script)
 
 
-def test_input_waits_for_inbox_model_change_to_settle(tmp_path: Path) -> None:
+@pytest.mark.parametrize("next_change", [None, "effort", "model"])
+def test_input_waits_for_inbox_model_change_to_settle(
+    tmp_path: Path, next_change: str | None
+) -> None:
     """A routed web turn runs on the routed model, not the old one.
 
     The executor queues ``model_change`` then ``user_message``; the poller
@@ -4780,25 +4871,46 @@ def test_input_waits_for_inbox_model_change_to_settle(tmp_path: Path) -> None:
 
     script = (
         _MODEL_SWITCH_HARNESS
+        + f"const nextChange = {json.dumps(next_change)};\n"
         + r"""
 (async () => {
   let committed = null;
+  let thinking = "off";
+  pi.setThinkingLevel = async (level) => {
+    await sleep(20);
+    thinking = committed ? level : "off";
+  };
   pi.setModel = async (model) => {
     setModelCalls.push(model);
     await sleep(150); // Pi's checkAuth before agent.state.model is set
     committed = model.id;
+    thinking = "off"; // Pi may restore the target model's own default.
     return true;
   };
   await handlers.session_start({}, ctx);
   const file = path.join(inboxDir, "000-model.json");
   fs.writeFileSync(
     file,
-    JSON.stringify({ id: "m1", type: "model_change", model: "databricks-claude-opus-4-1" }),
+    JSON.stringify({
+      id: "m1", type: "model_change",
+      model: "databricks-claude-opus-4-1", thinkingLevel: "medium",
+    }),
   );
+  if (nextChange) {
+    fs.writeFileSync(path.join(inboxDir, "001-settings.json"), JSON.stringify(
+      nextChange === "effort"
+        ? {id: "e2", type: "thinking_level_change", thinkingLevel: "high"}
+        : {id: "m2", type: "model_change",
+           model: "databricks-claude-sonnet-4-6", thinkingLevel: "low"}
+    ));
+  }
   while (fs.existsSync(file)) await sleep(10);
   assert.equal(committed, null); // still in flight
   await handlers.input({ text: "routed turn", source: "extension" }, ctx);
-  assert.equal(committed, "databricks-claude-opus-4-1");
+  assert.equal(committed, nextChange === "model"
+    ? "databricks-claude-sonnet-4-6" : "databricks-claude-opus-4-1");
+  assert.equal(thinking,
+    nextChange === "model" ? "low" : nextChange === "effort" ? "high" : "medium");
   finish();
 })().catch((error) => {
   finish();
@@ -4907,6 +5019,50 @@ def test_tui_prompt_route_turn_failure_fails_open(tmp_path: Path) -> None:
       (e) => e.type === "external_conversation_item" && e.data.item_data.role === "user",
     ),
   );
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_consumed_tui_prompt_is_mirrored_while_route_turn_is_pending(tmp_path: Path) -> None:
+    """Consumption remains authoritative when turn routing is still pending."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  let routeCalls = 0;
+  global.fetch = async (url, request) => {
+    if (url.endsWith("/hooks/route-turn")) {
+      routeCalls += 1;
+      return new Promise(() => {});
+    }
+    posted.push(JSON.parse(request.body));
+    return { ok: true };
+  };
+  await handlers.session_start({}, ctx);
+  const pending = handlers.input({ text: "one", source: "interactive" }, ctx);
+  await new Promise(setImmediate);
+  assert.equal(routeCalls, 1);
+  assert.ok(!posted.some(e => e.type === "external_conversation_item" &&
+    e.data.item_data.role === "user"));
+  await handlers.message_end({message: {role: "user", content: "one"}}, ctx);
+  await new Promise(setImmediate);
+  const users = posted.filter(
+    (e) => e.type === "external_conversation_item" && e.data.item_data.role === "user",
+  );
+  assert.equal(users.length, 1, "consumption must be mirrored before routing settles");
+  assert.deepEqual(users[0].data.item_data.content, [{ type: "input_text", text: "one" }]);
+  void pending;
   finish();
 })().catch((error) => {
   finish();

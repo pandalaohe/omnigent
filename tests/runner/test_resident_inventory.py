@@ -42,7 +42,7 @@ async def test_opencode_work_read_uses_owned_requests_and_exact_message_events(
     )
 
     server, native, responses, _requests = context_server
-    await native.create_session()
+    await native.create_session(title="Inventory test", directory="/opt/work/project")
     await native.fork("primary")
     monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {"conversation": server})
     monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
@@ -180,9 +180,11 @@ async def test_opencode_work_links_retain_uncertain_lifetimes(context_server, mo
     from omnigent.runner.resident_inventory import session_context_work_evidence_v2
 
     server, native, responses, _requests = context_server
-    await native.create_session()
+    await native.create_session(title="Inventory test", directory="/opt/work/project")
     if loss == "ambiguous":
-        await native.create_session()  # Same literal vendor id, distinct owning operations.
+        await native.create_session(
+            title="Inventory test", directory="/opt/work/project"
+        )  # Same literal vendor id, distinct owning operations.
     monkeypatch.setattr(orchestration, "_AUTO_OPENCODE_SERVERS", {"conversation": server})
     monkeypatch.setattr(orchestration, "_AUTO_CODEX_APP_SERVERS", {})
     monkeypatch.setattr(orchestration, "_STARTING_NATIVE_BACKENDS", {})
@@ -237,7 +239,7 @@ async def test_opencode_work_events_are_bounded_and_do_not_cross_owner(context_s
     import json
 
     server, native, responses, _requests = context_server
-    await native.create_session()
+    await native.create_session(title="Inventory test", directory="/opt/work/project")
 
     async def stream(*identifiers):
         async def reply(_request):
@@ -2263,7 +2265,7 @@ async def test_runner_opencode_context_v2_reads_existing_owner_without_probes(
         native._client.request = AsyncMock(
             return_value=httpx.Response(200, json={"id": "primary"})
         )
-        await native.create_session()
+        await native.create_session(title="Inventory test", directory="/opt/work/project")
         native._client.request.side_effect = AssertionError("inventory cannot query a vendor")
         orchestration._AUTO_OPENCODE_SERVERS["one"] = server
         response = await client.get(

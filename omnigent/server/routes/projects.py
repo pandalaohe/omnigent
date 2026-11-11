@@ -18,7 +18,7 @@ import asyncio
 import uuid
 from typing import Any, Literal
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 
 from omnigent.calling_defaults import validate_project_calling_defaults
 from omnigent.entities import Project
@@ -35,6 +35,7 @@ from omnigent.server.schemas import (
     ProjectOrderResponse,
     UpdateProjectRequest,
 )
+from omnigent.server.session_orchestration import require_named_source_private
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import (
@@ -44,6 +45,9 @@ from omnigent.stores.project_store import (
     project_config_revision,
 )
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
+
+_DEFAULT_PROJECT_PAGE = 50
+_MAX_PROJECT_PAGE = 200
 
 
 def _to_response(project: Project) -> dict[str, Any]:
@@ -88,6 +92,8 @@ def create_projects_router(
     :param project_store: The store backing project persistence.
     :param auth_provider: Auth provider used to identify the requesting user.
         ``None`` in single-user mode (owner scope is ``None``).
+    :param conversation_store: Resolves the calling session an agent tool names.
+    :param permission_store: Checks whether that session is shared with edit access.
     :returns: A configured :class:`APIRouter`.
     """
     router = APIRouter()
@@ -124,6 +130,14 @@ def create_projects_router(
         """
         user_id = require_user(request, auth_provider)
         _validate_calling_defaults(body.config)
+        if conversation_store is not None:
+            await asyncio.to_thread(
+                require_named_source_private,
+                request,
+                user_id,
+                conversation_store,
+                permission_store,
+            )
         project = await asyncio.to_thread(
             project_store.create,
             uuid.uuid4().hex,
@@ -139,16 +153,44 @@ def create_projects_router(
     @router.get("/projects")
     async def list_projects(
         request: Request,
+        limit: int | None = Query(default=None, ge=1, le=_MAX_PROJECT_PAGE),
+        after: str | None = None,
         include_archived: bool = False,
         archived: Literal["only"] | None = None,
     ) -> dict[str, Any]:
         """List the caller's projects.
 
+        Without ``limit`` or ``after`` this returns every project in the
+        caller's display order, as the sidebar needs. With either, it returns
+        one creation-ordered page.
+
         :param request: The incoming request, used to identify the user.
-        :returns: ``{"object": "list", "data": [...]}``.
-        :raises OmnigentError: 401 if unauthenticated in multi-user mode.
+        :param limit: Page size, e.g. ``50``.
+        :param after: The previous page's ``last_id``.
+        :returns: ``{"object": "list", "data": [...]}``, plus ``first_id``,
+            ``last_id`` and ``has_more`` for a page.
+        :raises OmnigentError: 401 if unauthenticated in multi-user mode, 400
+            for an unknown ``after``.
         """
         user_id = require_user(request, auth_provider)
+        if limit is not None or after is not None:
+            try:
+                page, has_more = await asyncio.to_thread(
+                    project_store.list_page,
+                    archived="only" if archived else "include" if include_archived else "exclude",
+                    user_id=user_id,
+                    limit=limit or _DEFAULT_PROJECT_PAGE,
+                    after_id=after,
+                )
+            except ValueError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+            return {
+                "object": "list",
+                "data": [await response(p) for p in page],
+                "first_id": page[0].id if page else None,
+                "last_id": page[-1].id if page else None,
+                "has_more": has_more,
+            }
 
         def read_projects() -> list[Project]:
             return apply_project_order(

@@ -42,6 +42,7 @@ export function ComposerAddMenu({
   showPlan = true,
   planDisabled = false,
   planLabel,
+  planUnavailableReason = "This harness does not support plan mode",
   testIdPrefix = "composer",
   onPlan,
   planActive,
@@ -60,6 +61,7 @@ export function ComposerAddMenu({
   showPlan?: boolean;
   planDisabled?: boolean;
   planLabel?: string;
+  planUnavailableReason?: string;
   testIdPrefix?: string;
   onPlan?: () => void;
   planActive: boolean;
@@ -71,7 +73,7 @@ export function ComposerAddMenu({
 }) {
   const [open, setOpen] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
-  const pendingGoalRef = useRef(false);
+  const pendingActionRef = useRef<(() => void) | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [geometry, setGeometry] = useState({ width: 456, alignOffset: 0, sideOffset: 6 });
   const measure = useCallback(() => {
@@ -114,9 +116,10 @@ export function ComposerAddMenu({
             type="button"
             size="icon"
             variant="ghost"
-            className="size-8 rounded-lg data-[state=open]:bg-muted data-[state=open]:text-foreground md:size-7"
+            className="size-8 mobile-touch-target rounded-lg data-[state=open]:bg-muted data-[state=open]:text-foreground md:size-7"
             disabled={disabled}
             aria-label="Add"
+            data-composer-action="add"
             title="Add"
             data-testid={`${testIdPrefix}-attach`}
             componentId={`${testIdPrefix}.add_menu`}
@@ -130,10 +133,9 @@ export function ComposerAddMenu({
         </DropdownMenuTrigger>
         <DropdownMenuContent
           onCloseAutoFocus={() => {
-            if (pendingGoalRef.current) {
-              pendingGoalRef.current = false;
-              requestAnimationFrame(() => onGoal?.());
-            }
+            const action = pendingActionRef.current;
+            pendingActionRef.current = null;
+            if (action !== null) requestAnimationFrame(action);
           }}
           side="top"
           align="start"
@@ -141,14 +143,18 @@ export function ComposerAddMenu({
           sideOffset={geometry.sideOffset}
           collisionPadding={12}
           aria-label="Add"
-          className="composer-add-menu max-w-[calc(100vw-24px)] rounded-[16px]"
+          className="composer-add-menu max-w-[calc(100vw-24px)] rounded-[16px] max-md:p-1.5"
           style={{ width: geometry.width }}
           data-testid={`${testIdPrefix}-add-menu`}
         >
           <div className="flex flex-col gap-3">
             <div className="flex flex-col gap-0.5">
               <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">Add</div>
-              <DropdownMenuItem onSelect={onAttach} disabled={attachDisabled}>
+              <DropdownMenuItem
+                className="mobile-touch-target"
+                onSelect={onAttach}
+                disabled={attachDisabled}
+              >
                 <span className="flex size-4 shrink-0 items-center justify-center">
                   <PaperclipIcon className="size-3.5" />
                 </span>
@@ -160,7 +166,13 @@ export function ComposerAddMenu({
                 <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">Session</div>
                 <div className="flex flex-col gap-px">
                   {onSideChat && (
-                    <DropdownMenuItem data-testid="composer-side-chat-action" onSelect={onSideChat}>
+                    <DropdownMenuItem
+                      className="mobile-touch-target"
+                      data-testid="composer-side-chat-action"
+                      onSelect={() => {
+                        pendingActionRef.current = onSideChat;
+                      }}
+                    >
                       <span className="flex size-4 shrink-0 items-center justify-center">
                         <MessagesSquareIcon className="size-3.5" />
                       </span>
@@ -172,12 +184,13 @@ export function ComposerAddMenu({
                   )}
                   {showGoal && (
                     <DropdownMenuItem
+                      className="mobile-touch-target"
                       disabled={!onGoal || goalDisabled}
                       title={!onGoal ? goalDescription : undefined}
                       data-testid="composer-goal-action"
                       data-active={goalActive || undefined}
                       onSelect={() => {
-                        pendingGoalRef.current = true;
+                        pendingActionRef.current = onGoal ?? null;
                       }}
                     >
                       <span className="flex size-4 shrink-0 items-center justify-center">
@@ -188,12 +201,13 @@ export function ComposerAddMenu({
                   )}
                   {showPlan && (
                     <DropdownMenuItem
+                      className="mobile-touch-target"
                       data-testid="composer-plan-action"
                       data-active={planActive || undefined}
                       aria-label={planLabel}
                       disabled={!onPlan || planDisabled}
                       onSelect={onPlan}
-                      title={onPlan ? undefined : "This harness does not support plan mode"}
+                      title={onPlan ? undefined : planUnavailableReason}
                     >
                       <span className="flex size-4 shrink-0 items-center justify-center">
                         <LightbulbIcon className="size-3.5" />
@@ -205,7 +219,10 @@ export function ComposerAddMenu({
                     </DropdownMenuItem>
                   )}
                   {onProjectSelect && (
-                    <DropdownMenuItem onSelect={() => setProjectPickerOpen(true)}>
+                    <DropdownMenuItem
+                      className="mobile-touch-target"
+                      onSelect={() => setProjectPickerOpen(true)}
+                    >
                       <span className="flex size-4 shrink-0 items-center justify-center">
                         <FolderIcon className="size-3.5" />
                       </span>

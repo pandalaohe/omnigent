@@ -150,6 +150,7 @@ def test_compression_migration_retains_fitting_snapshots_and_all_sessions(
         assert columns["inference_snapshot"]["nullable"]
         assert isinstance(columns["inference_snapshot"]["type"], sa.LargeBinary)
         assert not any(name.startswith("_inference_snapshot") for name in columns)
+
         _migrate(engine, _PREVIOUS, downgrade=True)
         for key, row in _rows(engine).items():
             assert row.inference_snapshot == (
@@ -162,7 +163,7 @@ def test_compression_migration_retains_fitting_snapshots_and_all_sessions(
                 migration.upgrade()
         assert _rows(engine) == after
 
-        # The current ORM reads columns added after the historical migration.
+        # The store maps the latest schema, so read the migrated rows at head.
         _migrate(engine, "head")
         store = SqlAlchemyConversationStore(db_uri)
         for (workspace_id, row_id), value in original.items():
@@ -174,7 +175,6 @@ def test_compression_migration_retains_fitting_snapshots_and_all_sessions(
             expected = None if value is None or value == oversized else json.loads(value)
             assert conversation.inference_snapshot == expected
             assert conversation.session_state == {"untouched": True}
-
     finally:
         _migrate(engine, "head")
 

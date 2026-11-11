@@ -16,7 +16,7 @@ only by bridge module, control-function name, and error label; they collapse to
 two parametrized methods driven by :data:`_UNIFORM_INTERRUPT` /
 :data:`_UNIFORM_STOP`. claude interrupt (bridge-id resolution), codex interrupt
 (MCP-startup + app-server ``turn/interrupt``), and opencode interrupt (native
-``POST /session/{id}/abort``) keep dedicated methods; claude stop is likewise
+``POST /api/session/{id}/interrupt``) keep dedicated methods; claude stop is likewise
 special-cased and codex/pi alias stop to their interrupt handler.
 
 Antigravity/OpenCode stop closes the runner-owned terminal instance and
@@ -83,6 +83,7 @@ class MarkSubagentTerminalAndWake(Protocol):
         output: str | None,
         only_if_work_id: str | None = None,
         terminal: TerminalEnvelope | None = None,
+        confirmed_cancellation: bool = False,
     ) -> SubagentDeliveryAck:
         raise NotImplementedError
 
@@ -376,6 +377,8 @@ def native_cancel_capability(wrapper_label: str | None) -> str:
 # hook, so this timer is the liveness floor that keeps the parent from
 # hanging; a confirmed completion that lands later still corrects the record.
 _NATIVE_INTERRUPT_CANCEL_GRACE_S = 20.0
+_CODEX_INTERRUPT_TIMEOUT_S = 5.0
+_CODEX_INTERRUPT_CLOSE_TIMEOUT_S = 1.0
 
 
 class NativeInterruptRunner:
@@ -452,8 +455,8 @@ class NativeInterruptRunner:
     async def stop(self, harness_name: str | None, conv_id: str) -> Response | None:
         """Dispatch a stop_session to the harness's bridge.
 
-        codex/pi have no distinct stop — they route to their interrupt handler,
-        exactly as the original dispatch chain did.
+        codex/pi/opencode have no distinct stop — they route to their interrupt
+        handler.
 
         :returns: A response when this harness has a stop handler, else ``None``
             so the caller falls through to the in-process turn cancel.
@@ -763,6 +766,7 @@ class NativeInterruptRunner:
             conv_id,
             status="cancelled",
             output=None,
+            confirmed_cancellation=True,
         )
         if not delivery_ack.delivered and (
             delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
@@ -896,6 +900,7 @@ class NativeInterruptRunner:
             conv_id,
             status="cancelled",
             output=None,
+            confirmed_cancellation=True,
         )
         if not delivery_ack.delivered and (
             delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
@@ -963,113 +968,114 @@ class NativeInterruptRunner:
             client_name="omnigent-codex-native-runner",
         )
         try:
-            await codex_client.connect()
-            if pending_mcp:
-                try:
-                    await codex_client.request(
-                        "turn/interrupt",
-                        {"threadId": state.thread_id, "turnId": ""},
-                    )
-                except Exception:
-                    self._logger.warning(
-                        "Codex-native MCP startup interrupt failed for session=%s thread=%s",
-                        conv_id,
-                        state.thread_id,
-                        exc_info=True,
-                    )
-            if state.active_turn_id is not None:
-                try:
-                    await codex_client.request(
-                        "turn/interrupt",
-                        {
-                            "threadId": state.thread_id,
-                            "turnId": state.active_turn_id,
-                        },
-                    )
-                except CodexAppServerResponseError as exc:
-                    if not is_stale_active_turn_error(exc):
-                        raise
-
-                    if is_no_active_turn_error(exc):
-                        # The turn ended and no idle edge is coming. Clear it only
-                        # if still recorded and publish idle under the bridge lock,
-                        # so a turn starting mid-interrupt is not masked by this idle.
-                        def _publish_idle() -> None:
-                            # Runs under the bridge state lock: stay quick, do not
-                            # touch bridge state, and never raise (the clear is done).
-                            try:
-                                self._publish_event(
-                                    conv_id, {"type": "session.status", "status": "idle"}
-                                )
-                                self._resource_registry.note_external_session_status(
-                                    conv_id, "idle"
-                                )
-                            except Exception:
-                                self._logger.warning(
-                                    "Codex-native idle publish failed for session=%s",
-                                    conv_id,
-                                    exc_info=True,
-                                )
-
-                        cleared = clear_active_turn_id_if_matches(
-                            bridge_dir, state.active_turn_id, on_cleared=_publish_idle
+            async with asyncio.timeout(_CODEX_INTERRUPT_TIMEOUT_S):
+                await codex_client.connect()
+                if pending_mcp:
+                    try:
+                        await codex_client.request(
+                            "turn/interrupt",
+                            {"threadId": state.thread_id, "turnId": ""},
                         )
-                        self._logger.info(
-                            "Codex-native interrupt reconciled an already-ended turn "
-                            "for session=%s thread=%s turn=%s cleared=%s: %s",
+                    except Exception:
+                        self._logger.warning(
+                            "Codex-native MCP startup interrupt failed for session=%s thread=%s",
                             conv_id,
                             state.thread_id,
-                            state.active_turn_id,
-                            cleared,
-                            exc.message,
+                            exc_info=True,
                         )
-                    else:
-                        # A newer turn replaced the one we targeted and is still
-                        # live, so leave its recorded id in place and publish no
-                        # idle; the forwarder owns the newer turn's lifecycle.
-                        self._logger.info(
-                            "Codex-native interrupt targeted a superseded turn for "
-                            "session=%s thread=%s turn=%s; a newer turn is live: %s",
-                            conv_id,
-                            state.thread_id,
-                            state.active_turn_id,
-                            exc.message,
+                if state.active_turn_id is not None:
+                    try:
+                        await codex_client.request(
+                            "turn/interrupt",
+                            {
+                                "threadId": state.thread_id,
+                                "turnId": state.active_turn_id,
+                            },
                         )
-                    # The targeted turn ended or was superseded, so skip the
-                    # deferred parent-wake cancel. A dropped sub-agent completion
-                    # can still leave its parent waiting; reconciled separately.
-                    if not active_child_turns:
-                        return Response(status_code=204)
-            for child_tid, child_turn_id in active_child_turns:
-                if not child_turn_id:
-                    response = await codex_client.request(
-                        "thread/read", {"threadId": child_tid, "includeTurns": True}
-                    )
-                    result = response.get("result")
-                    thread = result.get("thread") if isinstance(result, dict) else None
-                    turns = thread.get("turns") if isinstance(thread, dict) else None
-                    latest = turns[-1] if isinstance(turns, list) and turns else None
-                    child_turn_id = latest.get("id") if isinstance(latest, dict) else None
-                    if (
-                        not isinstance(latest, dict)
-                        or not isinstance(child_turn_id, str)
-                        or not child_turn_id
-                    ):
-                        raise RuntimeError("Codex helper turn could not be confirmed")
-                    if latest.get("status") in {"completed", "failed", "interrupted"}:
-                        clear_active_child_turn(bridge_dir, child_tid, child_turn_id)
-                        continue
-                try:
-                    await codex_client.request(
-                        "turn/interrupt",
-                        {"threadId": child_tid, "turnId": child_turn_id},
-                    )
-                except CodexAppServerResponseError as exc:
-                    if is_no_active_turn_error(exc):
-                        clear_active_child_turn(bridge_dir, child_tid, child_turn_id)
-                    else:
-                        # A superseded id proves a newer helper turn is still live.
-                        raise
+                    except CodexAppServerResponseError as exc:
+                        if not is_stale_active_turn_error(exc):
+                            raise
+
+                        if is_no_active_turn_error(exc):
+                            # The turn ended and no idle edge is coming. Clear it only
+                            # if still recorded and publish idle under the bridge lock,
+                            # so a turn starting mid-interrupt is not masked by this idle.
+                            def _publish_idle() -> None:
+                                # Runs under the bridge state lock: stay quick, do not
+                                # touch bridge state, and never raise (the clear is done).
+                                try:
+                                    self._publish_event(
+                                        conv_id, {"type": "session.status", "status": "idle"}
+                                    )
+                                    self._resource_registry.note_external_session_status(
+                                        conv_id, "idle"
+                                    )
+                                except Exception:
+                                    self._logger.warning(
+                                        "Codex-native idle publish failed for session=%s",
+                                        conv_id,
+                                        exc_info=True,
+                                    )
+
+                            cleared = clear_active_turn_id_if_matches(
+                                bridge_dir, state.active_turn_id, on_cleared=_publish_idle
+                            )
+                            self._logger.info(
+                                "Codex-native interrupt reconciled an already-ended turn "
+                                "for session=%s thread=%s turn=%s cleared=%s: %s",
+                                conv_id,
+                                state.thread_id,
+                                state.active_turn_id,
+                                cleared,
+                                exc.message,
+                            )
+                        else:
+                            # A newer turn replaced the one we targeted and is still
+                            # live, so leave its recorded id in place and publish no
+                            # idle; the forwarder owns the newer turn's lifecycle.
+                            self._logger.info(
+                                "Codex-native interrupt targeted a superseded turn for "
+                                "session=%s thread=%s turn=%s; a newer turn is live: %s",
+                                conv_id,
+                                state.thread_id,
+                                state.active_turn_id,
+                                exc.message,
+                            )
+                        # The targeted turn ended or was superseded, so skip the
+                        # deferred parent-wake cancel. A dropped sub-agent completion
+                        # can still leave its parent waiting; reconciled separately.
+                        if not active_child_turns:
+                            return Response(status_code=204)
+                for child_tid, child_turn_id in active_child_turns:
+                    if not child_turn_id:
+                        response = await codex_client.request(
+                            "thread/read", {"threadId": child_tid, "includeTurns": True}
+                        )
+                        result = response.get("result")
+                        thread = result.get("thread") if isinstance(result, dict) else None
+                        turns = thread.get("turns") if isinstance(thread, dict) else None
+                        latest = turns[-1] if isinstance(turns, list) and turns else None
+                        child_turn_id = latest.get("id") if isinstance(latest, dict) else None
+                        if (
+                            not isinstance(latest, dict)
+                            or not isinstance(child_turn_id, str)
+                            or not child_turn_id
+                        ):
+                            raise RuntimeError("Codex helper turn could not be confirmed")
+                        if latest.get("status") in {"completed", "failed", "interrupted"}:
+                            clear_active_child_turn(bridge_dir, child_tid, child_turn_id)
+                            continue
+                    try:
+                        await codex_client.request(
+                            "turn/interrupt",
+                            {"threadId": child_tid, "turnId": child_turn_id},
+                        )
+                    except CodexAppServerResponseError as exc:
+                        if is_no_active_turn_error(exc):
+                            clear_active_child_turn(bridge_dir, child_tid, child_turn_id)
+                        else:
+                            # A superseded id proves a newer helper turn is still live.
+                            raise
         except Exception as exc:
             self._logger.warning(
                 "Codex-native turn/interrupt failed for session=%s thread=%s turn=%s",
@@ -1089,7 +1095,9 @@ class NativeInterruptRunner:
             )
         finally:
             with contextlib.suppress(Exception):
-                await codex_client.close()
+                await asyncio.wait_for(
+                    codex_client.close(), timeout=_CODEX_INTERRUPT_CLOSE_TIMEOUT_S
+                )
         self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
@@ -1161,13 +1169,13 @@ class NativeInterruptRunner:
             directory=state.workspace,
         )
         try:
-            # OpenCode answers true even when idle, so the answer is not checked. Record
-            # before closing the client: the abort's idle edge usually follows within ms.
-            await client.abort(state.opencode_session_id)
+            # Record before closing the client: the forwarder publishes the idle edge
+            # from session.execution.interrupted, usually within milliseconds.
+            await client.interrupt(state.opencode_session_id)
             self._defer_parent_wake_after_native_interrupt(conv_id)
         except (OpenCodeClientError, httpx.HTTPError) as exc:
             self._logger.warning(
-                "OpenCode-native abort failed for session=%s opencode_session=%s",
+                "OpenCode-native interrupt failed for session=%s opencode_session=%s",
                 conv_id,
                 state.opencode_session_id,
                 exc_info=True,

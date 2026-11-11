@@ -939,6 +939,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         response: null,
         askUserQuestion: event.askUserQuestion,
         exitPlanMode: event.exitPlanMode,
+        fileEdit: event.fileEdit,
         codexCommand: event.codexCommand,
         allowAllEdits: event.allowAllEdits,
         interruptible: event.interruptible,

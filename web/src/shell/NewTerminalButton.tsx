@@ -71,8 +71,9 @@ export function NewTerminalButton({
   if (declared.length === 0) return null;
 
   const launch = (name: string, elevated = false) => {
-    create.mutate(elevated ? { terminal: name, elevated: true } : name, {
-      onSuccess: (info) => onCreated?.(terminalTabKey(info)),
+    create.launch(name, {
+      elevated,
+      onOpen: (info) => onCreated?.(terminalTabKey(info)),
     });
   };
 

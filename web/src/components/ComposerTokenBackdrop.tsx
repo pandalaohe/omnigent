@@ -11,6 +11,10 @@ import {
 } from "react";
 
 import { labelOf, tokenText } from "@/lib/composerTokens";
+import { findMentionTokens } from "@/lib/composerMentions";
+import { MENTION_TOKEN_CLASS } from "@/components/composer/MentionTokenOverlay";
+
+const NO_MENTION_TOKENS: readonly string[] = [];
 
 const TOKEN_RE = /\[(?:image|file) \d+\]/g;
 // Same pattern InlineComposerEditor's OmnigentReferenceHighlight matched, so
@@ -31,6 +35,7 @@ interface Span {
   start: number;
   end: number;
   className: string;
+  testId?: string;
 }
 
 function commandSpan(value: string, command: string | null): Span | null {
@@ -77,8 +82,17 @@ function computeSpans(
   files: readonly File[],
   command: string | null,
   activeIndex: number | null,
+  mentionTokens: readonly string[],
 ): Span[] {
   const spans = [...tokenSpans(value, files, activeIndex), ...s26Spans(value)];
+  spans.push(
+    ...findMentionTokens(value, mentionTokens).map(({ start, end }) => ({
+      start,
+      end,
+      className: MENTION_TOKEN_CLASS,
+      testId: "composer-mention-token",
+    })),
+  );
   const commandTint = commandSpan(value, command);
   if (commandTint) spans.push(commandTint);
   return spans.sort((a, b) => a.start - b.start);
@@ -104,7 +118,7 @@ function renderSegments(value: string, spans: Span[]): ReactNode[] {
     if (end <= start) return;
     if (start > cursor) nodes.push(content.slice(cursor, start));
     nodes.push(
-      <span key={`${start}-${end}`} className={span.className}>
+      <span key={`${start}-${end}`} className={span.className} data-testid={span.testId}>
         {content.slice(start, end)}
       </span>,
     );
@@ -129,8 +143,12 @@ export const ComposerTokenBackdrop = forwardRef<
     command: string | null;
     activeIndex: number | null;
     anchor: RefObject<HTMLTextAreaElement | null>;
+    mentionTokens?: readonly string[];
   }
->(function ComposerTokenBackdrop({ value, files, command, activeIndex, anchor }, ref) {
+>(function ComposerTokenBackdrop(
+  { value, files, command, activeIndex, anchor, mentionTokens = NO_MENTION_TOKENS },
+  ref,
+) {
   const innerRef = useRef<HTMLDivElement>(null);
   useImperativeHandle(ref, () => innerRef.current as HTMLDivElement);
   const [box, setBox] = useState({ top: 0, left: 0, width: 0, height: 0 });
@@ -222,8 +240,8 @@ export const ComposerTokenBackdrop = forwardRef<
   }, [anchor.current]);
 
   const spans = useMemo(
-    () => computeSpans(value, files, command, activeIndex),
-    [value, files, command, activeIndex],
+    () => computeSpans(value, files, command, activeIndex, mentionTokens),
+    [value, files, command, activeIndex, mentionTokens],
   );
   const nodes = useMemo(() => renderSegments(value, spans), [value, spans]);
 

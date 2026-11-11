@@ -349,6 +349,7 @@ class AddCommentRequest(BaseModel):
     start_index: int
     end_index: int
     anchor_content: str | None = None
+    anchor_metadata: None = None
 
     @model_validator(mode="after")
     def _validate_range(self) -> AddCommentRequest:
@@ -611,7 +612,7 @@ def create_comments_router(
                 )
         comments = store.list_for_conversation(session_id, path=path)
         return comment_rows(
-            comments,
+            [comment for comment in comments if comment.anchor_metadata is None],
             include_visitor_drafts=include_visitor_drafts,
             visitor_screenshot_allowed=screenshot_files.is_bound if screenshot_files else None,
         )
@@ -701,7 +702,7 @@ def create_comments_router(
         session_id: str,
         body: SendCommentsRequest,
     ) -> dict[str, Any]:
-        """Mark comments as addressed and format them into an agent message.
+        """Mark Files comments addressed and format them into an agent message.
 
         Fetches each requested comment, marks it ``addressed`` (unless
         ``mark_addressed`` is ``False``), and formats the full set into a
@@ -722,7 +723,7 @@ def create_comments_router(
             by the formatted message.
         :raises OmnigentError: 401/403/404 if the user lacks edit permission,
             or 404 if any requested comment is not found or does not belong to
-            this session.
+            this session; 400 if a requested comment belongs to a PR review.
         """
         user_id = get_user_id(request, auth_provider)
         await _require_session_access(user_id, session_id, LEVEL_EDIT)
@@ -738,6 +739,11 @@ def create_comments_router(
                 comment = store.get(cid, session_id)
                 if comment is None:
                     raise OmnigentError(f"Comment not found: {cid}", code=ErrorCode.NOT_FOUND)
+                if comment.anchor_metadata is not None:
+                    raise OmnigentError(
+                        "PR review comments must be sent through the chat composer",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
                 fetched.append(comment)
             if body.mark_addressed:
                 for comment in fetched:

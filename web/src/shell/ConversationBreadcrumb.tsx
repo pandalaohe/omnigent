@@ -17,6 +17,7 @@ import type { Agent } from "@/hooks/useAgents";
 import { cn } from "@/lib/utils";
 import { childPrimaryLabel, shortenPath, type ChildSessionLike } from "./subagentRailGroups";
 import { ProjectRowIcon } from "./ProjectPicker";
+import { useSessionNavigationPreferences } from "@/hooks/useSessionNavigationPreferences";
 
 /**
  * `agent @ host · cwd` chip for a child session's header. Hover shows the
@@ -89,6 +90,7 @@ export function ConversationBreadcrumb({
   childSession,
   childCwd,
   actions,
+  compact = false,
   className,
 }: {
   sessionId?: string | null;
@@ -139,6 +141,8 @@ export function ConversationBreadcrumb({
   childCwd?: string | null;
   /** Session-management menu rendered immediately after the title. */
   actions?: ReactNode;
+  /** Show only a Back link on phones; omit titles and session identity. */
+  compact?: boolean;
   /** Extra classes for the context (header vs title-bar strip). */
   className?: string;
 }) {
@@ -162,9 +166,12 @@ export function ConversationBreadcrumb({
   const childHost = childHostId ? hosts?.find((host) => host.host_id === childHostId) : undefined;
   const childHostName = hostDisplayName(childHostId, childHost);
   const childDisplay = childSession ? childAgentDisplay(childSession) : null;
-  // iOS/Android native chrome already identifies the session. Restore the
-  // compact "< Back" climb-out there; web / Electron keep the parent name.
-  const nativeMobileBack = isIOSShell() || isAndroidShell();
+  const compactBack = compact || isIOSShell() || isAndroidShell();
+  const { nativeMobileHeaderMode } = useSessionNavigationPreferences();
+  const showNativeTitle =
+    (isIOSShell() || isAndroidShell()) && nativeMobileHeaderMode === "conversation-title";
+  const compactChrome = compact && !showNativeTitle;
+  if (compactChrome && !titleLinkTo) return null;
   return (
     <nav
       aria-label="Conversation"
@@ -173,39 +180,40 @@ export function ConversationBreadcrumb({
         className,
       )}
     >
-      {projectTag ??
-        (projectName && (
-          <div className="hidden md:flex min-w-0 items-center gap-1.5 text-ui shrink-0">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span
-                  className={cn(
-                    "breadcrumb-folder flex shrink-0 items-center text-muted-foreground hover:opacity-100",
-                    // A full-color emoji reads as washed-out when faded, so only
-                    // dim the monochrome folder fallback.
-                    projectIcon ? "opacity-100" : "opacity-40",
-                  )}
-                  aria-label={`Project: ${projectName}`}
-                >
-                  <ProjectRowIcon icon={projectIcon} className="size-4 text-[16px]" />
-                </span>
-              </TooltipTrigger>
-              <TooltipContent side="bottom" align="start">
-                <div>
-                  <span className="font-semibold text-ui">{conversationTitle}</span>
-                  <div className="flex gap-1 text-muted-foreground">
+      {!compactChrome &&
+        (projectTag ??
+          (projectName && (
+            <div className="hidden md:flex min-w-0 items-center gap-1.5 text-ui shrink-0">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span
+                    className={cn(
+                      "breadcrumb-folder flex shrink-0 items-center text-muted-foreground hover:opacity-100",
+                      // A full-color emoji reads as washed-out when faded, so only
+                      // dim the monochrome folder fallback.
+                      projectIcon ? "opacity-100" : "opacity-40",
+                    )}
+                    aria-label={`Project: ${projectName}`}
+                  >
                     <ProjectRowIcon icon={projectIcon} className="size-4 text-[16px]" />
-                    {projectName}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" align="start">
+                  <div>
+                    <span className="font-semibold text-ui">{conversationTitle}</span>
+                    <div className="flex gap-1 text-muted-foreground">
+                      <ProjectRowIcon icon={projectIcon} className="size-4 text-[16px]" />
+                      {projectName}
+                    </div>
                   </div>
-                </div>
-              </TooltipContent>
-            </Tooltip>
-            <span aria-hidden className="shrink-0 text-muted-foreground opacity-40">
-              /
-            </span>
-          </div>
-        ))}
-      {!isChildSession && <WorktreeStatusMark sessionId={sessionId} />}
+                </TooltipContent>
+              </Tooltip>
+              <span aria-hidden className="shrink-0 text-muted-foreground opacity-40">
+                /
+              </span>
+            </div>
+          )))}
+      {!compactChrome && !isChildSession && <WorktreeStatusMark sessionId={sessionId} />}
       {titleLinkTo ? (
         <>
           <Link
@@ -213,12 +221,12 @@ export function ConversationBreadcrumb({
             aria-label="Back to parent session"
             className={cn(
               "breadcrumb-parent-link min-w-0 text-muted-foreground hover:text-foreground",
-              nativeMobileBack
+              compactBack
                 ? "inline-flex shrink-0 items-center gap-0.5"
                 : "truncate hover:underline",
             )}
           >
-            {nativeMobileBack ? (
+            {compactBack ? (
               <>
                 <ChevronLeftIcon className="size-4" />
                 <span>Back</span>
@@ -243,8 +251,8 @@ export function ConversationBreadcrumb({
           </span>
         ))
       )}
-      {actions}
-      {isChildSession && childSession ? (
+      {!compactChrome && actions}
+      {!compactChrome && isChildSession && childSession ? (
         <>
           <span aria-hidden className="shrink-0 text-muted-foreground opacity-40">
             /
@@ -268,6 +276,7 @@ export function ConversationBreadcrumb({
           )}
         </>
       ) : (
+        !compactChrome &&
         isChildSession && (
           <>
             <span aria-hidden className="shrink-0 text-muted-foreground opacity-40">

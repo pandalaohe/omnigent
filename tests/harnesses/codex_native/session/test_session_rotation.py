@@ -105,10 +105,10 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     Native Codex thread switches create a replacement Omnigent session.
 
     This is the ``/clear`` regression shape: Codex keeps the terminal
-    alive but starts a new app-server thread. The forwarder must move
-    terminal ownership, update bridge state, resubscribe to the new
-    thread, and send subsequent status/history events to the new AP
-    session.
+    alive but starts a new app-server thread. The forwarder must keep the
+    old title and project, move terminal ownership, update bridge state,
+    resubscribe to the new thread, and send subsequent status/history
+    events to the new AP session.
     """
     _write_forwarder_bridge(
         tmp_path, session_id="conv_old", thread_id="thread_old", active_turn_id=None
@@ -154,6 +154,7 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
                         "omnigent.archived_at": "123",
                         "omnigent.mcp_service.old": "1",
                     },
+                    "project_id": "proj_alpha",
                 },
             )
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_old/successor":
@@ -546,11 +547,13 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
     ] == ["running"]
     old_events = [event for event in session_events if event.session_id == "conv_old"]
     notice_types = {
+        "external_background_work",
         "external_session_status",
         "external_conversation_item",
         "external_session_superseded",
     }
     assert [event.body["type"] for event in old_events if event.body["type"] in notice_types] == [
+        "external_background_work",
         "external_session_status",
         "external_conversation_item",
         "external_session_superseded",

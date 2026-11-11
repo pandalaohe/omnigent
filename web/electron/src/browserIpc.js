@@ -14,6 +14,8 @@ const chromeCookieStoreModule = require("./chromeCookieStore");
 const { decodeLegacyBrowserAction } = require("./browserLegacyAction");
 const { buildDesignModeScript } = require("./designModeScript");
 
+const { SESSION_HOST_PROTOCOL } = require("./hostIdentity");
+
 // Max age of a real native input event for a design-mode submit marker to be
 // honored (see the gesture gate below). Covers click/Enter → console.log.
 const DESIGN_MODE_GESTURE_WINDOW_MS = 1500;
@@ -420,6 +422,34 @@ function registerBrowserIpc({
     }
   };
 
+  async function withAgentView(event, args) {
+    const gated = gateRegistry(event);
+    if (gated.error) return gated;
+    const entry = gated.registry.get(args?.conversationId);
+    if (!entry) return { error: "No browser view" };
+    const context = entry.agentContext;
+    if (context?.revoked) return { error: "The previous browser page is no longer available" };
+    if (context?.hostIsThisMachine === true) {
+      const opts = args?.opts;
+      if (
+        opts?.sessionHostProtocol !== SESSION_HOST_PROTOCOL ||
+        typeof opts.sourceHostId !== "string" ||
+        !opts.sourceHostId
+      ) {
+        return { error: "Current session host is required to read this browser view" };
+      }
+      const currentContext = getAgentContextForEvent(event, opts);
+      if (
+        opts.sourceHostId !== context.sourceHostId ||
+        currentContext?.hostIsThisMachine !== true
+      ) {
+        await gated.registry.revokeAgentView(args.conversationId);
+        return { error: "Session host changed; the previous browser page is no longer available" };
+      }
+    }
+    return { entry, registry: gated.registry };
+  }
+
   // Open (create-if-absent) or navigate a conversation's view, and measure it
   // into place. `force` reloads even on the same URL (agent "bring me back"
   // intent). Returns the registry's structured `{ ok, created, error }`.
@@ -439,7 +469,7 @@ function registerBrowserIpc({
     // the target and eligibility. Caller exception flags never establish identity.
     const userNavigation = consumeUserNavigation(event);
     const navigationContext = () => {
-      const context = getAgentContextForEvent(event, opts?.sourceHostId);
+      const context = getAgentContextForEvent(event, opts);
       return userNavigation ? { ...context, userNavigation: true } : context;
     };
     let agentContext = navigationContext();
@@ -470,11 +500,17 @@ function registerBrowserIpc({
       return {
         ok: r.ok,
         created: r.created ?? false,
+        ...(r.ok ? { hostIsThisMachine: r.entry?.agentContext?.hostIsThisMachine === true } : {}),
         error: hint ? `${r.error} ${hint}` : r.error,
       };
     };
 
     const navigate = async (registry, context = agentContext) => {
+      if (registry.needsAgentViewRevocation?.(registry.get(conversationId), context)) {
+        const cleared = await registry.revokeAgentView(conversationId, isCurrent);
+        if (!isCurrent()) return cancelled;
+        if (!cleared.ok) return cleared;
+      }
       if (url) {
         const verdict = await registry.checkAgentNavigation(conversationId, url, context);
         if (!isCurrent()) return cancelled;
@@ -536,7 +572,7 @@ function registerBrowserIpc({
           // The prompt can span a server switch (same registry, new pinned
           // origin); never retry the old server's answer under the new policy.
           const regate = gateRegistry(event);
-          const serverOrigin = getAgentContextForEvent(event, opts?.sourceHostId)?.serverOrigin;
+          const serverOrigin = getAgentContextForEvent(event, opts)?.serverOrigin;
           if (
             regate.error ||
             regate.registry !== activeRegistry ||
@@ -571,7 +607,25 @@ function registerBrowserIpc({
     if (g.error) return { ok: false, error: g.error };
     const conversationId = args?.conversationId ?? null;
     const r = g.registry.setActive(conversationId);
+    // A tab the user returns to gets keyboard focus back in its page.
+    if (r.ok && conversationId !== null && args?.focus === true) {
+      g.registry.get(conversationId)?.view.webContents.focus();
+    }
     return { ok: r.ok, error: r.error };
+  });
+
+  // The attached page if it has keyboard focus, so the renderer can tell a click
+  // into that page apart from the window losing focus to another app.
+  ipcMain.handle("omnigent:browser-focused-view", (event) => {
+    const g = gateRegistry(event);
+    if (g.error) return null;
+    const viewId = g.registry.activeConversationId();
+    if (viewId === null) return null;
+    try {
+      return g.registry.get(viewId)?.view.webContents.isFocused() ? viewId : null;
+    } catch {
+      return null;
+    }
   });
 
   // Hide/show the active view in place while a DOM overlay is open. The native
@@ -615,11 +669,9 @@ function registerBrowserIpc({
 
   // Capture the conversation's view as a base64 PNG.
   ipcMain.handle("omnigent:browser-screenshot", async (event, args) => {
-    const g = gateRegistry(event);
+    const g = await withAgentView(event, args);
     if (g.error) return { ok: false, error: g.error };
-    const { conversationId } = args ?? {};
-    const entry = g.registry.get(conversationId);
-    if (!entry) return { ok: false, error: "No browser view" };
+    const { entry } = g;
     try {
       const image = await captureCredentialSafePage(entry.view.webContents);
       const png = image.toPNG();
@@ -636,18 +688,16 @@ function registerBrowserIpc({
       return {
         ok: false,
         error: e && e.message ? e.message : String(e),
-        noSurface: g.registry.activeConversationId() !== conversationId,
+        noSurface: g.registry.activeConversationId() !== args.conversationId,
       };
     }
   });
 
   // Both transports converge on main-owned scripts and the same sender gate.
   async function performBrowserAction(event, args, legacy = false) {
-    const g = gateRegistry(event);
+    const g = await withAgentView(event, args);
     if (g.error) return { ok: false, error: g.error };
-    const { conversationId } = args ?? {};
-    const entry = g.registry.get(conversationId);
-    if (!entry) return { ok: false, error: "No browser view" };
+    const { entry } = g;
     try {
       const { action, params } = legacy ? decodeLegacyBrowserAction(args?.js) : (args ?? {});
       const js = buildBrowserActionScriptForExecution(action, params);
@@ -682,6 +732,7 @@ function registerBrowserIpc({
         : undefined;
     return {
       exists: true,
+      hostIsThisMachine: entry.agentContext?.hostIsThisMachine === true,
       url,
       title: webContents.getTitle(),
       ...(pendingUrl ? { pendingUrl } : {}),

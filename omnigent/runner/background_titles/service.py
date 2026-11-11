@@ -37,6 +37,10 @@ CUSTOM_BACKGROUND_TITLE_MAX_OUTPUT_TOKENS = 64
 BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS = 60.0
 BACKGROUND_TITLE_MAX_CHARS = DEFAULT_GENERATED_TITLE_MAX_CHARS
 CUSTOM_BACKGROUND_TITLE_MAX_CHARS = USER_SESSION_TITLE_MAX_CHARS
+#: Runner hello capability: background-title instructions may exceed the legacy limit.
+CAP_LONG_BACKGROUND_TITLE_INSTRUCTIONS = "background_title_long_instructions"
+#: Runners without that capability reject longer ``additional_instructions``.
+LEGACY_BACKGROUND_TITLE_INSTRUCTIONS_MAX_CHARS = 4_000
 FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION = (
     "Unless another language is explicitly requested, write the title in the "
     "same primary language as the user's message."

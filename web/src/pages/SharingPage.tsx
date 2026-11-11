@@ -34,25 +34,22 @@ const TIERS: { id: SharingMode; label: string; description: string }[] = [
     id: "on",
     label: "On",
     description:
-      "Anyone with manage access can share a session at any level (read, edit, or manage) and toggle public / workspace read.",
+      "Users with manage access can share at read, edit, or manage level and enable public or workspace read access.",
   },
   {
     id: "read_only",
     label: "Read only",
-    description:
-      "New shares are capped at read (view) access. Edit and manage grants are rejected.",
+    description: "New shares allow Read access only; Edit and Manage grants are rejected.",
   },
   {
     id: "restricted_read_only",
     label: "Read only (restricted)",
-    description:
-      "Read-only, and sessions whose working directory is a home directory or the filesystem root cannot be shared at all — not even read.",
+    description: "Read-only. Sessions in a home directory or the filesystem root cannot be shared.",
   },
   {
     id: "off",
     label: "Off",
-    description:
-      "Sharing is disabled. No new grants can be created and the Share control is hidden.",
+    description: "Block new shares and hide the Share control.",
   },
 ];
 
@@ -240,7 +237,7 @@ export function SharingPage() {
                             </span>
                             <span
                               id={`sharing-mode-${tier.id}-description`}
-                              className="text-sm leading-normal whitespace-normal text-muted-foreground"
+                              className="text-sm whitespace-normal text-muted-foreground"
                             >
                               {tier.description}
                             </span>
@@ -251,7 +248,7 @@ export function SharingPage() {
                   </Select>
                   <p
                     id="sharing-mode-description"
-                    className="min-w-0 flex-1 text-sm leading-normal text-muted-foreground md:pt-1"
+                    className="min-w-0 flex-1 text-sm text-muted-foreground md:pt-1"
                   >
                     {currentTier?.description}
                   </p>
@@ -271,9 +268,8 @@ export function SharingPage() {
                       className="flex-1"
                       description={
                         <>
-                          Allow sharing a session with anyone who has the link and can sign in. When
-                          off, new public grants are rejected; existing public grants remain
-                          accessible and can be revoked.
+                          Anyone with the link can access after signing in. Turning this off blocks
+                          new public grants; existing grants stay accessible and revocable.
                           {!publicEditable && (
                             <span className="mt-1 block">
                               Managed by this deployment and can&apos;t be changed here.
@@ -303,8 +299,8 @@ export function SharingPage() {
                     className="min-w-0 flex-1"
                     description={
                       <>
-                        The maximum access a public link can grant. Lowering this to Read also
-                        limits existing public Edit grants. Raising it does not upgrade Read grants.
+                        Limit access through public links. Lowering to Read limits existing Edit
+                        grants; raising it does not upgrade Read grants.
                         {!publicMaxEditable && (
                           <span className="mt-1 block">Managed by this deployment.</span>
                         )}
@@ -355,9 +351,8 @@ export function SharingPage() {
                         className="flex-1"
                         description={
                           <>
-                            New sessions start with public read access for anyone with the link who
-                            can sign in. Owners can revoke it in Share. Existing sessions are
-                            unchanged.
+                            New sessions allow public read access with a link and sign-in. Owners
+                            can revoke it in Share. Existing sessions stay unchanged.
                             {!defaultPublicEditable && (
                               <span className="mt-1 block">
                                 Managed by this deployment and can&apos;t be changed here.
@@ -423,6 +418,44 @@ export function SharingPage() {
                   </BlockedBy>
                 </div>
               </SettingsGroup>
+              {state?.peer_session_messaging_enabled !== undefined && (
+                <SettingsGroup title="Agent messaging" testId="settings-group-agent-messaging">
+                  <div className="flex items-center justify-between gap-4">
+                    <SettingsLabel
+                      label="Message other sessions"
+                      labelId="peer-messaging-label"
+                      descriptionId="peer-messaging-description"
+                      descriptionClassName="max-md:block"
+                      className="flex-1"
+                      description={
+                        <>
+                          Let agents send messages to other sessions owned by the same user. Changes
+                          apply immediately; child-session messaging is unchanged.
+                          {!state.peer_session_messaging_editable && (
+                            <span className="mt-1 block">
+                              Disabled by this deployment and can&apos;t be changed here.
+                            </span>
+                          )}
+                        </>
+                      }
+                    />
+                    <Switch
+                      checked={state.peer_session_messaging_enabled}
+                      onCheckedChange={(enabled) => {
+                        setError(null);
+                        setMode.mutate(
+                          { peer_session_messaging: enabled },
+                          { onError: (err) => setError(err.message) },
+                        );
+                      }}
+                      disabled={!state.peer_session_messaging_editable || setMode.isPending}
+                      aria-labelledby="peer-messaging-label"
+                      aria-describedby="peer-messaging-description"
+                      componentId="settings.sharing.peer_session_messaging"
+                    />
+                  </div>
+                </SettingsGroup>
+              )}
             </div>
             {error && <p className="mt-3 text-ui text-destructive">{error}</p>}
           </>

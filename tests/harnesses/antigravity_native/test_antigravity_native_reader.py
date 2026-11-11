@@ -4358,6 +4358,8 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
         "agent_id": "agent_xyz",
         "runner_id": "runner_abc",
         "labels": {ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: "bridge-123"},
+        "title": "Fix login flow",
+        "project_id": "proj_alpha",
     }
     calls: list[tuple[str, str, dict[str, object]]] = []
     async with _rotation_client(monkeypatch, calls=calls, snapshot=snapshot) as client:

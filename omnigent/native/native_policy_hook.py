@@ -20,6 +20,7 @@ model sees it).
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from typing import NotRequired, TypedDict
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -589,6 +591,34 @@ def _retry_budget_for_request(
     return _EVALUATE_POLICY_RETRY_BUDGET_S, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S
 
 
+def is_loopback_url(url: str) -> bool:
+    """
+    Report whether *url* addresses this machine's loopback interface.
+
+    Mirrors :func:`omnigent_client._http.is_loopback_url`; duplicated here
+    because importing the SDK package loads the server schemas and roughly
+    triples this hook's startup on every tool call.
+
+    :param url: Absolute URL to classify, e.g. ``"http://127.0.0.1:28700"``.
+    :returns: ``True`` for ``localhost``, any ``.localhost`` name,
+        ``127.0.0.0/8``, or ``::1``; ``False`` otherwise, including a URL
+        with no host.
+    """
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        # A malformed authority (e.g. an unterminated IPv6 bracket) is not loopback.
+        return False
+    if host is None:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def post_evaluate_with_retry(
     url: str,
     headers: dict[str, str],
@@ -673,6 +703,8 @@ def post_evaluate_with_retry(
     timeout = httpx.Timeout(read_timeout, connect=_EVALUATE_POLICY_CONNECT_TIMEOUT_S)
     reauthed = False
     last_error: str = "unknown error"
+    # Loopback callbacks cannot traverse an environment-configured proxy.
+    trust_env = not is_loopback_url(url)
     while True:
         retry_delay_s = backoff_s
         attempt_started = time.monotonic()
@@ -684,7 +716,11 @@ def post_evaluate_with_retry(
                 connect=min(_EVALUATE_POLICY_CONNECT_TIMEOUT_S, remaining),
             )
         try:
-            with httpx.Client(headers=headers, timeout=timeout) as client:
+            with httpx.Client(
+                headers=headers,
+                timeout=timeout,
+                trust_env=trust_env,
+            ) as client:
                 resp = client.post(url, json=request_body)
                 if (
                     reauth is not None

@@ -1,43 +1,14 @@
-// Model + reasoning-effort + permission-mode sub-form for the scheduled-task
-// dialog.
-//
-// A deliberately lightweight, scheduled-dialog-local picker rather than the
-// interactive NewChatDialog's 26-prop HarnessConfigModal (which is bound to
-// smart-routing / cost-control / per-turn dynamic model loading — all
-// disproportionate for a saved scheduled task). It reuses the SHARED source of
-// truth for the option lists: CLAUDE_NATIVE_MODELS (the version-agnostic model
-// aliases) and CLAUDE_NATIVE_EFFORTS + the MODEL_SELECT_DEFAULT /
-// EFFORT_SELECT_NONE sentinels from HarnessConfigControls for Claude, and the
-// selected host's catalog for Codex SDK, so choices stay in step with New Chat.
-//
-// The parent gates rendering on the selected agent's capability
-// (nativeAgentHasCapability(agent, "permissionMode") for Claude native) or its
-// SDK harness (Claude SDK / Codex SDK), exactly like interactive. Both controls
-// default to "unselected" ("" = agent default), which the parent omits from the
-// create/update body so the fire path uses the agent's configured model + effort.
+import { ScheduleSelect as Select } from "./ScheduleSelect";
+// Harness-specific automation controls; Default leaves the agent configuration unchanged.
 
-import { Label } from "@/components/scheduled/Label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
-  CLAUDE_NATIVE_EFFORTS,
-  EFFORT_SELECT_NONE,
-  MODEL_SELECT_DEFAULT,
-} from "@/components/HarnessConfigControls";
-import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
-import { CLAUDE_NATIVE_PERMISSION_MODES } from "@/lib/claudePermissionMode";
+import { normalizeSdkPermissionMode } from "@/lib/sdkPermissionModes";
 import { normalizeEffortLabel } from "@/lib/composerModelLabel";
-import { effortLevelsFor, reconcileEffortOnModelChange } from "@/lib/modelEffortOptions";
-import { normalizeSdkPermissionMode, sdkPermissionOptions } from "@/lib/sdkPermissionModes";
-import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
-import type { HarnessCapabilityMap } from "@/lib/sessionDefaultModes";
-import { reconcileSpeed } from "@/lib/speedTiers";
-import { useHostModelOptions } from "@/hooks/useHosts";
+import { cn } from "@/lib/utils";
+import { pickerTriggerClass } from "./pickerStyles";
+import { Label } from "@/components/scheduled/Label";
+import { SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { EFFORT_SELECT_NONE, MODEL_SELECT_DEFAULT } from "@/components/HarnessConfigControls";
+import type { useScheduledHarnessSettings } from "./useScheduledHarnessSettings";
 
 /** Sentinel Select value for "no permission override" (use the agent default).
  * Distinct from Claude's real `default` (Manual) mode so leaving the control
@@ -49,10 +20,8 @@ export function ModelEffortFields({
   effort,
   permissionMode,
   speed,
-  harness,
-  capabilities,
-  showModel,
-  hostId,
+  settings,
+  disabled = false,
   onModelChange,
   onEffortChange,
   onPermissionModeChange,
@@ -66,11 +35,8 @@ export function ModelEffortFields({
   /** Selected permission mode, or "" = agent default (nothing overridden). */
   permissionMode: string;
   speed: string;
-  harness: string;
-  capabilities?: HarnessCapabilityMap;
-  showModel?: boolean;
-  /** Pinned host id, or "" when unset (task resolves a host at fire time). */
-  hostId: string;
+  disabled?: boolean;
+  settings: ReturnType<typeof useScheduledHarnessSettings>;
   onModelChange: (model: string) => void;
   onEffortChange: (effort: string) => void;
   onPermissionModeChange: (mode: string) => void;
@@ -79,89 +45,54 @@ export function ModelEffortFields({
    * open dropdown from dismissing the whole modal. */
   onSelectOpenChange?: (open: boolean) => void;
 }) {
-  // When a host is pinned, use its live-resolved model options (mirrors the
-  // interactive dialog on a connected host). With no host pinned — the common
-  // case, since scheduled tasks resolve a host at fire time — fall back to the
-  // static Claude aliases so the picker is always populated for Claude. Codex
-  // has no static list; a saved choice remains visible until a host resolves it.
-  const { data: hostModelOptions } = useHostModelOptions(
-    hostId === "" ? null : hostId,
-    harness,
-    hostId !== "",
-  );
-  const rows = hostId === "" ? [] : (hostModelOptions ?? []);
-  const modelOptions =
-    rows.length > 0
-      ? rows.map((o) => ({ id: o.id, label: o.displayName ?? o.id }))
-      : harness === "claude-sdk" || harness === "claude-native"
-        ? CLAUDE_NATIVE_MODELS.map((m) => ({ id: m.id, label: m.label }))
-        : [];
-  if (model !== "" && !modelOptions.some((option) => option.id === model)) {
+  const modelOptions = settings.models.map((option) => ({
+    id: option.id,
+    label: option.displayName ?? option.id,
+  }));
+  if (model && !modelOptions.some((option) => option.id === model)) {
     modelOptions.push({ id: model, label: model });
   }
-  const selected = rows.find((row) => row.id === model) ?? rows.find((row) => row.isDefault);
-  const levels =
-    effortLevelsFor(harness, rows, model) ??
-    selected?.efforts ??
-    selected?.supportedReasoningEfforts?.map((option) => option.reasoningEffort) ??
-    [];
-  const effortOptions = (levels ?? []).map((value) => ({
-    value,
-    label:
-      CLAUDE_NATIVE_EFFORTS.find((option) => option.value === value)?.label ??
-      normalizeEffortLabel(value),
-  }));
-  if (effort !== "" && !effortOptions.some((option) => option.value === effort)) {
+  const effortOptions = [...settings.efforts];
+  if (effort && !effortOptions.some((option) => option.value === effort)) {
     effortOptions.push({ value: effort, label: normalizeEffortLabel(effort) });
   }
-  const permissionOptions =
-    capabilities?.[harness] && "session_modes" in capabilities[harness]
-      ? sessionDefaultModeOptions(harness, "permission", rows, model, "create", capabilities)
-      : harness === "claude-native"
-        ? CLAUDE_NATIVE_PERMISSION_MODES
-        : harness === "codex-native"
-          ? (sdkPermissionOptions("codex") ?? [])
-          : (sdkPermissionOptions(harness) ?? []);
-  const speedOptions = sessionDefaultModeOptions(
-    harness,
-    "speed",
-    rows,
-    model,
-    "create",
-    capabilities,
+  const permissionOptions = settings.permissions.filter(
+    (option) =>
+      ["claude-native", "claude-sdk"].includes(settings.harness ?? "") ||
+      option.value !== "default",
   );
 
   return (
     <div className="flex flex-col gap-3 sm:gap-4">
-      {showModel !== false && (
-        <div className="grid gap-3 sm:grid-cols-2 sm:gap-6" data-testid="task-model-effort-row">
-          <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-model-control">
+      {settings.supportsModel && (
+        <div className="flex flex-col gap-3" data-testid="task-model-effort-row">
+          <div
+            className="flex w-full min-w-0 items-center justify-between gap-4"
+            data-testid="task-model-control"
+          >
             <Label htmlFor="task-model">Model</Label>
             <Select
+              disabled={disabled}
               value={model === "" ? MODEL_SELECT_DEFAULT : model}
               componentId="tasks.scheduled.model"
               valueHasNoPii
-              onValueChange={(v) => {
-                const nextModel = v === MODEL_SELECT_DEFAULT ? "" : v;
-                onModelChange(nextModel);
-                if (speed && (harness === "codex" || harness === "codex-native")) {
-                  onSpeedChange(reconcileSpeed(speed, rows, nextModel) ?? "");
-                }
-                if ((harness === "codex" || harness === "codex-native") && effort !== "") {
-                  onEffortChange(
-                    reconcileEffortOnModelChange(harness, rows, nextModel, effort) ?? "",
-                  );
-                }
-              }}
+              onValueChange={(v) => onModelChange(v === MODEL_SELECT_DEFAULT ? "" : v)}
               onOpenChange={onSelectOpenChange}
             >
-              <SelectTrigger id="task-model" data-testid="task-model-trigger" className="w-full">
+              <SelectTrigger
+                id="task-model"
+                data-testid="task-model-trigger"
+                className={cn(
+                  "w-auto max-w-[65%] border-0 shadow-none text-muted-foreground",
+                  pickerTriggerClass,
+                )}
+              >
                 <SelectValue />
               </SelectTrigger>
               <SelectContent
                 position="popper"
-                align="start"
-                className="w-(--radix-select-trigger-width)"
+                align="end"
+                className="w-[min(20rem,calc(100vw-2rem))]"
               >
                 <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
                 {modelOptions.map((m) => (
@@ -173,39 +104,56 @@ export function ModelEffortFields({
             </Select>
           </div>
 
-          <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-effort-control">
-            <Label htmlFor="task-effort">Effort</Label>
-            <Select
-              value={effort === "" ? EFFORT_SELECT_NONE : effort}
-              componentId="tasks.scheduled.effort"
-              valueHasNoPii
-              onValueChange={(v) => onEffortChange(v === EFFORT_SELECT_NONE ? "" : v)}
-              onOpenChange={onSelectOpenChange}
+          {effortOptions.length > 0 && (
+            <div
+              className="flex w-full min-w-0 items-center justify-between gap-4"
+              data-testid="task-effort-control"
             >
-              <SelectTrigger id="task-effort" data-testid="task-effort-trigger" className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent
-                position="popper"
-                align="start"
-                className="w-(--radix-select-trigger-width)"
+              <Label htmlFor="task-effort">Effort</Label>
+              <Select
+                disabled={disabled}
+                value={effort === "" ? EFFORT_SELECT_NONE : effort}
+                componentId="tasks.scheduled.effort"
+                valueHasNoPii
+                onValueChange={(v) => onEffortChange(v === EFFORT_SELECT_NONE ? "" : v)}
+                onOpenChange={onSelectOpenChange}
               >
-                <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-                {effortOptions.map((e) => (
-                  <SelectItem key={e.value} value={e.value}>
-                    {e.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
+                <SelectTrigger
+                  id="task-effort"
+                  data-testid="task-effort-trigger"
+                  className={cn(
+                    "w-auto max-w-[65%] border-0 shadow-none text-muted-foreground",
+                    pickerTriggerClass,
+                  )}
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent
+                  position="popper"
+                  align="end"
+                  className="w-[min(20rem,calc(100vw-2rem))]"
+                >
+                  <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+                  {effortOptions.map((e) => (
+                    <SelectItem key={e.value} value={e.value}>
+                      {e.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
         </div>
       )}
+      {settings.catalogMessage && (
+        <p className="text-sm text-muted-foreground">{settings.catalogMessage}</p>
+      )}
 
-      {speedOptions.length > 0 && (
+      {settings.speedOptions.length > 0 && (
         <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-speed-control">
           <Label htmlFor="task-speed">Speed</Label>
           <Select
+            disabled={disabled}
             value={speed || EFFORT_SELECT_NONE}
             onValueChange={(value) => onSpeedChange(value === EFFORT_SELECT_NONE ? "" : value)}
             onOpenChange={onSelectOpenChange}
@@ -219,12 +167,12 @@ export function ModelEffortFields({
               className="w-(--radix-select-trigger-width)"
             >
               <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-              {speed && !speedOptions.some((option) => option.value === speed) && (
+              {speed && !settings.speedOptions.some((option) => option.value === speed) && (
                 <SelectItem value={speed} disabled>
                   Unavailable ({speed})
                 </SelectItem>
               )}
-              {speedOptions.map((option) => (
+              {settings.speedOptions.map((option) => (
                 <SelectItem key={option.value} value={option.value}>
                   {option.label}
                 </SelectItem>
@@ -235,13 +183,19 @@ export function ModelEffortFields({
       )}
 
       {permissionOptions.length > 0 && (
-        <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-permission-control">
-          <Label htmlFor="task-permission">Permission mode</Label>
+        <div
+          className="flex w-full min-w-0 items-center justify-between gap-4"
+          data-testid="task-permission-control"
+        >
+          <Label htmlFor="task-permission">Permissions</Label>
           <Select
+            disabled={disabled}
             value={
-              permissionMode === ""
+              permissionMode === "" ||
+              (!["claude-native", "claude-sdk", "codex"].includes(settings.harness ?? "") &&
+                permissionMode === "default")
                 ? PERMISSION_SELECT_DEFAULT
-                : normalizeSdkPermissionMode(harness, permissionMode)
+                : normalizeSdkPermissionMode(settings.harness ?? "", permissionMode)
             }
             componentId="tasks.scheduled.permission_mode"
             valueHasNoPii
@@ -251,18 +205,19 @@ export function ModelEffortFields({
             <SelectTrigger
               id="task-permission"
               data-testid="task-permission-trigger"
-              className="w-full"
+              className={cn(
+                "w-auto max-w-[65%] border-0 shadow-none text-muted-foreground",
+                pickerTriggerClass,
+              )}
             >
               <SelectValue />
             </SelectTrigger>
             <SelectContent
               position="popper"
-              align="start"
-              className="w-(--radix-select-trigger-width)"
+              align="end"
+              className="w-[min(20rem,calc(100vw-2rem))]"
             >
-              <SelectItem value={PERMISSION_SELECT_DEFAULT}>
-                {harness === "codex" ? "Agent default" : "Default"}
-              </SelectItem>
+              <SelectItem value={PERMISSION_SELECT_DEFAULT}>Default</SelectItem>
               {permissionOptions.map((m) => (
                 <SelectItem key={m.value} value={m.value}>
                   {m.label}

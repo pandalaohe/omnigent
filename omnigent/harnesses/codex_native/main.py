@@ -276,7 +276,9 @@ def _codex_auth_unavailable_reason() -> HarnessAvailability | None:
     CLI can't stall the readiness refresh, and any resolver failure fails safe
     onto the ``auth.json`` check.
 
-    :returns: ``"binary-missing"`` when the CLI is absent, ``"needs-auth"``
+    :returns: ``"binary-missing"`` when the CLI is absent,
+        ``"cli-unresponsive"`` when its ``--version`` probe times out,
+        ``"version-too-low"`` when it reports an unsupported version, ``"needs-auth"``
         when a config-selected provider's declared env credential is missing
         or the launch uses Codex login without a usable ``auth.json``, and
         ``None`` when a provider will route the launch, Codex's own config is
@@ -2344,6 +2346,7 @@ def _codex_rollout_records_from_session_items(
     ]
     seen_turn_ids: set[str] = set()
     open_function_calls: dict[str, _JsonObject] = {}
+    emitted_call_ids: set[str] = set()
     interrupted_response_ids = _interrupted_response_ids_from_session_items(items)
     remaining_function_outputs = _codex_function_output_counts(
         items,
@@ -2383,7 +2386,17 @@ def _codex_rollout_records_from_session_items(
                                 **message,
                                 "arguments": _codex_replayed_arguments(message["arguments"]),
                             }
+                        elif (
+                            message.get("type")
+                            in ("function_call_output", "custom_tool_call_output")
+                            and "output" in message
+                        ):
+                            message = {
+                                **message,
+                                "output": sanitize_replayed_image_blocks(message["output"]),
+                            }
                     replacement_history.append(message)
+                replacement_history = _codex_history_without_orphan_outputs(replacement_history)
                 replacement_call_ids = {
                     message.get("call_id")
                     for message in replacement_history
@@ -2399,6 +2412,7 @@ def _codex_rollout_records_from_session_items(
                     if call_id in remaining_function_outputs
                     and call_id not in replacement_call_ids
                 )
+                emitted_call_ids = _codex_function_call_ids(replacement_history)
                 compacted_payload: _JsonObject = {
                     "message": item.get("summary", ""),
                     "replacement_history": replacement_history,
@@ -2426,7 +2440,15 @@ def _codex_rollout_records_from_session_items(
         if isinstance(call_id, str) and call_id:
             if payload.get("type") == "function_call":
                 open_function_calls[call_id] = payload
+                emitted_call_ids.add(call_id)
             elif payload.get("type") == "function_call_output":
+                if call_id not in emitted_call_ids:
+                    # Providers pair tool results with the preceding call by position.
+                    _logger.warning(
+                        "Dropping Codex resume tool output without a preceding call: call_id=%s",
+                        call_id,
+                    )
+                    continue
                 open_function_calls.pop(call_id, None)
         turn_id = _codex_turn_id_for_session_item(
             session_id=session_id,
@@ -2519,6 +2541,37 @@ def _codex_function_output_counts(
         if item.get("type") == "function_call_output" and isinstance(call_id, str) and call_id:
             counts[call_id] += 1
     return counts
+
+
+def _codex_function_call_ids(items: Sequence[object]) -> set[str]:
+    """Return the call ids of function calls in Responses history."""
+    return {
+        item["call_id"]
+        for item in items
+        if isinstance(item, dict)
+        and item.get("type") == "function_call"
+        and isinstance(item.get("call_id"), str)
+    }
+
+
+def _codex_history_without_orphan_outputs(history: list[object]) -> list[object]:
+    """Drop function outputs whose call does not precede them in a history snapshot."""
+    call_ids: set[str] = set()
+    kept: list[object] = []
+    for item in history:
+        if isinstance(item, dict) and item.get("type") == "function_call_output":
+            if item.get("call_id") not in call_ids:
+                _logger.warning(
+                    "Dropping compacted Codex tool output without a preceding call: call_id=%s",
+                    item.get("call_id"),
+                )
+                continue
+        elif isinstance(item, dict) and item.get("type") == "function_call":
+            call_id = item.get("call_id")
+            if isinstance(call_id, str):
+                call_ids.add(call_id)
+        kept.append(item)
+    return kept
 
 
 def _codex_open_function_calls(items: Sequence[object]) -> dict[str, _JsonObject]:

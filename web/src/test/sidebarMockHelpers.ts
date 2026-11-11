@@ -3,10 +3,16 @@ import { vi } from "vitest";
 import type { Conversation, useConversations } from "@/hooks/useConversations";
 import type { SidebarListQuery } from "@/hooks/useSidebarData";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 
 export function conversationHooksMock() {
   return {
     useConversations: vi.fn(),
+    // Same gate as the real hook, so tests drive it through the server info.
+    useAutomationsEnabled: () => {
+      const info = useServerInfo();
+      return info !== "loading" && info.automations_enabled !== false;
+    },
     useStopAndDeleteConversation: () => ({
       mutate: vi.fn(),
       reset: vi.fn(),
@@ -26,6 +32,7 @@ export function conversationHooksMock() {
     setConversationPinned: vi.fn(() => Promise.resolve({})),
     PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
     PIN_WRITE_MUTATION_KEY: ["pin-write"],
+    retryListFetch: () => false,
     useRenameConversation: () => ({ mutate: vi.fn() }),
     useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
     useArchiveConversation: () => ({ mutate: vi.fn() }),

@@ -364,7 +364,7 @@ export const DEFAULT_SHORTCUT_DEFINITIONS: Record<ShortcutActionId, ShortcutDefi
     label: "Open a new shell",
     group: "view",
     scope: "global",
-    defaultBindings: [chord("KeyT", ["primary", "alt"])],
+    defaultBindings: [chord("Backquote", ["control"])],
   },
   previousSuggestion: {
     id: "previousSuggestion",
@@ -734,6 +734,11 @@ function rawDefaultShortcutBindings(
     const nativeShell = context.nativeShell ?? isNativeShell();
     return [nativeShell ? chord("KeyN", ["primary", "alt"]) : chord("KeyO", ["primary", "shift"])];
   }
+  const nativeShell = context.nativeShell ?? isNativeShell();
+  if (nativeShell && actionId === "openSettings") return [chord("Comma", ["primary"])];
+  if (nativeShell && actionId === "toggleConversationsSidebar") return [chord("KeyB", ["primary"])];
+  if (nativeShell && actionId === "toggleWorkspaceSidebar")
+    return [chord("KeyB", ["primary", "shift"])];
   if (actionId === "sendMessage" && context.submitWithModEnter) {
     return [chord("Enter", ["primary"])];
   }

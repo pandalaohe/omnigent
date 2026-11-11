@@ -34,6 +34,8 @@ import annotateSource from "../../public/omni-html-annotate.js?raw";
 import bridgeSource from "../../public/omni-html-bridge.js?raw";
 import captureSource from "../../public/omni-html-capture.js?raw";
 import { prepareHtmlPreviewDoc, startTagEnd } from "./codeViewerHelpers";
+import { type HtmlPreviewZoomAction, isHtmlPreviewZoomAction } from "./htmlPreviewZoom";
+import { SCROLL_RESTORE_BUDGET_MS } from "./useScrollRestore";
 
 /** Protocol version — bump on any breaking change to the message shapes. */
 export const BRIDGE_VERSION = 1;
@@ -60,6 +62,12 @@ export const BRIDGE_MSG = {
   /** iframe → parent: a panel-mode link that names a workspace file. */
   openPath: "omni:openPath",
   orphans: "omni:orphans",
+  /** iframe → parent: the user pressed a zoom shortcut inside the preview. */
+  zoom: "omni:zoom",
+  /** iframe → parent: the document's vertical scroll offset after it scrolled. */
+  scroll: "omni:scroll",
+  /** parent → iframe: restore a panel page after its ready identifies the path. */
+  restoreScroll: "omni:restoreScroll",
 } as const;
 
 /** Rect of a selection in the iframe's own viewport coordinates. */
@@ -82,6 +90,8 @@ export interface BridgeSelection {
   suffix: string;
   selector?: string;
   rect: BridgeRect;
+  /** The frame resized and re-reported an unchanged selection at its new position. */
+  reflow: boolean;
 }
 
 export interface BridgeCommentClick {
@@ -117,6 +127,17 @@ export interface BridgeOrphans {
   ids: string[];
 }
 
+export interface BridgeZoom {
+  type: typeof BRIDGE_MSG.zoom;
+  action: HtmlPreviewZoomAction;
+}
+
+export interface BridgeScroll {
+  type: typeof BRIDGE_MSG.scroll;
+  /** The document's vertical scroll offset, in the frame's CSS pixels. */
+  top: number;
+}
+
 /** Any message the iframe can send to the parent (post-handshake). */
 export type InboundBridgeMessage =
   | BridgeReady
@@ -124,7 +145,9 @@ export type InboundBridgeMessage =
   | BridgeCommentClick
   | BridgeSelectionCleared
   | BridgeOpenPath
-  | BridgeOrphans;
+  | BridgeOrphans
+  | BridgeZoom
+  | BridgeScroll;
 
 // ---------------------------------------------------------------------------
 // Inbound message validation
@@ -189,6 +212,7 @@ export function parseBridgeMessage(data: unknown, nonce: string): InboundBridgeM
           suffix: d.suffix,
           ...(d.selector ? { selector: d.selector } : {}),
           rect: d.rect,
+          reflow: d.reflow === true,
         };
       }
       return null;
@@ -218,6 +242,12 @@ export function parseBridgeMessage(data: unknown, nonce: string): InboundBridgeM
         return { type: BRIDGE_MSG.orphans, ids: d.ids };
       }
       return null;
+    case BRIDGE_MSG.zoom:
+      return isHtmlPreviewZoomAction(d.action) ? { type: BRIDGE_MSG.zoom, action: d.action } : null;
+    case BRIDGE_MSG.scroll:
+      return typeof d.top === "number" && Number.isFinite(d.top) && d.top >= 0
+        ? { type: BRIDGE_MSG.scroll, top: d.top }
+        : null;
     default:
       return null;
   }
@@ -356,6 +386,22 @@ export function buildCaptureScript(nonce: string): string {
 }
 
 /**
+ * Hides the page while a scroll restore is pending, so clamped offsets never paint and
+ * hidden controls take no clicks. The runtime removes it once the restore settles. If the
+ * runtime never runs, the animation still ends, but the rule keeps overriding the page's own
+ * <html> animation.
+ */
+function restoreHideStyle(nonce: string): string {
+  // The runtime's budget starts only when the bridge script at the end of the body runs.
+  const fallbackMs = 2 * SCROLL_RESTORE_BUDGET_MS;
+  return (
+    `<style data-omni-restore-hide="${escapeHtmlAttr(nonce)}">` +
+    `html{animation:omni-restore-hide ${fallbackMs}ms!important}` +
+    "@keyframes omni-restore-hide{from,to{opacity:0;pointer-events:none}}</style>"
+  );
+}
+
+/**
  * Prepare HTML artifact content for the comment-enabled preview iframe: first
  * run {@link prepareHtmlPreviewDoc} (so links still open in a new tab), then
  * inject the capture script at the top of `<head>` (so it runs before the
@@ -372,17 +418,36 @@ export function buildCaptureScript(nonce: string): string {
  * @param runtimeUrl External runtime asset for embeds whose CSP blocks inline
  *   scripts. The annotation runtime is evaluated inline, so that mode carries
  *   the bridge only.
+ * @param restoreScrollTop Saved vertical offset restored as the page lays out.
  */
-export function injectCommentBridge(html: string, nonce: string, runtimeUrl?: string): string {
-  const prepared = prepareHtmlPreviewDoc(html);
-  if (runtimeUrl) return injectBeforeClose(prepared, buildBridgeScript(nonce, runtimeUrl));
+export function injectCommentBridge(
+  html: string,
+  nonce: string,
+  runtimeUrl?: string,
+  restoreScrollTop = 0,
+): string {
+  let prepared = prepareHtmlPreviewDoc(html);
+  const restoring = Number.isFinite(restoreScrollTop) && restoreScrollTop > 0;
+  if (restoring) {
+    const headStart = Math.max(startTagEnd(prepared, "head"), 0);
+    prepared = prepared.slice(0, headStart) + restoreHideStyle(nonce) + prepared.slice(headStart);
+  }
+  const restore = restoring
+    ? ` data-omni-restore-scroll="${escapeHtmlAttr(JSON.stringify({ top: restoreScrollTop, budgetMs: SCROLL_RESTORE_BUDGET_MS }))}"`
+    : "";
+  const bridge = buildBridgeScript(nonce, runtimeUrl).replace(
+    " data-omni-nonce",
+    `${restore} data-omni-nonce`,
+  );
+  if (runtimeUrl) return injectBeforeClose(prepared, bridge);
 
   // prepareHtmlPreviewDoc leaves a real <head> unless the input is a bare
   // fragment, whose implicit head starts at offset 0.
-  const headAt = Math.max(startTagEnd(prepared, "head"), 0);
+  const headAt =
+    Math.max(startTagEnd(prepared, "head"), 0) + (restoring ? restoreHideStyle(nonce).length : 0);
   const withCapture =
     prepared.slice(0, headAt) + buildCaptureScript(nonce) + prepared.slice(headAt);
-  return injectBeforeClose(withCapture, buildBridgeScript(nonce) + buildAnnotateScript(nonce));
+  return injectBeforeClose(withCapture, bridge + buildAnnotateScript(nonce));
 }
 
 function injectBeforeClose(doc: string, inject: string): string {

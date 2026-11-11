@@ -11,8 +11,17 @@
 // without importing the block dispatcher that renders them.
 
 import type React from "react";
+import { useInRouterContext } from "react-router-dom";
+import { Link } from "@/lib/routing";
 import { useMemo } from "react";
-import { CopyIcon, GitPullRequestIcon } from "lucide-react";
+import {
+  BotIcon,
+  CopyIcon,
+  FileTextIcon,
+  FolderIcon,
+  GitPullRequestIcon,
+  MessageSquareIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
@@ -38,9 +47,11 @@ import { copyText } from "@/lib/clipboard";
 import { absoluteWorkspacePath } from "@/lib/composerContext";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
+import { parseMentionPillTitle } from "@/lib/mentionPills";
 import {
   useFileViewer,
   useFileViewerConversationId,
+  useFolderOpener,
   useIsChangedPath,
   useWorkspacePaths,
 } from "@/shell/FileViewerContext";
@@ -63,9 +74,9 @@ type WithHastNode<T> = T & { node?: unknown };
 /** What the chat renderers know about a cited path's openability. */
 interface WorkspaceFileOpener {
   /**
-   * Click handler opening the file in the FileViewer, or null when the text
-   * isn't an openable file (no FileViewer, unresolvable path, or no such
-   * file).
+   * Click handler opening the file in the FileViewer (or an explicitly linked
+   * folder in the Files tree), or null when the text isn't openable (no
+   * FileViewer, unresolvable path, or no such file).
    */
   open: (() => void) | null;
   /**
@@ -95,6 +106,8 @@ interface WorkspaceFileOpener {
   reveal: (() => void) | null;
   /** Clipboard path: host-absolute when the root is known, else the cited path. */
   copyPath: string;
+  /** True when `open` shows a folder in the Files tree rather than a file. */
+  isFolder: boolean;
 }
 
 /**
@@ -104,6 +117,7 @@ interface WorkspaceFileOpener {
  */
 function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFileOpener {
   const openFile = useFileViewer();
+  const openFolder = useFolderOpener();
   const isChangedPath = useIsChangedPath();
   const conversationId = useFileViewerConversationId();
   const { root, home } = useWorkspacePaths();
@@ -134,7 +148,7 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
   // workspace-relative); an outside-workspace absolute is never a change.
   const isChanged = !!linkPath && !linkPath.startsWith("/") && isChangedPath(linkPath);
   // Explicit links also verify basenames; inline code keeps its path heuristic.
-  const { exists, settled } = useWorkspaceFileExists(
+  const { exists, isDirectory, settled } = useWorkspaceFileExists(
     conversationId,
     openFile && linkPath && !isChanged ? linkPath : null,
     explicitLink || (resolution?.trusted ?? false) || isVideoFile(cited),
@@ -151,6 +165,22 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
               })
       : null;
 
+  // Only explicit links open folders; the Files tree navigates by host-absolute path.
+  if (openFolder && explicitLink && isDirectory && linkPath && copyPath.startsWith("/")) {
+    return {
+      open: () => openFolder(copyPath),
+      unopenable: false,
+      resolvedPath: linkPath,
+      hasFileViewer: !!openFile,
+      linkPath,
+      parentDir,
+      pathShaped,
+      reveal: () => openFolder(copyPath),
+      copyPath,
+      isFolder: true,
+    };
+  }
+
   if (!openFile || !linkPath || !(isChanged || exists)) {
     // An absolute / "~"-relative citation is unjudgeable until the workspace
     // root is known — resolution returning null then means "not yet", not
@@ -162,7 +192,8 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
       // be noise; with one, a hard-rejected resolution is final immediately
       // and a resolved path is final once its existence check settles with a
       // completed listing (skipped/pending/errored checks stay unverified).
-      unopenable: !!openFile && !rootPending && (linkPath === null || (settled && !exists)),
+      unopenable:
+        !!openFile && !rootPending && (linkPath === null || (settled && !exists && !isDirectory)),
       resolvedPath: linkPath ?? "",
       hasFileViewer: !!openFile,
       linkPath,
@@ -170,6 +201,7 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
       pathShaped,
       reveal: openResolved,
       copyPath,
+      isFolder: false,
     };
   }
   return {
@@ -182,6 +214,7 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
     pathShaped,
     reveal: openResolved,
     copyPath,
+    isFolder: false,
   };
 }
 
@@ -393,6 +426,7 @@ function WorkspaceFileLink({
     unopenable,
     resolvedPath,
     copyPath,
+    isFolder,
   } = useWorkspaceFileOpener(path, true);
   // Scopes the desktop in-app browser route to this conversation's view.
   const conversationId = useFileViewerConversationId();
@@ -483,8 +517,8 @@ function WorkspaceFileLink({
         </FileLinkContextMenu>
       );
     }
-    // Not verified yet (existence check still in flight, or it can't run):
-    // plain text, with the path on hover so it stays discoverable.
+    // Not verified yet (existence check still in flight, or it can't run), or
+    // a folder with no Files tree to show it: plain text, with the path on hover.
     return (
       <FileLinkContextMenu path={copyPath}>
         <span className={className} title={title ?? path}>
@@ -494,7 +528,7 @@ function WorkspaceFileLink({
     );
   }
 
-  if (conversationId && isVideoFile(resolvedPath)) {
+  if (conversationId && !isFolder && isVideoFile(resolvedPath)) {
     return (
       <VideoPlayer
         compact
@@ -598,10 +632,128 @@ function ZoomableMarkdownImage({
 
 // Stable module-level override map so MessageResponse's shallow prop compare
 // never sees a new `components` identity and re-parses needlessly.
+/** Same pink as the composer's mention tokens, so a tag looks alike before and after send. */
+const MENTION_PILL_CLASS =
+  "inline-flex max-w-full items-center gap-1 rounded-[4px] bg-brand-accent/10 px-1 align-baseline text-[0.95em] leading-snug text-brand-accent no-underline ring-2 ring-brand-accent/10 hover:bg-brand-accent/20";
+
+/** A tagged file in a sent message; opens it like a workspace file link. */
+function FileMentionPill({
+  path,
+  isDir,
+  lineSpan,
+  children,
+}: {
+  path: string;
+  isDir: boolean;
+  lineSpan?: string;
+  children: React.ReactNode;
+}) {
+  const { open } = useWorkspaceFileOpener(path, true);
+  const Icon = isDir ? FolderIcon : FileTextIcon;
+  return (
+    <button
+      type="button"
+      data-testid="mention-pill"
+      className={MENTION_PILL_CLASS}
+      // Disabled until the existence check says how to open the path.
+      aria-disabled={open ? undefined : true}
+      // The label can truncate; the hover title keeps the full path and line span.
+      title={lineSpan ? `${path}:${lineSpan}` : path}
+      onClick={(event) => {
+        event.stopPropagation();
+        open?.();
+      }}
+    >
+      <Icon className="size-3 shrink-0" />
+      <span className="truncate">{children}</span>
+    </button>
+  );
+}
+
+/** Links rendered as mention pills when their title carries the mention sentinel. */
+function MarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) {
+  const target = parseMentionPillTitle(props.title);
+  if (!target) return <WorkspaceFileLink {...props} />;
+  if (target.kind === "file") {
+    return (
+      <FileMentionPill path={target.path} isDir={target.isDir} lineSpan={target.lineSpan}>
+        {props.children}
+      </FileMentionPill>
+    );
+  }
+  return (
+    <SessionMentionPill id={target.id} isSubagent={target.isSubagent}>
+      {props.children}
+    </SessionMentionPill>
+  );
+}
+
+interface SessionMentionPillProps {
+  id: string;
+  isSubagent: boolean;
+  children: React.ReactNode;
+}
+
+/** A session pill (e.g. ``@Fix CI``) that opens session ``id`` without reloading the page. */
+export function SessionMentionPill(props: SessionMentionPillProps) {
+  // Markdown also renders outside the router (stories, embeds); there the href navigates.
+  return useInRouterContext() ? (
+    <RoutedSessionMentionPill {...props} />
+  ) : (
+    <SessionPillLink {...props} />
+  );
+}
+
+// The routing seam's Link rebases the href under an embed's mount, routes plain
+// clicks in-app and leaves modified clicks (new tab) to the browser.
+function RoutedSessionMentionPill({ id, isSubagent, children }: SessionMentionPillProps) {
+  return (
+    <Link
+      to={`/c/${encodeURIComponent(id)}`}
+      data-testid="mention-pill"
+      className={MENTION_PILL_CLASS}
+      title={isSubagent ? "Subagent" : "Session"}
+      onClick={(event) => event.stopPropagation()}
+    >
+      <SessionPillContent isSubagent={isSubagent}>{children}</SessionPillContent>
+    </Link>
+  );
+}
+
+function SessionPillLink({ id, isSubagent, children }: SessionMentionPillProps) {
+  return (
+    <a
+      data-testid="mention-pill"
+      href={withBasePath(`/c/${encodeURIComponent(id)}`)}
+      className={MENTION_PILL_CLASS}
+      title={isSubagent ? "Subagent" : "Session"}
+      onClick={(event) => event.stopPropagation()}
+    >
+      <SessionPillContent isSubagent={isSubagent}>{children}</SessionPillContent>
+    </a>
+  );
+}
+
+function SessionPillContent({
+  isSubagent,
+  children,
+}: {
+  isSubagent: boolean;
+  children: React.ReactNode;
+}) {
+  const Icon = isSubagent ? BotIcon : MessageSquareIcon;
+  return (
+    <>
+      <Icon className="size-3 shrink-0" />
+      <span className="truncate">{children}</span>
+    </>
+  );
+}
+
 const FILE_PATH_AWARE_COMPONENTS = {
   inlineCode: WorkspacePathInlineCode,
   img: ZoomableMarkdownImage,
-  a: WorkspaceFileLink,
+  a: MarkdownLink,
 };
 
 // How often the live (growing) assistant bubble re-parses its markdown. The
@@ -665,11 +817,16 @@ function isPathologicalText(text: string): boolean {
  * break opportunity inside an otherwise unbreakable token. Over-long payloads
  * are elided so the DOM node itself can't grow without bound.
  */
-function PlainTextFallback({ text }: { text: string }) {
+function PlainTextFallback({ text, className }: { text: string; className?: string }) {
   const truncated = text.length > MAX_PLAINTEXT_DISPLAY_LENGTH;
   const shown = truncated ? text.slice(0, MAX_PLAINTEXT_DISPLAY_LENGTH) : text;
   return (
-    <div className="whitespace-pre-wrap break-all font-mono text-sm">
+    <div
+      className={cn(
+        "plain-text-fallback whitespace-pre-wrap break-all font-mono text-sm",
+        className,
+      )}
+    >
       {shown}
       {truncated && (
         <span className="text-muted-foreground">
@@ -715,6 +872,7 @@ export function FilePathAwareMessageResponse({
   children,
   breaks = false,
   literalHtml = false,
+  isStreaming = false,
   ...props
 }: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
   const components = FILE_PATH_AWARE_COMPONENTS;
@@ -756,11 +914,18 @@ export function FilePathAwareMessageResponse({
     [isString, children],
   );
   if (pathological) {
-    return <PlainTextFallback text={children as string} />;
+    return <PlainTextFallback text={children as string} className={props.className} />;
   }
 
   return (
-    <MessageResponse {...props} components={components} remarkPlugins={remarkPlugins} markFileLinks>
+    <MessageResponse
+      {...props}
+      components={components}
+      remarkPlugins={remarkPlugins}
+      markFileLinks
+      // The shown text can trail the latest by one interval after the stream ends.
+      isStreaming={isStreaming || throttledText !== normalizedText}
+    >
       {isString ? throttledText : children}
     </MessageResponse>
   );

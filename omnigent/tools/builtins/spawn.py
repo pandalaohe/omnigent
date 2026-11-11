@@ -580,9 +580,11 @@ class SysSessionListTool(Tool):
       ``sys_session_send`` continues rather than spawns) and to grab each
       child's ``conversation_id`` for ``sys_session_get_history`` /
       ``sys_session_get_info`` / ``sys_session_close``.
-    - ``sessions`` — a **global** view of every session the caller can
-      access (bounded by the server's per-user permission model), each
-      with its status and runner connectivity. An optional
+    - ``sessions`` — a **global** view of the caller's own sessions
+      (``visibility="mine"``, the UI sidebar's default), each with its
+      status and runner connectivity. ``visibility="shared"`` lists
+      sessions other users shared with the caller instead, and ``"all"``
+      lists both; those rows carry ``owner``. An optional
       ``agent_name`` filter narrows this list. This powers
       orchestration: discovering sessions to inspect
       (``sys_agent_get`` / ``sys_session_get_info``) or drive
@@ -610,17 +612,15 @@ class SysSessionListTool(Tool):
             "(agent, title) children under this conversation (and your "
             "parent/siblings) — use their conversation_id to read "
             "history, get info, or close. 'sessions': a global list of "
-            "every session "
-            "you can access, each with status + runner connectivity, "
-            "project, workspace, creation-origin session id, last activity time "
-            "and a last-message "
-            "excerpt, "
-            "for orchestration (inspect via sys_agent_get / "
-            "sys_session_get_info, read the full transcript via "
-            "sys_session_get_history, or drive via sys_session_send by "
-            "session_id). Pass agent_name to filter the global list to "
-            "sessions running that agent. Pass archived='include' or "
-            "'only' to surface archived sessions in the global list. Calls "
+            "the sessions you own (visibility 'mine', the default), each with status, "
+            "runner connectivity, creation-origin session id, project, workspace, "
+            "last activity time and a last-message excerpt. Pass visibility 'shared' "
+            "for sessions other users shared with you, or 'all' for both; those rows "
+            "carry owner. Inspect via sys_agent_get / sys_session_get_info; read "
+            "transcripts via sys_session_get_history or drive via sys_session_send "
+            "by session_id. Pass agent_name to filter the global list, and "
+            "archived='include' or 'only' to include or select archived sessions. "
+            "include_archived remains an alias for archived='include'. Calls "
             "without pagination keep "
             "the complete result while it fits the tool-output budget; "
             "larger global session lists return a page with has_more "
@@ -651,6 +651,24 @@ class SysSessionListTool(Tool):
                                 "list to sessions whose bound agent has "
                                 "this name, e.g. 'researcher'. Does not "
                                 "affect the 'sub_agents' view."
+                            ),
+                        },
+                        "visibility": {
+                            "type": "string",
+                            "enum": ["mine", "shared", "all"],
+                            "description": (
+                                "Optional: which sessions the global 'sessions' "
+                                "view covers. 'mine' (default): sessions you own. "
+                                "'shared': sessions other users shared with you. "
+                                "'all': both. Does not affect 'sub_agents'."
+                            ),
+                        },
+                        "include_archived": {
+                            "type": "boolean",
+                            "description": (
+                                "Optional: also list archived sessions in the "
+                                "global 'sessions' view; each row then carries "
+                                "'archived'. Defaults to false."
                             ),
                         },
                         "limit": {
@@ -1053,7 +1071,7 @@ class SysSessionCreateTool(Tool):
     The default placement forces ``parent_session_id`` to the caller.
     A child inherits the caller's runner and starts when a message is queued.
     With ``agent_id``, independent placements use the server's orchestration
-    gate and create private top-level sessions without completion forwarding.
+    gate and create private sibling sessions without completion forwarding.
 
     Two optional addressing modes — at most one of ``agent_id`` or
     ``config_path``; with neither the child launches the parent
@@ -1115,12 +1133,15 @@ class SysSessionCreateTool(Tool):
             "for an agent that already exists — never download and "
             "re-upload its bundle. Optionally queue an initial user "
             "message. By default the new session is a child of the caller. "
-            "With agent_id, placement='same_host' creates an independent private session "
-            "on the caller's host/workspace; placement='managed' provisions a new sandbox "
-            "using the server's configured default provider. Managed creation requires a "
+            "With agent_id, placement='same_host' creates a private independent session "
+            "on the caller's host/workspace; placement='managed' creates one on a new sandbox "
+            "using the server's configured default provider. These sessions are grouped as "
+            "nested agents when enabled on the server; otherwise they appear at the top level. "
+            "Managed creation requires a "
             "configured sandbox provider; use same_host for an existing connected host. "
             "These placements require orchestration enabled "
-            "and a private sending session, including its side-chat source chain. "
+            "and a sending session that is private or shared read-only, including its "
+            "side-chat source chain. "
             "An independent worker's optional "
             "first message must contain 1–8000 characters. "
             "Independent sessions do not forward replies: "
@@ -1179,8 +1200,25 @@ class SysSessionCreateTool(Tool):
                             "enum": ["child", "same_host", "managed"],
                             "description": (
                                 "Default child; same_host or managed launches a private "
-                                "top-level session (agent_id only)."
+                                "independent session (agent_id only), grouped in this family "
+                                "when nested agents are enabled."
                             ),
+                        },
+                        "sandbox_provider": {
+                            "type": "string",
+                            "description": "Optional provider for placement='managed'.",
+                        },
+                        "sandbox_profile_id": {
+                            "type": "string",
+                            "description": (
+                                "Authorized profile ID for placement='managed', required by "
+                                "providers that manage profiles. Use a selection supplied by "
+                                "the user or discovered through GET /v1/sandbox-profiles."
+                            ),
+                        },
+                        "sandbox_profile_revision": {
+                            "type": "string",
+                            "description": "Expected catalog revision of sandbox_profile_id.",
                         },
                         "agent_id": {
                             "type": "string",

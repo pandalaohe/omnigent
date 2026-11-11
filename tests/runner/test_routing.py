@@ -86,11 +86,12 @@ def _conversation(
     )
 
 
-def _hello(*, harnesses: list[str]) -> HelloFrame:
+def _hello(*, harnesses: list[str], capabilities: list[str] | None = None) -> HelloFrame:
     """
     Build a runner hello frame.
 
     :param harnesses: Harness kinds advertised by the runner.
+    :param capabilities: Capability tokens advertised by the runner.
     :returns: A :class:`HelloFrame`.
     """
     return HelloFrame(
@@ -98,6 +99,7 @@ def _hello(*, harnesses: list[str]) -> HelloFrame:
         frame_protocol_version=1,
         harnesses=harnesses,
         envs=["os_sandbox"],
+        capabilities=capabilities or [],
     )
 
 
@@ -218,6 +220,23 @@ async def test_runner_capability_uses_current_live_hello() -> None:
         assert registry.get("runner_one") is not None
         registry.deregister("runner_one")
         assert not router.runner_has_capability("runner_one", "sdk_peer_receipts_v1")
+    finally:
+        await router.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runner_router_reports_advertised_capabilities() -> None:
+    """Only a connected runner that advertised the token has the capability."""
+    registry = TunnelRegistry()
+    registry.register(
+        "runner_new", _FakeWebSocket(), _hello(harnesses=["codex"], capabilities=["feature_x"])
+    )
+    registry.register("runner_old", _FakeWebSocket(), _hello(harnesses=["codex"]))
+    router = RunnerRouter(registry=registry, conversation_store=_ConversationStore({}))  # type: ignore[arg-type]
+    try:
+        assert router.runner_has_capability("runner_new", "feature_x") is True
+        assert router.runner_has_capability("runner_old", "feature_x") is False
+        assert router.runner_has_capability("runner_offline", "feature_x") is False
     finally:
         await router.aclose()
 

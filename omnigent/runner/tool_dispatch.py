@@ -32,7 +32,7 @@ import tempfile
 import time
 import uuid
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -69,8 +69,10 @@ from omnigent.models.model_override import (
     validate_model_override,
 )
 from omnigent.native.native_coding_agents import public_agent_name
+from omnigent.policies.builtins.safety import scheduled_task_review_error
 from omnigent.runner import flows
 from omnigent.runner.flows import FLOW_TOOL_NAMES
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.server.session_open_rate import (
     CREATE_ORIGIN_AGENT,
@@ -100,7 +102,11 @@ from omnigent.tools.builtins.os_env import (
 from omnigent.tools.builtins.panel import OpenInPanelTool
 from omnigent.tools.builtins.session_archive import SysSessionArchiveTool, SysSessionUnarchiveTool
 from omnigent.tools.builtins.session_handover import SysSessionHandoverTool
-from omnigent.tools.builtins.session_message import SysSessionMessageTool
+from omnigent.tools.builtins.session_message import (
+    SysSessionMessageTool,
+    peer_session_messaging_enabled,
+)
+from omnigent.tools.builtins.session_projects import SysProjectListTool, SysSessionUpdateTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -134,6 +140,7 @@ from omnigent.tools.builtins.timer import (
 from omnigent.tools.builtins.ui import OpenFileRequest, UiOpenFileTool
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
+from omnigent.util.reasoning_effort import validate_effort_for_harness
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
@@ -144,6 +151,8 @@ from omnigent.util.session_lifecycle import (
 _logger = logging.getLogger(__name__)
 
 _EventPublisher = Callable[[str, _JsonObject], None]
+# (session_id, handle_id, tool_name, status) once a background result is in the inbox.
+AsyncResultWake = Callable[[str, str, str, str], None]
 
 
 class _UnsetLocalToolWorkdir:
@@ -421,6 +430,8 @@ _SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name(), SysSessionHa
 # Priority 5f.0b: Archive / unarchive any session the user owns, over the same
 # owner-gated PATCH /v1/sessions/{id} the web archive uses.
 _SESSION_ARCHIVE_TOOLS = frozenset({SysSessionArchiveTool.name(), SysSessionUnarchiveTool.name()})
+# Project listing and moves proxy the sidebar's owner-gated REST endpoints.
+_PROJECT_TOOLS = frozenset({SysProjectListTool.name(), SysSessionUpdateTool.name()})
 _UI_TOOLS = frozenset({UiOpenFileTool.name()})
 
 # The title bound the rename tool advertises to the LLM — read once from the
@@ -523,13 +534,13 @@ _COMMENT_TOOLS = frozenset(
     }
 )
 
-# Priority 5k: Agent-management reads — sys_agent_get / sys_agent_download /
+# Priority 5k: Agent-management tools — sys_agent_get / sys_agent_download /
 # sys_agent_list. The runner has no in-process AgentStore/ArtifactStore, so
 # these proxy the Omnigent server's REST endpoints (GET /v1/sessions/{id}/agent,
 # .../agent/contents, GET /v1/agents, GET /v1/sessions) over server_client.
-# sys_agent_download writes the bundle bytes into the agent's local os_env
-# cwd so sys_os_* can read it; sys_agent_list also scans that cwd for
-# locally-authored configs.
+# sys_agent_download returns a redacted bundle for READ callers and writes it into the
+# agent's local os_env cwd so sys_os_* can read it; sys_agent_list also
+# scans that cwd for locally-authored configs.
 _AGENT_TOOLS = frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list"})
 
 # Priority 5l: Policy management — sys_add_policy.
@@ -613,6 +624,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
     | _SESSION_ARCHIVE_TOOLS
+    | _PROJECT_TOOLS
     | _UI_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
@@ -782,6 +794,8 @@ def build_native_relay_tool_schemas(
             SysSessionRenameTool,
             SysSessionHandoverTool,
             SysSessionMessageTool,
+            SysProjectListTool,
+            SysSessionUpdateTool,
             UiOpenFileTool,
             SysAgentGetTool,
             SysAgentListTool,
@@ -791,6 +805,8 @@ def build_native_relay_tool_schemas(
             OpenInPanelTool,
             AskUserAsyncTool,
         ):
+            if _cls is SysSessionMessageTool and not peer_session_messaging_enabled():
+                continue
             fallback_schema = _string_object_dict(_cls().get_schema())
             if fallback_schema is None:
                 continue
@@ -867,6 +883,11 @@ _AGENT_LIST_PAGE_LIMIT = 1000
 _RUNNER_ONLINE_SIZING_PLACEHOLDER = False
 # Max concurrent ``GET /v1/runners/{id}/status`` lookups per ``sys_session_list``.
 _RUNNER_STATUS_CONCURRENCY = 8
+# ``sys_session_list`` ownership scopes, forwarded as ``GET /v1/sessions``'s
+# ``visibility``. The default matches the UI sidebar: an agent reasoning over
+# "its" sessions must not pick up sessions other users shared with the caller.
+_SESSION_LIST_DEFAULT_VISIBILITY = "mine"
+_SESSION_LIST_VISIBILITIES = ("mine", "shared", "all")
 
 _DISCOVERY_LIST_MAX_LIMIT = 100
 # Match the existing default ceiling for ``sys_os_shell`` output. Discovery
@@ -1119,6 +1140,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
     | _SESSION_ARCHIVE_TOOLS
+    | _PROJECT_TOOLS
     | _UI_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
@@ -2597,36 +2619,6 @@ def _subagent_reasoning_effort_from_args(args: _JsonObject) -> str | None:
     if not isinstance(raw_effort, str) or not raw_effort:
         raise ValueError("'reasoning_effort' must be a non-empty string when provided")
     return raw_effort
-
-
-def _validate_subagent_reasoning_effort(effort: str, harness: str | None) -> str:
-    """
-    Validate *effort* against the child harness's declared effort family.
-
-    A harness whose family is ``NONE`` has no effort plumbing, and an
-    unrecognized one cannot be checked at all — the caller asked for this
-    explicitly, so reject rather than accept-and-drop. (Delivery of a
-    persisted effort takes the opposite tack and filters quietly; see the
-    reasoning guard in :mod:`omnigent.runner.app`.)
-
-    :param effort: Requested effort, e.g. ``"high"``.
-    :param harness: Resolved child harness, e.g. ``"claude-native"``.
-    :returns: The canonical effort that harness accepts.
-    :raises ValueError: If the harness supports no effort override, or
-        the value falls outside its vocabulary.
-    """
-    from omnigent.util.reasoning_effort import efforts_for_harness, validate_effort
-
-    canonical = canonicalize_harness(harness) if harness is not None else None
-    supported = efforts_for_harness(harness)
-    if not supported:
-        raise ValueError(
-            f"harness {canonical or harness or 'unknown'!r} does not support "
-            "a reasoning-effort override"
-        )
-    validated = validate_effort(effort, canonical or harness or "unknown", supported)
-    assert validated is not None
-    return validated
 
 
 def _subagent_file_ids_from_args(args: _JsonObject) -> list[str]:
@@ -4151,7 +4143,7 @@ async def _execute_subagent_tool(
                 effort_source = f"sub-agent {sub_agent_name!r} spec"
         if effective_effort is not None:
             try:
-                create_body["reasoning_effort"] = _validate_subagent_reasoning_effort(
+                create_body["reasoning_effort"] = validate_effort_for_harness(
                     effective_effort,
                     child_harness,
                 )
@@ -5450,6 +5442,38 @@ async def _post_child_message_recovering(
     )
 
 
+# The created session exists, and a transport error can hide whether its
+# first task was accepted, so a blind retry could duplicate the work.
+_UNCONFIRMED_FIRST_TASK_GUIDANCE = (
+    "inspect this session before continuing. Do not create a replacement; "
+    "do not automatically resend the task."
+)
+
+# sys_session_create argument -> session-create field, shared by the JSON
+# (agent_id) and multipart (config_path) creates so neither drops one.
+_SESSION_CREATE_FIELDS = (
+    ("title", "title"),
+    ("model", "model_override"),
+    ("reasoning_effort", "reasoning_effort"),
+)
+
+
+def _session_create_fields(args: Mapping[str, object]) -> _JsonObject:
+    """
+    Map ``sys_session_create`` arguments to the per-session create fields.
+
+    :param args: Tool arguments, e.g. ``{"model": "databricks-glm-5-2"}``.
+    :returns: The non-empty string fields under their create names, e.g.
+        ``{"model_override": "databricks-glm-5-2"}``.
+    """
+    fields: _JsonObject = {}
+    for arg_name, field_name in _SESSION_CREATE_FIELDS:
+        value = args.get(arg_name)
+        if isinstance(value, str) and value:
+            fields[field_name] = value
+    return fields
+
+
 def _build_session_create_body(
     agent_id: str | None,
     conversation_id: str,
@@ -5494,15 +5518,12 @@ def _build_session_create_body(
     """
     body: _JsonObject = {
         "parent_session_id": conversation_id,
+        **_session_create_fields(
+            {"title": title, "model": model, "reasoning_effort": reasoning_effort}
+        ),
     }
     if isinstance(agent_id, str) and agent_id:
         body["agent_id"] = agent_id
-    if isinstance(title, str) and title:
-        body["title"] = title
-    if isinstance(model, str) and model:
-        body["model_override"] = model
-    if isinstance(reasoning_effort, str) and reasoning_effort:
-        body["reasoning_effort"] = reasoning_effort
     if speed is not None:
         body["labels"] = {"omnigent.speed_tier": speed}
     if placement is not None:
@@ -5631,6 +5652,8 @@ async def _complete_created_session(
     :param agent_id: The launched agent id, e.g. ``"ag_abc123"``, or the
         server-resolved default.
     :param title: The caller-supplied title (or non-str when absent).
+    :param message: The caller-supplied first message (or non-str when absent).
+    :param server_client: HTTP client pointed at the Omnigent server.
     :param publish_event: Callback that enqueues an SSE event on the
         caller's outbound queue; ``None`` for in-process callers.
     :param message: Optional first user message to post.
@@ -5795,6 +5818,9 @@ async def _complete_created_session(
                 "error": "child_registration_failed",
                 "detail": registration_error,
             }
+
+    if initial_message is not None and initial_message.get("status") in {"failed", "pending"}:
+        initial_message["guidance"] = _UNCONFIRMED_FIRST_TASK_GUIDANCE
 
     evt = SessionCreatedEvent(
         type="session.created",
@@ -6046,8 +6072,10 @@ async def _execute_session_create_impl(
 
     The default placement forces ``parent_session_id`` to the caller.
     Independent placements use the server's gated orchestration endpoint.
-    A child inherits the caller's runner (server-side affinity), so a
-    queued initial message starts a turn immediately. Returns a handle
+    A child inherits the caller's runner (server-side affinity), so an
+    initial message starts a turn immediately; it is sent like a by-id
+    ``sys_session_send``, so the child's completion reaches the caller's
+    inbox and wakes it. Returns a handle
     the orchestrator can monitor (``sys_session_get_history`` /
     ``sys_session_get_info``) or drive (``sys_session_send`` by
     ``conversation_id``) — unlike named-mode send, it does NOT block on
@@ -6100,6 +6128,14 @@ async def _execute_session_create_impl(
     if placement_mode != "child" and has_config_path:
         return json.dumps({"error": "Independent sessions require agent_id"})
     message = args.get("message")
+    profile_fields = ("sandbox_provider", "sandbox_profile_id", "sandbox_profile_revision")
+    selection = {key: args[key] for key in profile_fields if args.get(key) is not None}
+    if selection and placement_mode != "managed":
+        return json.dumps({"error": "Sandbox profile selection requires placement='managed'"})
+    if any(not isinstance(value, str) or not value.strip() for value in selection.values()):
+        return json.dumps({"error": "Sandbox selection fields must be nonempty strings"})
+    if selection.get("sandbox_profile_revision") and not selection.get("sandbox_profile_id"):
+        return json.dumps({"error": "sandbox_profile_revision requires sandbox_profile_id"})
     if placement_mode != "child" and message is not None:
         if not isinstance(message, str) or not message.strip() or len(message) > 8000:
             return json.dumps({"error": "Provide an initial message of 1–8000 characters"})
@@ -6121,20 +6157,8 @@ async def _execute_session_create_impl(
                     ),
                 }
             )
-        # The multipart create carries only the config bundle, so an effort
-        # passed here would never reach the child. Refuse instead of dropping it.
         if args.get("speed") is not None:
             return json.dumps({"error": "speed requires an existing or default agent"})
-        if args.get("reasoning_effort") is not None:
-            return json.dumps(
-                {
-                    "error": (
-                        "sys_session_create 'reasoning_effort' is supported only "
-                        "with 'agent_id'; the 'config_path' create cannot carry "
-                        "it. Set the effort in the config you upload instead."
-                    )
-                }
-            )
         return await _session_create_from_config_path(
             str(config_path),
             args,
@@ -6196,6 +6220,7 @@ async def _execute_session_create_impl(
         headers[ORCHESTRATION_SOURCE_HEADER] = conversation_id
         if placement_mode == "managed":
             body["host_type"] = "managed"
+            body.update(selection)
             if message is not None:
                 body["initial_input"] = {
                     "type": "message",
@@ -6219,8 +6244,28 @@ async def _execute_session_create_impl(
 
             info = await server_client.get("/v1/info")
             info.raise_for_status()
+            info_data = info.json()
+            if (
+                info_data.get("sibling_sessions") is True
+                and info_data.get("sibling_session_destinations") == "current_host"
+            ):
+                return json.dumps(
+                    {
+                        "error": "Server policy only allows Add nested agent on the current host; "
+                        "no session was created."
+                    }
+                )
+            if selection.get("sandbox_profile_id"):
+                features = info_data.get("features") if isinstance(info_data, dict) else None
+                if not isinstance(features, dict) or features.get("sandbox_profiles") is not True:
+                    return json.dumps(
+                        {
+                            "error": "This server does not advertise sandbox profile support; "
+                            "no session was created."
+                        }
+                    )
             host_id = (
-                uuid.uuid4().hex if info.json().get("request_managed_sandbox_host_id") else None
+                uuid.uuid4().hex if info_data.get("request_managed_sandbox_host_id") else None
             )
             if host_id is not None:
                 body["host_id"] = host_id
@@ -6309,6 +6354,7 @@ async def _execute_session_create_impl(
         handle: dict[str, object] = {
             "conversation_id": data["id"],
             "kind": "default",
+            "family": data.get("family"),
             "status": data.get("status") or "created",
             "agent_id": data.get("agent_id") or agent_id,
             "title": data.get("title") or args.get("title"),
@@ -6331,9 +6377,7 @@ async def _execute_session_create_impl(
                 handle["status"] = "created_initial_message_failed"
                 handle["error"] = (
                     f"Session created, but its first task was refused or not confirmed "
-                    f"({initial_message['error']}); "
-                    "inspect this session before continuing. Do not create a replacement; "
-                    "do not automatically resend the task."
+                    f"({initial_message['error']}); {_UNCONFIRMED_FIRST_TASK_GUIDANCE}"
                 )
         return json.dumps(handle)
     return await _finalize_created_session(
@@ -6391,6 +6435,73 @@ def _bundle_local_agent_source(source: Path) -> bytes:
         return buf.getvalue()
 
 
+async def _bundle_model_override_unsupported(server_client: httpx.AsyncClient) -> str | None:
+    """
+    Refuse a config_path ``model`` the server cannot store.
+
+    Servers that predate ``session_bundle_model_override`` in ``GET /v1/info``
+    reject the field with a bare 400; name the cause instead, and never drop
+    the model, which would run the child on the bundle's own.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: ``None`` when the server accepts the field; a JSON error otherwise.
+    """
+    try:
+        info = await server_client.get("/v1/info", timeout=30.0)
+        info.raise_for_status()
+        supported = info.json().get("session_bundle_model_override") is True
+    except (httpx.HTTPError, ValueError) as exc:
+        return json.dumps({"error": f"sys_session_create could not check server support: {exc}"})
+    if supported:
+        return None
+    return json.dumps(
+        {
+            "error": "server_too_old",
+            "detail": (
+                "This server cannot set 'model' on a config_path child. Set "
+                "executor.model in the config, create the child by agent_id, "
+                "or upgrade the server."
+            ),
+        }
+    )
+
+
+def _config_path_effort_for_harness(bundle_bytes: bytes, effort: str) -> str:
+    """
+    Check a config_path ``reasoning_effort`` against the bundled child's harness.
+
+    A known harness with no effort plumbing, or an effort outside its
+    vocabulary, is refused instead of stored and dropped at every turn;
+    aliases fold to the harness's canonical value. A harness the registry
+    cannot classify (e.g. the runtime default) passes through, and launch
+    filters it. The check lives at the tool boundary, not the multipart
+    endpoint, so direct HTTP creates keep their shared-vocabulary rules.
+
+    :param bundle_bytes: The gzipped bundle about to be uploaded.
+    :param effort: The requested effort, e.g. ``"high"``.
+    :returns: The effort to send, e.g. ``"xhigh"`` for ``"ultra"`` on codex.
+    :raises ValueError: If the bundle's harness cannot use the effort.
+    """
+    from omnigent.models.model_catalog import spec_harness
+    from omnigent.spec import load
+    from omnigent.util.reasoning_effort import efforts_for_harness
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spec = load(
+                bundle_bytes,
+                dest=Path(tmpdir) / "agent",
+                expand_env=False,
+                enforce_handler_allowlist=True,
+            )
+    except Exception:  # noqa: BLE001 — the server reports an invalid bundle itself.
+        return effort
+    harness = spec_harness(spec)
+    if efforts_for_harness(harness) is None:
+        return effort
+    return validate_effort_for_harness(effort, harness)
+
+
 async def _upload_config_bundle(
     config_path: str,
     args: _JsonObject,
@@ -6412,7 +6523,8 @@ async def _upload_config_bundle(
     :param config_path: Caller-supplied path to the agent config YAML,
         agent directory, or ``.tar.gz`` bundle, relative to the os_env
         cwd, e.g. ``".omnigent/agent-configs/helper.yaml"``.
-    :param args: Parsed tool arguments; optional ``title``.
+    :param args: Parsed tool arguments; optional ``title``, ``model``
+        (sent as ``model_override``) and ``reasoning_effort``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The caller's session id — the forced parent.
     :param agent_spec: The calling agent's spec, for os_env resolution.
@@ -6440,10 +6552,25 @@ async def _upload_config_bundle(
     refusal = await _child_session_create_refusal(server_client, conversation_id)
     if refusal is not None:
         return refusal
-    metadata: _JsonObject = {"parent_session_id": conversation_id}
-    title = args.get("title")
-    if isinstance(title, str) and title:
-        metadata["title"] = title
+    for arg_name in ("model", "reasoning_effort"):
+        if args.get(arg_name) is not None and not isinstance(args.get(arg_name), str):
+            return json.dumps({"error": f"sys_session_create '{arg_name}' must be a string"})
+    metadata: _JsonObject = {
+        "parent_session_id": conversation_id,
+        **_session_create_fields(args),
+    }
+    effort = metadata.get("reasoning_effort")
+    if isinstance(effort, str):
+        try:
+            metadata["reasoning_effort"] = await asyncio.to_thread(
+                _config_path_effort_for_harness, bundle_bytes, effort
+            )
+        except ValueError as exc:
+            return json.dumps({"error": f"sys_session_create invalid 'reasoning_effort': {exc}"})
+    if "model_override" in metadata:
+        unsupported = await _bundle_model_override_unsupported(server_client)
+        if unsupported is not None:
+            return unsupported
     try:
         resp = await server_client.post(
             "/v1/sessions",
@@ -6499,8 +6626,8 @@ async def _session_create_from_config_path(
     :param config_path: Caller-supplied path to the agent config YAML,
         agent directory, or ``.tar.gz`` bundle, relative to the os_env
         cwd, e.g. ``".omnigent/agent-configs/helper.yaml"``.
-    :param args: Parsed tool arguments; optional ``title`` /
-        ``message``.
+    :param args: Parsed tool arguments; optional ``title``, ``message``,
+        ``model`` and ``reasoning_effort``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The caller's session id — the forced parent.
     :param publish_event: SSE publish callback for ``session.created``.
@@ -7858,36 +7985,15 @@ async def _project_id_for_name(server_client: httpx.AsyncClient, name: str) -> s
     """
     Return the id of the caller's project named *name*, creating it if missing.
 
-    Uses the projects API the web picker uses, so a typed name files sessions
-    and automations into the same project. A create that loses a race to the
-    same name (409) reuses the project the other request made.
-
     :param server_client: HTTP client pointed at the Omnigent server.
     :param name: The project name, e.g. ``"nightly triage"``.
     :returns: The project id.
     :raises ValueError: If the name is blank or the project can't be resolved.
     """
-    trimmed = name.strip()
-    if not trimmed:
-        raise ValueError("project_name must not be empty")
+    from omnigent.runner.session_projects import resolve_project_id
 
-    async def find() -> str | None:
-        resp = await server_client.get("/v1/projects", timeout=30.0)
-        if resp.status_code >= 400:
-            raise ValueError(f"could not list projects: {resp.text[:200]}")
-        projects = resp.json().get("data", [])
-        return next((p["id"] for p in projects if p.get("name") == trimmed), None)
-
-    existing = await find()
-    if existing is not None:
-        return existing
-    created = await server_client.post("/v1/projects", json={"name": trimmed}, timeout=30.0)
-    if created.status_code < 400:
-        return str(created.json()["id"])
-    racer = await find() if created.status_code == 409 else None
-    if racer is not None:
-        return racer
-    raise ValueError(f"could not create project {trimmed!r}: {created.text[:200]}")
+    project_id, _created = await resolve_project_id(server_client, name)
+    return project_id
 
 
 async def _execute_scheduled_task_tool(
@@ -7911,7 +8017,7 @@ async def _execute_scheduled_task_tool(
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         returns an error string.
     :param conversation_id: The calling session id, sent as
-        ``source_session_id`` on create so the server can inherit its project.
+        ``source_session_id`` with the agent-origin header as a legacy project hint.
     :returns: Tool output JSON string.
     """
     if server_client is None:
@@ -7920,6 +8026,13 @@ async def _execute_scheduled_task_tool(
         args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError:
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+    if not isinstance(args, dict):
+        return json.dumps({"error": f"{tool_name}: arguments must be an object"})
+    if tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update"):
+        action = "create" if tool_name == "sys_scheduled_task_create" else "update"
+        error = scheduled_task_review_error(args, action=action)
+        if error:
+            return json.dumps({"error": f"{tool_name}: {error}"})
     if "project_name" in args and "project_id" in args:
         return json.dumps({"error": f"{tool_name}: set project_id or project_name, not both"})
     raw_project_name = args.get("project_name")
@@ -7930,6 +8043,9 @@ async def _execute_scheduled_task_tool(
     project_name = raw_project_name if isinstance(raw_project_name, str) else None
     wants_project = tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update") and (
         "project_name" in args or "project_id" in args
+    )
+    mutation_headers = (
+        {ORCHESTRATION_SOURCE_HEADER: conversation_id} if conversation_id is not None else None
     )
 
     try:
@@ -7956,7 +8072,12 @@ async def _execute_scheduled_task_tool(
                 return refusal
             if project_name is not None:
                 payload["project_id"] = await _project_id_for_name(server_client, project_name)
-            resp = await server_client.post("/v1/scheduled-tasks", json=payload, timeout=30.0)
+            resp = await server_client.post(
+                "/v1/scheduled-tasks",
+                json=payload,
+                timeout=30.0,
+                headers={**(mutation_headers or {}), "x-omnigent-automation-source": "agent"},
+            )
         elif tool_name in ("sys_scheduled_task_update", "sys_scheduled_task_delete"):
             task_id = args.get("scheduled_task_id")
             if not task_id:
@@ -7986,7 +8107,9 @@ async def _execute_scheduled_task_tool(
                             server_client, project_name
                         )
                 if resp is None:
-                    resp = await server_client.patch(task_url, json=payload, timeout=30.0)
+                    resp = await server_client.patch(
+                        task_url, json=payload, headers=mutation_headers, timeout=30.0
+                    )
         else:  # pragma: no cover — routing guarantees a known name
             return json.dumps({"error": f"unknown scheduled-task tool {tool_name!r}"})
     except Exception as exc:  # noqa: BLE001
@@ -7994,7 +8117,7 @@ async def _execute_scheduled_task_tool(
 
     if resp.status_code >= 400:
         return json.dumps(
-            {"error": f"server returned {resp.status_code}", "details": resp.text[:500]}
+            {"error": f"server returned {resp.status_code}", "details": resp.text[:1000]}
         )
     return json.dumps(resp.json())
 
@@ -8216,19 +8339,28 @@ async def _execute_session_query_tool(
 
     if tool_name == "sys_session_list":
         agent_name = args.get("agent_name")
-        archived = args.get("archived", "exclude")
+        include_archived = args.get("include_archived") is True
+        archived = args.get("archived", "include" if include_archived else "exclude")
         if archived not in ("exclude", "include", "only"):
             return json.dumps(
                 {"error": "sys_session_list 'archived' must be one of exclude, include, only"}
             )
+        visibility = args.get("visibility", _SESSION_LIST_DEFAULT_VISIBILITY)
+        if visibility not in _SESSION_LIST_VISIBILITIES:
+            return json.dumps(
+                {
+                    "error": (
+                        "sys_session_list: visibility must be one of "
+                        + ", ".join(repr(v) for v in _SESSION_LIST_VISIBILITIES)
+                    )
+                }
+            )
+        include_archived = archived != "exclude"
         window = _discovery_list_window(
             args,
             tool_name,
             ("sessions",),
-            {
-                "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None,
-                "archived": archived,
-            },
+            _session_list_filters(agent_name, include_archived, visibility, archived),
         )
         if isinstance(window, str):
             return window
@@ -8237,6 +8369,8 @@ async def _execute_session_query_tool(
             conversation_id,
             server_client,
             agent_name,
+            include_archived=include_archived,
+            visibility=visibility,
             limit=limit,
             cursor_state=cursor_state,
             continued=continued,
@@ -8784,6 +8918,7 @@ async def _session_info_item(
         "runner_state_reason": runner_state_reason,
         "host_id": snap.get("host_id"),
         "parent_session_id": snap.get("parent_session_id"),
+        "family": snap.get("family"),
         "created_by_session_id": (_string_mapping(snap.get("labels")) or {}).get(
             CREATED_BY_SESSION_LABEL_KEY
         ),
@@ -9162,7 +9297,7 @@ async def _agent_download_via_rest(
     :param agent_spec: The running agent's spec, for os_env resolution.
     :param conversation_id: The caller's session id, for os_env cwd.
     :param runner_workspace: The runner workspace, authoritative cwd.
-    :returns: JSON ``{path, agent_name, agent_version, bytes_written}``,
+    :returns: JSON ``{path, agent_name, agent_version, bytes_written, redacted}``,
         or a JSON error object.
     """
     try:
@@ -9204,6 +9339,7 @@ async def _agent_download_via_rest(
             "agent_name": agent_name,
             "agent_version": agent_version,
             "bytes_written": len(resp.content),
+            "redacted": resp.headers.get("X-Agent-Bundle-Redacted") == "true",
         }
     )
 
@@ -9773,11 +9909,42 @@ def _project_agent_list(
     }
 
 
+def _session_list_filters(
+    agent_name: object,
+    include_archived: bool,
+    visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
+    archived: str = "exclude",
+) -> _JsonObject:
+    """
+    The ``sys_session_list`` filters a continuation cursor is bound to.
+
+    ``include_archived`` and a non-default ``visibility`` are recorded only
+    when set, so cursors issued before those arguments existed still match a
+    call that omits them.
+
+    :param agent_name: The caller's ``agent_name`` argument, e.g. ``"researcher"``.
+    :param include_archived: Whether archived sessions are listed.
+    :param visibility: Which sessions the global view covers, e.g. ``"mine"``.
+    :returns: The filter mapping, e.g. ``{"agent_name": None}``.
+    """
+    filters: _JsonObject = {
+        "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None,
+        "archived": archived,
+    }
+    if include_archived:
+        filters["include_archived"] = True
+    if visibility != _SESSION_LIST_DEFAULT_VISIBILITY:
+        filters["visibility"] = visibility
+    return filters
+
+
 async def _session_list_via_rest(
     conversation_id: str,
     server_client: httpx.AsyncClient,
     agent_name: object = None,
     *,
+    include_archived: bool = False,
+    visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
     limit: int | None,
     cursor_state: dict[str, _DiscoveryState],
     continued: bool,
@@ -9789,7 +9956,8 @@ async def _session_list_via_rest(
     ``sub_agents`` is the caller's named-sub-agent view (children, plus
     parent/siblings when the caller is itself a child) — see
     :func:`_collect_sub_agents`. ``sessions`` is the **global**,
-    permission-bounded list of every session the caller can access, each
+    permission-bounded list of the caller's own sessions (or, per
+    ``visibility``, those shared with them or both), each
     annotated with status + runner connectivity, optionally filtered by
     ``agent_name`` and by the archived view — see
     :func:`_collect_global_sessions`. Both are best-effort: a failure in
@@ -9800,6 +9968,9 @@ async def _session_list_via_rest(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter for the global
         ``sessions`` view; ignored for ``sub_agents``.
+    :param include_archived: Also list archived sessions in the global view.
+    :param visibility: ``"mine"``, ``"shared"`` or ``"all"`` — the server's
+        ownership filter for the global view.
     :param limit: Optional maximum rows returned from the global sessions view. When
         omitted, the complete legacy result is preserved while it fits.
     :param cursor_state: Opaque continuation position for the global sessions view.
@@ -9816,6 +9987,8 @@ async def _session_list_via_rest(
         else await _collect_global_sessions(
             server_client,
             agent_name,
+            include_archived=include_archived,
+            visibility=visibility,
             after=cursor_state["sessions"][1],
             limit=limit or _AGENT_LIST_PAGE_LIMIT,
             archived=archived,
@@ -9827,10 +10000,7 @@ async def _session_list_via_rest(
         cursor_state=cursor_state,
         continued=continued,
         tool_name="sys_session_list",
-        filters={
-            "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None,
-            "archived": archived,
-        },
+        filters=_session_list_filters(agent_name, include_archived, visibility, archived),
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
     )
@@ -10398,6 +10568,8 @@ async def _collect_global_sessions(
     server_client: httpx.AsyncClient,
     agent_name: object,
     *,
+    include_archived: bool = False,
+    visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
     after: str | None,
     limit: int,
     archived: str = "exclude",
@@ -10405,7 +10577,7 @@ async def _collect_global_sessions(
     """
     Fetch the global session list via ``GET /v1/sessions``.
 
-    Projects each accessible session to ``{session_id, agent_name, title,
+    Projects each listed session to ``{session_id, agent_name, title,
     status, runner_id, runner_online, parent_session_id, project_id,
     workspace, updated_at, last_message_preview, archived, archived_at}``.
     ``runner_online`` holds :data:`_RUNNER_ONLINE_SIZING_PLACEHOLDER` until
@@ -10414,9 +10586,19 @@ async def _collect_global_sessions(
     runner's request carries the owning user's identity). Best-effort:
     returns ``[]`` on a fetch failure.
 
+    An archive-inclusive ``mine``/``shared`` listing against a server that does
+    not advertise ``session_list_scoped_archives`` lists ``all`` and keeps the
+    rows whose ``owner`` matches the scope (see :func:`_session_row_in_scope`).
+    It fails closed when the caller's identity cannot be read.
+
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter; applied only when a
         non-empty string.
+    :param include_archived: Also return archived sessions, each marked
+        ``archived``.
+    :param visibility: The server's ownership filter. ``"mine"`` (the
+        sidebar's default) keeps other users' sessions out of an agent's
+        view; ``"shared"`` / ``"all"`` rows also carry ``owner``.
     :param after: Server cursor from the previous page, if any.
     :param limit: Maximum number of source rows to fetch.
     :param archived: ``"exclude"`` (default) lists live sessions only,
@@ -10424,18 +10606,32 @@ async def _collect_global_sessions(
         rows exclusively.
     :returns: Projected global session entries and continuation metadata.
     """
+    if archived == "exclude" and include_archived:
+        archived = "include"
+    include_archived = archived != "exclude"
+    server_visibility = "archived" if archived == "only" else visibility
+    scope_locally = False
+    viewer_id: str | None = None
+    if visibility != "all" and (
+        archived == "only"
+        or (include_archived and not await _server_scopes_archives(server_client))
+    ):
+        resolved, viewer_id = await _session_list_viewer(server_client)
+        if not resolved:
+            return _DiscoveryPage([], False, failed=True)
+        server_visibility = "archived" if archived == "only" else "all"
+        scope_locally = True
+        limit = _AGENT_LIST_PAGE_LIMIT
     params: dict[str, str | int] = {
         "limit": limit,
         "order": "desc",
-        "visibility": "all",
+        "visibility": server_visibility,
         "include_preview": 1,
     }
-    if archived == "include":
-        params["include_archived"] = "true"
-    elif archived == "only":
-        params["visibility"] = "archived"
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
+    if include_archived:
+        params["include_archived"] = "true"
     if after is not None:
         params["after"] = after
     try:
@@ -10452,6 +10648,8 @@ async def _collect_global_sessions(
     if page.failed:
         return page
     rows = page.rows
+    if scope_locally:
+        rows = [r for r in rows if _session_row_in_scope(r, viewer_id, visibility)]
     return _DiscoveryPage(
         [
             {
@@ -10473,8 +10671,18 @@ async def _collect_global_sessions(
                 "last_message_preview": r.get("last_message_preview"),
                 "archived": r.get("archived"),
                 "archived_at": r.get("archived_at"),
+                "family": r.get("family"),
                 "created_by_session_id": (_string_mapping(r.get("labels")) or {}).get(
                     CREATED_BY_SESSION_LABEL_KEY
+                ),
+                # Only an archive-inclusive listing can return archived rows.
+                **({"archived": r.get("archived") is True} if include_archived else {}),
+                # Every "mine" row is the caller's; elsewhere an agent must be
+                # able to tell another user's session from its own.
+                **(
+                    {"owner": r.get("owner")}
+                    if visibility != _SESSION_LIST_DEFAULT_VISIBILITY
+                    else {}
                 ),
             }
             for r in rows
@@ -10482,6 +10690,75 @@ async def _collect_global_sessions(
         page.has_more,
         page.next_after,
     )
+
+
+async def _server_scopes_archives(server_client: httpx.AsyncClient) -> bool:
+    """
+    Whether ``GET /v1/sessions`` applies ``include_archived`` to mine/shared.
+
+    Servers advertise it as ``session_list_scoped_archives`` in ``GET /v1/info``;
+    an unreadable info response counts as unsupported, which only costs the
+    slower local scoping in :func:`_collect_global_sessions`.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: ``True`` when the server scopes archive-inclusive listings itself.
+    """
+    try:
+        info = await server_client.get("/v1/info", timeout=30.0)
+        body = info.json() if info.status_code == 200 else None
+    except (httpx.HTTPError, ValueError):
+        return False
+    return isinstance(body, dict) and body.get("session_list_scoped_archives") is True
+
+
+async def _session_list_viewer(
+    server_client: httpx.AsyncClient,
+) -> tuple[bool, str | None]:
+    """
+    Resolve the caller's user id via ``GET /v1/me`` for local scoping.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: ``(True, user_id)`` on success, where ``user_id`` is ``None`` on
+        a server without authentication; ``(False, None)`` when the identity
+        cannot be read, so the caller fails closed instead of guessing.
+    """
+    try:
+        resp = await server_client.get("/v1/me", timeout=30.0)
+        body = resp.json() if resp.status_code == 200 else None
+    except (httpx.HTTPError, ValueError):
+        return False, None
+    # Only an explicit null means "no authentication"; a missing key is a
+    # malformed answer, and treating it as anonymous would let an admin's
+    # access to other users' sessions pass as ownership.
+    if not isinstance(body, dict) or "user_id" not in body:
+        return False, None
+    user_id = body["user_id"]
+    if user_id is not None and (not isinstance(user_id, str) or not user_id):
+        return False, None
+    return True, user_id
+
+
+def _session_row_in_scope(row: _JsonObject, viewer_id: str | None, visibility: str) -> bool:
+    """
+    Whether a ``visibility=all`` row belongs to the ``mine`` / ``shared`` scope.
+
+    Matches the server's own scoping: ``mine`` is an ownership grant held by the
+    viewer, and ``shared`` is everything else the viewer can access. Only the
+    row's ``owner`` counts, never ``permission_level``, because an admin's
+    elevated level does not make another user's session (or one whose owner was
+    deleted) theirs. A server without authentication has no ownership scopes
+    and lists every session for both.
+
+    :param row: One ``GET /v1/sessions?visibility=all`` row.
+    :param viewer_id: The caller's user id, or ``None`` when ``GET /v1/me``
+        reported an unauthenticated server.
+    :param visibility: ``"mine"`` or ``"shared"``.
+    :returns: ``True`` when the row is in the requested scope.
+    """
+    if viewer_id is None:
+        return True
+    owned = row.get("owner") == viewer_id
+    return owned if visibility == "mine" else not owned
 
 
 def _child_rows_to_entries(
@@ -10884,6 +11161,7 @@ async def execute_tool(
     filesystem_registry: FilesystemRegistry | None = None,
     effective_harness: str | None = None,
     skill_bundle_dir: Path | None = None,
+    wake_on_async_result: AsyncResultWake | None = None,
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -10913,6 +11191,9 @@ async def execute_tool(
         unconditional ``sys_os_*`` counts toward the granted surface.
     :param skill_bundle_dir: The session's bundle workdir, the skill
         registry's second discovery root.
+    :param wake_on_async_result: Callback a ``sys_call_async`` background
+        task invokes after queueing its completed or failed result, so the
+        runner can wake a session that is no longer in a turn.
     :returns: Tool output string.
     """
     if not arguments.strip():
@@ -11026,6 +11307,7 @@ async def execute_tool(
                 mcp_manager=mcp_manager,
                 filesystem_registry=filesystem_registry,
                 effective_harness=effective_harness,
+                wake_on_async_result=wake_on_async_result,
             )
         elif tool_name in _SUBAGENT_TOOLS:
             output = await _execute_subagent_tool(
@@ -11054,6 +11336,18 @@ async def execute_tool(
             from omnigent.runner.session_message import execute_message_tool
 
             output = await execute_message_tool(args, server_client, conversation_id)
+        elif tool_name in _PROJECT_TOOLS:
+            from omnigent.runner.session_projects import (
+                execute_project_list,
+                execute_session_update,
+            )
+
+            execute = (
+                execute_project_list
+                if tool_name == SysProjectListTool.name()
+                else execute_session_update
+            )
+            output = await execute(args, server_client, conversation_id)
         elif tool_name in _SESSION_CREATE_TOOLS:
             output = await _execute_session_create(
                 args,
@@ -11395,6 +11689,7 @@ async def dispatch_tool_locally(
     filesystem_registry: FilesystemRegistry | None = None,
     effective_harness: str | None = None,
     skill_bundle_dir: Path | None = None,
+    wake_on_async_result: AsyncResultWake | None = None,
 ) -> str:
     """Execute a tool once and POST its result to the harness.
 
@@ -11420,6 +11715,8 @@ async def dispatch_tool_locally(
         ``execute_tool`` for the granted-surface check.
     :param skill_bundle_dir: The session's bundle workdir, forwarded to
         ``execute_tool`` for the skill registry.
+    :param wake_on_async_result: Forwarded to ``execute_tool`` so a
+        ``sys_call_async`` result can wake the session after its turn ends.
     :returns: The tool output string.
     """
     if not conversation_id:
@@ -11448,6 +11745,7 @@ async def dispatch_tool_locally(
         publish_event=publish_event,
         effective_harness=effective_harness,
         skill_bundle_dir=skill_bundle_dir,
+        wake_on_async_result=wake_on_async_result,
     )
 
     # A file-mutating tool just ran — nudge the web to refetch the
@@ -11606,6 +11904,35 @@ def _effective_runner_os_env_spec(
     return OSEnvSpec(type="caller_process", cwd=cwd)
 
 
+async def _read_os_env_text(os_env: OSEnvironment, path: str) -> str | None:
+    """Return *path*'s complete UTF-8 text within the read cap, keeping its line endings.
+
+    A one-byte probe skips binary files before their content is read.
+
+    :param os_env: The :class:`~omnigent.inner.os_env.OSEnvironment` used for
+        the current tool dispatch — reused to avoid opening a second connection.
+    :param path: Path argument forwarded from the tool call, e.g. ``"src/foo.py"``.
+    :returns: The text, or ``None`` when the file is missing, binary, too large
+        to read whole, or unreadable.
+    """
+    from omnigent.runner.environment_filesystem import _MAX_READ_BYTES
+
+    try:
+        probe = await os_env.read(path=path, offset=1, limit=None, max_bytes=1)
+        if not isinstance(probe, dict) or probe.get("encoding") != "utf-8":
+            return None
+        existing = await os_env.read(path=path, offset=1, limit=None, max_bytes=_MAX_READ_BYTES)
+    except Exception:  # noqa: BLE001
+        return None  # file does not exist yet or unreadable
+    if (
+        isinstance(existing, dict)
+        and existing.get("encoding") == "utf-8"
+        and not existing.get("truncated")
+    ):
+        return cast("str", existing["content"])
+    return None
+
+
 async def _seed_os_env_snapshot(
     os_env: OSEnvironment,
     path: str,
@@ -11617,8 +11944,9 @@ async def _seed_os_env_snapshot(
     Reads the file via *os_env* and passes the content to
     :meth:`~omnigent.runtime.filesystem_registry.FilesystemRegistry.seed_snapshot`
     so the before/after diff endpoint can show the original content.
-    Silently skips when the file does not yet exist (new-file creates have no
-    baseline) or when any other read error occurs.
+    A file without complete text (see :func:`_read_os_env_text`) seeds no
+    snapshot and an unknown original, since a partial or binary original
+    cannot tell when a write restores it.
 
     :param os_env: The :class:`~omnigent.inner.os_env.OSEnvironment` used for
         the current tool dispatch — reused to avoid opening a second connection.
@@ -11626,14 +11954,8 @@ async def _seed_os_env_snapshot(
     :param filesystem_registry: Registry that stores the snapshot.
     :param conversation_id: Session scope for the snapshot, e.g. ``"conv_abc123"``.
     """
-    try:
-        existing = await os_env.read(path=path, offset=1, limit=None)
-        if isinstance(existing, dict) and "content" in existing:
-            filesystem_registry.seed_snapshot(
-                path, existing["content"], session_id=conversation_id
-            )
-    except Exception:  # noqa: BLE001
-        pass  # file does not exist yet or unreadable — no baseline to capture
+    original = await _read_os_env_text(os_env, path)
+    filesystem_registry.seed_snapshot(path, original, session_id=conversation_id)
 
 
 async def _execute_os_env_tool(
@@ -11725,7 +12047,9 @@ async def _execute_os_env_tool(
                 # previously exist, {"created": False} for an overwrite.
                 was_created = isinstance(result, dict) and result.get("created") is True
                 status = "created" if was_created else "modified"
-                filesystem_registry.record_change(_path, status, conversation_id)
+                await filesystem_registry.record_tracked_change(
+                    _path, status, conversation_id, lambda: _read_os_env_text(os_env, _path)
+                )
         elif tool_name == SysOsEditTool.name():
             _path = cast("str", args.get("path", ""))
             if filesystem_registry is not None and conversation_id is not None:
@@ -11737,7 +12061,9 @@ async def _execute_os_env_tool(
                 edits=cast("list[dict[str, str]] | None", args.get("edits")),
             )
             if filesystem_registry is not None and conversation_id is not None:
-                filesystem_registry.record_change(_path, "modified", conversation_id)
+                await filesystem_registry.record_tracked_change(
+                    _path, "modified", conversation_id, lambda: _read_os_env_text(os_env, _path)
+                )
         elif tool_name == SysOsShellTool.name():
             result = await os_env.shell(
                 command=cast("str", args.get("command", "")),
@@ -12305,6 +12631,7 @@ async def _execute_async_inbox_tool(
     filesystem_registry: FilesystemRegistry | None = None,
     harness_client: httpx.AsyncClient | None = None,
     effective_harness: str | None = None,
+    wake_on_async_result: AsyncResultWake | None = None,
 ) -> str:
     """
     Runner-local dispatch for async inbox tools.
@@ -12327,6 +12654,7 @@ async def _execute_async_inbox_tool(
     :param effective_harness: Harness the session actually runs, forwarded to
         ``_spawn_async_tool`` so the target is judged against the surface the
         session was advertised.
+    :param wake_on_async_result: Forwarded to ``_spawn_async_tool``.
     :returns: Tool output string.
     """
     del harness_client
@@ -12355,6 +12683,7 @@ async def _execute_async_inbox_tool(
             mcp_manager=mcp_manager,
             filesystem_registry=filesystem_registry,
             effective_harness=effective_harness,
+            wake_on_async_result=wake_on_async_result,
         )
 
     if tool_name == SysCancelAsyncTool.name():
@@ -12464,11 +12793,23 @@ def _format_async_task_item(payload: _JsonObject) -> str:
                 f"{retry.get('reason')})"
             )
         if status == "completed":
+            # A confirmed completion can overturn an optimistic cancellation the
+            # parent was already told about; note the correction so the earlier
+            # cancelled line is not read as a contradiction.
+            corrected = (
+                ", superseding its earlier cancelled notice"
+                if payload.get("corrected_status") == "cancelled"
+                else ""
+            )
             if not has_output:
                 return (
-                    f"[System: sub-agent task {handle_id} completed — {target} produced no output]"
+                    f"[System: sub-agent task {handle_id} completed — {target} "
+                    f"produced no output{corrected}]"
                 )
-            return f"[System: sub-agent task {handle_id} completed — {target} returned: {output}]"
+            return (
+                f"[System: sub-agent task {handle_id} completed — {target} "
+                f"returned: {output}{corrected}]"
+            )
         if status == "failed":
             return f"[System: sub-agent task {handle_id} failed — {target} error: {output}]"
         if status == "cancelled":
@@ -12952,13 +13293,15 @@ def _spawn_async_tool(
     filesystem_registry: FilesystemRegistry | None = None,
     local_tool_workdir: Path | _UnsetLocalToolWorkdir | None = _UNSET_LOCAL_TOOL_WORKDIR,
     effective_harness: str | None = None,
+    wake_on_async_result: AsyncResultWake | None = None,
 ) -> str:
     """
     Spawn a tool as a background asyncio.Task.
 
     Returns a handle immediately. On completion, the result is
     pushed to the session's inbox queue for ``sys_read_inbox``
-    to drain.
+    to drain, and a completed or failed result is reported through
+    ``wake_on_async_result`` so the runner can wake the session.
 
     :param args: Must contain ``"tool"`` (target tool name) and
         ``"args"`` (JSON string of target tool arguments).
@@ -12970,6 +13313,9 @@ def _spawn_async_tool(
         async terminal-tool launches.
     :param effective_harness: Harness the session actually runs, used to judge
         the target against the surface the session was advertised.
+    :param wake_on_async_result: Called with ``(session_id, handle_id,
+        tool_name, status)`` after a completed or failed result is queued.
+        Cancelled results are not reported: whoever cancelled is not waiting.
     :returns: JSON handle string with canonical ``handle_id``,
         plus compatibility ``task_id`` (identical value; remove in 0.8.0),
         ``tool_name``, ``status``, and ``message``. Prefer
@@ -13002,6 +13348,20 @@ def _spawn_async_tool(
     handle_id = f"handle_{uuid.uuid4().hex[:12]}"
     cancel_event = asyncio.Event()
 
+    def _report(status: str, output: str) -> None:
+        session_inbox.put_nowait(
+            {"handle_id": handle_id, "tool_name": target_tool, "status": status, "output": output}
+        )
+        if status == "cancelled" or conversation_id is None:
+            return
+        try:
+            if wake_on_async_result is not None:
+                wake_on_async_result(conversation_id, handle_id, target_tool, status)
+            else:
+                _notify_async_result(conversation_id, handle_id, target_tool, status)
+        except Exception:
+            _logger.exception("async tool %s result wake failed", target_tool)
+
     async def _bg() -> str:
         """
         Background task: dispatch the tool and push result to inbox.
@@ -13027,15 +13387,7 @@ def _spawn_async_tool(
                 )
                 if not allowed:
                     result = "[Result suppressed by policy: PHASE_TOOL_CALL denied]"
-                    session_inbox.put_nowait(
-                        {
-                            "handle_id": handle_id,
-                            "tool_name": target_tool,
-                            "status": "failed",
-                            "output": result,
-                        }
-                    )
-                    _notify_async_result(conversation_id, handle_id, target_tool, "failed")
+                    _report("failed", result)
                     return result
 
             # Race the tool execution against the cancel event.
@@ -13069,14 +13421,7 @@ def _spawn_async_tool(
                 # asyncio.to_thread, so that thread may run to completion.
                 for fut in pending:
                     fut.cancel()
-                session_inbox.put_nowait(
-                    {
-                        "handle_id": handle_id,
-                        "tool_name": target_tool,
-                        "status": "cancelled",
-                        "output": "",
-                    }
-                )
+                _report("cancelled", "")
                 return ""
             # Drop the losing future (cancel_event.wait()) so it doesn't
             # linger as a pending task for the life of the session.
@@ -13084,37 +13429,14 @@ def _spawn_async_tool(
                 fut.cancel()
             result = execution_task.result()
             status = "failed" if flows._step_error(result) is not None else "completed"
-            session_inbox.put_nowait(
-                {
-                    "handle_id": handle_id,
-                    "tool_name": target_tool,
-                    "status": status,
-                    "output": result,
-                }
-            )
-            _notify_async_result(conversation_id, handle_id, target_tool, status)
+            _report(status, result)
             return result
         except asyncio.CancelledError:
-            session_inbox.put_nowait(
-                {
-                    "handle_id": handle_id,
-                    "tool_name": target_tool,
-                    "status": "cancelled",
-                    "output": "",
-                }
-            )
+            _report("cancelled", "")
             raise
         except Exception as exc:
             _logger.exception("async tool %s failed", target_tool)
-            session_inbox.put_nowait(
-                {
-                    "handle_id": handle_id,
-                    "tool_name": target_tool,
-                    "status": "failed",
-                    "output": str(exc),
-                }
-            )
-            _notify_async_result(conversation_id, handle_id, target_tool, "failed")
+            _report("failed", str(exc))
             return f"Error: {exc}"
         finally:
             session_async_tasks.pop(handle_id, None)
@@ -13132,8 +13454,12 @@ def _spawn_async_tool(
             "message": (
                 f"[System: {target_tool} dispatched as background "
                 f"task {handle_id}. Result will appear in your "
-                f"inbox — call sys_read_inbox to check. To abort, "
-                f"call sys_cancel_async with handle_id={handle_id!r}.]"
+                f"inbox — call sys_read_inbox to check. If your turn "
+                f"ends first, the runtime posts a `[System: background "
+                f"task {handle_id} ... finished ...]` wake notice into "
+                f"this session; that notice comes from the runtime, not "
+                f"from a person. To abort, call sys_cancel_async with "
+                f"handle_id={handle_id!r}.]"
             ),
         }
     )

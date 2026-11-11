@@ -128,7 +128,8 @@ function isWindowFocused(): boolean {
  */
 export function useIdleNotifications(activeConversationId?: string): void {
   const navigate = useNavigate();
-  const { data } = useLoadedConversations();
+  // `data` subtracts answers in flight; new prompts are detected on the server's counts.
+  const { data, serverRows } = useLoadedConversations();
   const prevStatus = useRef<Map<string, ConversationStatus>>(new Map());
   const prevElicitations = useRef<Map<string, number>>(new Map());
   const prevRunaways = useRef<Map<string, string>>(new Map());
@@ -294,10 +295,10 @@ export function useIdleNotifications(activeConversationId?: string): void {
     pushBadge(unread, conversations);
 
     const idle = detectIdleTransitions(prevStatus.current, conversations);
-    const newElicitations = detectNewElicitations(prevElicitations.current, conversations);
+    const newElicitations = detectNewElicitations(prevElicitations.current, serverRows);
     const newRunaways = detectNewRunnerLogRunaways(prevRunaways.current, conversations);
     prevStatus.current = buildStatusMap(conversations);
-    prevElicitations.current = buildElicitationMap(conversations);
+    prevElicitations.current = buildElicitationMap(serverRows);
     prevRunaways.current = buildRunnerLogRunawayMap(conversations);
 
     const windowFocused = windowFocusedRef.current;
@@ -398,7 +399,7 @@ export function useIdleNotifications(activeConversationId?: string): void {
         notify(conversation, notice, navigate);
       }
     }
-  }, [data, navigate, activeConversationId]);
+  }, [data, serverRows, navigate, activeConversationId]);
 }
 
 /**
