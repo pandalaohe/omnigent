@@ -379,9 +379,9 @@ describe("CommandPalette — sessions", () => {
     renderPalette();
     const rows = screen
       .getAllByRole("option")
-      .map((option) => option.textContent ?? "")
-      .filter((text) => text.includes(" session"));
-    expect(rows.map((text) => text.split(" session")[0])).toEqual(["Bumped", "Middle", "Older"]);
+      .map((option) => option.getAttribute("data-value"))
+      .filter((value) => !value?.startsWith("action:"));
+    expect(rows).toEqual(["bumped", "middle", "older"]);
   });
 
   it("dedupes sessions that appear on overlapping pages", () => {
@@ -938,7 +938,7 @@ describe("CommandPalette — actions", () => {
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
     };
-    const view = render(<CommandPalette {...props} />);
+    const view = render(<CommandPalette {...props} />, { wrapper: withQueryClient() });
 
     newSessionTarget.route = "/?project=Alpha%20Team";
     newSessionTarget.target = {

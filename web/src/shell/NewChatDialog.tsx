@@ -1860,16 +1860,6 @@ export function AgentHarnessPicker({
     onPrefetchEntries?.(prefetchIds);
   }, [open, openNonce, harnessEntries, agentEntries, queryClient, onPrefetchEntries, prefetchIds]);
   const selectedOtherHarness = moreHarnessEntries.find((agent) => agent.id === effectiveAgentId);
-  const prefetchedOpenRef = useRef(false);
-  useEffect(() => {
-    if (open && !prefetchedOpenRef.current) {
-      for (const agent of [...harnessEntries, ...agentEntries]) {
-        void prefetchAvailableAgentDetails(agent, queryClient);
-      }
-      onPrefetchEntries?.(prefetchIds);
-    }
-    prefetchedOpenRef.current = open;
-  }, [open, harnessEntries, agentEntries, queryClient, onPrefetchEntries, prefetchIds]);
   const otherHarnessLabel =
     selectedOtherHarness && !autoHarnessActive
       ? `Other... (${selectedOtherHarness.display_name})`
@@ -2702,9 +2692,7 @@ function NewChatLandingContent({
       ...(customCatalog.data ?? []).map(customAgentForPicker),
     ]);
     if (curation.restrictToAgentNames.size === 0) return selectable;
-    const allowed = selectable.filter(
-      (agent) => agent.id === callingSeedAgentId || curation.restrictToAgentNames.has(agent.name),
-    );
+    const allowed = selectable.filter((agent) => curation.restrictToAgentNames.has(agent.name));
     const order = [...curation.restrictToAgentNames];
     return allowed.sort((first, second) => order.indexOf(first.name) - order.indexOf(second.name));
   }, [

@@ -918,13 +918,16 @@ describe("SubagentsPanel", () => {
   });
 
   it("gives native sub-agent children role/bot icons, not the brand logo", () => {
-    // A native session's sub-agents are all the same brand, so the logo
-    // is reserved for full native sessions; sub-agent rows read by role,
-    // with the generic bot as the fallback.
     mockChildTree({
       conv_root: [
         childInfo({
-          id: "conv_claude_explore",
+          id: "conv_generic",
+          title: "claude:tell-a-joke",
+          tool: "claude",
+          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+        }),
+        childInfo({
+          id: "conv_explore",
           title: "Explore:find-the-bug",
           tool: "Explore",
           labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
@@ -979,6 +982,12 @@ describe("SubagentsPanel", () => {
     mockChildTree({
       conv_root: [
         childInfo({
+          id: "conv_claude_explore",
+          title: "Explore:find-the-bug",
+          tool: "Explore",
+          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+        }),
+        childInfo({
           id: "conv_codex_researcher",
           title: "codex-native-ui-subagent:thread-1",
           tool: "Archimedes",
@@ -994,14 +1003,14 @@ describe("SubagentsPanel", () => {
     expandSubagentsZone(container);
 
     const claudeRow = childRow(container, "conv_claude_explore");
-    expect(claudeRow.querySelector('[data-harness-icon="claude"]')).not.toBeNull();
-    expect(claudeRow.querySelector(".lucide-search")).toBeNull();
+    expect(claudeRow.querySelector('[data-harness-icon="claude"]')).toBeNull();
+    expect(claudeRow.querySelector(".lucide-search")).not.toBeNull();
 
     const codexRow = childRow(container, "conv_codex_researcher");
     expect(codexRow).toHaveTextContent("Archimedes");
-    expect(codexRow.querySelector('[data-harness-icon="codex"]')).not.toBeNull();
+    expect(codexRow.querySelector('[data-harness-icon="codex"]')).toBeNull();
     expect(codexRow.querySelector(".lucide-bot")).toBeNull();
-    expect(codexRow.querySelector(".lucide-book-open")).toBeNull();
+    expect(codexRow.querySelector(".lucide-book-open")).not.toBeNull();
   });
 
   it("uses a user-picked host colour on the row bar and an automatic one otherwise", () => {

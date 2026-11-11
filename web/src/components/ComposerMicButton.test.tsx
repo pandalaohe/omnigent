@@ -326,6 +326,8 @@ describe("ComposerMicButton", () => {
     act(() => handlers.start?.({}));
     act(() => handlers.result?.(resultEvent("旧录音")));
     await act(async () => Promise.resolve());
+    // End the take explicitly; a browser pause now restarts the same take.
+    fireEvent.click(button);
     act(() => handlers.end?.({}));
 
     fireEvent.click(button);

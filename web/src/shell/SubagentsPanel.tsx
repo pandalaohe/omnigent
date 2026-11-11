@@ -248,9 +248,8 @@ export function iconForAgentType(tool: string | null): AgentRowIcon {
  * carries enough metadata. The shared harness-selector icon component uses
  * this identity to render the same color variant in the Agents panel.
  *
- * Both full native sessions and their native sub-agent children
- * (``…-subagent`` wrappers) get the harness glyph, so every coding agent
- * reads by the harness it runs on.
+ * Full native sessions get the harness glyph. Native sub-agent mirrors
+ * keep their role icon so siblings remain distinguishable.
  *
  * @param child - One child-session summary from the poll or stream.
  * @returns The agent identity used by the harness selector, or ``null``.
@@ -259,8 +258,7 @@ function harnessAgentForChild(
   child: ChildSessionInfo,
 ): { name: string; harness: string | null } | null {
   const wrapper = child.labels?.[WRAPPER_LABEL_KEY];
-  const nativeAgent =
-    nativeCodingAgentForWrapper(wrapper) ?? nativeCodingAgentForSubagentWrapper(wrapper);
+  const nativeAgent = nativeCodingAgentForWrapper(wrapper);
   if (nativeAgent) {
     return { name: nativeAgent.agentName, harness: nativeAgent.harness };
   }
@@ -1058,7 +1056,7 @@ function SubagentRow({
   const mirror = isHarnessSubagent(child);
   const showBadge = useChildAgentBadge(child) != null;
   const harnessAgent = harnessAgentForChild(child);
-  const RoleIcon = iconForAgentType(child.tool);
+  const RoleIcon = iconForAgentType(iconRoleForChild(child));
   const primary = childPrimaryLabel(child);
   const hostName = hostNameFor(child.host_id);
   const colorPreferences = useHostColorPreferences();

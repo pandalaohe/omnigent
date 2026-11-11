@@ -845,7 +845,7 @@ describe("links to folders", () => {
     );
 
     fireEvent.click(await screen.findByRole("button", { name: "experimental/data/summary.md" }));
-    expect(openFile).toHaveBeenCalledWith("experimental/data/summary.md");
+    await waitFor(() => expect(openFile).toHaveBeenCalledWith("experimental/data/summary.md"));
     expect(screen.getByText("experimental/data/mobile-touch-targets").tagName).toBe("CODE");
     expect(openFolder).not.toHaveBeenCalled();
     expect(toastMock).not.toHaveBeenCalled();

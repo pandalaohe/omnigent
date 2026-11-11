@@ -19,14 +19,14 @@ export async function connectHtmlPreviewBridge(iframe: HTMLIFrameElement) {
     );
   await waitFor(() => expect(commentInits().length).toBeGreaterThan(0));
   const [init, , transfer] = commentInits().at(-1) as unknown as [
-    { nonce: string },
+    { nonce: string; restoreScroll?: { top: number; budgetMs: number } | null },
     string,
     MessagePort[],
   ];
   const port = transfer[0];
   const send = (msg: Record<string, unknown>) =>
     port.postMessage({ source: BRIDGE_SOURCE, nonce: init.nonce, ...msg });
-  return { port, send };
+  return { port, send, init };
 }
 
 /** The saved offset the mounted preview was asked to restore, or null for none. */

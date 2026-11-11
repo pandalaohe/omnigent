@@ -304,7 +304,7 @@ describe("a curated New Chat picker", () => {
       ...screen
         .getByTestId("new-chat-landing-curated")
         .querySelectorAll("[data-harness-menu-choice-label]"),
-    ].map((node) => node.textContent);
+    ].map((node) => node.querySelector(".wrap-anywhere")?.textContent);
 
   it.each([
     // The deployment's own pick leads, which is the point of configuring it.

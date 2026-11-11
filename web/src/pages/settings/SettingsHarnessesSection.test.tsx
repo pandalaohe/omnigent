@@ -333,15 +333,11 @@ describe("Agent setup list", () => {
     (harness) => {
       hosts = [{ ...ONLINE, configured_harnesses: { [harness]: "cli-unresponsive" } }];
       renderHarnesses();
-
-      expect(within(card(harness)).getByText("CLI did not respond")).toBeTruthy();
-      expect(within(card(harness)).queryByLabelText(/Out of date/)).toBeNull();
+      // Installed products live in the master table, outside the missing-product cards.
+      expect(screen.queryByTestId(`harness-card-${harness}`)).toBeNull();
       expect(screen.queryByTestId(`harness-action-${harness}`)).toBeNull();
-      expect(card(harness).getAttribute("href")).toBe(
-        `/settings/harnesses/${harness}?tab=settings`,
-      );
-
-      fireEvent.click(screen.getByTestId(`harness-settings-${harness}`));
+      cleanup();
+      renderHarnesses(harness, "?tab=settings");
       expect(screen.getByText(/CLI on my-laptop didn’t respond to a version check/)).toBeTruthy();
       expect(screen.queryByText(/out of date|isn’t set up/)).toBeNull();
       expect(
@@ -1561,8 +1557,6 @@ it("displays AG as the antigravity-native title while keeping Google Antigravity
   const agyCard = card("antigravity-native");
   expect(within(agyCard).getByText("AG")).toBeInTheDocument();
   expect(
-    within(agyCard).getByText(
-      /Google Antigravity’s agent-first development platform for planning and executing software tasks\./,
-    ),
+    within(agyCard).getByText(/Google Antigravity’s agent platform for software development\./),
   ).toBeInTheDocument();
 });

@@ -152,7 +152,8 @@ describe("ExecutionLogsPanel open/close gating", () => {
     const custom = screen.getByTestId("ask-user-question-custom-input");
     custom.focus();
     fireEvent.keyDown(custom, { key: "Escape" });
-    expect(onClose).toHaveBeenCalledTimes(2);
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("ask-user-question-form")).toHaveFocus();
     expect(onReject).not.toHaveBeenCalled();
   });
 

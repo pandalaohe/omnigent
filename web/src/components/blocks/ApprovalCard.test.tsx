@@ -1578,10 +1578,10 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       title: "Antigravity needs your input",
     },
     {
-      name: "the legacy default for unknown prefixes",
+      name: "the generic default for unknown prefixes",
       policyName: "question_policy",
       phase: "pre_tool_use",
-      title: "Claude has questions",
+      title: "Agent has questions",
     },
   ])("labels structured input prompts using $name", ({ policyName, phase, title }) => {
     render(
@@ -1778,7 +1778,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       ).toBeDefined();
       expect(screen.queryByText("Claude has questions")).toBeNull();
       const submit = screen.getByTestId("ask-user-question-submit");
-      expect(submit.hasAttribute("disabled")).toBe(!textInput && options.length === 0);
+      expect(submit.hasAttribute("disabled")).toBe(!textInput);
       if (textInput) {
         expect(screen.getByTestId("ask-user-question-custom-input")).toHaveValue(textInput.default);
       }
@@ -1790,6 +1790,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
         }
       } else {
         expect(screen.queryByTestId("ask-user-question-custom-input")).toBeNull();
+        fireEvent.click(screen.getByLabelText(value));
         expect(screen.getByLabelText(value)).toBeChecked();
       }
       expect(submit.hasAttribute("disabled")).toBe(false);

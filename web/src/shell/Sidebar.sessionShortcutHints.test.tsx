@@ -103,19 +103,19 @@ afterEach(() => {
 });
 
 describe("Sidebar numbered-row shortcut hints", () => {
-  it("numbers the rows top to bottom only while the command key is held", async () => {
+  it("numbers pinned rows top to bottom only while the command key is held", async () => {
     renderSidebar();
     expect(hints()).toHaveLength(0);
 
     pressCommand();
     expect(hints()).toHaveLength(0); // still inside the reveal delay
 
-    // Pinned rows come first, then the unpinned sessions below them.
-    await waitForHints(5);
+    // Numbered jumps retain their pinned-only scope.
+    await waitForHints(3);
     const order = renderedRowIds();
     expect(order.slice(0, 3)).toEqual(["conv_a", "conv_b", "conv_c"]);
     order.forEach((id, index) => {
-      expect(hintKeys(rowOf(id))).toEqual([MOD_KEY, ALT_KEY, String(index + 1)]);
+      expect(hintKeys(rowOf(id))).toEqual(index < 3 ? [MOD_KEY, ALT_KEY, String(index + 1)] : []);
     });
 
     releaseCommand();
@@ -123,7 +123,13 @@ describe("Sidebar numbered-row shortcut hints", () => {
   });
 
   it("shows the badge on a session that's still being created", async () => {
-    mocks.pinned = [];
+    mocks.pinned = [
+      conv("temp:new", {
+        title: "New session draft",
+        provisional: true,
+        labels: { [PINNED_LABEL_KEY]: "1000" },
+      }),
+    ];
     vi.mocked(useConversations).mockImplementation(() =>
       conversationPage([conv("temp:new", { title: "New session draft", provisional: true })]),
     );
@@ -139,9 +145,10 @@ describe("Sidebar numbered-row shortcut hints", () => {
     renderSidebar();
 
     pressCommand();
-    await waitForHints(5);
+    await waitForHints(3);
     expect(hintKeys(rowOf("conv_a"))).toEqual([MOD_KEY, "1"]);
-    expect(hintKeys(rowOf(renderedRowIds()[3]!))).toEqual([MOD_KEY, "4"]);
+    expect(hintKeys(rowOf("conv_c"))).toEqual([MOD_KEY, "3"]);
+    expect(hintKeys(rowOf("conv_x"))).toEqual([]);
   });
 
   it("labels the tenth row 0 and gives no hint past it", async () => {
@@ -169,31 +176,32 @@ describe("Sidebar numbered-row shortcut hints", () => {
   it("hides the hints on window blur and when a digit is pressed", async () => {
     renderSidebar();
     pressCommand();
-    await waitForHints(5);
+    await waitForHints(3);
 
     fireEvent.blur(window);
     expect(hints()).toHaveLength(0);
 
     pressCommand();
-    await waitForHints(5);
+    await waitForHints(3);
     fireEvent.keyDown(window, { key: "1", ...COMMAND_MODIFIER });
     expect(hints()).toHaveLength(0);
   });
 
-  it("skips a collapsed section, so the rows below it take its numbers", async () => {
+  it("hides pinned shortcuts when their section is collapsed without numbering unpinned rows", async () => {
     renderSidebar();
     fireEvent.click(screen.getByRole("button", { name: "Pinned" }));
 
     pressCommand();
-    await waitForHints(2);
+    await waitPastRevealDelay();
+    expect(hints()).toHaveLength(0);
     const [first, second] = renderedRowIds().filter((id) => id === "conv_x" || id === "conv_y");
-    expect(hintKeys(rowOf(first!))).toEqual([MOD_KEY, ALT_KEY, "1"]);
-    expect(hintKeys(rowOf(second!))).toEqual([MOD_KEY, ALT_KEY, "2"]);
+    expect(hintKeys(rowOf(first!))).toEqual([]);
+    expect(hintKeys(rowOf(second!))).toEqual([]);
     releaseCommand();
 
     fireEvent.click(screen.getByRole("button", { name: "Pinned" }));
     pressCommand();
-    await waitForHints(5);
+    await waitForHints(3);
     releaseCommand();
   });
 

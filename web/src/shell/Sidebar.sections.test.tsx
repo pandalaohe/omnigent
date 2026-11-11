@@ -878,6 +878,13 @@ describe("Sidebar sections", () => {
     mockConversations([sAlpha, sBeta, sGamma, pinTop, sOther]);
     recentRef.current.data = [sAlpha, sBeta, sGamma];
 
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: Element,
+    ) {
+      return this.matches("li[data-sidebar-session-id]")
+        ? new DOMRect(0, 2000, 300, 40)
+        : new DOMRect(0, 0, 300, 500);
+    });
     const scrolledElements: Element[] = [];
     const scrollSpy = vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(function (
       this: Element,

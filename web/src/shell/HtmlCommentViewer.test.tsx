@@ -358,7 +358,9 @@ function renderScrollViewer(
       onSetActiveSelection={() => {}}
     />
   );
-  return render(embedded ? <EmbeddedProvider>{viewer}</EmbeddedProvider> : viewer);
+  return render(embedded ? <EmbeddedProvider>{viewer}</EmbeddedProvider> : viewer, {
+    wrapper: Providers,
+  });
 }
 
 function HostPreviewFrame({ htmlContent, iframeRef, onLoad }: HtmlPreviewFrameProps) {
@@ -412,7 +414,12 @@ describe("HtmlCommentViewer embedded host frame", () => {
     const postMessage = vi.spyOn(iframe.contentWindow!, "postMessage");
     fireEvent.load(iframe);
     expect(postMessage).toHaveBeenCalledWith(
-      { source: BRIDGE_SOURCE, nonce: expect.any(String), type: BRIDGE_MSG.init },
+      {
+        source: BRIDGE_SOURCE,
+        nonce: expect.any(String),
+        type: BRIDGE_MSG.init,
+        restoreScroll: { top: 0, budgetMs: 1500 },
+      },
       "*",
       [expect.anything()],
     );
@@ -1563,6 +1570,7 @@ describe("HtmlCommentViewer scroll position", () => {
   });
 
   it("saves a frame's offset under its own file while navigation to another file suspends", async () => {
+    vi.mocked(host.hasOmnigentHostFetcher).mockReturnValue(true);
     const key = "html-preview:conv_1:suspended.html";
     const nextKey = "html-preview:conv_1:next.html";
     const pending = new Promise<void>(() => {});
@@ -1589,7 +1597,7 @@ describe("HtmlCommentViewer scroll position", () => {
         <Suspend blocked={blocked} />
       </Suspense>
     );
-    const view = render(tree(key, false));
+    const view = render(tree(key, false), { wrapper: Providers });
     const { send } = await connectHtmlPreviewBridge(
       screen.getByTitle<HTMLIFrameElement>("HTML preview"),
     );

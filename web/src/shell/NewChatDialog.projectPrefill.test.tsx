@@ -416,6 +416,11 @@ async function expectNoProjectRoot(): Promise<void> {
 beforeEach(() => {
   navigateMock.mockReset();
   vi.mocked(authenticatedFetch).mockReset();
+  vi.mocked(fetchSandboxProfiles).mockReset().mockResolvedValue({
+    profiles: [],
+    managed_providers: [],
+    next_cursor: null,
+  });
   // The landing draft is module-scoped and survives unmount by design; clear it
   // so a case that never submits can't leak its state into the next test.
   resetLandingDraft();
@@ -816,7 +821,9 @@ describe("NewChatLandingScreen project prefill", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
     expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
     fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
-    expect(authenticatedFetch).not.toHaveBeenCalled();
+    expect(
+      vi.mocked(authenticatedFetch).mock.calls.filter(([, init]) => init?.method === "POST"),
+    ).toEqual([]);
     fireEvent.click(picker);
     fireEvent.click(screen.getByRole("option", { name: "Large workspace" }));
     const body = await submitAndReadBody();

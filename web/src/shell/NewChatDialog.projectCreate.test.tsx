@@ -889,7 +889,9 @@ describe("NewChatLandingScreen nested agent creation", () => {
         searchParams = new URLSearchParams(draft.source ? `sibling=${draft.source}` : "");
         renderLanding({ sibling_sessions: true });
         // oxlint-disable-next-line no-await-in-loop -- Each visit must unmount before the next.
-        expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue(draft.text);
+        expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue(
+          draft.file ? `${draft.text} [file 1] ` : draft.text,
+        );
         for (const other of drafts) {
           if (!other.file) continue;
           expect(screen.queryByText(other.file) !== null).toBe(other === draft);
@@ -978,7 +980,7 @@ describe("NewChatLandingScreen nested agent creation", () => {
       expect(useHosts).toHaveBeenCalledWith({ refetchOnFocus: true, sourceHostId: "host_1" });
       expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAttribute(
         "aria-label",
-        "Host: This machine, Online",
+        "Host: corey-laptop, Online",
       );
       fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
         target: { files: [new File(["submitted"], "submitted.txt", { type: "text/plain" })] },
@@ -1012,7 +1014,7 @@ describe("NewChatLandingScreen nested agent creation", () => {
       searchParams = new URLSearchParams("sibling=other");
       renderLanding({ sibling_sessions: true });
       expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue(
-        "Keep this other draft",
+        "Keep this other draft [file 1] ",
       );
       expect(screen.getByText("other.txt")).toBeVisible();
       expect(screen.queryByText("submitted.txt")).not.toBeInTheDocument();

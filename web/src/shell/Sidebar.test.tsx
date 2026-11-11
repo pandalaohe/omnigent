@@ -762,7 +762,8 @@ describe("Sidebar session list", () => {
     expect(within(screen.getByText("Pinned").closest("section")!).getByText("pinned-session")).toBe(
       pinned,
     );
-    if (view === "archived") expect(screen.queryByText("filed-session")).toBeNull();
+    if (view === "archived" || view === "shared")
+      expect(screen.queryByText("filed-session")).toBeNull();
     else expect(screen.getByText("filed-session")).toBe(filed);
     expect(screen.getByTestId("session-filter")).toBe(filter);
     const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
@@ -777,7 +778,8 @@ describe("Sidebar session list", () => {
     expect(within(screen.getByText("Pinned").closest("section")!).getByText("pinned-session")).toBe(
       pinned,
     );
-    if (view === "archived") expect(screen.getByText("filed-session")).toBeInTheDocument();
+    if (view === "archived" || view === "shared")
+      expect(screen.getByText("filed-session")).toBeInTheDocument();
     else expect(screen.getByText("filed-session")).toBe(filed);
   });
 
@@ -3965,7 +3967,7 @@ describe("Sidebar project Show more", () => {
     expect(folderRowIds()).toEqual([...filedIds(6), "conv_older"]);
   });
 
-  it("numbers the sessions above a folder's Show more and continues in the next folder", () => {
+  it("cycles through the sessions above a folder's Show more and continues in the next folder", () => {
     projectsMock.push("Customer X", "Customer Y");
     mockConversations([
       ...filedSessions(7),
@@ -3978,15 +3980,16 @@ describe("Sidebar project Show more", () => {
       EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
       JSON.stringify(["Customer X", "Customer Y"]),
     );
-    renderOnSession("conv_filed_1");
+    renderOnSession("conv_filed_0");
 
-    // Five rows show above Customer X's Show more, so the sixth number is Customer Y's row.
-    fireEvent.keyDown(window, {
-      code: "Digit6",
-      key: "6",
-      altKey: true,
-      ...(isMacPlatform() ? { metaKey: true } : { ctrlKey: true }),
-    });
+    // Five rows show above Customer X's Show more; the next visible row is Customer Y's.
+    for (let step = 0; step < 5; step++) {
+      fireEvent.keyDown(window, {
+        code: "BracketRight",
+        key: "]",
+        ...(isMacPlatform() ? { metaKey: true } : { ctrlKey: true }),
+      });
+    }
     expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_other_folder");
   });
 });
@@ -4428,7 +4431,7 @@ describe("Sidebar active-row auto-scroll", () => {
     (project) => {
       const priorMatchMedia = window.matchMedia;
       vi.stubGlobal("matchMedia", (query: string) => ({
-        matches: query !== "(min-width: 768px)",
+        matches: query === "(max-width: 767.98px)",
         media: query,
         addListener: vi.fn(),
         removeListener: vi.fn(),
@@ -4512,9 +4515,11 @@ describe("Sidebar active-row auto-scroll", () => {
     const scrollIntoView = vi.fn();
     vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(scrollIntoView);
     // jsdom has no layout: place every element below the viewport so the active row is offscreen.
-    vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue(
-      new DOMRect(0, 2000, 300, 40),
-    );
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: Element,
+    ) {
+      return this.tagName === "LI" ? new DOMRect(0, 2000, 300, 40) : new DOMRect(0, 0, 300, 400);
+    });
 
     mockConversations([conv("conv_top", "Claude Code"), conv("conv_active", "Claude Code")]);
     renderAtRoute("/c/conv_active");
@@ -5615,7 +5620,7 @@ describe("sidebar_grouping_ui release flag", () => {
           .getAllByRole("link", { name: /^conv_/ })
           .map((link) => link.textContent),
       ).toEqual(["conv_mine", "conv_shared"]);
-      expect(screen.queryByRole("button", { name: "Shared with me" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Shared" })).toBeNull();
       expect(screen.queryByRole("button", { name: "Done" })).toBeNull();
       expect(screen.queryByTestId("session-row-meta")).toBeNull();
       expect(screen.queryByTestId("session-row-updated")).toBeNull();
@@ -5753,7 +5758,7 @@ describe("sidebar_grouping_ui release flag", () => {
     renderGroupingSidebar();
 
     selectSessionFilter("all");
-    const shared = screen.getByRole("button", { name: "Shared with me" }).closest("section")!;
+    const shared = screen.getByRole("button", { name: "Shared" }).closest("section")!;
     const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
     expect(within(shared).getByText("conv_shared")).toBeInTheDocument();
     expect(within(sessions).queryByText("conv_shared")).toBeNull();
@@ -5763,11 +5768,11 @@ describe("sidebar_grouping_ui release flag", () => {
     );
 
     selectSessionFilter("mine");
-    expect(screen.queryByRole("button", { name: "Shared with me" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Shared" })).toBeNull();
 
     // The Shared filter shows that section alone.
     showSharedTab();
-    expect(screen.getByRole("button", { name: "Shared with me" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Shared" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Sessions" })).toBeNull();
     expect(screen.queryByText("conv_mine")).toBeNull();
   });
@@ -5783,7 +5788,7 @@ describe("sidebar_grouping_ui release flag", () => {
     renderGroupingSidebar();
 
     showSharedTab();
-    const shared = screen.getByRole("button", { name: "Shared with me" }).closest("section")!;
+    const shared = screen.getByRole("button", { name: "Shared" }).closest("section")!;
     expect(within(shared).getByRole("status")).toHaveTextContent("Loading…");
   });
 
@@ -5793,7 +5798,7 @@ describe("sidebar_grouping_ui release flag", () => {
     showSharedTab();
 
     // Shared carries the list controls (and the filter) while Projects is hidden.
-    const shared = screen.getByRole("button", { name: "Shared with me" }).closest("section")!;
+    const shared = screen.getByRole("button", { name: "Shared" }).closest("section")!;
     expect(within(shared).getByTestId("sessions-new-session")).toBeInTheDocument();
     expect(within(shared).getByTestId("session-filter")).toBeInTheDocument();
     fireEvent.click(within(shared).getByRole("button", { name: "Select sessions" }));
@@ -5832,7 +5837,7 @@ describe("sidebar_grouping_ui release flag", () => {
     // mustn't stall pagination; collapsing Shared as well does.
     fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
     expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Shared with me" }));
+    fireEvent.click(screen.getByRole("button", { name: "Shared" }));
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
   });
 
@@ -5916,7 +5921,7 @@ describe("sidebar_grouping_ui release flag", () => {
     renderGroupingSidebar();
 
     selectSessionFilter("all");
-    const shared = screen.getByRole("button", { name: "Shared with me" }).closest("section")!;
+    const shared = screen.getByRole("button", { name: "Shared" }).closest("section")!;
     expect(within(shared).getByText("conv_shared_alpha")).toBeInTheDocument();
     expect(screen.queryByText("conv_owned")).toBeNull(); // in the collapsed Alpha folder
   });
@@ -5938,7 +5943,7 @@ it.each(["default", "updated", "shared"])(
       renderGroupingSidebar();
       if (view === "shared") showSharedTab();
       const title =
-        view === "updated" ? "Updated today" : view === "shared" ? "Shared with me" : "Sessions";
+        view === "updated" ? "Updated today" : view === "shared" ? "Shared" : "Sessions";
       const status = screen.getByTestId("sidebar-import-progress");
       expect(screen.getByRole("heading", { name: new RegExp(title) })).toContainElement(status);
       expect(status).toHaveTextContent("Importing (35)");

@@ -856,8 +856,8 @@ describe("SettingsPage", () => {
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "About Copying from terminals" }));
     const help = screen.getByRole("tooltip");
-    expect(help).toHaveTextContent(/Controls copying text from all sessions/);
-    expect(help).toHaveTextContent(/Allowing copying also lets terminal programs silently replace/);
+    expect(help).toHaveTextContent(/Control copying from all sessions/);
+    expect(help).toHaveTextContent(/Allowing it lets terminal programs silently replace/);
     expect(help).toHaveTextContent(/all sessions and terminals on this server/);
     expect(help).toHaveTextContent(/this browser or app/);
     expect(within(select).getByRole("option", { name: "Allow copying" })).toBeInTheDocument();
@@ -1048,7 +1048,7 @@ describe("SettingsPage", () => {
       expect(link).toHaveAttribute("target", "_blank");
       expect(link).toHaveAttribute("rel", "noreferrer");
     }
-    const link = screen.getByRole("link", { name: "Databricks appearance settings" });
+    const link = screen.getByRole("link", { name: "Open Databricks preferences" });
     expect(link).toHaveAttribute("href", url);
     expect(link).toHaveAttribute("target", "_blank");
     expect(link).toHaveAttribute("rel", "noreferrer");

@@ -541,7 +541,7 @@ describe("ChatHeader — conversation breadcrumb", () => {
       expect(back).toHaveAttribute("href", "/c/parent-123");
       if (mobile) {
         expect(back).toHaveTextContent("Back");
-        expect(screen.queryByText("Fix the login bug")).toBeNull();
+        expect(screen.getByText("Fix the login bug")).toHaveAttribute("aria-hidden");
         expect(screen.queryByText("check-account-eligibility")).toBeNull();
         return;
       }

@@ -1401,7 +1401,7 @@ function AppearanceSection() {
       <div className="flex flex-col gap-6">
         <div key={resetKey} className="flex flex-col gap-6">
           <SettingsGroup title="Theme" testId="settings-group-theme">
-            {isEmbedded ? (
+            {isEmbedded && !isElectronShell() ? (
               <div className="flex flex-col gap-3">
                 <SettingsLabel
                   label="Theme"

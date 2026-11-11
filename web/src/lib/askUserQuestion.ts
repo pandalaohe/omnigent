@@ -95,6 +95,7 @@ export function castAskUserQuestionPayload(
       options: Array.isArray(rec.options) ? (rec.options as ClaudeQuestionOption[]) : [],
       multiSelect: rec.multiSelect === true,
       ...(typeof rec.isOther === "boolean" ? { isOther: rec.isOther } : {}),
+      ...(rec.isSecret === true ? { isSecret: true } : {}),
       ...(rec.textInput &&
       typeof rec.textInput === "object" &&
       "default" in rec.textInput &&

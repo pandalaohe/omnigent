@@ -86,7 +86,7 @@ const HARNESS_DESCRIPTIONS: Record<string, string> = {
   "cursor-native": "An AI editor with agents for navigating and editing code.",
   "pi-native": "A minimal, extensible terminal coding agent.",
   "devin-native": "Cognition’s autonomous coding agent.",
-  "antigravity-native": "Google’s agent platform for software development.",
+  "antigravity-native": "Google Antigravity’s agent platform for software development.",
   "kiro-native": "An agentic IDE for spec-driven development.",
   "qwen-native": "An open-source terminal coding agent powered by Qwen.",
   "goose-native": "An open-source local agent for coding and automation.",
