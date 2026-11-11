@@ -952,12 +952,6 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
     Codex bundle, standalone, and enabled plugin skills under the filter.
 
-    ``~/.agents/skills`` reaches the menu through ``codex_skill_sources``
-    like any other seeded source. After those, the menu also lists the repo
-    ``.agents/skills`` tier the Codex CLI loads itself
-    (:func:`_codex_repo_agents_skill_dirs`) — first name wins. The repo tier
-    is not seeded into the private home because the CLI reads it directly.
-
     Reuses the Codex executor's own helpers — ``codex_skill_sources`` (the
     shared source-list builder) and ``select_codex_skill_dirs`` (the shared
     selector) — so the menu draws from the same roots and selection the
@@ -968,8 +962,11 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     but not shown (correct — Codex won't register a malformed skill as a
     command either).
 
-    The menu applies ``skills_filter`` to every tier. Linked sources win
-    same-name collisions, followed by the nearest repo directory.
+    Native skills come first and ignore ``skills_filter``: Codex loads repo
+    skills whatever the filter and ranks them above the linked user skills.
+    Codex lists every same-named copy, and a plain ``$name`` that matches more
+    than one injects none of them. Codex has no precedence within the repo
+    scope, so the nearest directory wins here.
 
     A native ``codex-native`` session honors ``$CODEX_HOME``: its launch seeds
     the per-bridge home from the ``$CODEX_HOME``-resolved host home, so the menu
@@ -995,9 +992,12 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
 
     host_override = ctx.codex_home if ctx.is_native else None
     cwd = ctx.roots[0] if ctx.roots else None
-    sources = codex_skill_sources(ctx.bundle_dir, ctx.home, codex_home=host_override)
-    repo_sources = _codex_repo_agents_skill_dirs(cwd) if cwd is not None else []
-    selected = select_codex_skill_dirs(ctx.skills_filter, sources.linked + repo_sources)
+    sources = codex_skill_sources(
+        ctx.bundle_dir, ctx.home, codex_home=host_override, workspace=cwd
+    )
+    selected = select_codex_skill_dirs("all", sources.native)
+    for name, skill_dir in select_codex_skill_dirs(ctx.skills_filter, sources.linked).items():
+        selected.setdefault(name, skill_dir)
     out: list[SkillSpec] = []
     for name, skill_dir in selected.items():
         try:
@@ -1010,27 +1010,6 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
         discover_codex_plugin_skills(codex_home, ctx.skills_filter, cwd=cwd, warnings=ctx.warnings)
     )
     return out
-
-
-def _codex_repo_agents_skill_dirs(cwd: Path) -> list[Path]:
-    """
-    The repo ``.agents/skills`` dirs the Codex CLI loads for *cwd*.
-
-    Walks ``cwd`` up to the nearest ``.git`` ancestor (``cwd`` alone when
-    none), closest first. ``os.path`` probes count an unreadable path as
-    absent, as Codex skips stat errors.
-
-    :param cwd: The session workspace (the Codex CLI's cwd).
-    :returns: Existing ``<d>/.agents/skills`` dirs, closest first.
-    """
-    chain: list[Path] = []
-    for directory in (cwd, *cwd.parents):
-        chain.append(directory)
-        if os.path.exists(directory / ".git"):
-            break
-    else:
-        chain = [cwd]
-    return [d / ".agents" / "skills" for d in chain if os.path.isdir(d / ".agents" / "skills")]
 
 
 def cursor_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
