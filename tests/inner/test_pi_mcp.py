@@ -525,6 +525,30 @@ def test_session_owned_config_in_the_managed_dir_is_kept(
     assert not (pi_agent / "mcp.json").exists()
 
 
+def test_session_restoring_source_bytes_after_merge_is_kept(home: Path, pi_agent: Path) -> None:
+    _write_json(home / ".claude.json", {"mcpServers": {"inherited": {"command": "host"}}})
+    user_file = pi_agent / "mcp.json"
+    _write_json(user_file, {"mcpServers": {"notes": {"command": "mine"}}})
+    source_bytes = user_file.read_bytes()
+    (pi_agent / "AGENTS.md").write_text("first context", encoding="utf-8")
+    managed = _prepare(home, pi_agent)
+    assert _managed_servers(managed) == {
+        "inherited": {"command": "host"},
+        "notes": {"command": "mine"},
+    }
+
+    target = managed / "mcp.json"
+    target.write_bytes(source_bytes)
+    (pi_agent / "AGENTS.md").write_text("updated context", encoding="utf-8")
+
+    for _ in range(2):
+        _prepare(home, pi_agent)
+        assert target.read_bytes() == source_bytes
+        assert not target.is_symlink()
+        assert user_file.read_bytes() == source_bytes
+        assert (managed / "AGENTS.md").read_text(encoding="utf-8") == "updated context"
+
+
 def test_undecodable_digest_keeps_the_managed_config(home: Path, pi_agent: Path) -> None:
     _write_json(home / ".claude.json", {"mcpServers": {"github": {"command": "host"}}})
     managed = _prepare(home, pi_agent)

@@ -309,6 +309,14 @@ def _write_private_file(path: Path, content: bytes) -> None:
 
 def _write_generated_copy(target: Path, digest: Path, data: Mapping[str, object]) -> None:
     """Write *data* as the managed ``mcp.json`` and record its digest."""
+    from omnigent.inner.pi_settings import _PI_SEED_MANIFEST, _atomic_write, _read_settings_file
+
+    manifest_path = target.parent / _PI_SEED_MANIFEST
+    manifest = _read_settings_file(manifest_path)
+    if target.name in manifest:
+        # Retire seed ownership before a generated copy takes over the file.
+        del manifest[target.name]
+        _atomic_write(manifest_path, json.dumps(manifest).encode())
     content = (json.dumps(data, indent=2) + "\n").encode()
     _write_private_file(target, content)
     try:
