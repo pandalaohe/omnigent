@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from omnigent import install_ledger
 
 
@@ -200,8 +202,9 @@ def test_deep_backfill_observes_external_config_and_launch_agents(
     assert launch_agent.exists()
 
 
+@pytest.mark.parametrize("kind", ["launchd", "windows_task"])
 def test_record_and_remove_launch_agent_preserves_other_entries(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, kind: str
 ) -> None:
     home = tmp_path / "home"
     state = home / ".omnigent"
@@ -216,7 +219,7 @@ def test_record_and_remove_launch_agent_preserves_other_entries(
         label="ai.example.other",
     )
     stale = install_ledger.LaunchAgentEntry(
-        kind="launchd",
+        kind=kind,
         path=str(home / "Library/LaunchAgents/old.plist"),
         label="ai.omnigent.host",
     )
@@ -224,7 +227,7 @@ def test_record_and_remove_launch_agent_preserves_other_entries(
     install_ledger.write_ledger(ledger)
 
     current = install_ledger.LaunchAgentEntry(
-        kind="launchd",
+        kind=kind,
         path=str(home / "Library/LaunchAgents/ai.omnigent.host.plist"),
         label="ai.omnigent.host",
         confidence="certain",
@@ -235,7 +238,7 @@ def test_record_and_remove_launch_agent_preserves_other_entries(
     assert recorded is not None
     assert recorded.entries.launch_agents == [unrelated, current]
 
-    install_ledger.remove_launch_agent(kind="launchd", label="ai.omnigent.host")
+    install_ledger.remove_launch_agent(kind=kind, label="ai.omnigent.host")
 
     removed = install_ledger.load_ledger(install_ledger.ledger_path())
     assert removed is not None

@@ -21,6 +21,24 @@ import psutil
 _TRASH_SUFFIX = re.compile(r"\.trash-[0-9a-f]{32}")
 
 
+def resolve_uv_executable() -> str:
+    """Resolve standard per-user uv installs even when the shell PATH is stale."""
+    found = shutil.which("uv")
+    if found:
+        return found
+    candidates = [Path.home() / ".local" / "bin" / "uv.exe"]
+    if install_dir := os.environ.get("UV_INSTALL_DIR"):
+        candidates.insert(0, Path(install_dir) / "uv.exe")
+    if local := os.environ.get("LOCALAPPDATA"):
+        candidates.append(Path(local) / "Microsoft" / "WinGet" / "Links" / "uv.exe")
+    for path in candidates:
+        if path.is_file():
+            return str(path)
+    raise FileNotFoundError(
+        "uv was not found in PATH or its standard user installation locations."
+    )
+
+
 def installed_launchers() -> list[Path]:
     """Return entrypoints owned by this venv, including uv's external copies."""
     prefix = Path(sys.prefix)
@@ -62,9 +80,9 @@ def _inside_install(path: str) -> bool:
 
 def capture_host_tree(*, include_install_users: bool = False) -> list[psutil.Process]:
     """Capture Host trees and, for a forced upgrade, detached install users."""
-    autostart = Path.home() / ".omnigent" / "autostart"
-    script = str(autostart / "Start-OmnigentHostDefault.ps1").casefold()
-    pwsh = shutil.which("pwsh")
+    from omnigent.host.daemon_lifecycle import read_daemon_records
+
+    records = {record.pid: record for record in read_daemon_records()}
     executables = {str(path).casefold() for path in installed_launchers()}
     interpreters = {
         os.path.realpath(sys.executable).casefold(),
@@ -77,24 +95,16 @@ def capture_host_tree(*, include_install_users: bool = False) -> list[psutil.Pro
             args = proc.cmdline()
             exe = proc.exe().casefold()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
+            if proc.pid in records:
+                raise
             continue
         try:
             lowered = [arg.casefold() for arg in args]
-            file_arg = 1
-            while file_arg < len(args):
-                option = lowered[file_arg]
-                if option in ("-noprofile", "-nologo", "-noninteractive"):
-                    file_arg += 1
-                elif option in ("-executionpolicy", "-windowstyle"):
-                    file_arg += 2
-                else:
-                    break
-            loop = (
-                pwsh is not None
-                and exe == pwsh.casefold()
-                and file_arg + 1 < len(args)
-                and lowered[file_arg] == "-file"
-                and lowered[file_arg + 1] == script
+            service_entry = (
+                _inside_install(exe) or bool(args and _inside_install(args[0]))
+            ) and any(
+                lowered[index : index + 2] == ["-m", "omnigent.host.service_entry"]
+                for index in range(1, len(lowered) - 1)
             )
             host = (
                 exe in executables
@@ -102,6 +112,8 @@ def capture_host_tree(*, include_install_users: bool = False) -> list[psutil.Pro
                 and args[1:3] == ["host", "--server"]
                 and bool(args[3])
             )
+            recorded = records.get(proc.pid)
+            recorded_host = recorded is not None and proc.create_time() <= recorded.started_at + 5
             if proc.pid in protected:
                 runtime = any(
                     lowered[index : index + 2]
@@ -112,7 +124,7 @@ def capture_host_tree(*, include_install_users: bool = False) -> list[psutil.Pro
                     )
                     for index in range(1, len(lowered) - 1)
                 )
-                if loop or host or runtime:
+                if service_entry or host or runtime or recorded_host:
                     raise RuntimeError(
                         "Run the upgrade from a terminal outside the Host process tree."
                     )
@@ -140,8 +152,9 @@ def capture_host_tree(*, include_install_users: bool = False) -> list[psutil.Pro
                             if memory_maps is not None
                             else False
                         )
-            if not (loop or host or install_user):
+            if not (service_entry or host or recorded_host or install_user):
                 continue
+            proc.create_time()  # Bind identity before the scheduler can end the root.
             tree = [proc, *proc.children(recursive=True)]
             if not proc.is_running() or proc.cmdline() != args:
                 continue

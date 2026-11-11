@@ -129,6 +129,7 @@ if TYPE_CHECKING:
     import httpx
 
     from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
+    from omnigent.host.service import HostService
     from omnigent.install_ledger import InstallLedger
     from omnigent.onboarding.acp_auth import AcpAgentEntry
     from omnigent.server.smart_routing import LLMRoutingClient
@@ -5731,6 +5732,58 @@ def uninstall(
     assume_inferred: bool,
 ) -> None:
     """Uninstall Omnigent from this machine."""
+    if IS_WINDOWS:
+        from omnigent.host.service import (
+            HostServiceError,
+            disable_user_host_service,
+            installed_user_host_service,
+        )
+
+        if (
+            purge
+            or purge_workspace
+            or modify_external_config
+            or targets not in ((), ("all",), ("services",))
+        ):
+            raise click.ClickException(
+                "Windows uninstall removes the host service only; remove local state manually."
+            )
+        try:
+            snapshot = installed_user_host_service()
+            preview = dry_run or not yes
+            if not preview:
+                disable_user_host_service()
+        except HostServiceError as exc:
+            raise click.ClickException(str(exc)) from exc
+        manual = "Run uv tool uninstall omnigent from a separate terminal to remove the tool."
+        if json_output:
+            click.echo(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "dry_run": preview,
+                        "actions": [
+                            {
+                                "kind": "windows_task",
+                                "label": snapshot[0].label,
+                                "status": "planned" if preview else "done",
+                            }
+                        ]
+                        if snapshot
+                        else [],
+                        "exit_code": 0,
+                        "manual_step": manual,
+                    }
+                )
+            )
+        else:
+            click.echo(
+                ("Would remove" if preview else "Removed")
+                + " the Windows host task and saved environment."
+            )
+            click.echo(manual)
+        return
+
     from omnigent.install_ledger import resolve_uninstall_ledger
 
     ledger = resolve_uninstall_ledger()
@@ -5904,84 +5957,55 @@ def _drain_and_stop_local_server(*, force: bool) -> None:
         click.echo("Stopped the background server before upgrading.")
 
 
-def _windows_host_service_wrapper() -> Path | None:
-    """Locate the installed Windows Host supervisor, if present."""
-    command = shutil.which("omni-host-service.cmd") or shutil.which("omni-host-service")
-    wrapper = Path(command) if command else Path.home() / ".local/bin/omni-host-service.cmd"
-    return wrapper if wrapper.is_file() else None
+@contextlib.contextmanager
+def _upgrade_windows_host_service(
+    snapshot: tuple[HostService, str | None] | None, *, force: bool
+) -> Iterator[None]:
+    from omnigent.host.service import (
+        HostServiceError,
+        start_user_host_service,
+        stop_user_host_service,
+    )
+    from omnigent.host.windows_upgrade import capture_host_tree, stop_host_tree
 
-
-def _run_windows_host_service(wrapper: Path, action: Literal["start", "stop"]) -> None:
-    """Control the existing supervisor through PowerShell without a shell string path."""
-    pwsh = shutil.which("pwsh")
-    if pwsh is None:
-        raise click.ClickException("PowerShell 7 is required to control the Windows Host service.")
     try:
-        result = subprocess.run(
-            [
-                pwsh,
-                "-NoProfile",
-                "-Command",
-                "& $env:OMNIGENT_HOST_SERVICE_WRAPPER "
-                "$env:OMNIGENT_HOST_SERVICE_ACTION; exit $LASTEXITCODE",
-            ],
-            check=False,
-            timeout=60,
-            env={
-                **os.environ,
-                "OMNIGENT_HOST_SERVICE_WRAPPER": str(wrapper),
-                "OMNIGENT_HOST_SERVICE_ACTION": action,
-            },
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise click.ClickException(f"Windows Host supervisor could not {action}: {exc}") from exc
-    if result.returncode:
-        raise click.ClickException(
-            f"Windows Host supervisor failed to {action} (status {result.returncode}): {wrapper}"
-        )
+        # Keep identities before drain can orphan children or terminate the Host.
+        processes = capture_host_tree(include_install_users=force)
+    except (psutil.Error, OSError, ValueError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    service = snapshot[0] if snapshot else None
+    try:
+        _drain_and_stop_local_server(force=force)
+        if snapshot is not None:
+            server_url = snapshot[1]
+            if server_url is not None and not force:
+                record = _find_daemon_record(_normalize_daemon_target(server_url))
+                if record is not None:
+                    _wait_for_running_sessions(
+                        lambda: _count_running_daemon_sessions(record),
+                        force_hint="re-run with --force to stop them now",
+                    )
+            stop_user_host_service(snapshot[0])
+        if service is not None or force:
+            processes.extend(capture_host_tree(include_install_users=force))
+            stop_host_tree(processes)
+        yield
+    except (psutil.Error, OSError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        if service is not None:
+            failed = sys.exc_info()[0] is not None
+            try:
+                start_user_host_service(service)
+            except (HostServiceError, OSError) as exc:
+                if not failed:
+                    raise click.ClickException(str(exc)) from exc
+                click.echo(f"Additionally failed to restart the Windows Host: {exc}", err=True)
 
 
 @contextlib.contextmanager
 def _upgrade_host_service(*, force: bool) -> Iterator[None]:
     """Keep an enabled service stopped until the install and version check finish."""
-    if IS_WINDOWS:
-        from omnigent.host.windows_upgrade import capture_host_tree, stop_host_tree
-
-        wrapper = _windows_host_service_wrapper()
-        if wrapper is None or shutil.which("pwsh") is None:
-            raise click.ClickException(
-                "The Windows Host supervisor wrapper and PowerShell 7 "
-                "are required before upgrading."
-            )
-        try:
-            processes = capture_host_tree(include_install_users=force)
-        except (psutil.Error, OSError, ValueError, RuntimeError) as exc:
-            raise click.ClickException(str(exc)) from exc
-        try:
-            # A drain that fails part-way may already have stopped the Host.
-            _drain_and_stop_local_server(force=force)
-            try:
-                try:
-                    if wrapper is not None:
-                        _run_windows_host_service(wrapper, "stop")
-                finally:
-                    # The loop may have replaced a daemon while it was draining.
-                    processes.extend(capture_host_tree(include_install_users=force))
-                    stop_host_tree(processes)
-            except (psutil.Error, RuntimeError) as exc:
-                raise click.ClickException(str(exc)) from exc
-            yield
-        finally:
-            if wrapper is not None:
-                failed = sys.exc_info()[0] is not None
-                try:
-                    _run_windows_host_service(wrapper, "start")
-                except click.ClickException as exc:
-                    if not failed:
-                        raise
-                    click.echo(f"Additionally failed to restart the Windows Host: {exc}", err=True)
-        return
-
     from omnigent.host.service import (
         HostServiceError,
         enable_user_host_service,
@@ -5994,6 +6018,10 @@ def _upgrade_host_service(*, force: bool) -> Iterator[None]:
         snapshot = installed_user_host_service()
     except HostServiceError as exc:
         raise click.ClickException(str(exc)) from exc
+    if IS_WINDOWS:
+        with _upgrade_windows_host_service(snapshot, force=force):
+            yield
+        return
     _drain_and_stop_local_server(force=force)
     if snapshot is None:
         yield
@@ -11482,15 +11510,37 @@ def host_enable(
                 lambda: _count_running_daemon_sessions(record),
                 force_hint="re-run with --force to replace the host now",
             )
+        if IS_WINDOWS:
+            from omnigent.host.service import (
+                HostServiceError,
+                installed_user_host_service,
+                stop_user_host_service,
+            )
+            from omnigent.host.windows_upgrade import capture_host_tree, stop_host_tree
+
+            try:
+                processes = capture_host_tree()
+                snapshot = installed_user_host_service()
+                if snapshot is not None:
+                    stop_user_host_service(snapshot[0])
+                stop_host_tree(processes)
+            except (HostServiceError, psutil.Error, OSError, RuntimeError) as exc:
+                raise click.ClickException(str(exc)) from exc
         _record_daemon_stop_requested(record, reason="host_enable", force=False)
         _terminate_daemon(record, force=False)
 
     from omnigent.host.service import HostServiceError, enable_user_host_service
 
     try:
+        environment = _build_host_daemon_env(server_url=resolved_server)
+        if IS_WINDOWS and len(environment.get("PATH", "")) > 8191:
+            click.echo(
+                "Warning: PATH exceeds 8,191 characters; cmd.exe and .cmd harness shims may fail.",
+                err=True,
+            )
         service = enable_user_host_service(
             resolved_server,
-            environment=_build_host_daemon_env(server_url=resolved_server),
+            environment=environment,
         )
     except HostServiceError as exc:
         raise click.ClickException(str(exc)) from exc

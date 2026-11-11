@@ -347,6 +347,23 @@ def test_host_enable_subcommand_installs_user_service(
     assert "Enabled the Omnigent host user service for local" in result.output
 
 
+@pytest.mark.parametrize("length, warned", [(8191, False), (8192, True)])
+def test_windows_host_enable_warns_about_cmd_path_limit(monkeypatch, tmp_path, length, warned):
+    from omnigent.host.service import HostService
+
+    monkeypatch.setattr(cli_module, "IS_WINDOWS", True)
+    monkeypatch.setattr(cli_module, "_find_daemon_record", lambda _: None)
+    monkeypatch.setattr(cli_module, "_build_host_daemon_env", lambda **_: {"PATH": "x" * length})
+    monkeypatch.setattr(
+        "omnigent.host.service.enable_user_host_service",
+        lambda *_, **__: HostService("windows_task", tmp_path / "task.xml", "test-task"),
+    )
+    result = CliRunner().invoke(cli, ["host", "enable", "--server", ""])
+    assert result.exit_code == 0, result.output
+    assert ("PATH exceeds 8,191" in result.output) is warned
+    assert ("Warning:" in result.output) is warned
+
+
 def _record_for(target: str) -> cli_module._HostDaemonRecord:
     """Build a live-looking daemon record for ``target``."""
     return cli_module._HostDaemonRecord(

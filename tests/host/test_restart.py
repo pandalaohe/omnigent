@@ -1,8 +1,5 @@
 """Only a verified supervisor can advertise host restart."""
 
-from pathlib import Path
-from types import SimpleNamespace
-
 import pytest
 
 from omnigent.host import restart
@@ -47,37 +44,15 @@ def test_supervisor_admission(monkeypatch, platform, service, parent, invocation
 
 
 @pytest.mark.parametrize(
-    "disabled,ancestor,enabled",
-    [(False, True, True), (True, True, True), (False, False, True), (False, True, False)],
+    "service,marker,expected",
+    [
+        (True, "windows_task", "windows_task"),
+        (False, "windows_task", None),
+        (True, "", None),
+    ],
 )
-def test_windows_existing_restart_loop(monkeypatch, tmp_path, disabled, ancestor, enabled):
-    tmp_path = tmp_path / "用户"
-    root = tmp_path / ".omnigent" / "autostart"
-    root.mkdir(parents=True)
-    loop = root / "Start-OmnigentHostDefault.ps1"
-    launcher = root / "Launch-OmnigentHost.pyw"
-    loop.write_text("# test loop")
-    launcher.write_text("# test launcher")
-    if disabled:
-        (root / "disabled").touch()
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+def test_windows_task_supervisor_marker(monkeypatch, service, marker, expected):
     monkeypatch.setattr(restart.sys, "platform", "win32")
-    parent = SimpleNamespace(
-        cmdline=lambda: ["pwsh", "-File", str(loop)] if ancestor else ["pwsh"]
-    )
-    monkeypatch.setattr(
-        restart.psutil, "Process", lambda: SimpleNamespace(parents=lambda: [parent])
-    )
-    monkeypatch.setattr(
-        restart.subprocess,
-        "run",
-        lambda *a, **k: SimpleNamespace(
-            returncode=0,
-            stdout=(
-                f'<?xml version="1.0" encoding="UTF-16"?><Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Actions><Exec><Arguments>"{launcher}"</Arguments></Exec></Actions><Settings><Enabled>{str(enabled).lower()}</Enabled></Settings></Task>'
-            ).encode("utf-16"),
-        ),
-    )
-    assert restart.supervisor_kind() == (
-        "windows-wrapper" if ancestor and enabled and not disabled else None
-    )
+    monkeypatch.setattr(restart, "_service_entry", service)
+    monkeypatch.setenv("OMNIGENT_HOST_SERVICE_BACKEND", marker)
+    assert restart.supervisor_kind() == expected
