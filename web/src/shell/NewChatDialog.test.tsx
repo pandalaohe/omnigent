@@ -5459,8 +5459,8 @@ describe("NewChatLandingScreen", () => {
     fireEvent.blur(picker);
     const productIcon = screen.getByTestId("new-chat-landing-agent-icon").querySelector("img");
     const productIconSlot = screen.getByTestId("new-chat-landing-agent-icon");
-    expect(productIconSlot).toHaveClass("h-4");
-    expect(productIconSlot).not.toHaveClass("size-4");
+    expect(productIconSlot).toHaveClass("size-4");
+    expect(productIconSlot).not.toHaveClass("h-4");
     expect(productIcon).toHaveClass("size-4", "-translate-y-[0.5px]");
     const productIconSource = decodeURIComponent(productIcon?.getAttribute("src") ?? "");
     expect(productIconSource).toContain("<title>Claude Code</title>");
@@ -6319,7 +6319,7 @@ describe("NewChatLandingScreen", () => {
 
     await user.hover(workspaceTrigger);
     expect(await screen.findByRole("tooltip", {}, { timeout: 3000 })).toHaveTextContent(
-      "Working directory: /Users/corey/repo",
+      "Working directory: /opt/work/repo",
     );
     fireEvent.click(workspaceTrigger);
     expect(screen.getByTestId("new-chat-landing-workspace-open-folder")).toBeVisible();
@@ -8403,26 +8403,15 @@ describe("NewChatLandingScreen", () => {
       "ask-for-approval",
       "Ask for approval",
       [
-        "--sandbox",
-        "workspace-write",
         "--ask-for-approval",
         "on-request",
+        "--sandbox",
+        "workspace-write",
         "-c",
         'approvals_reviewer="user"',
       ],
     ],
-    [
-      "approve-for-me",
-      "Approve for me",
-      [
-        "--sandbox",
-        "workspace-write",
-        "--ask-for-approval",
-        "on-request",
-        "-c",
-        'approvals_reviewer="auto_review"',
-      ],
-    ],
+    ["approve-for-me", "Approve for me", ["--approve-for-me"]],
     [
       "full-access",
       "Full Access",
@@ -8791,7 +8780,9 @@ describe("NewChatLandingScreen", () => {
       expect(screen.queryByTestId("new-chat-landing-harness-warning")).toBeNull();
 
       fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-      fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+      if (!screen.queryByTestId("new-chat-landing-agent-a_pi")) {
+        fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+      }
       const row = screen.getByTestId("new-chat-landing-agent-a_pi");
       expect(row).not.toHaveAttribute("aria-disabled", "true");
       expect(within(row).queryByTestId("new-chat-landing-agent-warning-a_pi")).toBeNull();
@@ -10336,10 +10327,18 @@ describe("NewChatLandingScreen", () => {
         fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
           target: { files: [file] },
         });
+      // Exercise the durable upload path without an authored inline file position.
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "build the project" },
+      });
       expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
       fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
-      await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
-      const request = authenticatedFetchMock.mock.calls[0][1]!;
+      const creates = () =>
+        authenticatedFetchMock.mock.calls.filter(
+          ([url, init]) => url === "/v1/sessions" && init?.method === "POST",
+        );
+      await waitFor(() => expect(creates()).toHaveLength(1));
+      const request = creates()[0][1]!;
       const body = JSON.parse(
         attachments
           ? ((request.body as FormData).get("metadata") as string)
@@ -12344,8 +12343,21 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
     fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "my-agent" } });
     await chooseCreateAgentModel();
-    fireEvent.click(screen.getByTestId("create-agent-harness"));
-    fireEvent.click(screen.getByRole("option", { name: harnessLabel }));
+    const trigger = screen.getByTestId("agent-member-trigger");
+    if (trigger.getAttribute("data-state") === "closed") {
+      fireEvent.pointerDown(trigger, { button: 0 });
+    }
+    fireEvent.click(screen.getByTestId("agent-member-harness"));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: harnessLabel }));
+    fireEvent.keyDown(screen.getByTestId("agent-member-menu"), { key: "Escape" });
+    fireEvent.pointerDown(screen.getByTestId("agent-member-trigger"), { button: 0 });
+    fireEvent.click(screen.getByTestId("agent-member-model"));
+    fireEvent.click(screen.getByTestId("agent-member-model-other"));
+    fireEvent.change(screen.getByTestId("agent-member-model-input"), {
+      target: { value: "databricks-gpt-5-5" },
+    });
+    fireEvent.keyDown(screen.getByTestId("agent-member-model-input"), { key: "Enter" });
+    fireEvent.keyDown(screen.getByTestId("agent-member-menu"), { key: "Escape" });
     fireEvent.click(screen.getByTestId("create-agent-submit"));
     await waitFor(() => expect(screen.queryByTestId("create-agent-dialog")).toBeNull());
   }
@@ -16055,7 +16067,7 @@ describe("NewChatLandingScreen picker curation", () => {
 
   // Curation is a deployment-wide constraint on what New Chat may start, so it
   // outranks a project's configured agent; the user is told and must choose.
-  it("outranks a project default the deployment does not offer", () => {
+  it("outranks a project default the deployment does not offer", async () => {
     mockClaudeModels([{ id: "opus", displayName: "Opus", isDefault: true }]);
     useProjectsMock.mockReturnValue({
       ...SUCCESS_QUERY_STATE,
@@ -16072,8 +16084,10 @@ describe("NewChatLandingScreen picker curation", () => {
 
     // The project pins Claude Code, which this deployment does not offer: the
     // trigger says so rather than quietly starting on something else.
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-      "Agent unavailable",
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
+        "Agent unavailable",
+      ),
     );
     openPicker();
     expect(row("a1")).toBeNull();
@@ -16126,6 +16140,7 @@ describe("NewChatLandingScreen picker curation", () => {
     openPicker();
 
     expect(row("a2")).toHaveAttribute("data-active", "true");
+    if (!row("a1")) fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
     expect(row("a1")).not.toHaveAttribute("data-active");
     expect(screen.queryByTestId("new-chat-landing-curated")).toBeNull();
     expect(screen.getByText("Harnesses")).toBeVisible();

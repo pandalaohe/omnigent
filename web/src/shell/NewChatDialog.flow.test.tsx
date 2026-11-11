@@ -779,7 +779,9 @@ describe("NewChatLandingScreen create flow", () => {
           renderLanding([], info);
         }
         await waitForWorkspaceSeed();
-        expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this scoped draft");
+        expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(
+          "Keep this scoped draft [file 1] ",
+        );
         expect(screen.getByText("notes.txt")).toBeVisible();
         expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
       } finally {

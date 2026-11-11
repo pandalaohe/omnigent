@@ -2075,7 +2075,9 @@ function ProjectFolder({
           (c) =>
             (c.archived === true) === archived &&
             sessionBelongsToProject(c, { id: projectId, name }, viewerId) &&
-            (archived || !hidePinnedHomeCopies || !pinnedConversationIds.includes(c.id)),
+            (archived ||
+              !hidePinnedHomeCopies ||
+              (!pinnedConversationIds.includes(c.id) && !c.family?.pinned)),
         ),
         activeOverride,
         frozenSortKeys,
@@ -3103,7 +3105,9 @@ function ConversationList({
     // Pinned rows keep their home position when Favorites is removed.
     const allOrdered = sortConversations(
       tabScoped.filter(
-        (c) => !filedIds.has(c.id) && (!hidePinnedHomeCopies || !pinnedSet.has(c.id)),
+        (c) =>
+          !filedIds.has(c.id) &&
+          (!hidePinnedHomeCopies || (!pinnedSet.has(c.id) && !c.family?.pinned)),
       ),
       activeOverride,
       frozenKeys,
@@ -3910,7 +3914,7 @@ function ConversationList({
       for (const c of group.conversations) byId.set(c.id, c);
     }
     return rows
-      .filter((row) => !hidePinnedHomeCopies || !pinnedSet.has(row.id))
+      .filter((row) => !hidePinnedHomeCopies || (!pinnedSet.has(row.id) && !row.family?.pinned))
       .map((row) => byId.get(row.id) ?? row);
   }, [
     recentQuery.data,
@@ -3951,7 +3955,9 @@ function ConversationList({
       if (snapshot === undefined)
         return {
           group,
-          rows: group.conversations.filter((c) => !hidePinnedHomeCopies || !pinnedSet.has(c.id)),
+          rows: group.conversations.filter(
+            (c) => !hidePinnedHomeCopies || (!pinnedSet.has(c.id) && !c.family?.pinned),
+          ),
         };
       const current = new Map(group.conversations.map((c) => [c.id, c] as const));
       const rows: Conversation[] = [];
@@ -3970,11 +3976,18 @@ function ConversationList({
           if (!seen.has(row.id)) rows.push(row);
         }
       }
-      return { group, rows: rows.filter((c) => !hidePinnedHomeCopies || !pinnedSet.has(c.id)) };
+      return {
+        group,
+        rows: rows.filter(
+          (c) => !hidePinnedHomeCopies || (!pinnedSet.has(c.id) && !c.family?.pinned),
+        ),
+      };
     };
     return layout.sections
       .filter(
-        (section) => !grouped || (section.kind !== "projects" && section.kind !== "other_projects"),
+        (section) =>
+          (!grouped && activeTab !== "shared") ||
+          (section.kind !== "projects" && section.kind !== "other_projects"),
       )
       .map((section) => {
         const collapsed = effectiveCollapsedSections.includes(section.id);
@@ -4044,6 +4057,7 @@ function ConversationList({
     hidePinnedHomeCopies,
     favoriteProjectIds,
     grouped,
+    activeTab,
   ]);
 
   // The visible folder copy wins; otherwise the first visible copy in layout
@@ -4160,7 +4174,9 @@ function ConversationList({
     for (const conversations of folderSelectionConversations.values()) {
       for (const c of conversations) byId.set(c.id, c);
     }
-    return [...byId.values()].filter((c) => !hidePinnedHomeCopies || !pinnedSet.has(c.id));
+    return [...byId.values()].filter(
+      (c) => !hidePinnedHomeCopies || (!pinnedSet.has(c.id) && !c.family?.pinned),
+    );
   }, [sections.projectGroups, folderSelectionConversations, pinnedSet, hidePinnedHomeCopies]);
 
   // The bulk-action bar lives under the header of the section it targets, so it
@@ -4434,7 +4450,10 @@ function ConversationList({
     () =>
       favoritesSectionId !== null && collapsedSectionIds.includes(favoritesSectionId)
         ? []
-        : sections.pinned.filter(isPinOrderUnit).map((c) => c.id),
+        : sections.pinned
+            .filter(isPinOrderUnit)
+            .slice(0, SESSION_HOTKEY_DIGITS.length)
+            .map((c) => c.id),
     [sections.pinned, collapsedSectionIds, favoritesSectionId],
   );
   usePinnedSessionHotkeys(pinnedSessionIds, activeId);
@@ -5083,6 +5102,9 @@ function ConversationList({
                                                       }
                                                       gridsEnabled={grids?.enabled ?? false}
                                                       isPinned={pinnedConversationIds.includes(
+                                                        conversation.id,
+                                                      )}
+                                                      shortcutSlot={sessionShortcutSlots.get(
                                                         conversation.id,
                                                       )}
                                                       onClick={onRowClick}
@@ -7130,6 +7152,16 @@ function ConversationMenuItems({
           Mark as read
         </C.Item>
       )}
+      {canCreateAutomation && (
+        <C.Item
+          className="mobile-touch-target"
+          data-testid="create-automation-from-session"
+          onSelect={() => setAutomationOpen(true)}
+        >
+          <ClockPlusIcon className="size-3.5" />
+          Create automation
+        </C.Item>
+      )}
       <C.Item
         data-testid={soundsMuted ? "unmute-sounds-conversation" : "mute-sounds-conversation"}
         onSelect={() => {
@@ -7146,16 +7178,6 @@ function ConversationMenuItems({
         {soundsMuted ? <BellIcon className="size-3.5" /> : <BellOffIcon className="size-3.5" />}
         {soundsMuted ? "Unmute sounds" : "Mute sounds"}
       </C.Item>
-      {canCreateAutomation && (
-        <C.Item
-          className="mobile-touch-target"
-          data-testid="create-automation-from-session"
-          onSelect={() => setAutomationOpen(true)}
-        >
-          <ClockPlusIcon className="size-3.5" />
-          Create automation
-        </C.Item>
-      )}
       {/* The keyboard path for drag-to-reorder within the session's list. */}
       {reorder &&
         (["up", "down"] as const).map((direction) => {

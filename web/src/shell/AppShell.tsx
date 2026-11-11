@@ -1038,6 +1038,8 @@ function AppShellImpl() {
   // selected before its create returns, so a failed create puts this back.
   const railSelection = {
     conversationId,
+    rightRailTab,
+    openPanels,
     terminalKey: selectedTerminalKey,
     filePath: selectedFilePath,
     executionLogsKey,
@@ -1064,6 +1066,8 @@ function AppShellImpl() {
       const now = railSelectionRef.current;
       if (!failed || !before || before.conversationId !== now.conversationId) return;
       if (now.terminalKey !== terminalTabKey(failed)) return;
+      setRightRailTab(before.rightRailTab);
+      setOpenPanels(before.openPanels);
       setSelectedTerminalKey(before.terminalKey);
       setExecutionLogsKey(before.executionLogsKey);
       setFilesPanelOpen(before.filesPanelOpen);
@@ -1081,7 +1085,7 @@ function AppShellImpl() {
           { replace: true },
         );
       }
-      if (!before.rightPanelOpen) setRightPanelOpenAnimated(false);
+      setRightPanelOpenAnimated(before.rightPanelOpen);
     },
     [setSearchParams, setRightPanelOpenAnimated],
   );

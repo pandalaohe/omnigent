@@ -55,6 +55,7 @@ import {
 } from "@/lib/sessionNavigationPreferences";
 import { writePinnedWorkspaceTabs } from "@/lib/workspaceTabPreferences";
 import { dispatchMobileAssistantButton } from "@/lib/mobileAssistantPreferences";
+import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
 
 const runnerHealthState = vi.hoisted(() => ({
   runnerOnline: undefined as boolean | undefined,
@@ -863,6 +864,15 @@ describe("AppShell header", () => {
   it.each([false, true])(
     "opens a newly created phone shell (terminal first=%s)",
     async (terminalFirst) => {
+      const actual = await vi.importActual<typeof UseTerminalsModule>("@/hooks/useTerminals");
+      vi.mocked(useCreateTerminal).mockImplementation(actual.useCreateTerminal);
+      onTestFinished(() => {
+        vi.mocked(useCreateTerminal).mockReturnValue({
+          mutate: vi.fn(),
+          launch: vi.fn(),
+          isPending: false,
+        } as unknown as ReturnType<typeof useCreateTerminal>);
+      });
       const matchMedia = window.matchMedia;
       const viewport = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
         ...matchMedia(query),
@@ -1182,8 +1192,12 @@ describe("AppShell header", () => {
   ])(
     "archive confirmation for an off-window session follows $source",
     async ({ snapshot, backgroundTasks = 0, bound, row, asks }) => {
-      const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) =>
-        Response.json({ id: "conv_off_window", archived: true }),
+      const fetchMock = vi.fn(async (url: RequestInfo | URL, _init?: RequestInit) =>
+        Response.json(
+          String(url).includes("/v1/system/status")
+            ? { revision: 1, level: "ok", findings: [] }
+            : { id: "conv_off_window", archived: true },
+        ),
       );
       vi.stubGlobal("fetch", fetchMock);
       onTestFinished(() => {
@@ -3490,6 +3504,15 @@ describe("Right workspace card visibility", () => {
   });
 
   it("toggles the rail in one press and picks its fixed tabs by number from anywhere", async () => {
+    const baseMatchMedia = window.matchMedia;
+    const viewport = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...baseMatchMedia(query),
+      matches: query === "(min-width: 768px)",
+    }));
+    onTestFinished(() => viewport.mockRestore());
+    writeShortcutPreference("selectWorkspaceTab2", {
+      common: [{ code: "Digit2", modifiers: ["alt"] }],
+    });
     writeWorkspacePanelDefault("collapsed");
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
@@ -3509,9 +3532,11 @@ describe("Right workspace card visibility", () => {
     expect(focus.mock.contexts.at(-1)).toBe(filesTab);
     expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });
     focus.mockRestore();
-    // Alt+2 here (⌃2 on macOS) shows the second fixed tab, wherever focus is.
+    // The configured Alt+2 chord shows the second fixed tab, wherever focus is.
     screen.getByRole("button", { name: "Collapse right panel" }).focus();
-    fireEvent.keyDown(document.activeElement!, { code: "Digit2", key: "2", altKey: true });
+    expect(
+      fireEvent.keyDown(document.activeElement!, { code: "Digit2", key: "2", altKey: true }),
+    ).toBe(false);
     expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
 
     fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
@@ -7090,7 +7115,10 @@ describe("AppShell desktop Close", () => {
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
 
     act(() => sendCommand({ command: "new-terminal", browserViewId: null, closingQuits: false }));
-    act(() => callbacks.onOpen?.(shell));
+    act(() => {
+      useTerminalsMock.mockReturnValue({ terminals: [shell], isLoading: false, error: null });
+      callbacks.onOpen?.(shell);
+    });
     expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
 
     act(() => callbacks.onError?.(new Error("launch failed"), shell));

@@ -102,7 +102,8 @@ describe("SidebarServerPicker", () => {
     renderPicker();
 
     expect(await screen.findByTestId("sidebar-server-picker")).toBeInTheDocument();
-    expect(screen.getByText(window.location.host)).toHaveClass("text-sm");
+    expect(screen.getByText("Server")).toHaveClass("text-sm");
+    expect(screen.queryByText(window.location.host)).toBeNull();
     await openMenu();
     expect(screen.getByTestId("sidebar-profile-menu-settings")).toHaveAttribute(
       "href",
@@ -115,7 +116,7 @@ describe("SidebarServerPicker", () => {
         (key) => key.textContent,
       ),
     ).toEqual(["Ctrl", "Alt", ","]);
-    expect(screen.getByText("Server")).toBeInTheDocument();
+    expect(within(screen.getByRole("menu")).getByText(window.location.host)).toBeInTheDocument();
     expect(screen.queryByText("Connect to new server…")).toBeNull();
     expect(getServerPicker).not.toHaveBeenCalled();
   });
@@ -125,7 +126,8 @@ describe("SidebarServerPicker", () => {
     renderPicker();
 
     expect(await screen.findByTestId("sidebar-server-picker")).toBeInTheDocument();
-    expect(screen.getByText(window.location.host)).toBeInTheDocument();
+    expect(screen.getByTestId("sidebar-server-picker")).toHaveTextContent("Server");
+    expect(screen.queryByText(window.location.host)).toBeNull();
     expect(screen.getByTestId("sidebar-profile-settings")).toHaveAttribute("href", "/settings");
   });
 
@@ -138,7 +140,8 @@ describe("SidebarServerPicker", () => {
     renderPicker();
     await openMenu();
     await waitFor(() => expect(getServerPicker).toHaveBeenCalledTimes(2));
-    expect(screen.getByTestId("sidebar-server-picker")).toHaveAttribute("title", "omni.example");
+    expect(screen.getByTestId("sidebar-server-picker")).not.toHaveAttribute("title");
+    expect(within(screen.getByRole("menu")).getByText("omni.example")).toBeInTheDocument();
   });
 
   it.each([
@@ -156,7 +159,7 @@ describe("SidebarServerPicker", () => {
     supportsNativeServerPicker.mockReturnValue(false);
     renderPicker(["/"], browserServer({ login_url: null }));
     await openMenu();
-    expect(await screen.findByText("Server")).toBeInTheDocument();
+    expect(within(screen.getByRole("menu")).getByText("Server")).toBeInTheDocument();
     expect(screen.queryByTestId("sidebar-server-sign-out")).toBeNull();
   });
 
@@ -216,11 +219,8 @@ describe("SidebarServerPicker", () => {
       "font-medium",
       "text-ui",
     );
-    expect(screen.getByText("localhost:8000")).toHaveClass(
-      "text-left",
-      "text-sm",
-      "text-muted-foreground",
-    );
+    expect(screen.getByText("Server")).toHaveClass("text-left", "text-sm", "text-muted-foreground");
+    expect(screen.queryByText("localhost:8000")).toBeNull();
     expect(screen.getByTestId("sidebar-server-picker")).toHaveClass("h-9");
     expect(screen.getByTestId("sidebar-profile-settings")).toHaveClass("size-9");
     expect(screen.getByTestId("sidebar-profile-settings")).toHaveAttribute("href", "/settings");

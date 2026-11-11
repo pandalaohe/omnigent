@@ -2692,9 +2692,7 @@ function NewChatLandingContent({
       ...(customCatalog.data ?? []).map(customAgentForPicker),
     ]);
     if (curation.restrictToAgentNames.size === 0) return selectable;
-    const allowed = selectable.filter(
-      (agent) => agent.id === callingSeedAgentId || curation.restrictToAgentNames.has(agent.name),
-    );
+    const allowed = selectable.filter((agent) => curation.restrictToAgentNames.has(agent.name));
     const order = [...curation.restrictToAgentNames];
     return allowed.sort((first, second) => order.indexOf(first.name) - order.indexOf(second.name));
   }, [

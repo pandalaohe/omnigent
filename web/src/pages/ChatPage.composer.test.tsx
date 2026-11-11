@@ -4240,6 +4240,7 @@ describe("Composer permission-mode shortcut", () => {
         claudePermissionMode: harness === "devin-native" ? "normal" : "default",
         codexApprovalMode: "ask-for-approval",
       });
+      if (harness === "codex-native") observeCodexMode("ask-for-approval");
       const onSend = vi.fn();
       renderWithTooltips(<Composer {...composerProps({ onSend, ...props })} />);
       return onSend;
@@ -4295,7 +4296,13 @@ describe("Composer permission-mode shortcut", () => {
       fireEvent.change(textarea(), { target: { value: "/permissions" } });
       fireEvent.click(sendButton());
       fireEvent.click(await screen.findByTestId("composer-permission-option-approve-for-me"));
-      await waitFor(() => expect(screen.getByTestId("composer-permission-chip")).toBeDisabled());
+      await waitFor(() => expect(setApproval).toHaveBeenCalledWith("approve-for-me"));
+      // The readback stays inspectable during a write; its choices are disabled.
+      fireEvent.pointerDown(screen.getByTestId("composer-permission-chip"), { button: 0 });
+      expect(screen.getByTestId("composer-permission-option-full-access")).toHaveAttribute(
+        "data-disabled",
+      );
+      fireEvent.keyDown(screen.getByTestId("composer-permission-menu"), { key: "Escape" });
 
       fireEvent.change(textarea(), { target: { value: "/permissions" } });
       fireEvent.click(sendButton());
@@ -7432,9 +7439,9 @@ describe("Composer paste", () => {
 
   it("inserts a text-only paste as typed input", () => {
     render(<Composer {...composerProps()} />);
-    expect(fireEvent.paste(textarea(), pastePayload({ text: "hello world" }))).toBe(true);
+    expect(fireEvent.paste(textarea(), pastePayload({ text: "hello world" }))).toBe(false);
     expect(screen.queryByText(/too large/)).toBeNull();
-    expect(textarea().value).toBe("");
+    expect(textarea().value).toBe("hello world");
   });
 
   it("attaches a pasted file instead of inserting it as text", () => {

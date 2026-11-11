@@ -5155,11 +5155,6 @@ function ComposerImpl(
           }
         }}
       />
-      {/* Background tasks that outlive the turn show as a pill, not the
-          "Working…" shimmer. Floats as an overlay above the composer (the form
-          is `relative`) rather than a flow row, so it never clips the
-          transcript's last line. Self-gates to null otherwise. */}
-      <BackgroundTaskPill />
       {/* Drop cue, spanning the chat column this composer belongs to. */}
       {isDragActive && dropTarget ? <FileDropOverlay container={dropTarget} /> : null}
       {/* The composer stack above the card: trays dock onto the inset

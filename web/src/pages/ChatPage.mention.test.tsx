@@ -570,12 +570,18 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@readme");
     // Before the debounced search returns, the file is the top, highlighted row.
-    expect(screen.getByTestId("file-mention-item-0")).toHaveAttribute("data-active", "true");
+    expect(screen.getByTitle("Attach readme.md").closest('[role="option"]')).toHaveAttribute(
+      "data-active",
+      "true",
+    );
     await waitFor(() =>
       expect(screen.getByTitle("Tag session readme cleanup")).toBeInTheDocument(),
     );
     // The session row was inserted above, but the highlight stayed on the file.
-    expect(screen.getByTestId("file-mention-item-0")).toHaveAttribute("data-active", "true");
+    expect(screen.getByTitle("Attach readme.md").closest('[role="option"]')).toHaveAttribute(
+      "data-active",
+      "true",
+    );
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(tokens()).toEqual(["@readme.md"]);
   });
@@ -1030,7 +1036,10 @@ describe("Composer @-session mentions", () => {
     );
     // The Sessions row, then the "src" folder.
     fireEvent.keyDown(textarea(), { key: "ArrowDown" });
-    expect(screen.getByTestId("file-mention-item-0")).toHaveAttribute("data-active", "true");
+    expect(screen.getByTitle("Open src").closest('[role="option"]')).toHaveAttribute(
+      "data-active",
+      "true",
+    );
     fireEvent.keyDown(textarea(), { key: "Tab" });
     expect(tokens()).toEqual(["@src/"]);
   });
