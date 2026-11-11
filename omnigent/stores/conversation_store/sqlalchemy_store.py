@@ -301,11 +301,18 @@ def _host_binding_admission(method: _BindingWrite) -> _BindingWrite:
                     continue
                 if conversation_id is not None and not undo_archive:
                     for owner_id in (conversation_id, *cascade_bindings):
-                        owner = self.get_conversation(owner_id)
+                        with self._conv_session("check_worktree_admission_owner") as session:
+                            labels = _fetch_labels(
+                                session,
+                                owner_id,
+                                keys=(
+                                    ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY,
+                                    ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
+                                ),
+                            )
                         if (
-                            owner is not None
-                            and ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY in owner.labels
-                            and ARCHIVE_REMOVED_WORKTREE_LABEL_KEY not in owner.labels
+                            ARCHIVE_WORKTREE_ADMISSION_FENCE_LABEL_KEY in labels
+                            and ARCHIVE_REMOVED_WORKTREE_LABEL_KEY not in labels
                         ):
                             raise OmnigentError(
                                 "Worktree removal is unresolved; wait for host confirmation",
@@ -9530,6 +9537,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             SqlConversationMetadata.host_id,
             SqlConversationMetadata.workspace,
             SqlConversationMetadata.git_branch,
+            SqlConversationMetadata.worktree,
         ).where(
             SqlConversationMetadata.workspace_id == current_workspace_id(),
             SqlConversationMetadata.runner_id == runner_id,

@@ -11,13 +11,19 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from sqlalchemy import event, insert, update
+from sqlalchemy import event, insert, select, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
 from omnigent.cli_retention import CliRetentionPolicy
 from omnigent.db.account_authority import account_authority_scope
-from omnigent.db.db_models import SqlHost, SqlUser, current_workspace_id, workspace_scope
+from omnigent.db.db_models import (
+    SqlConversationLabel,
+    SqlHost,
+    SqlUser,
+    current_workspace_id,
+    workspace_scope,
+)
 from omnigent.db.utils import get_or_create_engine, now_epoch, run_write_transaction
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.routes._host_worktree import (
@@ -138,7 +144,15 @@ async def test_session_delete_keeps_shared_sandbox_until_last_binding(
             )
     finally:
         event.remove(conversations._conv_engine, "after_cursor_execute", capture_cleanup)
-    assert deleted_labels == [2, 2, 2, 1]
+    # Metadata admission rejects the deleted host before inserting conversation labels.
+    assert deleted_labels == []
+    with conversations._conv_engine.connect() as connection:
+        assert not connection.execute(
+            select(SqlConversationLabel.key).where(
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id == first.id,
+            )
+        ).all()
     assert conversations.get_conversation(first.id) is None
 
 

@@ -5002,6 +5002,7 @@ def test_reassign_runner_with_host_concurrent_detaches_keep_one_direct_binding(
     from threading import Barrier
 
     from omnigent.db.db_models import current_workspace_id, workspace_scope
+    from omnigent.errors import ErrorCode, OmnigentError
 
     store = conversation_store
     host_id, runner_id = "a" * 32, "runner-shared"
@@ -5023,11 +5024,22 @@ def test_reassign_runner_with_host_concurrent_detaches_keep_one_direct_binding(
                 )
             except ValueError as error:
                 return str(error)
+            except OmnigentError as error:
+                assert error.code == ErrorCode.CONFLICT
+                assert str(error) == "Host admission lease is busy; retry the session operation"
+                return str(error)
         return None
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         outcomes = list(executor.map(detach, [session.id for session in sessions]))
 
+    for index, outcome in enumerate(outcomes):
+        if outcome == "Host admission lease is busy; retry the session operation":
+            with pytest.raises(ValueError, match="Bind the replacement session") as error:
+                store.reassign_runner_with_host(
+                    sessions[index].id, host_id, None, expected_runner_id=runner_id
+                )
+            outcomes[index] = str(error.value)
     assert outcomes.count(None) == 1
     assert [outcome for outcome in outcomes if outcome is not None] == [
         "Bind the replacement session before detaching the managed runner"
