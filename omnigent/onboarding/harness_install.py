@@ -51,6 +51,11 @@ from packaging.version import InvalidVersion, Version
 from omnigent._platform import resolve_cli_binary
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.cli_invocation import cli_invocation
+from omnigent.harness_availability import (
+    HARNESS_BINARY_MISSING,
+    HARNESS_VERSION_TOO_LOW,
+    HarnessAvailability,
+)
 from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
 from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
@@ -724,7 +729,20 @@ def harness_setup_hint(harness: str | None) -> str:
         https://cursor.com/install -fsS | bash`, then run `cursor-agent
         login`"`` for native Cursor, or the ``omni setup`` hint otherwise.
     """
-    spec = required_cli_for_harness(harness or "")
+    key = OPENAI_FAMILY if harness == "codex" else _all_harness_name_to_key().get(harness or "")
+    spec = harness_install_spec(key) if key is not None else None
+    if sys.platform == "win32" and spec is not None and spec.package is not None:
+        binary = harness_cli_binary(key) if key is not None else None
+        if (
+            binary is not None
+            and Path(binary).suffix.lower() == ".cmd"
+            and not Path(binary).with_name("node.exe").is_file()
+            and shutil.which("node") is None
+        ):
+            return (
+                f"make Node.js available on this machine's PATH and restart the Host; "
+                f"the {spec.binary} launcher was found but its Node.js runtime was not"
+            )
     if spec is not None and spec.binary == "agy":
         from omnigent.errors import ErrorCode, OmnigentError
         from omnigent.harnesses.antigravity_native.credentials import (
@@ -865,16 +883,16 @@ def _harness_cli_version_satisfies(
     binary: str,
     timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_S,
 ) -> bool:
-    """Check *binary*'s ``--version`` against *spec*'s declared range.
+    """Return whether the selected binary is version-compatible."""
+    return _harness_cli_version_readiness(spec, binary, timeout) is True
 
-    A missing/unparseable version or a subprocess error is treated as not
-    satisfying the range, so an installed but incompatible CLI is reported
-    as not ready and the setup flow prompts for an upgrade before the
-    runtime gate rejects it.
 
-    :param timeout: Seconds to wait for the ``--version`` subprocess before
-        giving up, e.g. ``10.0`` on the readiness path.
-    """
+def _harness_cli_version_readiness(
+    spec: HarnessInstallSpec,
+    binary: str,
+    timeout: float,
+) -> HarnessAvailability:
+    """Report an old CLI only after parsing a version below its floor."""
     if spec.min_version is None and spec.max_version_exclusive is None:
         return True
     version = _harness_cli_version_string(spec, binary, timeout)
@@ -896,7 +914,7 @@ def _harness_cli_version_satisfies(
     if spec.min_version is not None:
         try:
             if parsed < Version(spec.min_version):
-                return False
+                return HARNESS_VERSION_TOO_LOW
         except InvalidVersion:
             return False
     if spec.max_version_exclusive is not None:
@@ -972,13 +990,20 @@ def harness_cli_installed(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
         ``False`` when it doesn't resolve, the key has no associated CLI,
         or its version falls outside the declared range.
     """
+    return harness_cli_readiness(key, timeout) is True
+
+
+def harness_cli_readiness(
+    key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_S
+) -> HarnessAvailability:
+    """Keep failed probes unavailable without labelling their CLI outdated."""
     spec = harness_install_spec(key)
     if spec is None:
         return False
     binary = harness_cli_binary(key)
     if binary is None:
-        return False
-    return _harness_cli_version_satisfies(spec, binary, timeout)
+        return HARNESS_BINARY_MISSING
+    return _harness_cli_version_readiness(spec, binary, timeout)
 
 
 def harness_cli_version(key: str) -> tuple[str | None, str | None]:
@@ -1050,6 +1075,8 @@ def _harness_cli_version_string(
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
             cwd=probe_cwd,
@@ -1262,6 +1289,8 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=probe_cwd,
         )
     except (OSError, subprocess.TimeoutExpired):

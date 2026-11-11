@@ -236,7 +236,7 @@ def test_cli_harness_configured_only_when_binary_installed(
         ("0.84.1", "0.85.1", True),
         ("0.85.1", "0.84.1", HARNESS_VERSION_TOO_LOW),
         ("0.85.1", None, HARNESS_BINARY_MISSING),
-        ("0.85.1", "unparseable", HARNESS_VERSION_TOO_LOW),
+        ("0.85.1", "unparseable", False),
     ],
 )
 def test_pi_readiness_uses_selected_executable(
@@ -892,7 +892,11 @@ def test_configured_harness_map_reports_version_too_low_for_outdated_clis(
     of being told the binary is missing.
     """
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(hi, "harness_cli_installed", lambda _key, **_kw: False)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, stdout="0.0.0", stderr=""),
+    )
     monkeypatch.setattr(hi, "harness_cli_logged_in", lambda _key, **_kw: True)
     result = configured_harness_map()
     for harness in (
@@ -908,6 +912,29 @@ def test_configured_harness_map_reports_version_too_low_for_outdated_clis(
         assert result[harness] == HARNESS_VERSION_TOO_LOW, (
             f"{harness} should report version-too-low, not binary-missing"
         )
+
+
+@pytest.mark.parametrize("harness", ["pi", "codex"])
+@pytest.mark.parametrize("failure", ["nonzero", "unparseable", "timeout"])
+def test_failed_version_probe_is_not_reported_as_old(
+    monkeypatch: pytest.MonkeyPatch, harness: str, failure: str
+) -> None:
+    from omnigent.onboarding.harness_readiness import _harness_availability
+
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/opt/bin/{name}")
+
+    def probe(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return subprocess.CompletedProcess(
+            argv,
+            int(failure == "nonzero"),
+            stdout="Node.js v24.0.0" if failure == "nonzero" else "invalid",
+            stderr="",
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", probe)
+    assert _harness_availability(harness) is False
 
 
 def test_antigravity_native_requires_credential(

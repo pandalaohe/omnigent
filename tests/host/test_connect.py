@@ -8917,6 +8917,64 @@ async def test_accepted_connect_resets_loopback_refused_streak(
     assert spy.call_count == 6
 
 
+@pytest.mark.parametrize(
+    ("windows", "registered_state"),
+    [(True, "current"), (False, "current"), (True, "unavailable"), (True, "empty")],
+)
+def test_host_startup_refreshes_registered_windows_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, windows: bool, registered_state: str
+) -> None:
+    import omnigent.host.connect as connect
+    from omnigent.terminals import conpty_process
+
+    runtime_dir = tmp_path / "registered-bin"
+    runtime_dir.mkdir()
+    runtime = runtime_dir / ("node.cmd" if os.name == "nt" else "node")
+    runtime.write_text(
+        "@echo off\necho registered-node\n"
+        if os.name == "nt"
+        else f"#!{sys.executable}\nprint('registered-node')\n"
+    )
+    runtime.chmod(0o755)
+    inherited = str(tmp_path / "inherited-bin")
+    monkeypatch.setenv("PATH", inherited)
+    monkeypatch.setenv("OMNIGENT_CODEX_PATH", "selected-codex")
+    monkeypatch.setattr(connect, "IS_WINDOWS", windows)
+
+    def registered() -> dict[str, str]:
+        assert windows, "POSIX startup must keep its caller environment"
+        if registered_state == "unavailable":
+            raise OSError("environment block unavailable")
+        if registered_state == "empty":
+            return {}
+        return {"Path": str(runtime_dir), "OMNIGENT_CODEX_PATH": "other-codex"}
+
+    monkeypatch.setattr(conpty_process, "registered_user_environment", registered)
+
+    def serve(*_args: object, **_kwargs: object) -> bool:
+        child = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import shutil, subprocess; node = shutil.which('node'); "
+                "print(subprocess.check_output([node, '--version'], text=True).strip() "
+                "if node else 'missing')",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert child.stdout.strip() == (
+            "registered-node" if windows and registered_state == "current" else "missing"
+        )
+        assert inherited in os.environ["PATH"].split(os.pathsep)
+        assert os.environ["OMNIGENT_CODEX_PATH"] == "selected-codex"
+        return False
+
+    monkeypatch.setattr(connect, "_serve_host_until_exit", serve)
+    run_host_process(server_url="https://server.example")
+
+
 @pytest.mark.parametrize("console_error", [None, BrokenPipeError(), ValueError("closed")])
 def test_run_host_process_exits_nonzero_on_fatal(
     monkeypatch: pytest.MonkeyPatch,

@@ -46,6 +46,8 @@ class _StdioJsonRpc:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             env=dict(env) if env is not None else None,
             **_proc.spawn_kwargs(),
@@ -194,6 +196,8 @@ def _run_json_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=dict(env) if env is not None else None,
             **_proc.spawn_kwargs(),
         )

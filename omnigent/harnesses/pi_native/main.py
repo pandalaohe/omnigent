@@ -199,10 +199,14 @@ def pi_version(executable: str) -> tuple[int, int, int] | None:
             [*pi_cli_argv(executable), "--version"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5.0,
             creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if IS_WINDOWS else 0,
         )
     except Exception:  # noqa: BLE001
+        return None
+    if result.returncode != 0:
         return None
     # Older Pi (mariozechner package) prints the version to stderr via
     # console.error; newer Pi (earendil-works) prints to stdout via

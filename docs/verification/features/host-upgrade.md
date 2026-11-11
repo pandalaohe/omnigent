@@ -9,6 +9,31 @@ The related component checks are `tests/cli/test_update_check.py`,
 entry point. Synthetic process tables prove selection and recovery branches; they
 do not establish native Windows file-sharing behavior.
 
+Windows Host startup also refreshes PATH from the registered user environment;
+`tests/host/test_connect.py::test_host_startup_refreshes_registered_windows_path`
+checks child runtime discovery and retained command overrides. On POSIX it checks
+the inherited PATH stays unchanged. On Windows, verify the candidate Host starts
+from a stale shell while Node.js is on the registered PATH, and that Codex/Pi
+version checks succeed. A failed version probe must stay unavailable rather than
+report an outdated CLI; a missing Node runtime should name Node.js and PATH in the
+launch error. Native Windows harnesses remain disabled independently of this check.
+
+For a Windows readiness trial, keep `PYTHONUTF8=1` and
+`PYTHONIOENCODING=utf-8`. Let a disposable CLI print its valid version or JSON
+result on stdout and a GBK diagnostic on stderr. The valid result must survive
+the diagnostic, while a nonzero or unparseable version stays unavailable. Check
+genuine UTF-8 account text remains intact. Task Scheduler supervisor admission
+must also accept UTF-16 XML with a non-ASCII launcher path. Mac subprocess tests
+exercise these decoding inputs; they do not prove Windows reader-thread behavior.
+
+An existing Host can re-probe immediately through the authenticated
+`POST /v1/hosts/{host_id}/harnesses/refresh` action. It invalidates version/login
+probe caches and updates the readiness snapshot without restarting the Host.
+The harness setup dialog's **Check again** button invokes this action when that
+phase is available. Re-probing uses the running Host's environment; it cannot
+repair a stale PATH inherited at launch. Record the refreshed map and any new
+decode traceback before deciding whether the operator needs to restart the Host.
+
 For a native Windows trial, install the candidate into a disposable UV_TOOL_DIR and
 UV_TOOL_BIN_DIR. Keep a second process holding a temporary launcher copy open without
 FILE_SHARE_DELETE. Exercise `retained_install` on that disposable layout: a lock
