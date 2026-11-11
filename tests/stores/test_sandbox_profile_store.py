@@ -177,7 +177,11 @@ def test_profile_binding_queries_stay_bounded_with_many_unrelated_labels(store):
         for statement, parameters in queries:
             if statement.lstrip().upper().startswith("SELECT"):
                 assert len(connection.exec_driver_sql(statement, parameters).all()) <= 7
-            if store._conv_engine.dialect.name == "sqlite":
+            # Profile reads seek within one conversation; admission fences span sessions.
+            if (
+                store._conv_engine.dialect.name == "sqlite"
+                and "conversation_labels.conversation_id =" in statement
+            ):
                 plan = str(
                     connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
                 )
