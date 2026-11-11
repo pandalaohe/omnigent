@@ -126,8 +126,17 @@ def test_an_attachment_never_reads_as_a_side_command() -> None:
     assert side_chat.side_chat_question_from_content([attachment]) is None
 
 
-@pytest.mark.parametrize("attachment_type", ["input_file", "input_image", "image"])
-def test_side_command_rejects_attachments(attachment_type: str) -> None:
+@pytest.mark.parametrize("attachment_type", ["input_image", "input_file", "input_audio"])
+def test_side_command_with_multimodal_input_stays_on_main_thread(attachment_type: str) -> None:
+    attachment = {"type": attachment_type, "file_id": "attached-file"}
+    assert (
+        side_chat.side_chat_question_from_content([*_text_items("/side explain this"), attachment])
+        is None
+    )
+
+
+@pytest.mark.parametrize("attachment_type", ["image", "unsupported_attachment"])
+def test_side_command_rejects_unsupported_attachments(attachment_type: str) -> None:
     from omnigent.errors import OmnigentError
 
     attachment = {"type": attachment_type, "file_id": "attached-file"}

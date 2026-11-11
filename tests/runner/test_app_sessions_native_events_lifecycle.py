@@ -5970,7 +5970,7 @@ async def test_events_codex_side_chat_preserves_indentation(
         if not inherited:
             payload["reasoning_effort"] = "max"
     if attachment:
-        payload["content"].append({"type": "input_file", "file_id": "attached-file"})
+        payload["content"].append({"type": "image", "file_id": "attached-file"})
     async with _runner_client(app) as client:
         created = await client.post(
             "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_side"}

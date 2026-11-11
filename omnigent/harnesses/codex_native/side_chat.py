@@ -133,7 +133,8 @@ def side_chat_question_from_content(content: object) -> str | None:
 
     Only typed text counts, never an attachment's contents. The server's owner
     check, the runner and the executor all decide with this one function, so
-    none of them acts on a command the others don't see.
+    none of them acts on a command the others don't see. Multimodal inputs stay
+    on the main thread with their attachments.
 
     :param content: A message body's ``content`` list, e.g.
         ``[{"type": "input_text", "text": "/side why?"}]``.
@@ -141,19 +142,19 @@ def side_chat_question_from_content(content: object) -> str | None:
     :raises OmnigentError: A ``/side`` command includes unsupported attachments.
     """
     question = side_chat_question_from_text(side_chat_text_from_content(content).lstrip())
-    if (
-        question is not None
-        and isinstance(content, list)
-        and any(
-            not isinstance(block, dict) or block.get("type") not in {"text", "input_text"}
-            for block in content
-        )
+    if question is None or not isinstance(content, list):
+        return question
+    multimodal_types = {"input_image", "input_file", "input_audio"}
+    if any(
+        not isinstance(block, dict)
+        or block.get("type") not in {"text", "input_text"} | multimodal_types
+        for block in content
     ):
         raise OmnigentError(
             "Codex /side doesn't support attachments. Remove the attachments and try again.",
             code=ErrorCode.INVALID_INPUT,
         )
-    return question
+    return None if any(block["type"] in multimodal_types for block in content) else question
 
 
 def is_side_chat_child(labels: Mapping[str, str] | None) -> bool:

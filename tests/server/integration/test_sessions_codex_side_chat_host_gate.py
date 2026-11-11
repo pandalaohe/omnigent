@@ -169,7 +169,7 @@ async def test_side_command_with_a_multimodal_block_is_not_gated_as_a_side_chat(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A /side request with attachments is refused before accepting an input."""
+    """A /side message with an image reaches the main thread with its pending input."""
     session_id = await _create_old_host_codex_session(
         client, app, db_uri, name="codex-side-text-image"
     )
@@ -190,6 +190,6 @@ async def test_side_command_with_a_multimodal_block_is_not_gated_as_a_side_chat(
         ],
     )
 
-    assert resp.status_code == 400, resp.text
-    assert "Codex /side doesn't support attachments" in resp.text
-    assert not pending_inputs.has_pending(session_id)
+    assert resp.status_code == 202, resp.text
+    assert resp.json().get("pending_id")
+    assert pending_inputs.has_pending(session_id)
