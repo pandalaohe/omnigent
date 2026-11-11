@@ -4115,6 +4115,15 @@ async def _finish_subscription(
         _refresh_model_from_config(bridge_dir, forwarder_state)
         _refresh_developer_instructions_from_config(bridge_dir, forwarder_state)
         _refresh_effort_from_config(bridge_dir, forwarder_state)
+        # Read app-server liveness before HTTP mirrors can stall on a slow server.
+        await _resync_background_work(
+            codex_client,
+            ap_client,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            thread_id=thread_id,
+            forwarder_state=forwarder_state,
+        )
         await _sync_model_change(ap_client, session_id=session_id, forwarder_state=forwarder_state)
         await _sync_service_tier_change(
             ap_client, session_id=session_id, forwarder_state=forwarder_state
@@ -4134,14 +4143,6 @@ async def _finish_subscription(
             )
         await _sync_codex_approval_mode_change(
             ap_client, session_id=session_id, forwarder_state=forwarder_state
-        )
-        await _resync_background_work(
-            codex_client,
-            ap_client,
-            session_id=session_id,
-            bridge_dir=bridge_dir,
-            thread_id=thread_id,
-            forwarder_state=forwarder_state,
         )
     if forwarder_state is not None and received_live_items:
         forwarder_state.resume_echo_thread_ids.add(thread_id)
