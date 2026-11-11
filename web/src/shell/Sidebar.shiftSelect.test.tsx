@@ -17,6 +17,7 @@ vi.mock("@/hooks/useSessionSwitchHotkey", async (importOriginal) => ({
   useSessionSwitchHotkey: vi.fn(),
 }));
 import { writeProjectFolderCollapse } from "@/lib/projectFolderPaginationPreferences";
+import { writeSessionFilter } from "@/lib/sessionFilterPreferences";
 
 // ── Pure unit tests ─────────────────────────────────────────────────────────
 import { computeShiftSelectRange } from "./Sidebar";
@@ -489,6 +490,57 @@ describe("Sidebar shift-click selection", () => {
     // Delete label carries the owned count (1), diverging from the "2 selected".
     expect(screen.getByRole("button", { name: "Delete 1" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+  });
+
+  it("keeps an archived, family-pinned folder row in cycle navigation and shift selection", async () => {
+    // On the Archived tab a folder lists archived rows; one that is also
+    // family-pinned keeps its home position there (the Favorites section owns
+    // only live copies). Those rows back the folder projection, so hiding them
+    // drops them from cycle navigation, the shift range and the projects pool.
+    writeSessionFilter("archived");
+    projectsMock.push("Alpha");
+    const archivedPinned = (id: string, updatedAt: number, family: string) =>
+      conv(id, {
+        labels: { omni_project: "Alpha" },
+        archived: true,
+        updated_at: updatedAt,
+        family: { id: family, representative_id: id, pinned: true },
+      });
+    const rows = [
+      archivedPinned("a_p1", 300, "fam_a"),
+      archivedPinned("a_p2", 200, "fam_b"),
+      archivedPinned("a_p3", 100, "fam_c"),
+    ];
+    mockConversations(rows);
+    // The folder's own query is the archived slice here (the global mock above
+    // ignores the tab), so the rendered folder holds all three rows.
+    projectSessionsMock.current["Alpha"] = rows;
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Alpha"]));
+    renderSidebar();
+
+    // Cycle navigation walks the folder's projection rows in render order.
+    await screen.findByRole("link", { name: "a_p1" });
+    await waitFor(() => {
+      expect(vi.mocked(useSessionSwitchHotkey).mock.lastCall?.[0]).toEqual([
+        "a_p1",
+        "a_p2",
+        "a_p3",
+      ]);
+    });
+
+    // Projects-scope selection: the pool holds only these archived rows, so
+    // entering the mode must not exit at once, and the range spans all three.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+    expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("link", { name: "a_p1" }));
+    fireEvent.click(screen.getByRole("link", { name: "a_p3" }), { shiftKey: true });
+    await waitFor(() => {
+      expect(screen.getByText("3 selected")).toBeInTheDocument();
+    });
   });
 
   it("normal click after shift-select sets a new anchor", async () => {

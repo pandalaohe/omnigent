@@ -3958,7 +3958,10 @@ function ConversationList({
         return {
           group,
           rows: group.conversations.filter(
-            (c) => !hidePinnedHomeCopies || (!pinnedSet.has(c.id) && !c.family?.pinned),
+            (c) =>
+              !hidePinnedHomeCopies ||
+              c.archived === true ||
+              (!pinnedSet.has(c.id) && !c.family?.pinned),
           ),
         };
       const current = new Map(group.conversations.map((c) => [c.id, c] as const));
@@ -3981,7 +3984,10 @@ function ConversationList({
       return {
         group,
         rows: rows.filter(
-          (c) => !hidePinnedHomeCopies || (!pinnedSet.has(c.id) && !c.family?.pinned),
+          (c) =>
+            !hidePinnedHomeCopies ||
+            c.archived === true ||
+            (!pinnedSet.has(c.id) && !c.family?.pinned),
         ),
       };
     };
@@ -4177,7 +4183,8 @@ function ConversationList({
       for (const c of conversations) byId.set(c.id, c);
     }
     return [...byId.values()].filter(
-      (c) => !hidePinnedHomeCopies || (!pinnedSet.has(c.id) && !c.family?.pinned),
+      (c) =>
+        !hidePinnedHomeCopies || c.archived === true || (!pinnedSet.has(c.id) && !c.family?.pinned),
     );
   }, [sections.projectGroups, folderSelectionConversations, pinnedSet, hidePinnedHomeCopies]);
 
