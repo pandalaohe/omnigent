@@ -328,5 +328,10 @@ def _read_tail(output: IO[bytes]) -> str:
     :returns: The last 2000 characters, with localized console decoding.
     """
     output.seek(0, os.SEEK_END)
-    output.seek(max(0, output.tell() - _OUTPUT_READ_BYTES))
-    return decode_console_output(output.read(_OUTPUT_READ_BYTES))[-_OUTPUT_TAIL_CHARS:]
+    offset = max(0, output.tell() - _OUTPUT_READ_BYTES)
+    output.seek(offset)
+    raw = output.read(_OUTPUT_READ_BYTES)
+    if offset:
+        # A chopped character must not select a different encoding for the tail.
+        raw = raw.partition(b"\n")[2]
+    return decode_console_output(raw)[-_OUTPUT_TAIL_CHARS:]

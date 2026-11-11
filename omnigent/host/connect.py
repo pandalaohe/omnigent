@@ -513,11 +513,11 @@ def _read_log_tail(path: Path, max_bytes: int = _LOG_TAIL_MAX_BYTES) -> str:
                 starts_mid_line = fh.read(1) != b"\n"
             else:
                 fh.seek(0)
-            raw = decode_console_output(fh.read())
+            raw = fh.read()
             if starts_mid_line:
-                # Discard partial first line when seeking into the middle of a line.
-                return "\n".join(raw.splitlines()[1:])
-            return raw
+                # Remove the partial line before it can skew encoding detection.
+                return "\n".join(decode_console_output(raw.partition(b"\n")[2]).splitlines())
+            return decode_console_output(raw)
     except OSError:
         return ""
 

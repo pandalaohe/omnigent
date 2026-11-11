@@ -1212,22 +1212,18 @@ def _read_log_tail(log_path: Path, max_lines: int = 50) -> str:
             size = fh.tell()
             offset = max(0, size - _TAIL_MAX_BYTES)
             fh.seek(offset)
-            raw = decode_console_output(fh.read(_TAIL_MAX_BYTES))
+            raw = fh.read(_TAIL_MAX_BYTES)
     except OSError as exc:
         return f"(could not read log file: {exc})"
-    lines = raw.splitlines()
+    if offset:
+        # Drop the chopped line before encoding detection and redaction: its
+        # missing prefix can otherwise cause mojibake or hide URL credentials.
+        raw = raw.partition(b"\n")[2]
+        if not raw:
+            return "(log tail suppressed: last line exceeds the tail read window)"
+    lines = decode_console_output(raw).splitlines()
     if not lines:
         return "(empty log file)"
-    if offset:
-        # The window starts mid-file, so the first decoded line is (almost
-        # always) the chopped remainder of a longer line. A fragment whose
-        # ``scheme://`` prefix fell outside the window would defeat the
-        # URL-userinfo redaction below and leak ``user:password@host`` —
-        # exactly what this tail promises to scrub — so drop the partial
-        # line entirely: better a missing line than a credential-bearing one.
-        del lines[0]
-        if not lines:
-            return "(log tail suppressed: last line exceeds the tail read window)"
     tail = "\n".join(lines[-max_lines:])
     return redact_secrets(_ANSI_OR_CONTROL.sub("", tail))
 
