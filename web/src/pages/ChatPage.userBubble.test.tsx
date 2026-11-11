@@ -211,7 +211,7 @@ describe("UserBubble system messages", () => {
     );
     // The attachment slots stay in a real bubble while their file URLs load.
     expect(screen.getByTestId("message-bubble")).toBeInTheDocument();
-    expect(screen.getByTestId("user-image-attachments").children).toHaveLength(2);
+    expect(screen.getAllByRole("status", { name: /^Loading image:/ })).toHaveLength(2);
     expect(screen.getByRole("status", { name: "Loading image: shot1.png" })).toHaveClass("size-20");
     expect(screen.getByRole("status", { name: "Loading image: shot2.png" })).toHaveClass("size-20");
     // Upload markers are stripped from the text, and an empty text renders
@@ -241,7 +241,7 @@ describe("UserBubble image attachments", () => {
     expect(screen.getByText("look at this")).toBeInTheDocument();
   });
 
-  it("keeps multiple images above the text bubble in one wrapping row", () => {
+  it("keeps multiple images after the text in authored order", () => {
     renderBubble(
       userBubble("compare these", {
         content: [
@@ -255,16 +255,20 @@ describe("UserBubble image attachments", () => {
       }),
     );
 
-    const row = screen.getByTestId("user-image-attachments");
     const content = screen.getByTestId("user-message-content");
-    expect(row).toHaveClass("flex-wrap", "justify-end");
-    expect(row.querySelectorAll("img")).toHaveLength(4);
-    expect(content).toHaveTextContent("compare these");
-    expect(content).not.toContainElement(row);
-    expect(row.parentElement).toBe(content.parentElement);
+    const images = Array.from(content.querySelectorAll("img"));
+    expect(images).toHaveLength(4);
+    expect(images.map((image) => image.alt)).toEqual([
+      "shot-1.png",
+      "shot-2.png",
+      "shot-3.png",
+      "shot-4.png",
+    ]);
+    const text = screen.getByText("compare these");
+    expect(text.compareDocumentPosition(images[0]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  it("shows images without an empty gray bubble when the message has no text", () => {
+  it("shows an image-only message without an empty text block", () => {
     renderBubble(
       userBubble("", {
         content: [{ type: "input_image", image_url: INLINE_PNG, filename: "only-shot.png" }],
@@ -272,8 +276,9 @@ describe("UserBubble image attachments", () => {
     );
 
     expect(screen.getByRole("button", { name: "Zoom image: only-shot.png" })).toBeInTheDocument();
-    expect(screen.getByTestId("user-image-attachments")).toBeInTheDocument();
-    expect(screen.queryByTestId("user-message-content")).toBeNull();
+    const content = screen.getByTestId("user-message-content");
+    expect(content).toContainElement(screen.getByRole("img", { name: "only-shot.png" }));
+    expect(content.querySelector("p")).toBeNull();
   });
 
   it("keeps file chips and text in the bubble below image attachments", () => {
@@ -287,12 +292,15 @@ describe("UserBubble image attachments", () => {
       }),
     );
 
-    const row = screen.getByTestId("user-image-attachments");
+    const row = screen.getByRole("img", { name: "shot.png" });
     const content = screen.getByTestId("user-message-content");
-    expect(row).toContainElement(screen.getByRole("img", { name: "shot.png" }));
+    expect(content).toContainElement(row);
     expect(content).toHaveTextContent("notes.pdf");
     expect(content).toHaveTextContent("read these");
-    expect(content).not.toContainElement(row);
+    expect(
+      row.compareDocumentPosition(screen.getByText("read these")) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   it("keeps the rest of the message readable when an image block is malformed", () => {
@@ -311,6 +319,7 @@ describe("UserBubble image attachments", () => {
   it("reserves a thumbnail slot while an upload is in flight", () => {
     renderBubble(
       userBubble("uploading", {
+        pending: true,
         content: [
           { type: "input_image", file_id: "pending:shot.png" },
           { type: "input_text", text: "uploading" },

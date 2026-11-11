@@ -17,7 +17,7 @@ import { toast } from "sonner";
 import * as sessionsApi from "@/lib/sessionsApi";
 import * as identity from "@/lib/identity";
 import { useChatStore } from "@/store/chatStore";
-import { workspaceTabAriaShortcut, workspaceTabShortcutKeys } from "@/components/KeyboardShortcut";
+import { workspaceTabAriaShortcut } from "@/components/KeyboardShortcut";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
@@ -31,7 +31,7 @@ import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
-import { emitBrowserActionRequest } from "@/lib/browserActionBus";
+import { emitBrowserActionClaimed } from "@/lib/browserActionBus";
 import { subagentTabId } from "@/lib/subagentTabs";
 import type { Session } from "@/lib/types";
 import { writeShortcutPreference } from "@/lib/keyboardShortcutPreferences";
@@ -194,6 +194,14 @@ afterEach(() => {
   >);
 });
 
+function bindWorkspaceTabNumbers() {
+  for (const digit of [1, 2, 3, 4] as const) {
+    writeShortcutPreference(`selectWorkspaceTab${digit}`, {
+      common: [{ code: `Digit${digit}`, modifiers: [isMacPlatform() ? "control" : "alt"] }],
+    });
+  }
+}
+
 /** Presses the chord that picks the Nth fixed workspace tab; returns whether nothing claimed it. */
 function pressTabNumber(digit: number): boolean {
   return fireEvent.keyDown(document.body, {
@@ -259,6 +267,7 @@ function renderWorkspace(
     permissionLevel?: number | null;
     /** Stands in for the mounted viewer's unsaved-edits check. */
     fileGuard?: FileNavigationGuard;
+    reportTabShortcutOnly?: boolean;
   } = {},
 ) {
   let overrides = initialOverrides;
@@ -266,7 +275,14 @@ function renderWorkspace(
   const onCloseFile = vi.fn();
   const onRightRailTabChange = vi.fn();
   const onBrowserTabOpened = vi.fn();
-  const onTabShortcut = vi.fn();
+  const onTabShortcut = vi.fn((tab) => {
+    if (!initialOverrides.reportTabShortcutOnly) {
+      if (tab === "files" || tab === "changes" || tab === "github")
+        requestSandboxWakeMock("conv_ws");
+      onRightRailTabChange(tab);
+      onReveal();
+    }
+  });
   const onClosePanel = vi.fn();
   const onReveal = vi.fn();
   const openTerminalTab = vi.fn();
@@ -378,6 +394,7 @@ function renderWorkspace(
 
 describe("WorkspacePanel surface presentation", () => {
   it("offers unpinned pages in + without requiring shell or browser support", () => {
+    bindWorkspaceTabNumbers();
     writePinnedWorkspaceTabs(["files", "subagents"]);
     const { onRightRailTabChange } = renderWorkspace({ showGithubTab: true });
 
@@ -497,7 +514,7 @@ describe("WorkspacePanel surface presentation", () => {
     });
     expect(screen.getByRole("tab", { name: "Content search" })).toHaveAttribute(
       "aria-keyshortcuts",
-      "Control+Alt+P 4",
+      "Control+Alt+P",
     );
     fireEvent.keyDown(window, { code: "KeyF", ctrlKey: true, shiftKey: true });
     expect(onRightRailTabChange).not.toHaveBeenCalled();
@@ -530,19 +547,16 @@ describe("WorkspacePanel surface presentation", () => {
     fireEvent.click(searchMenuItem);
     expect(enabled.onRightRailTabChange).toHaveBeenCalledWith("content-search");
     const searchTab = screen.getByRole("tab", { name: "Content search" });
-    expect(searchTab).toHaveAttribute(
-      "aria-keyshortcuts",
-      expect.stringContaining(` ${workspaceTabAriaShortcut("5")}`),
-    );
+    expect(searchTab).toHaveAttribute("aria-keyshortcuts", "Control+Shift+F");
     enabled.onRightRailTabChange.mockClear();
-    pressTabNumber(5);
+    fireEvent.keyDown(searchTab, { key: "5", code: "Digit5" });
     expect(enabled.onRightRailTabChange).toHaveBeenLastCalledWith("content-search");
 
     writePinnedWorkspaceTabs([]);
     enabled.rerender({ rightRailTab: "content-search" });
     expect(screen.getAllByRole("tab")).toHaveLength(2);
     expect(screen.getByRole("tab", { name: "Archive Library" })).toBeInTheDocument();
-    expect(searchTab).toHaveAttribute("aria-keyshortcuts", expect.stringContaining(" 1"));
+    expect(searchTab).toHaveAttribute("aria-keyshortcuts", "Control+Shift+F");
     expect(screen.getByTestId("content-search-stub").parentElement).toHaveClass("flex");
   });
 
@@ -622,6 +636,7 @@ describe("WorkspacePanel surface presentation", () => {
   });
 
   it("asks to wake the sandbox when Files, Changes or Pull Requests is picked, not Agents", () => {
+    bindWorkspaceTabNumbers();
     requestSandboxWakeMock.mockClear();
     writeDefaultWorkspaceTab("changes");
     renderWorkspace({ showGithubTab: true, showBrowserTab: true, rightRailTab: "changes" });
@@ -638,6 +653,7 @@ describe("WorkspacePanel surface presentation", () => {
   });
 
   it("selects fixed tabs by their visible number from anywhere, revealing the rail", () => {
+    bindWorkspaceTabNumbers();
     writeDefaultWorkspaceTab("changes");
     const { onRightRailTabChange, onReveal } = renderWorkspace({
       showGithubTab: true,
@@ -660,8 +676,8 @@ describe("WorkspacePanel surface presentation", () => {
     // No fifth fixed tab: the key passes through.
     expect(pressTabNumber(5)).toBe(true);
     expect(pressTabNumber(4)).toBe(false);
-    // A bare digit types as usual.
-    fireEvent.keyDown(changes, { key: "3", code: "Digit3" });
+    // A bare digit outside the focused strip types as usual.
+    fireEvent.keyDown(document.body, { key: "3", code: "Digit3" });
 
     expect(onRightRailTabChange).toHaveBeenNthCalledWith(1, "files");
     expect(onRightRailTabChange).toHaveBeenNthCalledWith(2, "subagents");
@@ -673,6 +689,7 @@ describe("WorkspacePanel surface presentation", () => {
     { cell: "selected", keyboardTarget: true, calls: 1 },
     { cell: "unselected", keyboardTarget: false, calls: 0 },
   ])("picks a fixed tab by number in a grid's $cell cell only", ({ keyboardTarget, calls }) => {
+    bindWorkspaceTabNumbers();
     writeDefaultWorkspaceTab("changes");
     const { onRightRailTabChange, onReveal } = renderWorkspace({
       contained: true,
@@ -687,6 +704,7 @@ describe("WorkspacePanel surface presentation", () => {
   });
 
   it("compresses numeric positions around unavailable permanent tabs", () => {
+    bindWorkspaceTabNumbers();
     writeDefaultWorkspaceTab("github");
     const { onRightRailTabChange } = renderWorkspace({ showGithubTab: false });
     const files = screen.getByRole("tab", { name: "Files" });
@@ -769,7 +787,7 @@ describe("WorkspacePanel surface presentation", () => {
       expect(tip).toHaveTextContent(tooltip);
       expect(
         Array.from(tip.querySelectorAll('[data-slot="kbd"]')).map((key) => key.textContent),
-      ).toEqual(workspaceTabShortcutKeys(shortcut));
+      ).toEqual(["Ctrl", "Alt", "]", shortcut]);
     },
   );
 
@@ -809,7 +827,9 @@ describe("WorkspacePanel select-tab hotkeys", () => {
     writeShortcutPreference("selectWorkspaceTab2", {
       common: [{ code: "KeyJ", modifiers: ["primary", "shift"] }],
     });
-    const { onRightRailTabChange, onTabShortcut } = renderWorkspace();
+    const { onRightRailTabChange, onTabShortcut } = renderWorkspace({
+      reportTabShortcutOnly: true,
+    });
 
     fireEvent.keyDown(window, { key: "j", code: "KeyJ", ctrlKey: true, shiftKey: true });
 
@@ -1248,8 +1268,8 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     const keycaps = (item: HTMLElement) =>
       Array.from(item.querySelectorAll("kbd"), (key) => key.textContent);
 
-    expect(keycaps(browser)).toEqual([]);
-    expect(keycaps(shell)).toEqual(["Ctrl", "`"]);
+    expect(keycaps(browser)).toEqual(["Ctrl", "Alt", "B"]);
+    expect(keycaps(shell)).toEqual(["Ctrl", "~"]);
   });
 
   it("shows the desktop menu's New Browser Tab chord when the shell owns it", async () => {
@@ -1267,7 +1287,8 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     const browser = await screen.findByRole("menuitem", { name: "Browser" });
     expect(Array.from(browser.querySelectorAll("kbd"), (key) => key.textContent)).toEqual([
       "Ctrl",
-      "T",
+      "Alt",
+      "B",
     ]);
     resetDesktopCommandsForTests();
   });
@@ -1693,13 +1714,13 @@ describe("WorkspacePanel browser tab", () => {
     );
   });
 
-  it("leaves Ctrl+Alt+B alone, since ⌘T opens a browser tab", () => {
+  it("opens a browser tab with the configurable browser binding", () => {
     const { onRightRailTabChange } = renderWorkspace({ showBrowserTab: true });
 
     fireEvent.keyDown(window, { code: "KeyB", ctrlKey: true, altKey: true });
 
-    expect(screen.queryByRole("tab", { name: "Browser 1" })).toBeNull();
-    expect(onRightRailTabChange).not.toHaveBeenCalledWith("browser");
+    expect(screen.getByRole("tab", { name: "Browser 1" })).toBeInTheDocument();
+    expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
   });
 
   it("offers browsers without shell access and creates multiple closable tabs", async () => {
@@ -2359,6 +2380,7 @@ describe("WorkspacePanel desktop menu commands", () => {
   const browserOpenOrNavigate = vi.fn();
 
   beforeEach(() => {
+    resetDesktopCommandsForTests();
     browserClose.mockResolvedValue({ ok: true });
     browserHasView.mockResolvedValue({ exists: false });
     browserOpenOrNavigate.mockResolvedValue({ ok: true });
@@ -2395,6 +2417,7 @@ describe("WorkspacePanel desktop menu commands", () => {
     const { onCloseTerminal } = renderWorkspace({
       openTerminals: ["terminal:zsh"],
       selectedTerminalKey: "terminal:zsh",
+      permissionLevel: 4,
     });
     focusRail();
     close();
@@ -3055,12 +3078,7 @@ describe("WorkspacePanel desktop menu commands", () => {
     const agentTab = await screen.findByRole("tab", { name: "Browser 1" });
     fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
     await waitFor(() => expect(browserHasView).toHaveBeenCalledTimes(2));
-    act(() =>
-      emitBrowserActionRequest(
-        { type: "browser_action_request", actionId: "navigate-2", action: "navigate", args: {} },
-        "conv_agent_kept",
-      ),
-    );
+    act(() => emitBrowserActionClaimed("conv_agent_kept", AGENT_BROWSER_TAB_ID));
     await act(async () => finishLookup({ exists: true, url: "https://example.com/" }));
 
     expect(browserClose).not.toHaveBeenCalled();

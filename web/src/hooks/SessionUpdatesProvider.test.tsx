@@ -1150,9 +1150,7 @@ describe("SessionUpdatesProvider list invalidation", () => {
     });
   }
 
-  it("patches a background session's updated_at bump without refetching the lists", () => {
-    // Running agents bump updated_at on every tick; each list view sorts its
-    // own rows, so a refetch would only re-read every list for nothing.
+  it("holds a background session's updated_at until the delayed order reconciliation", () => {
     vi.useFakeTimers();
     try {
       const client = new QueryClient();
@@ -1166,7 +1164,9 @@ describe("SessionUpdatesProvider list invalidation", () => {
 
       expect(listInvalidations(invalidate)).toEqual([]);
       const rows = client.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
-      expect(rows?.pages[0].data.find((row) => row.id === "conv_b")?.updated_at).toBe(5);
+      expect(rows?.pages[0].data.find((row) => row.id === "conv_b")?.updated_at).toBe(0);
+      act(() => vi.advanceTimersByTime(10_250));
+      expect(listInvalidations(invalidate)).not.toEqual([]);
     } finally {
       vi.useRealTimers();
     }
@@ -1183,8 +1183,10 @@ describe("SessionUpdatesProvider list invalidation", () => {
       renderProvider(client, ["/"]);
       const invalidate = vi.spyOn(client, "invalidateQueries");
       const handler = frameHandler();
-      const tick = (updatedAt: number) => {
-        act(() => handler({ type: "changed", items: [{ id: "conv_b", updated_at: updatedAt }] }));
+      const tick = (counter: number) => {
+        act(() =>
+          handler({ type: "changed", items: [{ id: "conv_b", runner_online: counter % 2 === 0 }] }),
+        );
         act(() => vi.advanceTimersByTime(10_000));
       };
 
@@ -1340,6 +1342,7 @@ describe("SessionUpdatesProvider push-patch refetch policy", () => {
       expect(cached!.pages[0].data[1]!.updated_at).toBe(0);
       expect(conversationsInvalidations(invalidate.mock.calls)).toHaveLength(0);
       act(() => vi.advanceTimersByTime(1));
+      act(() => vi.advanceTimersByTime(250));
       expect(conversationsInvalidations(invalidate.mock.calls)).toHaveLength(1);
       act(() => vi.advanceTimersByTime(15_000));
       expect(conversationsInvalidations(invalidate.mock.calls)).toHaveLength(1);
@@ -1390,7 +1393,7 @@ describe("SessionUpdatesProvider push-patch refetch policy", () => {
         "omnigent.last_context_tokens": "1234",
       });
       expect(listInvalidations(invalidate.mock.calls)).toEqual([]);
-      act(() => vi.advanceTimersByTime(14_700));
+      act(() => vi.advanceTimersByTime(14_950));
       expect(listInvalidations(invalidate.mock.calls)).toHaveLength(3);
     } finally {
       vi.useRealTimers();

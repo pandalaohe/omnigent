@@ -3566,6 +3566,9 @@ export function useConversationRow(id: string | null | undefined): Conversation 
 function findCachedConversationRow(queryClient: QueryClient, id: string): Conversation | undefined {
   return (
     findCachedListRow(queryClient, id) ??
+    queryClient
+      .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+      ?.conversations.find((row) => row.id === id) ??
     queryClient.getQueryData<Conversation | null>(["conversation-backfill", id]) ??
     cachedSessionRow(queryClient, id)
   );

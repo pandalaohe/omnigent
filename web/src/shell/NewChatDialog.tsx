@@ -1860,16 +1860,6 @@ export function AgentHarnessPicker({
     onPrefetchEntries?.(prefetchIds);
   }, [open, openNonce, harnessEntries, agentEntries, queryClient, onPrefetchEntries, prefetchIds]);
   const selectedOtherHarness = moreHarnessEntries.find((agent) => agent.id === effectiveAgentId);
-  const prefetchedOpenRef = useRef(false);
-  useEffect(() => {
-    if (open && !prefetchedOpenRef.current) {
-      for (const agent of [...harnessEntries, ...agentEntries]) {
-        void prefetchAvailableAgentDetails(agent, queryClient);
-      }
-      onPrefetchEntries?.(prefetchIds);
-    }
-    prefetchedOpenRef.current = open;
-  }, [open, harnessEntries, agentEntries, queryClient, onPrefetchEntries, prefetchIds]);
   const otherHarnessLabel =
     selectedOtherHarness && !autoHarnessActive
       ? `Other... (${selectedOtherHarness.display_name})`

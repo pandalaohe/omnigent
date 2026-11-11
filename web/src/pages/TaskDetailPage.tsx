@@ -57,7 +57,11 @@ import { useHosts } from "@/hooks/useHosts";
 import { useProjects } from "@/hooks/useConversations";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { nativeCodingAgentForAvailableAgent } from "@/lib/nativeCodingAgents";
-import { canonicalNativeHarness, nativePermissionOptions } from "@/lib/nativeHarnessModes";
+import {
+  canonicalNativeHarness,
+  nativePermissionOptions,
+  normalizeAgyPermissionTier,
+} from "@/lib/nativeHarnessModes";
 import { formatStatusEffortLabel, formatStatusModelLabel } from "@/lib/composerModelLabel";
 import { formatSessionCostUsd } from "@/lib/formatCost";
 import {
@@ -289,12 +293,17 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const triggerMode = task.sessionMode === "continue" && isTriggerPrompt(task.prompt);
   const paused = task.state === "paused";
   const { userPrompt, systemPrompt } = splitTriggerPrompt(task.prompt);
+  const permissionMode =
+    harness === "antigravity-native"
+      ? normalizeAgyPermissionTier(task.permissionMode)
+      : task.permissionMode;
   const permissionOption = nativePermissionOptions(harness).find(
-    (option) => option.value === task.permissionMode,
+    (option) => option.value === permissionMode,
   );
   // Outside Claude, the default permission choice leaves the CLI configuration unchanged.
   const permissionLabel =
-    !task.permissionMode || (permissionOption?.value === "default" && harness !== "claude-native")
+    !task.permissionMode ||
+    (task.permissionMode === "default" && harness != null && harness !== "claude-native")
       ? "Agent default"
       : (permissionOption?.label ?? task.permissionMode);
   const scheduleSummary = describeSchedule(task.rrule);

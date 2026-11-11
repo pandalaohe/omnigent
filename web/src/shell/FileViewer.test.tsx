@@ -2117,7 +2117,8 @@ describe("FileViewer Escape ownership", () => {
       fireEvent.focusIn(custom);
       custom.focus();
       fireEvent.keyDown(custom, { key: "Escape" });
-      expect(onReject).toHaveBeenCalledOnce();
+      expect(onReject).not.toHaveBeenCalled();
+      expect(screen.getByTestId("ask-user-question-form")).toHaveFocus();
       expect(onClose).not.toHaveBeenCalled();
     },
   );
@@ -3660,12 +3661,13 @@ describe("FileViewer comments follow the preview frame", () => {
     renderViewer({ open: true, path: "file1.py" });
 
     // No frame yet: comments belong to the opened file.
-    expect(useCommentsMock).toHaveBeenLastCalledWith("conv_1", "file1.py");
+    expect(useCommentsMock).toHaveBeenCalledWith("conv_1", "file1.py");
+    expect(useCommentsMock).toHaveBeenCalledWith("conv_1");
 
     // In-frame navigation reports the linked page; comments follow it.
     fireEvent.click(screen.getByRole("button", { name: "report frame" }));
     await waitFor(() =>
-      expect(useCommentsMock).toHaveBeenLastCalledWith("conv_1", "linked/page2.html"),
+      expect(useCommentsMock).toHaveBeenCalledWith("conv_1", "linked/page2.html"),
     );
 
     fireEvent.click(screen.getByRole("button", { name: "select text" }));

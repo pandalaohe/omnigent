@@ -11,7 +11,7 @@ import { FileViewerContext } from "./FileViewerContext";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PANEL_SANDBOX, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
 import { BRIDGE_MSG } from "./htmlCommentBridge";
-import { connectHtmlPreviewBridge, requestedScrollRestore } from "@/test/htmlPreviewBridge";
+import { connectHtmlPreviewBridge } from "@/test/htmlPreviewBridge";
 import { highlightCode } from "@/components/ai-elements/code-block";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
@@ -937,10 +937,10 @@ describe("CodeViewer HTML preview sandbox", () => {
       const opened = (filePath: string, conversationId: string) =>
         viewerElement(html, true, filePath, { viewMode: "preview", conversationId });
       const { rerender } = render(opened(path, "conv_1"));
-      expect(requestedScrollRestore()).toBeNull();
-      const { port, send } = await connectHtmlPreviewBridge(
-        screen.getByTitle<HTMLIFrameElement>("HTML preview"),
+      const { port, send, init } = await connectHtmlPreviewBridge(
+        await screen.findByTitle<HTMLIFrameElement>("HTML preview"),
       );
+      expect(init.restoreScroll).toMatchObject({ top: 0 });
       send({ type: BRIDGE_MSG.scroll, top: 760 });
       // Port messages arrive in order, so the zoom also shows the offset was handled.
       send({ type: BRIDGE_MSG.zoom, action: "in" });
@@ -949,12 +949,20 @@ describe("CodeViewer HTML preview sandbox", () => {
 
       // The content stays loaded, as it does for a cached file.
       rerender(opened(nextPath, nextConversationId));
+      const nextFrame = await connectHtmlPreviewBridge(
+        await screen.findByTitle<HTMLIFrameElement>("HTML preview"),
+      );
       expect(zoomBox().style.transform).toBe("");
-      expect(requestedScrollRestore()).toBeNull();
+      expect(nextFrame.init.restoreScroll).toMatchObject({ top: 0 });
       port.close();
+      nextFrame.port.close();
 
       rerender(opened(path, "conv_1"));
-      expect(requestedScrollRestore()).toMatchObject({ top: 760 });
+      const restored = await connectHtmlPreviewBridge(
+        await screen.findByTitle<HTMLIFrameElement>("HTML preview"),
+      );
+      expect(restored.init.restoreScroll).toMatchObject({ top: 760 });
+      restored.port.close();
     },
   );
 });

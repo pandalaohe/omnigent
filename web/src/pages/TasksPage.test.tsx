@@ -665,7 +665,7 @@ describe("row actions", () => {
     setTasks([task()]);
     renderPage();
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Run now" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Run this automation now" }));
 
     expect(runNowMutate).toHaveBeenCalledWith("st_1", expect.any(Object));
     expect(showToast).not.toHaveBeenCalled();
@@ -678,7 +678,7 @@ describe("row actions", () => {
     setTasks([task()]);
     renderPage();
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Run now" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Run this automation now" }));
 
     expect(runNowMutate).toHaveBeenCalledWith("st_1", expect.any(Object));
     expect(showToast).not.toHaveBeenCalled();

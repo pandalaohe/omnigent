@@ -917,23 +917,19 @@ describe("SubagentsPanel", () => {
     expect(within(childRow(container, "conv_agent")).queryByTestId("rail-agent-badge")).toBeNull();
   });
 
-  it("gives native sub-agent children role/bot icons, not the brand logo", () => {
-    // A native session's sub-agents are all the same brand, so the logo
-    // is reserved for full native sessions; sub-agent rows read by role,
-    // with the generic bot as the fallback.
+  it("gives children without a harness identity role/bot icons", () => {
     mockChildTree({
       conv_root: [
+        childInfo({ id: "conv_generic", tool: "general-purpose" }),
         childInfo({
-          id: "conv_claude_explore",
+          id: "conv_explore",
           title: "Explore:find-the-bug",
           tool: "Explore",
-          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
         }),
       ],
     });
 
     const { container } = renderPanel({ rootSessionId: "conv_root" });
-    expandSubagentsZone(container);
 
     const genericRow = childRow(container, "conv_generic");
     expect(genericRow.querySelector(".lucide-bot")).not.toBeNull();
@@ -975,9 +971,15 @@ describe("SubagentsPanel", () => {
     expect(within(childRow(container, "conv_member")).queryByTestId("rail-agent-badge")).toBeNull();
   });
 
-  it("uses a native sub-agent's role for its icon while keeping its nickname as the label", () => {
+  it("uses native harness icons while keeping sub-agent nicknames as labels", () => {
     mockChildTree({
       conv_root: [
+        childInfo({
+          id: "conv_claude_explore",
+          title: "Explore:find-the-bug",
+          tool: "Explore",
+          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+        }),
         childInfo({
           id: "conv_codex_researcher",
           title: "codex-native-ui-subagent:thread-1",

@@ -5543,33 +5543,6 @@ function ConversationList({
                                                   </TooltipContent>
                                                 </Tooltip>
                                               )}
-                                              <Tooltip>
-                                                <TooltipTrigger asChild>
-                                                  <Button
-                                                    asChild
-                                                    variant="ghost"
-                                                    size="icon-xs"
-                                                    aria-label="New session"
-                                                    data-testid="sessions-new-session"
-                                                    className="text-muted-foreground"
-                                                  >
-                                                    <Link
-                                                      to="/"
-                                                      componentId="sidebar.sessions_new_chat"
-                                                      onClick={(event) => {
-                                                        event.stopPropagation();
-                                                        onActiveTabChange("mine");
-                                                        onRowClick(event);
-                                                      }}
-                                                    >
-                                                      <MessageCirclePlusIcon className="size-3.5" />
-                                                    </Link>
-                                                  </Button>
-                                                </TooltipTrigger>
-                                                <TooltipContent side="bottom">
-                                                  New session
-                                                </TooltipContent>
-                                              </Tooltip>
                                               {!unifiedHeaderOnProjects && selectSessionsButton}
                                               {optionsAction}
                                             </div>

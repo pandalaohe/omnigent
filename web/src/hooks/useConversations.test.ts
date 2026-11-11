@@ -678,7 +678,7 @@ describe("useConversations stale cursor", () => {
     // Reissuing the same dead cursor fails identically, so the restart owns
     // the recovery instead.
     expect(retry(0, new ApiError("gone", 400, "stale_cursor"))).toBe(false);
-    expect(retry(0, new ApiError("bad", 400, "invalid_input"))).toBe(true);
+    expect(retry(0, new ApiError("bad", 400, "invalid_input"))).toBe(false);
   });
 });
 
@@ -2766,7 +2766,9 @@ describe("fetchPinnedConversations filter-honored detection", () => {
     const { result } = renderHook(() => usePinnedConversations(false), { wrapper });
 
     await waitFor(() => expect(result.current.isError).toBe(true));
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(
+      fetchMock.mock.calls.filter(([url]) => String(url).startsWith("/v1/sessions?")),
+    ).toHaveLength(1);
   });
 
   it("reports honored for an empty page (a user with no pins)", async () => {

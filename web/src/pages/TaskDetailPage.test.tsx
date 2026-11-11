@@ -399,7 +399,7 @@ describe("header, prompt, configuration", () => {
     ["antigravity-native", "default", "Agent default"],
     ["native-codex", "read-only", "Read Only"],
     ["cursor-native", "auto-review", "Auto-review"],
-    ["antigravity-native", "skip", "Skip permissions"],
+    ["antigravity-native", "skip", "Full access"],
     ["codex-native", "future-mode", "future-mode"],
     [null, "default", "default"],
     [null, "acceptEdits", "acceptEdits"],
