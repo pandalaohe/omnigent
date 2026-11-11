@@ -669,7 +669,7 @@ def test_release_closes_launcher_zip_opened_by_metadata(
         return any(Path(f.path) == launcher for f in psutil.Process().open_files())
 
     with pytest.raises(importlib.metadata.PackageNotFoundError):
-        importlib.metadata.version("bug271-absent-distribution")
+        importlib.metadata.version("omnigent-absent-distribution-probe")
     assert held(), "importlib.metadata keeps the launcher zip open"
     windows._release_launcher_zip()
     assert not held()
