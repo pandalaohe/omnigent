@@ -34,6 +34,7 @@ def test_child_header_opens_its_parent_panel_over_remembered_files(
     contract.json(f"{child_path}/agent", chat._agent())
     contract.json(f"{child_path}/health", chat._health())
     contract.json(f"{child_path}/child_sessions", list_payload([]))
+    contract.json(f"{child_path}/side_chats", list_payload([]))
     contract.json(f"{child_path}/resources/terminals", list_payload([]))
     contract.json(
         f"{child_path}/resources/environments/default",

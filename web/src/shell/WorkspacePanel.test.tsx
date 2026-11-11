@@ -2070,6 +2070,18 @@ describe("WorkspacePanel mobile side chats", () => {
 describe("WorkspacePanel sub-agent tabs", () => {
   const SUBAGENT_TAB = subagentTabId("conv_child");
 
+  it.each(["conv_side", SUBAGENT_TAB])(
+    "keeps a requested tab selected while its saved tabs restore: %s",
+    (childId) => {
+      useChatStore.setState({ sideChatToOpen: { childId, parentId: "conv_ws" } });
+      const { onRightRailTabChange } = renderWorkspace({ rightRailTab: "sidechat" });
+
+      expect(useChatStore.getState().sideChatToOpen).toBeNull();
+      expect(readSessionWorkspaceState("conv_ws").selectedSideChatId).toBe(childId);
+      expect(onRightRailTabChange).toHaveBeenLastCalledWith("sidechat");
+    },
+  );
+
   function clientWithSubagent(title = "Research agent", labels: Record<string, string> = {}) {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     queryClient.setQueryData(["session", "conv_child"], {

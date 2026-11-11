@@ -347,10 +347,12 @@ def test_switching_to_chat_does_not_type_into_the_hidden_terminal(
     page: Page, cli_bridge: tuple[Locator, list[bytes]]
 ) -> None:
     _, inputs = cli_bridge
+    page.set_viewport_size({"width": 390, "height": 844})
     page.get_by_role("button", name="Conversation actions", exact=True).tap()
     page.get_by_role("menuitem", name="Chat", exact=True).tap()
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible()
+    page.set_viewport_size({"width": 390, "height": 508})
 
     page.get_by_role("button", name="Open floating assistant", exact=True).tap()
     page.get_by_role("button", name="Phrase", exact=True).tap()

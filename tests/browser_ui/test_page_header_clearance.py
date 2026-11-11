@@ -12,6 +12,7 @@ from omnigent.server.child_idle import DEFAULT_CHECKIN_INSTRUCTIONS
 from tests.browser_ui.chat.conftest import chat_session_contract as chat_session_contract
 from tests.browser_ui.chat.session_contract import ChatSessionContract
 from tests.browser_ui.conftest import BrowserContract
+from tests.browser_ui.test_sessions_appearance import appearance_features as appearance_features
 from tests.browser_ui.test_sessions_appearance import appearance_url as appearance_url
 
 
@@ -162,6 +163,8 @@ def test_sidebar_page_scroll_viewport_clears_mobile_navigation(
 ) -> None:
     page.set_viewport_size({"width": 390, "height": 844})
     page.goto(f"{pages_url}{route}")
+    if route == "/tasks":
+        page.get_by_role("button", name="Maybe later", exact=True).click()
     if route == "/settings/system-status":
         expect(page).to_have_url(f"{pages_url}/system?monitor=1")
         monitor = page.get_by_role("dialog", name="Monitor settings", exact=True)
@@ -455,6 +458,7 @@ _PAGE_SCROLL_CALLERS = [
     ("/inbox", "Inbox", "InboxPage.tsx"),
     ("/system", "System status", "SystemStatusPage.tsx"),
     ("/settings/general", "General", "SettingsPage.tsx"),
+    ("/settings/admin", "Admin settings", "AdminGeneralPage.tsx"),
     ("/settings/system-status", "System status", "SettingsPage.tsx"),
     ("/settings/instructions", "Startup prompts", "InstructionsPage.tsx"),
     ("/settings/policies", "Global Policies", "PoliciesPage.tsx"),
@@ -487,7 +491,17 @@ def test_page_clearance_uses_shared_threshold(
             "localStorage.setItem('omnigent:session-navigation', "
             "JSON.stringify({showTaskBoard: false}))"
         )
-    if route in ("/settings/members", "/settings/sharing"):
+    if route == "/settings/admin":
+        browser_contract.json(
+            "/v1/info",
+            {
+                "accounts_enabled": False,
+                "single_user": True,
+                "sibling_sessions": True,
+                "features": {},
+            },
+        )
+    elif route in ("/settings/members", "/settings/sharing"):
         browser_contract.json(
             "/v1/info",
             {"accounts_enabled": False, "single_user": False, "features": {}},
@@ -524,6 +538,8 @@ def test_page_clearance_uses_shared_threshold(
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.set_viewport_size({"width": 768, "height": 390})
     page.goto(f"{pages_url}{route}")
+    if route == "/tasks":
+        page.get_by_role("button", name="Maybe later", exact=True).click()
     if route == "/settings/system-status":
         expect(page).to_have_url(f"{pages_url}/system?monitor=1")
         monitor = page.get_by_role("dialog", name="Monitor settings", exact=True)
@@ -630,7 +646,7 @@ def test_sidebar_surfaces_with_their_own_headers(
         first_row = page.get_by_role("heading", name="Archived sessions", exact=True)
     else:
         page.goto(chat.url)
-        first_row = page.get_by_role("navigation", name="Conversation", exact=True)
+        first_row = page.get_by_test_id("mobile-header-controls-slot")
     expect(first_row).to_be_visible()
     menu = (
         page.get_by_role("button", name="Back", exact=True)

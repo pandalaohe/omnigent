@@ -782,7 +782,7 @@ def test_chat_width_scales_while_prose_remains_readable(
     expect(page.get_by_text("Responsive prose width marker.", exact=False)).to_be_visible()
     expect(page.locator("table")).to_be_visible()
     widths = page.evaluate(
-        """() => {
+        """proseCh => {
           const frame = document.querySelector('.chat-conversation-content');
           const composer = document.querySelector('[data-composer-card]');
           const workspace = document.querySelector(
@@ -795,16 +795,19 @@ def test_chat_width_scales_while_prose_remains_readable(
           const paragraph = prose.querySelector('.chat-markdown > p');
           const font = getComputedStyle(paragraph);
           const measure = document.createElement('span');
-          measure.style.cssText = 'display: inline-block; width: 1ch';
+          measure.style.cssText = `display: inline-block; width: ${proseCh}ch`;
           paragraph.append(measure);
-          const ch = measure.getBoundingClientRect().width;
+          const proseLimit = measure.getBoundingClientRect().width;
+          measure.style.width = '80ch';
+          const narrowProseLimit = measure.getBoundingClientRect().width;
           measure.remove();
           return {
             frame: frame.getBoundingClientRect().width,
             inner: frame.clientWidth
               - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
             prose: paragraph.getBoundingClientRect().width,
-            ch,
+            proseLimit,
+            narrowProseLimit,
             fontSize: parseFloat(font.fontSize),
             table: table.getBoundingClientRect().width,
             tableProse: table.querySelector('.chat-markdown > p').getBoundingClientRect().width,
@@ -813,10 +816,11 @@ def test_chat_width_scales_while_prose_remains_readable(
             composerLeft: composer.getBoundingClientRect().left,
             frameLeft: frame.getBoundingClientRect().left,
           };
-        }"""
+        }""",
+        arg=prose_ch,
     )
     assert widths["frame"] == pytest.approx(expected_frame, abs=TOLERANCE)
-    expected_prose = min(widths["inner"], prose_ch * widths["ch"])
+    expected_prose = min(widths["inner"], widths["proseLimit"])
     assert widths["fontSize"] == font_size
     assert widths["prose"] == pytest.approx(expected_prose, abs=TOLERANCE)
     assert widths["table"] == pytest.approx(widths["inner"], abs=TOLERANCE)
@@ -844,7 +848,9 @@ def test_chat_width_scales_while_prose_remains_readable(
         )
         for marker in ("Responsive prose width marker.", "Responsive table width marker."):
             paragraph = page.get_by_text(marker, exact=False)
-            assert box(paragraph)["width"] == pytest.approx(80 * widths["ch"], abs=TOLERANCE)
+            assert box(paragraph)["width"] == pytest.approx(
+                widths["narrowProseLimit"], abs=TOLERANCE
+            )
 
 
 def test_composer_fits_available_space_while_resizing(

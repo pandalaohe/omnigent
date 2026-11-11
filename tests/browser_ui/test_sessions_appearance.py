@@ -419,7 +419,7 @@ def test_ui_font_family_applies_and_persists(page: Page, appearance_url: str) ->
 
     # The choice survives a full reload (persisted + re-applied before paint).
     page.reload()
-    expect(page.get_by_role("group", name="Font family", exact=True)).to_be_visible(timeout=30_000)
+    expect(page.get_by_test_id("ui-font-family-input")).to_be_visible(timeout=30_000)
     expect(page.get_by_test_id("ui-font-family-input")).to_have_value("Georgia")
     assert _ui_font_family(page).startswith("Georgia"), "family was not restored after reload"
 

@@ -51,6 +51,7 @@ def test_open_folder_and_file_in_app(
     tmp_path: Path,
 ) -> None:
     session = seeded_session
+    page.add_init_script("localStorage.setItem('omnigent:workspace-panel-widen-for-content', '0')")
     sid = session.session_id
     path = (
         "src/components/file-browser/toolbars/main.md"

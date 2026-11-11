@@ -1221,7 +1221,7 @@ function WorkspacePanelImpl({
   // A side chat the server just created (Codex's native fork, or the generic
   // fork) announces itself via `sideChatToOpen`. If a pending tab is awaiting,
   // rekey it in place; otherwise open a fresh tab. AppShell reveals the rail.
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (sideChatToOpen === null) return;
     // Only the parent that owns this side chat consumes (and clears) the signal
     // — a fork that resolves after the user navigated elsewhere waits for its
@@ -1594,7 +1594,9 @@ function WorkspacePanelImpl({
   useEffect(() => {
     if (
       ((rightRailTab === "browser" && browsers.selected === null) ||
-        (rightRailTab === "sidechat" && sideChats.selected === null)) &&
+        (rightRailTab === "sidechat" &&
+          sideChats.selected === null &&
+          sideChatToOpen?.parentId !== conversationId)) &&
       selectedFilePath === null &&
       selectedTerminalKey === null
     ) {
@@ -1604,6 +1606,8 @@ function WorkspacePanelImpl({
     rightRailTab,
     browsers.selected,
     sideChats.selected,
+    sideChatToOpen,
+    conversationId,
     selectedFilePath,
     selectedTerminalKey,
     browserFallbackTab,

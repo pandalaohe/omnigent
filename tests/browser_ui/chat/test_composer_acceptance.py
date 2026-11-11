@@ -183,7 +183,9 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
             "button", name=re.compile(r"^(?:Conversation|Session) actions$")
         )
         menu_button.click()
-        expect(page.get_by_label("Working directory: /work/repo", exact=True)).to_have_text("repo")
+        expect(
+            page.get_by_role("menu").get_by_label("Working directory: /work/repo", exact=True)
+        ).to_have_text("repo")
         page.get_by_role("menuitem", name="Pull Requests", exact=True).click()
         panel = page.get_by_test_id("github-panel-drawer")
         expect(panel).to_have_attribute("data-state", "open")
