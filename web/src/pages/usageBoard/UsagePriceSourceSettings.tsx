@@ -110,12 +110,27 @@ export function UsagePriceSourceSettings() {
           </span>
         )}
       </div>
-      {current?.source === "custom" ? (
-        <p className="mt-1 break-all text-xs text-muted-foreground">{current.url}</p>
+      {current?.url ? (
+        <p className="mt-1 break-all text-xs text-muted-foreground">
+          {current.format ? PRICE_SOURCE_NAMES[current.format] : "Custom URL"} · {current.url}
+        </p>
       ) : null}
       {current?.fetched_at ? (
         <p className="mt-1 text-xs text-muted-foreground">
-          {current.model_count.toLocaleString()} models · {formatShortDate(current.fetched_at)}
+          {current.model_count.toLocaleString(undefined, { maximumSignificantDigits: 3 })} models
+          {" · "}Fetched {formatShortDate(current.fetched_at)}
+        </p>
+      ) : current && current.source !== "builtin" ? (
+        <p className="mt-1 text-xs text-muted-foreground">Fetched: Never</p>
+      ) : null}
+      {current && current.source !== "builtin" ? (
+        <p className="mt-1 text-xs text-muted-foreground">
+          Version: {current.version ?? "Unknown"} ·{" "}
+          {current.state === "fresh"
+            ? "Fresh"
+            : current.state === "stale"
+              ? "Stale · last good prices remain in use"
+              : "Unavailable · using built-in catalog"}
         </p>
       ) : null}
       {message ? (
@@ -143,7 +158,8 @@ export function UsagePriceSourceSettings() {
           <DialogHeader>
             <DialogTitle>Add price source</DialogTitle>
             <DialogDescription>
-              Choose a public price map. A valid first reading is required.
+              Choose a price map. HTTPS is required except for private-network HTTP hosts. A valid
+              first reading is required.
             </DialogDescription>
           </DialogHeader>
           <form
@@ -170,9 +186,9 @@ export function UsagePriceSourceSettings() {
               </select>
             </label>
             <label className="grid gap-1.5 text-sm">
-              HTTPS URL
+              URL
               <Input
-                aria-label="Price map HTTPS URL"
+                aria-label="Price map URL"
                 type="url"
                 required
                 value={url}
