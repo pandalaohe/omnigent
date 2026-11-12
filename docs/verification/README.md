@@ -22,6 +22,7 @@ app; component checks use their own isolated test environment.
   Stop through chat interrupt, and window-owned action claims.
 
 Record the checkout revision, command, result and evidence location for each run.
+- [Purchase baseline API](features/usage-pricing.md): saved cards, FX, payment allocation and quota observations.
 An HTML preview with fake data proves the shown component interactions, rather
 than a deployed host or a live provider. Clean up only the test processes and
 temporary directories the run created.

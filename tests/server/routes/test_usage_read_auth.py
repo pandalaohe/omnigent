@@ -74,6 +74,7 @@ def test_usage_scope_never_inherits_session_or_write_authority() -> None:
         ("/v1/usage-events", "POST"),
         ("/v1/usage-events/child", "GET"),
         ("/v1/sessions", "GET"),
+        ("/v1/me/usage/analysis", "GET"),
         ("/v1/runners", "POST"),
         ("/auth/users", "GET"),
         # Only the receipts page joins the one read path; every other cutover
@@ -235,6 +236,7 @@ def test_usage_key_reads_and_writes_only_usage(
         ("GET", "/v1/usage-cutover/receipts"),
         ("GET", "/v1/me/usage"),
         ("GET", "/v1/me/usage/activity"),
+        ("GET", "/v1/me/usage/analysis"),
         ("GET", "/v1/me/usage/issues"),
         ("GET", "/v1/me/usage/models"),
         ("PUT", "/v1/me/usage/accounts/vendor"),

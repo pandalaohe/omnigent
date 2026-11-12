@@ -2173,6 +2173,9 @@ def create_app(
         UsageHoursStore,
         configure_usage_hours,
     )
+    from omnigent.stores.usage_pool_store import UsagePoolStore
+    from omnigent.stores.usage_pricing_store import UsagePricingStore
+    from omnigent.stores.usage_quota_closings import UsageQuotaClosingStore
     from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
     from omnigent.usage.activity import MarkSettings
 
@@ -2198,6 +2201,9 @@ def create_app(
         UsageSnapshotStore(conversation_store.storage_location),
         usage_enabled=usage_module_enabled(resolved_server_config),
         hours_store=usage_hours_store,
+        pool_store=UsagePoolStore(conversation_store.storage_location),
+        pricing_store=UsagePricingStore(conversation_store.storage_location),
+        quota_closing_store=UsageQuotaClosingStore(conversation_store.storage_location),
         mark_settings=usage_mark,
         agent_store=agent_store,
         agent_cache=agent_cache,

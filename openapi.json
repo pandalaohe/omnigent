@@ -812,6 +812,467 @@
         "title": "AgentSettingWriteRequest",
         "type": "object"
       },
+      "AnalysisAccountTotal": {
+        "properties": {
+          "account_id": {
+            "title": "Account Id",
+            "type": "string"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/AnalysisTotals"
+          }
+        },
+        "required": [
+          "account_id",
+          "totals"
+        ],
+        "title": "AnalysisAccountTotal",
+        "type": "object"
+      },
+      "AnalysisParentTotal": {
+        "properties": {
+          "parent_account_id": {
+            "title": "Parent Account Id",
+            "type": "string"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/AnalysisTotals"
+          }
+        },
+        "required": [
+          "parent_account_id",
+          "totals"
+        ],
+        "title": "AnalysisParentTotal",
+        "type": "object"
+      },
+      "AnalysisRowView": {
+        "description": "One model-hour row of an analysis window, with its pool attribution.",
+        "properties": {
+          "account_id": {
+            "title": "Account Id",
+            "type": "string"
+          },
+          "attributed": {
+            "default": false,
+            "title": "Attributed",
+            "type": "boolean"
+          },
+          "basis": {
+            "title": "Basis",
+            "type": "string"
+          },
+          "cache_creation_input_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Creation Input Tokens"
+          },
+          "cache_read_input_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Read Input Tokens"
+          },
+          "channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel"
+          },
+          "contributes_money": {
+            "default": false,
+            "title": "Contributes Money",
+            "type": "boolean"
+          },
+          "contributes_usage": {
+            "default": false,
+            "title": "Contributes Usage",
+            "type": "boolean"
+          },
+          "cost_usd": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Usd"
+          },
+          "coverage": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coverage"
+          },
+          "failed": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failed"
+          },
+          "host_id": {
+            "default": "",
+            "title": "Host Id",
+            "type": "string"
+          },
+          "hour": {
+            "format": "int64",
+            "title": "Hour",
+            "type": "integer"
+          },
+          "model": {
+            "default": "",
+            "title": "Model",
+            "type": "string"
+          },
+          "output_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Tokens"
+          },
+          "parent_account_id": {
+            "title": "Parent Account Id",
+            "type": "string"
+          },
+          "pool_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pool Id"
+          },
+          "priced": {
+            "default": false,
+            "title": "Priced",
+            "type": "boolean"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "reasoning_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Tokens"
+          },
+          "requests": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requests"
+          },
+          "tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tokens"
+          },
+          "uncached_input_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Uncached Input Tokens"
+          }
+        },
+        "required": [
+          "account_id",
+          "parent_account_id",
+          "hour",
+          "basis"
+        ],
+        "title": "AnalysisRowView",
+        "type": "object"
+      },
+      "AnalysisSpan": {
+        "description": "The bounded window one analysis read covers.",
+        "properties": {
+          "approx": {
+            "title": "Approx",
+            "type": "boolean"
+          },
+          "counted_from": {
+            "format": "int64",
+            "title": "Counted From",
+            "type": "integer"
+          },
+          "requested_from": {
+            "format": "double",
+            "title": "Requested From",
+            "type": "number"
+          },
+          "until": {
+            "format": "double",
+            "title": "Until",
+            "type": "number"
+          }
+        },
+        "required": [
+          "requested_from",
+          "counted_from",
+          "until",
+          "approx"
+        ],
+        "title": "AnalysisSpan",
+        "type": "object"
+      },
+      "AnalysisTotals": {
+        "description": "The nullable figures one grouped analysis value reports.\n\nA figure that a source did not report stays `None`; a reported zero is a\nknown zero and survives as `0`.",
+        "properties": {
+          "cost_coverage_pct": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Coverage Pct"
+          },
+          "cost_usd": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Usd"
+          },
+          "counted_cost_usd": {
+            "default": 0.0,
+            "format": "double",
+            "title": "Counted Cost Usd",
+            "type": "number"
+          },
+          "covered_cost_usd": {
+            "default": 0.0,
+            "format": "double",
+            "title": "Covered Cost Usd",
+            "type": "number"
+          },
+          "covered_tokens": {
+            "default": 0,
+            "format": "int64",
+            "title": "Covered Tokens",
+            "type": "integer"
+          },
+          "failed": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failed"
+          },
+          "failure_pct": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Pct"
+          },
+          "last_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last At"
+          },
+          "metered": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AnalysisTotals"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "partial_rows": {
+            "default": 0,
+            "format": "int64",
+            "title": "Partial Rows",
+            "type": "integer"
+          },
+          "per_million": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Per Million"
+          },
+          "reasons": {
+            "additionalProperties": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "title": "Reasons",
+            "type": "object"
+          },
+          "requests": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requests"
+          },
+          "tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tokens"
+          },
+          "tokens_complete": {
+            "default": false,
+            "title": "Tokens Complete",
+            "type": "boolean"
+          },
+          "unpriced": {
+            "default": 0,
+            "format": "int64",
+            "title": "Unpriced",
+            "type": "integer"
+          }
+        },
+        "title": "AnalysisTotals",
+        "type": "object"
+      },
+      "AnalysisUnmapped": {
+        "description": "Rows held at the parent with a reason instead of being divided.",
+        "properties": {
+          "count": {
+            "default": 0,
+            "format": "int64",
+            "title": "Count",
+            "type": "integer"
+          },
+          "reasons": {
+            "additionalProperties": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "title": "Reasons",
+            "type": "object"
+          },
+          "rows": {
+            "default": 0,
+            "format": "int64",
+            "title": "Rows",
+            "type": "integer"
+          }
+        },
+        "title": "AnalysisUnmapped",
+        "type": "object"
+      },
       "ArchivedSessionFacetsResponse": {
         "description": "Compact filter values for `GET /v1/sessions/archived-facets`.",
         "properties": {
@@ -7627,6 +8088,87 @@
         "title": "PolicySummary",
         "type": "object"
       },
+      "PoolCatalogEntry": {
+        "description": "One observed pool, listed even while its usage stays unavailable.\n\n`usage_available` states whether a proven `usage` channel exists for the\npool; a quota-only or monetary-only pool keeps its catalog row with\n`usage_available` false while its value/tokens read as unknown.",
+        "properties": {
+          "channels": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Channels",
+            "type": "array"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "effective_from_hour": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Effective From Hour"
+          },
+          "parent_account_id": {
+            "title": "Parent Account Id",
+            "type": "string"
+          },
+          "pool_id": {
+            "title": "Pool Id",
+            "type": "string"
+          },
+          "usage_available": {
+            "default": false,
+            "title": "Usage Available",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "parent_account_id",
+          "pool_id",
+          "display_name"
+        ],
+        "title": "PoolCatalogEntry",
+        "type": "object"
+      },
+      "PoolTotalView": {
+        "description": "A pool's own actual rows, kept per destination and channel.",
+        "properties": {
+          "account_id": {
+            "title": "Account Id",
+            "type": "string"
+          },
+          "channel": {
+            "title": "Channel",
+            "type": "string"
+          },
+          "parent_account_id": {
+            "title": "Parent Account Id",
+            "type": "string"
+          },
+          "pool_id": {
+            "title": "Pool Id",
+            "type": "string"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/AnalysisTotals"
+          }
+        },
+        "required": [
+          "parent_account_id",
+          "pool_id",
+          "account_id",
+          "channel",
+          "totals"
+        ],
+        "title": "PoolTotalView",
+        "type": "object"
+      },
       "PresenceViewer": {
         "description": "One user currently viewing a session (holding its SSE stream open).",
         "properties": {
@@ -7701,6 +8243,74 @@
         "title": "PriceSourceSelection",
         "type": "object"
       },
+      "PricingBaseline": {
+        "additionalProperties": false,
+        "properties": {
+          "cards": {
+            "items": {
+              "$ref": "#/components/schemas/PurchasedCard"
+            },
+            "maxItems": 2048,
+            "title": "Cards",
+            "type": "array"
+          },
+          "defaults": {
+            "$ref": "#/components/schemas/PricingDefaults"
+          },
+          "revision": {
+            "default": 0,
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Revision",
+            "type": "integer"
+          }
+        },
+        "title": "PricingBaseline",
+        "type": "object"
+      },
+      "PricingDefaults": {
+        "additionalProperties": false,
+        "properties": {
+          "default_discount": {
+            "default": "0.8",
+            "title": "Default Discount",
+            "type": "string"
+          },
+          "display_currency": {
+            "default": "USD",
+            "enum": [
+              "CNY",
+              "USD",
+              "HKD"
+            ],
+            "title": "Display Currency",
+            "type": "string"
+          },
+          "fx_to_display": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "enum": [
+                "CNY",
+                "USD",
+                "HKD"
+              ]
+            },
+            "title": "Fx To Display",
+            "type": "object"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "format": "int64",
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "title": "PricingDefaults",
+        "type": "object"
+      },
       "ProjectOrderRequest": {
         "description": "Rank owned project IDs; unranked projects append in discovery order.\n\nNull selects alphabetical mode without erasing the remembered manual IDs.\nThe serialized preference must fit in 65,535 bytes after compression and\nframing; lists below the 10,000-ID limit can still exceed this byte limit.",
         "properties": {
@@ -7760,6 +8370,123 @@
           "ordered_project_ids"
         ],
         "title": "ProjectOrderResponse",
+        "type": "object"
+      },
+      "PurchasedCard": {
+        "additionalProperties": false,
+        "properties": {
+          "allowance_usd": {
+            "title": "Allowance Usd",
+            "type": "string"
+          },
+          "discount_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Discount Override"
+          },
+          "id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9:_.-]*$",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "parent_account_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9:_.-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Account Id"
+          },
+          "period_kind": {
+            "enum": [
+              "week",
+              "month",
+              "month_weekly_reset"
+            ],
+            "title": "Period Kind",
+            "type": "string"
+          },
+          "purchase_currency": {
+            "default": "CNY",
+            "enum": [
+              "CNY",
+              "USD",
+              "HKD"
+            ],
+            "title": "Purchase Currency",
+            "type": "string"
+          },
+          "rates_usd_per_million": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TokenRates"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "retail_amount": {
+            "title": "Retail Amount",
+            "type": "string"
+          },
+          "starts_on": {
+            "format": "date",
+            "title": "Starts On",
+            "type": "string"
+          },
+          "target_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9:_.-]*$",
+            "title": "Target Id",
+            "type": "string"
+          },
+          "target_kind": {
+            "enum": [
+              "account",
+              "pool"
+            ],
+            "title": "Target Kind",
+            "type": "string"
+          },
+          "timezone": {
+            "default": "UTC",
+            "title": "Timezone",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "retail_amount",
+          "allowance_usd",
+          "period_kind",
+          "starts_on",
+          "target_kind",
+          "target_id"
+        ],
+        "title": "PurchasedCard",
         "type": "object"
       },
       "QueuedEvent": {
@@ -16360,6 +17087,47 @@
         "title": "TerminalCommandData",
         "type": "object"
       },
+      "TokenRates": {
+        "additionalProperties": false,
+        "properties": {
+          "cache_read": {
+            "title": "Cache Read",
+            "type": "string"
+          },
+          "cache_write": {
+            "title": "Cache Write",
+            "type": "string"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "read": {
+            "title": "Read",
+            "type": "string"
+          },
+          "write": {
+            "title": "Write",
+            "type": "string"
+          }
+        },
+        "required": [
+          "read",
+          "write",
+          "cache_read",
+          "cache_write"
+        ],
+        "title": "TokenRates",
+        "type": "object"
+      },
       "ToolOutputDeltaEvent": {
         "description": "Incremental output from an in-progress function call.",
         "properties": {
@@ -17748,6 +18516,122 @@
           "freshness"
         ],
         "title": "UsageAccountView",
+        "type": "object"
+      },
+      "UsageAnalysisView": {
+        "properties": {
+          "account_spans": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/AnalysisSpan"
+            },
+            "title": "Account Spans",
+            "type": "object"
+          },
+          "accounts": {
+            "items": {
+              "$ref": "#/components/schemas/AnalysisAccountTotal"
+            },
+            "title": "Accounts",
+            "type": "array"
+          },
+          "generated_at": {
+            "format": "double",
+            "title": "Generated At",
+            "type": "number"
+          },
+          "parents": {
+            "items": {
+              "$ref": "#/components/schemas/AnalysisParentTotal"
+            },
+            "title": "Parents",
+            "type": "array"
+          },
+          "partial": {
+            "default": false,
+            "title": "Partial",
+            "type": "boolean"
+          },
+          "pool_catalog": {
+            "items": {
+              "$ref": "#/components/schemas/PoolCatalogEntry"
+            },
+            "title": "Pool Catalog",
+            "type": "array"
+          },
+          "pools": {
+            "items": {
+              "$ref": "#/components/schemas/PoolTotalView"
+            },
+            "title": "Pools",
+            "type": "array"
+          },
+          "pricing": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing"
+          },
+          "quota_closings": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Quota Closings",
+            "type": "array"
+          },
+          "range": {
+            "title": "Range",
+            "type": "string"
+          },
+          "row_limit": {
+            "default": 0,
+            "format": "int64",
+            "title": "Row Limit",
+            "type": "integer"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/AnalysisRowView"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "format": "int64",
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "span": {
+            "$ref": "#/components/schemas/AnalysisSpan"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "tz": {
+            "title": "Tz",
+            "type": "string"
+          },
+          "unmapped": {
+            "$ref": "#/components/schemas/AnalysisUnmapped"
+          }
+        },
+        "required": [
+          "generated_at",
+          "range",
+          "tz",
+          "span"
+        ],
+        "title": "UsageAnalysisView",
         "type": "object"
       },
       "UsageBalance": {
@@ -24789,6 +25673,19 @@
                             ],
                             "title": "Plan"
                           },
+                          "polling_seconds": {
+                            "anyOf": [
+                              {
+                                "exclusiveMinimum": 0,
+                                "maximum": 86400,
+                                "type": "integer"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Polling Seconds"
+                          },
                           "product": {
                             "anyOf": [
                               {
@@ -25612,6 +26509,68 @@
                             ],
                             "title": "Plan"
                           },
+                          "polling_seconds": {
+                            "anyOf": [
+                              {
+                                "exclusiveMinimum": 0,
+                                "maximum": 86400,
+                                "type": "integer"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Polling Seconds"
+                          },
+                          "pool_relation": {
+                            "anyOf": [
+                              {
+                                "description": "Optional report-v2 metadata naming the pool one destination reports.\n\nThe exporter owns `pool_id` (a namespace plus digest). Renaming or\nreordering a pool's labels does not change this value, so a stored relation\nstays valid. The claim names no new hourly key: a pool-specific destination\nkeeps reporting its attributable rows under the existing activity\n`account_id`.",
+                                "properties": {
+                                  "channel": {
+                                    "enum": [
+                                      "usage",
+                                      "metered_cost",
+                                      "list_cost",
+                                      "quota"
+                                    ],
+                                    "title": "Channel",
+                                    "type": "string"
+                                  },
+                                  "effective_from_hour": {
+                                    "minimum": 0,
+                                    "title": "Effective From Hour",
+                                    "type": "integer"
+                                  },
+                                  "parent_account_id": {
+                                    "maxLength": 32,
+                                    "minLength": 1,
+                                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
+                                    "title": "Parent Account Id",
+                                    "type": "string"
+                                  },
+                                  "pool_id": {
+                                    "maxLength": 128,
+                                    "minLength": 1,
+                                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+                                    "title": "Pool Id",
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "parent_account_id",
+                                  "pool_id",
+                                  "channel",
+                                  "effective_from_hour"
+                                ],
+                                "title": "PoolRelationClaim",
+                                "type": "object"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
                           "product": {
                             "anyOf": [
                               {
@@ -26284,6 +27243,19 @@
                           }
                         ],
                         "title": "Plan"
+                      },
+                      "polling_seconds": {
+                        "anyOf": [
+                          {
+                            "exclusiveMinimum": 0,
+                            "maximum": 86400,
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Polling Seconds"
                       },
                       "product": {
                         "anyOf": [
@@ -27108,6 +28080,68 @@
                         ],
                         "title": "Plan"
                       },
+                      "polling_seconds": {
+                        "anyOf": [
+                          {
+                            "exclusiveMinimum": 0,
+                            "maximum": 86400,
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Polling Seconds"
+                      },
+                      "pool_relation": {
+                        "anyOf": [
+                          {
+                            "description": "Optional report-v2 metadata naming the pool one destination reports.\n\nThe exporter owns `pool_id` (a namespace plus digest). Renaming or\nreordering a pool's labels does not change this value, so a stored relation\nstays valid. The claim names no new hourly key: a pool-specific destination\nkeeps reporting its attributable rows under the existing activity\n`account_id`.",
+                            "properties": {
+                              "channel": {
+                                "enum": [
+                                  "usage",
+                                  "metered_cost",
+                                  "list_cost",
+                                  "quota"
+                                ],
+                                "title": "Channel",
+                                "type": "string"
+                              },
+                              "effective_from_hour": {
+                                "minimum": 0,
+                                "title": "Effective From Hour",
+                                "type": "integer"
+                              },
+                              "parent_account_id": {
+                                "maxLength": 32,
+                                "minLength": 1,
+                                "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$",
+                                "title": "Parent Account Id",
+                                "type": "string"
+                              },
+                              "pool_id": {
+                                "maxLength": 128,
+                                "minLength": 1,
+                                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+                                "title": "Pool Id",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "parent_account_id",
+                              "pool_id",
+                              "channel",
+                              "effective_from_hour"
+                            ],
+                            "title": "PoolRelationClaim",
+                            "type": "object"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
                       "product": {
                         "anyOf": [
                           {
@@ -27616,6 +28650,163 @@
         "summary": "Read Activity"
       }
     },
+    "/v1/me/usage/analysis": {
+      "get": {
+        "operationId": "read_analysis_v1_me_usage_analysis_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "default": "d7",
+              "enum": [
+                "today",
+                "h24",
+                "d7",
+                "period",
+                "d30",
+                "d90",
+                "custom"
+              ],
+              "title": "Range",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "From"
+            }
+          },
+          {
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "To"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tz",
+            "required": false,
+            "schema": {
+              "default": "UTC",
+              "title": "Tz",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "account",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Account"
+            }
+          },
+          {
+            "in": "query",
+            "name": "pool",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pool"
+            }
+          },
+          {
+            "in": "query",
+            "name": "model",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Model"
+            }
+          },
+          {
+            "in": "query",
+            "name": "card",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Card"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageAnalysisView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Analysis"
+      }
+    },
     "/v1/me/usage/issues": {
       "get": {
         "operationId": "read_activity_v1_me_usage_issues_get",
@@ -28105,6 +29296,56 @@
           }
         },
         "summary": "Write Price Source"
+      }
+    },
+    "/v1/me/usage/pricing-baseline": {
+      "get": {
+        "operationId": "read_baseline_v1_me_usage_pricing_baseline_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Baseline"
+      },
+      "put": {
+        "operationId": "save_baseline_v1_me_usage_pricing_baseline_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PricingBaseline"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Baseline"
       }
     },
     "/v1/policies": {
