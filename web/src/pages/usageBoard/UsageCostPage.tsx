@@ -5,7 +5,6 @@ import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { UsageBoardFrame } from "./UsageBoardFrame";
 import { useUsageOverview } from "./usageBoardData";
-import { useUsageActivity } from "./usageActivityData";
 import {
   analysisKey,
   analysisTotals,
@@ -13,6 +12,7 @@ import {
   toggleAnalysisPick,
   useUsageAnalysis,
   type AnalysisDimension,
+  analysisValueText,
 } from "./usageAnalysisData";
 import {
   UsageAnalysisShares,
@@ -21,6 +21,13 @@ import {
 } from "./UsageAnalysisAmounts";
 import { UsageAnalysisChart } from "./UsageCostChart";
 import { AnalysisPanel, AnalysisUnknown } from "./UsageAnalysisPanel";
+import {
+  AnalysisCards,
+  AnalysisComparisons,
+  AnalysisPayback,
+  AnalysisClosings,
+  AnalysisHeatmap,
+} from "./UsageAnalysisDetails";
 import "./usageAnalysis.css";
 
 const compact = (value: number | null) =>
@@ -34,14 +41,14 @@ export function UsageCostPage() {
   const board = useUsageContextPreferences().board;
   const range = ["today", "d7", "d30", "d90"].includes(board.range?.key ?? "")
     ? board.range!
-    : { key: "d7" as const };
+    : { key: "d30" as const };
   const overview = useUsageOverview(true);
   const analysis = useUsageAnalysis(range);
-  const activity = useUsageActivity(undefined, range.key !== "d90", range);
   const [dimension, setDimension] = useState<AnalysisDimension | "card">("account");
   const [picks, setPicks] = useState<Partial<Record<AnalysisDimension | "card", string[] | null>>>(
     {},
   );
+  const [cardSort, setCardSort] = useState({ key: "paid", direction: -1 });
   const [sort, setSort] = useState<{
     key: "api" | "paid" | "tokens" | "payback" | "failure";
     direction: number;
@@ -59,7 +66,10 @@ export function UsageCostPage() {
     [analysis.data, names],
   );
   const items = useMemo(() => {
-    if (dimension === "card") return [];
+    if (dimension === "card")
+      return (analysis.data?.pricing?.cards ?? [])
+        .filter((card) => !board.hidden.includes(card.parent_account_id ?? ""))
+        .map((card) => ({ key: card.id, name: card.name }));
     if (dimension === "account")
       return visible.map((account) => ({ key: account.id, name: account.display_name }));
     if (dimension === "pool")
@@ -72,23 +82,34 @@ export function UsageCostPage() {
     return [...new Set(rows.filter((row) => row.contributes_usage).map((row) => row.model))].map(
       (model) => ({ key: model, name: model || "Unknown model" }),
     );
-  }, [dimension, visible, analysis.data, names, rows]);
+  }, [dimension, visible, analysis.data, names, rows, board.hidden]);
   const live = picks[dimension]?.filter((key) => items.some((item) => item.key === key));
   const all = !live?.length || live.length === items.length;
   const keys = all ? items.map((item) => item.key) : live;
+  const selected = useUsageAnalysis(range, {
+    dimension,
+    keys,
+    hidden: board.hidden,
+    enabled: !!analysis.data,
+  });
+  const presentation = selected.data?.presentation;
   const selectedRows = useMemo(
     () =>
       dimension === "card"
         ? []
-        : rows.filter((row) => keys.includes(analysisKey(row, dimension) ?? "")),
-    [rows, keys, dimension],
+        : (presentation?.rows ??
+          rows.filter((row) => keys.includes(analysisKey(row, dimension) ?? ""))),
+    [rows, keys, dimension, presentation],
   );
-  const partial = analysis.data?.partial || analysis.data?.truncated;
+  const partial = presentation
+    ? presentation.partial || selected.data?.partial || selected.data?.truncated
+    : analysis.data?.partial || analysis.data?.truncated;
   const totals = analysisTotals(selectedRows, partial);
   const selectedItems = items
     .filter((item) => keys.includes(item.key))
     .map((item) => ({
       ...item,
+      projection: presentation?.items.find((value) => value.key === item.key)?.projection,
       rows:
         dimension === "card"
           ? []
@@ -99,7 +120,7 @@ export function UsageCostPage() {
       title="Cost"
       generatedAt={analysis.data?.generated_at}
       loading={analysis.isPending || overview.isPending}
-      error={analysis.error ?? overview.error}
+      error={selected.error ?? analysis.error ?? overview.error}
       actions={
         <details>
           <summary>Analysis tools</summary>
@@ -182,22 +203,34 @@ export function UsageCostPage() {
         ))}
       </div>
       {dimension === "card" ? (
-        <AnalysisPanel title="Purchased cards">
-          <AnalysisUnknown reason="Not available yet" />
-        </AnalysisPanel>
+        <AnalysisCards
+          data={presentation}
+          sort={cardSort}
+          onSort={(key) =>
+            setCardSort({ key, direction: cardSort.key === key ? -cardSort.direction : -1 })
+          }
+        />
       ) : (
         <>
           {!items.length ? <p role="status">No usage in this range.</p> : null}
           <div className="ua-kpis">
             {[
               ["At API price", "Unknown", "Not available yet · price evidence"],
-              ["Paid", "Unknown", "Payment breakdown unavailable"],
+              [
+                "Paid",
+                analysisValueText(presentation?.projection.paid),
+                "Configured FX · selected payments",
+              ],
               [
                 "Token",
                 compact(totals.tokens),
                 partial ? "Partial source coverage" : "Reported tokens",
               ],
-              ["Payback", "Unknown", "Requires compatible API and paid cohort"],
+              [
+                "Payback",
+                analysisValueText(presentation?.projection.payback, "ratio"),
+                `Known-paid ${presentation?.projection.payback.coverage?.known_paid ?? 0}/${presentation?.projection.payback.coverage?.total_items ?? 0}`,
+              ],
             ].map(([label, value, caption]) => (
               <div className="ua-kpi" key={label}>
                 <span>{label}</span>
@@ -213,29 +246,11 @@ export function UsageCostPage() {
                 span={analysis.data?.span}
                 unknown={totals.tokens === null}
                 previousUnavailable={range.key !== "d90"}
-                previousAccounts={
-                  dimension === "account" && range.key !== "d90"
-                    ? activity.data?.accounts.filter((item) => keys.includes(item.account))
-                    : undefined
-                }
+                previous={range.key === "d90" ? null : presentation?.previous}
+                paidSeries={presentation?.paid_series}
               />
             </AnalysisPanel>
-            <AnalysisPanel title="Compared with previous" caption="Aggregate unit cost">
-              <div className="ua-comparisons">
-                {["Same usage", "Same spend"].map((title) => (
-                  <div key={title}>
-                    <span>{title}</span>
-                    <AnalysisUnknown
-                      reason={
-                        range.key === "d90"
-                          ? "90 days has no previous period"
-                          : "Selected-cohort comparison not available yet"
-                      }
-                    />
-                  </div>
-                ))}
-              </div>
-            </AnalysisPanel>
+            <AnalysisComparisons data={presentation} ninety={range.key === "d90"} />
           </div>
           <UsageAnalysisTable
             items={selectedItems}
@@ -244,17 +259,15 @@ export function UsageCostPage() {
             onSort={(key) => setSort({ key, direction: sort.key === key ? -sort.direction : -1 })}
           />
           <div className="ua-cards">
-            <AnalysisPanel title="Subscription payback">
-              <AnalysisUnknown />
-            </AnalysisPanel>
-            <AnalysisPanel title="Unused last period" caption="Measured closing observation">
-              <AnalysisUnknown reason="Requires a matching quota closing observation" />
-            </AnalysisPanel>
+            <AnalysisPayback items={selectedItems} />
+            <AnalysisClosings data={presentation} names={names} model={dimension === "model"} />
             <UsageAnalysisShares rows={selectedRows} incomplete={!!partial} />
             <UsageAnalysisFailures items={selectedItems} incomplete={!!partial} />
-            <AnalysisPanel title="When usage is highest">
-              <AnalysisUnknown reason="Not available yet" />
-            </AnalysisPanel>
+            <AnalysisHeatmap
+              rows={selectedRows}
+              partial={!!partial}
+              timezone={analysis.data?.tz ?? Intl.DateTimeFormat().resolvedOptions().timeZone}
+            />
             <AnalysisPanel title="Cache savings">
               <AnalysisUnknown reason="Not available yet · price evidence" />
             </AnalysisPanel>

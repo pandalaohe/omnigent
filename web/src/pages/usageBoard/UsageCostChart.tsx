@@ -1,5 +1,12 @@
 import { useId, useMemo } from "react";
-import type { AnalysisRow, UsageAnalysis } from "./usageAnalysisData";
+import {
+  analysisTotals,
+  analysisValueText,
+  type AnalysisPresentation,
+  type AnalysisRow,
+  type AnalysisValue,
+  type UsageAnalysis,
+} from "./usageAnalysisData";
 import {
   Bar,
   BarChart,
@@ -12,7 +19,7 @@ import {
   YAxis,
 } from "recharts";
 import type { UsageAccountActivity } from "./usageActivityData";
-import { formatMoney } from "./usageBoardFormat";
+import { formatMoney, formatUsageValue } from "./usageBoardFormat";
 import { UsageTipCard } from "./UsageTip";
 
 export interface UsageChartPoint {
@@ -22,20 +29,70 @@ export interface UsageChartPoint {
   bucket: number;
 }
 
+const EMPTY_PAID_SERIES: AnalysisPresentation["paid_series"] = [];
+function AnalysisChartTooltip({
+  active,
+  payload,
+  tokensUnknown,
+}: {
+  active?: boolean;
+  payload?: readonly {
+    payload?: { at: number; tokens?: number; previous?: number; payment?: AnalysisValue };
+  }[];
+  tokensUnknown: boolean;
+}) {
+  const point = payload?.[0]?.payload;
+  return active && point ? (
+    <div className="rounded-lg border border-border bg-popover p-2.5 shadow-md">
+      <UsageTipCard
+        model={{
+          title: new Date(point.at * 1000).toLocaleString(),
+          rows: [
+            ...(!tokensUnknown ? [{ label: "Token", value: String(point.tokens) }] : []),
+            ...(point.previous === undefined
+              ? []
+              : [{ label: "Previous", value: String(point.previous) }]),
+            ...(point.payment ? [{ label: "Paid", value: analysisValueText(point.payment) }] : []),
+          ],
+        }}
+      />
+    </div>
+  ) : null;
+}
+
 export function UsageAnalysisChart({
   rows,
   span,
   unknown,
   previousUnavailable,
   previousAccounts,
+  previous,
+  paidSeries = EMPTY_PAID_SERIES,
 }: {
   rows: AnalysisRow[];
   span?: UsageAnalysis["span"];
   unknown: boolean;
   previousUnavailable: boolean;
   previousAccounts?: UsageAccountActivity[];
+  previous?: AnalysisPresentation["previous"];
+  paidSeries?: AnalysisPresentation["paid_series"];
 }) {
   const prior = useMemo(() => {
+    if (previous !== undefined) {
+      if (!previous || analysisTotals(previous.rows, previous.partial).tokens === null || !span)
+        return [];
+      const offset = span.counted_from - previous.span.counted_from,
+        buckets = new Map<number, number>();
+      for (const row of previous.rows)
+        if (row.contributes_usage && row.tokens !== null) {
+          const at = Math.min(span.until, Math.max(span.counted_from, row.hour + offset));
+          buckets.set(at, (buckets.get(at) ?? 0) + row.tokens);
+        }
+      let sum = 0;
+      return [...buckets]
+        .sort(([a], [b]) => a - b)
+        .map(([at, tokens]) => ({ at, previous: (sum += tokens) }));
+    }
     const current = new Map<string, number>();
     for (const row of rows) {
       if (!row.contributes_usage) continue;
@@ -53,31 +110,48 @@ export function UsageAnalysisChart({
       )
       ? usageChartPoints(previousAccounts, true, false, false, span?.until ?? 0)
       : [];
-  }, [previousAccounts, span?.until, rows]);
+  }, [previous, previousAccounts, rows, span]);
   const points = useMemo(() => {
     const buckets = new Map<number, number>();
     for (const row of rows)
       if (row.contributes_usage && row.tokens !== null)
         buckets.set(row.hour, (buckets.get(row.hour) ?? 0) + row.tokens);
-    let sum = 0;
-    const current = [...buckets]
-      .sort(([a], [b]) => a - b)
-      .map(([at, tokens]) => ({ at, tokens: (sum += tokens) }));
-    let index = 0;
-    return current.map((point) => {
-      while (index + 1 < prior.length && prior[index + 1].at <= point.at) index++;
-      return { ...point, previous: prior.length ? prior[index]?.previous : undefined };
+    const times = [
+      ...new Set([
+        ...buckets.keys(),
+        ...prior.map((point) => point.at),
+        ...paidSeries.map((point) => point.at),
+        ...(span ? [span.counted_from, span.until] : []),
+      ]),
+    ].sort((a, b) => a - b);
+    let total = 0,
+      index = 0,
+      paidIndex = 0;
+    return times.map((at) => {
+      total += buckets.get(at) ?? 0;
+      while (index + 1 < prior.length && prior[index + 1].at <= at) index++;
+      while (paidIndex + 1 < paidSeries.length && paidSeries[paidIndex + 1].at <= at) paidIndex++;
+      const payment = paidSeries.length ? paidSeries[paidIndex]?.value : undefined;
+      return {
+        at,
+        tokens: unknown ? undefined : total,
+        previous: prior.length && prior[index].at <= at ? prior[index].previous : undefined,
+        paid: payment?.low == null ? undefined : Number(payment.low),
+        payment,
+      };
     });
-  }, [rows, prior]);
-  if (unknown || !span || !points.length)
+  }, [rows, span, prior, paidSeries, unknown]);
+  const hasPaid = paidSeries.some((point) => point.value.low !== null);
+  if (!span || (unknown && !hasPaid) || (!rows.length && !hasPaid))
     return (
       <div className="ua-unknown">
         <strong>Unknown</strong>
         <small>No complete selected token series</small>
       </div>
     );
+  const currency = paidSeries.find((point) => point.value.currency)?.value.currency ?? "USD";
   return (
-    <figure aria-label="Cumulative selected tokens">
+    <figure aria-label="Cumulative selected tokens and paid">
       <div style={{ height: 190, width: "100%", minWidth: 0 }}>
         <ResponsiveContainer width="100%" height="100%">
           <LineChart data={points} margin={{ top: 8, right: 10, left: 0, bottom: 0 }}>
@@ -93,6 +167,7 @@ export function UsageAnalysisChart({
               axisLine={false}
             />
             <YAxis
+              yAxisId="tokens"
               width={40}
               tickFormatter={(value) =>
                 new Intl.NumberFormat("en-US", {
@@ -104,23 +179,33 @@ export function UsageAnalysisChart({
               tickLine={false}
               axisLine={false}
             />
-            <Tooltip
-              labelFormatter={(at) => new Date(Number(at) * 1000).toLocaleString()}
-              formatter={(value) =>
-                new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(Number(value))
-              }
-            />
-            <Line
-              dataKey="tokens"
-              name="Token"
-              type="linear"
-              dot={false}
-              stroke="var(--info)"
-              strokeWidth={2}
-              isAnimationActive={false}
-            />
+            {hasPaid ? (
+              <YAxis
+                yAxisId="paid"
+                orientation="right"
+                width={60}
+                tickFormatter={(value) => formatUsageValue(value, currency)}
+                tick={{ fontSize: 10 }}
+                tickLine={false}
+                axisLine={false}
+              />
+            ) : null}
+            <Tooltip content={<AnalysisChartTooltip tokensUnknown={unknown} />} />
+            {!unknown ? (
+              <Line
+                yAxisId="tokens"
+                dataKey="tokens"
+                name="Token"
+                type="linear"
+                dot={false}
+                stroke="var(--info)"
+                strokeWidth={2}
+                isAnimationActive={false}
+              />
+            ) : null}
             {prior.length ? (
               <Line
+                yAxisId="tokens"
                 dataKey="previous"
                 name="Previous"
                 type="linear"
@@ -131,9 +216,24 @@ export function UsageAnalysisChart({
                 isAnimationActive={false}
               />
             ) : null}
+            {hasPaid ? (
+              <Line
+                yAxisId="paid"
+                dataKey="paid"
+                name="Paid"
+                type="linear"
+                dot={false}
+                stroke="var(--success)"
+                strokeWidth={2}
+                isAnimationActive={false}
+              />
+            ) : null}
           </LineChart>
         </ResponsiveContainer>
       </div>
+      <figcaption className="text-xs text-muted-foreground">
+        Token · {hasPaid ? "Paid (right axis) · " : ""}At API price: Not available yet
+      </figcaption>
       {previousUnavailable && !prior.length ? (
         <figcaption className="text-xs text-muted-foreground">
           Previous selected hourly series not available yet

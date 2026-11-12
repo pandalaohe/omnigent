@@ -314,3 +314,138 @@
     grid-column: 1/-1;
   }
 }
+.ua-spark {
+  display: block;
+  width: 88px;
+  height: 22px;
+  max-width: 100%;
+}
+.ua-spark path {
+  fill: none;
+  stroke: var(--info);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+.ua-card-head,
+.ua-card-row {
+  display: grid;
+  grid-template-columns: minmax(84px, 1.2fr) repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  padding: 6px 4px;
+  align-items: center;
+  font-size: 12px;
+}
+.ua-card-head {
+  color: var(--muted-foreground);
+}
+.ua-card-row {
+  border-top: 1px solid var(--border);
+}
+.ua-card-table [role="cell"]:not(:first-child),
+.ua-card-table [role="columnheader"]:not(:first-child) {
+  text-align: right;
+}
+.ua-card-row small {
+  display: block;
+  color: var(--muted-foreground);
+  font-size: 11px;
+}
+.ua-card-row b {
+  overflow-wrap: anywhere;
+}
+.ua-payback .ua-track {
+  height: 2px;
+}
+.ua-payback .ua-track s {
+  position: absolute;
+  top: -5px;
+  height: 12px;
+  width: 1px;
+  background: var(--muted-foreground);
+}
+.ua-payback .ua-track i {
+  position: absolute;
+  top: -4px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-left: -5px;
+}
+.ua-closing {
+  display: grid;
+  grid-template-columns: minmax(60px, 1fr) auto auto;
+  gap: 8px;
+  font-size: 12px;
+  text-align: left;
+  align-items: center;
+  width: 100%;
+}
+.ua-closing small {
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+.ua-heat {
+  display: grid;
+  gap: 2px;
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+.ua-heat > div {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr);
+  gap: 5px;
+  align-items: center;
+}
+.ua-heat > div > div {
+  display: grid;
+  grid-template-columns: repeat(24, minmax(0, 1fr));
+  gap: 1.5px;
+}
+.ua-heat-cell {
+  display: block;
+  aspect-ratio: 1;
+  min-width: 0;
+}
+.ua-heat-cell button {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 5px;
+  border-radius: 2px;
+}
+.ua-heat footer {
+  display: flex;
+  justify-content: space-between;
+  margin-left: 31px;
+}
+@container (max-width:780px) {
+  .ua-card-head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+  }
+  .ua-card-head > [role="columnheader"]:first-child {
+    display: none;
+  }
+  .ua-card-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 2px 12px;
+  }
+  .ua-card-row > [role="cell"]:first-child {
+    grid-column: 1/-1;
+  }
+  .ua-card-row > [data-label] {
+    display: flex;
+    justify-content: space-between;
+    gap: 6px;
+  }
+  .ua-card-row > [data-label]::before {
+    content: attr(data-label);
+    font-weight: 400;
+    color: var(--muted-foreground);
+  }
+  .ua-card-row > [data-label="Paid"] {
+    grid-column: 1/-1;
+  }
+}

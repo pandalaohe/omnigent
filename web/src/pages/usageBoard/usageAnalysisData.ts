@@ -27,6 +27,8 @@ export interface AnalysisValue {
   high: string | null;
   currency: string | null;
   reason: string | null;
+  formatted?: { low: string | null; high: string | null };
+  coverage?: { known_paid: number; total_items: number };
 }
 export interface UsageAnalysis {
   generated_at: number;
@@ -40,13 +42,29 @@ export interface UsageAnalysis {
   rows: AnalysisRow[];
   partial: boolean;
   truncated: boolean;
-  pricing?: { paid: AnalysisValue; tokens: AnalysisValue; payback: AnalysisValue } | null;
+  pricing?: AnalysisProjection | null;
+  presentation?: AnalysisPresentation | null;
+  tz?: string;
 }
-export function useUsageAnalysis(range: UsageRange) {
+export function useUsageAnalysis(
+  range: UsageRange,
+  selection?: {
+    dimension: AnalysisDimension | "card";
+    keys: string[];
+    hidden: string[];
+    enabled: boolean;
+  },
+) {
   const params = usageRangeQuery(range);
+  if (selection) {
+    params.set("dimension", selection.dimension);
+    params.set("selection", JSON.stringify(selection.keys));
+    for (const id of selection.hidden) params.append("exclude", id);
+  }
   return useQuery({
     queryKey: ["usageBoard", "analysis", params.toString()],
     queryFn: () => usageJson<UsageAnalysis>(`analysis?${params}`),
+    enabled: selection?.enabled ?? true,
     retry: false,
     refetchInterval: () => (document.visibilityState === "visible" ? USAGE_BOARD_POLL_MS : false),
   });
@@ -87,4 +105,73 @@ export function analysisTotals(rows: AnalysisRow[], incomplete = false) {
     failed,
     failure: requests && failed !== null ? (failed / requests) * 100 : null,
   };
+}
+
+export interface AnalysisProjection {
+  paid: AnalysisValue;
+  payback: AnalysisValue;
+  tokens: AnalysisValue;
+  coverage?: { known_paid: number; total_items: number };
+  cards?: AnalysisCard[];
+}
+export interface AnalysisCard {
+  id: string;
+  name: string;
+  parent_account_id?: string;
+  pool_id?: string | null;
+  paid: AnalysisValue;
+  original_paid?: AnalysisValue;
+  allowance: AnalysisValue;
+  paid_per_quota: AnalysisValue;
+  reset_count?: number;
+  starts_at: number;
+  ends_at: number;
+}
+export interface AnalysisPresentation {
+  partial?: boolean;
+  rows: AnalysisRow[];
+  projection: AnalysisProjection;
+  items: { key: string; projection: AnalysisProjection }[];
+  previous: { span: UsageAnalysis["span"]; rows: AnalysisRow[]; partial: boolean } | null;
+  comparison: {
+    reason?: string;
+    same_usage?: AnalysisValue;
+    same_usage_difference?: AnalysisValue;
+    same_spend?: AnalysisValue;
+    same_spend_difference?: AnalysisValue;
+    same_spend_percent?: AnalysisValue;
+  };
+  cards: AnalysisCard[];
+  allowance: AnalysisValue;
+  paid_per_quota: AnalysisValue;
+  paid_series: { at: number; value: AnalysisValue }[];
+  quota_closings: {
+    account_id: string;
+    window_id: string;
+    observed_at: number;
+    resets_at: number;
+    remaining: AnalysisValue;
+  }[];
+}
+export function analysisValueText(
+  value: AnalysisValue | null | undefined,
+  unit: "money" | "ratio" | "percent" | "quota" | "number" = "money",
+): string {
+  if (!value?.formatted?.low || value.state === "unknown") return "Unknown";
+  const symbol =
+    unit === "quota"
+      ? "$"
+      : unit === "money"
+        ? ({ USD: "$", CNY: "¥", HKD: "HK$" }[value.currency ?? "USD"] ?? "")
+        : "";
+  const text = (raw: string) => {
+    const [whole, decimal] = raw.split(".");
+    const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    return unit === "money" || unit === "quota"
+      ? `${grouped.startsWith("-") ? "-" : ""}${symbol}${grouped.replace(/^-/, "")}.${decimal ?? "00"}`
+      : `${grouped}${decimal && Number(decimal) ? `.${decimal.replace(/0+$/, "")}` : ""}${unit === "ratio" ? "×" : unit === "percent" ? "%" : ""}`;
+  };
+  const low = text(value.formatted.low),
+    high = value.formatted.high === null ? null : text(value.formatted.high);
+  return high === null ? `≥${low}` : low === high ? low : `${low}–${high}`;
 }

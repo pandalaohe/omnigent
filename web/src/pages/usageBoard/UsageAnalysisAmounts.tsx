@@ -1,11 +1,18 @@
-import { type AnalysisRow, analysisTotals } from "./usageAnalysisData";
+import {
+  type AnalysisRow,
+  type AnalysisProjection,
+  analysisTotals,
+  analysisValueText,
+} from "./usageAnalysisData";
 import { AnalysisPanel, AnalysisUnknown } from "./UsageAnalysisPanel";
 import { UsageTip } from "./UsageTip";
+import { AnalysisTrend, compareAnalysisDecimals } from "./UsageAnalysisDetails";
 
 interface Item {
   key: string;
   name: string;
   rows: AnalysisRow[];
+  projection?: AnalysisProjection;
 }
 type SortKey = "api" | "paid" | "tokens" | "payback" | "failure";
 const number = (value: number | null) =>
@@ -35,6 +42,17 @@ export function UsageAnalysisTable({
 }) {
   const data = items.map((item) => ({ ...item, ...analysisTotals(item.rows, incomplete) }));
   data.sort((a, b) => {
+    if (sort.key === "paid" || sort.key === "payback") {
+      const av = a.projection?.[sort.key]?.low,
+        bv = b.projection?.[sort.key]?.low;
+      return av == null
+        ? bv == null
+          ? 0
+          : 1
+        : bv == null
+          ? -1
+          : compareAnalysisDecimals(av, bv) * sort.direction;
+    }
     const av = sort.key === "tokens" ? a.tokens : sort.key === "failure" ? a.failure : null;
     const bv = sort.key === "tokens" ? b.tokens : sort.key === "failure" ? b.failure : null;
     return av === null ? (bv === null ? 0 : 1) : bv === null ? -1 : (av - bv) * sort.direction;
@@ -73,14 +91,14 @@ export function UsageAnalysisTable({
             <span role="cell" className="ua-name">
               {item.name}
             </span>
-            <span role="cell" title="API trend not available yet">
-              —
+            <span role="cell">
+              <AnalysisTrend rows={item.rows} />
             </span>
             {[
               ["At API price", "Unknown"],
-              ["Paid", "Unknown"],
+              ["Paid", analysisValueText(item.projection?.paid)],
               ["Token", number(item.tokens)],
-              ["Payback", "Unknown"],
+              ["Payback", analysisValueText(item.projection?.payback, "ratio")],
               ["Failure rate", percent(item.failure)],
             ].map(([label, value]) => (
               <span key={label} role="cell" data-label={label}>
