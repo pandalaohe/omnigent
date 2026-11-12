@@ -9641,6 +9641,38 @@ _POLICY_PROXY_ERROR_DETAIL_MAX = 400
 _FILE_CHANGE_OBSERVER_TIMEOUT_S = 10.0
 
 
+def _wait_for_pi_bootstrap_frame(
+    future: Future[_JsonObject],
+    loop: asyncio.AbstractEventLoop,
+    connection: socket.socket,
+    closed: threading.Event | None,
+    *,
+    timeout: float = 30.0,
+) -> _JsonObject:
+    """Wait for fresh validation within a bounded window, cancelling abandoned work."""
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            if closed is not None and closed.is_set():
+                raise ConnectionAbortedError("Pi bootstrap relay closed")
+            if loop.is_closed() or not loop.is_running():
+                raise ConnectionAbortedError("Pi bootstrap runner loop stopped")
+            if select.select([connection], [], [], 0)[0]:
+                raise ConnectionAbortedError("Pi bootstrap watch peer disconnected")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Pi bootstrap continuity deadline exceeded")
+            try:
+                return future.result(timeout=min(0.1, remaining))
+            except TimeoutError:
+                # Completion can race the wait timeout; retrieve the actual
+                # value or coroutine exception rather than rethrowing the wait.
+                if future.done():
+                    return future.result()
+    finally:
+        future.cancel()
+
+
 def _tool_relay_handler_factory(
     token: str,
     tool_executor: ToolExecutor,
@@ -9737,15 +9769,7 @@ def _tool_relay_handler_factory(
                     )
                     # A busy runner loop is not a lost attestor. Await this check
                     # without publishing an unvalidated frame or replacing its future.
-                    while True:
-                        try:
-                            frame = future.result(timeout=0.1)
-                            break
-                        except TimeoutError:
-                            if future.done():
-                                raise
-                            if closed is not None and closed.is_set():
-                                raise ConnectionAbortedError("Pi bootstrap relay closed") from None
+                    frame = _wait_for_pi_bootstrap_frame(future, loop, self.connection, closed)
                 except Exception as exc:  # noqa: BLE001 - EOF/error seals the private client
                     future.cancel()
                     _logger.warning(

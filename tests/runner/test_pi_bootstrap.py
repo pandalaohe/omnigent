@@ -6,8 +6,11 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import threading
+from concurrent.futures import Future
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,7 +18,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from omnigent.harnesses.claude_native.bridge import start_tool_relay
+from omnigent.harnesses.claude_native.bridge import _wait_for_pi_bootstrap_frame, start_tool_relay
 from omnigent.harnesses.pi_cli import pi_cli_argv
 from omnigent.permission_tiers import NativeCallBinding
 from omnigent.permission_tiers import _native_digest as native_digest
@@ -26,6 +29,7 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitSnapshot,
 )
 from omnigent.server.permission_tiers import ConfirmedPermissionState
+from tests._helpers.polling import poll_until_async
 from tests.runner.test_permission_tier_runtime import (
     _extension_runtime,
     _scope_call,
@@ -1337,6 +1341,102 @@ async def test_continuity_survives_runner_loop_delay_and_still_revokes(attestor_
             runtime.pi_scopes.invalidate("session-a")
             with pytest.raises(StopAsyncIteration):
                 await asyncio.wait_for(anext(lines), 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("validation_error", [False, True])
+async def test_continuity_wait_reads_completion_after_timeout(validation_error):
+    frame = {"live": True, "incarnation": "fixture"}
+
+    class CompletingFuture(Future):
+        def result(self, timeout=None):
+            if not self.done():
+                if validation_error:
+                    self.set_exception(TimeoutError("validation failed"))
+                else:
+                    self.set_result(frame)
+                raise TimeoutError("wait elapsed")
+            return super().result(timeout)
+
+    future = CompletingFuture()
+    connection, peer = socket.socketpair()
+    try:
+        if validation_error:
+            with pytest.raises(TimeoutError, match="validation failed"):
+                _wait_for_pi_bootstrap_frame(future, asyncio.get_running_loop(), connection, None)
+        else:
+            assert (
+                _wait_for_pi_bootstrap_frame(future, asyncio.get_running_loop(), connection, None)
+                == frame
+            )
+    finally:
+        connection.close()
+        peer.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["deadline", "peer_exit", "loop_stop", "relay_close"])
+async def test_pending_continuity_releases_validation(ending, monkeypatch):
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever)
+    entered, released, closed = threading.Event(), threading.Event(), threading.Event()
+    connection, peer = socket.socketpair()
+
+    async def validate():
+        try:
+            entered.set()
+            await asyncio.Event().wait()
+        finally:
+            released.set()
+
+    thread.start()
+    future = asyncio.run_coroutine_threadsafe(validate(), loop)
+    waiting = threading.Event()
+    result = future.result
+
+    def observe_wait(timeout=None):
+        waiting.set()
+        return result(timeout)
+
+    monkeypatch.setattr(future, "result", observe_wait)
+    waiter = None
+    try:
+        await poll_until_async(entered.is_set)
+        waiter = asyncio.create_task(
+            asyncio.to_thread(
+                _wait_for_pi_bootstrap_frame, future, loop, connection, closed, timeout=0.5
+            )
+        )
+        await poll_until_async(waiting.is_set)
+        if ending == "peer_exit":
+            peer.close()
+        elif ending == "relay_close":
+            closed.set()
+        elif ending == "loop_stop":
+            loop.call_soon_threadsafe(loop.stop)
+            await asyncio.to_thread(thread.join, 2)
+            assert not thread.is_alive()
+        failure = TimeoutError if ending == "deadline" else ConnectionAbortedError
+        with pytest.raises(failure, match="Pi bootstrap"):
+            await asyncio.wait_for(waiter, 2)
+        assert future.cancelled()
+    finally:
+        future.cancel()
+        closed.set()
+        if waiter is not None:
+            await asyncio.gather(waiter, return_exceptions=True)
+        if loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        await asyncio.to_thread(thread.join, 2)
+
+        def drain():
+            loop.run_until_complete(asyncio.sleep(0))
+            loop.close()
+
+        await asyncio.to_thread(drain)
+        connection.close()
+        peer.close()
+    assert released.is_set(), "the validation coroutine must observe cancellation"
 
 
 @pytest.mark.asyncio
