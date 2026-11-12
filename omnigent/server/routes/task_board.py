@@ -120,6 +120,8 @@ def create_task_board_router(
         closed_after: str | None = None,
         closed_before: str | None = None,
         changed_after: str | None = None,
+        snapshot: str | None = None,
+        source_generation: str | None = None,
         include_gone: Literal["0", "1"] = "0",
         include_history: Literal["0", "1"] = "0",
         cursor: str | None = Query(default=None, max_length=4096),
@@ -135,6 +137,8 @@ def create_task_board_router(
             closed_before=_query_time(closed_before, "closed_before"),
             changed_after=_query_time(changed_after, "changed_after"),
             read_at=started,
+            snapshot=snapshot,
+            source_generation=source_generation,
             include_gone=include_gone == "1",
             include_history=include_history == "1",
             cursor=cursor,
@@ -154,9 +158,22 @@ def create_task_board_router(
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     @router.get("/item")
-    async def read_item(request: Request, source: str, uid: str) -> JSONResponse:
+    async def read_item(
+        request: Request,
+        source: str,
+        uid: str,
+        snapshot: str | None = None,
+        source_generation: str | None = None,
+    ) -> JSONResponse:
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
-        item = await asyncio.to_thread(store.get_item, owner, source, uid)
+        item = await asyncio.to_thread(
+            store.get_item,
+            owner,
+            source,
+            uid,
+            snapshot=snapshot,
+            source_generation=source_generation,
+        )
         if item is None:
             raise ReportError("not_found", "uid", "Task not found", status=404)
         return JSONResponse(item, headers={"Cache-Control": "no-store"})
@@ -164,6 +181,8 @@ def create_task_board_router(
     @router.get("/history")
     async def read_history(
         request: Request,
+        snapshot: str | None = None,
+        source_generation: str | None = None,
         after: str | None = None,
         before: str | None = None,
         source: str | None = None,
@@ -178,6 +197,8 @@ def create_task_board_router(
             owner,
             HistoryQuery(
                 source=source,
+                snapshot=snapshot,
+                source_generation=source_generation,
                 after=after,
                 before=before,
                 cursor=cursor,
@@ -192,6 +213,8 @@ def create_task_board_router(
     @router.get("/closed-counts")
     async def read_closed_counts(
         request: Request,
+        snapshot: str | None = None,
+        source_generation: str | None = None,
         from_: str | None = Query(default=None, alias="from"),
         to: str | None = None,
         offset: int = Query(default=0, ge=-1439, le=1439),
@@ -205,8 +228,43 @@ def create_task_board_router(
             before=_query_time(to, "to"),
             offset=offset,
             source=source,
+            snapshot=snapshot,
+            source_generation=source_generation,
         )
         return JSONResponse({"days": days}, headers={"Cache-Control": "no-store"})
+
+    @router.get("/sources/{source_id}/display")
+    async def read_display(
+        source_id: str,
+        request: Request,
+        snapshot: str | None = None,
+        source_generation: str | None = None,
+        part: Literal["identity", "future", "closedDays", "accountDays", "releases"] = "identity",
+        from_: str | None = Query(default=None, alias="from"),
+        to: str | None = None,
+        cursor: str | None = None,
+        limit: int = Query(default=1000, ge=1, le=1000),
+    ) -> JSONResponse:
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        if cursor and (not snapshot or not source_generation):
+            raise ReportError(
+                "bad_value", "cursor", "Paged display reads require source and snapshot pins"
+            )
+        if cursor is not None and len(cursor) > 4096:
+            raise ReportError("too_long", "cursor", "Display cursor exceeds limit")
+        payload = await asyncio.to_thread(
+            store.read_display,
+            owner,
+            source_id,
+            snapshot=snapshot,
+            source_generation=source_generation,
+            part=part,
+            after=from_,
+            before=to,
+            cursor=cursor,
+            limit=limit,
+        )
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     @router.delete("/sources/{source_id}", status_code=204)
     async def delete_source(source_id: str, request: Request) -> Response:

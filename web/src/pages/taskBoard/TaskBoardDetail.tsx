@@ -1,3 +1,6 @@
+import { useBoardCadence } from "./taskBoardPreferences";
+import type { SourceCache } from "./taskBoardSnapshotData";
+import { boardExitProps } from "@/lib/boardFrame";
 import { useQuery } from "@tanstack/react-query";
 import { ExternalLinkIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -14,6 +17,7 @@ import { useBoardSessionDetails, type BoardSession } from "./taskBoardNative";
 import { taskRelations, taskLocalTime } from "./taskBoardRouteData";
 import { formatDate, formatNumber, t } from "./taskBoardText";
 import { TaskProgressIcon } from "./TaskProgressIcon";
+import { TaskSourceDetails } from "./TaskSourceDetails";
 import { TaskBoardActions, taskActions } from "./TaskBoardActions";
 
 export const taskTitle = (task: BoardTask) =>
@@ -43,24 +47,28 @@ export function TaskBoardDetail({
   sessions,
   onSelect,
   onClose,
+  sourceCache,
 }: {
+  sourceCache?: SourceCache;
   task: BoardTask;
   tasks: BoardTask[];
   sessions: BoardSession[];
   onSelect: (task: BoardTask) => void;
   onClose: () => void;
 }) {
+  const cadence = useBoardCadence();
   const query = useQuery({
     queryKey: ["taskBoard", "item", task["omnigent.ai:source"], task.uid, task.updated],
     queryFn: () =>
       readBoardJson<BoardTask>(
         `/v1/me/tasks/item?${new URLSearchParams({ source: task["omnigent.ai:source"], uid: task.uid })}`,
       ),
+    enabled: !sourceCache,
     retry: false,
     staleTime: 30_000,
-    refetchInterval: () => (document.visibilityState === "visible" ? 60_000 : false),
+    refetchInterval: cadence,
   });
-  const current = query.data ?? task;
+  const current = sourceCache ? task : (query.data ?? task);
   const actions = taskActions(current["omnigent.ai:actions"]);
   const spans = current["omnigent.ai:workedBy"] ?? [];
   const ids = [...new Set(spans.map((span) => span.session))];
@@ -325,6 +333,7 @@ export function TaskBoardDetail({
             {ids.map((id) => (
               <li key={id}>
                 <Link
+                  {...boardExitProps()}
                   to={`/c/${encodeURIComponent(id)}`}
                   className="block truncate text-sm underline underline-offset-2"
                 >
@@ -364,6 +373,7 @@ export function TaskBoardDetail({
           </ol>
         </details>
       )}
+      <TaskSourceDetails display={current["omnigent.ai:sourceDisplay"]} />
     </section>
   );
 }

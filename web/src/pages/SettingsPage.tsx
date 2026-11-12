@@ -174,7 +174,7 @@ import { authenticatedFetch, getCurrentIsAdmin, resolveIdentity } from "@/lib/id
 import { archiveDateRangeBounds } from "@/lib/archiveDateRange";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { usageBoardAvailable, taskBoardAvailable, isFeatureEnabled } from "@/lib/capabilities";
-import { TaskBoardSettings } from "@/pages/taskBoard/TaskBoardSettings";
+import { TaskBoardSettings, TaskBoardSourceSettings } from "@/pages/taskBoard/TaskBoardSettings";
 import { t as taskBoardText } from "@/pages/taskBoard/taskBoardText";
 import { ParentSessionsSettings } from "@/components/ParentSessionsSettings";
 import { t as autoRotationText } from "@/lib/autoRotationText";
@@ -2631,6 +2631,7 @@ function GeneralSection() {
           <SettingsGroup title={taskBoardText("board.title")} testId="settings-group-task-board">
             <ExpandableSettings id="task-board-settings" title={taskBoardText("board.title")}>
               <TaskBoardSettings />
+              <TaskBoardSourceSettings />
             </ExpandableSettings>
           </SettingsGroup>
         )}

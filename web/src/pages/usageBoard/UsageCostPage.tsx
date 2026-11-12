@@ -1,3 +1,4 @@
+import { boardExitProps, boardPath } from "@/lib/boardFrame";
 import { Link } from "@/lib/routing";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { UsageBoardFrame } from "./UsageBoardFrame";
@@ -23,6 +24,7 @@ export function UsageCostPage() {
       error={activity.error ?? overview.error}
       actions={
         <Link
+          {...boardExitProps()}
           className="inline-flex min-h-11 items-center text-xs text-muted-foreground"
           to="/usage"
         >
@@ -44,7 +46,7 @@ export function UsageCostPage() {
             return (
               <Link
                 key={account.id}
-                to={`/usage/board/${encodeURIComponent(account.id)}`}
+                to={boardPath(`/usage/board/${encodeURIComponent(account.id)}`)}
                 className="flex min-h-11 min-w-0 items-center gap-3 border-t border-border py-2 text-sm first:border-t-0"
               >
                 <span className="min-w-0 flex-1 truncate">{account.display_name}</span>

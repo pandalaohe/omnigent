@@ -1,7 +1,7 @@
 """Add source status snapshots and an insert-once source event archive.
 
 Revision ID: a65c20261112
-Revises: a64c20261112
+Revises: a66c20261112
 """
 
 import sqlalchemy as sa
@@ -9,7 +9,7 @@ from alembic import op
 from sqlalchemy.dialects.mysql import VARCHAR
 
 revision = "a65c20261112"
-down_revision = "a64c20261112"
+down_revision = "a66c20261112"
 branch_labels = None
 depends_on = None
 

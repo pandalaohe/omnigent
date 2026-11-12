@@ -37,6 +37,7 @@ from omnigent.server.task_board.models import (
     utc_text,
     utc_timestamp,
 )
+from omnigent.stores.task_board_snapshots import apply_snapshot, digest, guard_sources, source_pin
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,8 @@ class ItemQuery:
     read_at: float | None = None
     cursor: str | None = None
     limit: int = 1000
+    snapshot: str | None = None
+    source_generation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,8 @@ class HistoryQuery:
     before: str | None = None
     cursor: str | None = None
     limit: int = 500
+    snapshot: str | None = None
+    source_generation: str | None = None
 
 
 def _read_cursor(owner: str, kind: str, query: Any) -> tuple[str, dict[str, Any]]:
@@ -198,117 +203,154 @@ class TaskBoardStore:
     ) -> WriteOutcome:
 
         def apply(session: Session) -> WriteOutcome:
-            source = self._source(session, owner, source_id, now.timestamp() if now else None)
-            timestamp = now.timestamp() if now is not None else datetime.now(UTC).timestamp()
-            if report.group is not None:
-                if "title" in report.group:
-                    source.name = report.group["title"]
-                if "source" in report.group:
-                    source.source = report.group["source"]
-            items = {
-                row.uid: row
-                for row in session.scalars(
-                    select(SqlTaskBoardItem).where(
-                        *self._scope(SqlTaskBoardItem, owner),
-                        SqlTaskBoardItem.source_id == source_id,
-                    )
+            self._lock_owner(session, owner)
+            source = session.scalar(
+                select(SqlTaskBoardSource)
+                .where(
+                    *self._scope(SqlTaskBoardSource, owner),
+                    SqlTaskBoardSource.source_id == source_id,
                 )
-            }
-            history_ids = set(
-                session.execute(
-                    select(SqlTaskBoardHistory.uid, SqlTaskBoardHistory.entry_id).where(
-                        *self._scope(SqlTaskBoardHistory, owner),
-                        SqlTaskBoardHistory.source_id == source_id,
-                    )
-                ).tuples()
+                .with_for_update()
             )
-            outcome = WriteOutcome()
-            for task in report.tasks:
-                uid = task["uid"]
-                body = {key: value for key, value in task.items() if key != "omnigent.ai:history"}
-                updated, sequence = utc_timestamp(task["updated"]), task.get("sequence", 0)
-                item = items.get(uid)
-                incoming_version = (utc_sort_key(task["updated"]), sequence)
-                stored_version = (
-                    (utc_sort_key(item.body["updated"]), item.sequence) if item else ("", -1)
-                )
-                if item is None or incoming_version > stored_version:
-                    if item is None:
-                        item = SqlTaskBoardItem(
-                            workspace_id=current_workspace_id(),
-                            owner_id=owner,
-                            source_id=source_id,
-                            uid=uid,
-                        )
-                        session.add(item)
-                    progress = task_progress(body)
-                    if progress in OPEN_PROGRESS:
-                        item.closed_seen_at = None
-                        item.closed_at = None
-                    else:
-                        item.closed_seen_at = item.closed_seen_at or timestamp
-                        item.closed_at = (
-                            utc_timestamp(body["progressUpdated"])
-                            if "progressUpdated" in body
-                            else None
-                        )
-                    item.body, item.progress = body, progress
-                    item.group_id = body.get("omnigent.ai:group", {}).get("id", "")
-                    item.source_updated, item.sequence, item.changed_at = (
-                        updated,
-                        sequence,
-                        timestamp,
+            display = (report.group or {}).get("omnigent.ai:sourceDisplay", {})
+            header = display.get("snapshot")
+            if source is None:
+                if header and (header["operation"] != "begin" or header.get("sourceGeneration")):
+                    raise ReportError(
+                        "source_generation_changed",
+                        "snapshot.sourceGeneration",
+                        "Source no longer exists",
+                        status=409,
                     )
-                    outcome.applied += 1
-                elif incoming_version == stored_version and body == item.body:
-                    outcome.unchanged += 1
-                else:
-                    outcome.held.append({"uid": uid, "reason": "older"})
-                if item.gone_at is not None:
-                    item.gone_at, item.changed_at = None, timestamp
-                    outcome.returned += 1
-                for entry in task.get("omnigent.ai:history", []):
-                    identity = (uid, entry["id"])
-                    if identity in history_ids:
-                        continue
-                    session.add(
-                        SqlTaskBoardHistory(
-                            workspace_id=current_workspace_id(),
-                            owner_id=owner,
-                            source_id=source_id,
-                            uid=uid,
-                            entry_id=entry["id"],
-                            time=utc_timestamp(entry["time"]),
-                            kind=entry["kind"],
-                            entry=entry,
-                        )
-                    )
-                    history_ids.add(identity)
-                    outcome.history_added += 1
-                    item.changed_at = timestamp
-            if report.group is not None and (complete := report.group.get("omnigent.ai:complete")):
-                version = report.group["updated"]
-                if source.complete_version is not None and utc_sort_key(version) < utc_sort_key(
-                    source.complete_version
-                ):
-                    outcome.complete = "skipped_older"
-                else:
-                    present = {task["uid"] for task in report.tasks}
-                    for item in items.values():
-                        if (
-                            item.uid not in present
-                            and item.gone_at is None
-                            and (complete == "all" or item.progress in OPEN_PROGRESS)
-                        ):
-                            item.gone_at = item.changed_at = timestamp
-                            outcome.gone += 1
-                    source.complete_updated = utc_timestamp(version)
-                    source.complete_version = version
-                    outcome.complete = "applied"
-            source.last_write = {"time": utc_text(timestamp), **asdict(outcome)}
-            return outcome
+                source = self._source(session, owner, source_id, now.timestamp() if now else None)
+            timestamp = now.timestamp() if now is not None else datetime.now(UTC).timestamp()
+            return apply_snapshot(
+                session,
+                source,
+                report,
+                lambda delta: self._apply_report(
+                    session, owner, source_id, source, delta, timestamp
+                ),
+            )
 
         return run_write_transaction(self._writes, "report_tasks", apply)
+
+    def _apply_report(
+        self,
+        session: Session,
+        owner: str,
+        source_id: str,
+        source: SqlTaskBoardSource,
+        report: Report,
+        timestamp: float,
+    ) -> WriteOutcome:
+        if report.group is not None:
+            if "title" in report.group:
+                source.name = report.group["title"]
+            if "source" in report.group:
+                source.source = report.group["source"]
+        items = {
+            row.uid: row
+            for row in session.scalars(
+                select(SqlTaskBoardItem).where(
+                    *self._scope(SqlTaskBoardItem, owner),
+                    SqlTaskBoardItem.source_id == source_id,
+                )
+            )
+        }
+        history_ids = set(
+            session.execute(
+                select(SqlTaskBoardHistory.uid, SqlTaskBoardHistory.entry_id).where(
+                    *self._scope(SqlTaskBoardHistory, owner),
+                    SqlTaskBoardHistory.source_id == source_id,
+                )
+            ).tuples()
+        )
+        outcome = WriteOutcome()
+        for task in report.tasks:
+            uid = task["uid"]
+            body = {key: value for key, value in task.items() if key != "omnigent.ai:history"}
+            updated, sequence = utc_timestamp(task["updated"]), task.get("sequence", 0)
+            item = items.get(uid)
+            incoming_version = (utc_sort_key(task["updated"]), sequence)
+            stored_version = (
+                (utc_sort_key(item.body["updated"]), item.sequence) if item else ("", -1)
+            )
+            if item is None or incoming_version > stored_version:
+                if item is None:
+                    item = SqlTaskBoardItem(
+                        workspace_id=current_workspace_id(),
+                        owner_id=owner,
+                        source_id=source_id,
+                        uid=uid,
+                    )
+                    session.add(item)
+                progress = task_progress(body)
+                if progress in OPEN_PROGRESS:
+                    item.closed_seen_at = None
+                    item.closed_at = None
+                else:
+                    item.closed_seen_at = item.closed_seen_at or timestamp
+                    item.closed_at = (
+                        utc_timestamp(body["progressUpdated"])
+                        if "progressUpdated" in body
+                        else None
+                    )
+                item.body, item.progress = body, progress
+                item.group_id = body.get("omnigent.ai:group", {}).get("id", "")
+                item.source_updated, item.sequence, item.changed_at = (
+                    updated,
+                    sequence,
+                    timestamp,
+                )
+                outcome.applied += 1
+            elif incoming_version == stored_version and body == item.body:
+                outcome.unchanged += 1
+            else:
+                outcome.held.append({"uid": uid, "reason": "older"})
+            if item.gone_at is not None:
+                item.gone_at, item.changed_at = None, timestamp
+                outcome.returned += 1
+            for entry in task.get("omnigent.ai:history", []):
+                identity = (uid, entry["id"])
+                if identity in history_ids:
+                    continue
+                session.add(
+                    SqlTaskBoardHistory(
+                        workspace_id=current_workspace_id(),
+                        owner_id=owner,
+                        source_id=source_id,
+                        uid=uid,
+                        entry_id=entry["id"],
+                        time=utc_timestamp(entry["time"]),
+                        kind=entry["kind"],
+                        entry=entry,
+                    )
+                )
+                history_ids.add(identity)
+                outcome.history_added += 1
+                item.changed_at = timestamp
+        if report.group is not None and (complete := report.group.get("omnigent.ai:complete")):
+            version = report.group["updated"]
+            if source.complete_version is not None and utc_sort_key(version) < utc_sort_key(
+                source.complete_version
+            ):
+                outcome.complete = "skipped_older"
+            else:
+                present = {task["uid"] for task in report.tasks}
+                for item in items.values():
+                    if (
+                        item.uid not in present
+                        and item.gone_at is None
+                        and (complete == "all" or item.progress in OPEN_PROGRESS)
+                    ):
+                        item.gone_at = item.changed_at = timestamp
+                        outcome.gone += 1
+                source.complete_updated = utc_timestamp(version)
+                source.complete_version = version
+                outcome.complete = "applied"
+        source.last_write = {"time": utc_text(timestamp), **asdict(outcome)}
+        return outcome
 
     def list_items(self, owner: str, query: ItemQuery) -> tuple[list[dict[str, Any]], str | None]:
         changes = query.changed_after is not None
@@ -319,11 +361,30 @@ class TaskBoardStore:
                 query.read_at if query.read_at is not None else datetime.now(UTC).timestamp()
             ),
         )
-        with self._reads("read_tasks") as session:
+        with self._writes("read_tasks") as session:
+            self._lock_owner(session, owner)
+            pins = guard_sources(
+                session,
+                owner,
+                query.source,
+                snapshot=query.snapshot,
+                source_generation=query.source_generation,
+                cursor_pins=cursor.get("pins"),
+                changed_after=query.changed_after,
+            )
             statement = select(SqlTaskBoardItem).where(
                 *self._scope(SqlTaskBoardItem, owner),
-                SqlTaskBoardItem.changed_at <= utc_timestamp(through),
             )
+            legacy_ids = [key for key, pin in pins.items() if pin["phase"] == "legacy"]
+            if legacy_ids:
+                from sqlalchemy import or_
+
+                statement = statement.where(
+                    or_(
+                        SqlTaskBoardItem.source_id.not_in(legacy_ids),
+                        SqlTaskBoardItem.changed_at <= utc_timestamp(through),
+                    )
+                )
             if query.source is not None:
                 statement = statement.where(SqlTaskBoardItem.source_id == query.source)
             if query.group is not None:
@@ -370,7 +431,9 @@ class TaskBoardStore:
             entries = self._entries(session, owner, page, history=query.include_history)
             next_cursor = None
             if len(rows) > query.limit:
-                next_cursor = _next_cursor(fingerprint, position(page[-1]), through=through)
+                next_cursor = _next_cursor(
+                    fingerprint, position(page[-1]), through=through, pins=digest(pins)
+                )
             return entries, next_cursor
 
     @staticmethod
@@ -422,8 +485,20 @@ class TaskBoardStore:
             result.append(item)
         return result
 
-    def get_item(self, owner: str, source: str, uid: str) -> dict[str, Any] | None:
-        with self._reads("read_task") as session:
+    def get_item(
+        self,
+        owner: str,
+        source: str,
+        uid: str,
+        *,
+        snapshot: str | None = None,
+        source_generation: str | None = None,
+    ) -> dict[str, Any] | None:
+        with self._writes("read_task") as session:
+            self._lock_owner(session, owner)
+            guard_sources(
+                session, owner, source, snapshot=snapshot, source_generation=source_generation
+            )
             row = session.scalar(
                 select(SqlTaskBoardItem).where(
                     *self._scope(SqlTaskBoardItem, owner),
@@ -437,7 +512,16 @@ class TaskBoardStore:
         self, owner: str, query: HistoryQuery
     ) -> tuple[list[dict[str, Any]], str | None]:
         fingerprint, cursor = _read_cursor(owner, "history", query)
-        with self._reads("read_task_history") as session:
+        with self._writes("read_task_history") as session:
+            self._lock_owner(session, owner)
+            pins = guard_sources(
+                session,
+                owner,
+                query.source,
+                snapshot=query.snapshot,
+                source_generation=query.source_generation,
+                cursor_pins=cursor.get("pins"),
+            )
             statement = select(SqlTaskBoardHistory).where(*self._scope(SqlTaskBoardHistory, owner))
             if query.source is not None:
                 statement = statement.where(SqlTaskBoardHistory.source_id == query.source)
@@ -456,7 +540,9 @@ class TaskBoardStore:
             page = rows[: query.limit]
             return [
                 {**row.entry, "source": row.source_id, "uid": row.uid} for row in page
-            ], _next_cursor(fingerprint, position(page[-1])) if len(rows) > query.limit else None
+            ], _next_cursor(fingerprint, position(page[-1]), pins=digest(pins)) if len(
+                rows
+            ) > query.limit else None
 
     def closed_counts(
         self,
@@ -466,8 +552,14 @@ class TaskBoardStore:
         before: str | None,
         offset: int,
         source: str | None,
+        snapshot: str | None = None,
+        source_generation: str | None = None,
     ) -> list[dict[str, Any]]:
-        with self._reads("count_closed_tasks") as session:
+        with self._writes("count_closed_tasks") as session:
+            self._lock_owner(session, owner)
+            guard_sources(
+                session, owner, source, snapshot=snapshot, source_generation=source_generation
+            )
             statement = select(SqlTaskBoardItem).where(
                 *self._scope(SqlTaskBoardItem, owner),
                 SqlTaskBoardItem.gone_at.is_(None),
@@ -512,7 +604,8 @@ class TaskBoardStore:
         return run_write_transaction(self._writes, "delete_task_source", remove)
 
     def list_sources(self, owner: str) -> list[dict[str, Any]]:
-        with self._reads("read_task_sources") as session:
+        with self._writes("read_task_sources") as session:
+            self._lock_owner(session, owner)
             counts: dict[str, dict[str, int]] = {}
             for source_id, progress, gone_at, count in session.execute(
                 select(
@@ -543,8 +636,11 @@ class TaskBoardStore:
                     "source": row.source,
                     "created": utc_text(row.created_at),
                     "last_write": row.last_write,
-                    "counts": counts.get(row.source_id, {"open": 0, "closed": 0, "gone": 0}),
+                    "counts": (row.snapshot_state or {}).get("counts")
+                    if row.snapshot_state and row.snapshot_state.get("phase") == "staging"
+                    else counts.get(row.source_id, {"open": 0, "closed": 0, "gone": 0}),
                     "issues": row.issues,
+                    "snapshot": source_pin(row),
                 }
                 for row in session.scalars(
                     select(SqlTaskBoardSource)
@@ -555,6 +651,98 @@ class TaskBoardStore:
                     .order_by(SqlTaskBoardSource.source_id)
                 )
             ]
+
+    def read_display(
+        self,
+        owner: str,
+        source_id: str,
+        *,
+        snapshot: str | None,
+        source_generation: str | None,
+        part: str,
+        after: str | None,
+        before: str | None,
+        offset: int = 0,
+        limit: int = 1000,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        with self._writes("read_source_display") as session:
+            self._lock_owner(session, owner)
+            pins = guard_sources(
+                session, owner, source_id, snapshot=snapshot, source_generation=source_generation
+            )
+            source = session.scalar(
+                select(SqlTaskBoardSource).where(
+                    *self._scope(SqlTaskBoardSource, owner),
+                    SqlTaskBoardSource.source_id == source_id,
+                )
+            )
+            if source is None or source.source_display is None:
+                raise ReportError("not_found", "source", "Source display unavailable", status=404)
+            query_key = hashlib.sha256(
+                json.dumps(
+                    [
+                        current_workspace_id(),
+                        owner,
+                        source_id,
+                        pins[source_id],
+                        part,
+                        after,
+                        before,
+                    ],
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest()
+            if cursor:
+                try:
+                    decoded = json.loads(base64.urlsafe_b64decode(cursor))
+                    if (
+                        decoded["query"] != query_key
+                        or type(decoded["offset"]) is not int
+                        or decoded["offset"] < 0
+                    ):
+                        raise ValueError
+                    offset = decoded["offset"]
+                except (ValueError, KeyError, TypeError, UnicodeError):
+                    raise ReportError(
+                        "bad_value", "cursor", "Invalid cursor for this display query"
+                    ) from None
+            display = source.source_display
+            if part == "identity":
+                return {
+                    "snapshot": pins[source_id],
+                    "display": {
+                        key: value
+                        for key, value in display.items()
+                        if key
+                        in {
+                            "version",
+                            "asOf",
+                            "timeZone",
+                            "identity",
+                            "groups",
+                            "checkHosts",
+                            "accounts",
+                        }
+                    },
+                }
+            rows = display.get(part, [])
+            key = "publishedAt" if part == "releases" else "at" if part == "future" else "date"
+            rows = [
+                row
+                for row in rows
+                if (after is None or utc_sort_key(row[key]) >= utc_sort_key(after))
+                and (before is None or utc_sort_key(row[key]) < utc_sort_key(before))
+            ]
+            return {
+                "snapshot": pins[source_id],
+                "entries": rows[offset : offset + limit],
+                "cursor": base64.urlsafe_b64encode(
+                    json.dumps({"query": query_key, "offset": offset + limit}).encode()
+                ).decode()
+                if offset + limit < len(rows)
+                else None,
+            }
 
     def record_issue(self, owner: str, source_id: str, error: ReportError, now: datetime) -> None:
         def record(session: Session) -> None:

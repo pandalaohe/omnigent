@@ -78,6 +78,11 @@ function renderBoard(path = "/usage/board") {
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[path]}>
         <Routes>
+          <Route path="/frame/usage/board" element={<UsageBoardRoute view="board" />} />
+          <Route
+            path="/frame/usage/board/:accountId"
+            element={<UsageBoardRoute view="account" />}
+          />
           <Route path="/usage/board" element={<UsageBoardRoute view="board" />} />
           <Route path="/usage/board/:accountId" element={<UsageBoardRoute view="account" />} />
           <Route
@@ -370,3 +375,21 @@ function readCollab() {
     quotaFloorPct?: number | null;
   };
 }
+
+it("keeps imperative account navigation and back/settings links inside a frame", async () => {
+  window.history.replaceState({}, "", "/frame/usage/board");
+  try {
+    renderBoard("/frame/usage/board");
+    fireEvent.click((await screen.findAllByTestId("usage-ring"))[0]);
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Codex"),
+    );
+    expect(screen.getByRole("link", { name: "Account settings" }).getAttribute("href")).toBe(
+      "/frame/usage/board/codex/settings",
+    );
+    const back = screen.getByRole("link", { name: "Usage board" });
+    expect(back.getAttribute("href")).toBe("/frame/usage/board");
+  } finally {
+    window.history.replaceState({}, "", "/");
+  }
+});

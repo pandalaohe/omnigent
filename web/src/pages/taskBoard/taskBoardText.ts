@@ -27,7 +27,7 @@ export function createTaskBoardText(override: Pack = {}) {
     formatDate: (value: Date | number, options?: Intl.DateTimeFormatOptions) =>
       new Intl.DateTimeFormat(locale, options).format(value),
     formatNumber: (value: number, options?: Intl.NumberFormatOptions) =>
-      new Intl.NumberFormat(locale, options).format(value),
+      new Intl.NumberFormat(locale, { maximumFractionDigits: 2, ...options }).format(value),
   };
 }
 

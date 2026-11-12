@@ -1,3 +1,4 @@
+import { isFramePath } from "./boardFrame";
 /**
  * User identity discovery and request header injection.
  *
@@ -359,6 +360,16 @@ function identityIsCurrent(epoch: number, connectionId: string): boolean {
   return epoch === identityEpoch && connectionId === currentIdentityConnectionId();
 }
 
+let frameLoginUrl: string | null = null;
+const frameAuthListeners = new Set<() => void>();
+export const getFrameLoginUrl = () => frameLoginUrl;
+export function subscribeFrameAuth(listener: () => void): () => void {
+  frameAuthListeners.add(listener);
+  return () => {
+    frameAuthListeners.delete(listener);
+  };
+}
+
 /**
  * Hand the browser to `loginUrl`, at most once per document.
  *
@@ -367,6 +378,17 @@ function identityIsCurrent(epoch: number, connectionId: string): boolean {
  *     already under way.
  */
 function redirectToLogin(loginUrl: string): boolean {
+  if (isFramePath()) {
+    const returnTo =
+      withBasePath(stripBasePath(window.location.pathname).slice("/frame".length)) +
+      window.location.search;
+    const url = `${withBasePath(loginUrl)}?return_to=${encodeURIComponent(returnTo)}`;
+    if (frameLoginUrl !== url) {
+      frameLoginUrl = url;
+      frameAuthListeners.forEach((listener) => listener());
+    }
+    return false;
+  }
   if (loginRedirectPending) return false;
   loginRedirectPending = true;
   const returnTo = encodeURIComponent(window.location.pathname + window.location.search);

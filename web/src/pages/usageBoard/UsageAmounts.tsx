@@ -1,3 +1,4 @@
+import { boardPath } from "@/lib/boardFrame";
 import { Link } from "@/lib/routing";
 import { ArrowDownRightIcon, ArrowUpRightIcon, HistoryIcon, TriangleAlertIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -113,7 +114,7 @@ export function UsageSummary({ accounts }: { accounts: UsageAccountActivity[] })
       className="mb-3 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 rounded-[11px] border border-border bg-card px-3 py-2"
     >
       <Link
-        to="/usage/board/cost"
+        to={boardPath("/usage/board/cost")}
         className="inline-flex min-h-11 items-center gap-2 text-xl font-semibold md:min-h-[30px]"
       >
         {amount ? <UsageAmountFigure amount={amount} tokens={tokens} total /> : "—"}
@@ -253,7 +254,7 @@ export function UsageCostCard({
       />
       {failures.requests !== null || failures.unpriced > 0 ? (
         <Link
-          to={issuesPath}
+          to={boardPath(issuesPath)}
           className="mt-2 flex min-h-11 flex-wrap items-center gap-x-3 gap-y-1 border-t border-border pt-2 text-xs text-muted-foreground"
         >
           <TriangleAlertIcon className="size-3.5" aria-hidden="true" />

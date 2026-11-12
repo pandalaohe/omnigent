@@ -14,7 +14,7 @@ def test_evidence_migration_roundtrip(db_uri):
         else engine
     )
     try:
-        _alembic_command(db_uri, migration_engine, "downgrade", "a64c20261112")
+        _alembic_command(db_uri, migration_engine, "downgrade", "a66c20261112")
         assert "usage_source_events" not in sa.inspect(engine).get_table_names()
         assert "usage_pricing_cards" in sa.inspect(engine).get_table_names()
         _alembic_command(db_uri, migration_engine, "upgrade", "head")

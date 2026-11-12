@@ -1,3 +1,4 @@
+import { boardExitProps } from "@/lib/boardFrame";
 import { Link } from "@/lib/routing";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { taskBoardAvailable } from "@/lib/capabilities";
@@ -21,6 +22,7 @@ function TaskBoardContent() {
       <div className="space-y-3 p-6">
         <h1 className="text-lg font-semibold">{t("board.userOff")}</h1>
         <Link
+          {...boardExitProps()}
           to="/settings/general#task-board-settings"
           className="text-sm underline underline-offset-2"
         >

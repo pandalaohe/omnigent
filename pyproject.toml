@@ -136,6 +136,7 @@ dependencies = [
     # `omnigent server start` without it. POSIX platforms use the system
     # database and don't need the wheel.
     "tzdata>=2024.1; platform_system == 'Windows'",
+    "rfc8785>=0.1.4",
 ]
 
 [project.optional-dependencies]

@@ -17,6 +17,9 @@ def test_task_board_sqlite_migration_round_trip():
     precision = importlib.import_module(
         "omnigent.db.migrations.versions.a55c20261106_task_board_complete_version"
     )
+    snapshots = importlib.import_module(
+        "omnigent.db.migrations.versions.a66c20261112_task_source_snapshots"
+    )
     engine = sa.create_engine("sqlite://")
     try:
         with engine.begin() as connection:
@@ -24,6 +27,25 @@ def test_task_board_sqlite_migration_round_trip():
             with Operations.context(MigrationContext.configure(connection)):
                 migration.upgrade()
                 precision.upgrade()
+                snapshots.upgrade()
+                connection.execute(
+                    sa.text(
+                        "INSERT INTO task_board_sources "
+                        "(owner_id, source_id, created_at, issues, source_generation) "
+                        "VALUES ('retained', 'example', 1, '[]', 'generation')"
+                    )
+                )
+                snapshots.downgrade()
+                snapshots.upgrade()
+                assert (
+                    connection.scalar(
+                        sa.text(
+                            "SELECT source_generation FROM task_board_sources "
+                            "WHERE owner_id = 'retained'"
+                        )
+                    )
+                    == "generation"
+                )
         with Session(engine) as session:
             session.add(
                 SqlTaskBoardSource(
@@ -59,8 +81,14 @@ def test_task_board_sqlite_migration_round_trip():
                 )
             )
             session.commit()
-            assert session.scalar(sa.select(SqlTaskBoardSource.complete_version)) == (
-                "2026-11-06T06:30:00.0000001Z"
+            assert (
+                session.scalar(
+                    sa.select(SqlTaskBoardSource.complete_version).where(
+                        SqlTaskBoardSource.owner_id == "owner",
+                        SqlTaskBoardSource.source_id == "example",
+                    )
+                )
+                == "2026-11-06T06:30:00.0000001Z"
             )
             assert session.scalar(sa.select(SqlTaskBoardItem.body)) == {
                 "@type": "Task",
@@ -74,6 +102,7 @@ def test_task_board_sqlite_migration_round_trip():
             with Operations.context(MigrationContext.configure(connection)):
                 migration.upgrade()
                 precision.upgrade()
+                snapshots.upgrade()
             assert {"task_board_sources", "task_board_items", "task_board_history"} <= set(
                 sa.inspect(connection).get_table_names()
             )

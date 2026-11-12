@@ -11,6 +11,7 @@ import {
   routeTicks,
   segmentHitsRect,
   taskRelations,
+  parentRelationCounts,
   taskLocalTime,
   taskTime,
   detailLevel,
@@ -192,4 +193,25 @@ it("shows orphaned and cyclic native sessions exactly once", () => {
   ]);
   expect(new Set(tree.map((row) => row.session.id)).size).toBe(3);
   expect(tree.find((row) => row.session.id === "orphan")?.depth).toBe(0);
+});
+
+it("preserves unique parent membership counts for ordinary and clustered stops", () => {
+  const tasks: BoardTask[] = [
+    { uid: "parent", "omnigent.ai:source": "one" },
+    {
+      uid: "child",
+      "omnigent.ai:source": "one",
+      relatedTo: { parent: { relation: { parent: true } } },
+    },
+    {
+      uid: "orphan",
+      "omnigent.ai:source": "one",
+      relatedTo: { missing: { relation: { parent: true } } },
+    },
+    { uid: "child", "omnigent.ai:source": "two" },
+  ];
+  const counts = parentRelationCounts(tasks);
+  expect(counts.get(tasks[0])).toBe(1);
+  expect(counts.get(tasks[2])).toBeUndefined();
+  expect(counts.get(tasks[3])).toBeUndefined();
 });

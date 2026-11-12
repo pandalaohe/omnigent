@@ -1,3 +1,4 @@
+import { boardExitProps } from "@/lib/boardFrame";
 // The route entry for every Usage board page: it decides whether the module may
 // render here before a page fetches anything. Deployment off is a statement;
 // the user's own switch off redirects to the switch in Settings.
@@ -53,7 +54,11 @@ export function UsageBoardRoute({
           It is switched off for your account. Its readings keep arriving, so turning it on shows
           them at once.
         </p>
-        <Link className="underline underline-offset-2" to={USAGE_BOARD_SETTINGS_PATH}>
+        <Link
+          {...boardExitProps()}
+          className="underline underline-offset-2"
+          to={USAGE_BOARD_SETTINGS_PATH}
+        >
           Turn it on in Settings
         </Link>
       </div>

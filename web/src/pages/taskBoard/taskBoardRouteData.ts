@@ -19,8 +19,8 @@ export interface TimeWindow {
 }
 export type RouteMode = "order" | "time";
 export type DetailLevel = "station" | "phase" | "segment";
-export const detailLevel = (span: number): DetailLevel =>
-  span <= 2 * DAY ? "station" : span <= 14 * DAY ? "phase" : "segment";
+export const detailLevel = (span: number, stationDays = 2, phaseDays = 14): DetailLevel =>
+  span <= stationDays * DAY ? "station" : span <= phaseDays * DAY ? "phase" : "segment";
 export const initialWindow = (now = Date.now()): TimeWindow => ({ from: now - DAY, to: now + DAY });
 export function changeWindow(window: TimeWindow, delta: number, zoom: boolean): TimeWindow {
   const span = window.to - window.from;
@@ -122,6 +122,18 @@ export function taskRelations(tasks: BoardTask[]): TaskRelation[] {
       }
     }
   return [...edges.values()];
+}
+
+/** Parent membership is indexed once for every stop in the graph. */
+export function parentRelationCounts(
+  tasks: BoardTask[],
+  relations = taskRelations(tasks),
+): Map<BoardTask, number> {
+  const counts = new Map<BoardTask, number>();
+  for (const edge of relations) {
+    if (edge.kind === "parent" && edge.to) counts.set(edge.from, (counts.get(edge.from) ?? 0) + 1);
+  }
+  return counts;
 }
 
 function score(ids: string[], links: [string, string][]): number {
@@ -354,9 +366,10 @@ export function routeLayout(
   width: number,
   now: number,
   label: (node: RouteNode) => string,
+  thresholds = { station: 2, phase: 14 },
 ): RouteLayout {
-  const rowHeight =
-    detailLevel(window.to - window.from) === "station" || mode === "order" ? 136 : 92;
+  const levelOf = (span: number) => detailLevel(span, thresholds.station, thresholds.phase);
+  const rowHeight = levelOf(window.to - window.from) === "station" || mode === "order" ? 136 : 92;
   const gutter = width < 600 ? 14 : 190,
     right = width - 28;
   const nodes: RouteNode[] = [],
@@ -384,7 +397,7 @@ export function routeLayout(
     const step = (right - gutter - 42) / Math.max(1, visible.length - 1);
     const clusters: RouteNode[] = [];
     const span = window.to - window.from,
-      level = detailLevel(span);
+      level = levelOf(span);
     const minGap = level === "station" ? 60 : level === "phase" ? 84 : 40;
     if (mode === "time" && level === "segment") {
       const intervals = [timeDay, timeMonday, timeMonth, timeMonth.every(3)!, timeYear];
@@ -461,7 +474,7 @@ export function routeLayout(
     nodes.flatMap((node) => node.tasks.map((task) => [taskIdentity(task), node] as const)),
   );
   const relations =
-    mode === "time" && detailLevel(window.to - window.from) === "segment"
+    mode === "time" && levelOf(window.to - window.from) === "segment"
       ? []
       : taskRelations(rows.flatMap((row) => row.tasks));
   const kids = new Map<string, number>();
@@ -504,7 +517,7 @@ export function routeLayout(
       grouped.push(edge);
     }
   }
-  if (mode !== "time" || detailLevel(window.to - window.from) !== "segment")
+  if (mode !== "time" || levelOf(window.to - window.from) !== "segment")
     placeRouteLabels(nodes, grouped, width, rowHeight, gutter, label);
   return { nodes, edges: grouped, rails, headers, height: Math.max(136, top), rowHeight };
 }

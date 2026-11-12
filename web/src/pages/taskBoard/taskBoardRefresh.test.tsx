@@ -39,6 +39,7 @@ function board(
   );
 }
 it("refreshes an open cluster from current task identities after updates and deletions", () => {
+  vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-11-06T13:00:00Z"));
   const tasks = rows(16),
     view = render(board(tasks));
   fireEvent.click(screen.getByRole("button", { name: "Open 16 stops" }));
@@ -58,6 +59,7 @@ it("refreshes an open cluster from current task identities after updates and del
   expect(screen.queryByRole("region", { name: "Stops in this group" })).toBeNull();
 });
 it("clamps the phone page after tasks disappear", () => {
+  vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-11-06T13:00:00Z"));
   const tasks = rows(13),
     view = render(board(tasks));
   const phone = within(view.container.querySelector(".tb-route-phone")! as HTMLElement);
@@ -66,6 +68,12 @@ it("clamps the phone page after tasks disappear", () => {
   view.rerender(board(tasks.slice(0, 11)));
   expect(phone.getByText("Task 1")).toBeTruthy();
   expect(phone.queryByText("Task 13")).toBeNull();
+});
+it("keeps an unresolved failure visible after the recent board window", () => {
+  vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-11-12T13:00:00Z"));
+  const view = render(board(rows(1).map((task) => ({ ...task, progress: "failed" }))));
+  const phone = within(view.container.querySelector(".tb-route-phone")! as HTMLElement);
+  expect(phone.getByText("Task 1")).toBeTruthy();
 });
 it("zooms observed-close clusters around their observed time", () => {
   const now = Date.parse("2026-11-06T13:00:00Z");
@@ -83,6 +91,7 @@ it("zooms observed-close clusters around their observed time", () => {
   expect(screen.getByRole("button", { name: "Open 2 stops" })).toBeTruthy();
 });
 it("lets a route relation open its endpoints", () => {
+  vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-11-06T13:00:00Z"));
   const tasks = rows(17).map((task, index) => ({
     ...task,
     "omnigent.ai:group": { id: index < 16 ? "cluster" : "target" },

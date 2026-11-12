@@ -1,3 +1,4 @@
+import { boardExitProps, boardPath } from "@/lib/boardFrame";
 // The Usage board: one band of tiles per group, each tile a ring per window.
 // Display only — every setting lives in Settings or the account's own settings
 // page, reached from a tile. Arranging (groups and hand order) is the one edit
@@ -154,7 +155,7 @@ export function UsageBoardPage() {
               )}
             </Button>
             <Button variant="ghost" size="icon" asChild aria-label="Usage board settings">
-              <Link to="/settings/general#usage-settings">
+              <Link {...boardExitProps()} to="/settings/general#usage-settings">
                 <SettingsIcon className="size-4" aria-hidden="true" />
               </Link>
             </Button>
@@ -279,7 +280,9 @@ export function UsageBoardPage() {
                         }
                         amount={activity.data?.accounts.find((item) => item.account === account.id)}
                         tokens={board.unit === "tokens"}
-                        onOpen={() => navigate(`/usage/board/${encodeURIComponent(account.id)}`)}
+                        onOpen={() =>
+                          navigate(boardPath(`/usage/board/${encodeURIComponent(account.id)}`))
+                        }
                         onMove={(direction) => nudgeTile(account.id, direction)}
                       />
                     ))}
@@ -304,7 +307,9 @@ function EmptyBoard() {
         a host has read them.
       </p>
       <Button variant="outline" size="sm" asChild className="mt-1">
-        <Link to="/settings/general#usage-settings">Open settings</Link>
+        <Link {...boardExitProps()} to="/settings/general#usage-settings">
+          Open settings
+        </Link>
       </Button>
     </div>
   );

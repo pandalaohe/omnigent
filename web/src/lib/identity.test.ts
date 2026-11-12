@@ -1342,6 +1342,45 @@ describe("login redirect", () => {
     });
   });
 
+  it.each([
+    [false, ""],
+    [true, ""],
+    [false, "/proxy"],
+    [true, "/proxy"],
+  ] as const)("keeps frame 401s in a sign-in panel (late=%s, base=%s)", async (late, base) => {
+    window.__OMNIGENT_BASE_PATH__ = base;
+    stubLocation(`${base}/frame/usage/board/account`, "?range=d30");
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(late ? { user_id: "alice" } : { user_id: null, login_url: "/login" }, {
+        ok: late,
+        status: late ? 200 : 401,
+      }),
+    );
+    if (late) {
+      const { resolveServerInfo } = await import("./capabilities");
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({ login_url: "/login" }));
+      // The real boot resolves capabilities alongside identity.
+      const identityProbe = (await import("./identity")).resolveIdentity();
+      await resolveServerInfo();
+      await identityProbe;
+    }
+    const identity = await import("./identity");
+    if (!late) await identity.resolveIdentity();
+    fetchMock.mockResolvedValue(
+      mockJsonResponse({ user_id: null, login_url: "/login" }, { ok: false, status: 401 }),
+    );
+    const listener = vi.fn();
+    identity.subscribeFrameAuth(listener);
+    await Promise.all(Array.from({ length: 8 }, () => identity.authenticatedFetch("/v1/sessions")));
+    expect(identity.getFrameLoginUrl()).toBe(
+      `${base}/login?return_to=${encodeURIComponent(`${base}/usage/board/account?range=d30`)}`,
+    );
+    expect(hrefWrites).toEqual([]);
+    expect(identity.isLoginRedirectPending()).toBe(false);
+    expect(listener.mock.calls.length).toBeLessThanOrEqual(1);
+    delete window.__OMNIGENT_BASE_PATH__;
+  });
+
   it("redirects once for a whole burst of 401s", async () => {
     // /v1/me 401s with a login page (accounts / OIDC), then eight queries land
     // 401 behind it — the shape of a real logged-out page load.

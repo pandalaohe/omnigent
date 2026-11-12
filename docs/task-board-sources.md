@@ -319,3 +319,80 @@ curl -fsS -X DELETE "https://omnigent.example.com/v1/me/tasks/sources/example-en
 ```
 
 Deletion is scoped to the authenticated owner and removes the source row, its tasks, and its history events in one transaction. Pushing to the same `{source_id}` later creates a fresh source generation with a new `created` timestamp.
+
+## Display projections and snapshot updates (report schema revision 2)
+
+`omnigent.ai:sourceDisplay` is an optional, closed, versioned object. Its `version` is `1`.
+The canonical [report schema](schemas/task-board-report.schema.json) defines `TaskDisplayV1`,
+`SourceDisplayV1`, and their nested records and bounds. Unknown display fields and unsupported
+versions reject the report; ordinary legacy JSCalendar properties continue to round-trip.
+Task display badges, rows and HTTP links appear in **Source details** when populated. Strings
+render literally. A missing/empty display adds no section. Rich projections are stored for their
+native consumers; supplying a projection does not itself add its chart or view to the page.
+Money is kept at full precision internally and displayed with two fractional digits.
+
+A Group display requires the snapshot protocol. This opt-in cannot be undone by a legacy PUT.
+Use the same authenticated PUT route; the protocol grants no new permissions. Snapshot-mode
+writes must use Group envelopes; task-only and legacy writes return `409 snapshot_required`.
+The Group has a nonnegative safe-integer `sequence` (default `0`); publication versions compare
+canonical UTC `updated` first, then sequence.
+
+1. Read `GET /v1/me/tasks/sources`. Its `snapshot` object supplies `sourceGeneration`, `id`,
+   `asOf`, and `phase` (`legacy`, `staging`, `published`). A newly created source can omit
+   `sourceGeneration` in its initial begin; use the begin receipt's value thereafter.
+2. Send a Group display with `snapshot.operation=begin`, unique `id`, `baseId` equal to the last
+   published id (or null), `chunkCount`, `expectedTaskCount`, `contentHash`, and date coverage
+   `[coverageFrom,coverageTo)`. Send full replacement metadata, fixed `asOf`/`timeZone`, and no
+   task entries. Begin marks the source staging before task mutations. A competing begin returns
+   `409 snapshot_busy`; explicitly replace an interrupted upload using a new id and
+   `snapshot.abandons` naming the staging id. Previously applied deltas are retained, so a
+   replacement must declare all compensating changes and the resulting hash/count.
+3. Append deltas with the same immutable header, `sourceGeneration` and `chunkIndex` in
+   `[0,chunkCount)`. Only begin supplies metadata arrays. Task/removal uids must be disjoint
+   across chunks. `removedUids` marks existing tasks logically gone at `asOf`. Retained tasks
+   omitted from the delta stay present. Empty append is rejected; a zero-delta upload uses
+   `chunkCount:0`, then publish. Do not send `omnigent.ai:complete` in this protocol.
+4. Publish with no task entries after all chunks. The resulting non-gone task count and hash
+   must match; same-source TaskRefs must resolve, including tombstoned targets. Cross-source
+   refs are shape-checked. A release's `source` must equal the authenticated report source id.
+   A successful transaction publishes metadata/id/asOf together. Identical operation retries
+   return their receipts, including after publication; changed duplicate chunks return
+   `409 chunk_conflict`, held task bodies return `409 held_chunk` before any chunk mutation,
+   missing chunks return `409 snapshot_incomplete`, and result mismatch returns
+   `409 snapshot_conflict`. Stale generations return `409 source_generation_changed`.
+
+Content hashes use SHA-256 of RFC 8785 JCS UTF-8 bytes, implemented with `rfc8785`. The result
+shape is `{group,tasks,removedUids}`. `group` is the exact begin Group excluding `entries`, with
+its entire `sourceDisplay.snapshot` removed. `tasks` contains every resulting stored raw task
+body (gone tasks included), sorted by uid; append-only `omnigent.ai:history` is included when
+nonempty, sorted by event id within task uid. `removedUids` is the sorted resulting tombstone
+set. Server-added observation fields are excluded. Unknown raw JSCalendar fields are retained.
+Object keys use JCS UTF-16 order; array order stays as supplied except these specified sorts.
+See the executable [golden vectors](schemas/task-board-snapshot-vectors.json) for all three
+wire envelopes, integers/decimals/negative zero, null cost, and tombstone hash input.
+
+During staging, task/list/item/history/closed-count/display reads reject with
+`409 snapshot_updating`. Published reads may pin `snapshot=<id>` and
+`source_generation=<sourceGeneration>`; mismatches reject rather than returning a mixed picture.
+Task/history cursors bind the query and source-generation vector. Incremental `changed_after`
+reads remain legacy-only; they reject for snapshot-managed sources. A deleted source's pins
+are invalid, including when another source later uses its id.
+
+`GET /v1/me/tasks/sources/{source_id}/display` accepts `part=identity|future|closedDays|accountDays|releases`,
+optional half-open `from`/`to`, `cursor`, and `limit` (at most 1000). Identity returns
+`{snapshot,display}` with identity/groups/checkHosts/accounts/asOf/timeZone. Array parts return
+`{snapshot,entries,cursor}`; follow opaque cursors with the same query and both pins. Task-level
+arrays have no paging route: over-bound arrays are rejected. A feeder may explicitly send the
+newest bounded records and `TaskDisplayV1.omitted` counts; it must preserve independent totals.
+
+The native client assembles each source's pages and metadata privately and publishes a complete
+cache in one step. A warm client retains its prior complete cache while updating; a cold client
+shows updating/unavailable until a full read succeeds. Sources are independent, and live native
+sessions/usage have their own clocks. Account identity is `{namespace,id}` plus date, with a
+source-declared authority/timezone; conflicting declarations or amounts are unknown, never zero.
+Native session runtime replaces the source runtime tuple by full session id; source attribution
+and historical costs remain source facts.
+
+The additive migration keeps nullable source display, generation, and snapshot state. Rolling
+back UI code must retain these columns/data; the down migration deliberately does not drop them.
+Disable revision-2 feeders before running an older server that cannot enforce publication guards.
