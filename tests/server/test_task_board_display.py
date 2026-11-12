@@ -115,11 +115,24 @@ def repository_day():
     }
 
 
-def test_repository_daily_commits_round_trip():
-    display = {**source_display(), "repositoryDailyCommits": [repository_day()]}
+@pytest.mark.parametrize("head", ["a" * 40, "A1" * 32])
+def test_repository_daily_commits_round_trip(head):
+    display = {**source_display(), "repositoryDailyCommits": [{**repository_day(), "head": head}]}
     group = {"@type": "Group", "uid": "group", "updated": STAMP, "entries": [], KEY: display}
     assert report(group).group == group
     jsonschema.validate(group, SCHEMA)
+
+
+@pytest.mark.parametrize("head", ["not-a-sha", "a" * 39, "a" * 41, "a" * 63, "a" * 65, "g" * 40])
+def test_repository_head_rejection_matches_schema(head):
+    display = {**source_display(), "repositoryDailyCommits": [{**repository_day(), "head": head}]}
+    group = {"@type": "Group", "uid": "group", "updated": STAMP, "entries": [task()], KEY: display}
+    with pytest.raises(ReportError) as error:
+        report(group)
+    assert error.value.status == 422
+    assert error.value.path.endswith("repositoryDailyCommits[0].head")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(group, SCHEMA)
 
 
 @pytest.mark.parametrize(

@@ -466,7 +466,7 @@ class RepositoryDailyCommits(Closed):
     timeZone: Zone
     totalCommits: Count
     refs: list[Id] = Field(max_length=8)
-    head: Id
+    head: Annotated[str, Field(pattern=r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")]
     collectedAt: UTCDateTime
 
 
