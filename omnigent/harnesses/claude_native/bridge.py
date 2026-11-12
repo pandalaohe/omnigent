@@ -9640,6 +9640,39 @@ _POLICY_PROXY_ERROR_DETAIL_MAX = 400
 # waiting never stalls other relay traffic.
 _FILE_CHANGE_OBSERVER_TIMEOUT_S = 10.0
 
+# Five minutes is when a user watching an unresponsive Pi child would consider it stuck.
+_PI_CONTINUITY_STUCK_BACKSTOP_S = 5 * 60.0
+
+
+def _wait_for_pi_bootstrap_frame(
+    future: Future[_JsonObject],
+    loop: asyncio.AbstractEventLoop,
+    connection: socket.socket,
+    closed: threading.Event | None,
+) -> _JsonObject:
+    """Wait for fresh validation, stopping on lost liveness or a stuck runner."""
+    deadline = time.monotonic() + _PI_CONTINUITY_STUCK_BACKSTOP_S
+    try:
+        while True:
+            if closed is not None and closed.is_set():
+                raise ConnectionAbortedError("Pi bootstrap relay closed")
+            if loop.is_closed() or not loop.is_running():
+                raise ConnectionAbortedError("Pi bootstrap runner loop stopped")
+            if select.select([connection], [], [], 0)[0]:
+                raise ConnectionAbortedError("Pi bootstrap watch peer disconnected")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Pi bootstrap continuity stuck beyond user-wait backstop")
+            try:
+                return future.result(timeout=min(0.1, remaining))
+            except TimeoutError:
+                # Completion can race the wait timeout; retrieve the actual
+                # value or coroutine exception rather than rethrowing the wait.
+                if future.done():
+                    return future.result()
+    finally:
+        future.cancel()
+
 
 def _tool_relay_handler_factory(
     token: str,
@@ -9735,7 +9768,9 @@ def _tool_relay_handler_factory(
                     future = asyncio.run_coroutine_threadsafe(
                         _bootstrap_request(authorization), loop
                     )
-                    frame = future.result(timeout=2.0)
+                    # A busy runner loop is not a lost attestor. Await this check
+                    # without publishing an unvalidated frame or replacing its future.
+                    frame = _wait_for_pi_bootstrap_frame(future, loop, self.connection, closed)
                 except Exception as exc:  # noqa: BLE001 - EOF/error seals the private client
                     future.cancel()
                     _logger.warning(
