@@ -10,6 +10,8 @@ import {
   LogIn,
   LogOut,
   Pause,
+  Network,
+  Route,
   Play,
 } from "lucide-react";
 import { taskIdentity, type BoardTask } from "./taskBoardData";
@@ -168,11 +170,23 @@ export function TaskBoardLog({
       <div className="l-bar">
         <ActivitySegments
           value={by}
+          small={false}
           onChange={change(setBy)}
-          items={["time", "mother", "line"].map((k) => [k, t(`g6.log.by.${k}`)])}
+          items={["time", "mother", "line"].map((k) => [
+            k,
+            t(`g6.log.by.${k}`),
+            k === "time" ? (
+              <Clock key={k} size={13} />
+            ) : k === "mother" ? (
+              <Network key={k} size={13} />
+            ) : (
+              <Route key={k} size={13} />
+            ),
+          ])}
         />
         <ActivitySegments
           value={kind}
+          small={false}
           onChange={change(setKind)}
           items={["all", "hand", "test", "commit"].map((k) => [k, t(`g6.log.kind.${k}`)])}
         />

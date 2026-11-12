@@ -16,6 +16,7 @@ export function TaskBoardHistoryChart({
   to,
   now,
   historyStart,
+  capped,
   sourceOrder,
   onRange,
 }: {
@@ -26,6 +27,7 @@ export function TaskBoardHistoryChart({
   to: number;
   now: number;
   historyStart: number;
+  capped: boolean;
   sourceOrder: string[];
   onRange: (from: number, to: number) => void;
 }) {
@@ -77,8 +79,7 @@ export function TaskBoardHistoryChart({
     const cell = cells.find((c) => date >= c.a && date < c.b);
     if (cell) cell.values.set(source, (cell.values.get(source) ?? 0) + n);
   };
-  if (counts.some((c) => Date.parse(c.day + "T00:00:00") < historyStart))
-    counts.forEach((c) => add(c.source, Date.parse(c.day + "T12:00:00"), c.closed));
+  if (capped) counts.forEach((c) => add(c.source, Date.parse(c.day + "T12:00:00"), c.closed));
   else cards.forEach((c) => add(c.source, c.end, 1));
   const totals = cells.map((c) => [...c.values.values()].reduce((a, b) => a + b, 0)),
     ranked = [...totals].sort((a, b) => b - a),

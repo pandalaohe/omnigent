@@ -1938,3 +1938,33 @@
   box-shadow: 0 0 0 2px var(--primary);
   background: var(--background);
 }
+.tb-activity-final .h-chev {
+  margin-left: 0;
+}
+.tb-activity-final .h-row .h-name {
+  grid-column: 2;
+  grid-row: 1;
+}
+.tb-activity-final .h-line {
+  overflow: hidden;
+}
+@container (min-width:621px) {
+  .tb-activity-final .h-line {
+    width: 250px;
+  }
+}
+@container (max-width:620px) {
+  .tb-activity-final .h-row > .h-bullet,
+  .tb-activity-final .h-row > .tb-identity-mark {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .tb-activity-final .h-row > .h-chev {
+    grid-column: 4;
+    grid-row: 1;
+  }
+  .tb-activity-final .h-line {
+    grid-column: 1/-1;
+    grid-row: 2;
+  }
+}

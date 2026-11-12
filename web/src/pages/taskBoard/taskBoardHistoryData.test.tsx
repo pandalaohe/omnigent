@@ -230,6 +230,7 @@ it("loads pinned old-month cursor pages and discards a cancelled response", asyn
     .mockResolvedValueOnce(Response.json({ display: c.display, snapshot: c.pin }));
   fireEvent.click(screen.getByRole("button", { name: "Load month" }));
   await waitFor(() => expect(container.querySelector(".h-stat>b")?.textContent).toBe("2"));
+  expect(container.querySelector(".h-range")?.textContent).toContain("January 1");
   expect(fetcher).toHaveBeenCalledTimes(4);
   expect(fetcher.mock.calls[2][0]).toContain("cursor=later");
 });

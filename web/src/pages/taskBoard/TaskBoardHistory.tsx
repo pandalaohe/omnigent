@@ -42,7 +42,18 @@ export function HistoryStrip({
   from: number;
   to: number;
 }) {
-  const W = 250,
+  const stripRef = useRef<SVGSVGElement>(null),
+    [stripWidth, setStripWidth] = useState(250);
+  useEffect(() => {
+    const parent = stripRef.current?.parentElement;
+    if (!parent) return;
+    const update = () => setStripWidth(Math.max(220, parent.clientWidth));
+    const observer = new ResizeObserver(update);
+    update();
+    observer.observe(parent);
+    return () => observer.disconnect();
+  }, []);
+  const W = stripWidth,
     y = 12,
     ts = cards.map((c) => c.end).sort((a, b) => a - b),
     xs = ts.map((time) =>
@@ -50,11 +61,21 @@ export function HistoryStrip({
     ),
     roll = historyRoll(cards),
     room = xs.every((x, i) => !i || x - xs[i - 1] >= 13);
-  const bins = Array.from({ length: 62 }, () => 0);
-  xs.forEach((x) => bins[Math.min(61, Math.floor(x / 4))]++);
+  const columns = Math.max(1, Math.floor(W / 4)),
+    step = W / columns,
+    bins = Array.from({ length: columns }, () => 0);
+  ts.forEach(
+    (time) =>
+      bins[
+        Math.max(
+          0,
+          Math.min(columns - 1, Math.floor(((time - from) / Math.max(1, to - from)) * columns)),
+        )
+      ]++,
+  );
   const max = Math.max(6, ...bins);
   return (
-    <svg className="cl" width={W} height={31} viewBox={`0 0 ${W} 31`}>
+    <svg ref={stripRef} className="cl" width={W} height={31} viewBox={`0 0 ${W} 31`}>
       <title>
         {t("g6.stripOutcome", {
           good: roll.good,
@@ -103,10 +124,10 @@ export function HistoryStrip({
           {bins.map((n, i) =>
             n ? (
               <rect
-                key={String(i * 4)}
-                x={i * 4}
+                key={String(i * step)}
+                x={i * step}
                 y={y - Math.sqrt(n / max) * 11}
-                width={3.2}
+                width={step - 0.8}
                 height={Math.max(3, Math.sqrt(n / max) * 22)}
                 fill={color}
               />
@@ -207,7 +228,7 @@ export function TaskBoardHistory({
   extra.forEach((task) => merged.set(taskIdentity(task), task));
   const historyStart = Math.min(
     now,
-    ...tasks
+    ...[...merged.values()]
       .map((task) =>
         Date.parse(task["omnigent.ai:sourceDisplay"]?.historyState?.first ?? task.created ?? ""),
       )
@@ -426,6 +447,7 @@ export function TaskBoardHistory({
         to={to}
         now={now}
         historyStart={historyStart}
+        capped={hasOldMonths}
         sourceOrder={Object.keys(caches)}
         onRange={setTime}
       />
@@ -442,7 +464,12 @@ export function TaskBoardHistory({
                 .sort((a, b) => count.get(b)! - count.get(a)!)
                 .filter((v) => key !== "source" || v.toLowerCase().includes(search.toLowerCase())),
               selected = sets[key],
-              label = (v: string) => (key === "outcome" ? t("g6.outcome." + (v || "unknown")) : v);
+              label = (v: string) =>
+                key === "outcome"
+                  ? t("g6.outcome." + (v || "unknown"))
+                  : key === "agent" && t("g6.agent." + v) !== "g6.agent." + v
+                    ? t("g6.agent." + v)
+                    : v;
             return (
               <div key={key} className="fwrap">
                 <button
@@ -552,6 +579,11 @@ export function TaskBoardHistory({
                             }
                           >
                             <i className="fck">{selected.includes(v) ? "✓" : ""}</i>
+                            {key === "agent" ? (
+                              <BoardAgentLogo id={v} size={13} />
+                            ) : key === "source" ? (
+                              <i className="dot" style={{ background: sourceColor(v) }} />
+                            ) : null}
                             <span>{label(v)}</span>
                             <em>{count.get(v)}</em>
                           </button>

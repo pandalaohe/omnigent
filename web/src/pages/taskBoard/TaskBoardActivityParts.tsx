@@ -4,13 +4,26 @@ import { t, formatDate } from "./taskBoardText";
 import type { BoardTask } from "./taskBoardData";
 import { BoardPager } from "./TaskBoardRoutes";
 
-export const activityStamp = (at: number, timeOnly = false) =>
-  formatDate(
-    new Date(at),
-    timeOnly
-      ? { hour: "2-digit", minute: "2-digit", hour12: false }
-      : { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false },
-  );
+export const activityStamp = (at: number, timeOnly = false) => {
+  const now = Date.now(),
+    date = new Date(at),
+    day = (value: number) => {
+      const d = new Date(value);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    },
+    key = day(at);
+  const time = formatDate(date, { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+  if (timeOnly || key === day(now)) return time;
+  const prefix =
+    now - at > 300 * 86400000
+      ? key
+      : key === day(now - 86400000)
+        ? t("routes.yesterday")
+        : at > now && at - now < 2 * 86400000
+          ? t("routes.tomorrow")
+          : key.slice(5);
+  return prefix + " " + time;
+};
 export const activityDuration = (value: number) => {
   const seconds = Math.round(value);
   if (seconds < 3600) return Math.max(1, Math.round(seconds / 60)) + "m";
@@ -55,14 +68,16 @@ export function ActivitySegments({
   value,
   items,
   onChange,
+  small = true,
 }: {
+  small?: boolean;
   value: string;
-  items: [string, string][];
+  items: [string, string, ReactNode?][];
   onChange: (value: string) => void;
 }) {
   return (
-    <div className="seg seg-sm">
-      {items.map(([id, label]) => (
+    <div className={small ? "seg seg-sm" : "seg"}>
+      {items.map(([id, label, icon]) => (
         <button
           type="button"
           key={id}
@@ -70,6 +85,7 @@ export function ActivitySegments({
           aria-pressed={value === id}
           onClick={() => onChange(id)}
         >
+          {icon}
           {label}
         </button>
       ))}
@@ -91,6 +107,7 @@ export function ActivityPages({
     <BoardPager
       page={Math.min(page, Math.ceil(total / size) - 1)}
       pages={Math.ceil(total / size)}
+      total={total}
       onChange={onChange}
     />
   ) : null;
