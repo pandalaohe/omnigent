@@ -18,6 +18,8 @@ const initial = {
   can_edit: true,
   model_count: 0,
   fetched_at: null,
+  version: null,
+  state: "unavailable",
   error: null,
 };
 beforeEach(() => {
@@ -26,6 +28,33 @@ beforeEach(() => {
   patchUsageBoardPreferences({ enabled: true });
 });
 afterEach(cleanup);
+
+it.each([
+  ["fresh", "Fresh"],
+  ["stale", "Stale · last good prices remain in use"],
+  ["unavailable", "Unavailable · using built-in catalog"],
+])("shows imported source metadata and %s state", async (state, label) => {
+  fetchMock.mockResolvedValue(
+    new Response(
+      JSON.stringify({
+        ...initial,
+        source: "custom",
+        format: "litellm",
+        url: "http://192.168.1.1/map.json",
+        version: "abcdef123456",
+        fetched_at: 1794484800,
+        state,
+        error: state === "stale" ? "Price source returned HTTP 500" : null,
+      }),
+    ),
+  );
+  mount("settings");
+  await screen.findByText(/LiteLLM map · http:/);
+  expect(screen.getByText(new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))).toBeTruthy();
+  expect(screen.getByText(/Version: abcdef123456/)).toBeTruthy();
+  expect(screen.getByText(/Fetched/)).toBeTruthy();
+  if (state === "stale") expect(screen.getByRole("alert").textContent).toContain("HTTP 500");
+});
 
 function mount(view: "settings" | "models" | "range") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -68,7 +97,7 @@ it("saves a selected map and leaves the prior selection after a rejected URL", a
   await screen.findByText("Saved");
   expect((select as HTMLSelectElement).value).toBe("litellm");
   fireEvent.click(screen.getByRole("button", { name: "Add price source URL" }));
-  fireEvent.change(screen.getByLabelText("Price map HTTPS URL"), {
+  fireEvent.change(screen.getByLabelText("Price map URL"), {
     target: { value: "https://prices.example.test/empty.json" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Add source" }));

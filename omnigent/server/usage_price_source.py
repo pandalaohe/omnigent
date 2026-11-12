@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import ipaddress
 import json
 import logging
 import math
@@ -33,6 +35,27 @@ _PRESETS = {
 }
 
 
+def _private_host(host: str | None) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(host or "")
+    except ValueError:
+        return False
+    return (
+        address.is_loopback
+        or address.is_link_local
+        or any(
+            address in network
+            for network in (
+                ipaddress.ip_network("10.0.0.0/8"),
+                ipaddress.ip_network("172.16.0.0/12"),
+                ipaddress.ip_network("192.168.0.0/16"),
+            )
+        )
+    )
+
+
 class PriceSourceSelection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -44,11 +67,14 @@ class PriceSourceSelection(BaseModel):
     def validate_selection(self) -> Self:
         if self.source == "custom":
             if self.format is None or self.url is None:
-                raise ValueError("Choose a format and an HTTPS URL")
+                raise ValueError("Choose a format and a price map URL")
             try:
                 url = urlsplit(self.url)
                 valid = (
-                    url.scheme == "https"
+                    (
+                        url.scheme == "https"
+                        or (url.scheme == "http" and _private_host(url.hostname))
+                    )
                     and bool(url.hostname)
                     and url.username is None
                     and url.password is None
@@ -57,9 +83,15 @@ class PriceSourceSelection(BaseModel):
                     and not any(char.isspace() for char in self.url)
                 )
             except ValueError:
-                raise ValueError("Use an HTTPS URL without credentials or a fragment") from None
+                raise ValueError(
+                    "Use an HTTPS URL, or HTTP on a private host, "
+                    "without credentials or a fragment"
+                ) from None
             if not valid:
-                raise ValueError("Use an HTTPS URL without credentials or a fragment")
+                raise ValueError(
+                    "Use an HTTPS URL, or HTTP on a private host, "
+                    "without credentials or a fragment"
+                )
             if "?" in self.url:
                 raise ValueError("Price source URLs cannot contain a query string")
         elif self.url is not None or self.format is not None:
@@ -75,11 +107,11 @@ class PriceSourceSelection(BaseModel):
         return _PRESETS[self.source], self.source
 
 
-async def fetch_prices(selection: PriceSourceSelection) -> PriceMap:
+async def fetch_prices(selection: PriceSourceSelection) -> tuple[PriceMap, str | None]:
     """Fetch a bounded JSON document without redirects, proxy or auth inheritance."""
     location = selection.location()
     if location is None:
-        return PriceMap({})
+        return PriceMap({}), None
     url, format_name = location
     try:
         async with (
@@ -102,7 +134,7 @@ async def fetch_prices(selection: PriceSourceSelection) -> PriceMap:
     prices = READERS[format_name](payload)
     if not prices:
         raise ValueError("Price source contains no valid input and output prices in this format")
-    return PriceMap(prices)
+    return PriceMap(prices), hashlib.sha256(content).hexdigest()[:12]
 
 
 class UsagePriceSource:
@@ -115,6 +147,7 @@ class UsagePriceSource:
         self.selection = PriceSourceSelection()
         self.prices: PriceMap | None = None
         self.fetched_at: float | None = None
+        self.version: str | None = None
         self.last_attempt_at: float | None = None
         self.error: str | None = None
         self.failures: list[dict[str, Any]] = []
@@ -167,22 +200,44 @@ class UsagePriceSource:
                 raise ValueError("Invalid price cache time")
             self.prices = PriceMap(normalized)
             self.fetched_at = fetched_at
+            version = cache.get("version")
+            self.version = (
+                version
+                if isinstance(version, str)
+                and len(version) == 12
+                and all(char in "0123456789abcdef" for char in version)
+                else None
+            )
+            if self.failures and self.failures[-1]["at"] > fetched_at:
+                self.error = self.failures[-1]["error"]
             install_price_map(self.prices)
         except (OSError, ValueError, TypeError, KeyError, AttributeError, SQLAlchemyError):
+            self.error = "Price cache could not be restored; using built-in catalog"
             _logger.warning("Could not restore the usage price source cache")
 
     def status(self) -> dict[str, Any]:
+        location = self.selection.location()
+        state = "unavailable"
+        if self.prices and self.fetched_at is not None:
+            state = "stale" if time.time() - self.fetched_at > 2 * _DAY else "fresh"
         return {
             **self.selection.model_dump(),
-            "url": redact_url(self.selection.url),
+            "url": redact_url(location[0]) if location else None,
+            "format": location[1] if location else None,
             "fetched_at": self.fetched_at,
+            "version": self.version,
+            "state": state,
             "last_attempt_at": self.last_attempt_at,
             "model_count": len(self.prices.prices) if self.prices else 0,
             "error": self.error,
         }
 
     def _save_cache(
-        self, selection: PriceSourceSelection, prices: PriceMap, fetched_at: float
+        self,
+        selection: PriceSourceSelection,
+        prices: PriceMap,
+        fetched_at: float,
+        version: str | None,
     ) -> None:
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.cache_path.with_suffix(".tmp")
@@ -191,6 +246,7 @@ class UsagePriceSource:
                 {
                     "selection": selection.model_dump(),
                     "fetched_at": fetched_at,
+                    "version": version,
                     "prices": {model: asdict(price) for model, price in prices.prices.items()},
                 },
                 allow_nan=False,
@@ -206,12 +262,14 @@ class UsagePriceSource:
         async with self._lock:
             now = time.time()
             try:
-                prices = await fetch_prices(selection) if selection.location() else None
+                prices, version = (
+                    await fetch_prices(selection) if selection.location() else (None, None)
+                )
             except ValueError as exc:
                 await self._note_failure(str(exc), now)
                 raise
             if prices is not None:
-                await asyncio.to_thread(self._save_cache, selection, prices, now)
+                await asyncio.to_thread(self._save_cache, selection, prices, now, version)
             await asyncio.to_thread(
                 self.snapshots.write,
                 RESERVED_USER_LOCAL,
@@ -220,6 +278,7 @@ class UsagePriceSource:
             )
             self.selection, self.prices = selection, prices
             self.fetched_at = now if prices is not None else None
+            self.version = version
             self.last_attempt_at, self.error = now, None
             install_price_map(prices)
             await self._fill()
@@ -258,8 +317,8 @@ class UsagePriceSource:
                 return
             self.last_attempt_at = now
             try:
-                prices = await fetch_prices(self.selection)
-                await asyncio.to_thread(self._save_cache, self.selection, prices, now)
+                prices, version = await fetch_prices(self.selection)
+                await asyncio.to_thread(self._save_cache, self.selection, prices, now, version)
             except (ValueError, OSError) as exc:
                 message = (
                     str(exc) if isinstance(exc, ValueError) else "Price cache could not be saved"
@@ -267,6 +326,7 @@ class UsagePriceSource:
                 await self._note_failure(message, now)
                 return
             self.prices, self.fetched_at, self.error = prices, now, None
+            self.version = version
             install_price_map(prices)
             await self._fill()
 

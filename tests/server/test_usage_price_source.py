@@ -1,5 +1,8 @@
 """Source selection, restart, failures and the owner-scoped Models join."""
 
+import hashlib
+import json
+
 import httpx
 import pytest
 from fastapi import FastAPI
@@ -41,6 +44,13 @@ def price_source(service, tmp_path, monkeypatch):
     "url",
     [
         "http://example.test/prices",
+        "http://8.8.8.8/prices",
+        "http://100.64.0.1/prices",
+        "http://0.0.0.0/prices",
+        "http://[::]/prices",
+        "http://192.168.1.1.example.test/prices",
+        "http://192.168.1.1/prices?edition=public",
+        "http://name:pass@192.168.1.1/prices",
         "https://name:pass@example.test/prices",
         "https://name@example.test/prices",
         "https:///missing",
@@ -48,8 +58,32 @@ def price_source(service, tmp_path, monkeypatch):
     ],
 )
 def test_custom_requires_https_without_credentials(url):
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError) as failure:
         PriceSourceSelection(source="custom", format="litellm", url=url)
+    if url == "http://8.8.8.8/prices":
+        assert failure.value.errors()[0]["msg"] == (
+            "Value error, Use an HTTPS URL, or HTTP on a private host, "
+            "without credentials or a fragment"
+        )
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "localhost",
+        "127.0.0.1",
+        "10.0.0.1",
+        "172.16.0.1",
+        "192.168.1.1",
+        "169.254.1.1",
+        "[::1]",
+        "[fe80::1]",
+    ],
+)
+def test_private_http_source_is_accepted(host):
+    assert PriceSourceSelection(
+        source="custom", format="litellm", url=f"http://{host}/map"
+    ).location()
 
 
 @pytest.mark.parametrize(
@@ -81,6 +115,8 @@ async def test_plain_public_url_is_accepted(price_source, respx_mock):
     assert route.call_count == 1
     assert status["url"] == URL
     assert status["model_count"] == 1
+    assert status["state"] == "fresh"
+    assert status["version"] == hashlib.sha256(route.calls[0].response.content).hexdigest()[:12]
 
 
 @pytest.mark.asyncio
@@ -132,9 +168,11 @@ async def test_selection_freezes_priced_history_fills_closed_only_and_restarts(
     restored = UsagePriceSource(price_source.snapshots, hours, price_source.cache_path.parent)
     install_price_map(None)
     restored.load()
+    assert restored.status()["version"] == price_source.status()["version"]
     assert fetch_model_pricing_with_provider("model") == ModelPricing(2e-6, 6e-6)
     assert route.call_count == 2  # loading the cache needed no request
     await restored.select(PriceSourceSelection())
+    assert restored.status()["version"] is None
     assert fetch_model_pricing_with_provider("model") is None
     assert hours.read(OWNER, HOUR - 7200, HOUR + 1) == rows
 
@@ -147,6 +185,7 @@ async def test_failed_daily_read_keeps_last_map_and_becomes_an_issue(
     monkeypatch.setattr("omnigent.server.usage_price_source.time.time", lambda: clock[0])
     route = respx_mock.get(URL).respond(200, json=PAYLOAD)
     await price_source.select(CUSTOM)
+    version = price_source.status()["version"]
     await price_source.refresh_if_due()
     assert route.call_count == 1
     clock[0] += 86400
@@ -154,6 +193,20 @@ async def test_failed_daily_read_keeps_last_map_and_becomes_an_issue(
     await price_source.refresh_if_due()
     assert price_source.error
     clock[0] += 1
+    assert price_source.status()["state"] == "fresh"
+    clock[0] = NOW + 2 * 86400
+    assert price_source.status()["state"] == "fresh"
+    clock[0] += 1
+    await price_source.refresh_if_due()
+    assert price_source.status()["state"] == "stale"
+    assert price_source.status()["version"] == version
+    restored = UsagePriceSource(
+        price_source.snapshots, price_source.hours, price_source.cache_path.parent
+    )
+    restored.load()
+    assert restored.status()["state"] == "stale"
+    assert restored.status()["version"] == version
+    assert restored.status()["error"] == price_source.error
     assert fetch_model_pricing_with_provider("model") == ModelPricing(2e-6, 6e-6)
     app = FastAPI()
     app.include_router(
@@ -165,12 +218,53 @@ async def test_failed_daily_read_keeps_last_map_and_becomes_an_issue(
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
+        public_http = await client.put(
+            "/v1/me/usage/price-source",
+            json={"source": "custom", "format": "litellm", "url": "http://8.8.8.8/prices"},
+        )
+        assert public_http.status_code == 422
+        assert public_http.json()["detail"][0]["msg"] == (
+            "Value error, Use an HTTPS URL, or HTTP on a private host, "
+            "without credentials or a fragment"
+        )
         assert (await client.get("/v1/me/usage/issues")).json()["price_source"][0]["error"]
         failed = await client.put(
             "/v1/me/usage/price-source", json={"source": "custom", "format": "litellm", "url": URL}
         )
         assert failed.status_code == 422
         assert (await client.get("/v1/me/usage/price-source")).json()["fetched_at"] == NOW
+        assert (await client.get("/v1/me/usage/price-source")).json()["state"] == "stale"
+    route.respond(200, json={**PAYLOAD, "vendor/new": PAYLOAD["vendor/model"]})
+    clock[0] += 86400
+    await price_source.refresh_if_due()
+    assert price_source.status()["state"] == "fresh"
+    assert price_source.status()["version"] != version
+    assert price_source.status()["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_cache_versions_are_optional_but_unreadable_cache_is_unavailable(
+    price_source, respx_mock
+):
+    assert price_source.status()["state"] == "unavailable"
+    respx_mock.get(URL).respond(200, json=PAYLOAD)
+    await price_source.select(CUSTOM)
+    cache = json.loads(price_source.cache_path.read_text())
+    cache.pop("version")
+    price_source.cache_path.write_text(json.dumps(cache))
+    restored = UsagePriceSource(
+        price_source.snapshots, price_source.hours, price_source.cache_path.parent
+    )
+    restored.load()
+    assert restored.status()["state"] == "fresh"
+    assert restored.status()["version"] is None
+    price_source.cache_path.write_text("broken")
+    unavailable = UsagePriceSource(
+        price_source.snapshots, price_source.hours, price_source.cache_path.parent
+    )
+    unavailable.load()
+    assert unavailable.status()["state"] == "unavailable"
+    assert unavailable.status()["error"]
 
 
 def test_models_join_keeps_stale_owned_hosts_and_scopes_product(service, db_uri, monkeypatch):

@@ -8243,6 +8243,126 @@
         "title": "PriceSourceSelection",
         "type": "object"
       },
+      "PriceSourceStatus": {
+        "properties": {
+          "can_edit": {
+            "title": "Can Edit",
+            "type": "boolean"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "fetched_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fetched At"
+          },
+          "format": {
+            "anyOf": [
+              {
+                "enum": [
+                  "litellm",
+                  "openrouter",
+                  "modelsdev"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Format"
+          },
+          "last_attempt_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Attempt At"
+          },
+          "model_count": {
+            "format": "int64",
+            "title": "Model Count",
+            "type": "integer"
+          },
+          "source": {
+            "enum": [
+              "builtin",
+              "litellm",
+              "openrouter",
+              "modelsdev",
+              "custom"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "fresh",
+              "stale",
+              "unavailable"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "source",
+          "format",
+          "url",
+          "can_edit",
+          "model_count",
+          "fetched_at",
+          "last_attempt_at",
+          "version",
+          "state",
+          "error"
+        ],
+        "title": "PriceSourceStatus",
+        "type": "object"
+      },
       "PricingBaseline": {
         "additionalProperties": false,
         "properties": {
@@ -29522,9 +29642,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Read Price Source V1 Me Usage Price Source Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/PriceSourceStatus"
                 }
               }
             },
@@ -29550,9 +29668,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Write Price Source V1 Me Usage Price Source Put",
-                  "type": "object"
+                  "$ref": "#/components/schemas/PriceSourceStatus"
                 }
               }
             },

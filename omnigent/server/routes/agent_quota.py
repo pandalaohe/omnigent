@@ -161,6 +161,19 @@ def _inline_openapi_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return resolve(schema)
 
 
+class PriceSourceStatus(BaseModel):
+    source: Literal["builtin", "litellm", "openrouter", "modelsdev", "custom"]
+    format: Literal["litellm", "openrouter", "modelsdev"] | None
+    url: str | None
+    can_edit: bool
+    model_count: int
+    fetched_at: float | None
+    last_attempt_at: float | None
+    version: str | None
+    state: Literal["fresh", "stale", "unavailable"]
+    error: str | None
+
+
 class QuotaReportWindow(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -620,7 +633,7 @@ def create_agent_quota_router(
             view.model_dump(mode="json"), headers={"Cache-Control": "private, no-store"}
         )
 
-    @router.get("/me/usage/price-source")
+    @router.get("/me/usage/price-source", response_model=PriceSourceStatus)
     async def read_price_source(request: Request) -> dict[str, Any]:
         require_usage()
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
@@ -633,7 +646,7 @@ def create_agent_quota_router(
         )
         return {**price_source.status(), "can_edit": can_edit}
 
-    @router.put("/me/usage/price-source")
+    @router.put("/me/usage/price-source", response_model=PriceSourceStatus)
     async def write_price_source(request: Request, body: PriceSourceSelection) -> dict[str, Any]:
         require_usage()
         from omnigent.server.routes.default_policies import _require_admin

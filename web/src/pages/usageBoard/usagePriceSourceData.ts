@@ -11,6 +11,8 @@ export interface PriceSourceStatus extends PriceSelection {
   can_edit: boolean;
   model_count: number;
   fetched_at: number | null;
+  version: string | null;
+  state: "fresh" | "stale" | "unavailable";
   error: string | null;
 }
 
@@ -30,6 +32,7 @@ export function usePriceSource() {
     queryKey: ["usageBoard", "priceSource"],
     queryFn: () => usageJson<PriceSourceStatus>("price-source"),
     retry: false,
+    refetchInterval: 60_000,
   });
 }
 
