@@ -5,6 +5,7 @@ from __future__ import annotations
 from fractions import Fraction
 from typing import Any
 
+from omnigent.usage.analysis import LIST_BASES
 from omnigent.usage.contract import AnalysisRowView, UsageAnalysisView
 from omnigent.usage.pricing import Currency, PricingBaseline, PurchasedCard
 from omnigent.usage.value import Coverage, Value, divide, exact, multiply, subtract
@@ -63,11 +64,24 @@ def value_usage(
         and (pool is None or (card.target_kind == "pool" and card.target_id == pool))
         and (card_id is None or card.id == card_id)
     ]
+    actual_rows = [row for row in view.rows if row.contributes_usage]
+    rows = actual_rows
+    if card_id is not None:
+        if all_cards:
+            selected_card = all_cards[0]
+            begins, ends = selected_card.billing_span()
+            rows = [
+                row
+                for row in rows
+                if _matches(selected_card, row)
+                and begins.timestamp() <= row.hour < ends.timestamp()
+            ]
+        else:
+            rows = []
     rows = [
         row
-        for row in view.rows
-        if row.contributes_usage
-        and (pool is None or (row.attributed and row.pool_id == pool))
+        for row in rows
+        if (pool is None or (row.attributed and row.pool_id == pool))
         and (model is None or row.model == model)
     ]
     cards = []
@@ -91,6 +105,9 @@ def value_usage(
     rows_by_parent: dict[str, list[AnalysisRowView]] = {}
     for row in rows:
         rows_by_parent.setdefault(row.parent_account_id, []).append(row)
+    actual_by_parent: dict[str, list[AnalysisRowView]] = {}
+    for row in actual_rows:
+        actual_by_parent.setdefault(row.parent_account_id, []).append(row)
     for card in all_cards:
         b0, b1 = card.billing_span()
         billing = (int(b0.timestamp()), int(b1.timestamp()))
@@ -152,10 +169,13 @@ def value_usage(
                 ratio_items.add(card.id)
                 ratio_paid += paid * Fraction(defaults.fx_to_display[card.purchase_currency])
         rates = card.rates_usd_per_million
+        target_rows = [
+            row
+            for row in actual_by_parent.get(card.parent, [])
+            if _matches(card, row) and billing[0] <= row.hour < billing[1]
+        ]
         compatible = rates is not None and (
-            all(row.model == rates.model for row in card_rows)
-            if rates.model
-            else len({row.model for row in card_rows}) <= 1
+            rates.model is not None or len({row.model for row in target_rows}) <= 1
         )
         for row in card_rows:
             card_covered.add(id(row))
@@ -169,6 +189,7 @@ def value_usage(
             if (
                 not compatible
                 or rates is None
+                or (rates.model is not None and row.model != rates.model)
                 or any(count is None for count in counts)
                 or row.hour < selected[0]
                 or row.hour + 3600 > selected[1]
@@ -216,7 +237,14 @@ def value_usage(
     source_money = [
         row
         for row in view.rows
-        if row.contributes_money
+        if card_id is None
+        and row.reason is None
+        and (
+            row.channel is None
+            or (row.pool_id is not None and row.channel in {"usage", "list_cost", "metered_cost"})
+        )
+        and (row.channel != "list_cost" or row.basis in LIST_BASES)
+        and (row.channel != "metered_cost" or row.basis not in LIST_BASES)
         and row.priced
         and row.cost_usd is not None
         and (pool is None or row.pool_id == pool)
@@ -236,11 +264,16 @@ def value_usage(
         if id(row) in card_covered:
             continue
         matches = money_by_activity.get(activity_key(row), [])
-        listed = next(
+        listed = max(
             (item for item in matches if item.basis == "list" and item.coverage == "complete"),
-            None,
+            key=lambda item: item.channel == "list_cost",
+            default=None,
         )
-        billed = next((item for item in matches if item.basis in {"billed", "metered"}), None)
+        billed = max(
+            (item for item in matches if item.basis in {"billed", "metered"}),
+            key=lambda item: item.basis == "billed",
+            default=None,
+        )
         if billed is not None and billed.cost_usd is not None:
             legacy_precision = True
             legacy_paid[row.parent_account_id] = legacy_paid.get(

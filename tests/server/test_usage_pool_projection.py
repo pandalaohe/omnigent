@@ -12,6 +12,8 @@ from omnigent.stores.usage_pool_store import UsagePoolConflictError, UsagePoolSt
 from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
 from omnigent.usage.analysis import bounded_span
 from omnigent.usage.contract import UsageReportV2
+from omnigent.usage.pricing import PricingBaseline
+from omnigent.usage.pricing_projection import value_usage
 from tests.server.integration.test_global_instructions_routes import auth_app as authenticated_app  # noqa: F401
 from tests.server.test_usage_activity import HOUR, NOW, OWNER
 from tests.server.test_usage_activity import service as activity_service  # noqa: F401
@@ -76,6 +78,23 @@ def test_two_pools_boundary_quota_and_cost_channels(pools):
         for row in view.rows
         if row.channel in {"quota", "metered_cost", "list_cost"}
     )
+
+
+def test_pricing_consumes_separate_source_list_and_paid_channels(pools):
+    push(pools, "a", {}, [entry(100)])
+    push(pools, "list", {"channel": "list_cost"}, [entry(999, cost_usd=5, cost_basis="list")])
+    push(pools, "paid", {"channel": "metered_cost"}, [entry(999, cost_usd=2)])
+    sample = pools.analysis(OWNER, now=NOW + 3600)
+    listed = next(row for row in sample.rows if row.account_id == "list")
+    assert not listed.contributes_money
+    for pool in (None, "source:pool-a"):
+        result = value_usage(sample, PricingBaseline(), pool=pool)
+        assert result["api_value"].state == "exact"
+        assert result["api_value"].low == "5"
+        assert result["paid"].low == "2"
+        assert result["payback"].low == "2.5"
+        assert result["tokens"].low == "100"
+    assert sample.parents[0].totals.cost_usd == 2
 
 
 def test_conflict_and_snapshot_failure_rollback_every_write(pools, monkeypatch):

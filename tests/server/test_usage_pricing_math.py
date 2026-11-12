@@ -290,3 +290,51 @@ def test_known_payment_with_unpriced_usage_stays_in_ratio_denominator():
     assert result["payback"].state == "partial"
     assert result["payback"].display(money=False)["low"] == "2.38"
     assert result["payback"].coverage.usage_units == 74_000_000
+
+
+@pytest.mark.parametrize("selected", ["card-a", "missing-card"])
+def test_card_selection_excludes_other_accounts_and_uncovered_period_payments(selected):
+    purchase = card(purchase_currency="USD")
+    sample = view(purchase)
+    sample.rows.extend(
+        [
+            sample.rows[0].model_copy(
+                update={
+                    "account_id": "account-b",
+                    "parent_account_id": "account-b",
+                    "contributes_money": True,
+                    "priced": True,
+                    "cost_usd": 20.0,
+                }
+            ),
+            sample.rows[0].model_copy(
+                update={
+                    "hour": sample.rows[0].hour - 3600,
+                    "contributes_money": True,
+                    "priced": True,
+                    "cost_usd": 30.0,
+                }
+            ),
+        ]
+    )
+    sample.account_spans["account-b"] = sample.span
+    result = value_usage(sample, baseline(purchase), card_id=selected)
+    if selected == "card-a":
+        assert result["paid"].state == "exact"
+        assert result["paid"].low == "80"
+        assert result["coverage"].total_items == 1
+    else:
+        assert result["paid"].state == "unknown"
+        assert result["cards"] == []
+    assert result["api_value"].state == result["tokens"].state == "unknown"
+
+
+def test_model_selection_does_not_establish_unmapped_rate_compatibility():
+    sample = view()
+    sample.rows.append(sample.rows[0].model_copy(update={"model": "model-b"}))
+    assert value_usage(sample, baseline(), model="model-a")["api_value"].state == "unknown"
+    purchase = card()
+    purchase.rates_usd_per_million.model = "model-a"
+    result = value_usage(sample, baseline(purchase), model="model-a")
+    assert result["api_value"].state == "exact"
+    assert result["api_value"].low == "49"

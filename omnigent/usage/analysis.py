@@ -77,10 +77,13 @@ class AnalysedRow:
 
     def view(self) -> AnalysisRowView:
         row = self.row
+        # Aggregate price selection does not remove a proven pool identity.
         return AnalysisRowView(
             account_id=self.account_id,
             parent_account_id=self.parent_account_id,
-            pool_id=self.pool_id if self.pool_money or self.pool_usage else None,
+            pool_id=(
+                self.pool_id if self.pool_money or self.pool_usage or self.reason is None else None
+            ),
             channel=self.channel,
             hour=row.hour_utc,
             model=row.model,
