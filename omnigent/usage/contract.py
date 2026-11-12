@@ -220,6 +220,7 @@ class _ReportFields(BaseModel):
     observed_at: Annotated[_Number, Field(gt=0)]
     status: Literal["available", "unavailable"] = "available"
     fresh_until: Annotated[_Number, Field(gt=0)] | None = None
+    polling_seconds: Annotated[StrictInt, Field(gt=0, le=86400)] | None = None
     pinned_window: _Id | None = None
     display_name: str | None = Field(default=None, max_length=64)
     plan: str | None = Field(default=None, max_length=64)
@@ -471,6 +472,8 @@ class UsageAnalysisView(BaseModel):
     truncated: bool = False
     partial: bool = False
     row_limit: int = 0
+    pricing: dict[str, Any] | None = None
+    quota_closings: list[dict[str, Any]] = Field(default_factory=list)
 
 
 AnalysisTotals.model_rebuild()

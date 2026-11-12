@@ -8243,6 +8243,74 @@
         "title": "PriceSourceSelection",
         "type": "object"
       },
+      "PricingBaseline": {
+        "additionalProperties": false,
+        "properties": {
+          "cards": {
+            "items": {
+              "$ref": "#/components/schemas/PurchasedCard"
+            },
+            "maxItems": 2048,
+            "title": "Cards",
+            "type": "array"
+          },
+          "defaults": {
+            "$ref": "#/components/schemas/PricingDefaults"
+          },
+          "revision": {
+            "default": 0,
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Revision",
+            "type": "integer"
+          }
+        },
+        "title": "PricingBaseline",
+        "type": "object"
+      },
+      "PricingDefaults": {
+        "additionalProperties": false,
+        "properties": {
+          "default_discount": {
+            "default": "0.8",
+            "title": "Default Discount",
+            "type": "string"
+          },
+          "display_currency": {
+            "default": "USD",
+            "enum": [
+              "CNY",
+              "USD",
+              "HKD"
+            ],
+            "title": "Display Currency",
+            "type": "string"
+          },
+          "fx_to_display": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "enum": [
+                "CNY",
+                "USD",
+                "HKD"
+              ]
+            },
+            "title": "Fx To Display",
+            "type": "object"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "format": "int64",
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "title": "PricingDefaults",
+        "type": "object"
+      },
       "ProjectOrderRequest": {
         "description": "Rank owned project IDs; unranked projects append in discovery order.\n\nNull selects alphabetical mode without erasing the remembered manual IDs.\nThe serialized preference must fit in 65,535 bytes after compression and\nframing; lists below the 10,000-ID limit can still exceed this byte limit.",
         "properties": {
@@ -8302,6 +8370,123 @@
           "ordered_project_ids"
         ],
         "title": "ProjectOrderResponse",
+        "type": "object"
+      },
+      "PurchasedCard": {
+        "additionalProperties": false,
+        "properties": {
+          "allowance_usd": {
+            "title": "Allowance Usd",
+            "type": "string"
+          },
+          "discount_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Discount Override"
+          },
+          "id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9:_.-]*$",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "parent_account_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9:_.-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Account Id"
+          },
+          "period_kind": {
+            "enum": [
+              "week",
+              "month",
+              "month_weekly_reset"
+            ],
+            "title": "Period Kind",
+            "type": "string"
+          },
+          "purchase_currency": {
+            "default": "CNY",
+            "enum": [
+              "CNY",
+              "USD",
+              "HKD"
+            ],
+            "title": "Purchase Currency",
+            "type": "string"
+          },
+          "rates_usd_per_million": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TokenRates"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "retail_amount": {
+            "title": "Retail Amount",
+            "type": "string"
+          },
+          "starts_on": {
+            "format": "date",
+            "title": "Starts On",
+            "type": "string"
+          },
+          "target_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9:_.-]*$",
+            "title": "Target Id",
+            "type": "string"
+          },
+          "target_kind": {
+            "enum": [
+              "account",
+              "pool"
+            ],
+            "title": "Target Kind",
+            "type": "string"
+          },
+          "timezone": {
+            "default": "UTC",
+            "title": "Timezone",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "retail_amount",
+          "allowance_usd",
+          "period_kind",
+          "starts_on",
+          "target_kind",
+          "target_id"
+        ],
+        "title": "PurchasedCard",
         "type": "object"
       },
       "QueuedEvent": {
@@ -16902,6 +17087,47 @@
         "title": "TerminalCommandData",
         "type": "object"
       },
+      "TokenRates": {
+        "additionalProperties": false,
+        "properties": {
+          "cache_read": {
+            "title": "Cache Read",
+            "type": "string"
+          },
+          "cache_write": {
+            "title": "Cache Write",
+            "type": "string"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "read": {
+            "title": "Read",
+            "type": "string"
+          },
+          "write": {
+            "title": "Write",
+            "type": "string"
+          }
+        },
+        "required": [
+          "read",
+          "write",
+          "cache_read",
+          "cache_write"
+        ],
+        "title": "TokenRates",
+        "type": "object"
+      },
       "ToolOutputDeltaEvent": {
         "description": "Incremental output from an in-progress function call.",
         "properties": {
@@ -18337,6 +18563,26 @@
               "$ref": "#/components/schemas/PoolTotalView"
             },
             "title": "Pools",
+            "type": "array"
+          },
+          "pricing": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing"
+          },
+          "quota_closings": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Quota Closings",
             "type": "array"
           },
           "range": {
@@ -25427,6 +25673,19 @@
                             ],
                             "title": "Plan"
                           },
+                          "polling_seconds": {
+                            "anyOf": [
+                              {
+                                "exclusiveMinimum": 0,
+                                "maximum": 86400,
+                                "type": "integer"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Polling Seconds"
+                          },
                           "product": {
                             "anyOf": [
                               {
@@ -26250,6 +26509,19 @@
                             ],
                             "title": "Plan"
                           },
+                          "polling_seconds": {
+                            "anyOf": [
+                              {
+                                "exclusiveMinimum": 0,
+                                "maximum": 86400,
+                                "type": "integer"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Polling Seconds"
+                          },
                           "pool_relation": {
                             "anyOf": [
                               {
@@ -26971,6 +27243,19 @@
                           }
                         ],
                         "title": "Plan"
+                      },
+                      "polling_seconds": {
+                        "anyOf": [
+                          {
+                            "exclusiveMinimum": 0,
+                            "maximum": 86400,
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Polling Seconds"
                       },
                       "product": {
                         "anyOf": [
@@ -27795,6 +28080,19 @@
                         ],
                         "title": "Plan"
                       },
+                      "polling_seconds": {
+                        "anyOf": [
+                          {
+                            "exclusiveMinimum": 0,
+                            "maximum": 86400,
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ],
+                        "title": "Polling Seconds"
+                      },
                       "pool_relation": {
                         "anyOf": [
                           {
@@ -28434,6 +28732,54 @@
               ],
               "title": "Account"
             }
+          },
+          {
+            "in": "query",
+            "name": "pool",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pool"
+            }
+          },
+          {
+            "in": "query",
+            "name": "model",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Model"
+            }
+          },
+          {
+            "in": "query",
+            "name": "card",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Card"
+            }
           }
         ],
         "responses": {
@@ -28950,6 +29296,56 @@
           }
         },
         "summary": "Write Price Source"
+      }
+    },
+    "/v1/me/usage/pricing-baseline": {
+      "get": {
+        "operationId": "read_baseline_v1_me_usage_pricing_baseline_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Baseline"
+      },
+      "put": {
+        "operationId": "save_baseline_v1_me_usage_pricing_baseline_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PricingBaseline"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Baseline"
       }
     },
     "/v1/policies": {

@@ -7,6 +7,7 @@ import hashlib
 import uuid
 from collections.abc import Iterator
 from contextvars import ContextVar
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import (
@@ -19,6 +20,7 @@ from sqlalchemy import (
     Index,
     Integer,
     LargeBinary,
+    Numeric,
     SmallInteger,
     String,
     Text,
@@ -3387,3 +3389,56 @@ class SqlUsageProducer(OmnigentBase):
     producer_digest: Mapped[bytes] = mapped_column(_CKSUM32, primary_key=True)
     producer_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
     binding: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class SqlUsagePricingDefaults(OmnigentBase):
+    """Revision authority and defaults, outside the preferences envelope."""
+
+    __tablename__ = "usage_pricing_defaults"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    owner_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    default_discount: Mapped[Decimal] = mapped_column(
+        Numeric(38, 18, asdecimal=True), nullable=False
+    )
+    cny_fx: Mapped[Decimal | None] = mapped_column(Numeric(38, 18, asdecimal=True))
+    usd_fx: Mapped[Decimal | None] = mapped_column(Numeric(38, 18, asdecimal=True))
+    hkd_fx: Mapped[Decimal | None] = mapped_column(Numeric(38, 18, asdecimal=True))
+    # Canonical input strings preserve original precision, including on SQLite.
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class SqlUsagePricingCard(OmnigentBase):
+    """One actual purchased period; omission from an edit never deletes history."""
+
+    __tablename__ = "usage_pricing_cards"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    owner_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    card_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    retail_amount: Mapped[Decimal] = mapped_column(Numeric(38, 18, asdecimal=True), nullable=False)
+    allowance_usd: Mapped[Decimal] = mapped_column(Numeric(38, 18, asdecimal=True), nullable=False)
+    discount_override: Mapped[Decimal | None] = mapped_column(Numeric(38, 18, asdecimal=True))
+    read_rate: Mapped[Decimal | None] = mapped_column(Numeric(38, 18, asdecimal=True))
+    write_rate: Mapped[Decimal | None] = mapped_column(Numeric(38, 18, asdecimal=True))
+    cache_read_rate: Mapped[Decimal | None] = mapped_column(Numeric(38, 18, asdecimal=True))
+    cache_write_rate: Mapped[Decimal | None] = mapped_column(Numeric(38, 18, asdecimal=True))
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class SqlUsageQuotaClosing(OmnigentBase):
+    """Closest received pre-reset observation, never synthesized from pricing."""
+
+    __tablename__ = "usage_quota_closings"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    owner_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    window_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    resets_at: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    observed_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)

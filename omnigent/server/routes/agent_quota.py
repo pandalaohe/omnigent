@@ -189,6 +189,9 @@ def create_agent_quota_router(
     import_max_body_bytes: int = 5 * 1024 * 1024,
 ) -> APIRouter:
     router = APIRouter()
+    from omnigent.server.routes.usage_pricing import create_usage_pricing_router
+
+    router.include_router(create_usage_pricing_router(service, auth_provider))
     otlp_receiver = OtlpReceiver(service)
 
     @router.get("/me/usage/lines")
@@ -552,6 +555,9 @@ def create_agent_quota_router(
         to_date: Annotated[date | None, Query(alias="to")] = None,
         tz: str = "UTC",
         account: str | None = None,
+        pool: str | None = None,
+        model: str | None = None,
+        card: str | None = None,
     ) -> Response:
         require_usage()
         from fastapi.responses import JSONResponse
@@ -567,6 +573,47 @@ def create_agent_quota_router(
                 tz=tz,
                 account=account,
             )
+            if service.pricing_store is not None:
+                from fastapi.encoders import jsonable_encoder
+
+                from omnigent.usage.pricing_projection import compare_periods, value_usage
+
+                baseline = await asyncio.to_thread(service.pricing_store.read, owner)
+                projection = await asyncio.to_thread(
+                    value_usage, view, baseline, pool=pool, model=model, card_id=card
+                )
+                if range_key != "d90":
+                    prior = await asyncio.to_thread(
+                        service.analysis,
+                        owner,
+                        range_key=range_key,
+                        from_date=from_date,
+                        to_date=to_date,
+                        tz=tz,
+                        account=account,
+                        now=view.generated_at,
+                        previous=True,
+                    )
+                    previous_values = await asyncio.to_thread(
+                        value_usage, prior, baseline, pool=pool, model=model, card_id=card
+                    )
+                    projection["previous"] = previous_values
+                    projection["comparison"] = compare_periods(projection, previous_values)
+                else:
+                    projection["comparison"] = {"reason": "no_previous_period_for_d90"}
+                view.pricing = jsonable_encoder(projection)
+            if service.quota_closing_store is not None:
+                view.quota_closings = await asyncio.to_thread(
+                    service.quota_closing_store.read,
+                    owner,
+                    int(view.span.counted_from),
+                    int(view.span.until),
+                    as_of=int(view.generated_at),
+                )
+                if account is not None:
+                    view.quota_closings = [
+                        item for item in view.quota_closings if item["account_id"] == account
+                    ]
         except (ValueError, ZoneInfoNotFoundError):
             raise HTTPException(422, "Invalid usage range or timezone") from None
         return JSONResponse(

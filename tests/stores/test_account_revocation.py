@@ -19,8 +19,12 @@ from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from omnigent.stores.usage_pool_store import UsagePoolStore
+from omnigent.stores.usage_pricing_store import UsagePricingStore
+from omnigent.stores.usage_quota_closings import UsageQuotaClosingStore
 from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
-from omnigent.usage.contract import PoolRelationClaim
+from omnigent.usage.contract import PoolRelationClaim, UsageWindow
+from omnigent.usage.pricing import PricingBaseline
+from tests.server.test_usage_pricing_math import card
 
 
 def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) -> None:
@@ -37,15 +41,38 @@ def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) 
         effective_from_hour=1794304800,
     )
     pools.write("alice", "pool", relation)
+    pricing = UsagePricingStore(db_uri)
+    edit = PricingBaseline(cards=[card()])
+    pricing.save("alice", edit, known_accounts={"account-a"}, pools=set())
+    closings = UsageQuotaClosingStore(db_uri)
+    closings.record(
+        "alice",
+        "account-a",
+        [UsageWindow(id="weekly", resets_at=1794304800, percent_used=30)],
+        observed_at=1794304790,
+        source="reader",
+        polling_seconds=60,
+    )
     assert accounts.delete_user("alice") is True
     assert accounts.get_user("alice") is None
     with pytest.raises(OmnigentError, match="revoked"):
         permissions.ensure_user("alice")
     new = accounts.create_user_with_password("alice", "replacement-password-hash")
     assert pools.read("alice") == []
+    assert pricing.read("alice").cards == []
+    assert closings.read("alice", 0, 1794304801, as_of=1794304801) == []
     assert new.account_generation and new.account_generation != old.account_generation
     with account_authority_scope("alice", old.account_generation):
         for write in (
+            lambda: pricing.save("alice", edit, known_accounts={"account-a"}, pools=set()),
+            lambda: closings.record(
+                "alice",
+                "account-a",
+                [UsageWindow(id="weekly", resets_at=1794304800, percent_used=30)],
+                observed_at=1794304790,
+                source="reader",
+                polling_seconds=60,
+            ),
             lambda: pools.write("alice", "pool", relation),
             lambda: permissions.ensure_user("alice"),
             lambda: permissions.grant("alice", uuid.uuid4().hex, 3),

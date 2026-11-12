@@ -50,6 +50,8 @@ from omnigent.stores.usage_pool_store import (
     UsagePoolRelationError,
     UsagePoolStore,
 )
+from omnigent.stores.usage_pricing_store import UsagePricingStore
+from omnigent.stores.usage_quota_closings import UsageQuotaClosingStore
 from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
 from omnigent.usage.activity import MarkSettings, attributed_rows, error_mark, summarize, totals
 from omnigent.usage.analysis import (
@@ -209,6 +211,8 @@ class AgentQuotaService:
         agent_store: AgentStore | None = None,
         agent_cache: AgentCache | None = None,
         pool_store: UsagePoolStore | None = None,
+        pricing_store: UsagePricingStore | None = None,
+        quota_closing_store: UsageQuotaClosingStore | None = None,
     ) -> None:
         self.conversations = conversation_store
         self.permissions = permission_store
@@ -219,6 +223,8 @@ class AgentQuotaService:
         self.usage_enabled = usage_enabled
         self.hours_store = hours_store
         self.pool_store = pool_store
+        self.pricing_store = pricing_store
+        self.quota_closing_store = quota_closing_store
         self.mark_settings = mark_settings or MarkSettings()
         self.agent_store = agent_store
         self.agent_cache = agent_cache
@@ -269,6 +275,14 @@ class AgentQuotaService:
         accepted = self._store_snapshot(owner, host_id, product, snapshot, now=now)
         if accepted:
             self._note_display(owner, host_id, product, snapshot, now=now, project=True)
+            if self.quota_closing_store is not None:
+                self.quota_closing_store.record(
+                    owner,
+                    product,
+                    _native_windows(snapshot, product),
+                    observed_at=int(snapshot["captured_at"]),
+                    source="native",
+                )
         return accepted
 
     def _store_snapshot(
@@ -451,6 +465,17 @@ class AgentQuotaService:
                         self.snapshot_store.write_in_session(
                             session, owner, self._account_key(account_id), result[1]
                         )
+                    if self.quota_closing_store is not None and report.status == "available":
+                        assert session is not None
+                        self.quota_closing_store.record_in_session(
+                            session,
+                            owner,
+                            account_id,
+                            report.windows,
+                            observed_at=int(report.observed_at),
+                            source=report.source or source,
+                            polling_seconds=report.polling_seconds,
+                        )
                     return result
 
                 try:
@@ -481,6 +506,15 @@ class AgentQuotaService:
             else:
                 outcome = None
                 self._report_account(owner, account_id, report, now=now)
+                if self.quota_closing_store is not None and report.status == "available":
+                    self.quota_closing_store.record(
+                        owner,
+                        account_id,
+                        report.windows,
+                        observed_at=int(report.observed_at),
+                        source=source,
+                        polling_seconds=report.polling_seconds,
+                    )
                 if event:
                     key = (current_workspace_id(), owner, account_id)
                     with self._lock:
@@ -1321,6 +1355,7 @@ class AgentQuotaService:
         to_date: date | None = None,
         account: str | None = None,
         now: float | None = None,
+        previous: bool = False,
     ) -> UsageAnalysisView:
         """Read one bounded analysis window with serve pool attribution.
 
@@ -1379,7 +1414,7 @@ class AgentQuotaService:
         spans = {}
         for key, view in views.items():
             parent = relations[key].parent_account_id if key in relations else key
-            spans[key], _ = range_spans(
+            current_span, previous_span = range_spans(
                 range_key,
                 now,
                 zone,
@@ -1387,6 +1422,7 @@ class AgentQuotaService:
                 to_date=to_date,
                 period=views.get(parent, view).period,
             )
+            spans[key] = previous_span if previous else current_span
         selected_spans = {
             key: value
             for key, value in spans.items()
@@ -1400,7 +1436,10 @@ class AgentQuotaService:
                 max(value.until for value in selected_spans.values()),
             )
         else:
-            span, _ = range_spans(range_key, now, zone, from_date=from_date, to_date=to_date)
+            current_span, previous_span = range_spans(
+                range_key, now, zone, from_date=from_date, to_date=to_date
+            )
+            span = previous_span if previous else current_span
         since, until, _, clamped = bounded_span(span.requested_from, span.until)
         non_usage = {key for key, relation in relations.items() if relation.channel != "usage"}
         usage_records = {key: value for key, value in records.items() if key not in non_usage}
