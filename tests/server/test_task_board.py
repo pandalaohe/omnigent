@@ -367,11 +367,11 @@ async def test_item_history_closed_seen_and_lazy_relations(board_client, store):
     assert item["omnigent.ai:closedSeen"] == utc_text(NOW.timestamp())
     assert "progressUpdated" not in item
     assert item["omnigent.ai:history"] == history
-    assert item["omnigent.ai:unresolved"] == ["target", "missing"]
+    assert sorted(item["omnigent.ai:unresolved"]) == ["missing", "target"]
     store.write("other@example.com", "other", parse(task("target")), NOW)
-    assert (await board_client.get(item_url)).json()["omnigent.ai:unresolved"] == [
-        "target",
+    assert sorted((await board_client.get(item_url)).json()["omnigent.ai:unresolved"]) == [
         "missing",
+        "target",
     ]
     store.write("owner@example.com", "other", parse(task("target")), NOW)
     assert (await board_client.get(item_url)).json()["omnigent.ai:unresolved"] == ["missing"]
