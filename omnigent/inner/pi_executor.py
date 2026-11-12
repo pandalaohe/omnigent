@@ -1851,7 +1851,8 @@ _NATIVE_POLICY_APPROVAL_TIMEOUT_S = 86_400.0
 # Post-error drain budget: pi emits the run's ``agent_end`` right after an
 # errored message, so only that gap is bounded tightly. Module-level so tests
 # can patch it.
-_TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S = 10.0
+_TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S = 30.0
+_COMPACT_TIMEOUT_S = 600.0
 
 # CLI flags whose values are sensitive (e.g. the full system prompt) and must
 # not be written to logs verbatim. The value following these flags is replaced
@@ -5043,7 +5044,7 @@ class PiExecutor(Executor):
             response = await rpc.request(
                 {"type": "compact", "id": f"compact_{secrets.token_hex(8)}"},
                 "compact",
-                timeout=_TURN_STDOUT_IDLE_TIMEOUT_S,
+                timeout=_COMPACT_TIMEOUT_S,
             )
             data = response.get("data") if response else None
             if not isinstance(data, dict) or not isinstance(data.get("summary"), str):

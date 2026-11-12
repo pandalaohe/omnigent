@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -24,6 +25,76 @@ from omnigent.native._native_post_delivery import (
 # Status codes a forwarder treats as transient/retryable, used by the replay
 # classifier to tell a recoverable exhausted-503 from a permanent 4xx.
 _RETRYABLE = frozenset({429, 500, 503})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["slow", "hang", "stop"])
+async def test_succession_backstop_and_explicit_cancellation(monkeypatch, outcome, caplog):
+    from omnigent.native import _native_post_delivery as delivery
+
+    monkeypatch.setattr(delivery, "_SUCCESSION_REQUEST_TIMEOUT_S", 0.12)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def handle(request):
+        started.set()
+        try:
+            if outcome == "slow":
+                await asyncio.sleep(0.06)
+                return httpx.Response(200)
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://ap"
+    ) as client:
+        task = asyncio.create_task(
+            delivery.post_session_succession(client, old_session_id="old", new_session_id="new")
+        )
+        await started.wait()
+        if outcome == "stop":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            await asyncio.wait_for(task, 1)
+        assert cancelled.is_set()
+    if outcome == "hang":
+        assert "succession attempt" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_succession_retries_only_use_the_original_remaining_budget(monkeypatch, caplog):
+    from omnigent.native import _native_post_delivery as delivery
+
+    monkeypatch.setattr(delivery, "_SUCCESSION_REQUEST_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(delivery, "_SUCCESSION_RETRY_DELAYS_S", (0.01, 0.01))
+    budgets = []
+    interrupted = asyncio.Event()
+
+    async def handle(request):
+        budgets.append(request.extensions["timeout"]["read"])
+        if len(budgets) < 3:
+            await asyncio.sleep(0.1)
+            return httpx.Response(503)
+        try:
+            await asyncio.Future()
+        finally:
+            interrupted.set()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://ap"
+    ) as client:
+        await asyncio.wait_for(
+            delivery.post_session_succession(client, old_session_id="old", new_session_id="new"),
+            timeout=1,
+        )
+    assert len(budgets) == 3
+    assert budgets[0] > budgets[1] > budgets[2]
+    assert budgets[2] < 0.1
+    assert interrupted.is_set()
+    assert "succession attempt" in caplog.text
 
 
 @pytest.mark.asyncio

@@ -63,6 +63,7 @@ from omnigent.errors import ErrorCode, OmnigentError, SessionSupersededError
 from omnigent.harness_plugins import NativeCodingAgent
 from omnigent.harnesses.codex_native.shell_input import shell_command_from_input
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+from omnigent.harnesses.codex_native.timeouts import HELPER_STOP_FORWARD_TIMEOUT_SECONDS
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
@@ -4954,7 +4955,7 @@ def register_events_routes(
                         "reason": body.data["helper_action"],
                         "children": body.data.get("children", {}),
                     },
-                    timeout=5.0,
+                    timeout=HELPER_STOP_FORWARD_TIMEOUT_SECONDS,
                 )
                 result.raise_for_status()
                 return result.json()

@@ -1,6 +1,8 @@
 """The host validates startup permission before configuration probes or spawn."""
 
+import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
@@ -126,6 +128,54 @@ def _host_process(tmp_path) -> HostProcess:
         config_path=tmp_path / "config.yaml",
         interactive_shells=["bash"],
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["ready", "hang", "stop"])
+async def test_host_claim_slow_grant_hang_and_stop(monkeypatch, tmp_path, outcome):
+    from omnigent.host import connect
+
+    host = _host_process(tmp_path)
+    ws = object()
+    host._ws = ws
+    host._startup_generation = "connection"
+    requests = asyncio.Queue()
+    budgets = []
+
+    async def send(connection, raw):
+        assert connection is ws
+        requests.put_nowait(decode_host_frame(raw))
+
+    async def scaled_wait(future, *, timeout):
+        budgets.append(timeout)
+        return await asyncio.wait_for(future, timeout=timeout / 100)
+
+    monkeypatch.setattr(host, "_send_text", send)
+    monkeypatch.setattr(
+        connect, "asyncio", SimpleNamespace(**{**vars(asyncio), "wait_for": scaled_wait})
+    )
+    frame = HostLaunchRunnerFrame(
+        request_id="launch",
+        binding_token="test-binding",
+        workspace="/opt/work/project",
+        session_id=uuid4().hex,
+        startup=attempt(),
+    )
+    waiting = asyncio.create_task(host._claim_startup(frame))
+    request = await requests.get()
+    if outcome == "ready":
+        # custom-lint: disable-next=sleep-then-assert -- inject a reply beyond the old deadline
+        await asyncio.sleep(0.2)  # 20 virtual seconds, beyond the old five-second wait.
+        await host._dispatch_host_frame(ws, HostStartupClaimResultFrame(request.request_id, True))
+        assert await waiting
+    elif outcome == "hang":
+        assert not await waiting
+    else:
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+    assert budgets == [125]
+    assert host._startup_claims == {}
 
 
 class _LiveProcess:

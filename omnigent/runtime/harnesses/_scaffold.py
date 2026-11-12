@@ -120,7 +120,8 @@ _POLICY_EVAL_TIMEOUT_S = 86400.0
 # lost in delivery must not stall the turn for the full human-wait budget.
 _HUMAN_GATED_POLICY_PHASES = frozenset({"PHASE_TOOL_CALL", "PHASE_LLM_REQUEST", "PHASE_REQUEST"})
 _UNGATED_POLICY_EVAL_TIMEOUT_S = 120.0
-_STARTUP_CLAIM_TIMEOUT_S = 10.0
+_STARTUP_CLAIM_TIMEOUT_S = 125.0
+_INPUT_CLAIM_TIMEOUT_S = 120.0
 _RESIDENT_THREAD_INVENTORY_TIMEOUT_S = 5.0
 
 # Stable, client-visible error code for a turn-context desync (the inner SDK
@@ -879,7 +880,7 @@ class TurnContext:
         )
         try:
             deadline = request.input_admission_deadline
-            remaining = max(0, deadline - time.time()) if deadline else _STARTUP_CLAIM_TIMEOUT_S
+            remaining = max(0, deadline - time.time()) if deadline else _INPUT_CLAIM_TIMEOUT_S
             result = await asyncio.wait_for(future, timeout=remaining + 5)
             if result.state == "pending":
                 raise RuntimeError("input_execution_acceptance_unknown")

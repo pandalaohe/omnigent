@@ -2351,7 +2351,7 @@ class HostProcess:
                     )
                 ),
             )
-            granted = await asyncio.wait_for(future, timeout=5)
+            granted = await asyncio.wait_for(future, timeout=125)
             return granted and self._ws is ws and self._startup_generation == generation
         except (ConnectionError, OSError, TimeoutError):
             return False

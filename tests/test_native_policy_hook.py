@@ -391,6 +391,7 @@ def test_tool_call_budget_override_extends_the_outage_wait(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A tool-call gate keeps retrying to the caller's budget, and stops at it."""
+    monkeypatch.setattr(native_policy_hook, "TOOL_CALL_POLICY_RETRY_BUDGET_S", 30.0)
     clock = {"t": 0.0}
     monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: clock["t"])
     monkeypatch.setattr(
@@ -704,8 +705,9 @@ def test_post_evaluate_with_retry_exhausts_budget_after_repeated_faults(
     assert error is not None
     assert "retry budget exhausted" in error
     assert ("server returned 429" if fault == "429" else "connection torn") in error
-    assert sleeps == [1.0, 2.0, 4.0, 8.0]
-    assert len(request_bodies) == 5
+    assert sleeps[:4] == [1.0, 2.0, 4.0, 8.0]
+    assert 110 <= sum(sleeps) <= 120
+    assert len(request_bodies) == len(sleeps) + 1
     assert len({body["_omnigent_elicitation_id"] for body in request_bodies}) == 1
 
 
@@ -738,7 +740,7 @@ async def test_post_evaluate_with_retry_async_recovers_with_stable_elicitation_i
 
 @pytest.mark.parametrize("error_type", [httpx.RemoteProtocolError, httpx.ReadError])
 @pytest.mark.parametrize(
-    "phase,last_attempt", [("PHASE_REQUEST", 15.0), ("PHASE_TOOL_CALL", 300.0)]
+    "phase,last_attempt", [("PHASE_REQUEST", 120.0), ("PHASE_TOOL_CALL", 300.0)]
 )
 @pytest.mark.asyncio
 async def test_post_evaluate_with_retry_async_fast_tears_spend_phase_budget(
@@ -1216,7 +1218,8 @@ def test_post_evaluate_with_retry_fast_5xx_still_exhausts_the_budget(
 
     assert resp is None
     assert error is not None and "retry budget exhausted" in error
-    assert 2 <= len(posts) <= 8, "retried within the budget, then gave up"
+    assert len(posts) >= 2
+    assert 110 <= clock["t"] <= 120, "retried within the backstop, then gave up"
 
 
 @pytest.mark.parametrize("fault", ["503", "protocol", "read"])

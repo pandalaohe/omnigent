@@ -1128,6 +1128,7 @@ async def test_codex_settings_forward_uses_startup_budget(
     assert session.codex.ready_gate is not None
     monkeypatch.setattr(routes_core, "_TUI_INJECT_FORWARD_TIMEOUT_S", 0.05)
     settings_timeout_s = routes_core._CODEX_SETTINGS_FORWARD_TIMEOUT_S
+    assert settings_timeout_s > native_controls._CODEX_SETTINGS_LAUNCH_TIMEOUT_S + 60
     missing = _observe_missing_bridge(monkeypatch, session)
     post = session.runner.post
     forward_timeouts: list[float] = []

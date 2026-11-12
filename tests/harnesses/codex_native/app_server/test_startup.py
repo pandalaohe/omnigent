@@ -1011,8 +1011,8 @@ async def test_wait_until_ready_deadline_is_the_app_server_budget(
     clock = {"offset": 0.0}
     monkeypatch.setattr(loop, "time", lambda: real_time() + clock["offset"])
     # Each refused probe costs 5 s of virtual time, so the listener accepts after
-    # 20 s: past the 10 s discovery budget, inside the 60 s app-server budget.
-    ready_at = loop.time() + 20.0
+    # A loaded listener can become ready after the old 60-second startup cutoff.
+    ready_at = loop.time() + 75.0
 
     @dataclass
     class _SlowListenerClient:
@@ -1050,6 +1050,7 @@ async def test_wait_until_ready_deadline_is_the_app_server_budget(
     assert connected.close_calls == 0
     assert all(client.close_calls == 1 for client in clients[:-1])
     assert clock["offset"] > codex_native_app_server._CONNECT_TIMEOUT_SECONDS
+    assert clock["offset"] > 60.0
     assert clock["offset"] < codex_native_app_server._APP_SERVER_READY_TIMEOUT_SECONDS
 
 
@@ -1108,7 +1109,7 @@ async def test_wait_until_ready_timeout_reports_listen_target_and_budget(
     )
     assert "Connect call failed" in message
     assert (str(server.socket_path) in message) is (listen_url is None)
-    assert len(clients) == 3
+    assert len(clients) == int(budget // 25) + 1
     assert all(client.close_calls == 1 for client in clients)
     # Alive but never listening: the respawnable subclass carries the stderr tail
     # size and the class of the last failed probe.

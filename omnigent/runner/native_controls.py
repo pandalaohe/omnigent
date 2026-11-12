@@ -31,10 +31,13 @@ from omnigent.debug_logging import debug_event
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import native_terminal_name
 from omnigent.harnesses.codex_native.timeouts import (
-    APP_SERVER_READY_TIMEOUT_SECONDS as _CODEX_SETTINGS_LAUNCH_TIMEOUT_S,
+    HELPER_STOP_TIMEOUT_SECONDS as _CODEX_HELPER_STOP_TOTAL_TIMEOUT_S,
 )
 from omnigent.harnesses.codex_native.timeouts import (
     SETTINGS_BRIDGE_READY_TIMEOUT_SECONDS as _CODEX_SETTINGS_READY_TIMEOUT_S,
+)
+from omnigent.harnesses.codex_native.timeouts import (
+    SETTINGS_LAUNCH_TIMEOUT_SECONDS as _CODEX_SETTINGS_LAUNCH_TIMEOUT_S,
 )
 from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.runner.app_support import (
@@ -81,10 +84,10 @@ _CLAUDE_MODEL_CONFIRM_TIMEOUT_S = 10.0
 
 _CLAUDE_MODEL_CONFIRM_POLL_S = 0.25
 
-_CODEX_HELPER_STOP_TIMEOUT_S = 1.0
+_CODEX_HELPER_STOP_TIMEOUT_S = 10.0
 _CODEX_HELPER_STOP_POLL_S = 0.05
-_CODEX_HELPER_CLOSE_TIMEOUT_S = 1.0
-_CODEX_HELPER_PROCESS_GRACE_S = 0.15
+_CODEX_HELPER_CLOSE_TIMEOUT_S = 5.0
+_CODEX_HELPER_PROCESS_GRACE_S = 2.0
 
 
 class _CodexPermissionSwitchRefused(RuntimeError):
@@ -92,12 +95,12 @@ class _CodexPermissionSwitchRefused(RuntimeError):
 
 
 # A session woken for a control may still be booting its TUI, so typing waits for
-# the prompt, capped so the rest fits the server's ~20s wait for the control.
-_CLAUDE_CONTROL_PROMPT_WAIT_S = 9.0
+# the prompt, capped so the rest fits the server's forwarding deadline.
+_CLAUDE_CONTROL_PROMPT_WAIT_S = 55.0
 
 
-# Whole-request budget for a control, under the server's ~20s forward timeout.
-_CLAUDE_CONTROL_BUDGET_S = 18.0
+# Whole-request budget; the server leaves five seconds for the final reply.
+_CLAUDE_CONTROL_BUDGET_S = 60.0
 
 
 class _ClaudeControlDeadline(threading.Event):
@@ -224,7 +227,7 @@ _CODEX_SETTINGS_READY_POLL_S = 0.1
 _CODEX_SETTINGS_CLOSE_TIMEOUT_S = 1.0
 # Older servers read any reply as a confirmed result, so outlast their
 # 20-second forward instead of reporting an unconfirmed timeout.
-_LEGACY_SERVER_UPDATE_TIMEOUT_S = 30.0
+_LEGACY_SERVER_UPDATE_TIMEOUT_S = 60.0
 
 
 class _CodexNativeBridgeStateForSessionFn(Protocol):
@@ -572,20 +575,15 @@ def build_native_controls(
             read_codex_config_model,
         )
         from omnigent.runner.native.orchestration import _AUTO_CODEX_APP_SERVERS
-        from omnigent.runner.turn_routing import SETTINGS_UPDATE_TIMEOUT_S
         from omnigent.util.reasoning_effort import effort_for_model_switch
 
         if ready_deadline is None:
             # Only an explicit capability promises enough forward time for cold startup.
             # Older rollback-aware servers still have a 40-second total budget.
-            ready_deadline = (
-                asyncio.get_running_loop().time()
-                + _CODEX_SETTINGS_READY_TIMEOUT_S
-                + (
-                    _CODEX_SETTINGS_LAUNCH_TIMEOUT_S
-                    if allow_cold_start and not legacy_server
-                    else 0
-                )
+            ready_deadline = asyncio.get_running_loop().time() + (
+                _CODEX_SETTINGS_LAUNCH_TIMEOUT_S
+                if allow_cold_start and not legacy_server
+                else _CODEX_SETTINGS_READY_TIMEOUT_S
             )
         backend_before_ready = _AUTO_CODEX_APP_SERVERS.get(conv_id)
         process_before_ready = getattr(backend_before_ready, "proc", None)
@@ -673,11 +671,12 @@ def build_native_controls(
             client_name="omnigent-codex-native-runner",
         )
         failed_backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
+        control_deadline = asyncio.get_running_loop().time() + 60.0
         try:
             try:
                 await asyncio.wait_for(
                     codex_client.connect(),
-                    timeout=SETTINGS_UPDATE_TIMEOUT_S,
+                    timeout=max(0.0, control_deadline - asyncio.get_running_loop().time()),
                 )
             except (ConnectionRefusedError, FileNotFoundError):
                 if not retry_unreachable:
@@ -723,7 +722,10 @@ def build_native_controls(
             update_pending = False
             try:
                 async with asyncio.timeout(
-                    _LEGACY_SERVER_UPDATE_TIMEOUT_S if legacy_server else SETTINGS_UPDATE_TIMEOUT_S
+                    min(
+                        _LEGACY_SERVER_UPDATE_TIMEOUT_S,
+                        max(0.0, control_deadline - asyncio.get_running_loop().time()),
+                    )
                 ):
                     params = {"threadId": state.thread_id, **settings}
                     update_pending = True
@@ -912,6 +914,18 @@ def build_native_controls(
         reason: str = "tightening",
         discovered: dict[str, dict[str, str | None]] | None = None,
     ) -> bool:
+        try:
+            async with asyncio.timeout(_CODEX_HELPER_STOP_TOTAL_TIMEOUT_S):
+                return await _stop_codex_native_helpers_within_budget(conv_id, reason, discovered)
+        except TimeoutError:
+            _logger.warning("Codex helper stop deadline expired for %s; stop unconfirmed", conv_id)
+            return False
+
+    async def _stop_codex_native_helpers_within_budget(
+        conv_id: str,
+        reason: str = "tightening",
+        discovered: dict[str, dict[str, str | None]] | None = None,
+    ) -> bool:
         discovered = discovered or {}
         lock = _codex_terminal_ensure_locks.setdefault(conv_id, asyncio.Lock())
         async with lock:
@@ -1042,7 +1056,7 @@ def build_native_controls(
                 if survivors:
                     reason += f"; unconfirmed process PIDs: {sorted(survivors)}"
             try:
-                async with asyncio.timeout(1.5):
+                async with asyncio.timeout(_CODEX_HELPER_CLOSE_TIMEOUT_S):
                     confirmed = await _finish_codex_native_helpers(
                         conv_id, bridge_dir, reason, confirmed, children, owns_backend, retired
                     )

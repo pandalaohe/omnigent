@@ -190,7 +190,7 @@ if not math.isfinite(_PROMPT_TIMEOUT_SECONDS) or _PROMPT_TIMEOUT_SECONDS <= 0:
     raise ValueError(_PROMPT_TIMEOUT_ERR)
 
 # Default deadline for each initial ACP handshake / session setup RPC.
-_INIT_TIMEOUT_SECONDS = 30.0
+_INIT_TIMEOUT_SECONDS = 180.0
 
 # Agent stderr kept for diagnostics: how many trailing lines to retain, how many
 # to quote in a turn error, and the per-line cap (a chatty CLI can emit one
@@ -265,8 +265,8 @@ class AcpAgentConfig:
     :param default_model: Model to restore when a per-turn override is cleared.
         ``None`` preserves the launch-model fallback; an empty string uses the
         model originally reported by the ACP session.
-    :param init_timeout_s: Deadline in seconds per handshake/session-setup RPC.
-        Defaults to 30; slow-starting agents can request a longer deadline.
+    :param init_timeout_s: Shared deadline in seconds for handshake/session setup.
+        Defaults to 180; slow-starting agents can request a longer deadline.
     """
 
     command: str
@@ -550,6 +550,7 @@ class AcpExecutor(Executor):
 
         self._session_id: str | None = None
         self._initialized: bool = False
+        self._initialization_deadline: float | None = None
         self._image_supported: bool = False
         # One-way latch per subprocess: set after a successful ACP
         # ``authenticate``; reset on restart so a fresh process re-auths.
@@ -858,8 +859,10 @@ class AcpExecutor(Executor):
         fut: asyncio.Future[_AcpJsonObject] = loop.create_future()
         self._pending[req_id] = fut
 
-        await self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
         try:
+            if self._initialization_deadline is not None:
+                timeout = min(timeout, max(0.0, self._initialization_deadline - loop.time()))
+            await self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
             return await asyncio.wait_for(fut, timeout=timeout)
         except TimeoutError as exc:
             self._pending.pop(req_id, None)
@@ -869,6 +872,8 @@ class AcpExecutor(Executor):
                 f"ACP agent {self._config.name!r} did not answer {method} "
                 f"within {timeout:g}s (command: {self._config.command!r})"
             ) from exc
+        finally:
+            self._pending.pop(req_id, None)
 
     # ------------------------------------------------------------------
     # ACP handshake
@@ -2378,8 +2383,15 @@ class AcpExecutor(Executor):
             if self._proc is None or self._proc.returncode is not None:
                 await self._start_process()
             self._start_effort = config.extra.get("reasoning_effort") if config else None
-            await self._ensure_initialized()
-            session_id = await self._ensure_session()
+            self._initialization_deadline = (
+                asyncio.get_running_loop().time() + self._config.init_timeout_s
+            )
+            try:
+                async with asyncio.timeout_at(self._initialization_deadline + 5):
+                    await self._ensure_initialized()
+                    session_id = await self._ensure_session()
+            finally:
+                self._initialization_deadline = None
         except Exception as exc:  # noqa: BLE001
             yield ExecutorError(message=self._startup_error_message(exc), retryable=False)
             return

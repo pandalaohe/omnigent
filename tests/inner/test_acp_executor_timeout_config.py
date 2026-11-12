@@ -48,7 +48,7 @@ async def test_handshake_and_auth_retry_use_agent_timeout(configured: bool) -> N
         assert await ex._ensure_session() == "session"
     assert methods == ["initialize", "session/new", "authenticate", "session/new"]
     assert [call.kwargs["timeout"] for call in rpc.call_args_list] == [
-        120.5 if configured else 30.0
+        120.5 if configured else 180.0
     ] * 4
 
 
@@ -59,6 +59,48 @@ async def test_initialize_timeout_names_configured_deadline() -> None:
         with pytest.raises(TimeoutError, match=r"Silent.*initialize within 0\.01s"):
             await ex._ensure_initialized()
     assert not ex._pending
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["slow", "hang", "stop"])
+async def test_initialize_slow_reply_hang_and_cancellation(outcome) -> None:
+    import asyncio
+
+    # Scale the default to milliseconds; the peer answers after the old 30s cut.
+    config = AcpAgentConfig(
+        command="test-agent",
+        omnigent_mcp=False,
+        init_timeout_s=AcpAgentConfig(command="test-agent").init_timeout_s / 1000,
+    )
+    ex = AcpExecutor(config)
+    started = asyncio.Event()
+    replies = []
+
+    async def respond(msg):
+        started.set()
+        if outcome == "slow":
+
+            async def later():
+                await asyncio.sleep(0.045)
+                ex._pending[msg["id"]].set_result({"result": {}})
+
+            replies.append(asyncio.create_task(later()))
+
+    with patch.object(ex, "_send", side_effect=respond):
+        task = asyncio.create_task(ex._ensure_initialized())
+        await started.wait()
+        if outcome == "stop":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif outcome == "hang":
+            with pytest.raises(TimeoutError, match="initialize"):
+                await task
+        else:
+            await task
+            assert ex._initialized
+    assert not ex._pending
+    await asyncio.gather(*replies)
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "bad", ""])

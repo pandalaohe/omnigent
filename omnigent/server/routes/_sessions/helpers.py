@@ -8860,7 +8860,7 @@ async def _forward_session_change_to_runner(
 #: only runs after a fast verify), so the default 5s budget could time out on
 #: a legitimately-still-working injection and report a failure that did not
 #: happen.
-_TUI_INJECT_FORWARD_TIMEOUT_S = 20.0
+_TUI_INJECT_FORWARD_TIMEOUT_S = 65.0
 
 
 async def _forward_session_change_to_runner_impl(
