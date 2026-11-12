@@ -780,7 +780,9 @@ def _is_batchable_external_item(event: SessionEventInput) -> bool:
         and isinstance(item_data, dict)
         and item_data.get("kind") == "input"
     )
-    return item_type != "slash_command" and not is_user_message and not is_shell_input
+    return (
+        item_type not in {"slash_command", "error"} and not is_user_message and not is_shell_input
+    )
 
 
 def _event_body_too_large() -> HTTPException:
@@ -3832,6 +3834,19 @@ def register_events_routes(
                 background_title_coordinator=background_title_coordinator,
                 enabled=background_session_titles_enabled(request.headers),
             )
+            if item_id is not None and not replayed and body.data.get("item_type") == "error":
+                from omnigent.server.session_choice_runtime import record_quota_exhaustion
+
+                error_data = body.data["item_data"]
+                if error_data.get("level") != "info":
+                    await record_quota_exhaustion(
+                        request.app,
+                        conv,
+                        error_data["message"],
+                        actor=user_id,
+                        from_runner=_has_bound_runner_authority(request, conv),
+                        response_id=body.data.get("response_id"),
+                    )
             return {
                 "queued": False,
                 "item_id": item_id,
@@ -4311,6 +4326,19 @@ def register_events_routes(
             output = data.get("output")
             status_error: ErrorDetail | None = None
             if status == "failed" and isinstance(output, str) and output.strip():
+                if not replayed:
+                    from omnigent.server.session_choice_runtime import record_quota_exhaustion
+
+                    quota_output = body.data.get("failure_detail") or body.data.get("output")
+                    if isinstance(quota_output, str):
+                        await record_quota_exhaustion(
+                            request.app,
+                            conv,
+                            quota_output,
+                            actor=user_id,
+                            from_runner=_has_bound_runner_authority(request, conv),
+                            response_id=response_id,
+                        )
                 harness = await asyncio.to_thread(
                     _resolve_harness,
                     conv,

@@ -79,7 +79,7 @@ async def create(env, **changes):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("harness", ["codex-native", "codex"])
+@pytest.mark.parametrize("harness", ["codex-native", "codex", "pi-native", "pi"])
 @pytest.mark.parametrize("offered", [True, False, "failed"])
 async def test_create_checks_current_host_catalog_before_skipping_model(
     choice_env, db_uri, monkeypatch, harness, offered
@@ -122,6 +122,10 @@ async def test_create_checks_current_host_catalog_before_skipping_model(
     assert response.status_code == 201, response.text
     assert response.json()["agent_id"] == env.agents[0 if available else 1]["id"]
     assert response.json()["model_override"] == (custom if available else official)
+    if not available:
+        choice = response.json()["session_choice"]
+        assert choice["skipped"][0]["why"] == "model_not_in_catalog"
+        assert any(custom in warning for warning in choice["warnings"])
     assert catalogs.list([HOST])[0]["models"] == rows
     lookup.assert_awaited_once()
     if offered != "failed":
@@ -151,6 +155,179 @@ async def test_create_checks_current_host_catalog_before_skipping_model(
         )
         assert legacy.models[env.agents[0]["id"]] == frozenset({official})
         lookup.assert_not_awaited()
+
+
+@pytest.fixture
+async def quota_runner(choice_env, monkeypatch):
+    import httpx
+
+    from omnigent.server.routes import sessions
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(204)),
+        base_url="http://runner",
+    ) as runner:
+        monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=runner))
+        yield choice_env
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event_type", ["status", "legacy-status", "error", "legacy-error", "batch-error"]
+)
+async def test_provider_quota_failure_blocks_pool_until_reset(
+    quota_runner, monkeypatch, event_type
+):
+    env = quota_runner
+    clock = [time.time()]
+    monkeypatch.setattr("omnigent.server.session_choice_runtime.time.time", lambda: clock[0])
+    first = (await create(env)).json()
+    message = "Individual quota reached. Resets in 132h0m26s"
+    if event_type in {"status", "legacy-status"}:
+        from omnigent.harnesses.antigravity_native.steps import error_message_text
+
+        message = error_message_text(
+            {
+                "type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+                "status": "CORTEX_STEP_STATUS_DONE",
+                "errorMessage": {"shouldShowUser": True, "error": {"userErrorMessage": message}},
+            }
+        )
+        assert isinstance(message, str)
+    data = (
+        {"status": "failed", "output": message, "response_id": "quota-turn"}
+        if event_type in {"status", "legacy-status"}
+        else {
+            "item_type": "error",
+            "item_data": {"message": message, "source": "execution", "code": "native_turn_error"},
+            "response_id": "quota-turn",
+            "source_id": "quota-error",
+        }
+    )
+    if event_type in {"legacy-status", "legacy-error"}:
+        data.pop("response_id")
+        data.pop("source_id", None)
+    event = {
+        "type": "external_session_status"
+        if event_type in {"status", "legacy-status"}
+        else "external_conversation_item",
+        "data": data,
+    }
+    payload = [event] if event_type == "batch-error" else event
+    response = await env.client.post(f"/v1/sessions/{first['id']}/events", json=payload)
+    assert response.status_code == 202, response.text
+    reset = clock[0] + 132 * 3600 + 26
+    env.store.set_session_live_status(first["id"], "idle")
+    second = await create(env)
+    assert second.status_code == 201, second.text
+    choice = second.json()["session_choice"]
+    assert choice["pool"] == "pool-1"
+    assert choice["skipped"][0]["why"] == "exhausted"
+    assert choice["skipped"][0]["until"] == reset
+
+    named = await create(
+        env,
+        agent_id=env.agents[0]["id"],
+        model_override="test-model",
+        choice_reason="specific need",
+    )
+    assert named.status_code == 409, named.text
+    assert named.json()["detail"]["code"] == "agent_exhausted"
+    assert named.json()["detail"]["reset"] == reset
+
+    clock[0] += 30
+    replay = await env.client.post(f"/v1/sessions/{first['id']}/events", json=payload)
+    assert replay.status_code == 202, replay.text
+    env.settings["hosts"][HOST]["work"] = env.settings["hosts"][HOST]["work"][:1]
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    held = await create(env)
+    assert held.status_code == 201, held.text
+    assert held.json()["session_choice"]["outcome"] == "hold"
+    assert held.json()["session_choice"]["clears_at"] == reset
+    clock[0] = reset
+    replay = await env.client.post(f"/v1/sessions/{first['id']}/events", json=payload)
+    assert replay.status_code == 202, replay.text
+    recovered = await create(env)
+    assert recovered.status_code == 201, recovered.text
+    assert recovered.json()["session_choice"]["outcome"] == "pick"
+    assert recovered.json()["session_choice"]["pool"] == "pool-0"
+
+
+@pytest.mark.asyncio
+async def test_assistant_fallback_is_not_a_provider_quota_rejection(quota_runner):
+    from omnigent.entities import MessageData, NewConversationItem
+
+    env = quota_runner
+    child = (await create(env)).json()
+    env.store.append(
+        child["id"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="echo-turn",
+                data=MessageData(
+                    role="assistant",
+                    agent="example",
+                    content=[
+                        {
+                            "type": "output_text",
+                            "text": "Individual quota reached. Resets in 1h",
+                        }
+                    ],
+                ),
+            )
+        ],
+    )
+    failed = await env.client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "failed", "response_id": "echo-turn"},
+        },
+    )
+    assert failed.status_code == 202, failed.text
+    env.store.set_session_live_status(child["id"], "idle")
+    response = await create(env)
+    assert response.status_code == 201, response.text
+    assert response.json()["session_choice"]["pool"] == "pool-0"
+
+
+@pytest.mark.asyncio
+async def test_shared_editor_cannot_exhaust_owners_pool(auth_app, auth_client):
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, resolve_auth_header
+    from omnigent.server.session_choice import state_for
+
+    store = auth_app.state.conversation_store
+    permissions = auth_app.state.permission_store
+    session = store.create_conversation(labels={CHOICE_LABEL: json.dumps({"pool": "pool-0"})})
+    owner, editor = "owner@example.test", "editor@example.test"
+    for user, level in ((owner, LEVEL_OWNER), (editor, LEVEL_EDIT)):
+        permissions.ensure_user(user)
+        permissions.grant(user, session.id, level)
+    event = {
+        "type": "external_session_status",
+        "data": {
+            "status": "failed",
+            "response_id": "quota-turn",
+            "output": "Individual quota reached. Resets in 1h",
+        },
+    }
+    for actor in (editor, owner):
+        response = await auth_client.post(
+            f"/v1/sessions/{session.id}/events",
+            json=event,
+            headers={resolve_auth_header(): actor},
+        )
+        assert response.status_code == 202, response.text
+        readings = state_for(auth_app).quota_readings(owner, {}, time.time())
+        assert ("pool-0" in readings) is (actor == owner)
+    with workspace_scope(42):
+        assert not state_for(auth_app).quota_readings(owner, {}, time.time())
 
 
 @pytest.mark.asyncio
