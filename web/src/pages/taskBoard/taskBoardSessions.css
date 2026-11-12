@@ -248,6 +248,11 @@
   border-color: var(--warning);
   color: var(--warning);
 }
+.tb-session-line.state-stale .tb-session-station.current {
+  background: var(--destructive);
+  border-color: var(--destructive);
+  color: white;
+}
 .tb-session-archive {
   display: flex;
   align-items: center;
@@ -337,10 +342,26 @@
   background: var(--secondary);
   color: var(--muted-foreground);
 }
-.tb-recent-kind.check,
+.tb-recent-kind.check.passed,
 .tb-recent-kind.outcome {
   background: color-mix(in srgb, var(--success) 14%, transparent);
   color: var(--success);
+}
+.tb-recent-kind.check.failed {
+  background: color-mix(in srgb, var(--destructive) 14%, transparent);
+  color: var(--destructive);
+}
+.tb-recent-kind.check.flaky {
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  color: var(--warning);
+}
+.tb-recent-event small.failed,
+.tb-task-check.failed {
+  color: var(--destructive);
+}
+.tb-recent-event small.flaky,
+.tb-task-check.flaky {
+  color: var(--warning);
 }
 .tb-recent-kind.start,
 .tb-recent-kind.transfer {
@@ -386,6 +407,56 @@
   color: var(--muted-foreground);
   font-size: 12px;
 }
+.tb-session-hover:has(.tb-task-hover) {
+  width: 370px;
+}
+.tb-task-hover header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.tb-task-hover header b {
+  display: block;
+  font-weight: 600;
+  font-size: 14.5px;
+}
+.tb-task-hover-state {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: var(--secondary);
+}
+.tb-task-hover-state.user,
+.tb-task-hover-state.blocked {
+  background: color-mix(in srgb, var(--warning) 16%, transparent);
+}
+.tb-task-hover-state.failed {
+  background: color-mix(in srgb, var(--destructive) 16%, transparent);
+}
+.tb-task-hover-description {
+  color: var(--muted-foreground);
+}
+.tb-task-hover-relation svg {
+  flex: none;
+}
+.tb-task-hover-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+.tb-task-check {
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+.tb-task-check.passed {
+  color: var(--success);
+}
 .tb-session-hover p,
 .tb-session-hover-meta {
   display: flex;
@@ -417,6 +488,9 @@
   display: block;
   height: 100%;
   background: var(--muted-foreground);
+}
+.tb-session-context b.hot {
+  background: var(--destructive);
 }
 .tb-session-context em {
   font-style: normal;

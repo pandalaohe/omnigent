@@ -1,6 +1,7 @@
 import { taskIdentity, type BoardTask } from "./taskBoardData";
 import { mergeDisplaySession, sessionObservation, type DisplaySession } from "./taskBoardDisplay";
 import { sessionTree, type BoardSession } from "./taskBoardNative";
+import type { SourceCache } from "./taskBoardSnapshotData";
 
 const colors = [
   "#ee352e",
@@ -21,10 +22,15 @@ export interface SessionRow {
   native?: BoardSession;
   task?: BoardTask;
   color: string;
+  asOf?: string;
 }
 
 /** Source identity stays source-owned; native observations replace its runtime tuple. */
-export function boardSessionRows(tasks: BoardTask[], native: BoardSession[]): SessionRow[] {
+export function boardSessionRows(
+  tasks: BoardTask[],
+  native: BoardSession[],
+  sourceCaches?: Record<string, SourceCache>,
+): SessionRow[] {
   const byId = new Map(native.map((session) => [session.id, session]));
   const tasksById = new Map(tasks.map((task) => [taskIdentity(task), task]));
   const rows = new Map<string, SessionRow>();
@@ -64,6 +70,9 @@ export function boardSessionRows(tasks: BoardTask[], native: BoardSession[]): Se
         native: byId.get(source.id),
         task: linked,
         color: colorFor(linked),
+        asOf: byId.has(source.id)
+          ? undefined
+          : sourceCaches?.[task["omnigent.ai:source"]]?.display.asOf,
       });
     }
   }
@@ -134,7 +143,7 @@ export function sessionGroups(rows: SessionRow[], asOf: string) {
   const live = rows.filter((row) => row.session.status !== "archived");
   const rank = (row: SessionRow) =>
     ({ waiting: 0, stale: 1, failed: 1, running: 2, idle: 3, archived: 4 })[
-      sessionObservation(row.session, asOf).state
+      sessionObservation(row.session, row.asOf ?? asOf).state
     ] ?? 3;
   const byId = new Map(live.map((row) => [row.session.id, row]));
   const ordered = live

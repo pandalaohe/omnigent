@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
@@ -12,6 +12,7 @@ import {
 import type { BoardTask } from "./taskBoardData";
 import type { BoardSession } from "./taskBoardNative";
 import type { DisplaySession } from "./taskBoardDisplay";
+import type { SourceCache } from "./taskBoardSnapshotData";
 
 const now = Date.parse("2026-11-12T04:00:00Z"),
   asOf = new Date(now).toISOString();
@@ -22,6 +23,7 @@ afterEach(() => {
   cleanup();
   clients.forEach((client) => client.clear());
   clients.length = 0;
+  fetcher.mockClear();
   vi.restoreAllMocks();
 });
 const session = (id: string, change: Partial<DisplaySession> = {}): DisplaySession => ({
@@ -47,12 +49,16 @@ const task = (sessions: DisplaySession[]): BoardTask => ({
     sessions,
   },
 });
-function mount(tasks: BoardTask[], sessions: BoardSession[] = []) {
+function mount(
+  tasks: BoardTask[],
+  sessions: BoardSession[] = [],
+  options: { details?: BoardSession[]; sourceCaches?: Record<string, SourceCache> } = {},
+) {
   vi.spyOn(Date, "now").mockReturnValue(now);
   fetcher.mockImplementation(async (path: string) =>
     Response.json(
       path.includes("/sessions/")
-        ? sessions.find((row) => path.includes(`/sessions/${row.id}?`))
+        ? (options.details ?? sessions).find((row) => path.includes(`/sessions/${row.id}?`))
         : tasks[0],
     ),
   );
@@ -60,17 +66,247 @@ function mount(tasks: BoardTask[], sessions: BoardSession[] = []) {
   clients.push(client);
   const select = vi.fn(),
     view = vi.fn();
-  const rendered = render(
+  const content = (currentSessions: BoardSession[]) => (
     <QueryClientProvider client={client}>
       <MemoryRouter>
         <div className="tb-page">
-          <TaskBoardSessions tasks={tasks} sessions={sessions} onSelect={select} onView={view} />
+          <TaskBoardSessions
+            tasks={tasks}
+            sessions={currentSessions}
+            sourceCaches={options.sourceCaches}
+            onSelect={select}
+            onView={view}
+          />
         </div>
       </MemoryRouter>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
-  return { ...rendered, select, view };
+  const rendered = render(content(sessions));
+  return {
+    ...rendered,
+    select,
+    view,
+    client,
+    updateSessions: (value: BoardSession[]) => rendered.rerender(content(value)),
+  };
 }
+
+it("moves detail-only archived transitions out of live groups and keeps the observation while folded", async () => {
+  const list = [{ id: "transition", title: "Transition", status: "running" }];
+  const detail = { ...list[0], archived: true, archived_at: now / 1000 };
+  const { container, client } = mount([], list, { details: [detail] });
+  const archive = await screen.findByRole("button", { name: "1 archived today" });
+  expect(container.querySelectorAll(".tb-session-group")).toHaveLength(0);
+  fireEvent.click(archive);
+  expect(container.querySelectorAll(".tb-session-line.archived")).toHaveLength(1);
+  fireEvent.click(archive);
+  await act(async () => client.setQueryData(["taskBoard", "session", "transition"], detail));
+  expect(container.querySelectorAll(".tb-session-group")).toHaveLength(0);
+  expect(fetcher).toHaveBeenCalledTimes(1);
+});
+
+it("reorders a newly waiting child from refreshed detail without fetching hidden children", async () => {
+  const list = [
+    { id: "root", title: "Root", status: "running" },
+    { id: "one", title: "First", status: "running", parent_session_id: "root" },
+    { id: "two", title: "Second", status: "running", parent_session_id: "root" },
+    ...Array.from({ length: 8 }, (_, index) => ({
+      id: `later-${index}`,
+      status: "idle",
+      parent_session_id: "root",
+    })),
+  ];
+  const { container, client } = mount([], list);
+  await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(9));
+  await act(async () =>
+    client.setQueryData(["taskBoard", "session", "two"], {
+      ...list[2],
+      status: "waiting",
+      need: "Approve the next step",
+    }),
+  );
+  expect(container.querySelector(".tb-session-line.child")?.getAttribute("data-session-id")).toBe(
+    "two",
+  );
+  expect(fetcher.mock.calls.some(([path]) => path.includes("later-7"))).toBe(false);
+});
+
+it("keeps source-only tools and durations at the retained snapshot clock while native rows stay live", () => {
+  const snapshot = new Date(now - 3600_000).toISOString();
+  const supplied = task([
+    session("cached", {
+      idleSeconds: undefined,
+      lastActivityAt: new Date(now - 3600_000 - 1250_000).toISOString(),
+      tool: {
+        id: "run",
+        name: "test",
+        label: "Tests",
+        startedAt: new Date(now - 3600_000 - 60_000).toISOString(),
+        limitSeconds: 120,
+      },
+    }),
+  ]);
+  const sourceCaches: Record<string, SourceCache> = {
+    source: {
+      pin: { sourceGeneration: "generation", id: "snapshot", asOf: snapshot, phase: "published" },
+      display: { version: 1, asOf: snapshot, timeZone: "UTC" },
+      tasks: [supplied],
+      history: [],
+      counts: [],
+    },
+  };
+  const native = {
+    id: "live",
+    status: "running",
+    updated_at: now / 1000,
+    running_since: now / 1000 - 600,
+  };
+  const { container } = mount([supplied], [native], { sourceCaches });
+  const cached = screen.getByRole("button", { name: "Session details: cached" });
+  expect(cached.classList.contains("state-running")).toBe(true);
+  fireEvent.mouseEnter(cached);
+  expect(screen.getByRole("tooltip").textContent).toContain("1m / 2m");
+  expect(
+    container
+      .querySelector('.tb-session-line[data-session-id="live"]')
+      ?.classList.contains("state-running"),
+  ).toBe(true);
+  const rows = boardSessionRows(
+    [supplied],
+    [{ ...native, id: "cached", updated_at: (now - 1300_000) / 1000 }],
+    sourceCaches,
+  );
+  expect(rows[0].asOf).toBeUndefined();
+  expect(sessionGroups(rows, asOf)[0].root.session.tool).toBeUndefined();
+});
+
+it("clamps the root page after the last visible root moves to archives", async () => {
+  const list = Array.from({ length: 7 }, (_, index) => ({
+    id: `root-${index}`,
+    status: "running",
+  }));
+  const { container } = mount([], list, {
+    details: list.map((row, index) =>
+      index === 6 ? { ...row, archived: true, archived_at: now / 1000 } : row,
+    ),
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Next page" }));
+  await screen.findByRole("button", { name: "1 archived today" });
+  expect(container.querySelectorAll(".tb-session-line.root")).toHaveLength(6);
+  expect(fetcher).toHaveBeenCalledTimes(7);
+});
+
+it("lets a newer list observation replace a retained older archive detail", async () => {
+  const list = [{ id: "transition", status: "running", updated_at: now / 1000 }];
+  const { container, updateSessions } = mount([], list, {
+    details: [{ ...list[0], archived: true, archived_at: now / 1000 }],
+  });
+  await screen.findByRole("button", { name: "1 archived today" });
+  updateSessions([{ ...list[0], updated_at: now / 1000 + 10 }]);
+  expect(container.querySelectorAll(".tb-session-line.root.state-running")).toHaveLength(1);
+  expect(screen.getByRole("button", { name: "0 archived today" })).toBeTruthy();
+});
+
+it("shows passed, failed, flaky and missing recent check results without implying success", () => {
+  const supplied = task([]),
+    display = supplied["omnigent.ai:sourceDisplay"]!;
+  display.checks = (["passed", "failed", "flaky"] as const).map((verdict, index) => ({
+    id: verdict,
+    host: `host-${index}`,
+    verdict,
+    count: index,
+    at: asOf,
+  }));
+  display.events = [
+    ...display.checks.map((check) => ({
+      id: check.id,
+      kind: "check" as const,
+      task: { source: "source", uid: "task" },
+      at: asOf,
+      checkId: check.id,
+    })),
+    {
+      id: "missing",
+      kind: "check",
+      task: { source: "source", uid: "task" },
+      at: asOf,
+      checkId: "absent",
+    },
+  ];
+  const { container } = mount([supplied]);
+  for (const [index, verdict] of ["passed", "failed", "flaky"].entries()) {
+    const row = screen.getByRole("button", { name: new RegExp(`host-${index} ${verdict}`) });
+    expect(row.querySelector(`.tb-recent-kind.${verdict}`)).toBeTruthy();
+    expect(row.textContent).toContain(index === 1 ? "1 test" : `${index} tests`);
+  }
+  const unknown = screen.getByRole("button", { name: /Check result unavailable/ });
+  expect(unknown.querySelector(".passed")).toBeNull();
+  expect(container.querySelectorAll(".tb-recent-event")).toHaveLength(4);
+});
+
+it("renders the recent task card on hover and keyboard focus, including state, handlers, relations and receipts", () => {
+  const supplied = task([]),
+    display = supplied["omnigent.ai:sourceDisplay"]!;
+  display.state = "blocked";
+  display.current = "Checking a slow connection";
+  display.actors = [{ id: "actor", agentId: "codex", label: "Recovery owner" }];
+  display.relations = [
+    {
+      id: "dependency",
+      from: { source: "source", uid: "task" },
+      to: { source: "source", uid: "other" },
+      kind: "dependency",
+      origin: "observed",
+      provenance: "source",
+    },
+    {
+      id: "include",
+      from: { source: "source", uid: "task" },
+      to: { source: "source", uid: "other" },
+      kind: "include",
+      origin: "observed",
+      provenance: "source",
+    },
+  ];
+  display.checks = [{ id: "check", host: "worker", verdict: "failed", count: 4, at: asOf }];
+  display.events = [
+    {
+      id: "event",
+      kind: "start",
+      at: asOf,
+      task: { source: "source", uid: "task" },
+      label: "Started work",
+    },
+  ];
+  mount([supplied, { uid: "other", title: "Upstream task", "omnigent.ai:source": "source" }]);
+  const row = screen.getByRole("button", { name: /Started work/ });
+  fireEvent.mouseEnter(row);
+  const hover = screen.getByRole("tooltip");
+  expect(hover.textContent).toContain("Blocked");
+  expect(hover.textContent).toContain("ENG-1");
+  expect(hover.textContent).toContain("Recovery owner");
+  expect(hover.textContent).toContain("Checking a slow connection");
+  expect(hover.textContent).toContain("Dependency · Upstream task");
+  expect(hover.textContent).toContain("Includes · Upstream task");
+  expect(hover.textContent).toContain("worker failed · 4");
+  fireEvent.mouseLeave(row);
+  expect(screen.queryByRole("tooltip")).toBeNull();
+  fireEvent.focus(row);
+  expect(row.getAttribute("aria-describedby")).toBe(screen.getByRole("tooltip").id);
+  fireEvent.keyDown(row, { key: "Escape" });
+  expect(screen.queryByRole("tooltip")).toBeNull();
+});
+
+it("shows archive time and the high-context branch rather than an idle duration", () => {
+  mount([task([session("archive", { status: "archived", archivedAt: asOf, context: 0.86 })])]);
+  fireEvent.click(screen.getByRole("button", { name: "1 archived today" }));
+  fireEvent.mouseEnter(screen.getByRole("button", { name: "Session details: archive" }));
+  const hover = screen.getByRole("tooltip");
+  expect(hover.textContent).toContain("Archived");
+  expect(hover.textContent).toContain("2026");
+  expect(hover.textContent).not.toContain("Idle");
+  expect(hover.querySelector(".tb-session-context b.hot")).toBeTruthy();
+});
 
 it("joins only explicit source/task ids and preserves supplied identity, steps and estimated cost", () => {
   const supplied = session("native", {

@@ -414,3 +414,114 @@ def test_task_board_display_switch_and_source_list(
             expect(navigation).to_have_css("background-color", "rgb(24, 31, 37)")
             navigation.get_by_role("button", name="Sessions", exact=True).click()
             expect(page.get_by_role("region", name="Sessions", exact=True)).to_be_visible()
+    observed = datetime.now(UTC).isoformat()
+    ref = {"source": "example", "uid": "observations"}
+    checks = [
+        {"id": verdict, "host": f"host-{verdict}", "verdict": verdict, "count": 7, "at": observed}
+        for verdict in ("passed", "failed", "flaky")
+    ]
+    browser_contract.json(
+        "/v1/me/tasks",
+        {
+            "entries": [
+                {
+                    "uid": "observations",
+                    "title": "Recovery observations",
+                    "omnigent.ai:source": "example",
+                    "omnigent.ai:sourceDisplay": {
+                        "version": 1,
+                        "state": "blocked",
+                        "current": "Verify the recovery path",
+                        "identity": {
+                            "key": "ENG-2",
+                            "label": "Recovery observations",
+                            "groupId": "v2",
+                            "groupLabel": "Version two",
+                        },
+                        "actors": [{"id": "owner", "agentId": "codex", "label": "Recovery owner"}],
+                        "sessions": [
+                            {
+                                "id": "source-stale",
+                                "task": ref,
+                                "role": "root",
+                                "agentId": "codex",
+                                "label": "Source stale",
+                                "title": "Source stale",
+                                "status": "running",
+                                "createdAt": observed,
+                                "lastActivityAt": observed,
+                                "idleSeconds": 1300,
+                                "context": 0.9,
+                                "steps": [
+                                    {
+                                        "id": "step",
+                                        "kind": "you",
+                                        "label": "Review recovered output",
+                                        "state": "current",
+                                    }
+                                ],
+                            },
+                            {
+                                "id": "source-archive",
+                                "task": ref,
+                                "role": "root",
+                                "agentId": "codex",
+                                "label": "Source archive",
+                                "title": "Source archive",
+                                "status": "archived",
+                                "createdAt": observed,
+                                "lastActivityAt": observed,
+                                "archivedAt": observed,
+                                "context": 0.85,
+                            },
+                        ],
+                        "checks": checks,
+                        "events": [
+                            {
+                                "id": check["id"],
+                                "at": observed,
+                                "kind": "check",
+                                "task": ref,
+                                "checkId": check["id"],
+                            }
+                            for check in checks
+                        ],
+                    },
+                }
+            ],
+            "updated": observed,
+        },
+    )
+    page.evaluate(
+        "localStorage.setItem('omnigent.taskBoard.display', "
+        f"JSON.stringify({{theme:{json.dumps(theme)}, defaultView:'sessions'}}))"
+    )
+    page.goto(appearance_url + "/task-board")
+    marker = page.locator('[data-session-id="source-stale"] .tb-session-station.current')
+    danger = "rgb(231, 98, 125)" if theme == "dark" else "rgb(193, 49, 74)"
+    expect(marker).to_have_css("background-color", danger)
+    expect(marker).to_have_css("border-top-color", danger)
+    expect(marker).to_have_css("color", "rgb(255, 255, 255)")
+    failed = page.get_by_role("button", name=re.compile("host-failed failed"))
+    expect(failed.locator(".tb-recent-kind")).to_have_css("color", danger)
+    flaky = page.get_by_role("button", name=re.compile("host-flaky flaky"))
+    expect(flaky.locator(".tb-recent-kind")).to_have_css(
+        "color", "rgb(212, 151, 42)" if theme == "dark" else "rgb(129, 95, 34)"
+    )
+    if width >= 621:
+        page.get_by_role("button", name="Session details: Source stale", exact=True).hover()
+        expect(page.get_by_role("tooltip").locator(".tb-session-context b.hot")).to_have_css(
+            "background-color", danger
+        )
+        page.get_by_role("button", name="2 archived today", exact=True).click()
+        page.get_by_role("button", name="Session details: Source archive", exact=True).hover()
+        expect(page.get_by_role("tooltip")).to_contain_text("Archived")
+        expect(page.get_by_role("tooltip")).to_contain_text(str(datetime.now(UTC).year))
+        expect(page.get_by_role("tooltip").locator(".tb-session-context b.hot")).to_have_count(0)
+        failed.focus()
+        expect(page.get_by_role("tooltip")).to_contain_text("Recovery owner")
+        expect(page.get_by_role("tooltip")).to_contain_text("Verify the recovery path")
+        expect(page.get_by_role("tooltip")).to_contain_text("host-failed failed")
+        page.keyboard.press("Escape")
+        expect(page.get_by_role("tooltip")).to_have_count(0)
+    assert not errors

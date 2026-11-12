@@ -1,4 +1,13 @@
-import { Fragment, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import {
+  Fragment,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   ActivityIcon,
   ArrowLeftRightIcon,
@@ -33,6 +42,7 @@ import { boardExitProps } from "@/lib/boardFrame";
 import { Link } from "@/lib/routing";
 import { BoardIdentityMark } from "./BoardIdentityMark";
 import { TaskBoardDetail, taskTitle } from "./TaskBoardDetail";
+import { TaskBoardTaskHover } from "./TaskBoardTaskHover";
 import { BoardPager } from "./TaskBoardRoutes";
 import "./taskBoardSessions.css";
 import { taskIdentity, type BoardTask } from "./taskBoardData";
@@ -119,11 +129,20 @@ function SessionHover({ session, asOf }: { session: DisplaySession; asOf: string
           {[session.agentId || t("sessions.unknown"), session.model].filter(Boolean).join(" · ")}
         </span>
         <span>
-          {t(`sessions.state.${observation.state}`)}
-          {" · "}
-          {duration(
-            observation.state === "running" ? observation.runningSeconds : observation.idleSeconds,
-          )}
+          {session.status === "archived"
+            ? t("sessions.archiveStamp", {
+                time: session.archivedAt
+                  ? formatDate(Date.parse(session.archivedAt), {
+                      dateStyle: "medium",
+                      timeStyle: "short",
+                    })
+                  : t("sessions.unknown"),
+              })
+            : `${t(`sessions.state.${observation.state}`)} · ${duration(
+                observation.state === "running"
+                  ? observation.runningSeconds
+                  : observation.idleSeconds,
+              )}`}
         </span>
       </div>
       {liveTool && (
@@ -144,7 +163,10 @@ function SessionHover({ session, asOf }: { session: DisplaySession; asOf: string
         <div className="tb-session-context">
           <span>{t("sessions.context")}</span>
           <i>
-            <b style={{ width: `${Math.max(0, Math.min(100, session.context * 100))}%` }} />
+            <b
+              className={session.context > 0.85 ? "hot" : undefined}
+              style={{ width: `${Math.max(0, Math.min(100, session.context * 100))}%` }}
+            />
           </i>
           <em>{`${formatNumber(session.context * 100)}%`}</em>
         </div>
@@ -410,19 +432,35 @@ export function TaskBoardSessions({
     [selected, setSelected] = useState<string | null>(null);
   const [hover, setHover] = useState<ReactNode>(null),
     [pointer, setPointer] = useState({ x: 0, y: 0 });
+  const [hoverEvent, setHoverEvent] = useState<string | null>(null);
+  const tooltipId = useId();
+  const tooltip = useRef<HTMLDivElement>(null);
+  const [hoverSize, setHoverSize] = useState({ width: 330, height: 180 });
+  useLayoutEffect(() => {
+    if (!hover || !tooltip.current) return;
+    const { width, height } = tooltip.current.getBoundingClientRect();
+    setHoverSize((old) => (old.width === width && old.height === height ? old : { width, height }));
+  }, [hover]);
   const rowElements = useRef(new Map<string, HTMLDivElement>());
+  const client = useQueryClient();
   const now = Date.now(),
     asOf = new Date(now).toISOString();
-  const initial = useMemo(() => boardSessionRows(tasks, sessions), [tasks, sessions]);
-  const initialGroups = sessionGroups(initial, asOf),
-    current = Math.min(page, Math.max(0, Math.ceil(initialGroups.length / 6) - 1));
-  const groupsOnPage = initialGroups.slice(current * 6, (current + 1) * 6);
-  const childPage = (group: (typeof initialGroups)[number]) =>
+  const hydrated = sessions.map((session) => {
+    const detail = client.getQueryData<BoardSession>(["taskBoard", "session", session.id]);
+    return detail && (detail.updated_at ?? 0) >= (session.updated_at ?? 0)
+      ? { ...session, ...detail }
+      : session;
+  });
+  const rows = boardSessionRows(tasks, hydrated, sourceCaches);
+  const groups = sessionGroups(rows, asOf),
+    current = Math.min(page, Math.max(0, Math.ceil(groups.length / 6) - 1));
+  const groupsOnPage = groups.slice(current * 6, (current + 1) * 6);
+  const childPage = (group: (typeof groups)[number]) =>
     Math.min(
       childPages[group.root.session.id] ?? 0,
       Math.max(0, Math.ceil(group.children.length / 8) - 1),
     );
-  const archived = archivedToday(initial, now),
+  const archived = archivedToday(rows, now),
     lastArchive = Math.max(0, Math.ceil(archived.length / 10) - 1),
     archiveCurrent = Math.min(archivePage, lastArchive);
   const visibleIds = groupsOnPage
@@ -436,13 +474,11 @@ export function TaskBoardSessions({
     ])
     .concat(archiveOpen ? archived.slice(archiveCurrent * 10, archiveCurrent * 10 + 10) : [])
     .flatMap((row) => (row.native ? [row.session.id] : []));
-  const details = useBoardSessionDetails(visibleIds);
-  const hydrated = new Map(sessions.map((session) => [session.id, session]));
-  for (const detail of details)
-    if (detail.data && hydrated.has(detail.data.id))
-      hydrated.set(detail.data.id, { ...hydrated.get(detail.data.id)!, ...detail.data });
-  const rows = boardSessionRows(tasks, [...hydrated.values()]),
-    byId = new Map(rows.map((row) => [row.session.id, row]));
+  // Keep cached observations subscribed when a transition moves a row off-page.
+  const details = useBoardSessionDetails(
+    sessions.map((session) => session.id),
+    visibleIds,
+  );
   const restore = () => {
     const id = selected;
     setSelected(null);
@@ -460,7 +496,7 @@ export function TaskBoardSessions({
           }}
         >
           <SessionLine
-            row={byId.get(id) ?? row}
+            row={row}
             kind={kind}
             expanded={!closed.includes(id)}
             onToggle={
@@ -476,8 +512,11 @@ export function TaskBoardSessions({
               setSelected(open ? null : id);
               setHover(null);
             }}
-            asOf={asOf}
-            onHover={setHover}
+            asOf={row.asOf ?? asOf}
+            onHover={(content) => {
+              setHoverEvent(null);
+              setHover(content);
+            }}
             onHoverOff={() => setHover(null)}
             onPointer={(x, y) => setPointer({ x, y })}
           />
@@ -487,7 +526,7 @@ export function TaskBoardSessions({
             <TaskBoardDetail
               task={row.task}
               tasks={tasks}
-              sessions={sessions}
+              sessions={hydrated}
               sourceCache={sourceCaches?.[row.task["omnigent.ai:source"]]}
               onSelect={onSelect}
               onClose={restore}
@@ -501,7 +540,7 @@ export function TaskBoardSessions({
                 <XIcon size={15} />
               </button>
               <h3>{row.session.title}</h3>
-              <SessionHover session={(byId.get(id) ?? row).session} asOf={asOf} />
+              <SessionHover session={row.session} asOf={row.asOf ?? asOf} />
               <p>{t("sessions.noTask")}</p>
             </section>
           ))}
@@ -535,7 +574,7 @@ export function TaskBoardSessions({
       ))}
       <BoardPager
         page={current}
-        pages={Math.max(1, Math.ceil(initialGroups.length / 6))}
+        pages={Math.max(1, Math.ceil(groups.length / 6))}
         onChange={(value) => {
           setPage(value);
           setSelected(null);
@@ -576,19 +615,43 @@ export function TaskBoardSessions({
           </h4>
           {recent.events.map(({ event, task }) => {
             const Icon = eventIcons[event.kind] ?? ActivityIcon;
+            const eventKey = JSON.stringify([taskIdentity(task), event.id]);
+            const taskHover = <TaskBoardTaskHover task={task} tasks={tasks} />;
+            const check =
+              event.kind === "check"
+                ? task["omnigent.ai:sourceDisplay"]?.checks?.find(
+                    (item) => item.id === event.checkId,
+                  )
+                : undefined;
             return (
               <button
                 type="button"
                 className="tb-recent-event"
-                key={JSON.stringify([taskIdentity(task), event.id])}
-                title={[
-                  taskTitle(task),
-                  task.description,
-                  task["omnigent.ai:sourceDisplay"]?.current,
-                ]
-                  .filter(Boolean)
-                  .join(" · ")}
-                onClick={() => onSelect(task)}
+                key={eventKey}
+                aria-describedby={hover && hoverEvent === eventKey ? tooltipId : undefined}
+                onMouseEnter={(pointerEvent) => {
+                  setHoverEvent(eventKey);
+                  setPointer({ x: pointerEvent.clientX, y: pointerEvent.clientY });
+                  setHover(taskHover);
+                }}
+                onMouseMove={(pointerEvent) =>
+                  setPointer({ x: pointerEvent.clientX, y: pointerEvent.clientY })
+                }
+                onMouseLeave={() => setHover(null)}
+                onFocus={(focusEvent) => {
+                  setHoverEvent(eventKey);
+                  const rect = focusEvent.currentTarget.getBoundingClientRect();
+                  setPointer({ x: rect.left, y: rect.top });
+                  setHover(taskHover);
+                }}
+                onBlur={() => setHover(null)}
+                onKeyDown={(keyEvent) => {
+                  if (keyEvent.key === "Escape") setHover(null);
+                }}
+                onClick={() => {
+                  setHover(null);
+                  onSelect(task);
+                }}
               >
                 <time dateTime={event.at}>{clock(event.at)}</time>
                 <BoardIdentityMark
@@ -598,20 +661,24 @@ export function TaskBoardSessions({
                   neutral
                   size={24}
                 />
-                <i className={`tb-recent-kind ${event.kind}`}>
+                <i className={`tb-recent-kind ${event.kind} ${check?.verdict ?? ""}`}>
                   <Icon size={12} />
                 </i>
                 <span>
                   <b>{task["omnigent.ai:sourceDisplay"]?.identity?.label || taskTitle(task)}</b>{" "}
-                  <small>{event.label || t(`sessions.event.${event.kind}`)}</small>
+                  <small className={check?.verdict}>
+                    {check
+                      ? `${check.host} ${t(`sessions.check.${check.verdict}`)}`
+                      : event.kind === "check"
+                        ? event.label || t("sessions.check.unknown")
+                        : event.label || t(`sessions.event.${event.kind}`)}
+                  </small>
                 </span>
                 <em>
-                  {event.workSeconds
-                    ? duration(event.workSeconds)
-                    : event.kind === "check"
-                      ? task["omnigent.ai:sourceDisplay"]?.checks?.find(
-                          (check) => check.id === event.checkId,
-                        )?.count
+                  {check
+                    ? t("sessions.checkCount", { count: check.count })
+                    : event.workSeconds
+                      ? duration(event.workSeconds)
                       : ""}
                 </em>
               </button>
@@ -653,10 +720,15 @@ export function TaskBoardSessions({
       {hover && (
         <div
           className="tb-session-hover"
+          id={tooltipId}
+          ref={tooltip}
           role="tooltip"
           style={{
-            left: Math.max(10, Math.min(pointer.x + 18, window.innerWidth - 350)),
-            top: Math.max(10, Math.min(pointer.y + 14, window.innerHeight - 180)),
+            left:
+              pointer.x + 18 + hoverSize.width > window.innerWidth - 10
+                ? Math.max(10, pointer.x - hoverSize.width - 18)
+                : pointer.x + 18,
+            top: Math.max(10, Math.min(pointer.y + 14, window.innerHeight - hoverSize.height - 10)),
           }}
         >
           {hover}
