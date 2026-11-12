@@ -1933,3 +1933,8 @@
     grid-template-columns: 36px repeat(6, minmax(0, 1fr));
   }
 }
+
+.tb-activity-final .fsearch:focus-within {
+  box-shadow: 0 0 0 2px var(--primary);
+  background: var(--background);
+}

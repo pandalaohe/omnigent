@@ -1,17 +1,12 @@
 import type { BoardTask } from "./taskBoardData";
 import type { BoardSession } from "./taskBoardNative";
-import { mergeDisplaySession } from "./taskBoardDisplay";
+import { boardSessionRows } from "./taskBoardSessionData";
 import { accountTotals } from "./taskBoardHistoryData";
 import { latestRelease, type SourceCache } from "./taskBoardSnapshotData";
 import { localDay } from "./taskBoardActivityData";
 import { t } from "./taskBoardText";
 import { BoardIdentityMark } from "./BoardIdentityMark";
-import {
-  activityTaskName,
-  ActivityMoney,
-  activityStamp,
-  activityMoney,
-} from "./TaskBoardActivityParts";
+import { activityTaskName, activityStamp, activityMoney } from "./TaskBoardActivityParts";
 import type { UsageActivity } from "@/pages/usageBoard/usageActivityData";
 import { Coins, FlaskConical, Network, PackageCheck, Quote } from "lucide-react";
 
@@ -97,16 +92,9 @@ export function TaskBoardToday({
         String(b.q.date ?? b.q.at ?? "").localeCompare(String(a.q.date ?? a.q.at ?? "")) ||
         (a.q.rank ?? 0) - (b.q.rank ?? 0),
     );
-  const native = new Map(sessions.map((s) => [s.id, s])),
-    projected = new Map(
-      tasks.flatMap((task) =>
-        (task["omnigent.ai:sourceDisplay"]?.sessions ?? []).map(
-          (s) => [s.id, mergeDisplaySession(s, native.get(s.id))] as const,
-        ),
-      ),
-    ),
-    agents = new Map<string, { n: number; live: number; cost: number | null }>();
-  for (const s of projected.values())
+  const projected = boardSessionRows(tasks, sessions, caches).map((row) => row.session);
+  const agents = new Map<string, { n: number; live: number; cost: number | null }>();
+  for (const s of projected)
     if (
       localDay(s.lastActivityAt) === today ||
       (s.archivedAt && localDay(s.archivedAt) === today)
@@ -305,7 +293,9 @@ export function TaskBoardToday({
             <i className="td-bar">
               <u style={{ width: `${((a.amount ?? 0) / maxCost) * 100}%` }} />
             </i>
-            <ActivityMoney amount={a.amount} />
+            <span title={t("sessions.cost.estimate.hint")}>
+              {a.amount === null ? "—" : activityMoney(a.amount)}
+            </span>
           </div>
         ))}
         <p className="muted td-foot">{t("g6.costFootnote")}</p>

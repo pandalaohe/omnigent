@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
+import userEvent from "@testing-library/user-event";
 import { historyCards, historySort, accountTotals, DAY } from "./taskBoardHistoryData";
 import { TaskBoardLog } from "./TaskBoardLog";
 import { TaskBoardHistory } from "./TaskBoardHistory";
@@ -231,4 +232,84 @@ it("loads pinned old-month cursor pages and discards a cancelled response", asyn
   await waitFor(() => expect(container.querySelector(".h-stat>b")?.textContent).toBe("2"));
   expect(fetcher).toHaveBeenCalledTimes(4);
   expect(fetcher.mock.calls[2][0]).toContain("cursor=later");
+});
+
+it("keeps native sessions without a supplied task in the Today worker totals", () => {
+  render(
+    <TaskBoardToday
+      tasks={[]}
+      sessions={[
+        {
+          id: "independent",
+          agent_id: "codex",
+          status: "running",
+          updated_at: now / 1000,
+          total_cost_usd: 3,
+        },
+      ]}
+      caches={{}}
+      now={now}
+      onSelect={vi.fn()}
+    />,
+  );
+  expect(screen.getByText("Codex", { selector: "b" })).toBeTruthy();
+  expect(screen.getByText(/1 sessions, 1 open/)).toBeTruthy();
+  expect(screen.getByText(/\$3\.00/)).toBeTruthy();
+});
+it("uses supplied activity instead of duplicating task-body update history", () => {
+  const a = task("A");
+  a["omnigent.ai:sourceDisplay"]!.events = [
+    {
+      id: "source-event",
+      at: new Date(now).toISOString(),
+      kind: "commit",
+      task: { source: "engineering", uid: "A" },
+      label: "Source commit",
+    },
+  ];
+  const { container } = render(
+    <TaskBoardLog
+      tasks={[a]}
+      sessions={[]}
+      onSelect={vi.fn()}
+      events={[
+        {
+          id: "native-delta",
+          source: "engineering",
+          uid: "A",
+          time: new Date(now).toISOString(),
+          kind: "update",
+        },
+      ]}
+    />,
+  );
+  expect(container.querySelectorAll(".lr")).toHaveLength(1);
+  expect(screen.getByText("Source commit")).toBeTruthy();
+});
+
+it("opens the task button from the keyboard without toggling its enclosing event", async () => {
+  const a = task("Keyboard task"),
+    select = vi.fn();
+  const { container } = render(
+    <TaskBoardLog
+      tasks={[a]}
+      sessions={[]}
+      onSelect={select}
+      events={[
+        {
+          id: "event",
+          source: "engineering",
+          uid: a.uid,
+          time: new Date(now).toISOString(),
+          kind: "commit",
+        },
+      ]}
+    />,
+  );
+  const user = userEvent.setup();
+  screen.getByRole("button", { name: "Keyboard task" }).focus();
+  await user.keyboard("{Enter}");
+  expect(select).toHaveBeenCalledWith(a);
+  expect(screen.getByRole("button", { name: "Resume" })).toBeTruthy();
+  expect(container.querySelector(".lr")?.getAttribute("aria-expanded")).toBe("false");
 });

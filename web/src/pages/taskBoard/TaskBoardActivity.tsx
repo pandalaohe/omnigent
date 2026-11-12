@@ -36,10 +36,11 @@ export function TaskBoardActivity({
   const cadence = useBoardCadence(),
     info = useServerInfo(),
     [detail, setDetail] = useState(false);
+  const excluded = view === "history" ? hiddenSources : EMPTY_HIDDEN;
   const caches = Object.fromEntries(
-      Object.entries(sourceCaches ?? {}).filter(([id]) => !hiddenSources.includes(id)),
+      Object.entries(sourceCaches ?? {}).filter(([id]) => !excluded.includes(id)),
     ),
-    visible = tasks.filter((task) => !hiddenSources.includes(task["omnigent.ai:source"]));
+    visible = tasks.filter((task) => !excluded.includes(task["omnigent.ai:source"]));
   const now = Date.now(),
     today = localDay(now),
     offset = -new Date(now).getTimezoneOffset();
@@ -70,17 +71,33 @@ export function TaskBoardActivity({
     onSelect(task);
   };
   const events = (sourceCaches ? sourceHistory(caches) : (history.data ?? [])).filter(
-    (e) => !hiddenSources.includes(e.source),
+    (e) => !excluded.includes(e.source),
   );
   const closedCounts = (
     sourceCaches ? Object.values(caches).flatMap((c) => c.counts) : (counts.data?.days ?? [])
-  ).filter((c) => !hiddenSources.includes(c.source));
+  ).filter((c) => !excluded.includes(c.source));
   return (
     <section className="tb-activity-final" aria-label={t("view." + view)}>
       {!sourceCaches && history.isError && (
         <p role="alert">
           {t("activity.failed")}{" "}
           <button type="button" onClick={() => void history.refetch()}>
+            {t("board.retry")}
+          </button>
+        </p>
+      )}
+      {view === "history" && counts.isError && (
+        <p role="alert">
+          {t("activity.countsFailed")}{" "}
+          <button type="button" onClick={() => void counts.refetch()}>
+            {t("board.retry")}
+          </button>
+        </p>
+      )}
+      {view === "today" && usage.isError && (
+        <p role="alert">
+          {t("today.costFailed")}{" "}
+          <button type="button" onClick={() => void usage.refetch()}>
             {t("board.retry")}
           </button>
         </p>

@@ -61,6 +61,13 @@ export function TaskBoardLog({
     [pages, setPages] = useState<Record<string, number>>({});
   const taskMap = new Map(tasks.map((task) => [taskIdentity(task), task])),
     colors = boardGroupColors(tasks);
+  const roots = new Map(
+    tasks.flatMap((task) =>
+      (task["omnigent.ai:sourceDisplay"]?.sessions ?? []).map(
+        (session) => [session.id, session] as const,
+      ),
+    ),
+  );
   const rich = tasks.flatMap((task) =>
     (task["omnigent.ai:sourceDisplay"]?.events ?? []).map((event) => ({
       task,
@@ -69,7 +76,16 @@ export function TaskBoardLog({
     })),
   );
   const richMap = new Map(rich.map((r) => [r.key, r]));
-  const combined = new Map(events.map((e) => [JSON.stringify([e.source, e.uid, e.id]), e]));
+  const supplied = new Set(
+    tasks
+      .filter((task) => task["omnigent.ai:sourceDisplay"]?.events !== undefined)
+      .map(taskIdentity),
+  );
+  const combined = new Map(
+    events
+      .filter((event) => !supplied.has(JSON.stringify([event.source, event.uid])))
+      .map((e) => [JSON.stringify([e.source, e.uid, e.id]), e]),
+  );
   rich.forEach(({ event, key }) =>
     combined.set(key, {
       id: event.id,
@@ -87,12 +103,17 @@ export function TaskBoardLog({
         (richMap.get(JSON.stringify([b.source, b.uid, b.id]))?.event.rank ?? 0),
   );
   const shown = paused ?? live,
-    buffered = paused
-      ? live.filter(
-          (e) => !paused.some((p) => p.id === e.id && p.source === e.source && p.uid === e.uid),
-        ).length
-      : 0;
-  const groups = new Map<string, { label: string; rows: BoardEvent[] }>();
+    pausedKeys = new Set(
+      (paused ?? []).map((event) => JSON.stringify([event.source, event.uid, event.id])),
+    );
+  const buffered = paused
+    ? live.filter((event) => !pausedKeys.has(JSON.stringify([event.source, event.uid, event.id])))
+        .length
+    : 0;
+  const groups = new Map<
+    string,
+    { label: string; subtitle?: string; agent?: string; rows: BoardEvent[] }
+  >();
   for (const event of shown) {
     const k = kinds[event.kind] ?? event.kind;
     if (
@@ -111,19 +132,33 @@ export function TaskBoardLog({
         : by === "mother"
           ? (root ?? mother?.id ?? "none")
           : JSON.stringify([event.source, identity?.groupId ?? task?.["omnigent.ai:group"]?.id]);
+    const rootSession = root ? roots.get(root) : mother ? roots.get(mother.id) : undefined;
+    const day = localDay(event.time);
     const label =
       by === "time"
-        ? localDay(event.time)
+        ? day === localDay(Date.now())
+          ? t("view.today")
+          : day === localDay(Date.now() - 86400000)
+            ? t("routes.yesterday")
+            : day.slice(5)
         : by === "mother"
-          ? (sessions.find((s) => s.id === root)?.title ??
+          ? (rootSession?.label ??
+            sessions.find((s) => s.id === root)?.title ??
             mother?.label ??
             t("activity.unassigned"))
           : (identity?.groupLabel ?? task?.["omnigent.ai:group"]?.name ?? event.source);
-    if (!groups.has(key)) groups.set(key, { label, rows: [] });
+    if (!groups.has(key))
+      groups.set(key, {
+        label,
+        subtitle: by === "time" ? day.slice(5) : rootSession?.title,
+        agent: by === "mother" ? rootSession?.agentId : undefined,
+        rows: [],
+      });
     groups.get(key)!.rows.push(event);
   }
   const change = (setter: (v: string) => void) => (v: string) => {
     setter(v);
+    setPaused(null);
     setPage(0);
     setPages({});
     setOpen(null);
@@ -144,6 +179,7 @@ export function TaskBoardLog({
         <button
           type="button"
           className={`l-play ${paused ? "on" : ""}`}
+          disabled={by !== "time"}
           onClick={() => setPaused(paused ? null : live)}
         >
           {paused ? <Play size={14} /> : <Pause size={14} />}
@@ -154,7 +190,11 @@ export function TaskBoardLog({
       {[...groups].slice(page * 6, page * 6 + 6).map(([key, g]) => (
         <section className="l-g" key={key}>
           <h4>
+            {g.agent && (
+              <BoardIdentityMark id={g.agent} product={g.agent} label={g.agent} size={18} />
+            )}
             {g.label}
+            {g.subtitle && <small>{g.subtitle}</small>}
             <em>{g.rows.length}</em>
           </h4>
           <div className="l-rows">
@@ -193,6 +233,7 @@ export function TaskBoardLog({
                       setOpen(open === id ? null : id);
                     }}
                     onKeyDown={(e) => {
+                      if (e.target !== e.currentTarget) return;
                       if (e.key === "Enter" || e.key === " ") {
                         e.preventDefault();
                         setPaused(paused ?? live);
@@ -251,11 +292,22 @@ export function TaskBoardLog({
                     </span>
                     <span className="lr-line">
                       {d?.identity && (
-                        <BoardIdentityMark
-                          id={d.identity.groupId}
-                          label={d.identity.groupBadge ?? d.identity.groupId}
-                          size={18}
-                        />
+                        <span
+                          style={{
+                            display: "inline-grid",
+                            placeItems: "center",
+                            minWidth: 18,
+                            height: 18,
+                            padding: "0 5px",
+                            borderRadius: 6,
+                            background: task ? colors.get(taskIdentity(task)) : "var(--secondary)",
+                            color: "white",
+                            fontSize: 10,
+                            fontWeight: 700,
+                          }}
+                        >
+                          {d.identity.groupBadge ?? d.identity.groupId}
+                        </span>
                       )}
                       <code>{d?.identity?.key ?? row.uid}</code>
                     </span>
