@@ -131,6 +131,8 @@ def test_usage_ranges_pools_and_navigation(
     expect(page.get_by_test_id("usage-tile")).to_have_count(50)
     summary = page.get_by_role("region", name="Usage summary")
     expect(summary.get_by_text("$617.00")).to_have_count(4)
+    # The target question glyph must not inherit a full-height button row.
+    assert summary.locator(".usage-summary-tip").first.bounding_box()["height"] == 15
     usable_ms = (time.perf_counter() - started) * 1000
     assert set(ranges) == {"period", "d30", "today", "h24", "d7"}
     assert len(ranges) == 5
