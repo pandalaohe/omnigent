@@ -42,6 +42,9 @@ def test_pool_migration_additive_roundtrip(db_uri):
         ]
         assert key == ["workspace_id", "owner_id", "account_id"]
         script = ScriptDirectory.from_config(_build_alembic_config(db_uri))
-        assert script.get_heads() == ["a64c20261112"]
+        heads = script.get_heads()
+        assert len(heads) == 1
+        lineage = {revision.revision for revision in script.iterate_revisions(heads[0], "base")}
+        assert "a63c20261112" in lineage
     finally:
         _alembic_command(db_uri, migration_engine, "upgrade", "head")
