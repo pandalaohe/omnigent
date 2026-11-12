@@ -1,0 +1,316 @@
+.ua-controls {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.ua-segment {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 15px;
+  overflow: hidden;
+  background: var(--card);
+}
+.ua-segment button {
+  height: 28px;
+  padding: 0 12px;
+  white-space: nowrap;
+}
+.ua-segment button + button {
+  border-left: 1px solid var(--border);
+}
+.ua-segment [aria-pressed="true"] {
+  background: var(--info);
+  color: var(--background);
+  font-weight: 700;
+}
+.ua-picks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 8px;
+}
+.ua-picks button {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 3px 10px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+.ua-picks [aria-pressed="true"] {
+  border-color: var(--info);
+  background: color-mix(in srgb, var(--info) 14%, transparent);
+  color: var(--info);
+}
+.ua-kpis {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.ua-kpi {
+  display: grid;
+  gap: 1px;
+  padding: 9px 12px 10px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  min-width: 0;
+}
+.ua-kpi > span,
+.ua-comparisons > div > span {
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+.ua-kpi strong,
+.ua-unknown strong {
+  font-size: 22px;
+  line-height: 28px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  overflow-wrap: anywhere;
+}
+.ua-kpi small,
+.ua-unknown small {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  overflow-wrap: anywhere;
+}
+.ua-main {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.ua-panel {
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  padding: 10px 12px 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  min-width: 0;
+}
+.ua-panel h2 {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+  font-size: 13px;
+  font-weight: 700;
+}
+.ua-panel h2 > span {
+  margin-left: auto;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--muted-foreground);
+}
+.ua-unknown,
+.ua-comparisons {
+  display: grid;
+  gap: 1px;
+}
+.ua-comparisons {
+  gap: 12px;
+}
+.ua-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 292px), 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+.ua-table-head,
+.ua-table-row {
+  display: grid;
+  grid-template-columns: minmax(100px, 1.4fr) 88px repeat(5, minmax(65px, 1fr));
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+}
+.ua-table-head {
+  color: var(--muted-foreground);
+  padding-bottom: 6px;
+}
+.ua-table-row {
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+}
+.ua-table [role="cell"],
+.ua-table [role="columnheader"] {
+  text-align: right;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.ua-table [role="cell"]:first-child,
+.ua-table [role="columnheader"]:first-child {
+  text-align: left;
+}
+.ua-name {
+  font-weight: 600;
+}
+.ua-bars {
+  display: grid;
+  gap: 5px;
+}
+.ua-bar {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr) 46px;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  min-height: 18px;
+  width: 100%;
+  text-align: left;
+}
+.ua-bar > span:first-child {
+  overflow-wrap: anywhere;
+  line-height: 15px;
+}
+.ua-bar b {
+  text-align: right;
+}
+.ua-track {
+  height: 8px;
+  background: var(--muted);
+  border-radius: 4px;
+  position: relative;
+  display: block;
+}
+.ua-track i {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: var(--info);
+  border-radius: 4px;
+}
+.ua-share-row {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+.ua-stack {
+  display: flex;
+  gap: 2px;
+  height: 14px;
+  min-width: 0;
+}
+.ua-stack button {
+  min-width: 2px;
+  height: 14px;
+}
+.ua-share-legend {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px 14px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+.ua-share-legend > span {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.ua-share-legend i {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  flex: none;
+}
+.ua-share-legend b {
+  margin-left: auto;
+  white-space: nowrap;
+}
+.ua-controls button:focus-visible,
+.ua-picks button:focus-visible,
+.ua-table button:focus-visible,
+.ua-bar:focus-visible,
+.ua-stack button:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+.ua-share-piece {
+  display: block;
+  width: 100%;
+  height: 14px;
+}
+.ua-picks {
+  gap: 6px;
+}
+.ua-picks button {
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 13px;
+  background: var(--card);
+  white-space: nowrap;
+}
+.ua-picks [aria-pressed="true"] {
+  font-weight: 700;
+  color: var(--foreground);
+}
+.ua-table-head,
+.ua-table-row {
+  grid-template-columns: minmax(84px, 1.2fr) 88px repeat(5, minmax(0, 1fr));
+  padding: 2px 4px;
+}
+.ua-table-row {
+  min-height: 34px;
+}
+.ua-table-row [role="cell"] {
+  font-weight: 700;
+}
+@media (pointer: coarse) {
+  .ua-picks button {
+    height: 36px;
+    border-radius: 18px;
+  }
+}
+@container (max-width: 900px) {
+  .ua-main {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .ua-comparisons {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@container (max-width: 780px) {
+  .ua-kpis {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .ua-table-head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+  }
+  .ua-table-head > [role="columnheader"]:nth-child(-n + 2) {
+    display: none;
+  }
+  .ua-table-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 2px 12px;
+    padding: 6px 4px;
+  }
+  .ua-table-row > .ua-name {
+    grid-column: auto;
+  }
+  .ua-table [role="cell"] {
+    display: flex;
+    justify-content: space-between;
+    gap: 6px;
+  }
+  .ua-table [role="cell"][data-label]::before {
+    content: attr(data-label);
+    font-weight: 400;
+    color: var(--muted-foreground);
+  }
+  .ua-table-row > [data-label="At API price"] {
+    grid-column: 1/-1;
+  }
+}

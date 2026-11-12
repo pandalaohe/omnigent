@@ -1,4 +1,5 @@
-import { useId } from "react";
+import { useId, useMemo } from "react";
+import type { AnalysisRow, UsageAnalysis } from "./usageAnalysisData";
 import {
   Bar,
   BarChart,
@@ -19,6 +20,120 @@ export interface UsageChartPoint {
   now: number;
   previous?: number;
   bucket: number;
+}
+
+export function UsageAnalysisChart({
+  rows,
+  span,
+  unknown,
+  previousUnavailable,
+  previousAccounts,
+}: {
+  rows: AnalysisRow[];
+  span?: UsageAnalysis["span"];
+  unknown: boolean;
+  previousUnavailable: boolean;
+  previousAccounts?: UsageAccountActivity[];
+}) {
+  const prior = useMemo(
+    () =>
+      previousAccounts?.length &&
+      previousAccounts.every(
+        (account) =>
+          account.previous?.totals.tokens_complete &&
+          account.previous.series.every((point) => point.tokens_complete),
+      )
+        ? usageChartPoints(previousAccounts, true, false, false, span?.until ?? 0)
+        : [],
+    [previousAccounts, span?.until],
+  );
+  const points = useMemo(() => {
+    const buckets = new Map<number, number>();
+    for (const row of rows)
+      if (row.contributes_usage && row.tokens !== null)
+        buckets.set(row.hour, (buckets.get(row.hour) ?? 0) + row.tokens);
+    let sum = 0;
+    const current = [...buckets]
+      .sort(([a], [b]) => a - b)
+      .map(([at, tokens]) => ({ at, tokens: (sum += tokens) }));
+    let index = 0;
+    return current.map((point) => {
+      while (index + 1 < prior.length && prior[index + 1].at <= point.at) index++;
+      return { ...point, previous: prior.length ? prior[index]?.previous : undefined };
+    });
+  }, [rows, prior]);
+  if (unknown || !span || !points.length)
+    return (
+      <div className="ua-unknown">
+        <strong>Unknown</strong>
+        <small>No complete selected token series</small>
+      </div>
+    );
+  return (
+    <figure aria-label="Cumulative selected tokens">
+      <div style={{ height: 190, width: "100%", minWidth: 0 }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={points} margin={{ top: 8, right: 10, left: 0, bottom: 0 }}>
+            <XAxis
+              dataKey="at"
+              type="number"
+              domain={[span.counted_from, span.until]}
+              tickFormatter={(at) =>
+                new Date(at * 1000).toLocaleDateString("en-US", { month: "short", day: "numeric" })
+              }
+              tick={{ fontSize: 11 }}
+              tickLine={false}
+              axisLine={false}
+            />
+            <YAxis
+              width={40}
+              tickFormatter={(value) =>
+                new Intl.NumberFormat("en-US", {
+                  notation: "compact",
+                  maximumFractionDigits: 2,
+                }).format(value)
+              }
+              tick={{ fontSize: 11 }}
+              tickLine={false}
+              axisLine={false}
+            />
+            <Tooltip
+              labelFormatter={(at) => new Date(Number(at) * 1000).toLocaleString()}
+              formatter={(value) =>
+                new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(Number(value))
+              }
+            />
+            <Line
+              dataKey="tokens"
+              name="Token"
+              type="linear"
+              dot={false}
+              stroke="var(--info)"
+              strokeWidth={2}
+              isAnimationActive={false}
+            />
+            {prior.length ? (
+              <Line
+                dataKey="previous"
+                name="Previous"
+                type="linear"
+                dot={false}
+                stroke="var(--muted-foreground)"
+                strokeDasharray="4 4"
+                strokeWidth={1.25}
+                isAnimationActive={false}
+              />
+            ) : null}
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+      {previousUnavailable && !prior.length ? (
+        <figcaption className="text-xs text-muted-foreground">
+          Previous selected hourly series not available yet
+        </figcaption>
+      ) : null}
+    </figure>
+  );
 }
 
 /** Rebucket after aligning each account's Previous to its own current start. */
