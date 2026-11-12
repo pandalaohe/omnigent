@@ -4589,3 +4589,119 @@ async def test_agy_readback_preserves_request_and_notifies_parent(
         notices
     )
     assert wake.await_count == (1 if notice == "agy_model_substituted" else 0)
+
+
+@pytest.mark.asyncio
+async def test_agy_parent_notice_retries_after_failed_delivery(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.server.routes._sessions import helpers, orchestration
+    from omnigent.server.schemas import SessionEventInput
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(
+        parent_conversation_id=parent.id,
+        model_override="claude-opus-5-5",
+        harness_override="antigravity-native",
+    )
+    wake = AsyncMock(side_effect=[False, True])
+    monkeypatch.setattr(orchestration, "_post_system_message", wake)
+    event = SessionEventInput(
+        type="external_model_change", data={"model": "Gemini 3.8 Flash", "confirmed": True}
+    )
+    for attempt in range(3):
+        fresh = store.get_conversation(child.id)
+        assert fresh is not None
+        await helpers._persist_external_model_change(child.id, fresh, event, store)
+        saved = store.get_conversation(child.id)
+        assert saved is not None
+        assert (helpers._AGY_PENDING_MODEL_NOTICE in saved.labels) == (attempt == 0)
+    assert wake.await_count == 2
+    assert wake.call_args_list[0] == wake.call_args_list[1]
+    notices = [item for item in store.list_items(child.id).data if item.type == "error"]
+    assert len(notices) == 1
+    assert notices[0].data.code == "agy_model_substituted"
+
+
+@pytest.mark.asyncio
+async def test_agy_historical_response_cannot_replace_current_model(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import UTC, datetime
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.antigravity_native import reader
+    from omnigent.server.routes._sessions import helpers, orchestration
+    from omnigent.server.schemas import SessionEventInput
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(
+        parent_conversation_id=parent.id,
+        model_override="gemini-3-8-flash",
+        harness_override="antigravity-native",
+    )
+    store.update_conversation(child.id, reported_model="Gemini 3.8 Flash")
+    wake = AsyncMock(return_value=True)
+    monkeypatch.setattr(orchestration, "_post_system_message", wake)
+
+    async def post(client: Any, session_id: str, event: Any) -> None:
+        if event.event_type == "external_model_change":
+            fresh = store.get_conversation(session_id)
+            assert fresh is not None
+            await helpers._persist_external_model_change(
+                session_id, fresh, SessionEventInput(type=event.event_type, data=event.data), store
+            )
+
+    monkeypatch.setattr(reader, "_post_event", post)
+    monkeypatch.setattr(
+        reader,
+        "read_tmux_info",
+        lambda path: {"socket_path": "/example/socket", "tmux_target": "main"},
+    )
+    state = reader._ReaderState(
+        seen=set(),
+        interacted=set(),
+        bridge_dir=tmp_path,
+        current_model="Gemini 3.8 Flash",
+        model_catalog={},
+        model_observed_at=datetime(2026, 11, 12, 9, tzinfo=UTC),
+    )
+    stale = {
+        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+        "status": "CORTEX_STEP_STATUS_DONE",
+        "metadata": {
+            "completedAt": "2026-11-12T08:00:00Z",
+            "modelUsage": {"model": "Claude Opus 5.5"},
+        },
+    }
+    await reader._repeat_model_report(cast(Any, None), child.id, state)
+    await reader._maybe_emit_model_change(
+        stale, client=cast(Any, None), session_id=child.id, state=state
+    )
+    await reader._repeat_model_report(cast(Any, None), child.id, state)
+    saved = store.get_conversation(child.id)
+    assert saved is not None and saved.reported_model == "Gemini 3.8 Flash"
+    wake.assert_not_awaited()
+    assert not [item for item in store.list_items(child.id).data if item.type == "error"]
+    fresh_step = {
+        **stale,
+        "metadata": {**stale["metadata"], "completedAt": "2026-11-12T09:01:00Z"},
+    }
+    await reader._maybe_emit_model_change(
+        fresh_step, client=cast(Any, None), session_id=child.id, state=state
+    )
+    # Replaying old A and repeating the current observation cannot undo fresh readback.
+    await reader._maybe_emit_model_change(
+        stale, client=cast(Any, None), session_id=child.id, state=state
+    )
+    await reader._repeat_model_report(cast(Any, None), child.id, state)
+    saved = store.get_conversation(child.id)
+    assert saved is not None and saved.reported_model == "Claude Opus 5.5"
+    wake.assert_awaited_once()

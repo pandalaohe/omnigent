@@ -6522,7 +6522,12 @@ async def test_actual_response_model_overrides_requested_model(
 ) -> None:
     sink = _PostSink()
     monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
-    state = reader._ReaderState(seen=set(), interacted=set(), model_catalog=_FAKE_CATALOG)
+    state = reader._ReaderState(
+        seen=set(),
+        interacted=set(),
+        model_catalog=_FAKE_CATALOG,
+        model_observed_at=reader.datetime(2026, 1, 1, tzinfo=reader.UTC),
+    )
     client = cast(httpx.AsyncClient, object())
     for step in [_user_input_with_model("MODEL_PLACEHOLDER_M132"), _planner_with_model_usage()]:
         await reader._maybe_emit_model_change(
@@ -6533,30 +6538,20 @@ async def test_actual_response_model_overrides_requested_model(
     assert reports[0]["confirmed"] is False
 
 
-@pytest.mark.parametrize(
-    ("pane", "expected"),
-    [
-        (
-            "Gemini in transcript\n? for shortcuts accept-edits · Gemini 3.8 Flash · high",
-            "Gemini 3.8 Flash",
-        ),
-        ("? for shortcuts accept-edits · Claude Opus 5.5 · xhigh", "Claude Opus 5.5"),
-        ("Gemini 3.8 Flash\nEnter a message", None),
-        ("", None),
-    ],
-)
-def test_terminal_model_reads_only_footer(pane: str, expected: str | None) -> None:
-    assert reader._terminal_model(pane) == expected
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "pane", ["? for shortcuts accept-edits · Gemini 3.8 Flash · high", "loading"]
+    "body",
+    [
+        "accept-edits · Claude Opus 5.5 · high\n\n\n",
+        "? for shortcuts accept-edits · Claude Opus 5.5 · high\n\n\n",
+        "loading",
+        "",
+    ],
 )
-async def test_terminal_readback_reports_confirmation_once(
+async def test_body_cannot_confirm_a_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    pane: str,
+    body: str,
 ) -> None:
     sink = _PostSink()
     monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
@@ -6565,13 +6560,12 @@ async def test_terminal_readback_reports_confirmation_once(
         "read_tmux_info",
         lambda path: {"socket_path": "/example/socket", "tmux_target": "main"},
     )
-    monkeypatch.setattr(reader, "_capture_pane", lambda *args: pane)
     state = reader._ReaderState(seen=set(), interacted=set(), bridge_dir=tmp_path)
-    for _ in range(2):
-        await reader._report_terminal_model(cast(httpx.AsyncClient, object()), _SESSION_ID, state)
+    step = copy.deepcopy(_load("planner_response_text"))
+    step["metadata"].pop("modelUsage", None)
+    step["plannerResponse"]["response"] = body
+    client = cast(httpx.AsyncClient, object())
+    await reader._maybe_emit_model_change(step, client=client, session_id=_SESSION_ID, state=state)
+    await reader._repeat_model_report(client, _SESSION_ID, state)
     reports = [data for kind, data in sink.posts if kind == "external_model_change"]
-    assert (
-        reports == [{"model": "unconfirmed", "confirmed": False}]
-        if pane == "loading"
-        else reports == [{"model": "Gemini 3.8 Flash", "confirmed": True}]
-    )
+    assert reports == [{"model": "unconfirmed", "confirmed": False}]

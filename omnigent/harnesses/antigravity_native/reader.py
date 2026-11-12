@@ -55,7 +55,6 @@ import contextlib
 import hashlib
 import json
 import logging
-import re
 import sqlite3
 import weakref
 from collections import Counter
@@ -71,7 +70,6 @@ import httpx
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.antigravity_native.bridge import (
     AntigravityNativeBridgeState,
-    _capture_pane,
     is_placeholder_conversation_id,
     read_bridge_state,
     read_tmux_info,
@@ -1048,7 +1046,7 @@ async def supervise_reader(
         port=port,
         bridge_dir=bridge_dir,
     )
-    await _report_terminal_model(client, session_id, state)
+    await _repeat_model_report(client, session_id, state)
 
     # Task T-G: the rotation detector records the new cascade id here and the
     # ``stop`` predicate the reader body consults flips to True so the body exits
@@ -1080,7 +1078,7 @@ async def supervise_reader(
                 body_holder[0].cancel()
 
     async def _read_summaries_and_close() -> dict[str, object]:
-        await _report_terminal_model(client, session_id, state)
+        await _repeat_model_report(client, session_id, state)
         return await _reconcile_idle_turn(
             port=port,
             cascade_id=cascade_id,
@@ -1308,8 +1306,8 @@ class _ReaderState:
     last_text: str = ""
     posted_model_enum: str | None = None
     posted_model_confirmed: bool = False
-    posted_terminal_model: str | None = None
-    terminal_model_checked: bool = False
+    current_model: str | None = None
+    model_observed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     model_catalog: dict[str, object] | None = None
     port: int = 0
     bridge_dir: Path | None = None
@@ -1636,7 +1634,7 @@ async def _commit_step(
             turn_active=state.turn_active,
             bridge_dir=state.bridge_dir,
         )
-        # Requests remain unconfirmed until terminal or response readback.
+        # Requests remain unconfirmed until fresh structured response readback.
         await _maybe_emit_model_change(
             step,
             client=client,
@@ -3045,85 +3043,67 @@ async def _maybe_emit_model_change(
     session_id: str,
     state: _ReaderState,
 ) -> None:
-    """
-    Emit actual response models; label USER_INPUT model requests unconfirmed.
-
-    Tracks the per-run ``state.posted_model_enum`` baseline; emits only when the
-    model or confirmation differs from the last-emitted report.
-    Effort is encoded in the model enum (no separate field), so one change event
-    covers both. The catalog is fetched once per run and cached in ``state``.
-
-    De-dup: this function is only called inside the ``key not in state.seen``
-    branch, so a replayed USER_INPUT (already in ``seen``) never reaches here.
-    The enum-vs-posted_enum comparison further deduplicates same-model turns.
-
-    :param step: One USER_INPUT or settled PLANNER_RESPONSE step.
-    :param client: HTTP client for Omnigent event posts.
-    :param session_id: Omnigent conversation id.
-    :param state: Per-run trackers (posted_model_enum + model_catalog + port).
-    :returns: None.
-    """
+    """Confirm only responses newer than attachment and the last observation."""
     usage = _model_usage_from_step(step)
     actual_model = usage.get("model") if usage else None
-    model_enum = (
-        actual_model if isinstance(actual_model, str) else _requested_model_enum_from_step(step)
-    )
-    if model_enum is None:
-        return
     confirmed = isinstance(actual_model, str)
+    if confirmed:
+        metadata = step.get("metadata")
+        observed_at = (
+            _parse_activity_timestamp(metadata.get("completedAt"))
+            or _parse_activity_timestamp(metadata.get("finishedGeneratingAt"))
+            if isinstance(metadata, dict)
+            else None
+        )
+        if observed_at is None or observed_at <= state.model_observed_at:
+            return
+        state.model_observed_at = observed_at
+        model_enum = actual_model
+    else:
+        model_enum = _requested_model_enum_from_step(step)
+    if not isinstance(model_enum, str):
+        return
     if model_enum == state.posted_model_enum and confirmed == state.posted_model_confirmed:
         return
     catalog = await _ensure_catalog(state)
     display_name = _resolve_display_name(model_enum, catalog)
-    step_idx = _step_index(step) or 0
+    if confirmed:
+        state.current_model = display_name
     await _post_event(
         client,
         session_id,
         OutboundEvent(
             event_type=_EXTERNAL_MODEL_CHANGE,
-            data={"model": display_name, "confirmed": isinstance(actual_model, str)},
-            step_index=step_idx,
+            data={"model": display_name, "confirmed": confirmed},
+            step_index=_step_index(step) or 0,
         ),
     )
     state.posted_model_enum = model_enum
     state.posted_model_confirmed = confirmed
 
 
-async def _report_terminal_model(
+async def _repeat_model_report(
     client: httpx.AsyncClient, session_id: str, state: _ReaderState
 ) -> None:
-    """Read only agy's bottom chrome; transcript text cannot confirm a model."""
-    if state.bridge_dir is None:
+    """Repeat current evidence so pending parent notices can retry independently."""
+    if (
+        state.bridge_dir is None
+        or await asyncio.to_thread(read_tmux_info, state.bridge_dir) is None
+    ):
         return
-    info = await asyncio.to_thread(read_tmux_info, state.bridge_dir)
-    if info is None:
-        return
-    pane = await asyncio.to_thread(_capture_pane, info["socket_path"], info["tmux_target"])
-    model = _terminal_model(pane)
-    if state.terminal_model_checked and (model is None or model == state.posted_terminal_model):
-        return
-    await _post_event(
-        client,
-        session_id,
-        OutboundEvent(
-            event_type=_EXTERNAL_MODEL_CHANGE,
-            data={"model": model or "unconfirmed", "confirmed": model is not None},
-            step_index=0,
-        ),
-    )
-    state.posted_terminal_model = model
-    state.terminal_model_checked = True
-
-
-def _terminal_model(pane: str) -> str | None:
-    """Return a model only from a complete native status row."""
-    line = next((line.strip() for line in reversed(pane.splitlines()) if line.strip()), "")
-    match = re.search(
-        r"^(?:\? for shortcuts\s+)?(?:accept-edits|plan|default|auto)\s*·\s*"
-        r"([^·]+?)\s*·\s*(?:low|medium|high|xhigh|max)\s*$",
-        line,
-    )
-    return match.group(1).strip() if match else None
+    async with state.commit_lock:
+        await _post_event(
+            client,
+            session_id,
+            OutboundEvent(
+                event_type=_EXTERNAL_MODEL_CHANGE,
+                data={
+                    "model": state.current_model or "unconfirmed",
+                    "confirmed": state.current_model is not None,
+                },
+                step_index=0,
+            ),
+        )
 
 
 async def _ensure_catalog(state: _ReaderState) -> dict[str, object]:
