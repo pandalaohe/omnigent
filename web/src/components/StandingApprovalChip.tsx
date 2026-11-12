@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { changeStandingApproval, getStandingApproval } from "@/lib/standingApprovalApi";
+import { cn } from "@/lib/utils";
 
 const kindLabel = (kind: string) =>
   kind === "answer-child-approvals" ? "Answer child approvals" : kind;
@@ -12,9 +13,12 @@ const kindLabel = (kind: string) =>
 export function StandingApprovalChip({
   sessionId,
   readOnly = false,
+  appearance = "chip",
 }: {
   sessionId: string;
   readOnly?: boolean;
+  /** "bar" drops the border to sit among the phone composer bar's indicators. */
+  appearance?: "chip" | "bar";
 }) {
   const client = useQueryClient();
   const query = useQuery({
@@ -65,7 +69,12 @@ export function StandingApprovalChip({
             <button
               type="button"
               aria-label={`Standing approval: ${summary}`}
-              className="flex h-7 shrink-0 items-center gap-1 rounded-full border border-border bg-background px-2 text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className={cn(
+                "flex h-7 shrink-0 items-center gap-1 rounded-full px-2 text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                appearance === "bar"
+                  ? "phone-hit-area relative px-1.5"
+                  : "border border-border bg-background",
+              )}
             >
               <ShieldCheckIcon className="size-3.5" aria-hidden="true" />
               <span>{record ? record.kinds.length : "…"}</span>

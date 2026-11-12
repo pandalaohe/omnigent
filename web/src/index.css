@@ -85,16 +85,39 @@ select optgroup {
 }
 
 /* CSS-pixel floor for native shells and touch browsers, independent of width. */
+/* Touch targets keep the control's visible size: an invisible pseudo-element
+ * extends the hit area to 44px (as .phone-hit-area), so rows stay compact. */
 @utility mobile-touch-target {
   &:is([data-mobile-app="true"], [data-mobile-app="true"] *) {
-    min-width: 44px;
-    min-height: 44px;
+    &:not(.absolute, .fixed, .sticky) {
+      position: relative;
+    }
+    &::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: max(100%, 44px);
+      height: max(100%, 44px);
+      transform: translate(-50%, -50%);
+      pointer-events: inherit;
+    }
   }
-  /* Match the native branch's specificity so row resets like min-h-0 can't win. */
   @media (pointer: coarse) and (hover: none) {
     &:is(:root, :root *) {
-      min-width: 44px;
-      min-height: 44px;
+      &:not(.absolute, .fixed, .sticky) {
+        position: relative;
+      }
+      &::after {
+        content: "";
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: max(100%, 44px);
+        height: max(100%, 44px);
+        transform: translate(-50%, -50%);
+        pointer-events: inherit;
+      }
     }
   }
 }
@@ -580,6 +603,19 @@ select optgroup {
 /* Density rules above are unlayered, so opted-in app targets need the same cascade priority. */
 :is(.composer-add-menu, .composer-host-menu, .composer-agent-menu) .mobile-touch-target {
   @apply mobile-touch-target;
+}
+
+/* Phone menus keep 16px text but a tighter line box, so rows stay compact;
+ * .mobile-touch-target still gives each row a 44px hit area. */
+@media (width < 48rem) {
+  [data-slot="dropdown-menu-content"]
+    :is(
+      [data-slot="dropdown-menu-item"],
+      [data-slot="dropdown-menu-checkbox-item"],
+      [data-slot="dropdown-menu-radio-item"]
+    ) {
+    line-height: 1.4;
+  }
 }
 
 @media (width < 48rem) {
@@ -1175,10 +1211,11 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
 
 @media (width < 48rem) {
   .session-chat-transcript > [role="log"] {
+    /* The floating header sits below the safe area: fade content out under it. */
     --chat-edge-fade: linear-gradient(
       to bottom,
-      transparent 0,
-      black max(64px, var(--omnigent-safe-top)),
+      transparent calc(var(--omnigent-safe-top) + 44px),
+      black calc(var(--omnigent-safe-top) + 84px),
       black calc(100% - max(64px, var(--omnigent-safe-bottom))),
       transparent 100%
     );

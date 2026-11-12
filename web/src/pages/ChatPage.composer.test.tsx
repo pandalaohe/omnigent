@@ -112,6 +112,13 @@ vi.mock("@/hooks/usePullRequests", () => ({
 // The archived-comments banner reads session comments via a TanStack query
 // hook; stub it so bare Composer renders don't need a QueryClientProvider.
 vi.mock("@/hooks/useComments", () => ({ useComments: () => ({ data: [] }) }));
+// The session chips read react-query; their own suites cover them.
+vi.mock("@/components/StandingApprovalChip", () => ({
+  StandingApprovalChip: () => <span data-testid="standing-approval-chip-stub" />,
+}));
+vi.mock("@/components/AutoRotationChip", () => ({
+  AutoRotationChip: () => <span data-testid="auto-rotation-chip-stub" />,
+}));
 // The workspace bar's git-status hook uses TanStack Query; stub it so the
 // composer renders in isolation (no QueryClient) with a neutral empty status.
 // The hoisted spy records the args so a test can assert the page passes the
@@ -557,6 +564,25 @@ describe("Composer Escape interrupt", () => {
       expect(screen.getByRole("button", { name: "Interrupt" })).toBeDisabled();
       fireEvent.keyDown(textarea(), { key: "Escape" });
       expect(props.onStop).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([false, true])(
+    "drops the Esc hint from the queued placeholder on phones (mobile=%s)",
+    (mobile) => {
+      if (mobile) {
+        const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+        vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+          ...mediaQuery,
+          media: query,
+          matches: query === "(max-width: 767.98px)",
+        }));
+      }
+      render(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
+      expect(textarea()).toHaveAttribute(
+        "placeholder",
+        mobile ? "Send a follow-up (queued)" : "Send a follow-up (queued) — Esc to stop",
+      );
     },
   );
 
@@ -4426,7 +4452,9 @@ describe("Composer background tasks", () => {
         name: "1 background task still running",
       });
       expect(screen.getAllByTestId("background-task-pill")).toHaveLength(1);
-      if (mobile) expect(screen.queryByTestId("composer-workspace-controls")).toBeNull();
+      if (mobile) {
+        expect(screen.getByTestId("composer-workspace-controls")).not.toContainElement(trigger);
+      }
       expect(trigger).toHaveTextContent("1");
       expect(screen.queryByTestId("subagent-task-pill")).toBeNull();
       fireEvent.click(trigger);

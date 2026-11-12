@@ -311,6 +311,9 @@ import {
 } from "@/lib/sessionHost";
 import { HostBadge } from "@/components/HostBadge";
 import { MobileHeaderControlPortal } from "@/shell/MobileHeaderControlsSlot";
+import { OmniGlassSurface } from "@/components/OmniGlassSurface";
+import { StandingApprovalChip } from "@/components/StandingApprovalChip";
+import { AutoRotationChip } from "@/components/AutoRotationChip";
 import {
   type McpServerRow,
   BUILTIN_SLASH_COMMANDS,
@@ -5213,14 +5216,20 @@ function ComposerImpl(
             comments={archivedComments ?? []}
           />
         )}
-        {!isMobile && (
+        {/* Phone: the same bar floats as a glass strip above the compact
+            composer, so session status stays out of the crowded header. */}
+        {(!isMobile || composerSessionId) && (
           <ComposerWorkspaceBar
             data-testid="composer-workspace-controls"
             className={cn(
               hasQueuedComposerMessages &&
+                !isMobile &&
                 "rounded-t-none border-t-0 border-border/50 before:pointer-events-none before:absolute before:inset-x-4 before:top-0 before:h-px before:bg-border/50 before:content-['']",
+              isMobile &&
+                "isolate mx-0! mb-4 h-10! w-full! max-w-none! flex-nowrap! gap-1 rounded-[20px] border-0 px-2! py-0!",
             )}
           >
+            {isMobile && <OmniGlassSurface borderRadius={20} className="-z-10" />}
             <ComposerWorkspaceStatus
               workspacePath={composerWorkspace ?? null}
               worktreePath={composerGit.worktreePath}
@@ -5245,7 +5254,8 @@ function ComposerImpl(
                 data-testid="composer-task-indicators"
                 className="flex items-center gap-0 empty:hidden"
               >
-                <BackgroundTaskIndicator />
+                {/* Phone shows background tasks in the header pill. */}
+                {!isMobile && <BackgroundTaskIndicator />}
                 <SubagentTaskIndicator conversationId={conversationId} />
                 {goal && <GoalStatusPill goal={goal} onOpen={() => setGoalDialogOpen(true)} />}
                 <RunnerLogRunawayIndicator
@@ -5267,32 +5277,30 @@ function ComposerImpl(
                   })}
                 />
               )}
+              {isMobile && composerSessionId && (
+                <>
+                  <StandingApprovalChip
+                    key={`approval:${composerSessionId}`}
+                    sessionId={composerSessionId}
+                    appearance="bar"
+                    readOnly={
+                      composerSession?.parentSessionId != null ||
+                      composerSession?.archived === true ||
+                      !isEditorLevel(permissionLevel ?? null)
+                    }
+                  />
+                  <AutoRotationChip
+                    key={`auto-rotation:${composerSessionId}`}
+                    sessionId={composerSessionId}
+                    appearance="bar"
+                    readOnly={
+                      composerSession?.archived === true || !isEditorLevel(permissionLevel ?? null)
+                    }
+                  />
+                </>
+              )}
             </div>
           </ComposerWorkspaceBar>
-        )}
-        {isMobile && (
-          <MobileHeaderControlPortal sessionId={composerSessionId}>
-            <SubagentTaskIndicator conversationId={conversationId} />
-            {goal && <GoalStatusPill goal={goal} onOpen={() => setGoalDialogOpen(true)} />}
-            <RunnerLogRunawayIndicator
-              key={conversationId}
-              labels={runnerLogLabels}
-              fallbackLabels={runnerLogFallbackLabels}
-            />
-            {conversationId && (
-              <ComposerContextRing
-                contextWindow={composerContextWindow}
-                tokensUsed={composerTokensUsed}
-                autoCompactTokenLimit={composerCompactLimit}
-                sourceKey={usageContextSourceKey({
-                  hostId: composerSession?.hostId,
-                  agentName: composerBoundAgentName,
-                  harness: sessionHarness,
-                  model: sessionDefaultModel,
-                })}
-              />
-            )}
-          </MobileHeaderControlPortal>
         )}
       </div>
       <ChatComposer
@@ -5337,8 +5345,11 @@ function ComposerImpl(
           },
           "aria-label": "Message the agent",
           "aria-keyshortcuts": nextFromSelected === null ? undefined : permissionCycleShortcut.aria,
+          // Phones have no Esc key, so their placeholders drop the key hints.
           placeholder: composerLockedByBtw
-            ? "Side chat open — press Esc to close"
+            ? isMobile
+              ? "Side chat open"
+              : "Side chat open — press Esc to close"
             : readOnlyReason !== null
               ? readOnlyReason
               : isReadOnly
@@ -5350,9 +5361,13 @@ function ComposerImpl(
                     : disabled && sendDisabledReason === null
                       ? "Waiting for agents…"
                       : isStreaming
-                        ? "Send a follow-up (queued) — Esc to stop"
+                        ? isMobile
+                          ? "Send a follow-up (queued)"
+                          : "Send a follow-up (queued) — Esc to stop"
                         : multiMemberSession
-                          ? "Send a message… — @role hands a part to a member"
+                          ? isMobile
+                            ? "Message · @role for a member"
+                            : "Send a message… — @role hands a part to a member"
                           : readyPlaceholder,
           rows: 1,
           disabled: inputDisabled,

@@ -14,6 +14,7 @@ import {
   type AutoRotationStatus,
 } from "@/lib/autoRotationApi";
 import { t } from "@/lib/autoRotationText";
+import { cn } from "@/lib/utils";
 import {
   isSessionCollabPreferenceDirty,
   SESSION_COLLAB_BOUNDS,
@@ -96,9 +97,12 @@ function ensureGlobalSessionCollabSyncListener(): void {
 export function AutoRotationChip({
   sessionId,
   readOnly = false,
+  appearance = "chip",
 }: {
   sessionId: string;
   readOnly?: boolean;
+  /** "bar" drops the border to sit among the phone composer bar's indicators. */
+  appearance?: "chip" | "bar";
 }) {
   const client = useQueryClient();
   const preferences = useSessionCollabPreferences();
@@ -292,7 +296,12 @@ export function AutoRotationChip({
               type="button"
               data-testid="auto-rotation-chip-trigger"
               aria-label={chipLabel}
-              className="inline-flex h-7 shrink-0 items-center justify-center gap-1 rounded-full border border-border bg-background px-2 text-xs leading-none text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className={cn(
+                "inline-flex h-7 shrink-0 items-center justify-center gap-1 rounded-full px-2 text-xs leading-none text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                appearance === "bar"
+                  ? "phone-hit-area relative px-1.5"
+                  : "border border-border bg-background",
+              )}
             >
               <RefreshCwIcon className="size-3.5 shrink-0" aria-hidden="true" />
               <span>

@@ -54,6 +54,7 @@ import { TAB_BADGE_BASE } from "./railTabs";
 import { TerminalSplitControls } from "./TerminalSplitControls";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import { SidebarOpenButton } from "./SidebarOpenButton";
+import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { ReceiveAnnotationsButton } from "@/components/ReceiveAnnotationsButton";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AutoRotationChip } from "@/components/AutoRotationChip";
@@ -599,6 +600,12 @@ export function ChatHeader({
   // desktop, owner-managed top-level row. A sub-agent's title stays a
   // back-to-parent link (titleLinkTo wins over titleSlot in the breadcrumb),
   // and mobile keeps the Rename item in the kebab.
+  // Phone web shows the session title beside the menu button; native shells
+  // follow the "Mobile title" setting through ConversationBreadcrumb instead.
+  const mobileTitle =
+    isMobile && conversationId && !titleLinkTo && !isIOSShell() && !isAndroidShell()
+      ? conversationTitle || UNTITLED_CONVERSATION_LABEL
+      : null;
   const titleSlot =
     !pending && !isMobile && actionConversation && !isChildSession ? (
       <HeaderTitle
@@ -629,16 +636,35 @@ export function ChatHeader({
       <div
         className={cn(
           "flex min-w-0 items-center gap-1 md:gap-6",
+          isMobile && "flex-1",
           !sidebarOpen && !canvas && "traffic-light-clearance",
         )}
       >
-        {!sidebarOpen && (!canvas || canvas.compact || canvas.focused) && (
-          <SidebarOpenButton
-            onOpenSidebar={onOpenSidebar}
-            settingsMode={settingsMode}
-            componentId="chat.header.open_sidebar"
-          />
-        )}
+        {!sidebarOpen &&
+          (!canvas || canvas.compact || canvas.focused) &&
+          (mobileTitle ? (
+            // Phone: menu button and session title share one glass surface.
+            <MobileHeaderButtonGroup className="flex min-w-0 items-center gap-0.5 pl-0! pr-4!">
+              <SidebarOpenButton
+                onOpenSidebar={onOpenSidebar}
+                settingsMode={settingsMode}
+                componentId="chat.header.open_sidebar"
+              />
+              <span
+                className="min-w-0 truncate text-ui font-medium text-foreground"
+                title={mobileTitle}
+                data-testid="mobile-header-title"
+              >
+                {mobileTitle}
+              </span>
+            </MobileHeaderButtonGroup>
+          ) : (
+            <SidebarOpenButton
+              onOpenSidebar={onOpenSidebar}
+              settingsMode={settingsMode}
+              componentId="chat.header.open_sidebar"
+            />
+          ))}
         {canvas?.compact && (
           <Button
             variant="ghost"
@@ -698,11 +724,12 @@ export function ChatHeader({
         )}
       </div>
 
-      <MobileHeaderButtonGroup className="flex items-center gap-2 max-md:empty:hidden">
+      <MobileHeaderButtonGroup className="flex shrink-0 items-center gap-2 max-md:empty:hidden max-md:ml-2">
         {isMobile && !settingsMode && (
           <MobileHeaderControlsSlot sessionId={conversationId ?? null} />
         )}
-        {!pending && conversationId && (
+        {/* Phone: these two live in the bar above the composer (ChatPage). */}
+        {!pending && conversationId && !isMobile && (
           <>
             <StandingApprovalChip
               key={`approval:${conversationId}`}
