@@ -8277,7 +8277,8 @@ def create_runner_app(
             [
                 entry
                 for entry in list_subagent_work(session_id)
-                if entry.delivered and entry.child_session_id in unread
+                if (entry.delivered or entry.status == "launch_unconfirmed")
+                and entry.child_session_id in unread
             ],
             _session_harness_name(session_id),
         )

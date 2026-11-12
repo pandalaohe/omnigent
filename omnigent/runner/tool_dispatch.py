@@ -25,6 +25,7 @@ import contextlib
 import dataclasses
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -39,6 +40,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
+from omnigent.runtime.tool_call_deadline import pause_tool_call_deadline
 from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -344,7 +346,7 @@ _HOST_RESTART_TOOLS = frozenset({"sys_host_restart"})
 # window only for creates that present it, so web UI creates do not spend
 # the agent's budget.
 _AGENT_CREATE_HEADERS = {CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT}
-# Leave headroom below the relay's 300 s cap for returning a created handle.
+# The relay leaves response headroom above this five-minute startup budget.
 _SESSION_CREATE_TIMEOUT = httpx.Timeout(60.0, read=300.0)
 _SESSION_CREATE_TOOL_TIMEOUT_S = 305.0
 _SESSION_CREATE_FINALIZE_TIMEOUT_S = 300.0
@@ -1981,10 +1983,12 @@ async def _post_child_message_event(
     deadline: float | None = None,
 ) -> httpx.Response:
     """Post a child message, retrying once without best-effort attribution."""
-    deadline = deadline if deadline is not None else _SESSION_START_DEADLINE.get()
+    if deadline is not None:
+        _SESSION_START_DEADLINE.set(deadline)
     from omnigent.server.session_collab import AGENT_SESSION_HEADER
 
     def _payload(actor: str | None) -> _JsonObject:
+        deadline = _SESSION_START_DEADLINE.get()
         return {
             "type": "message",
             "data": {
@@ -1995,30 +1999,31 @@ async def _post_child_message_event(
             **({"created_by": actor} if actor is not None else {}),
         }
 
-    resp = await server_client.post(
-        f"{_session_url(session_id)}/events",
-        json=_payload(created_by),
-        headers={AGENT_SESSION_HEADER: "agent"},
-        # This message is gated at the recipient's REQUEST phase, which can
-        # PARK on a human ASK (e.g. session_cost_budget) up to the policy's
-        # ``ask_timeout``. A 30s read budget severed that park → fail-closed
-        # /retry → duplicate cards. Wait for the real verdict (one-day read
-        # budget, fast connect); a non-parking eval still returns immediately.
-        timeout=_ASK_GATE_DELIVERY_TIMEOUT,
-    )
+    async def post(actor: str | None) -> httpx.Response:
+        # REQUEST policy can park on the server. Its own policy bounds that wait;
+        # the server separately enforces and adjusts the machine admission deadline.
+        with pause_tool_call_deadline(_ASK_GATE_DELIVERY_READ_TIMEOUT_S):
+            response = await server_client.post(
+                f"{_session_url(session_id)}/events",
+                json=_payload(actor),
+                headers={AGENT_SESSION_HEADER: "agent"},
+                timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+            )
+        waited = getattr(response, "headers", {}).get("X-Omnigent-Approval-Wait-Seconds")
+        if waited is not None:
+            try:
+                seconds = float(waited)
+            except ValueError:
+                seconds = 0.0
+            current = _SESSION_START_DEADLINE.get()
+            if current is not None and math.isfinite(seconds) and seconds > 0:
+                _SESSION_START_DEADLINE.set(current + seconds)
+        return response
+
+    resp = await post(created_by)
     if created_by is None or resp.status_code != 403:
         return resp
-
-    _logger.debug(
-        "Child message POST attribution rejected for session=%s; retrying without actor",
-        session_id,
-    )
-    return await server_client.post(
-        f"{_session_url(session_id)}/events",
-        json=_payload(None),
-        headers={AGENT_SESSION_HEADER: "agent"},
-        timeout=_ASK_GATE_DELIVERY_TIMEOUT,
-    )
+    return await post(None)
 
 
 async def _send_to_in_flight_child(
@@ -5445,32 +5450,38 @@ async def _post_child_message_recovering(
         deadline = min(deadline, inherited_deadline)
     token = _SESSION_START_DEADLINE.set(deadline)
     try:
-        async with asyncio.timeout(max(0.0, deadline - time.time()) + 5.0):
-            resp = await _post_child_message_event(
-                server_client, session_id, content=content, created_by=created_by
-            )
-            if _message_post_accepted(resp) or not _message_post_needs_runner_wait(resp):
-                return resp
-            if await _wait_for_runner_online(
-                server_client, session_id, timeout_s=_BY_ID_CHILD_READY_TIMEOUT_S
-            ):
-                return await _post_child_message_event(
-                    server_client, session_id, content=content, created_by=created_by
-                )
-            if time.time() >= deadline:
-                return resp
-            retry = await server_client.post(
-                f"/v1/sessions/{session_id}/events",
-                json={"type": "retry_session", "data": {}},
-                timeout=httpx.Timeout(
-                    _RETRY_SESSION_TIMEOUT, read=max(0.001, deadline - time.time())
-                ),
-            )
-            if retry.status_code >= 400:
-                return retry
-            return await _post_child_message_event(
-                server_client, session_id, content=content, created_by=created_by
-            )
+        resp = await _post_child_message_event(
+            server_client, session_id, content=content, created_by=created_by
+        )
+        if _message_post_accepted(resp) or not _message_post_needs_runner_wait(resp):
+            return resp
+        deadline = _SESSION_START_DEADLINE.get() or deadline
+        try:
+            async with asyncio.timeout(max(0.0, deadline - time.time())):
+                if await _wait_for_runner_online(
+                    server_client, session_id, timeout_s=_BY_ID_CHILD_READY_TIMEOUT_S
+                ):
+                    retry = None
+                else:
+                    if time.time() >= deadline:
+                        return resp
+                    retry = await server_client.post(
+                        f"/v1/sessions/{session_id}/events",
+                        json={"type": "retry_session", "data": {}},
+                        timeout=httpx.Timeout(
+                            max(0.001, deadline - time.time()),
+                            connect=_RETRY_SESSION_TIMEOUT.connect,
+                            write=_RETRY_SESSION_TIMEOUT.write,
+                            pool=_RETRY_SESSION_TIMEOUT.pool,
+                        ),
+                    )
+        except TimeoutError as exc:
+            raise httpx.ReadTimeout("Child runner recovery deadline expired") from exc
+        if retry is not None and retry.status_code >= 400:
+            return retry
+        return await _post_child_message_event(
+            server_client, session_id, content=content, created_by=created_by
+        )
     finally:
         _SESSION_START_DEADLINE.reset(token)
 

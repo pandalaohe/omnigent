@@ -1702,6 +1702,7 @@ def report_subagent_launch_unconfirmed(child_session_id: str) -> _SubagentDelive
         {
             "type": "sub_agent",
             "task_id": entry.child_session_id,
+            "handle_id": entry.child_session_id,
             "conversation_id": entry.child_session_id,
             "work_id": entry.work_id,
             "agent": entry.agent,

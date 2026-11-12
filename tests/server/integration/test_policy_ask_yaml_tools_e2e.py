@@ -208,6 +208,7 @@ async def test_input_ask_yaml_approve(
         # It may then fail with 503 (no runner bound) — that still proves
         # the ASK gate approved the message through.
         resp = await asyncio.wait_for(message_task, timeout=5.0)
+        assert float(resp.headers["X-Omnigent-Approval-Wait-Seconds"]) > 0
         body = resp.json()
         assert body.get("denied") is not True, f"approved INPUT ASK should not deny; got {body}"
     finally:

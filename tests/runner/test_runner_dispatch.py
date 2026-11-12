@@ -4365,7 +4365,7 @@ async def test_sys_session_send_existing_offline_child_relaunches_and_reposts(
     assert len(message_posts) == 2, "the refused message must be reposted after recovery"
     assert len(retry_posts) == 1
     assert retry_posts[0] == {"type": "retry_session", "data": {}}
-    assert liveness_reads == 1
+    assert liveness_reads == 0, "zero observation budget must not start a liveness read"
 
 
 @pytest.mark.asyncio
@@ -17758,3 +17758,89 @@ async def test_readiness_does_not_reset_expired_chain(monkeypatch: pytest.Monkey
         client.get.assert_not_awaited()
     finally:
         tool_dispatch._SESSION_START_DEADLINE.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_child_request_approval_outlives_machine_and_relay_deadlines(monkeypatch):
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.runner import tool_dispatch
+
+    monkeypatch.setattr(tool_dispatch, "_REMOTE_CHILD_READY_TIMEOUT_S", 0.15)
+    monkeypatch.setattr(bridge, "_TOOL_CALL_TIMEOUT_S", 0.1)
+    waiting, approve = asyncio.Event(), asyncio.Event()
+    deadlines = []
+
+    async def handler(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"runner_online": True})
+        deadlines.append(json.loads(request.content)["data"]["_input_admission_deadline"])
+        if len(deadlines) == 1:
+            started = asyncio.get_running_loop().time()
+            waiting.set()
+            await approve.wait()
+            waited = asyncio.get_running_loop().time() - started
+            return httpx.Response(
+                202,
+                json={"queued": True, "forwarded": False},
+                headers={"X-Omnigent-Approval-Wait-Seconds": str(waited)},
+            )
+        return httpx.Response(202, json={"queued": True})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+
+        async def executor(_name, _arguments):
+            response = await tool_dispatch._post_child_message_recovering(
+                client, "child", content=[{"type": "input_text", "text": "work"}], created_by=None
+            )
+            return {"conversation_id": "child", "accepted": response.status_code == 202}
+
+        call = asyncio.create_task(
+            asyncio.to_thread(
+                bridge._run_relay_tool,
+                executor,
+                asyncio.get_running_loop(),
+                "sys_session_send",
+                {},
+            )
+        )
+        try:
+            await asyncio.wait_for(waiting.wait(), 2)
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(call), 0.3)
+            approve.set()
+            result = await asyncio.wait_for(call, 2)
+            assert not result.get("isError")
+            assert json.loads(result["content"][0]["text"]) == {
+                "conversation_id": "child",
+                "accepted": True,
+            }
+            assert len(deadlines) == 2
+            assert deadlines[1] - deadlines[0] >= 0.3
+        finally:
+            approve.set()
+            await asyncio.wait_for(call, 2)
+
+
+@pytest.mark.asyncio
+async def test_child_machine_recovery_expiry_does_not_repost(monkeypatch):
+    from omnigent.runner import tool_dispatch
+
+    monkeypatch.setattr(tool_dispatch, "_REMOTE_CHILD_READY_TIMEOUT_S", 0.02)
+    posts = []
+
+    async def handler(request):
+        if request.method == "GET":
+            await asyncio.Future()
+        posts.append(request)
+        return httpx.Response(202, json={"queued": True, "forwarded": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        with pytest.raises(httpx.ReadTimeout, match="recovery deadline"):
+            await tool_dispatch._post_child_message_recovering(
+                client, "child", content=[{"type": "input_text", "text": "work"}], created_by=None
+            )
+    assert len(posts) == 1

@@ -10365,7 +10365,10 @@ async def _forward_event_to_runner(
             f"/v1/sessions/{session_id}/events",
             json=runner_body,
             timeout=httpx.Timeout(
-                _RUNNER_FORWARD_TIMEOUT, read=max(0.001, forward_deadline - time.time()) + 5.0
+                max(0.001, forward_deadline - time.time()) + 5.0,
+                connect=_RUNNER_FORWARD_TIMEOUT.connect,
+                write=_RUNNER_FORWARD_TIMEOUT.write,
+                pool=_RUNNER_FORWARD_TIMEOUT.pool,
             ),
         )
         # httpx only raises on transport errors, so a rejection (e.g. a 400 on a
@@ -13653,6 +13656,7 @@ async def _evaluate_input_policy(
     # deciding policy's writes only on accept (POLICIES.md §7.2). Accept ->
     # ALLOW (fall through to forward the message); decline / timeout ->
     # DENY (fail-closed).
+    approval_started = time.monotonic()
     try:
         approved = await _hold_native_ask_gate(
             request,
@@ -13668,6 +13672,18 @@ async def _evaluate_input_policy(
             "verdict": "deny",
             "reason": exc.args[0] or "Denied by policy",
         }
+    finally:
+        waited = max(0.0, time.monotonic() - approval_started)
+        if isinstance(request, Request):
+            request.state.input_approval_wait_seconds = (
+                getattr(request.state, "input_approval_wait_seconds", 0.0) + waited
+            )
+        body.data["_input_approval_wait_seconds"] = (
+            body.data.get("_input_approval_wait_seconds", 0.0) + waited
+        )
+        deadline = body.data.get("_input_admission_deadline")
+        if isinstance(deadline, (int, float)) and not isinstance(deadline, bool):
+            body.data["_input_admission_deadline"] = deadline + waited
     if approved:
         return None
     return {

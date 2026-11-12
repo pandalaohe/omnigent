@@ -375,7 +375,7 @@ def _valid_pi_session_usage(payload: Mapping[str, object]) -> bool:
 
 
 # Active dispatch budget; each call excludes its own bounded approval waits.
-_TOOL_CALL_TIMEOUT_S = 300.0
+_TOOL_CALL_TIMEOUT_S = 320.0
 _TOOL_RELAY_HEARTBEAT_S = 1.0
 _MCP_CALL_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
     "mcp_call_cancel_event", default=None

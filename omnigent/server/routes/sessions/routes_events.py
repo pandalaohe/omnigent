@@ -22,6 +22,7 @@ from fastapi import (
     APIRouter,
     HTTPException,
     Request,
+    Response,
 )
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRoute
@@ -1674,6 +1675,7 @@ def register_events_routes(
     )
     async def post_event(
         request: Request,
+        response: Response,
         session_id: str,
         body: SessionEventInput | list[SessionEventInput],
     ) -> dict[str, bool | str | None] | list[dict[str, bool | str | None]]:
@@ -1695,6 +1697,8 @@ def register_events_routes(
         """
         user_id = _get_user_id(request, auth_provider)
         events = body if isinstance(body, list) else [body]
+        for event in events:
+            event.data.pop("_input_approval_wait_seconds", None)
         if events and (
             request.headers.get("X-Omnigent-Permission-Tiers") != "1"
             or any(event.type in {"message", "approval"} for event in events)
@@ -1767,14 +1771,26 @@ def register_events_routes(
                     if touched:
                         await _record_touch(request, session_id, user_id)
                 return acks
-            ack = await _post_event_impl(
-                request,
-                session_id,
-                body,
-                in_flight=in_flight if body.type in _IN_FLIGHT_EVENT_TYPES else None,
-            )
+            try:
+                ack = await _post_event_impl(
+                    request,
+                    session_id,
+                    body,
+                    in_flight=in_flight if body.type in _IN_FLIGHT_EVENT_TYPES else None,
+                )
+            except HTTPException as exc:
+                waited = body.data.get("_input_approval_wait_seconds")
+                if isinstance(waited, (int, float)) and waited > 0:
+                    exc.headers = {
+                        **(exc.headers or {}),
+                        "X-Omnigent-Approval-Wait-Seconds": str(waited),
+                    }
+                raise
             if _event_touches_recent(body, ack):
                 await _record_touch(request, session_id, user_id)
+            waited = body.data.get("_input_approval_wait_seconds")
+            if isinstance(waited, (int, float)) and waited > 0:
+                response.headers["X-Omnigent-Approval-Wait-Seconds"] = str(waited)
             return ack
 
     async def _peer_post_event(
