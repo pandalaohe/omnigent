@@ -101,7 +101,8 @@ async def test_first_pi_turn_waits_for_permission_bootstrap(monkeypatch, install
             assert response.status_code == 202, response.text
             turn = app.state.active_turns.get("cold-pi")
             assert turn is not None
-            done, _ = await asyncio.wait([turn], timeout=0.05)
+            wait = 61.2 if installed and phase == "bootstrap" else 0.05
+            done, _ = await asyncio.wait([turn], timeout=wait)
             assert not done, "first turn failed while permission bootstrap was still running"
             state = app.state.permission_tiers.state("cold-pi")
             assert (
@@ -134,7 +135,7 @@ async def test_first_pi_native_turn_waits_for_late_permission_ack(monkeypatch, c
     entered = asyncio.Event()
     async with _runner_client(app, permission_harness="pi-native") as client:
         loop = asyncio.get_running_loop()
-        acknowledge_at = loop.time() + 40.2
+        acknowledge_at = loop.time() + 61.2
 
         def acknowledge_late(*_args):
             entered.set()
@@ -164,7 +165,7 @@ async def test_first_pi_native_turn_waits_for_late_permission_ack(monkeypatch, c
         assert turn is not None
         done, _ = await asyncio.wait([turn], timeout=0.05)
         assert not done, "first turn failed while the extension acknowledgement was late"
-        initialized = await asyncio.wait_for(init, 60)
+        initialized = await asyncio.wait_for(init, 75)
         await asyncio.wait_for(turn, 60)
     assert initialized.status_code == 201, initialized.text
     assert "hello" in json.dumps(harness.posted_bodies)

@@ -20,7 +20,12 @@ from typing import ClassVar
 from omnigent.inner.async_utils import run_sync_cleanup, run_sync_on_thread
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import OSEnvironment
-from omnigent.inner.terminal import TerminalInstance, TerminalResult, terminal_pane_environment
+from omnigent.inner.terminal import (
+    TerminalInstance,
+    TerminalResult,
+    _strip_ansi,
+    terminal_pane_environment,
+)
 from omnigent.native.native_coding_agents import native_coding_agent_for_terminal_name
 from omnigent.terminals.conpty_process import PseudoConsoleProcess, registered_user_environment
 
@@ -348,6 +353,12 @@ class ConPtyTerminalInstance(TerminalInstance):
             "screen": text,
             "scrollback_lines": scrollback,
         }
+
+    def startup_diagnostic_text(self) -> str | None:
+        """Read the bounded output ring even before a UI read or after exit."""
+        with self._output_lock:
+            data = self._output.snapshot()
+        return _strip_ansi(data.decode("utf-8", errors="replace")).strip() or None
 
     async def is_alive(self) -> bool:
         if not self.running or self._process is None:

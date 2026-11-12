@@ -21,6 +21,7 @@ from omnigent.native import native_bridge_common
 from omnigent.permission_tiers import PermissionTier, plan_visible_tool_names
 from omnigent.permission_tiers.host import HOST_PERMISSION_STATE_FILE, read_host_permission_state
 from omnigent.permission_tiers.pi_tools import pi_permission_control_path
+from omnigent.pi_timeouts import CONTROL_TIMEOUT_S
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -615,8 +616,10 @@ async def apply_pi_permission_tier(
         change_id = enqueue_permission_tier_change(
             bridge_dir, target_tier=target_tier, expected_revision=state.revision
         )
-        deadline = asyncio.get_running_loop().time() + 8.0
+        deadline = asyncio.get_running_loop().time() + CONTROL_TIMEOUT_S
         while asyncio.get_running_loop().time() < deadline:
+            if read_host_permission_state(bridge_dir / HOST_PERMISSION_STATE_FILE) != state:
+                return False
             ack_path = pi_permission_control_path(bridge_dir, PERMISSION_ACK_FILE)
             if ack_path.is_symlink():
                 return False

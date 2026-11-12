@@ -145,12 +145,12 @@ test("a queued attestation timeout expires old calls and a new call still succee
  const started=performance.now();
  const verdicts=await Promise.all([0,1,2].map(i=>client.evaluate({...event,toolCallId:String(i)},{},support)));
  assert.ok(verdicts.every(verdict=>verdict.block));
- assert.ok(performance.now()-started<18000,"queue wait must not multiply the deadline");
+ assert.ok(performance.now()-started<68000,"queue wait must not multiply the deadline");
  await new Promise(resolve=>setTimeout(resolve,50));
  const request=records.find(record=>record.event==="request_failed");
  assert.equal(request.route,"/pi/bootstrap");
  assert.equal(request.outcome,"deadline");
- assert.ok(request.elapsed_ms>=14000);
+ assert.ok(request.elapsed_ms>=64000);
  assert.equal(records.filter(record=>record.branch==="transport_exception"&&record.stage==="attest").length,3);
  assert.equal(attestRequests,1,"expired queued calls must not dispatch later");
  const output=JSON.stringify(records);
@@ -165,7 +165,7 @@ test("a queued attestation timeout expires old calls and a new call still succee
  assert.equal(starts,1);
  assert.equal(attestRequests,3,"only the first stalled call and the fresh call's two attestations dispatch");
 });
-test("three serial attestations slower than two seconds succeed; bind and revoke keep their short timeout",async t=>{
+test("slow attestations, bind and revoke survive the old two second limit",async t=>{
  const http=require("node:http"),records=[],operations=[];
  const server=http.createServer((req,res)=>{
   if(req.url==="/pi/bootstrap/watch") {
@@ -176,8 +176,7 @@ test("three serial attestations slower than two seconds succeed; bind and revoke
    const body=JSON.parse(text);
    if(req.url==="/pi/bootstrap") {
     operations.push(body.op);
-    if(body.op!=="attest")return; // Bind/revoke must still time out in 2s.
-    setTimeout(()=>res.end(JSON.stringify({attested:true})),2200);
+    setTimeout(()=>res.end(JSON.stringify(body.op==="bind"?{bound:true}:body.op==="revoke"?{revoked:true,scope_id:scope.scope_id,installation_id:scope.installation_id}:{attested:true})),2200);
    } else {
     const id=body.event.data.call_id;
     res.end(JSON.stringify({result:"POLICY_ACTION_ALLOW",permission_tier_binding:{
@@ -194,10 +193,10 @@ test("three serial attestations slower than two seconds succeed; bind and revoke
  const client=connection.client({scope,credential:"fixture"},"fixture",()=>({status:"ready",revision:3}),async()=>support);
  const verdicts=await Promise.all([0,1,2].map(i=>client.evaluate({...event,toolCallId:String(i)},{},support)));
  assert.deepEqual(verdicts,[{block:false},{block:false},{block:false}]);
- await assert.rejects(connection.bind({handle:"fixture"}));
- await assert.rejects(client.close());
+ assert.deepEqual(await connection.bind({handle:"fixture"}),{bound:true});
+ await client.close();
  assert.deepEqual(operations,["attest","attest","attest","bind","revoke"]);
- assert.equal(records.filter(r=>r.outcome==="timeout").length,2);
+ assert.equal(records.filter(r=>r.outcome==="timeout").length,0);
 });
 test("diagnostics persist to the session file without writing into the TUI",t=>{
  const fs=require("node:fs"),path=require("node:path");
@@ -227,9 +226,9 @@ test("the production handoff wires denial diagnostics to its verified bridge dir
  });
  await new Promise(resolve=>server.listen(0,"127.0.0.1",resolve));
  t.after(()=>{server.closeAllConnections();server.close();});
- fs.writeFileSync(locator,JSON.stringify({protocol:1,pid:process.pid,bridgeDir,
+ setTimeout(()=>fs.writeFileSync(locator,JSON.stringify({protocol:1,pid:process.pid,bridgeDir,
   statePath:path.join(bridgeDir,"permission-state.json"),credential:"pi_attestor_"+"a".repeat(43),
-  endpoint:`http://127.0.0.1:${server.address().port}`,brokerIncarnation:"epoch",launchEpoch:"launch"}),{mode:0o600});
+  endpoint:`http://127.0.0.1:${server.address().port}`,brokerIncarnation:"epoch",launchEpoch:"launch"}),{mode:0o600}),8200);
  const {connection}=await connectFromHandoff(locator);
  t.after(()=>connection.close());
  let writes=0;t.mock.method(console,"error",()=>writes++);
@@ -239,4 +238,42 @@ test("the production handoff wires denial diagnostics to its verified bridge dir
  assert.match(log,/"branch":"not_current"/);
  assert.equal(log.includes("pi_attestor_"+"a".repeat(43)),false);
  assert.equal(writes,0);
+});
+
+test("a delayed first continuity frame survives the old one second limit",async t=>{
+ const http=require("node:http");
+ const server=http.createServer((req,res)=>{
+  req.resume();
+  setTimeout(()=>{res.writeHead(200);res.write(JSON.stringify({incarnation:"epoch",launch_epoch:"launch",live:true,revoked_scopes:[]})+"\n");},1250);
+ });
+ await new Promise(resolve=>server.listen(0,"127.0.0.1",resolve));
+ t.after(()=>{server.closeAllConnections();server.close();});
+ const connection=await connectAttestor({endpoint:`http://127.0.0.1:${server.address().port}`,credential:"fixture",brokerIncarnation:"epoch",launchEpoch:"launch"});
+ connection.close();
+});
+
+test("revocation, epoch replacement and process loss cancel queued controls immediately",async t=>{
+ const http=require("node:http");
+ for(const loss of ["revoked","epoch","process"]) {
+  let watch,trigger;
+  const entered=new Promise(resolve=>trigger=resolve);
+  const frame={incarnation:"epoch",launch_epoch:"launch",live:true,revoked_scopes:[]};
+  const server=http.createServer((req,res)=>{
+   req.resume();
+   if(req.url==="/pi/bootstrap/watch") {watch=res;res.writeHead(200);res.write(JSON.stringify(frame)+"\n");}
+   else trigger();
+  });
+  await new Promise(resolve=>server.listen(0,"127.0.0.1",resolve));
+  try {
+   const connection=await connectAttestor({endpoint:`http://127.0.0.1:${server.address().port}`,credential:"fixture",brokerIncarnation:"epoch",launchEpoch:"launch"});
+   const client=connection.client({scope,credential:"fixture"},"handle",()=>({status:"ready",revision:3}),async()=>support);
+   const pending=[0,1].map(i=>client.evaluate({...event,toolCallId:`loss-${i}`},{},support));
+   await entered;
+   if(loss==="process")watch.end();
+   else watch.write(JSON.stringify({...frame,...(loss==="epoch"?{launch_epoch:"replacement"}:{revoked_scopes:[scope.scope_id]})})+"\n");
+   const verdicts=await Promise.race([Promise.all(pending),new Promise((_,reject)=>{const timer=setTimeout(()=>reject(new Error("loss did not cancel controls")),1000);timer.unref();})]);
+   assert.ok(verdicts.every(value=>value.block));
+   connection.close();
+  } finally {server.closeAllConnections();server.close();}
+ }
 });

@@ -1320,6 +1320,55 @@ async def test_continuity_ends_on_launch_rebind_with_same_process_and_tier(attes
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["watch", "control"])
+async def test_initial_bootstrap_survives_slow_runner_scheduling(
+    attestor_relay, monkeypatch, route
+):
+    from omnigent.harnesses.claude_native import bridge
+
+    runtime, broker, relay, _source, _registry = attestor_relay
+    actor, _admission = await bind_ready(runtime, broker, relay)
+    schedule = asyncio.run_coroutine_threadsafe
+
+    def delayed(coroutine, loop):
+        if coroutine.cr_code.co_name != "_bootstrap_request":
+            return schedule(coroutine, loop)
+
+        async def pending():
+            try:
+                await asyncio.sleep(5.2)
+                return await coroutine
+            finally:
+                coroutine.close()
+
+        return schedule(pending(), loop)
+
+    monkeypatch.setattr(bridge.asyncio, "run_coroutine_threadsafe", delayed)
+    async with httpx.AsyncClient(
+        base_url=relay._advertised_url, trust_env=False, timeout=15
+    ) as client:
+        headers = {"Authorization": "Bearer " + actor.token}
+        if route == "watch":
+            async with client.stream("GET", "/pi/bootstrap/watch", headers=headers) as response:
+                assert response.status_code == 200
+                assert json.loads(await anext(response.aiter_lines()))["live"] is True
+        else:
+            response = await client.post(
+                "/pi/bootstrap",
+                headers=headers,
+                json={
+                    "protocol": 1,
+                    "sequence": actor.sequence + 1,
+                    "op": "bind",
+                    "loader": "slow-loader",
+                    "handle": "slow-installation",
+                },
+            )
+            assert response.status_code == 200
+            assert response.json()["ready"] is False
+
+
+@pytest.mark.asyncio
 async def test_continuity_survives_runner_loop_delay_and_still_revokes(attestor_relay):
     import time
 

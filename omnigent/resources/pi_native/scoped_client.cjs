@@ -138,21 +138,23 @@ function createScopedClient({scope, transport, readState, recheck, report=diagno
 }
 
 /** A pinned, loopback-only control/continuity channel; capabilities stay in this closure. */
-async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoch,report=diagnostic,onLoss=diagnostic}) {
+async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoch,report=diagnostic,onLoss=diagnostic,deadline=performance.now()+60000}) {
   const url=new URL(endpoint);
   if(url.protocol!=="http:" || !["127.0.0.1","[::1]"].includes(url.hostname) || !url.port ||
     url.username || url.password || url.search || url.hash || !["","/"].includes(url.pathname))
     throw new Error("Scoped Pi endpoint is not trusted loopback");
   let live=true, ready=false, sequence=0, queue=Promise.resolve();
+  const lifetime=new AbortController();
   const listeners=new Set(), scopeListeners=new Map(), revoked=new Set();
   const lose=cause=>{
     if(!live)return;
-    live=false;ready=false;
+    live=false;ready=false;lifetime.abort();
     reportDiagnostic(report,{event:"continuity_lost",cause});
     for(const callback of listeners)callback("transport_lost");
     if(cause!=="connection_close")onLoss();
   };
   function request(route,body,token,onResponse,signal) {
+    signal=signal?AbortSignal.any([signal,lifetime.signal]):lifetime.signal;
     return new Promise((resolve,reject)=>{
       const started=performance.now();
       let reported=false;
@@ -169,10 +171,10 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
         res.on("end",()=>{try {const reply=JSON.parse(text);if(onResponse)onResponse(reply);resolve(reply);}catch(_){failure("response_invalid");reject(new Error("Scoped Pi transport response unavailable"));}});
         res.on("error",()=>{failure("response_error");reject(new Error("Scoped Pi transport response unavailable"));});
       });
-      req.setTimeout(route==="/policies/evaluate" || route==="/pi/rpc" ? 86400000 : 2000,()=>req.destroy());
+      req.setTimeout(route==="/pi/bootstrap" ? 0 : route==="/policies/evaluate" || route==="/pi/rpc" ? 86400000 : 60000,()=>req.destroy());
       req.on("error",()=>reject(new Error("Scoped Pi transport unavailable")));
       req.end(bytes);
-      if(signal)req.setTimeout(15000);
+
       req.on("timeout",()=>failure("timeout"));
       req.on("error",()=>failure(signal?.aborted?"deadline":"request_error"));
     });
@@ -201,14 +203,12 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
     res.on("close",()=>lose("watch_close"));res.on("end",()=>lose("watch_end"));res.on("error",()=>lose("watch_error"));
   });
   watch.on("error",()=>lose("watch_request_error"));
-  for(let count=0;count<100&&!ready&&live;count++)await new Promise(resolve=>setTimeout(resolve,10));
+  while(performance.now()<deadline&&!ready&&live)await new Promise(resolve=>setTimeout(resolve,10));
   if(!ready||!live){watch.destroy();throw new Error("Scoped Pi continuity unavailable");}
-  async function control(op,values) {
-    // The bridge allows 5s for authentication and 5s for the operation.
-    // Allow scheduling slack, but cap the entire attest (including queue wait)
-    // at 15s, well below the RPC caller's 120s idle budget. Bind/revoke stay short.
-    const deadline=op==="attest"?performance.now()+15000:undefined;
-    const signal=op==="attest"?AbortSignal.timeout(15000):undefined;
+  async function control(op,values,scopeSignal) {
+    // Queueing and transport share one control deadline; never replay a bind.
+    const deadline=performance.now()+65000;
+    const signal=AbortSignal.any([AbortSignal.timeout(65000),lifetime.signal,...(scopeSignal?[scopeSignal]:[])]);
     const task=queue.then(async()=>{
       if(deadline!==undefined && performance.now()>=deadline) throw new Error("Scoped Pi attestation deadline");
       signal?.throwIfAborted();
@@ -228,11 +228,11 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
     });
   }
   function client(binding,handle,readState,recheck) {
-    const scope=binding.scope, scopeCredential=binding.credential;
+    const scope=binding.scope, scopeCredential=binding.credential, scopeLifetime=new AbortController();
     return createScopedClient({scope,readState,recheck,report,transport:{
       isCurrent:value=>live&&ready&&!revoked.has(value.scope_id)&&value.runner_epoch===scope.runner_epoch&&value.launch_epoch===launchEpoch,
-      onLoss:callback=>{listeners.add(callback);const set=scopeListeners.get(scope.scope_id)||new Set();set.add(callback);scopeListeners.set(scope.scope_id,set);if(revoked.has(scope.scope_id))callback("scope_revoked");},
-      attest:(event,support,revision)=>control("attest",{handle,call_id:event.toolCallId,name:event.toolName,arguments:event.input,revision,support}),
+      onLoss:callback=>{const close=cause=>{scopeLifetime.abort();callback(cause);};listeners.add(close);const set=scopeListeners.get(scope.scope_id)||new Set();set.add(close);scopeListeners.set(scope.scope_id,set);if(revoked.has(scope.scope_id))close("scope_revoked");},
+      attest:(event,support,revision)=>control("attest",{handle,call_id:event.toolCallId,name:event.toolName,arguments:event.input,revision,support},scopeLifetime.signal),
       evaluate:(event,revision)=>request("/policies/evaluate",{event:{type:"PHASE_TOOL_CALL",target:"",context:{},data:{name:event.toolName,arguments:event.input,call_id:event.toolCallId,expected_permission_tier_revision:revision}}},scopeCredential),
       execute:(metadata,onResponse)=>request("/permission-tiers/control",{type:"permission_tier_execute",...metadata},scopeCredential,onResponse),
       finish:metadata=>request("/permission-tiers/control",{type:"permission_tier_finish",...metadata},scopeCredential),
@@ -262,7 +262,7 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
   return Object.freeze({bind:values=>control("bind",values),client,close:()=>{lose("connection_close");watch.destroy();}});
 }
 
-async function connectFromHandoff(locator, {timeoutMs=8000}={}) {
+async function connectFromHandoff(locator, {timeoutMs=120000}={}) {
   if(typeof locator!=="string" || !path.isAbsolute(locator) || !/^[a-f0-9]{32}\.json$/.test(path.basename(locator)))
     throw new Error("Scoped Pi handoff locator unavailable");
   const directory=path.dirname(locator), info=fs.lstatSync(directory);
@@ -270,8 +270,8 @@ async function connectFromHandoff(locator, {timeoutMs=8000}={}) {
   const windows=process.platform==="win32";
   if(!info.isDirectory() || !windows&&(info.mode&0o077) || process.getuid&&info.uid!==process.getuid() || fs.realpathSync(directory)!==directory)
     throw new Error("Scoped Pi handoff directory unavailable");
-  const deadline=Date.now()+timeoutMs;
-  while(!fs.existsSync(locator) && Date.now()<deadline) await new Promise(resolve=>setTimeout(resolve,10));
+  const deadline=performance.now()+timeoutMs;
+  while(!fs.existsSync(locator) && performance.now()<deadline) await new Promise(resolve=>setTimeout(resolve,10));
   let descriptor;
   const fd=fs.openSync(locator,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);
   try {
@@ -289,7 +289,7 @@ async function connectFromHandoff(locator, {timeoutMs=8000}={}) {
     !/^pi_attestor_[A-Za-z0-9_-]{43}$/.test(descriptor.credential||"") ||
     descriptor.bridgeDir!==path.dirname(directory) || !path.isAbsolute(descriptor.statePath||""))
     throw new Error("Scoped Pi handoff binding unavailable");
-  const connection=await connectAttestor({...descriptor,report:fileDiagnostic(descriptor.bridgeDir),onLoss:()=>{
+  const connection=await connectAttestor({...descriptor,deadline:Math.min(deadline,performance.now()+60000),report:fileDiagnostic(descriptor.bridgeDir),onLoss:()=>{
     // A launched SDK cannot reuse authority from a dead runner incarnation.
     process.stderr.write("Scoped Pi authority transport lost; restart the Pi session to establish fresh authority.\n");
     process.exit(1);

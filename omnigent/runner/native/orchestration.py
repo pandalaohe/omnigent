@@ -27,6 +27,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapp
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
 
+from omnigent.pi_timeouts import COLD_START_TIMEOUT_S, startup_dependency_failure
 from omnigent.util.http_retry import jittered_retry_delay
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -3793,8 +3794,18 @@ async def _auto_create_pi_terminal(
                     "started_at": identity[1],
                 }
             )
-            deadline = asyncio.get_running_loop().time() + 20.0
+            deadline = asyncio.get_running_loop().time() + COLD_START_TIMEOUT_S
             while True:
+                from omnigent.inner.pi_executor import PiPermissionBootstrapError
+
+                alive = await terminal_instance.is_alive()
+                dependency = startup_dependency_failure(
+                    terminal_instance.startup_diagnostic_text() or ""
+                )
+                if dependency is not None:
+                    raise PiPermissionBootstrapError(f"dependency_missing (code={dependency})")
+                if not alive:
+                    raise PiPermissionBootstrapError("process_exit (status=None)")
                 confirmed = scoped_launch[0].handle_launcher(
                     {"protocol": 1, "op": "confirm", "launch_id": scoped_launch[1]}
                 )
