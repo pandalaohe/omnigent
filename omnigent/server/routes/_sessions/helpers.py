@@ -3512,15 +3512,16 @@ async def _persist_agy_model_notice(
         session_id,
         NewConversationItem(type="error", response_id=generate_task_id(), data=error),
     )
-    if result != "persisted":
+    if result not in {"persisted", "duplicate"}:
         return
-    _publish_error_event(session_id, error)
+    if result == "persisted":
+        _publish_error_event(session_id, error)
     if actual is not None and conv.parent_conversation_id:
-        pending = message
+        key = f"{_AGY_PENDING_MODEL_NOTICE}.{generate_task_id()}"
         await asyncio.to_thread(
             conversation_store.set_labels,
             session_id,
-            {_AGY_PENDING_MODEL_NOTICE: pending},
+            {key: message},
         )
         fresh = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if fresh is not None:
@@ -3536,25 +3537,30 @@ async def _retry_agy_parent_notice(
     conversation_store: ConversationStore,
 ) -> None:
     """Retain failed delivery independently of model and child-item deduplication."""
-    pending = conv.labels.get(_AGY_PENDING_MODEL_NOTICE)
-    if pending is None or conv.parent_conversation_id is None:
+    if conv.parent_conversation_id is None:
         return
     from omnigent.server.routes._sessions.orchestration import _post_system_message
 
-    delivered = await _post_system_message(
-        conv.parent_conversation_id,
-        f"[System: Antigravity model substitution in child {session_id}: {pending}]",
-        conversation_store=conversation_store,
-        runner_router=None,
-    )
-    if delivered:
-        await asyncio.to_thread(
-            conversation_store.compare_and_set_label,
-            session_id,
-            _AGY_PENDING_MODEL_NOTICE,
-            pending,
-            None,
+    for key, pending in conv.labels.items():
+        # Also drain the single pending label written by older readers.
+        if key != _AGY_PENDING_MODEL_NOTICE and not key.startswith(
+            _AGY_PENDING_MODEL_NOTICE + "."
+        ):
+            continue
+        delivered = await _post_system_message(
+            conv.parent_conversation_id,
+            f"[System: Antigravity model substitution in child {session_id}: {pending}]",
+            conversation_store=conversation_store,
+            runner_router=None,
         )
+        if delivered:
+            await asyncio.to_thread(
+                conversation_store.compare_and_set_label,
+                session_id,
+                key,
+                pending,
+                None,
+            )
 
 
 async def _persist_external_session_title(
