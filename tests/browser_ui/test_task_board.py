@@ -475,7 +475,7 @@ def test_task_board_display_switch_and_source_list(
     page.get_by_role("button", name="History", exact=True).click()
     history = page.get_by_role("region", name="History", exact=True)
     history.get_by_role("button", name="1 year", exact=True).click()
-    history.get_by_role("button", name=re.compile(r"^example\b")).click()
+    history.get_by_role("button", name=re.compile(r"\bexample\b")).click()
     history.get_by_role("button", name=re.compile("Earlier checks")).click()
     expect(history.get_by_text("Earlier recovery check", exact=True)).to_be_visible()
     old_requests: list[dict[str, list[str]]] = []
@@ -509,7 +509,7 @@ def test_task_board_display_switch_and_source_list(
     history.get_by_label("Find month", exact=True).fill("2020-01")
     history.get_by_role("button", name="Load month", exact=True).click()
     expect(history.locator(".h-stat>b").first).to_have_text("2")
-    history.get_by_role("button", name=re.compile(r"^example\b")).click()
+    history.get_by_role("button", name=re.compile(r"\bexample\b")).click()
     history.get_by_role("button", name=re.compile("Archive checks")).click()
     expect(history.get_by_text("Archived first check", exact=True)).to_be_visible()
     expect(history.get_by_text("Archived second check", exact=True)).to_be_visible()
