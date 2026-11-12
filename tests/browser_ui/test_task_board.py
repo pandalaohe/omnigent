@@ -370,7 +370,8 @@ def test_task_board_display_switch_and_source_list(
     expect(region).not_to_have_attribute(
         "data-window-from", str(int(original[0]) - 2 * 24 * 3600000)
     )
-    page.get_by_role("button", name="Now", exact=True).click()
+    page.locator(".rt-map").focus()
+    page.locator(".rt-map").press("0")
     assert abs(int(region.get_attribute("data-window-from")) - int(original[0])) < 10000
     assert abs(int(region.get_attribute("data-window-to")) - int(original[1])) < 10000
     page.get_by_role("button", name="How to read this map", exact=True).click()
@@ -418,7 +419,8 @@ def test_task_board_display_switch_and_source_list(
             - int(region.get_attribute("data-window-from"))
             < before_pinch
         )
-        page.get_by_role("button", name="Now", exact=True).click()
+        page.locator(".rt-map").focus()
+        page.locator(".rt-map").press("0")
     graph = region.locator("svg").first
     assert graph.bounding_box()
     assert page.locator("main").last.evaluate(

@@ -21,6 +21,13 @@ import {
   PlusIcon,
   RouteIcon,
   XIcon,
+  HandIcon,
+  CircleCheckIcon,
+  CircleXIcon,
+  CircleDotIcon,
+  BanIcon,
+  PackageCheckIcon,
+  ActivityIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Link } from "@/lib/routing";
@@ -34,7 +41,6 @@ import {
   MIN_SPAN,
   detailLevel,
   initialWindow,
-  routeTicks,
   taskLocalTime,
   type RouteMode,
   type TimeWindow,
@@ -53,6 +59,9 @@ import {
   routeQueued,
   routeState,
   stepMapWindow,
+  mapAxisTicks,
+  routeLabelLines,
+  placeMapLabels,
   type MapGroup,
   type MapRelation,
   type MapNode,
@@ -60,8 +69,8 @@ import {
   type MapEdge,
 } from "./taskBoardRouteModel";
 import { TaskBoardDetail, taskTitle } from "./TaskBoardDetail";
-import { TaskBoardSearch } from "./TaskBoardSearch";
 import { TaskBoardTaskHover } from "./TaskBoardTaskHover";
+import { TaskBoardRouteFocus } from "./TaskBoardRouteFocus";
 import { BoardIdentityMark } from "./BoardIdentityMark";
 import { formatDate, formatNumber, t } from "./taskBoardText";
 import "./taskBoardRoutes.css";
@@ -79,6 +88,10 @@ interface Hover {
   y: number;
 }
 const badgeStyle = (color: string) => ({ "--rt-color": color }) as CSSProperties;
+const dayKey = (time: number) => {
+  const date = new Date(time);
+  return `${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+};
 const momentWord = (time: number) => {
   const current = Date.now(),
     date = new Date(time),
@@ -93,22 +106,38 @@ const momentWord = (time: number) => {
     ? ""
     : sameDay(date, yesterday)
       ? t("routes.yesterday")
-      : formatDate(time, {
-          ...(date.getFullYear() !== today.getFullYear() ? { year: "numeric" as const } : {}),
-          month: "numeric",
-          day: "numeric",
-        });
+      : sameDay(date, new Date(current + DAY))
+        ? t("routes.tomorrow")
+        : (current - time > 300 * DAY ? date.getFullYear() + "-" : "") + dayKey(time);
   return `${day ? day + " " : ""}${formatDate(time, { hour: "2-digit", minute: "2-digit", hour12: false })}`;
 };
 const stateWord = (task: BoardTask) => t(`sessions.taskState.${routeState(task)}`);
 const nodeLabel = (node: MapNode) =>
   node.tasks.length > 1
-    ? t(node.queued ? "routes.queuedCount" : "routes.earlierCount", { count: node.tasks.length })
+    ? t(
+        node.timeCluster
+          ? "routes.stops"
+          : node.queued
+            ? "routes.queuedCount"
+            : "routes.earlierCount",
+        { count: node.tasks.length },
+      )
     : (node.tasks[0]["omnigent.ai:sourceDisplay"]?.identity?.label ?? taskTitle(node.tasks[0]));
-function Station({ tasks }: { tasks: BoardTask[] }) {
+function Station({
+  tasks,
+  extent = 0,
+  time = false,
+}: {
+  tasks: BoardTask[];
+  extent?: number;
+  time?: boolean;
+}) {
   if (tasks.length > 1)
     return (
-      <span className={`rt-capsule${tasks.every(routeQueued) ? " queued" : ""}`}>
+      <span
+        style={{ width: extent + 29 }}
+        className={`rt-capsule${tasks.every(routeQueued) ? " queued" : time && tasks.some((task) => routeState(task) === "failed") ? " hot" : ""}`}
+      >
         {formatNumber(tasks.length)}
       </span>
     );
@@ -132,6 +161,55 @@ function Station({ tasks }: { tasks: BoardTask[] }) {
     </span>
   );
 }
+const taskKey = (task: BoardTask) =>
+  task["omnigent.ai:sourceDisplay"]?.identity?.key ?? task["omnigent.ai:key"] ?? task.uid;
+function PhoneStation({ task }: { task: BoardTask }) {
+  const state = routeState(task),
+    Icon = {
+      running: ActivityIcon,
+      user: HandIcon,
+      done: CircleCheckIcon,
+      failed: CircleXIcon,
+      ready: PackageCheckIcon,
+      held: CircleDotIcon,
+      queued: ClockIcon,
+      blocked: BanIcon,
+    }[state],
+    session = task["omnigent.ai:sourceDisplay"]?.sessions?.find(
+      (item) => item.status === "running",
+    );
+  return (
+    <i className={`rt-phone-icon state-${state}`}>
+      {state === "running" && session ? (
+        <BoardIdentityMark
+          id={session.agentId}
+          label={session.agentId}
+          product={session.agentId}
+          size={16}
+        />
+      ) : (
+        <Icon size={14} />
+      )}
+    </i>
+  );
+}
+const measureLabel = (() => {
+  let context: CanvasRenderingContext2D | null = null;
+  const measured = new Map<string, number>();
+  return (text: string, size: number, weight: number) => {
+    const font = 'ui-sans-serif,system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif',
+      key = font + size + weight + text;
+    if (measured.has(key)) return measured.get(key)!;
+    if (typeof document !== "undefined" && !navigator.userAgent.includes("jsdom"))
+      context ??= document.createElement("canvas").getContext("2d");
+    if (context) context.font = `${weight} ${size}px ${font}`;
+    const width = context
+      ? context.measureText(text).width
+      : [...text].reduce((n, char) => n + size * (char.charCodeAt(0) > 127 ? 1 : 0.56), 0);
+    measured.set(key, width);
+    return width;
+  };
+})();
 function RelationFacts({
   relations,
   onSelect,
@@ -143,22 +221,44 @@ function RelationFacts({
     <div className="rt-relation-facts">
       {relations.map((relation) => (
         <div key={relation.id}>
-          <button type="button" onClick={() => onSelect(relation.from)}>
-            {relation.from["omnigent.ai:sourceDisplay"]?.identity?.key ??
-              relation.from["omnigent.ai:key"] ??
-              relation.from.uid}
-          </button>
-          <span>{relation.label ?? t(relation.labelKey ?? `relation.${relation.kind}`)}</span>
-          <button type="button" onClick={() => onSelect(relation.to)}>
-            {relation.to["omnigent.ai:sourceDisplay"]?.identity?.key ??
-              relation.to["omnigent.ai:key"] ??
-              relation.to.uid}
-          </button>
+          <p>
+            <button
+              type="button"
+              onClick={() => onSelect(relation.from)}
+              aria-label={taskKey(relation.from)}
+            >
+              <code>{taskKey(relation.from)}</code> {taskTitle(relation.from)}
+            </button>
+          </p>
+          <p className="to">
+            <button
+              type="button"
+              onClick={() => onSelect(relation.to)}
+              aria-label={taskKey(relation.to)}
+            >
+              <code>{taskKey(relation.to)}</code> {taskTitle(relation.to)}
+            </button>
+          </p>
           <small>
-            {relation.origin ? t(`routes.origin.${relation.origin}`) : t("routes.relationReported")}
-            {relation.provenance ? ` · ${relation.provenance}` : ""}
-            {" · "}
-            {relation.since ? momentWord(Date.parse(relation.since)) : t("routes.relationUndated")}
+            {relation.label ??
+              (relation.labelKey
+                ? t(relation.labelKey)
+                : t(`routes.direction.${relation.kind}`, {
+                    from: taskKey(relation.from),
+                    to: taskKey(relation.to),
+                  }))}
+          </small>
+          <small>
+            <i className={`rt-origin ${relation.origin ?? "reported"}`}>
+              {relation.origin
+                ? t(`routes.origin.${relation.origin}`)
+                : t("routes.relationReported")}
+            </i>{" "}
+            {relation.origin === "manual"
+              ? t("routes.manualSource", { source: relation.provenance ?? "" })
+              : relation.since
+                ? t("routes.attachedAt", { date: relation.since.slice(0, 10) })
+                : t("routes.relationUndated")}
           </small>
         </div>
       ))}
@@ -207,6 +307,18 @@ export function TaskBoardRoutes({
     }, [tasks]),
     groups = useMemo(() => mapGroups(tasks, sources, caches), [tasks, sources, caches]),
     relations = useMemo(() => mapRelations(tasks), [tasks]);
+  const relationCounts = useMemo(() => {
+    const counts = new Map<string, { outgoing: number; incoming: number }>();
+    for (const relation of relations) {
+      const from = taskIdentity(relation.from),
+        to = taskIdentity(relation.to);
+      if (!counts.has(from)) counts.set(from, { outgoing: 0, incoming: 0 });
+      if (!counts.has(to)) counts.set(to, { outgoing: 0, incoming: 0 });
+      counts.get(from)!.outgoing++;
+      counts.get(to)!.incoming++;
+    }
+    return counts;
+  }, [relations]);
   const hubs = useMemo(
     () =>
       new Map(
@@ -233,6 +345,7 @@ export function TaskBoardRoutes({
     [help, setHelp] = useState(false),
     [hover, setHover] = useState<Hover | null>(null),
     [hoverHub, setHoverHub] = useState<string | null>(null);
+  const [focusOpen, setFocusOpen] = useState(false);
   const open = useMemo<OpenPanel | null>(() => {
     if (!selection) return null;
     const byId = new Map(tasks.map((task) => [taskIdentity(task), task]));
@@ -280,11 +393,15 @@ export function TaskBoardRoutes({
       Math.min(
         now - DAY,
         ...tasks.flatMap((task) => {
-          const at = routeMoment(task, now);
+          const at =
+            Date.parse(task["omnigent.ai:sourceDisplay"]?.historyState?.first ?? "") ||
+            routeMoment(task, now);
           return at === undefined ? [] : [at];
         }),
         ...Object.values(caches).flatMap((cache) =>
-          (cache.display.closedDays ?? []).map((day) => Date.parse(day.date)),
+          (cache.display.closedDays ?? []).map((day) =>
+            taskLocalTime(`${day.date}T00:00:00`, cache.display.timeZone),
+          ),
         ),
       ),
     [tasks, caches, now],
@@ -397,10 +514,17 @@ export function TaskBoardRoutes({
                       Date.parse((task.progressUpdated ?? task["omnigent.ai:closedSeen"])!) >=
                         now - boardHours * HOUR),
                 )
-              : group.tasks,
+              : level === "segment"
+                ? group.tasks
+                : group.tasks.filter((task) =>
+                    routeQueued(task)
+                      ? nowOn && level === "station"
+                      : (routeMoment(task, now) ?? 0) >= view.from &&
+                        (routeMoment(task, now) ?? 0) <= view.to,
+                  ),
         }))
-        .filter((group) => mode !== "order" || group.tasks.length > 0),
-    [groups, focus, mode, now, boardHours],
+        .filter((group) => group.tasks.length > 0),
+    [groups, focus, mode, now, boardHours, level, nowOn, view],
   );
   const sourceIds = [
     ...new Set([
@@ -433,11 +557,15 @@ export function TaskBoardRoutes({
                 : routeMoment(task, now)! >= view.from && routeMoment(task, now)! <= view.to,
             ).length;
     const append = (lane: Omit<MapLane, "top" | "nodes">) => {
+      const historical = lane.header
+        ? groups.filter((group) => group.source === lane.source).flatMap((group) => group.tasks)
+        : (groups.find((group) => group.id === lane.id)?.tasks ?? lane.tasks);
       lanes.push({
         ...lane,
         top,
         nodes: [],
         count: countTasks(lane.tasks, lane.collapsed ? lane.source : undefined),
+        historyStart: Math.min(...historical.map((task) => routeMoment(task, now) ?? Infinity)),
       });
       top += lane.height;
       if (open?.lane === lane.id) top += panelHeight;
@@ -481,6 +609,17 @@ export function TaskBoardRoutes({
         badge: sourceBadge(source),
         color: sourceColor(source),
         tasks: sourceTasks,
+        summary: (() => {
+          const all = groups
+            .filter((group) => group.source === source)
+            .flatMap((group) => group.tasks)
+            .filter((task) => task["omnigent.ai:sourceDisplay"]?.historyState?.active !== false);
+          const counts = ["running", "user", "failed"].flatMap((state) => {
+            const count = all.filter((task) => routeState(task) === state).length;
+            return count ? [t(`routes.summary.${state}`, { count })] : [];
+          });
+          return counts.join(" · ") || t("routes.groupCount", { count: candidates.length });
+        })(),
         header: true,
         collapsed: !opened,
         height: opened
@@ -533,17 +672,66 @@ export function TaskBoardRoutes({
           color: sourceColor(source),
           tasks: [],
           pager: true,
+          total: list.length,
           page,
           pages: Math.ceil(list.length / 10),
           height: 40,
         });
     }
     return {
-      ...mapScene(lanes, mode, view, width, now, level, relations, hubs, caches, nodeLabel),
+      ...mapScene(
+        lanes,
+        mode,
+        view,
+        width,
+        now,
+        level,
+        relations,
+        hubs,
+        caches,
+        (node) => {
+          if (node.timeCluster) {
+            const times = node.tasks.map((task) => routeMoment(task, now)!),
+              first = Math.min(...times),
+              last = Math.max(...times),
+              hm = (time: number) =>
+                formatDate(time, { hour: "2-digit", minute: "2-digit", hour12: false });
+            const day = (time: number) => formatDate(time, { month: "2-digit", day: "2-digit" });
+            return {
+              lines: [t("routes.stops", { count: node.tasks.length })],
+              sub:
+                level === "station"
+                  ? `${hm(first)}–${hm(last)}`
+                  : day(first) === day(last)
+                    ? day(first)
+                    : `${day(first)}–${day(last)}`,
+            };
+          }
+          const task = node.tasks[0];
+          return {
+            lines:
+              node.tasks.length > 1
+                ? [mode === "time" && node.queued ? t("routes.queuedMore") : nodeLabel(node)]
+                : routeLabelLines(nodeLabel(node)),
+            sub:
+              node.tasks.length === 1
+                ? mode === "time" && routeState(task) === "user"
+                  ? t("sessions.taskState.user")
+                  : !routeQueued(task) &&
+                      !["running", "user"].includes(routeState(task)) &&
+                      routeMoment(task, now)
+                    ? momentWord(routeMoment(task, now)!)
+                    : ""
+                : "",
+          };
+        },
+        measureLabel,
+      ),
       height: top,
     };
   }, [
     selectedGroups,
+    groups,
     sourceSlice,
     sourceName,
     sourceBadge,
@@ -567,17 +755,93 @@ export function TaskBoardRoutes({
   ]);
   const x = (time: number) =>
       gutter + ((time - view.from) / (view.to - view.from)) * (right - gutter),
-    ticks = mode === "time" ? routeTicks(view, right - gutter) : [];
+    axis = mapAxisTicks(view, right - gutter),
+    ticks = mode === "time" ? axis.ticks : [];
+  const tickText = (date: Date, step: number) =>
+    step < DAY
+      ? date.getHours() === 0
+        ? dayKey(+date) === dayKey(now)
+          ? t("routes.today")
+          : dayKey(+date) === dayKey(now + DAY)
+            ? t("routes.tomorrow")
+            : dayKey(+date)
+        : formatDate(date, { hour: "2-digit", minute: "2-digit", hour12: false })
+      : step < 28 * DAY
+        ? dayKey(+date)
+        : date.getMonth() === 0
+          ? t("routes.year", { year: date.getFullYear() })
+          : `${String(date.getFullYear()).slice(2)}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+  const nowX = Math.max(40, Math.min(x(now), width - 46));
+  const shading: { from: number; to: number }[] = [];
+  if (mode === "time" && axis.step < 2 * DAY) {
+    const day = new Date(view.from);
+    day.setHours(0, 0, 0, 0);
+    for (; +day < view.to; day.setDate(day.getDate() + 1)) {
+      const number = Math.floor((+day - day.getTimezoneOffset() * 60000) / DAY);
+      if (number % 2) continue;
+      const end = new Date(day);
+      end.setDate(end.getDate() + 1);
+      const from = Math.max(gutter, x(+day)),
+        to = Math.min(right, x(+end), nowOn ? x(now) : Infinity);
+      if (to > from) shading.push({ from, to });
+    }
+  }
   const scheduledVisible =
     mode === "time" && level === "station" && nowOn
       ? future.filter((item) => item.at > now && item.at >= view.from && item.at <= view.to)
       : [];
   const scheduleGroups = scheduledVisible.reduce<(typeof scheduledVisible)[]>((out, item) => {
     const previous = out.at(-1);
-    if (previous && x(item.at) - x(previous.at(-1)!.at) < 48) previous.push(item);
+    if (previous && x(item.at) - x(previous.at(-1)!.at) < 92) previous.push(item);
     else out.push([item]);
     return out;
   }, []);
+  const scheduleLabels: MapNode[] = scheduleGroups.map((items) => ({
+    id: items[0].id,
+    lane: "scheduled",
+    tasks: [],
+    x: x(items[0].at),
+    x1: Math.max(x(items.at(-1)!.at), x(items[0].at) + (items.length > 1 ? 2 : 0)),
+    y: model.height + (phone ? 96 : 88) / 2 + (phone ? 8 : 7),
+    top: model.height,
+    height: phone ? 96 : 88,
+    color: "var(--foreground)",
+    queued: false,
+    scheduled: true,
+    lines: items.length > 1 ? [t("routes.items", { count: items.length })] : [items[0].label],
+    sub:
+      items.length > 1
+        ? `${formatDate(items[0].at, { hour: "2-digit", minute: "2-digit", hour12: false })}–${formatDate(items.at(-1)!.at, { hour: "2-digit", minute: "2-digit", hour12: false })}`
+        : momentWord(items[0].at),
+  }));
+  if (scheduleLabels.length)
+    placeMapLabels(
+      scheduleLabels,
+      [
+        { a: { x: x(now), y: 0 }, b: { x: x(now), y: 99999 }, half: 1 },
+        {
+          a: { x: x(now), y: scheduleLabels[0].y },
+          b: { x: Math.max(...scheduleLabels.map((node) => node.x1)), y: scheduleLabels[0].y },
+          half: 1.5,
+        },
+      ],
+      [
+        {
+          id: "scheduled",
+          source: "",
+          name: "",
+          badge: "",
+          color: "",
+          tasks: [],
+          height: phone ? 96 : 88,
+          top: model.height,
+          nodes: [],
+        },
+      ],
+      width,
+      phone ? 4 : 168,
+      measureLabel,
+    );
   const activeEdge = hover?.edge ?? (open?.kind === "edge" ? open.edge : null),
     activeHub = hoverHub ?? (open?.kind === "hub" ? taskIdentity(open.task) : null);
   const highlighted = new Set(
@@ -721,10 +985,18 @@ export function TaskBoardRoutes({
       (kind === "map" && (event.target as Element).closest("button,a,[role=button]"))
     )
       return;
+    const target = event.target as HTMLElement,
+      handle = target.closest(".rt-overview-window")?.getBoundingClientRect();
+    const edge =
+      handle &&
+      event.clientX > handle.left + handle.width * 0.25 &&
+      event.clientX < handle.right - handle.width * 0.25
+        ? "move"
+        : (target.dataset.edge ?? "move");
     pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
     pointer.current = {
       kind,
-      edge: (event.target as HTMLElement).dataset.edge ?? "move",
+      edge,
       x: event.clientX,
       view,
     };
@@ -773,6 +1045,11 @@ export function TaskBoardRoutes({
     pinch.current = null;
   };
   const mapKey = (key: string) => {
+    if (key === "0") {
+      setView(initialWindow(now));
+      setOpen(null);
+      return;
+    }
     if (key === "+" || key === "-") zoom(key === "+" ? -1 : 1);
     else {
       const delta = (key === "ArrowLeft" ? -1 : 1) * (view.to - view.from) * 0.1;
@@ -797,6 +1074,7 @@ export function TaskBoardRoutes({
     <BoardPager
       page={lane.page ?? 0}
       pages={lane.pages ?? 1}
+      total={lane.total}
       onChange={(value) => {
         setGroupPages((current) => ({ ...current, [lane.source]: value }));
         setOpen(null);
@@ -1030,20 +1308,15 @@ export function TaskBoardRoutes({
               </div>
             </>
           )}
-          <TaskBoardSearch
-            label={t("routes.focus")}
-            options={groups.map((group) => ({
-              id: group.id,
-              label: group.name || t("group.default"),
-              hint: sourceName(group.source),
-            }))}
-            selected={focus}
-            onChange={(ids) => {
-              onFocus(ids);
-              setSourcePage(0);
-              setOpen(null);
-            }}
-          />
+          <button
+            type="button"
+            className="rt-focus-toggle"
+            aria-pressed={focusOpen}
+            onClick={() => setFocusOpen(!focusOpen)}
+          >
+            {t("routes.focus")}
+            {focus.length > 0 && <em>{focus.length}</em>}
+          </button>
           <button
             type="button"
             className="rt-icon"
@@ -1092,6 +1365,20 @@ export function TaskBoardRoutes({
           <p>{t("routes.gestureHelp")}</p>
         </section>
       )}
+      {focusOpen && (
+        <TaskBoardRouteFocus
+          groups={groups}
+          selected={focus}
+          sourceName={sourceName}
+          sourceColor={sourceColor}
+          onClose={() => setFocusOpen(false)}
+          onChange={(ids) => {
+            onFocus(ids);
+            setSourcePage(0);
+            setOpen(null);
+          }}
+        />
+      )}
       {mode === "time" && (
         <div
           ref={overviewRef}
@@ -1122,17 +1409,26 @@ export function TaskBoardRoutes({
               <rect
                 key={bucket.from}
                 x={((bucket.from - oldest) / (now - oldest)) * width}
-                y={32 - Math.sqrt(bucket.count / overviewMax) * 26}
-                width={Math.max(1, ((bucket.to - bucket.from) / (now - oldest)) * width - 1)}
-                height={Math.sqrt(bucket.count / overviewMax) * 26}
+                y={32 - Math.max(2, Math.sqrt(bucket.count / overviewMax) * 30)}
+                width={Math.max(1, width / 240 - 0.6)}
+                height={bucket.count ? Math.max(2, Math.sqrt(bucket.count / overviewMax) * 30) : 0}
                 rx="1"
               />
             ))}
-            {routeTicks({ from: oldest, to: now }, width).map((date) => (
-              <text key={+date} x={((+date - oldest) / (now - oldest)) * width} y="44">
-                {formatDate(date, { month: "short", day: "numeric" })}
-              </text>
-            ))}
+            {mapAxisTicks({ from: oldest, to: now }, width, width < 500 ? 84 : 70)
+              .ticks.filter(
+                (date) =>
+                  ((+date - oldest) / (now - oldest)) * width > 22 &&
+                  ((+date - oldest) / (now - oldest)) * width < width - 22,
+              )
+              .map((date) => (
+                <text key={+date} x={((+date - oldest) / (now - oldest)) * width} y="43">
+                  {tickText(
+                    date,
+                    mapAxisTicks({ from: oldest, to: now }, width, width < 500 ? 84 : 70).step,
+                  )}
+                </text>
+              ))}
           </svg>
           <div
             className="rt-overview-window"
@@ -1187,26 +1483,6 @@ export function TaskBoardRoutes({
           </div>
         </div>
       )}
-      {mode === "time" && (
-        <div className="rt-window-word">
-          <span>
-            {momentWord(view.from)}
-            {" — "}
-            {momentWord(view.to)}
-            {" · "}
-            {t(`routes.${level}`)}
-          </span>
-          <button
-            type="button"
-            onClick={() => {
-              setView(initialWindow(now));
-              setOpen(null);
-            }}
-          >
-            {t("routes.now")}
-          </button>
-        </div>
-      )}
       <div
         ref={mapRef}
         className={`rt-map rt-${mode}${phone ? " rt-phone" : ""}`}
@@ -1235,7 +1511,7 @@ export function TaskBoardRoutes({
           if (
             mode === "time" &&
             event.target === event.currentTarget &&
-            ["ArrowLeft", "ArrowRight", "+", "-"].includes(event.key)
+            ["ArrowLeft", "ArrowRight", "+", "-", "0"].includes(event.key)
           ) {
             event.preventDefault();
             mapKey(event.key);
@@ -1244,15 +1520,39 @@ export function TaskBoardRoutes({
       >
         {mode === "time" && (
           <div ref={axisRef} className="rt-axis">
-            {ticks.map((date) => (
-              <span key={+date} style={{ left: x(+date) }}>
-                {formatDate(date, {
-                  month: "short",
-                  day: "numeric",
-                  ...(view.to - view.from < 3 * DAY ? { hour: "numeric" as const } : {}),
-                })}
+            {ticks
+              .filter(
+                (date) =>
+                  x(+date) >= gutter + 4 &&
+                  x(+date) <= right - 6 &&
+                  (!nowOn || Math.abs(x(+date) - nowX) >= 66),
+              )
+              .map((date) => (
+                <span
+                  className={`${axis.step < DAY ? (date.getHours() === 0 ? "major" : "") : date.getDate() === 1 ? "major" : ""} ${+date > now ? "future" : ""}`}
+                  key={+date}
+                  style={{ left: x(+date) }}
+                >
+                  {tickText(date, axis.step)}
+                </span>
+              ))}
+            {nowOn ? (
+              <span className="rt-now-chip" style={{ left: nowX }}>
+                {t("routes.now")}{" "}
+                {formatDate(now, { hour: "2-digit", minute: "2-digit", hour12: false })}
               </span>
-            ))}
+            ) : (
+              <button
+                className="rt-back-now"
+                type="button"
+                onClick={() => {
+                  setView(initialWindow(now));
+                  setOpen(null);
+                }}
+              >
+                {t("routes.backNow")}
+              </button>
+            )}
           </div>
         )}
         {mode === "order" && phone ? (
@@ -1268,9 +1568,15 @@ export function TaskBoardRoutes({
                     onClick={() => changeSource(band)}
                   >
                     <ChevronDownIcon size={15} />
-                    <i className="rt-bullet">{band.badge}</i>
-                    <b>{band.name}</b>
-                    <small>{t("board.tasks", { count: band.count ?? band.tasks.length })}</small>
+                    <i className="rt-bullet round">{band.badge}</i>
+                    <span>
+                      <b>{band.name}</b>
+                      <small>
+                        {t("board.tasks", { count: band.count ?? band.tasks.length })}
+                        {" · "}
+                        {band.summary}
+                      </small>
+                    </span>
                   </button>
                   {!band.collapsed &&
                     model.lanes
@@ -1296,7 +1602,7 @@ export function TaskBoardRoutes({
                             <h3>
                               <i className="rt-bullet">{lane.badge}</i>
                               {lane.name}
-                              <small>{lane.tasks.length}</small>
+                              <small>{t("board.tasks", { count: lane.tasks.length })}</small>
                             </h3>
                             <ol>
                               {sorted.slice(page * 8, (page + 1) * 8).map((task) => (
@@ -1308,7 +1614,7 @@ export function TaskBoardRoutes({
                                       type="button"
                                       onClick={() => selectTask(task)}
                                     >
-                                      <Station tasks={[task]} />
+                                      <PhoneStation task={task} />
                                       <span>
                                         <b>{taskTitle(task)}</b>
                                         <small>
@@ -1318,6 +1624,10 @@ export function TaskBoardRoutes({
                                           routeMoment(task, now)
                                             ? ` · ${momentWord(routeMoment(task, now)!)}`
                                             : ""}
+                                          {!!relationCounts.get(taskIdentity(task))?.outgoing &&
+                                            ` · ${t("routes.connectedTo", { count: relationCounts.get(taskIdentity(task))!.outgoing })}`}
+                                          {!!relationCounts.get(taskIdentity(task))?.incoming &&
+                                            ` · ${t("routes.connectedFrom", { count: relationCounts.get(taskIdentity(task))!.incoming })}`}
                                         </small>
                                       </span>
                                     </button>
@@ -1339,6 +1649,7 @@ export function TaskBoardRoutes({
                             <BoardPager
                               page={page}
                               pages={Math.ceil(sorted.length / 8)}
+                              total={sorted.length}
                               onChange={(value) =>
                                 setPhonePages((current) => ({ ...current, [lane.id]: value }))
                               }
@@ -1360,14 +1671,32 @@ export function TaskBoardRoutes({
         ) : (
           <div
             className="rt-scene"
-            style={{ height: model.height + (scheduledVisible.length ? 100 : 0) }}
+            style={{ height: model.height + (scheduledVisible.length ? (phone ? 96 : 88) : 0) }}
           >
             <svg
               className={`rt-svg${activeEdge ? " rt-edge-focus" : ""}`}
               width={width}
-              height={model.height + (scheduledVisible.length ? 100 : 0)}
+              height={model.height + (scheduledVisible.length ? (phone ? 96 : 88) : 0)}
               aria-label={t("routes.map")}
             >
+              {mode === "time" && nowOn && view.to - view.from <= 2 * DAY && (
+                <rect
+                  className="rt-future-bg"
+                  x={x(now)}
+                  y={0}
+                  width={Math.max(0, right - x(now) + 14)}
+                  height="100%"
+                />
+              )}
+              {shading.map((band) => (
+                <rect
+                  key={band.from}
+                  className="rt-day-band"
+                  x={band.from}
+                  width={band.to - band.from}
+                  height="100%"
+                />
+              ))}
               {model.edges
                 .filter((edge) => edge.long && !edge.hub)
                 .map((edge) => (
@@ -1391,11 +1720,11 @@ export function TaskBoardRoutes({
                     x2={x(+date)}
                     y1="0"
                     y2={model.height}
-                    className="rt-grid"
+                    className={`rt-grid${axis.step < DAY ? (date.getHours() === 0 ? " major" : "") : date.getDate() === 1 ? " major" : ""}`}
                   />
                 ))}
               {mode === "time" && nowOn && (
-                <line x1={x(now)} x2={x(now)} y1="0" y2={model.height} className="rt-now" />
+                <line x1={x(now)} x2={x(now)} y1="0" y2="100%" className="rt-now" />
               )}
               {model.edges
                 .filter((edge) => !edge.long && !edge.hub)
@@ -1419,13 +1748,32 @@ export function TaskBoardRoutes({
                 ))}
               {model.lanes.map((lane) => (
                 <g key={lane.id}>
+                  {mode === "time" &&
+                    lane.nodes.some((node) => !node.queued && !node.density) &&
+                    (() => {
+                      const past = lane.nodes.filter((node) => !node.queued && !node.density);
+                      const earliest = lane.historyStart ?? Infinity;
+                      return (
+                        <line
+                          className="rt-rail"
+                          x1={earliest < view.from ? gutter : past[0].x}
+                          x2={past.at(-1)!.x1}
+                          y1={past[0].y}
+                          y2={past[0].y}
+                          stroke={lane.color}
+                          strokeWidth={lane.collapsed ? 7 : level === "station" ? 11 : 9}
+                          strokeLinecap="round"
+                        />
+                      );
+                    })()}
                   {lane.nodes
                     .slice(1)
-                    .filter((node) => !node.density)
-                    .map((node, index) => (
+                    .filter((node) => !node.density && (mode === "order" || node.queued))
+                    .map((node) => (
                       <line
                         key={node.id}
-                        x1={lane.nodes[index].x1}
+                        className="rt-rail"
+                        x1={lane.nodes[lane.nodes.indexOf(node) - 1]?.x1 ?? gutter}
                         x2={node.x}
                         y1={node.y}
                         y2={node.y}
@@ -1447,8 +1795,58 @@ export function TaskBoardRoutes({
                         fill={node.color}
                       />
                     ))}
+                  {lane.nodes.some((node) => node.density) && (
+                    <line
+                      x1={lane.nodes[0].x}
+                      x2={lane.nodes.at(-1)!.x1}
+                      y1={lane.nodes[0].y}
+                      y2={lane.nodes[0].y}
+                      stroke={lane.color}
+                      strokeWidth={2.5}
+                      opacity={0.4}
+                    />
+                  )}
+                  {lane.nodes.slice(1).map((node, index) => {
+                    const previous = lane.nodes[index],
+                      running =
+                        mode === "order"
+                          ? previous.tasks.length === 1 &&
+                            routeState(previous.tasks[0]) === "running"
+                          : node.tasks.length === 1 && routeState(node.tasks[0]) === "running";
+                    return running ? (
+                      <line
+                        key={"flow" + node.id}
+                        className="rt-flow"
+                        x1={previous.x1}
+                        x2={node.x}
+                        y1={node.y}
+                        y2={node.y}
+                        stroke="var(--card-solid)"
+                        strokeWidth={2.5}
+                        strokeDasharray="3 9"
+                        strokeLinecap="round"
+                      />
+                    ) : null;
+                  })}
                 </g>
               ))}
+              {model.edges
+                .filter((edge) => !edge.hub && edge.badge)
+                .map((edge) => (
+                  <g className="rt-edge-count" key={"count" + edge.id}>
+                    <circle
+                      cx={edge.badge!.x}
+                      cy={edge.badge!.y}
+                      r={9}
+                      fill="var(--card-solid)"
+                      stroke={edge.from.color}
+                      strokeWidth={2}
+                    />
+                    <text x={edge.badge!.x} y={edge.badge!.y + 4} textAnchor="middle">
+                      {edge.relations.length}
+                    </text>
+                  </g>
+                ))}
               {model.edges
                 .filter(
                   (edge) =>
@@ -1528,7 +1926,14 @@ export function TaskBoardRoutes({
               <div
                 key={lane.id}
                 className={`rt-lane${lane.header ? " rt-source" : ""}${lane.header && !lane.collapsed ? " thin" : ""}${lane.quiet ? " quiet" : ""}`}
-                style={{ ...badgeStyle(lane.color), top: lane.top, height: lane.height }}
+                style={
+                  {
+                    ...badgeStyle(lane.color),
+                    "--rt-band-color": sourceColor(lane.source),
+                    top: lane.top,
+                    height: lane.height,
+                  } as CSSProperties
+                }
               >
                 {lane.quiet ? (
                   quietButton(lane)
@@ -1543,11 +1948,14 @@ export function TaskBoardRoutes({
                         onClick={() => changeSource(lane)}
                       >
                         <ChevronDownIcon size={14} className={lane.collapsed ? "-rotate-90" : ""} />
-                        <i className="rt-bullet">{lane.badge}</i>
+                        <i className="rt-bullet round">{lane.badge}</i>
                         <span>
                           <b>{lane.name}</b>
                           <small>
-                            {t("board.tasks", { count: lane.count ?? lane.tasks.length })}
+                            <span>
+                              {t("board.tasks", { count: lane.count ?? lane.tasks.length })}
+                            </span>
+                            {` · ${lane.summary}`}
                           </small>
                         </span>
                       </button>
@@ -1616,20 +2024,26 @@ export function TaskBoardRoutes({
                       onBlur={() => setHover(null)}
                       onClick={() => openNode(node)}
                     >
-                      <Station tasks={node.tasks} />
+                      <Station
+                        tasks={node.tasks}
+                        extent={node.x1 - node.x}
+                        time={mode === "time"}
+                      />
                     </button>
                     {node.label && (
                       <span
-                        className={`rt-label rt-label-${node.tasks.length === 1 ? routeState(node.tasks[0]) : "cluster"}`}
+                        className={`rt-label${node.hub ? " hub" : ""} rt-label-${node.tasks.length === 1 ? routeState(node.tasks[0]) : "cluster"}`}
                         style={{ left: node.label.x, top: node.label.y, width: node.label.width }}
                       >
-                        <b>{nodeLabel(node)}</b>
-                        {node.tasks.length === 1 &&
-                          !routeQueued(node.tasks[0]) &&
-                          !["running", "user"].includes(routeState(node.tasks[0])) &&
-                          routeMoment(node.tasks[0], now) && (
-                            <small>{momentWord(routeMoment(node.tasks[0], now)!)}</small>
-                          )}
+                        <b>
+                          {node.lines?.map((line, index) => (
+                            <Fragment key={line}>
+                              {index > 0 && <br />}
+                              {line}
+                            </Fragment>
+                          ))}
+                        </b>
+                        {node.sub && <small>{node.sub}</small>}
                       </span>
                     )}
                     {node.tasks.length === 1 &&
@@ -1637,7 +2051,7 @@ export function TaskBoardRoutes({
                         <button
                           type="button"
                           className="rt-hub-badge"
-                          style={{ left: node.x + 16, top: node.y - 31 }}
+                          style={{ left: node.x + 16, top: node.y - 25 }}
                           aria-label={t("routes.hubCount", {
                             count: hubs.get(taskIdentity(node.tasks[0]))!.size,
                           })}
@@ -1664,42 +2078,47 @@ export function TaskBoardRoutes({
               </Fragment>
             ))}
             {scheduledVisible.length > 0 && (
-              <div className="rt-future" style={{ top: model.height, height: 100 }}>
+              <div className="rt-future" style={{ top: model.height, height: phone ? 96 : 88 }}>
                 <div className="rt-lane-heading">
-                  <i className="rt-bullet">{"◆"}</i>
-                  <b>{t("schedule.title")}</b>
+                  <i className="rt-bullet round">{"◆"}</i>
+                  <span>
+                    <b>{t("routes.scheduledTitle")}</b>
+                    <small>{t("routes.items", { count: scheduledVisible.length })}</small>
+                  </span>
                 </div>
-                {scheduleGroups.map((items) => (
-                  <div
-                    className="rt-future-stop"
-                    key={items[0].id}
-                    style={{
-                      left: Math.min(width - 70, Math.max(gutter + 18, x(items[0].at))),
-                      top: 34,
-                    }}
-                  >
-                    <span className="rt-symbol rt-scheduled">
-                      {items.length > 1 ? items.length : null}
-                    </span>
-                    {items.length === 1 && items[0].native ? (
-                      <Link {...boardExitProps()} to={`/tasks/${encodeURIComponent(items[0].id)}`}>
-                        {items[0].label}
-                      </Link>
-                    ) : items.length === 1 ? (
-                      items[0].task ? (
-                        <button
-                          type="button"
-                          data-route-task={items[0].task.uid}
-                          onClick={() => selectTask(items[0].task!)}
+                <svg className="rt-svg" width={width} height={phone ? 96 : 88} aria-hidden="true">
+                  <line
+                    x1={x(now)}
+                    x2={Math.max(...scheduledVisible.map((item) => x(item.at)))}
+                    y1={(phone ? 96 : 88) / 2 + (phone ? 8 : 7)}
+                    y2={(phone ? 96 : 88) / 2 + (phone ? 8 : 7)}
+                    stroke="var(--muted-foreground)"
+                    strokeWidth={2.5}
+                  />
+                </svg>
+                {scheduleGroups.map((items) => {
+                  const first = x(items[0].at),
+                    last = Math.max(x(items.at(-1)!.at), first + (items.length > 1 ? 2 : 0)),
+                    center = (first + last) / 2,
+                    cy = (phone ? 96 : 88) / 2 + (phone ? 8 : 7);
+                  return (
+                    <Fragment key={items[0].id}>
+                      <details className="rt-future-cluster" style={{ left: center, top: cy }}>
+                        <summary
+                          aria-label={
+                            items.length > 1
+                              ? t("routes.futureCount", { count: items.length })
+                              : items[0].label
+                          }
                         >
-                          {items[0].label}
-                        </button>
-                      ) : (
-                        <span title={items[0].sourceLabel}>{items[0].label}</span>
-                      )
-                    ) : (
-                      <details className="rt-future-cluster">
-                        <summary>{t("routes.futureCount", { count: items.length })}</summary>
+                          {items.length > 1 ? (
+                            <span className="rt-capsule" style={{ width: last - first + 29 }}>
+                              {items.length}
+                            </span>
+                          ) : (
+                            <span className="rt-symbol rt-scheduled" />
+                          )}
+                        </summary>
                         <ul>
                           {items.map((item) => (
                             <li key={item.id}>
@@ -1710,6 +2129,14 @@ export function TaskBoardRoutes({
                                 >
                                   {item.label}
                                 </Link>
+                              ) : item.task ? (
+                                <button
+                                  type="button"
+                                  data-route-task={item.task.uid}
+                                  onClick={() => selectTask(item.task!)}
+                                >
+                                  {item.label}
+                                </button>
                               ) : (
                                 <b>{item.label}</b>
                               )}
@@ -1722,10 +2149,33 @@ export function TaskBoardRoutes({
                           ))}
                         </ul>
                       </details>
-                    )}
-                    <small>{momentWord(items[0].at)}</small>
-                  </div>
-                ))}
+                      {scheduleLabels.find((node) => node.id === items[0].id)?.label &&
+                        (() => {
+                          const node = scheduleLabels.find((label) => label.id === items[0].id)!;
+                          return (
+                            <span
+                              className="rt-label"
+                              style={{
+                                left: node.label!.x,
+                                top: node.label!.y - model.height,
+                                width: node.label!.width,
+                              }}
+                            >
+                              <b>
+                                {node.lines!.map((line, index) => (
+                                  <Fragment key={line}>
+                                    {index > 0 && <br />}
+                                    {line}
+                                  </Fragment>
+                                ))}
+                              </b>
+                              <small>{node.sub}</small>
+                            </span>
+                          );
+                        })()}
+                    </Fragment>
+                  );
+                })}
               </div>
             )}
             {renderPanel()}
@@ -1749,6 +2199,7 @@ export function TaskBoardRoutes({
       <BoardPager
         page={currentPage}
         pages={pageCount}
+        total={sourceIds.length}
         onChange={(value) => {
           setSourcePage(value);
           setOpen(null);
@@ -1769,8 +2220,13 @@ export function TaskBoardRoutes({
         >
           {hover.edge ? (
             <>
-              <b>{t("routes.relationTitle")}</b>
-              <RelationFacts relations={hover.edge.relations} onSelect={selectTask} />
+              <b>
+                {t(
+                  hover.edge.relations.length > 1 ? "routes.relationCount" : "routes.relationTitle",
+                  { count: hover.edge.relations.length },
+                )}
+              </b>
+              <RelationFacts relations={hover.edge.relations.slice(0, 4)} onSelect={selectTask} />
             </>
           ) : hover.node?.density ? (
             <>
@@ -1803,10 +2259,12 @@ export function BoardPager({
   page,
   pages,
   onChange,
+  total,
 }: {
   page: number;
   pages: number;
   onChange: (page: number) => void;
+  total?: number;
 }) {
   if (pages <= 1) return null;
   return (
@@ -1830,6 +2288,7 @@ export function BoardPager({
       >
         <ChevronRightIcon className="size-4" />
       </Button>
+      {total !== undefined && <small>{t("routes.pagerTotal", { count: total })}</small>}
     </nav>
   );
 }

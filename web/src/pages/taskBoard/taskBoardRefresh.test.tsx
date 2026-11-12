@@ -91,12 +91,85 @@ it("uses eight phone stations per page and clamps after tasks disappear", () => 
   fireEvent.click(screen.getByRole("button", { name: /Source/ }));
   const phone = within(view.container.querySelector(".rt-phone-order")! as HTMLElement);
   expect(phone.getByText("Task 13")).toBeTruthy();
+  expect(phone.getByText("13 tasks")).toBeTruthy();
+  expect(phone.getByText("13 total")).toBeTruthy();
   fireEvent.click(phone.getByRole("button", { name: "Next page" }));
   expect(phone.getByText("Task 1")).toBeTruthy();
   view.rerender(board(tasks.slice(0, 7)));
   expect(phone.getByText("Task 7")).toBeTruthy();
   expect(phone.queryByText("Task 13")).toBeNull();
   expect(phone.queryByRole("button", { name: "Next page" })).toBeNull();
+});
+it("selects an entire source inline and supports filtered keyboard selection", () => {
+  vi.spyOn(Date, "now").mockReturnValue(now);
+  const tasks = rows(2).map((task, index) => ({
+    ...task,
+    "omnigent.ai:group": { id: index ? "beta" : "alpha", name: index ? "Beta" : "Alpha" },
+  }));
+  const onFocus = vi.fn();
+  const view = render(board(tasks, "order", { onFocus }));
+  fireEvent.click(screen.getByRole("button", { name: "Focus" }));
+  const panel = screen.getByRole("region", { name: "Show only these" });
+  expect(panel.parentElement).toBe(view.container.querySelector(".rt-routes"));
+  fireEvent.click(within(panel).getByRole("checkbox", { name: /Source/ }));
+  expect(onFocus).toHaveBeenLastCalledWith(
+    expect.arrayContaining([JSON.stringify(["one", "alpha"]), JSON.stringify(["one", "beta"])]),
+  );
+  const input = within(panel).getByPlaceholderText(
+    "Search sources or groups; Enter toggles the first",
+  );
+  fireEvent.change(input, { target: { value: "Beta" } });
+  fireEvent.keyDown(input, { key: "Enter" });
+  expect(onFocus).toHaveBeenLastCalledWith([JSON.stringify(["one", "beta"])]);
+  fireEvent.keyDown(input, { key: "Escape" });
+  expect((input as HTMLInputElement).value).toBe("");
+  fireEvent.keyDown(input, { key: "Escape" });
+  expect(screen.queryByRole("region", { name: "Show only these" })).toBeNull();
+});
+it("counts only eligible queued groups as quiet in the current time window", () => {
+  vi.spyOn(Date, "now").mockReturnValue(now);
+  const tasks = rows(3).map((task, index) => ({
+    ...task,
+    "omnigent.ai:group": { id: `group-${index}`, name: `Group ${index}` },
+    progress: index === 1 ? ("needs-action" as const) : task.progress,
+    progressUpdated: new Date(index === 2 ? now - 100 * DAY : now - 3600000).toISOString(),
+  }));
+  render(board(tasks, "time"));
+  fireEvent.click(screen.getByRole("button", { name: "Expand all" }));
+  expect(screen.getByRole("button", { name: /1 groups had no activity/ })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /2 groups had no activity/ })).toBeNull();
+  expect(screen.queryByText("Group 2")).toBeNull();
+});
+it("continues a group's rail from the window edge when its earlier stop is outside the window", () => {
+  vi.spyOn(Date, "now").mockReturnValue(now);
+  const tasks = rows(2);
+  tasks[0].progressUpdated = new Date(now - 100 * DAY).toISOString();
+  const view = render(board(tasks, "time"));
+  fireEvent.click(screen.getByRole("button", { name: "Expand all" }));
+  expect(view.container.querySelector(".rt-rail")!.getAttribute("x1")).toBe("208");
+  expect(screen.queryByText("Task 1")).toBeNull();
+});
+it("refreshes directional phone relation counts when tasks change", () => {
+  vi.spyOn(Date, "now").mockReturnValue(now);
+  vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(390);
+  const tasks = rows(3);
+  tasks[0].relatedTo = {
+    "task-1": { relation: { next: true } },
+    "task-2": { relation: { next: true } },
+  };
+  const view = render(board(tasks));
+  fireEvent.click(screen.getByRole("button", { name: /Source/ }));
+  expect(screen.getByRole("button", { name: "Task 1" }).textContent).toContain(
+    "Connects to 2 tasks",
+  );
+  expect(screen.getByRole("button", { name: "Task 2" }).textContent).toContain(
+    "Connected from 1 tasks",
+  );
+  view.rerender(board(tasks.slice(0, 2)));
+  expect(screen.getByRole("button", { name: "Task 1" }).textContent).toContain(
+    "Connects to 1 tasks",
+  );
+  expect(screen.queryByRole("button", { name: "Task 3" })).toBeNull();
 });
 it("keeps an unresolved failure visible after the recent board window", () => {
   vi.spyOn(Date, "now").mockReturnValue(now + 6 * DAY);
@@ -166,7 +239,7 @@ it("preserves plain vertical scrolling, pans the overview and restores the origi
   });
   expect(pan.defaultPrevented).toBe(true);
   expect(map.getAttribute("data-window-from")).not.toBe(original[0]);
-  fireEvent.click(screen.getByRole("button", { name: "Now" }));
+  fireEvent.keyDown(map, { key: "0" });
   expect([map.getAttribute("data-window-from"), map.getAttribute("data-window-to")]).toEqual(
     original,
   );
@@ -201,7 +274,7 @@ it("shows scheduled native and source items with no held task and hides them at 
       scheduled: [{ id: "shared", name: "Native schedule", state: "active", next_run_at: at }],
     }),
   );
-  fireEvent.click(screen.getByText("2 scheduled items"));
+  fireEvent.click(screen.getByLabelText("2 scheduled items"));
   expect(screen.getByRole("link", { name: "Source schedule" }).getAttribute("href")).toBe(
     "/tasks/shared",
   );

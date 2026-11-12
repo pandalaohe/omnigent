@@ -1,5 +1,5 @@
 import { graphlib, layout as layoutGraph } from "@dagrejs/dagre";
-import { timeDay, timeMonday, timeMonth, timeYear } from "d3-time";
+import { timeHour, timeDay, timeMonday, timeMonth, timeYear } from "d3-time";
 import { taskIdentity, taskProgress, type BoardTask, type TaskSource } from "./taskBoardData";
 import type { TaskDisplay } from "./taskBoardDisplay";
 import {
@@ -48,8 +48,7 @@ export function routeMoment(task: BoardTask, now: number): number | undefined {
   if (["running", "user"].includes(routeState(task))) return now;
   const display = task["omnigent.ai:sourceDisplay"];
   const supplied = [
-    display?.historyState?.end,
-    display?.historyState?.last,
+    display?.historyState?.end ?? display?.historyState?.last,
     display?.lastActivity,
     task.progressUpdated,
     task["omnigent.ai:closedSeen"],
@@ -107,7 +106,13 @@ export function mapGroups(
       caches[group.source]?.display.groups?.find(
         (item) => JSON.stringify([group.source, item.id]) === group.id,
       )?.rank ?? Number.MAX_SAFE_INTEGER;
-    return rank(a) - rank(b) || a.id.localeCompare(b.id);
+    const liveSession = (group: MapGroup) =>
+      group.tasks.some((task) =>
+        task["omnigent.ai:sourceDisplay"]?.sessions?.some(
+          (session) => session.status === "running",
+        ),
+      );
+    return Number(liveSession(b)) - Number(liveSession(a)) || rank(a) - rank(b);
   });
   for (const group of colorOrder) {
     const id = JSON.parse(group.id)[1] as string,
@@ -362,7 +367,7 @@ export function orderStops(tasks: BoardTask[], room: number, collapsed = false):
     ]
       .filter((items) => items.length)
       .map((items) => ({ tasks: items, queued: items.every(routeQueued) }));
-  const sorted = [...past, ...queued];
+  const sorted = tasks;
   if (sorted.length <= room)
     return sorted.map((task) => ({ tasks: [task], queued: routeQueued(task) }));
   const keep = new Set(past.filter(routeAttention));
@@ -432,6 +437,28 @@ export interface MapDensity {
   count: number;
   tasks: BoardTask[];
 }
+export function mapAxisTicks(view: TimeWindow, width: number, minPx = 72) {
+  const rungs: [ReturnType<typeof timeHour.every>, number][] = [
+    [timeHour.every(1), HOUR],
+    [timeHour.every(2), 2 * HOUR],
+    [timeHour.every(3), 3 * HOUR],
+    [timeHour.every(6), 6 * HOUR],
+    [timeHour.every(12), 12 * HOUR],
+    [timeDay, DAY],
+    [timeDay.every(2), 2 * DAY],
+    [timeMonday, 7 * DAY],
+    [timeMonth, 30.4 * DAY],
+    [timeMonth.every(2), 61 * DAY],
+    [timeMonth.every(3), 91 * DAY],
+    [timeMonth.every(6), 182 * DAY],
+    [timeYear, 365 * DAY],
+    [timeYear.every(2), 730 * DAY],
+  ];
+  const [interval, step] =
+    rungs.find(([, duration]) => (duration * width) / (view.to - view.from) >= minPx) ??
+    rungs.at(-1)!;
+  return { ticks: interval!.range(new Date(view.from), new Date(view.to + 1)), step };
+}
 export function mapDensity(
   tasks: BoardTask[],
   view: TimeWindow,
@@ -440,12 +467,25 @@ export function mapDensity(
   cache?: SourceCache,
 ): MapDensity[] {
   const interval =
-    [timeDay, timeMonday, timeMonth, timeMonth.every(3)!, timeYear].find(
-      (item) => item.range(new Date(view.from), new Date(view.to)).length <= Math.max(2, width / 5),
-    ) ?? timeYear;
+    ([
+      [timeDay, 1],
+      [timeDay.every(2)!, 2],
+      [timeMonday, 7],
+      [timeMonth, 30.4],
+      [timeMonth.every(3)!, 91],
+      [timeMonth.every(6)!, 182],
+      [timeYear, 365],
+    ].find(([, days]) => width / ((view.to - view.from) / DAY / (days as number)) >= 4.5)?.[0] as
+      typeof timeDay | undefined) ?? timeYear;
   const buckets = new Map<number, MapDensity>();
   const put = (at: number, count: number, task?: BoardTask) => {
-    if (!Number.isFinite(at) || at > now || at < view.from || at > view.to) return;
+    if (
+      !Number.isFinite(at) ||
+      at > now ||
+      at < +timeDay.floor(new Date(view.from)) ||
+      at >= +timeDay.offset(timeDay.floor(new Date(view.to)), 1)
+    )
+      return;
     const from = +interval.floor(new Date(at)),
       to = +interval.offset(new Date(from), 1);
     const bucket = buckets.get(from) ?? { from, to, count: 0, tasks: [] };
@@ -473,7 +513,11 @@ export function mapOverview(
   width: number,
   now: number,
 ): MapDensity[] {
-  const buckets = new Map<number, MapDensity>();
+  void width;
+  const days: number[] = [];
+  for (let day = timeDay.floor(new Date(view.from)); +day <= now; day = timeDay.offset(day, 1))
+    days.push(+day);
+  const counts = new Map<number, number>();
   const sources = new Set([
     ...tasks.map((task) => task["omnigent.ai:source"]),
     ...Object.keys(caches),
@@ -482,17 +526,22 @@ export function mapOverview(
     for (const bucket of mapDensity(
       tasks.filter((task) => task["omnigent.ai:source"] === source),
       view,
-      width,
+      Number.MAX_SAFE_INTEGER,
       now,
       caches[source],
     )) {
-      const held = buckets.get(bucket.from);
-      if (held) {
-        held.count += bucket.count;
-        held.tasks.push(...bucket.tasks);
-      } else buckets.set(bucket.from, { ...bucket, tasks: [...bucket.tasks] });
+      counts.set(bucket.from, (counts.get(bucket.from) ?? 0) + bucket.count);
     }
-  return [...buckets.values()].sort((a, b) => a.from - b.from);
+  const prefix = [0];
+  for (const day of days) prefix.push(prefix.at(-1)! + (counts.get(day) ?? 0));
+  return Array.from({ length: 240 }, (_, index) => ({
+    from: view.from + (index / 240) * (now - view.from),
+    to: view.from + ((index + 1) / 240) * (now - view.from),
+    count:
+      prefix[Math.floor(((index + 1) * days.length) / 240)] -
+      prefix[Math.floor((index * days.length) / 240)],
+    tasks: [],
+  }));
 }
 export function roundedRoutePath(points: { x: number; y: number }[], radius = 16) {
   let path = `M${points[0].x} ${points[0].y}`;
@@ -526,6 +575,9 @@ export interface MapLane {
   pages?: number;
   nodes: MapNode[];
   count?: number;
+  summary?: string;
+  total?: number;
+  historyStart?: number;
 }
 export interface MapNode {
   id: string;
@@ -539,6 +591,11 @@ export interface MapNode {
   color: string;
   queued: boolean;
   label?: { x: number; y: number; width: number };
+  lines?: string[];
+  sub?: string;
+  timeCluster?: boolean;
+  hub?: boolean;
+  scheduled?: boolean;
   density?: MapDensity;
 }
 export interface MapEdge {
@@ -549,6 +606,180 @@ export interface MapEdge {
   long: boolean;
   hub: boolean;
   relations: MapRelation[];
+  points: { x: number; y: number }[];
+  badge?: { x: number; y: number };
+}
+export function routeLabelLines(text: string): string[] {
+  const tokens = text.match(/[A-Za-z0-9.\-_/]+|\s+|./g) ?? [];
+  const cost = (token: string) =>
+    /^[A-Za-z0-9.\-_/]/.test(token) ? token.length * 0.56 : /^\s/.test(token) ? 0.3 : 1;
+  const total = tokens.reduce((sum, token) => sum + cost(token), 0);
+  if (total <= 8.5) return [text];
+  let best = 1,
+    score = Infinity,
+    acc = 0;
+  tokens.forEach((token, index) => {
+    acc += cost(token);
+    if (index === tokens.length - 1 || /^[，、。）:]/.test(tokens[index + 1])) return;
+    let next = Math.max(acc, total - acc);
+    if (/^[，、]/.test(token) || /^\s/.test(token)) next -= 0.8;
+    if (Math.min(acc, total - acc) < 2) next += 9;
+    if (next < score) {
+      score = next;
+      best = index + 1;
+    }
+  });
+  return [tokens.slice(0, best).join("").trim(), tokens.slice(best).join("").trim()];
+}
+interface RoutePoint {
+  x: number;
+  y: number;
+}
+interface RouteBox extends RoutePoint {
+  w: number;
+  h: number;
+}
+export function routeSegmentHits(
+  a: RoutePoint,
+  b: RoutePoint,
+  box: RouteBox,
+  pad: number,
+): boolean {
+  let low = 0,
+    high = 1;
+  const dx = b.x - a.x,
+    dy = b.y - a.y;
+  for (const [p, q] of [
+    [-dx, a.x - box.x + pad],
+    [dx, box.x + box.w + pad - a.x],
+    [-dy, a.y - box.y + pad],
+    [dy, box.y + box.h + pad - a.y],
+  ]) {
+    if (p === 0) {
+      if (q < 0) return false;
+      continue;
+    }
+    const ratio = q / p;
+    if (p < 0) {
+      if (ratio > high) return false;
+      low = Math.max(low, ratio);
+    } else {
+      if (ratio < low) return false;
+      high = Math.min(high, ratio);
+    }
+  }
+  return true;
+}
+export const routeNodeRadius = (node: MapNode) =>
+  node.scheduled
+    ? node.x1 > node.x
+      ? 15
+      : 9
+    : node.tasks.length > 1
+      ? 15
+      : node.tasks[0] && routeState(node.tasks[0]) === "running"
+        ? node.hub
+          ? 19
+          : 17
+        : node.tasks[0] && routeState(node.tasks[0]) === "user"
+          ? 15
+          : node.tasks[0] && routeState(node.tasks[0]) === "failed"
+            ? 14
+            : node.queued
+              ? 10
+              : 12;
+export function placeMapLabels(
+  nodes: MapNode[],
+  segs: { a: RoutePoint; b: RoutePoint; half: number }[],
+  lanes: MapLane[],
+  width: number,
+  gutter: number,
+  measure: (text: string, size: number, weight: number) => number,
+) {
+  const labelled = nodes.filter((node) => node.lines?.length),
+    placed: RouteBox[] = [];
+  const boxes = labelled.map((node) => {
+    const radius = routeNodeRadius(node),
+      half = (node.x1 - node.x) / 2 + radius;
+    return {
+      x: (node.x + node.x1) / 2 - half - 2,
+      y: node.y - radius - 2,
+      w: half * 2 + 4,
+      h: radius * 2 + 4,
+    };
+  });
+  labelled.forEach((node) => {
+    if (node.hub) boxes.push({ x: node.x + 14, y: node.y - 27, w: 28, h: 22 });
+  });
+  const touches = (a: RouteBox, b: RouteBox, pad: number) =>
+    a.x < b.x + b.w + pad &&
+    b.x < a.x + a.w + pad &&
+    a.y < b.y + b.h + pad &&
+    b.y < a.y + a.h + pad;
+  const rank = (node: MapNode) =>
+    node.hub
+      ? 0
+      : (node.tasks.length === 1
+          ? { running: 1, user: 2, failed: 3, ready: 4, held: 5, done: 5, queued: 6, blocked: 6 }[
+              routeState(node.tasks[0])
+            ]
+          : 7) + (node.tasks.length > 1 ? 1 : 0);
+  [...labelled]
+    .sort((a, b) => rank(a) - rank(b) || b.x - a.x)
+    .forEach((node) => {
+      const w =
+        Math.ceil(
+          Math.max(
+            ...node.lines!.map((line) => measure(line, node.hub ? 14 : 13, 700)),
+            node.sub ? measure(node.sub, 12, 400) : 0,
+          ),
+        ) + 2;
+      const h = node.lines!.length * 17 + (node.sub ? 15 : 0),
+        gap = routeNodeRadius(node) + 4,
+        cx = (node.x + node.x1) / 2,
+        lane = lanes.find((item) => item.id === node.lane)!;
+      let found: RouteBox | undefined,
+        best = Infinity;
+      for (const dy of [-(gap + h), gap])
+        for (const dx of [
+          0,
+          10,
+          -10,
+          22,
+          -22,
+          36,
+          -36,
+          w / 2 + 4,
+          -(w / 2 + 4),
+          w / 2 + 20,
+          -(w / 2 + 20),
+        ]) {
+          const box = { x: cx + dx - w / 2, y: node.y + dy, w, h };
+          if (
+            box.x < gutter + 4 ||
+            box.x + w > width - 2 ||
+            box.y < lane.top + (width <= 620 ? 26 : 0) + 2 ||
+            box.y + h > lane.top + lane.height - 2
+          )
+            continue;
+          const cost = Math.abs(dx) + (dy > 0 ? 6 : 0);
+          if (
+            cost < best &&
+            !segs.some((segment) =>
+              routeSegmentHits(segment.a, segment.b, box, segment.half + 3),
+            ) &&
+            !placed.some((other) => touches(box, other, 4)) &&
+            !boxes.some((other) => touches(box, other, 1))
+          ) {
+            best = cost;
+            found = box;
+          }
+        }
+      if (found) {
+        node.label = { x: found.x, y: found.y, width: found.w };
+        placed.push(found);
+      }
+    });
 }
 export function mapScene(
   lanes: MapLane[],
@@ -560,7 +791,9 @@ export function mapScene(
   relations: MapRelation[],
   hubs: Map<string, Set<string>>,
   caches: Record<string, SourceCache>,
-  label: (node: MapNode) => string,
+  label: (node: MapNode) => string | { lines: string[]; sub: string },
+  measure: (text: string, size: number, weight: number) => number = (text, size) =>
+    text.length * size * 0.56,
 ) {
   const phone = width <= 620;
   if (phone && mode === "order") return { nodes: [] as MapNode[], edges: [] as MapEdge[], lanes };
@@ -606,13 +839,17 @@ export function mapScene(
         color: lane.color,
         queued: tasks.length > 0 && tasks.every(routeQueued),
         density,
+        hub: tasks.length === 1 && (hubs.get(taskIdentity(tasks[0]))?.size ?? 0) > 0,
       };
       nodes.push(node);
       lane.nodes.push(node);
       return node;
     };
     if (mode === "order") {
-      (items.get(lane.id) ?? []).forEach((item, index) => add(item.tasks, gutter + index * gap));
+      (items.get(lane.id) ?? []).forEach((item, index) => {
+        const at = gutter + index * gap;
+        add(item.tasks, at, item.tasks.length > 1 ? at + 2 : at);
+      });
       continue;
     }
     if (level === "segment") {
@@ -652,19 +889,15 @@ export function mapScene(
       pinnedGap = lane.collapsed ? 38 : 50,
       limit = pinned.length ? pinnedX - (pinned.length - 1) * pinnedGap - minimum : Infinity;
     for (const task of rest) {
-      const px = Math.min(
-          limit,
-          Math.min(right - 10, Math.max(gutter + 10, x(routeMoment(task, now)!))),
-        ),
+      const px = Math.min(limit, x(routeMoment(task, now)!)),
         previous = lane.nodes.at(-1);
       if (previous && px - previous.x1 < minimum) {
         previous.tasks.push(task);
-        previous.x1 = px;
+        previous.x1 = Math.max(px, previous.x + 2);
+        previous.timeCluster = true;
       } else add([task], px);
     }
-    pinned.forEach((task, index) =>
-      add([task], Math.max(gutter + 12, pinnedX - (pinned.length - 1 - index) * pinnedGap)),
-    );
+    pinned.forEach((task, index) => add([task], pinnedX - (pinned.length - 1 - index) * pinnedGap));
     if (view.from <= now && view.to >= now && level === "station") {
       const queue = lane.tasks.filter(routeQueued),
         end = Math.max(x(now), ...lane.nodes.map((node) => node.x1)),
@@ -679,7 +912,10 @@ export function mapScene(
         queue.length > fit || lane.collapsed ? queue.slice(0, Math.max(0, fit - 1)) : queue;
       shown.forEach((task, index) => add([task], first + index * gapQ));
       const more = queue.slice(shown.length);
-      if (more.length && fit > 0) add(more, first + shown.length * gapQ);
+      if (more.length && fit > 0) {
+        const at = first + shown.length * gapQ;
+        add(more, at, more.length > 1 ? at + 2 : at);
+      }
     }
     lane.nodes.sort((a, b) => a.x - b.x);
   }
@@ -687,6 +923,7 @@ export function mapScene(
       nodes.flatMap((node) => node.tasks.map((task) => [taskIdentity(task), node] as const)),
     ),
     edgeMap = new Map<string, MapEdge>();
+  let offset = 0;
   if (!(mode === "time" && level === "segment") && !(mode === "order" && phone))
     for (const relation of relations) {
       const a = positions.get(taskIdentity(relation.from)),
@@ -709,10 +946,10 @@ export function mapScene(
         dy = b.y - a.y,
         sign = Math.sign(dy) || 1,
         dx = Math.sign(b.x - a.x) || 1,
-        middle = a.y + sign * (a.height / 2 - 2),
+        middle = a.y + sign * (a.height / 2 - 2 + offset * 7),
         d1 = Math.abs(middle - a.y),
         d2 = Math.abs(b.y - middle),
-        rail = a.x + 26,
+        rail = a.x + (a.x1 - a.x) / 2 + 26 + ((offset + 1) % 3) * 7,
         step = Math.min(30, Math.abs(dy) / 3);
       const points =
         long || hub
@@ -722,92 +959,91 @@ export function mapScene(
             : Math.abs(a.x - b.x) <= Math.abs(dy) * 1.3
               ? [a, b]
               : [a, { x: a.x + dx * d1, y: middle }, { x: b.x - dx * d2, y: middle }, b];
+      offset = (offset + 1) % 3;
       edgeMap.set(key, {
         id: key,
         from: a,
         to: b,
         path: roundedRoutePath(points),
+        points,
         long,
         hub,
         relations: [relation],
       });
     }
   const edges = [...edgeMap.values()];
-  const occupied: { x: number; y: number; w: number; h: number }[] = nodes.map((node) => ({
-    x: node.x - 20,
-    y: node.y - 20,
-    w: node.x1 - node.x + 40,
-    h: 40,
-  }));
-  const intersects = (
-    a: { x: number; y: number },
-    b: { x: number; y: number },
-    box: { x: number; y: number; w: number; h: number },
-  ) => {
-    let low = 0,
-      high = 1;
-    const dx = b.x - a.x,
-      dy = b.y - a.y;
-    for (const [p, q] of [
-      [-dx, a.x - box.x],
-      [dx, box.x + box.w - a.x],
-      [-dy, a.y - box.y],
-      [dy, box.y + box.h - a.y],
-    ]) {
-      if (!p) {
-        if (q < 0) return false;
-        continue;
-      }
-      const ratio = q / p;
-      if (p < 0) low = Math.max(low, ratio);
-      else high = Math.min(high, ratio);
-      if (low > high) return false;
+  for (const edge of edges) {
+    if (edge.relations.length > 1) {
+      const index = Math.floor(edge.points.length / 2),
+        a = edge.points[index],
+        b = edge.points[index - 1];
+      edge.badge = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
     }
-    return true;
-  };
-  for (const node of [...nodes]
-    .filter((item) => !item.density && !lanes.find((lane) => lane.id === item.lane)?.header)
-    .sort(
-      (a, b) =>
-        Number(b.tasks.some(routeAttention)) - Number(a.tasks.some(routeAttention)) || b.x - a.x,
-    )) {
-    const text = label(node),
-      w = Math.min(
-        146,
-        Math.max(
-          64,
-          [...text].reduce((sum, char) => sum + ((char.codePointAt(0) ?? 0) > 127 ? 12 : 6.5), 0) /
-            1.6,
-        ),
-      ),
-      h = 38;
-    for (const y of [node.y - 62, node.y + 24])
-      for (const offset of [0, 10, -10, 24, -24]) {
-        if (node.label) break;
-        const x = (node.x + node.x1) / 2 - w / 2 + offset;
-        if (
-          x < gutter - 24 ||
-          x + w > width - 6 ||
-          y < node.top + 4 ||
-          y + h > node.top + node.height - 3
-        )
-          continue;
-        const box = { x, y, w, h };
-        if (
-          occupied.some(
-            (other) =>
-              box.x < other.x + other.w + 3 &&
-              other.x < box.x + box.w + 3 &&
-              box.y < other.y + other.h + 3 &&
-              other.y < box.y + box.h + 3,
-          )
-        )
-          continue;
-        if (edges.some((edge) => !edge.long && !edge.hub && intersects(edge.from, edge.to, box)))
-          continue;
-        node.label = { x, y, width: w };
-        occupied.push(box);
-      }
   }
+  const segments: { a: RoutePoint; b: RoutePoint; half: number }[] = [];
+  for (const lane of lanes) {
+    const railNodes = lane.nodes.filter((node) => !node.density),
+      thick = lane.collapsed ? 7 : mode === "time" && level === "phase" ? 9 : 11;
+    if (mode === "time" && railNodes.length) {
+      const past = railNodes.filter((node) => !node.queued),
+        first = past[0],
+        last = past.at(-1);
+      if (first && last) {
+        const earliest =
+          lane.historyStart ??
+          Math.min(
+            ...lane.tasks
+              .map((task) =>
+                Date.parse(
+                  task["omnigent.ai:sourceDisplay"]?.historyState?.end ??
+                    task["omnigent.ai:sourceDisplay"]?.historyState?.last ??
+                    "",
+                ),
+              )
+              .filter(Number.isFinite),
+          );
+        segments.push({
+          a: { x: earliest < view.from ? gutter : first.x, y: first.y },
+          b: { x: last.x1, y: last.y },
+          half: thick / 2,
+        });
+      }
+    }
+    railNodes.slice(1).forEach((node, index) =>
+      segments.push({
+        a: { x: railNodes[index].x1, y: node.y },
+        b: { x: node.x, y: node.y },
+        half: node.queued ? 2.5 : mode === "order" ? thick / 2 + 1 : thick / 2,
+      }),
+    );
+  }
+  for (const edge of edges) {
+    if (!edge.long && !edge.hub)
+      for (let i = 1; i < edge.points.length; i++)
+        segments.push({ a: edge.points[i - 1], b: edge.points[i], half: 3 });
+  }
+  if (mode === "time" && view.from <= now && now <= view.to) {
+    const at = gutter + ((now - view.from) / (view.to - view.from)) * (right - gutter);
+    segments.push({ a: { x: at, y: 0 }, b: { x: at, y: 99999 }, half: 1 });
+  }
+  for (const node of nodes) {
+    if (node.density || lanes.find((lane) => lane.id === node.lane)?.header) continue;
+    const value = label(node);
+    if (typeof value === "string") {
+      node.lines = routeLabelLines(value);
+      node.sub = "";
+    } else {
+      node.lines = value.lines;
+      node.sub = value.sub;
+    }
+    if (
+      mode === "time" &&
+      level !== "station" &&
+      node.tasks.length === 1 &&
+      !routeAttention(node.tasks[0])
+    )
+      node.lines = [];
+  }
+  placeMapLabels(nodes, segments, lanes, width, mode === "order" ? 168 : phone ? 4 : 168, measure);
   return { nodes, edges, lanes };
 }

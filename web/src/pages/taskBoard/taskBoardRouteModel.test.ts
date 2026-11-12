@@ -130,7 +130,7 @@ describe("route source projection", () => {
       pinned: false,
       future: false,
     };
-    expect(routeMoment(old, now)).toBe(Date.parse("2020-01-03T00:00:00Z"));
+    expect(routeMoment(old, now)).toBe(Date.parse("2020-01-02T00:00:00Z"));
     expect(routeMoment(task("live", "running"), now)).toBe(now);
   });
 });
@@ -192,9 +192,49 @@ describe("order folding and viewport", () => {
       now,
     );
     expect(buckets.reduce((total, bucket) => total + bucket.count, 0)).toBe(300);
+    expect(buckets).toHaveLength(240);
     expect(
       stepMapWindow({ from: now - 6 * HOUR, to: now + 6 * HOUR }, -1, now - 200 * DAY, now),
     ).toEqual({ from: now - 6 * HOUR, to: now + 6 * HOUR });
+  });
+  it("includes the first partial calendar day in historical density", () => {
+    const buckets = mapDensity(
+      [],
+      { from: Date.parse("2026-11-05T09:00:00Z"), to: now },
+      900,
+      now,
+      cache([
+        { date: "2026-11-04", count: 20 },
+        { date: "2026-11-05", count: 1 },
+        { date: "2026-11-06", count: 7 },
+      ]),
+    );
+    expect(buckets.reduce((sum, bucket) => sum + bucket.count, 0)).toBe(8);
+  });
+  it("keeps a time capsule's extent and member failures in the scene", () => {
+    const tasks = [task("first"), task("second", "failed")];
+    tasks.forEach((item, index) => {
+      item["omnigent.ai:sourceDisplay"]!.lastActivity = new Date(
+        now - HOUR + index * 10 * 60_000,
+      ).toISOString();
+    });
+    const group = mapGroups(tasks, [{ id: "example", name: "Example", source: null }], {})[0];
+    const scene = mapScene(
+      [{ ...group, top: 0, height: 136, nodes: [] }],
+      "time",
+      initialWindow(now),
+      1200,
+      now,
+      "station",
+      [],
+      new Map(),
+      {},
+      () => "Two stops",
+    );
+    expect(scene.nodes).toHaveLength(1);
+    expect(scene.nodes[0].timeCluster).toBe(true);
+    expect(scene.nodes[0].x1).toBeGreaterThan(scene.nodes[0].x);
+    expect(scene.nodes[0].tasks).toEqual(tasks);
   });
   it("draws rounded nearby connectors and omits phone order connectors", () => {
     const a = task("from", "running"),
