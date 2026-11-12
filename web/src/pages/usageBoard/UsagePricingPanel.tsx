@@ -1,5 +1,5 @@
 import { nanoid } from "nanoid";
-import { useId, useState, type ReactNode } from "react";
+import { cloneElement, useId, useState, type ReactElement } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation } from "@/lib/routing";
 import { boardPath } from "@/lib/boardFrame";
@@ -526,13 +526,30 @@ function PricingEditor({
   );
 }
 
-function Field({ label, error, children }: { label: string; error?: string; children: ReactNode }) {
+function Field({
+  label,
+  error,
+  children,
+}: {
+  label: string;
+  error?: string;
+  children: ReactElement<{ id?: string; "aria-describedby"?: string; "aria-invalid"?: boolean }>;
+}) {
+  const id = useId();
   return (
-    <label className="grid min-w-0 gap-1 text-xs">
-      <span>{label}</span>
-      {children}
-      {error ? <span className="text-destructive">{error}</span> : null}
-    </label>
+    <div className="grid min-w-0 gap-1 text-xs">
+      <label htmlFor={id}>{label}</label>
+      {cloneElement(children, {
+        id,
+        "aria-describedby": error ? `${id}-error` : undefined,
+        "aria-invalid": !!error,
+      })}
+      {error ? (
+        <span id={`${id}-error`} className="text-destructive">
+          {error}
+        </span>
+      ) : null}
+    </div>
   );
 }
 function DecimalField({

@@ -307,8 +307,11 @@ async def test_analysis_http_auth_and_real_app_pool_intake(request):
         response = await client.get(path, headers=headers)
         assert response.status_code == 200
         assert response.json()["pool_catalog"][0]["pool_id"] == "source:pool-a"
-        other = await client.get(path, headers={"X-Forwarded-Email": "other@example.test"})
+        other = await client.get(
+            path + "?include_previous=true", headers={"X-Forwarded-Email": "other@example.test"}
+        )
         assert other.status_code == 200 and other.json()["pool_catalog"] == []
+        assert other.json()["previous"]["pool_catalog"] == []
 
 
 def test_query_bound_filters_cohort_before_limit_and_reports_partial(pools, monkeypatch):
