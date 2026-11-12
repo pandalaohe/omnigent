@@ -38,7 +38,7 @@ import {
 } from "./usageBoardFormat";
 import { groupWindows, isStale, neverRead, pickWindow } from "./usageBoardSelect";
 import { readingTip, windowTip } from "./usageBoardTips";
-import { useUsageActivity } from "./usageActivityData";
+import { useUsageAccountActivity } from "./usageActivityData";
 
 import { renewalOf } from "./UsageBoardPage";
 import { UsageBalances } from "./UsageBalances";
@@ -48,12 +48,13 @@ export function UsageAccountPage() {
   const info = useServerInfo();
   const board = useUsageContextPreferences().board;
   const overview = useUsageOverview(info !== "loading" && info.usage_board_enabled === true);
-  const activity = useUsageActivity(
-    accountId,
-    info !== "loading" && info.usage_board_enabled === true,
-  );
   const [search] = useSearchParams();
   const focus = search.get("focus");
+  const activity = useUsageAccountActivity(
+    accountId,
+    focus,
+    info !== "loading" && info.usage_board_enabled === true,
+  );
   const account = overview.data?.accounts.find((item) => item.id === accountId);
 
   if (!overview.isPending && !overview.error && !account) {
@@ -136,10 +137,6 @@ export function UsageAccountPage() {
           </div>
 
           <div className="usage-account-detail">
-            <div className="mb-3">
-              <UsageBalances account={account} />
-            </div>
-
             <div className="usage-detail-grid">
               <section className="rounded-[11px] border border-border bg-card px-3.5 py-3">
                 <div className="mb-2 flex min-h-5 items-center gap-1.5 text-[13px] font-semibold">
@@ -151,7 +148,6 @@ export function UsageAccountPage() {
                     </span>
                   ) : null}
                 </div>
-                <UsageBalances account={account} />
                 {groups.length === 0 ? (
                   <div className="flex flex-col items-center gap-2 py-6">
                     <UsageRing window={null} stale size={92} />
@@ -258,6 +254,11 @@ export function UsageAccountPage() {
                     );
                   })
                 )}
+                {account.balances?.length ? (
+                  <div className="mt-3 border-t border-border pt-3 [&>div]:justify-start">
+                    <UsageBalances account={account} />
+                  </div>
+                ) : null}
               </section>
 
               <div className="grid gap-2">
@@ -271,13 +272,25 @@ export function UsageAccountPage() {
             </div>
             <details className="mt-2 rounded-[11px] border border-border bg-card px-3.5 py-3 text-sm">
               <summary className="cursor-pointer font-semibold">Usage tools</summary>
-              <UsageCostCard
-                accounts={activity.data?.accounts ?? []}
-                account={account}
-                now={activity.data?.generated_at ?? Date.now() / 1000}
-                fee={board.fees?.[account.id]}
-              />
-              <UsageByModel accounts={activity.data?.accounts ?? []} />
+              {focus && !activity.data?.accounts.length ? (
+                <p className="pt-2 text-xs text-muted-foreground">
+                  {activity.error
+                    ? "Cost could not be read"
+                    : activity.isPending
+                      ? "Reading cost…"
+                      : "Not reported · No proven usage for this pool."}
+                </p>
+              ) : (
+                <>
+                  <UsageCostCard
+                    accounts={activity.data?.accounts ?? []}
+                    account={account}
+                    now={activity.data?.generated_at ?? Date.now() / 1000}
+                    fee={focus ? undefined : board.fees?.[account.id]}
+                  />
+                  <UsageByModel accounts={activity.data?.accounts ?? []} />
+                </>
+              )}
             </details>
             <details className="mt-2 rounded-[11px] border border-border bg-card px-3.5 py-3 text-sm">
               <summary className="cursor-pointer font-semibold">Records</summary>

@@ -175,7 +175,15 @@ def test_account_detail_keyboard_ranges_and_return(
     first.get_by_role("link", name="Example plan 0 Pool B", exact=True).focus()
     page.keyboard.press("Enter")
     expect(page.locator("[data-pool]").first).to_have_attribute("data-pool", "Pool B")
-    expect(page.get_by_text("Not reported · No proven usage for this pool.")).to_be_visible()
+    expect(
+        page.locator(".usage-detail-cost").get_by_text(
+            "Not reported · No proven usage for this pool."
+        )
+    ).to_be_visible()
+    tools = page.get_by_text("Usage tools", exact=True).locator("..")
+    tools.locator("summary").click()
+    expect(tools.get_by_text("Not reported · No proven usage for this pool.")).to_be_visible()
+    expect(tools).not_to_contain_text("$12.34")
     # The relation read is real, but this fixture proves no activity channel.
     expect(page.get_by_role("group", name="Cost time range")).not_to_contain_text("$12.34")
     page.get_by_role("link", name="Usage board", exact=True).click()

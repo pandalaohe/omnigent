@@ -402,6 +402,22 @@ it("keeps imperative account navigation and back/settings links inside a frame",
 });
 
 describe("Account detail composition", () => {
+  it("shows each balance once in Quota after the card windows", () => {
+    const data = usageBoardData();
+    const account = data.accounts[0];
+    account.balances = [{ id: "balance", remaining: 298.24, unit: "CNY" }];
+    account.balance_freshness = "fresh";
+    mocks.overview.current = { ...LOADED, data };
+    renderBoard(`/usage/board/${encodeURIComponent(account.id)}`);
+    const balance = screen.getByText("¥298.24");
+    const quota = screen.getByText("Quota", { exact: true }).closest("section")!;
+    expect(quota.contains(balance)).toBe(true);
+    const rings = within(quota).getAllByTestId("usage-ring");
+    expect(
+      rings.at(-1)!.compareDocumentPosition(balance) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
   it("prioritizes the requested quota group and retains support workflows", () => {
     const data = usageBoardData();
     const account = data.accounts[0];
@@ -456,9 +472,9 @@ describe("Mounted model pools page", () => {
 });
 
 describe("Proven pool usage", () => {
-  it("keeps all cost cells and model detail inside the selected pool", async () => {
+  it.each(["tokens", "money"])("scopes %s tools to the selected pool", async (unit) => {
     const account = usageBoardData().accounts[0].id;
-    mocks.board.current = { ...(mocks.board.current as object), unit: "tokens" };
+    mocks.board.current = { ...(mocks.board.current as object), unit };
     const totals = sampleTotals(3.2, 1000);
     const now = Date.now() / 1000;
     const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(
@@ -466,7 +482,16 @@ describe("Proven pool usage", () => {
         new Response(
           JSON.stringify({
             generated_at: now,
-            accounts: [],
+            accounts: [
+              {
+                account,
+                span: { requested_from: now - 86400, counted_from: now - 86400, until: now },
+                totals: sampleTotals(99, 99999),
+                series: [],
+                previous: null,
+                models: [{ model: "parent-model", ...sampleTotals(99, 99999) }],
+              },
+            ],
             previous: {
               generated_at: now,
               span: {
@@ -562,13 +587,54 @@ describe("Proven pool usage", () => {
       renderBoard(`/usage/board/${encodeURIComponent(account)}?focus=Pool%20A`);
       const cells = screen.getByRole("group", { name: "Cost time range" });
       await waitFor(() => expect(within(cells).getAllByText("$3.20")).toHaveLength(3));
-      await screen.findByText("Previous $1.20", { exact: true });
+      await within(cells.closest("section")!).findByText("Previous $1.20", { exact: true });
       fireEvent.click(screen.getByText("Cost breakdown", { exact: true }));
       expect(
-        screen.getByText("selected-model", { exact: true }).parentElement?.textContent,
+        within(screen.getByText("Cost breakdown", { exact: true }).closest("details")!).getByText(
+          "selected-model",
+          { exact: true },
+        ).parentElement?.textContent,
       ).toContain("$3.20");
       expect(screen.queryByText("other-model", { exact: true })).toBeNull();
       expect(within(cells).queryByText("$99.00")).toBeNull();
+      fireEvent.click(screen.getByText("Usage tools", { exact: true }));
+      const tools = screen.getByText("Usage tools", { exact: true }).closest("details")!;
+      fireEvent.click(within(tools).getByText("By model", { exact: true }));
+      expect(within(tools).getByText("selected-model", { exact: true })).toBeTruthy();
+      expect(
+        within(tools).getAllByText(unit === "tokens" ? "1K" : "$3.20", { exact: true }),
+      ).toHaveLength(2);
+      expect(tools.textContent).not.toContain("99,999");
+      expect(tools.textContent).not.toContain("parent-model");
+      expect(tools.textContent).not.toContain("other-model");
+    } finally {
+      fetch.mockRestore();
+    }
+  });
+
+  it("keeps Usage tools unknown when the focused pool has no proven cohort", async () => {
+    const account = usageBoardData().accounts[0].id;
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () =>
+        new Response(
+          JSON.stringify({
+            generated_at: Date.now() / 1000,
+            accounts: [{ account, totals: sampleTotals(99, 99999), series: [], previous: null }],
+            pool_catalog: [],
+            pools: [],
+            rows: [],
+          }),
+        ),
+    );
+    try {
+      renderBoard(`/usage/board/${encodeURIComponent(account)}?focus=Unproven`);
+      fireEvent.click(screen.getByText("Usage tools", { exact: true }));
+      const tools = screen.getByText("Usage tools", { exact: true }).closest("details")!;
+      expect(
+        await within(tools).findByText("Not reported · No proven usage for this pool."),
+      ).toBeTruthy();
+      expect(tools.textContent).not.toContain("$99.00");
+      expect(within(tools).queryByRole("region", { name: "Cost" })).toBeNull();
     } finally {
       fetch.mockRestore();
     }
