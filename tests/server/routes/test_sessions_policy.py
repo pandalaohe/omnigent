@@ -712,7 +712,7 @@ async def test_input_empty_text_skips_policy():
 
 
 @pytest.mark.asyncio
-async def test_input_ask_approved_falls_through_to_allow():
+async def test_input_ask_approved_falls_through_to_allow(monkeypatch):
     """A REQUEST-phase ASK the user APPROVES collapses to ALLOW.
 
     Regression guard for the request-phase approval round-trip. The
@@ -724,11 +724,20 @@ async def test_input_ask_approved_falls_through_to_allow():
     ``[Denied by policy]`` — the approval card was published but nothing
     waited on it.
     """
+    from types import SimpleNamespace
+
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.spec.types import DEFAULT_ASK_TIMEOUT
+
+    assert DEFAULT_ASK_TIMEOUT == 86400
+    clock = [1000.0]
+    monkeypatch.setattr(orchestration, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     conv_store = _FakeConversationStore()
     agent_store = _FakeAgentStore(agent=_make_agent())
     conv = conv_store.get_conversation("sess_1")
     body = _make_user_message_body("delete the file /tmp/policy-demo.txt")
 
+    body.data["_input_admission_deadline"] = 1300.0
     spec = _make_spec_with_guardrails()
     loaded = LoadedAgent(spec=spec, workdir="/tmp/fake")
     ask_result = PolicyResult(
@@ -761,6 +770,7 @@ async def test_input_ask_approved_falls_through_to_allow():
         :returns: ``True`` — the user clicked Approve.
         """
         held_phases.append(phase)
+        clock[0] += 600.0
         return True
 
     with (
@@ -788,6 +798,8 @@ async def test_input_ask_approved_falls_through_to_allow():
     # (the regressed "pending"/silent-deny path); a non-REQUEST phase
     # would mean the wrong gate fired.
     assert held_phases == [Phase.REQUEST]
+    assert body.data["_input_admission_deadline"] == 1300.0
+    assert body.data["_input_approval_wait_seconds"] == 600.0
     # Approve -> None -> the /events handler forwards the message. A dict
     # here would mean the message was wrongly blocked despite approval.
     assert result is None

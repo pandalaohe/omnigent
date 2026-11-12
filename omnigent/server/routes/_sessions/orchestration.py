@@ -254,6 +254,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _acp_effort_options_cache,
     _deferred_elicitation_clear_tasks,
     _detached_elicitation_tasks,
+    _input_admission_deadline,
     _intentional_runner_stop_locks,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
@@ -9059,7 +9060,7 @@ def _build_native_terminal_message_event(
     if body.data.get("_input_admission_required") is True:
         event["input_admission_required"] = True
         event["input_id"] = event.get("stable_id") or uuid.uuid4().hex
-        event["input_admission_deadline"] = time.time() + _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S
+        event["input_admission_deadline"] = _input_admission_deadline(body.data)
     event.update(input_attributes(input_delivery))
     # Carry the persisted override in-band like the non-native forwards: a
     # runner whose session cache is cold (fresh process, missed init) must
@@ -9183,15 +9184,16 @@ async def _forward_native_terminal_message(
     try:
         if startup_context is not None:
             startup_context.forward_started = True
-        await claim_retry_forward(
-            session_id, event, deadline=time.time() + _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S
+        forward_deadline = event.get("input_admission_deadline") or _input_admission_deadline(
+            body.data
         )
+        await claim_retry_forward(session_id, event, deadline=forward_deadline)
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events?stream=true"
             if harness == "claude-native" and body.data.get("confirm_delivery") is True
             else f"/v1/sessions/{session_id}/events",
             json=event,
-            timeout=_CLAUDE_NATIVE_MESSAGE_TIMEOUT_S,
+            timeout=max(0.001, forward_deadline - time.time()) + 5.0,
             **forward_options,
         )
         _logger.info(
@@ -10353,15 +10355,21 @@ async def _forward_event_to_runner(
             runner_body["input_admission_deadline"] = (
                 startup_context.recovery_deadline
                 if startup_context is not None and startup_context.recovery_id is not None
-                else time.time() + _RUNNER_FORWARD_TIMEOUT.read
+                else _input_admission_deadline(body.data)
             )
-        await claim_retry_forward(
-            session_id, runner_body, deadline=time.time() + _RUNNER_FORWARD_TIMEOUT.read
-        )
+        forward_deadline = runner_body.get(
+            "input_admission_deadline"
+        ) or _input_admission_deadline(body.data)
+        await claim_retry_forward(session_id, runner_body, deadline=forward_deadline)
         _forward_resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=runner_body,
-            timeout=_RUNNER_FORWARD_TIMEOUT,
+            timeout=httpx.Timeout(
+                max(0.001, forward_deadline - time.time()) + 5.0,
+                connect=_RUNNER_FORWARD_TIMEOUT.connect,
+                write=_RUNNER_FORWARD_TIMEOUT.write,
+                pool=_RUNNER_FORWARD_TIMEOUT.pool,
+            ),
         )
         # httpx only raises on transport errors, so a rejection (e.g. a 400 on a
         # malformed body, or a 501 from a runner with no process manager) would
@@ -13648,6 +13656,7 @@ async def _evaluate_input_policy(
     # deciding policy's writes only on accept (POLICIES.md §7.2). Accept ->
     # ALLOW (fall through to forward the message); decline / timeout ->
     # DENY (fail-closed).
+    approval_started = time.monotonic()
     try:
         approved = await _hold_native_ask_gate(
             request,
@@ -13663,6 +13672,15 @@ async def _evaluate_input_policy(
             "verdict": "deny",
             "reason": exc.args[0] or "Denied by policy",
         }
+    finally:
+        waited = max(0.0, time.monotonic() - approval_started)
+        if isinstance(request, Request):
+            request.state.input_approval_wait_seconds = (
+                getattr(request.state, "input_approval_wait_seconds", 0.0) + waited
+            )
+        body.data["_input_approval_wait_seconds"] = (
+            body.data.get("_input_approval_wait_seconds", 0.0) + waited
+        )
     if approved:
         return None
     return {

@@ -53,7 +53,7 @@ CODEX_NATIVE_ORIGIN_UNKNOWN = "unknown"
 # Bound how long a sub-agent dispatch can wait for a start acknowledgment.
 # A timeout reports uncertain launch status, not proof that the process is dead.
 _SUBAGENT_LAUNCH_TIMEOUT_S_ENV = "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S"
-_DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S = 180.0
+_DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S = 300.0
 # Interval for the background sweep in the runner entrypoint.
 SUBAGENT_LAUNCH_REAP_INTERVAL_S = 30.0
 
@@ -65,7 +65,7 @@ def resolve_subagent_launch_timeout_s() -> float:
     Values ``<= 0`` disable the reaper. A non-numeric override is rejected
     with a warning and falls back to the default.
 
-    :returns: The budget in seconds, e.g. ``180.0``.
+    :returns: The budget in seconds, e.g. ``300.0``.
     """
     raw = os.environ.get(_SUBAGENT_LAUNCH_TIMEOUT_S_ENV, "").strip()
     if not raw:
@@ -201,10 +201,8 @@ class _SubagentWorkEntry:
     :param corrected_status: The provisional status this terminal report
         overturned, e.g. ``"cancelled"`` when a confirmed completion
         corrected an optimistic cancellation. ``None`` for a direct report.
-    :param launch_timed_out: Whether the recorded ``failed`` came from the
-        launch-liveness reaper rather than from the child itself. Such a
-        failure is a guess ("no start acknowledgment"), so a genuine
-        terminal edge from the child afterwards must replace it.
+    :param launch_timed_out: Whether launch confirmation exceeded its budget.
+        The child remains tracked until a real start or terminal edge arrives.
     :param recovered: Whether recovery rebuilt this entry for a turn the
         parent did not dispatch. Such an entry never reads as a parent
         dispatch, so a peer turn it is parented to is still kept as a copy.
@@ -672,8 +670,9 @@ def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | No
     if entry.recovery_result is not None:
         entry.recovery_turn_started = True
     entry.parent_turn_consumed = False
-    if entry.status in {"launching", "waiting"}:
+    if entry.status in {"launching", "launch_unconfirmed", "waiting"}:
         entry.status = "running"
+        entry.launch_timed_out = False
     return entry
 
 
@@ -803,7 +802,7 @@ def list_active_codex_native_work(parent_session_id: str) -> list[_SubagentWorkE
     return [
         entry
         for entry in list_subagent_work(parent_session_id)
-        if entry.status in {"launching", "running", "waiting"}
+        if entry.status in {"launching", "launch_unconfirmed", "running", "waiting"}
         and is_codex_native_subagent_wrapper(entry.wrapper_label)
     ]
 
@@ -1523,6 +1522,7 @@ def mark_subagent_work_terminal(
             entry.output = output
             entry.completed_at = time.time()
         return _deliver_subagent_completion(entry, result_key)
+    entry.launch_timed_out = False
     entry.status = status
     entry.output = output
     entry.completed_at = time.time()
@@ -1692,6 +1692,30 @@ def _remember_terminal_identity(entry: _SubagentWorkEntry) -> None:
         _subagent_retained_state_parents[entry.child_session_id] = entry.parent_session_id
 
 
+def report_subagent_launch_unconfirmed(child_session_id: str) -> _SubagentDeliveryAck:
+    """Enqueue a launch observation without consuming the child's eventual result."""
+    entry = get_subagent_work(child_session_id)
+    inbox = _session_inboxes_ref.get(entry.parent_session_id) if entry is not None else None
+    if entry is None or inbox is None:
+        return _SubagentDeliveryAck(entry, False, False, "missing_parent_inbox")
+    inbox.put_nowait(
+        {
+            "type": "sub_agent",
+            "task_id": entry.child_session_id,
+            "handle_id": entry.child_session_id,
+            "conversation_id": entry.child_session_id,
+            "work_id": entry.work_id,
+            "agent": entry.agent,
+            "title": entry.title,
+            "status": "launch_unconfirmed",
+            "output": (
+                "Launch is unconfirmed. Keep checking this child; do not create a replacement."
+            ),
+        }
+    )
+    return _SubagentDeliveryAck(entry, True, True, "launch_unconfirmed")
+
+
 def reap_stalled_subagent_launches(
     *,
     now: float | None = None,
@@ -1699,67 +1723,41 @@ def reap_stalled_subagent_launches(
     mark_terminal: MarkSubagentTerminalAndWake | None = None,
     child_statuses: Mapping[str, str | None] | None = None,
 ) -> list[_SubagentWorkEntry]:
-    """
-    Fail sub-agent dispatches stuck in ``launching`` beyond the liveness budget.
+    """Report missing launch proof without declaring the child dead.
 
-    A dispatch with no running/waiting/terminal status acknowledgment can
-    otherwise remain pending forever. Missing acknowledgment does not prove
-    that the child process never started. Each reaped entry is
-    marked ``failed`` and its failure is delivered to the parent inbox through
-    ``mark_terminal``.
-
-    :param now: Clock override for tests, e.g. ``time.time()``.
-    :param timeout_s: Budget override for tests; defaults to
-        :func:`resolve_subagent_launch_timeout_s`.
-    :param mark_terminal: Terminal-delivery callback. Production passes the
-        app's ``mark_subagent_terminal_and_wake`` seam so the reaped failure
-        also schedules the parent wake POST — the sole signal that rouses an
-        idle parent to drain its inbox. Defaults to the inbox-only
-        :func:`mark_subagent_work_terminal`.
-    :param child_statuses: Fresh server statuses for expired dispatches. Running
-        children are promoted; terminal children await normal result delivery.
-    :returns: The entries that were failed by this sweep.
+    Unknown children remain tracked and are checked on subsequent sweeps.
+    Real terminal statuses are left to normal result delivery.
     """
     budget = resolve_subagent_launch_timeout_s() if timeout_s is None else timeout_s
     if budget <= 0:
         return []
-    deliver = mark_subagent_work_terminal if mark_terminal is None else mark_terminal
     current = time.time() if now is None else now
     reaped: list[_SubagentWorkEntry] = []
     for entry in list(_subagent_work_by_child.values()):
-        if entry.status != "launching":
+        if entry.status not in {"launching", "launch_unconfirmed"}:
             continue
         if current - entry.created_at < budget:
             continue
         status = child_statuses.get(entry.child_session_id) if child_statuses else None
-        if status in {"running", "waiting"}:
+        if status in {"running", "in_progress", "waiting"}:
             mark_subagent_work_started(entry.child_session_id)
             continue
         if status in _SUBAGENT_TERMINAL_STATUSES:
             continue
+        if entry.launch_timed_out:
+            continue
         _logger.warning(
-            "Sub-agent dispatch stuck in launching for %.0fs; failing it: parent=%s child=%s",
+            "Sub-agent launch unconfirmed after %.0fs: parent=%s child=%s",
             current - entry.created_at,
             entry.parent_session_id,
             entry.child_session_id,
         )
         entry.launch_timed_out = True
-        deliver(
-            entry.child_session_id,
-            status="failed",
-            terminal=TerminalEnvelope(
-                child_id=entry.child_session_id,
-                parent_id=entry.parent_session_id,
-                status="failed",
-                event_kind="dispatch_failed",
-                error={"code": "launch_ack_timeout", "message": "No start acknowledgment."},
-            ),
-            output=(
-                f"Error: no start acknowledgment for sub-agent {entry.agent!r} "
-                f"title {entry.title!r} within {budget:.0f}s of dispatch. "
-                "The child may still be running; inspect its session before retrying."
-            ),
-        )
+        entry.status = "launch_unconfirmed"
+        if mark_terminal is None:
+            report_subagent_launch_unconfirmed(entry.child_session_id)
+        else:
+            mark_terminal(entry.child_session_id, status="launch_unconfirmed", output=None)
         reaped.append(entry)
     return reaped
 
@@ -1780,8 +1778,8 @@ async def run_subagent_launch_reaper(
 
     :param interval_s: Seconds between sweeps, e.g. ``30.0``.
     :param mark_terminal: Terminal-delivery callback forwarded to each sweep;
-        the entrypoint passes the app's wake-scheduling seam so a reaped
-        failure wakes the parent, not just its inbox.
+        the entrypoint passes the app's wake-scheduling seam so a launch
+        observation wakes the parent.
     :param reconcile_pending: Refresh recovered work awaiting remote completion.
     :param child_status: Read a child's current server status before timing it out.
     :param check_remote_members: Slow liveness check for remote members that
@@ -1796,7 +1794,10 @@ async def run_subagent_launch_reaper(
             statuses: dict[str, str | None] = {}
             if child_status is not None and budget > 0:
                 for entry in list(_subagent_work_by_child.values()):
-                    if entry.status == "launching" and now - entry.created_at >= budget:
+                    if (
+                        entry.status in {"launching", "launch_unconfirmed"}
+                        and now - entry.created_at >= budget
+                    ):
                         statuses[entry.child_session_id] = await child_status(
                             entry.child_session_id
                         )
@@ -2025,8 +2026,9 @@ def _format_subagent_wake_notice(
     identity = f"{agent}/{title}"
     if placement_label:
         identity = f"{identity} [{placement_label}]"
+    outcome = "launch unconfirmed" if status == "launch_unconfirmed" else f"finished ({status})"
     notice = (
-        f"[System: sub-agent {identity} finished ({status}) — "
+        f"[System: sub-agent {identity} {outcome} — "
         f"{pending} {noun} waiting in inbox. Call sys_read_inbox to collect.]"
     )
     if status == "failed" and output:

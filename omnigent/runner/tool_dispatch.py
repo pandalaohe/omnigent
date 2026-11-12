@@ -33,6 +33,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -343,10 +344,13 @@ _HOST_RESTART_TOOLS = frozenset({"sys_host_restart"})
 # window only for creates that present it, so web UI creates do not spend
 # the agent's budget.
 _AGENT_CREATE_HEADERS = {CREATE_ORIGIN_HEADER: CREATE_ORIGIN_AGENT}
-# Leave headroom below the relay's 300 s cap for returning a created handle.
-_SESSION_CREATE_TIMEOUT = httpx.Timeout(30.0, read=90.0)
-_SESSION_CREATE_TOOL_TIMEOUT_S = 240.0
-_SESSION_CREATE_FINALIZE_TIMEOUT_S = 90.0
+# The relay leaves response headroom above this five-minute startup budget.
+_SESSION_CREATE_TIMEOUT = httpx.Timeout(60.0, read=300.0)
+_SESSION_CREATE_TOOL_TIMEOUT_S = 305.0
+_SESSION_CREATE_FINALIZE_TIMEOUT_S = 300.0
+_SESSION_START_DEADLINE: ContextVar[float | None] = ContextVar(
+    "session_start_deadline", default=None
+)
 _INITIAL_MESSAGE_LABEL = "omnigent.initial_message"
 _INITIAL_MESSAGE_LABEL_RETRY_DELAY_S = 0.5
 _SESSION_CREATE_DELIVERIES: set[asyncio.Task[str]] = set()
@@ -2245,7 +2249,7 @@ _HOST_NAME_CACHE: dict[str, str] = {}
 # How long a remote create waits for the child's runner to come online when
 # the first message POST is refused, and how often it rechecks. Tests patch
 # these to stay fast.
-_REMOTE_CHILD_READY_TIMEOUT_S = 120.0
+_REMOTE_CHILD_READY_TIMEOUT_S = 300.0
 _REMOTE_CHILD_READY_POLL_S = 3.0
 
 # How long a by-id send to an existing child waits for its runner after the
@@ -3814,7 +3818,10 @@ async def _execute_subagent_tool(
             )
         child_wrapper_label = _session_wrapper_label(existing)
         existing_work = _subagent_work.get_subagent_work(child_session_id)
-        if existing_work is not None and existing_work.status == "launching":
+        if existing_work is not None and existing_work.status in {
+            "launching",
+            "launch_unconfirmed",
+        }:
             # The child's turn hasn't started streaming yet, so there is no
             # active turn to inject into and a send now could race a parallel
             # start. Ask the caller to retry once it is running (a matter of a
@@ -4982,7 +4989,7 @@ async def _send_to_existing_session(
         workspace=_optional_string(snap_data.get("workspace")),
     )
     existing_work = _subagent_work.get_subagent_work(target_session_id)
-    if existing_work is not None and existing_work.status == "launching":
+    if existing_work is not None and existing_work.status in {"launching", "launch_unconfirmed"}:
         # No active turn to inject into yet; a send now could race a parallel
         # start. Ask the caller to retry once it is running.
         return (
@@ -5328,20 +5335,30 @@ async def _wait_for_runner_online(
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param child_session_id: The cross-host child session id.
-    :param timeout_s: Budget override; defaults to 120 s.
+    :param timeout_s: Budget override; defaults to 300 s.
     :returns: ``True`` when the child's ``runner_online`` became true.
     """
     timeout = _REMOTE_CHILD_READY_TIMEOUT_S if timeout_s is None else timeout_s
+    chain_deadline = _SESSION_START_DEADLINE.get()
+    if chain_deadline is not None:
+        timeout = min(timeout, max(0.0, chain_deadline - time.time()))
     deadline = time.monotonic() + timeout
     while True:
-        snapshot = await _fetch_session_metadata(
-            server_client, child_session_id, include_liveness=True
-        )
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining <= 0:
+            return False
+        try:
+            async with asyncio.timeout(remaining):
+                snapshot = await _fetch_session_metadata(
+                    server_client, child_session_id, include_liveness=True
+                )
+        except TimeoutError:
+            return False
         if snapshot is not None and snapshot.get("runner_online") is True:
             return True
         if time.monotonic() >= deadline:
             return False
-        await asyncio.sleep(_REMOTE_CHILD_READY_POLL_S)
+        await asyncio.sleep(min(_REMOTE_CHILD_READY_POLL_S, max(0.0, deadline - time.monotonic())))
 
 
 async def _post_created_child_message(
@@ -5356,7 +5373,7 @@ async def _post_created_child_message(
     The create itself never carries the message: on another host the server
     stores ``initial_items`` as history only, so the first turn runs only
     when the message reaches the child's own runner. When the POST is
-    refused because that runner is not online yet, poll for up to 120 s and
+    refused because that runner is not online yet, poll within the shared startup budget and
     post once more.
 
     :param server_client: HTTP client pointed at the Omnigent server.
@@ -5618,7 +5635,11 @@ async def _finalize_created_session(
     _SESSION_CREATE_DELIVERIES.add(task)
     task.add_done_callback(_SESSION_CREATE_DELIVERIES.discard)
     # Caller interruption detaches; delivery retains the message request's lifetime.
-    done, _ = await asyncio.wait({task}, timeout=_SESSION_CREATE_FINALIZE_TIMEOUT_S)
+    deadline = _SESSION_START_DEADLINE.get()
+    remaining = _SESSION_CREATE_FINALIZE_TIMEOUT_S
+    if deadline is not None:
+        remaining = min(remaining, max(0.0, deadline - time.time()))
+    done, _ = await asyncio.wait({task}, timeout=remaining)
     return task.result() if done else pending()
 
 
@@ -6008,6 +6029,7 @@ async def _execute_session_create(
     runner_workspace: Path | None = None,
 ) -> str:
     progress = _SessionCreateProgress()
+    token = _SESSION_START_DEADLINE.set(time.time() + min(300.0, _SESSION_CREATE_TOOL_TIMEOUT_S))
     try:
         async with asyncio.timeout(_SESSION_CREATE_TOOL_TIMEOUT_S):
             return await _execute_session_create_impl(
@@ -6043,6 +6065,9 @@ async def _execute_session_create(
                 ),
             }
         )
+
+    finally:
+        _SESSION_START_DEADLINE.reset(token)
 
 
 async def _execute_session_create_impl(
@@ -13798,7 +13823,10 @@ async def _cancel_subagent_task(
         and entry.status == "failed"
         and await _native_child_pane_alive(str(task_id), entry.wrapper_label)
     )
-    if entry.status not in ("launching", "running", "waiting") and not can_stop_failed:
+    if (
+        entry.status not in ("launching", "launch_unconfirmed", "running", "waiting")
+        and not can_stop_failed
+    ):
         return _cached_subagent_cancel_result(str(task_id), entry.status)
     if is_native_subagent_wrapper_label(
         entry.wrapper_label

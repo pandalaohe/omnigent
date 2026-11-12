@@ -492,7 +492,7 @@ _DEVIN_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Devin"
 _PI_NATIVE_WRAPPER_LABEL_VALUE = PI_NATIVE_CODING_AGENT.wrapper_label
 
 
-_CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 30.0
+_CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 300.0
 
 
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
@@ -656,7 +656,7 @@ _SNAPSHOT_RUNNER_TIMEOUT_S = 2.0
 _RUNNER_RELAY_READY_TIMEOUT_S = 5.0
 
 
-_RUNNER_FORWARD_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=10.0)
+_RUNNER_FORWARD_TIMEOUT = httpx.Timeout(connect=5.0, read=305.0, write=60.0, pool=10.0)
 
 
 # Event types clients post; ``/v1/info`` advertises these as ``session_event_types``.
@@ -1539,3 +1539,12 @@ get_caps = _FacadeCallable("get_caps")
 session_stream = _FacadeAttrProxy("session_stream")
 user_session_stream = _FacadeAttrProxy("user_session_stream")
 _ELICITATION_MODE = _FacadeValue("_ELICITATION_MODE")
+
+
+def _input_admission_deadline(data: dict[str, Any]) -> float:
+    """Keep the caller's startup deadline, bounded by the local admission budget."""
+    deadline = time.time() + _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S
+    requested = data.get("_input_admission_deadline")
+    if isinstance(requested, (int, float)) and not isinstance(requested, bool):
+        deadline = min(deadline, requested)
+    return deadline

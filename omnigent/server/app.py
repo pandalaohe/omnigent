@@ -3610,8 +3610,10 @@ def create_app(
                     error_phase=exc.phase.value,
                 ),
             )
+        waited = getattr(request.state, "input_approval_wait_seconds", 0.0)
         return JSONResponse(
             status_code=exc.http_status,
+            headers={"X-Omnigent-Approval-Wait-Seconds": str(waited)} if waited > 0 else None,
             content={
                 "error": {
                     "code": exc.code,

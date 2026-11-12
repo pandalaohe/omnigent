@@ -19,6 +19,7 @@ import httpx
 import pytest
 
 from omnigent.runner import create_runner_app, subagent_work
+from tests._helpers.polling import poll_until_async
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient
 
@@ -103,8 +104,10 @@ async def _strand_a_completion(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("unconfirmed", [False, True])
 async def test_reconnect_redelivers_wake_stranded_by_server_outage(
     _no_wake_backoff: list[float],
+    unconfirmed: bool,
 ) -> None:
     """The catch-up scan must re-POST a wake that failed during an outage.
 
@@ -134,7 +137,18 @@ async def test_reconnect_redelivers_wake_stranded_by_server_outage(
     )
     try:
         async with _runner_client(app) as client:
-            await _strand_a_completion(client, server_client, parent_id, child_id)
+            if unconfirmed:
+                entry = subagent_work.get_subagent_work(child_id)
+                subagent_work.reap_stalled_subagent_launches(
+                    now=entry.created_at + 301,
+                    mark_terminal=app.state.mark_subagent_terminal_and_wake,
+                )
+                await poll_until_async(lambda: len(server_client.failed_posts) == 3, timeout_s=5)
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                assert entry.status == "launch_unconfirmed" and not entry.delivered
+            else:
+                await _strand_a_completion(client, server_client, parent_id, child_id)
             assert session_inbox.qsize() == 1, "completion must be in the parent inbox"
 
             # Recovery: the server is back and the tunnel reconnected.
@@ -157,6 +171,21 @@ async def test_reconnect_redelivers_wake_stranded_by_server_outage(
             assert "waiting in inbox" in notice_text, (
                 f"Re-delivered POST is not a wake notice: {notice_text!r}"
             )
+            if unconfirmed:
+                observation = session_inbox.get_nowait()
+                assert observation["handle_id"] == child_id
+                assert observation["status"] == "launch_unconfirmed"
+                assert "terminal" not in observation
+                response = await client.post(
+                    f"/v1/sessions/{child_id}/events",
+                    json={
+                        "type": "external_session_status",
+                        "data": {"status": "idle", "output": "REAL_DONE"},
+                    },
+                )
+                assert response.status_code == 204
+                assert session_inbox.get_nowait()["status"] == "completed"
+                assert entry.delivered
     finally:
         subagent_work.unregister_subagent_work(child_id)
         subagent_work._session_inboxes_ref.pop(parent_id, None)

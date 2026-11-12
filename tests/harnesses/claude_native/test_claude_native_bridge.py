@@ -22172,3 +22172,33 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved)
         }
     else:
         assert settings_path.read_bytes() == original
+
+
+@pytest.mark.asyncio
+async def test_relay_returns_created_handle_after_inner_startup_budget(monkeypatch):
+    from omnigent.runner import tool_dispatch
+    from omnigent.runtime.tool_call_deadline import ToolCallDeadline
+
+    class LateDeadline(ToolCallDeadline):
+        def __init__(self, seconds):
+            super().__init__(seconds)
+            self._started -= tool_dispatch._SESSION_CREATE_TOOL_TIMEOUT_S + 1
+
+    assert claude_native_bridge._TOOL_CALL_TIMEOUT_S > tool_dispatch._SESSION_CREATE_TOOL_TIMEOUT_S
+    assert (
+        claude_native_bridge._TOOL_RELAY_POST_TIMEOUT_S > claude_native_bridge._TOOL_CALL_TIMEOUT_S
+    )
+    monkeypatch.setattr(claude_native_bridge, "ToolCallDeadline", LateDeadline)
+
+    async def executor(_name, _arguments):
+        return {"conversation_id": "existing_child", "status": "pending"}
+
+    result = await asyncio.to_thread(
+        claude_native_bridge._run_relay_tool,
+        executor,
+        asyncio.get_running_loop(),
+        "sys_session_create",
+        {},
+    )
+    assert not result.get("isError")
+    assert json.loads(result["content"][0]["text"])["conversation_id"] == "existing_child"

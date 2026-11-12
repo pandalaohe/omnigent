@@ -4365,7 +4365,7 @@ async def test_sys_session_send_existing_offline_child_relaunches_and_reposts(
     assert len(message_posts) == 2, "the refused message must be reposted after recovery"
     assert len(retry_posts) == 1
     assert retry_posts[0] == {"type": "retry_session", "data": {}}
-    assert liveness_reads == 1
+    assert liveness_reads == 0, "zero observation budget must not start a liveness read"
 
 
 @pytest.mark.asyncio
@@ -4446,7 +4446,7 @@ async def test_sys_session_send_in_flight_child_waits_runner_without_relaunch(
     from omnigent.runner import tool_dispatch
     from omnigent.runner.tool_dispatch import execute_tool
 
-    monkeypatch.setattr(tool_dispatch, "_BY_ID_CHILD_READY_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(tool_dispatch, "_BY_ID_CHILD_READY_TIMEOUT_S", 1.0)
     monkeypatch.setattr(tool_dispatch, "_REMOTE_CHILD_READY_POLL_S", 0.0)
     monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -9034,11 +9034,11 @@ async def test_sys_session_create_waits_for_slow_creation_and_sends_message(
             return httpx.Response(200, json={})
         posts.append(request.url.path)
         if request.url.path == "/v1/sessions":
-            # Model a host operation completing after 65 seconds without a
+            # Model a host operation completing after 121 seconds without a
             # wall-clock sleep: enforce the HTTP client's configured budget.
             read_timeout = request.extensions["timeout"]["read"]
-            assert read_timeout is not None and read_timeout < 300
-            if read_timeout is not None and read_timeout < 65:
+            assert read_timeout is not None and read_timeout <= 300
+            if read_timeout is not None and read_timeout < 121:
                 raise httpx.ReadTimeout("", request=request)
             return httpx.Response(
                 201, json={"id": "slow_child", "session_id": "slow_child", "agent_id": "ag_x"}
@@ -17690,3 +17690,104 @@ async def test_sys_session_create_first_message_delivery_failures(failure: str |
     assert handle["agent_id"] == "ag_x"
     assert handle["agent_name"] == "researcher"
     assert handle["initial_message"]["status"] == "sent"
+
+
+@pytest.mark.asyncio
+async def test_created_child_readiness_survives_old_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.runner import tool_dispatch
+
+    clock = [1000.0]
+    posts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal posts
+        if request.method == "GET":
+            clock[0] += 121
+            return httpx.Response(200, json={"runner_online": True})
+        posts += 1
+        if posts == 1:
+            return httpx.Response(503)
+        return httpx.Response(202, json={"queued": True})
+
+    monkeypatch.setattr(
+        tool_dispatch, "time", SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0])
+    )
+    token = tool_dispatch._SESSION_START_DEADLINE.set(1300.0)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://server"
+        ) as client:
+            assert (
+                await tool_dispatch._post_created_child_message(
+                    client, "child", "work", remote=True
+                )
+                is None
+            )
+        assert posts == 2
+        assert clock[0] == 1121.0
+    finally:
+        tool_dispatch._SESSION_START_DEADLINE.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_readiness_does_not_reset_expired_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.runner import tool_dispatch
+
+    client = AsyncMock()
+    token = tool_dispatch._SESSION_START_DEADLINE.set(0.0)
+    try:
+        assert not await tool_dispatch._wait_for_runner_online(client, "child")
+        client.get.assert_not_awaited()
+    finally:
+        tool_dispatch._SESSION_START_DEADLINE.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_child_message_keeps_approval_transport_lifetime(monkeypatch):
+    from omnigent.runner import tool_dispatch
+
+    monkeypatch.setattr(tool_dispatch, "_REMOTE_CHILD_READY_TIMEOUT_S", 0.01)
+    entered, finish = asyncio.Event(), asyncio.Event()
+    posts = []
+
+    async def handler(request):
+        posts.append(request)
+        entered.set()
+        await finish.wait()
+        return httpx.Response(202, json={"queued": True})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        token = tool_dispatch._SESSION_START_DEADLINE.set(0.0)
+        try:
+            call = asyncio.create_task(
+                tool_dispatch._post_child_message_recovering(
+                    client,
+                    "child",
+                    content=[{"type": "input_text", "text": "work"}],
+                    created_by=None,
+                )
+            )
+        finally:
+            tool_dispatch._SESSION_START_DEADLINE.reset(token)
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(call), 0.05)
+            finish.set()
+            assert (await asyncio.wait_for(call, 1)).status_code == 202
+            assert len(posts) == 1
+            assert posts[0].extensions["timeout"]["read"] == 86400.0
+            data = json.loads(posts[0].content)["data"]
+            assert "_input_admission_deadline" not in data
+            assert "_input_request_id" not in data
+        finally:
+            finish.set()
+            await asyncio.gather(call, return_exceptions=True)

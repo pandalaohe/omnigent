@@ -156,6 +156,8 @@ async def test_input_ask_yaml_approve(
     Proves the full bundle-upload -> spec parse -> engine build ->
     INPUT ASK gate -> elicitation publish -> resolve -> ALLOW path.
     """
+    from omnigent.runner import tool_dispatch
+
     agent = await create_test_agent(
         client,
         name="test-input-ask-approve",
@@ -172,21 +174,21 @@ async def test_input_ask_yaml_approve(
 
         # POST the user message — this parks inside _evaluate_input_policy
         # until the ASK is resolved.
-        message_task = asyncio.create_task(
-            client.post(
-                f"/v1/sessions/{session_id}/events",
-                json={
-                    "type": "message",
-                    "data": {
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": "hello approve test"}],
-                    },
-                },
+        token = tool_dispatch._SESSION_START_DEADLINE.set(0.0)
+        try:
+            message_task = asyncio.create_task(
+                tool_dispatch._post_child_message_event(
+                    client,
+                    session_id,
+                    content=[{"type": "input_text", "text": "hello approve test"}],
+                    created_by=None,
+                )
             )
-        )
+        finally:
+            tool_dispatch._SESSION_START_DEADLINE.reset(token)
 
         # Wait for the elicitation to appear on the stream.
-        elicitation_id = await drain_task
+        elicitation_id = await asyncio.wait_for(drain_task, 1.0)
 
         # Also verify the elicitation appears in the session snapshot.
         snap = await client.get(f"/v1/sessions/{session_id}")
@@ -195,6 +197,9 @@ async def test_input_ask_yaml_approve(
         assert any(p["elicitation_id"] == elicitation_id for p in pending), (
             f"elicitation {elicitation_id} not in session snapshot: {pending}"
         )
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(message_task), 0.05)
 
         # Approve the elicitation.
         verdict = await client.post(
@@ -208,6 +213,7 @@ async def test_input_ask_yaml_approve(
         # It may then fail with 503 (no runner bound) — that still proves
         # the ASK gate approved the message through.
         resp = await asyncio.wait_for(message_task, timeout=5.0)
+        assert float(resp.headers["X-Omnigent-Approval-Wait-Seconds"]) > 0
         body = resp.json()
         assert body.get("denied") is not True, f"approved INPUT ASK should not deny; got {body}"
     finally:

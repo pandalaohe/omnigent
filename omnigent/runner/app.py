@@ -2928,7 +2928,7 @@ def create_runner_app(
         if _session_background_task_counts.get(session_id, 0) > 0:
             return True
         return any(
-            entry.status in {"launching", "running", "waiting"}
+            entry.status in {"launching", "launch_unconfirmed", "running", "waiting"}
             or (entry.status in _SUBAGENT_TERMINAL_STATUSES and not entry.delivered)
             for entry in list_subagent_work(session_id)
         )
@@ -7414,7 +7414,7 @@ def create_runner_app(
                 children = _subagent_work_by_parent.get(conv_id, set())
                 has_running_children = any(
                     (entry := _subagent_work_by_child.get(child_id)) is not None
-                    and entry.status in ("launching", "running", "waiting")
+                    and entry.status in ("launching", "launch_unconfirmed", "running", "waiting")
                     for child_id in children
                 )
                 waiting = has_running_children or conv_id in _subagent_wake_pending
@@ -8277,7 +8277,8 @@ def create_runner_app(
             [
                 entry
                 for entry in list_subagent_work(session_id)
-                if entry.delivered and entry.child_session_id in unread
+                if (entry.delivered or entry.status == "launch_unconfirmed")
+                and entry.child_session_id in unread
             ],
             _session_harness_name(session_id),
         )
@@ -8530,6 +8531,11 @@ def create_runner_app(
         confirmed_completion: bool = False,
         confirmed_cancellation: bool = False,
     ) -> _SubagentDeliveryAck:
+        if status == "launch_unconfirmed":
+            ack = _subagent_work.report_subagent_launch_unconfirmed(child_session_id)
+            if ack.delivered_now and ack.entry is not None:
+                _schedule_subagent_wake(ack.entry)
+            return ack
         entry = get_subagent_work(child_session_id)
         terminal_error = terminal_data.get("terminal_error") if terminal_data is not None else None
         if error is None and isinstance(terminal_error, dict):
@@ -10850,7 +10856,7 @@ def create_runner_app(
                     and execution[1] <= time.time()
                 ):
                     # Queue wait and harness setup are outside the consumption attempt.
-                    deadline = time.time() + 60
+                    deadline = time.time() + 300
                     event_body["input_admission_deadline"] = deadline
                     _input_execution_claims[execution_key] = (None, deadline, "ordinary")
                 async with client.stream(
