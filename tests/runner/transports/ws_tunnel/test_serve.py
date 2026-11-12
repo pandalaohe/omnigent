@@ -3868,6 +3868,7 @@ async def test_serve_tunnel_keeps_escalating_after_brief_connection(
         ("GET", "/unknown-operation", True, False),
         ("POST", "/v1/sessions/conv/events", False, False),
         ("POST", "/v1/sessions/conv/events", False, True),
+        ("WS", "/unknown-websocket", False, True),
         ("WS", "/unknown-websocket", True, False),
         ("WS", "/unknown-websocket", False, False),
     ],
@@ -3887,7 +3888,9 @@ async def test_application_progress_bounds_connection_owned_requests(
     from websockets.asyncio.client import ClientConnection
 
     monkeypatch.setattr(serve_module, "RUNNER_TUNNEL_SILENCE_TIMEOUT_S", 0.5)
-    monkeypatch.setattr(serve_module, "RUNNER_TUNNEL_BUSY_SILENCE_TIMEOUT_S", 0.75)
+    monkeypatch.setattr(
+        serve_module, "RUNNER_TUNNEL_BUSY_SILENCE_TIMEOUT_S", 1.5 if quick_request else 0.75
+    )
     finishes = finishes and not blocked_pong
     started = asyncio.Event()
     cancelled = asyncio.Event()
@@ -3895,7 +3898,16 @@ async def test_application_progress_bounds_connection_owned_requests(
     checked = asyncio.Event()
     pong_started = asyncio.Event()
     pong_cancelled = asyncio.Event()
+    busy_receive = asyncio.Event()
     original_send = ClientConnection.send
+    original_recv = ClientConnection.recv
+
+    async def observe_receive(self, *args, **kwargs):
+        if started.is_set():
+            busy_receive.set()
+        return await original_recv(self, *args, **kwargs)
+
+    monkeypatch.setattr(ClientConnection, "recv", observe_receive)
 
     async def send_with_backpressure(self, data, *args, **kwargs):
         if isinstance(data, str) and json.loads(data).get("kind") == "pong":
@@ -3943,10 +3955,13 @@ async def test_application_progress_bounds_connection_owned_requests(
             await asyncio.wait_for(pong_started.wait(), timeout=2)
             await asyncio.wait_for(await ws.ping(), timeout=2)
         if quick_request:
+            await asyncio.wait_for(busy_receive.wait(), timeout=2)
+            await asyncio.wait_for(await ws.ping(), timeout=2)
             finish.set()
             while json.loads(await ws.recv())["kind"] not in {"response.end", "ws.close"}:
                 pass
-            await asyncio.wait_for(ws.wait_closed(), timeout=2)
+            # The outstanding busy wait must shrink when its last request completes.
+            await asyncio.wait_for(ws.wait_closed(), timeout=0.9)
             checked.set()
             return
         if finishes:

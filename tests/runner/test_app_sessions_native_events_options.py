@@ -5459,6 +5459,7 @@ async def test_unregistered_elicitation_interrupt_validates_native_thread_owner(
         "spawn-during-report",
         "slow-stop",
         "hung-stop",
+        "total-deadline",
     ],
 )
 async def test_codex_helper_stop_ownership_and_finalization(tmp_path, monkeypatch, case):
@@ -5494,6 +5495,9 @@ async def test_codex_helper_stop_ownership_and_finalization(tmp_path, monkeypatc
         else 0.02,
     )
     monkeypatch.setattr(native_controls, "_CODEX_HELPER_PROCESS_GRACE_S", 0.001)
+    if case == "total-deadline":
+        monkeypatch.setattr(native_controls, "_CODEX_HELPER_STOP_TIMEOUT_S", 1)
+        monkeypatch.setattr(native_controls, "_CODEX_HELPER_STOP_TOTAL_TIMEOUT_S", 0.03)
     closed, signals, reports, child_posts = [], [], [], []
     stop_cancelled = asyncio.Event()
     backend = SimpleNamespace(
@@ -5562,7 +5566,7 @@ async def test_codex_helper_stop_ownership_and_finalization(tmp_path, monkeypatc
             if case == "slow-stop":
                 await asyncio.sleep(0.03)  # Beyond the old scaled stop backstop.
                 bridge.clear_active_child_turn(tmp_path, "child_thread")
-            if case == "hung-stop":
+            if case in {"hung-stop", "total-deadline"}:
                 try:
                     await asyncio.Future()
                 finally:
@@ -5641,6 +5645,10 @@ async def test_codex_helper_stop_ownership_and_finalization(tmp_path, monkeypatc
         elif case == "late":
             assert subagent_work.get_subagent_work("late_child").status == "failed"
             assert any("late_child" in path for path in child_posts)
+        elif case == "total-deadline":
+            assert stop_cancelled.is_set()
+            assert response.json() == {"helpers_stopped": False}
+            assert bridge.read_bridge_state(tmp_path).helper_stop_pending
         elif case == "hung-stop":
             assert stop_cancelled.is_set()
             assert closed, "a hung stop must proceed to bounded owned-backend cleanup"
@@ -5648,4 +5656,4 @@ async def test_codex_helper_stop_ownership_and_finalization(tmp_path, monkeypatc
             assert closed == [], "reporting must not destroy a responsive backend"
             if case in {"replacement-report", "spawn-during-report"}:
                 assert "new_thread" in bridge.read_active_child_turns(tmp_path)
-        assert len(reports) == 1
+        assert len(reports) == (0 if case == "total-deadline" else 1)

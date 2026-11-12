@@ -31,6 +31,9 @@ from omnigent.debug_logging import debug_event
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import native_terminal_name
 from omnigent.harnesses.codex_native.timeouts import (
+    HELPER_STOP_TIMEOUT_SECONDS as _CODEX_HELPER_STOP_TOTAL_TIMEOUT_S,
+)
+from omnigent.harnesses.codex_native.timeouts import (
     SETTINGS_BRIDGE_READY_TIMEOUT_SECONDS as _CODEX_SETTINGS_READY_TIMEOUT_S,
 )
 from omnigent.harnesses.codex_native.timeouts import (
@@ -907,6 +910,18 @@ def build_native_controls(
         )
 
     async def _stop_codex_native_helpers(
+        conv_id: str,
+        reason: str = "tightening",
+        discovered: dict[str, dict[str, str | None]] | None = None,
+    ) -> bool:
+        try:
+            async with asyncio.timeout(_CODEX_HELPER_STOP_TOTAL_TIMEOUT_S):
+                return await _stop_codex_native_helpers_within_budget(conv_id, reason, discovered)
+        except TimeoutError:
+            _logger.warning("Codex helper stop deadline expired for %s; stop unconfirmed", conv_id)
+            return False
+
+    async def _stop_codex_native_helpers_within_budget(
         conv_id: str,
         reason: str = "tightening",
         discovered: dict[str, dict[str, str | None]] | None = None,

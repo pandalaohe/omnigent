@@ -1232,15 +1232,24 @@ async def _serve_tunnel_once(
             nonlocal last_progress
             operation = asyncio.create_task(receive_and_handle_frame())
             try:
-                done, _pending = await asyncio.wait(
-                    {operation},
-                    timeout=max(0.0, last_progress + silence_timeout() - loop.time()),
-                )
-                now = loop.time()
-                if done and now - last_progress < silence_timeout():
-                    operation.result()
-                    last_progress = now
-                    return
+                while True:
+                    work = set(dispatch_tasks.values()) | {
+                        channel.task
+                        for channel in ws_channels.values()
+                        if channel.task is not None
+                    }
+                    done, _pending = await asyncio.wait(
+                        {operation, *work},
+                        timeout=max(0.0, last_progress + silence_timeout() - loop.time()),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    now = loop.time()
+                    if now - last_progress >= silence_timeout():
+                        break
+                    if operation in done:
+                        operation.result()
+                        last_progress = now
+                        return
                 if shutdown_event is None or not shutdown_event.is_set():
                     _logger.warning(
                         "Runner %s made no server-frame progress for %.0fs; reconnecting",

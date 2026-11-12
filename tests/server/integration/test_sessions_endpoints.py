@@ -15564,6 +15564,142 @@ async def test_post_external_codex_approval_mode_change_sets_label_and_publishes
     assert snapshot["labels"]["omnigent.codex_native.approval_mode"] == "full-access"
 
 
+@pytest.mark.parametrize("outcome", ["slow-ack", "hung-stop"])
+async def test_codex_helper_stop_chain_outlives_inner_cleanup(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.codex_native import app_server, bridge, forwarder
+    from omnigent.inner import _proc
+    from omnigent.runner import native_controls
+    from omnigent.runner.native import orchestration
+    from omnigent.server.routes import sessions
+    from tests.runner.conftest import _build_app_for_spec, _runner_client
+    from tests.runner.native_helpers import _harness_spec
+
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client, agent["id"], labels={"omnigent.wrapper": "codex-native-ui"}
+    )
+    parent = session["id"]
+    bridge.write_bridge_state(
+        tmp_path,
+        bridge.CodexNativeBridgeState(
+            session_id=parent,
+            socket_path="ws://127.0.0.1:1234",
+            thread_id="parent_thread",
+            codex_home=str(tmp_path / "home"),
+        ),
+    )
+    bridge.update_active_child_turn(tmp_path, "child_thread", turn_id="child_turn")
+    monkeypatch.setattr(bridge, "bridge_dir_for_bridge_id", lambda _: tmp_path)
+    monkeypatch.setattr(native_controls, "_CODEX_HELPER_STOP_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(native_controls, "_CODEX_HELPER_PROCESS_GRACE_S", 0.001)
+    interrupted, closed, receipts, budgets = [], [], [], []
+    cancelled = asyncio.Event()
+    backend = SimpleNamespace(
+        proc=SimpleNamespace(pid=4242, returncode=None),
+        process_start_stamp=100.0,
+        resident_incarnation_id="owned",
+    )
+
+    async def close():
+        closed.append(True)
+
+    backend.close = close
+    monkeypatch.setitem(orchestration._AUTO_CODEX_APP_SERVERS, parent, backend)
+
+    async def teardown(*_args, **_kwargs):
+        await close()
+        orchestration._AUTO_CODEX_APP_SERVERS.pop(parent, None)
+
+    monkeypatch.setattr(orchestration, "teardown_codex_native_app_server", teardown)
+    monkeypatch.setattr(_proc, "snapshot_process_tree", lambda *_: {4242: 100.0})
+    monkeypatch.setattr(_proc, "_signal_identities", lambda *_, **__: None)
+    monkeypatch.setattr(_proc, "surviving_process_snapshot", lambda _: {})
+
+    class NativeClient:
+        async def connect(self):
+            pass
+
+        async def close(self):
+            pass
+
+        async def request(self, method, params):
+            interrupted.append(method)
+            if outcome == "hung-stop":
+                try:
+                    await asyncio.Future()
+                finally:
+                    cancelled.set()
+            else:
+                # custom-lint: disable-next=sleep-then-assert -- ACK past the old HTTP deadline
+                await asyncio.sleep(0.065)  # ACK after the old scaled HTTP cutoff.
+                bridge.clear_active_child_turn(tmp_path, "child_thread")
+            return {"result": {}}
+
+    monkeypatch.setattr(app_server, "client_for_transport", lambda *_, **__: NativeClient())
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native"))
+    async with _runner_client(app) as runner:
+        created = await runner.post(
+            "/v1/sessions", json={"session_id": parent, "agent_id": agent["id"]}
+        )
+        assert created.status_code == 201, created.text
+
+        async def runner_for_session(*_args, **_kwargs):
+            return runner
+
+        monkeypatch.setattr(sessions, "_get_runner_client", runner_for_session)
+
+        def bound_post(original, layer):
+            async def post(url, **kwargs):
+                body = kwargs.get("json", {})
+                if body.get("type") != "codex_helpers_stop" and not body.get("data", {}).get(
+                    "helper_action"
+                ):
+                    return await original(url, **kwargs)
+                budget = kwargs["timeout"]
+                budgets.append((layer, budget))
+                try:
+                    async with asyncio.timeout(budget / 100):
+                        response = await original(url, **kwargs)
+                except TimeoutError as exc:
+                    raise httpx.ReadTimeout("helper stop deadline") from exc
+                receipts.append((layer, response.status_code, response.json()))
+                return response
+
+            return post
+
+        monkeypatch.setattr(runner, "post", bound_post(runner.post, "runner"))
+        monkeypatch.setattr(client, "post", bound_post(client.post, "server"))
+        state = forwarder._CodexForwarderState()
+        state.note_resume_response(
+            {"result": {"approvalPolicy": "never", "sandboxPolicy": {"type": "dangerFullAccess"}}}
+        )
+        await forwarder._sync_codex_approval_mode_change(
+            client, session_id=parent, forwarder_state=state
+        )
+        state.note_thread_settings_updated(
+            {"threadSettings": {"approvalPolicy": "never", "sandboxPolicy": {"type": "readOnly"}}}
+        )
+        await forwarder._sync_codex_approval_mode_change(
+            client, session_id=parent, forwarder_state=state
+        )
+        assert state.helper_control_task is not None
+        await asyncio.wait_for(state.helper_control_task, timeout=2)
+    assert interrupted == ["turn/interrupt"]
+    assert receipts == [
+        ("runner", 200, {"helpers_stopped": True}),
+        ("server", 202, {"helpers_stopped": True}),
+    ]
+    assert budgets[0][1] > budgets[1][1] > native_controls._CODEX_HELPER_STOP_TOTAL_TIMEOUT_S
+    assert bool(closed) == cancelled.is_set() == (outcome == "hung-stop")
+
+
 async def test_post_external_codex_approval_mode_change_requires_a_field(
     client: httpx.AsyncClient,
 ) -> None:

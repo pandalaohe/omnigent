@@ -84,6 +84,7 @@ from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
 from omnigent.harnesses.codex_native.launch_args import PROFILE_ID, codex_stance_is_workspace_write
+from omnigent.harnesses.codex_native.timeouts import HELPER_STOP_EVENT_TIMEOUT_SECONDS
 from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
@@ -3514,7 +3515,7 @@ async def _reconcile_helpers_once(
                 "children": cast(_JsonObject, children if len(children) <= 512 else {}),
             },
             max_attempts=1,
-            timeout=5.0,
+            timeout=HELPER_STOP_EVENT_TIMEOUT_SECONDS,
         )
     else:
         set_helper_stop_pending(bridge_dir, False)
@@ -5582,7 +5583,7 @@ async def _sync_codex_approval_mode_change(
                                 event_type="external_codex_approval_mode_change",
                                 data={"helper_action": "tightening"},
                                 max_attempts=1,
-                                timeout=5.0,
+                                timeout=HELPER_STOP_EVENT_TIMEOUT_SECONDS,
                             )
 
                     forwarder_state.helper_control_task = asyncio.create_task(
