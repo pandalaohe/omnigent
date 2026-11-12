@@ -11,6 +11,9 @@ import { usageRangeQuery } from "@/pages/usageBoard/UsageRangeControl";
 import { readBoardJson } from "./taskBoardData";
 
 export interface BoardSession {
+  agent_id?: string | null;
+  reported_model?: string | null;
+  last_message_preview?: string | null;
   running_since?: number;
   running_seconds?: number;
   idle_seconds?: number;
@@ -121,11 +124,14 @@ export function useBoardSessions() {
   return query;
 }
 
-export function useBoardSessionDetails(ids: string[]) {
+export function useBoardSessionDetails(ids: string[], visibleIds = ids) {
   const cadence = useBoardCadence();
+  const visible = new Set(visibleIds);
   return useQueries({
     queries: [...new Set(ids)].map((id) => ({
       queryKey: ["taskBoard", "session", id],
+      enabled: visible.has(id),
+      notifyOnChangeProps: ["data", "error", "status"],
       queryFn: () =>
         readBoardJson<BoardSession>(
           `/v1/sessions/${encodeURIComponent(id)}?include_preview=true&include_usage=true&include_items=false&include_liveness=false&refresh_state=false`,

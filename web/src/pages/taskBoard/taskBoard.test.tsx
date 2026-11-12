@@ -124,6 +124,118 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+it.each(["none", "recent", "archive"])(
+  "opens one history detail through the real page with %s relation navigation",
+  async (relation) => {
+    enableBoard("history");
+    const old: BoardTask = {
+      uid: "archive",
+      title: "Archive recovery",
+      progress: "completed",
+      "omnigent.ai:source": "tracker",
+      "omnigent.ai:group": { id: "archive", name: "Archive group" },
+      created: "2020-01-01T00:00:00Z",
+      progressUpdated: "2020-01-20T00:00:00Z",
+    };
+    const recent: BoardTask = {
+      ...old,
+      uid: "recent",
+      title: "Recent selection",
+      created: new Date(Date.now() - 3600000).toISOString(),
+      progressUpdated: new Date().toISOString(),
+    };
+    const related: BoardTask = {
+      ...(relation === "recent" ? recent : old),
+      uid: "related",
+      title: "Related task",
+    };
+    const current =
+      relation === "none" ? [] : [recent, ...(relation === "recent" ? [related] : [])];
+    const archived = [old, ...(relation === "archive" ? [related] : [])];
+    if (relation !== "none") old.relatedTo = { related: { relation: { parent: true } } };
+    mocks.tasks.mockImplementation(async (path: string) => {
+      const url = new URL(path, "https://example.test");
+      if (url.pathname.endsWith("/sources"))
+        return Response.json({ sources: [{ id: "tracker", name: "Tracker", source: null }] });
+      if (url.pathname.endsWith("/closed-counts"))
+        return Response.json({
+          days: [{ source: "tracker", day: "2020-01-20", closed: archived.length }],
+        });
+      if (url.pathname.endsWith("/history")) return Response.json({ entries: [] });
+      if (url.pathname.endsWith("/item"))
+        return Response.json(
+          [...current, ...archived].find((task) => task.uid === url.searchParams.get("uid")),
+        );
+      return Response.json({
+        entries: url.searchParams.has("closed_before")
+          ? archived
+          : url.searchParams.get("state") === "closed"
+            ? current
+            : [],
+        updated: new Date().toISOString(),
+      });
+    });
+    const view = renderBoard();
+    if (relation !== "none") {
+      await waitFor(() => expect(view.container.querySelector(".h-p")).toBeTruthy());
+      fireEvent.click(view.container.querySelector(".h-p")!);
+      fireEvent.click(view.container.querySelector(".h-srow")!);
+      fireEvent.click(screen.getByRole("button", { name: /Recent selection.*Completed/ }));
+      const recentTrigger = screen.getByRole("button", { name: "Open task details" });
+      recentTrigger.focus();
+      fireEvent.click(recentTrigger);
+      expect(await screen.findByRole("region", { name: "Details: Recent selection" })).toBeTruthy();
+    }
+    fireEvent.click(await screen.findByRole("button", { name: "Find by month" }));
+    fireEvent.change(view.container.querySelector("input[type=month]")!, {
+      target: { value: "2020-01" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Load month" }));
+    await waitFor(() =>
+      expect(view.container.querySelector(".h-stat>b")?.textContent).toBe(String(archived.length)),
+    );
+    fireEvent.click(view.container.querySelector(".h-p")!);
+    fireEvent.click(view.container.querySelector(".h-srow")!);
+    fireEvent.click(screen.getByRole("button", { name: /Archive recovery.*Completed/ }));
+    const trigger = screen.getByRole("button", { name: "Open task details" });
+    trigger.focus();
+    fireEvent.click(trigger);
+    const detail = await screen.findByRole("region", { name: "Details: Archive recovery" });
+    expect(view.container.querySelectorAll(".tb-dc")).toHaveLength(1);
+    fireEvent.click(within(detail).getByRole("button", { name: "Close" }));
+    expect(view.container.querySelectorAll(".tb-dc")).toHaveLength(0);
+    expect(document.activeElement).toBe(trigger);
+    if (relation === "none") {
+      fireEvent.click(trigger);
+      fireEvent.keyDown(screen.getByRole("slider", { name: "Range start" }), { key: "ArrowRight" });
+      expect(view.container.querySelectorAll(".tb-dc")).toHaveLength(0);
+      fireEvent.click(view.container.querySelector(".h-p")!);
+      fireEvent.click(view.container.querySelector(".h-srow")!);
+      fireEvent.click(screen.getByRole("button", { name: /Archive recovery.*Completed/ }));
+      const sameTask = screen.getByRole("button", { name: "Open task details" });
+      sameTask.focus();
+      fireEvent.click(sameTask);
+      const reopened = await screen.findByRole("region", { name: "Details: Archive recovery" });
+      expect(view.container.querySelectorAll(".tb-dc")).toHaveLength(1);
+      fireEvent.click(within(reopened).getByRole("button", { name: "Close" }));
+      expect(view.container.querySelectorAll(".tb-dc")).toHaveLength(0);
+      expect(document.activeElement).toBe(sameTask);
+    }
+    if (relation !== "none") {
+      fireEvent.click(trigger);
+      const reopened = await screen.findByRole("region", { name: "Details: Archive recovery" });
+      fireEvent.click(within(reopened).getByRole("button", { name: /related.*Related task/ }));
+      const target = await screen.findByRole("region", { name: "Details: Related task" });
+      expect(view.container.querySelectorAll(".tb-dc")).toHaveLength(1);
+      expect(screen.queryByRole("region", { name: "Details: Archive recovery" })).toBeNull();
+      expect(screen.queryByRole("region", { name: "Details: Recent selection" })).toBeNull();
+      fireEvent.click(within(target).getByRole("button", { name: "Close" }));
+      expect(view.container.querySelectorAll(".tb-dc")).toHaveLength(0);
+      expect(document.activeElement).toBe(trigger);
+    }
+  },
+);
+
 it("keeps deployment and user gates ahead of every read", () => {
   mocks.info = { task_board_enabled: false };
   const view = renderBoard();
@@ -150,10 +262,15 @@ it("opens an empty board with source management in Settings", async () => {
 it("defaults to native parent/child sessions and watches without device activity", async () => {
   enableBoard();
   const fixture = taskBoardFixture();
-  mocks.sessions = fixture.sessions;
+  mocks.sessions = fixture.sessions.map((session) =>
+    session.archived ? { ...session, archived_at: Date.now() / 1000 } : session,
+  );
   renderBoard();
   const region = await screen.findByRole("region", { name: "Sessions" });
   expect(await within(region).findByText("Verifying resumed chunks")).toBeTruthy();
+  fireEvent.click(
+    within(region).getByRole("button", { name: "Collapse child sessions: Transfer reliability" }),
+  );
   expect(within(region).queryByRole("link", { name: /Check retry behaviour/ })).toBeNull();
   fireEvent.click(
     within(region).getByRole("button", { name: "Expand child sessions: Transfer reliability" }),
@@ -163,6 +280,7 @@ it("defaults to native parent/child sessions and watches without device activity
       .getByRole("link", { name: /Check retry behaviour/ })
       .getAttribute("href"),
   ).toBe("/c/child");
+  fireEvent.click(within(region).getByRole("button", { name: "1 archived today" }));
   expect(
     within(region)
       .getByRole("link", { name: /Document the recovery path/ })
@@ -266,8 +384,8 @@ it("maps source tasks to routes and keeps unsafe source URLs as text", async () 
   expect(await within(detail).findByRole("link", { name: "Open source" })).toBeTruthy();
   fireEvent.click(screen.getAllByRole("button", { name: "Remove old endpoint" })[0]);
   const noPage = await screen.findByRole("region", { name: "Details: Remove old endpoint" });
-  expect(within(noPage).getByText("The source gives no page")).toBeTruthy();
-  expect(await within(noPage).findByText("not_planned")).toBeTruthy();
+  expect(within(noPage).queryByRole("link", { name: "Open source" })).toBeNull();
+  expect(await within(noPage).findByText("This task is closed.")).toBeTruthy();
   expect(document.querySelector('a[href^="javascript:"]')).toBeNull();
   expect(mocks.fetch.mock.calls.every((call) => call.length === 1)).toBe(true);
 });
@@ -290,11 +408,11 @@ it("joins task waits with native prompts and opens real session links", async ()
   const detail = await screen.findByRole("region", { name: "Details: Choose the retry budget" });
   expect(within(detail).getByText("Approve a limit of three retries.")).toBeTruthy();
   expect(within(detail).getByText("Depends on")).toBeTruthy();
-  fireEvent.click(within(detail).getByRole("button", { name: "ENG-123" }));
+  fireEvent.click(within(detail).getByRole("button", { name: /ENG-123/ }));
   const changed = await screen.findByRole("region", {
     name: "Details: Recover interrupted uploads",
   });
-  expect(await within(changed).findByText("65%")).toBeTruthy();
+  expect(within(changed).queryByText("65%")).toBeNull();
   expect(await within(changed).findByText("$1.90")).toBeTruthy();
 });
 it("keeps native sessions usable with no source and retries a failed source read", async () => {
@@ -355,4 +473,40 @@ describe("translation catalogue", () => {
       "Unknown task board translation key",
     );
   });
+});
+
+it("reveals a related task at the expanded session anchor and restores its row on close", async () => {
+  enableBoard();
+  const fixture = taskBoardFixture();
+  const origin = fixture.tasks[1];
+  origin["omnigent.ai:sourceDisplay"] = {
+    version: 1,
+    sessions: [
+      {
+        id: "source-session",
+        task: { source: origin["omnigent.ai:source"], uid: origin.uid },
+        role: "root",
+        agentId: "pi",
+        label: "Example worker",
+        title: "Example worker",
+        status: "running",
+        createdAt: new Date().toISOString(),
+        lastActivityAt: new Date().toISOString(),
+      },
+    ],
+  };
+  report(fixture.tasks, fixture.sources);
+  renderBoard();
+  const row = await screen.findByRole("button", { name: "Session details: Example worker" });
+  fireEvent.click(row);
+  const original = await screen.findByRole("region", { name: "Details: Choose the retry budget" });
+  fireEvent.click(within(original).getByRole("button", { name: /ENG-123/ }));
+  const target = await screen.findByRole("region", {
+    name: "Details: Recover interrupted uploads",
+  });
+  expect(target.closest(".tb-session-group")).toBeTruthy();
+  expect(screen.queryByRole("region", { name: "Details: Choose the retry budget" })).toBeNull();
+  fireEvent.click(within(target).getByRole("button", { name: "Close" }));
+  expect(screen.queryByRole("region", { name: "Details: Recover interrupted uploads" })).toBeNull();
+  expect(document.activeElement).toBe(row);
 });

@@ -5,19 +5,22 @@ from __future__ import annotations
 import json
 import re
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 from playwright.sync_api import Page, Request, expect
 
+from tests.browser_ui._task_board_scroll import scroll_to_history_row, wait_for_history_list
 from tests.browser_ui.conftest import BrowserContract
 from tests.browser_ui.test_sessions_appearance import appearance_features as appearance_features
 from tests.browser_ui.test_sessions_appearance import appearance_url as appearance_url
 
 
-@pytest.mark.parametrize("width,theme", [(1440, "dark"), (1440, "light"), (390, "dark")])
+@pytest.mark.parametrize(
+    "width,theme", [(1440, "dark"), (1440, "light"), (390, "dark"), (390, "light")]
+)
 def test_task_board_display_switch_and_source_list(
     page: Page,
     appearance_url: str,
@@ -84,6 +87,7 @@ def test_task_board_display_switch_and_source_list(
             "title": "Document recovery",
             "status": "idle",
             "archived": True,
+            "archived_at": time.time(),
             "host_id": "workstation",
             "updated_at": time.time(),
         },
@@ -160,6 +164,7 @@ def test_task_board_display_switch_and_source_list(
                         {"session": "parent", "from": "2026-11-06T05:00:00Z"}
                     ],
                     "omnigent.ai:group": {"id": "v2", "name": "Version two"},
+                    "relatedTo": {"drop": {"relation": {"next": True}}},
                     "links": {
                         "page": {
                             "@type": "Link",
@@ -183,6 +188,14 @@ def test_task_board_display_switch_and_source_list(
                         }
                     },
                 },
+                {
+                    "uid": "past",
+                    "title": "Earlier recovery check",
+                    "progress": "completed",
+                    "omnigent.ai:source": "example",
+                    "omnigent.ai:group": {"id": "past", "name": "Earlier checks"},
+                    "progressUpdated": (datetime.now(UTC) - timedelta(days=180)).isoformat(),
+                },
             ],
         },
     )
@@ -203,7 +216,7 @@ def test_task_board_display_switch_and_source_list(
     )
     browser_contract.json(
         "/v1/me/tasks/closed-counts",
-        {"days": [{"day": "2020-01-01", "source": "example", "closed": 23}]},
+        {"days": [{"day": "2020-01-01", "source": "example", "closed": 2}]},
     )
     browser_contract.json(
         "/v1/me/tasks/item",
@@ -272,17 +285,37 @@ def test_task_board_display_switch_and_source_list(
     page.get_by_role("link", name="Task board", exact=True).click()
     native = page.get_by_role("region", name="Sessions", exact=True)
     expect(native.get_by_text("Transfer reliability", exact=True)).to_be_visible()
-    expect(native.locator('a[href="/c/child"]')).to_have_count(0)
-    native.get_by_role(
-        "button", name="Expand child sessions: Transfer reliability", exact=True
-    ).click()
     expect(native.locator('a[href="/c/child"]')).to_be_visible()
+    if width >= 621:
+        native.get_by_role(
+            "button", name="Collapse child sessions: Transfer reliability", exact=True
+        ).click()
+        expect(native.locator('a[href="/c/child"]')).to_have_count(0)
+        native.get_by_role(
+            "button", name="Expand child sessions: Transfer reliability", exact=True
+        ).click()
+        expect(native.locator('a[href="/c/child"]')).to_be_visible()
+    native.get_by_role("button", name="1 archived today", exact=True).click()
     expect(native.locator('a[href="/c/archived"]')).to_be_visible()
+    native.get_by_role("button", name="Session details: Transfer reliability", exact=True).click()
+    session_detail = native.get_by_role(
+        "region", name="Session details: Transfer reliability", exact=True
+    )
+    expect(
+        session_detail.get_by_text("No linked task was supplied for this session.")
+    ).to_be_visible()
+    session_detail.get_by_role("button", name="Close", exact=True).click()
     expect(native.get_by_text("Verify resumed chunks").first).to_be_visible()
     page.get_by_role("button", name="2 Waiting on me", exact=True).click()
     waiting = page.get_by_role("region", name="Waiting on me", exact=True)
     expect(waiting.get_by_text("Approve the retry budget")).to_be_visible()
     expect(waiting.locator('a[href="/c/child"]')).to_be_visible()
+    waiting.get_by_role("button", name=re.compile("Approve the retry budget")).click()
+    waiting_detail = waiting.get_by_role(
+        "region", name="Details: Retry failed uploads", exact=True
+    )
+    expect(waiting_detail).to_be_visible()
+    waiting_detail.get_by_role("button", name="Close", exact=True).click()
     waiting.get_by_role("button", name="Close", exact=True).click()
     page.get_by_role("navigation", name="Board views").get_by_role(
         "button", name="Routes", exact=True
@@ -290,27 +323,133 @@ def test_task_board_display_switch_and_source_list(
     region = page.get_by_role("region", name="Routes", exact=True)
     expect(region.get_by_role("heading", name="Version two")).to_be_visible()
     region.get_by_role(
-        "button", name=re.compile(r"Retry failed uploads(?:\s*ENG-1)?$")
+        "button", name=re.compile(r"^Retry failed uploads(?:\s+Waiting on you.*)?$")
     ).first.click()
     detail = page.get_by_role("region", name="Details: Retry failed uploads", exact=True)
     expect(detail.get_by_text("Check a slow connection")).to_be_visible()
     expect(detail.locator('a[href="https://tracker.example.com/retry"]')).to_be_visible()
     expect(detail.locator('a[href="/c/parent"]')).to_be_visible()
-    detail.get_by_text("History and commits", exact=True).click()
-    expect(detail.get_by_text("Keep confirmed chunks")).to_be_visible()
+    expect(detail.locator(".tb-dc-tiles")).to_be_visible()
+    expect(detail.locator('a[href="/c/parent"]')).to_have_attribute("target", "_blank")
+    if width >= 621:
+        expect(detail.locator(".tb-dc-body")).to_have_css(
+            "grid-template-columns", re.compile(r".+ .+")
+        )
     detail.get_by_role("button", name="Close", exact=True).click()
-    region.get_by_role("button", name=re.compile(r"Drop the legacy endpoint")).first.click()
+    region.get_by_role(
+        "button", name=re.compile(r"^Drop the legacy endpoint(?:\s+Completed.*)?$")
+    ).first.click()
     no_page = page.get_by_role("region", name="Details: Drop the legacy endpoint", exact=True)
-    expect(no_page.get_by_text("The source gives no page")).to_be_visible()
+    expect(no_page.locator("a[href^=javascript]")).to_have_count(0)
     expect(page.locator('a[href^="javascript:"]')).to_have_count(0)
     no_page.get_by_role("button", name="Close", exact=True).click()
+    if width == 1440:
+        edge = region.locator(".rt-edge-hit").first
+        hit = edge.evaluate(
+            """el => {
+              const p = el.getPointAtLength(el.getTotalLength()/2), m = el.getScreenCTM();
+              return {x:p.x*m.a+p.y*m.c+m.e, y:p.x*m.b+p.y*m.d+m.f};
+            }"""
+        )
+        page.mouse.move(hit["x"], hit["y"])
+        expect(page.get_by_role("tooltip")).to_contain_text("No relationship date supplied")
+        page.mouse.click(hit["x"], hit["y"])
+        relation = page.get_by_role("region", name="Related tasks", exact=True)
+        expect(relation).to_contain_text("Predecessor / successor")
+        relation.get_by_role("button", name="Close", exact=True).click()
     page.get_by_role("button", name="By time", exact=True).click()
-    expect(region.locator(".tb-axis")).to_be_visible()
+    expect(region.locator(".rt-axis")).to_be_visible()
+    retry_stop = region.locator('.rt-stop[data-route-task="retry"]')
+    retry_stop.click()
+    expect(detail).to_be_visible()
+    expect(detail.locator(".tb-dc-tiles")).to_be_visible()
+    assert detail.evaluate(
+        "el => {const panel=el.closest('.rt-panel'), scene=el.closest('.rt-scene');"
+        "const next=[...scene.querySelectorAll('.rt-lane')].find(lane=>"
+        "lane.getBoundingClientRect().top>=panel.getBoundingClientRect().top);"
+        "return !next || next.getBoundingClientRect().top>=el.getBoundingClientRect().bottom;}"
+    )
+    detail.get_by_role("button", name="Close", exact=True).click()
+    expect(retry_stop).to_be_focused()
+    overview = page.get_by_role(
+        "region", name="All-history overview: drag the window or its edges"
+    )
+    expect(overview).to_be_visible()
+    original = [region.get_attribute("data-window-from"), region.get_attribute("data-window-to")]
+    page.get_by_role("button", name="Zoom out", exact=True).click()
+    assert int(region.get_attribute("data-window-to")) == int(original[1])
+    assert (
+        int(region.get_attribute("data-window-to")) - int(region.get_attribute("data-window-from"))
+        == 4 * 24 * 3600000
+    )
+    window_box = overview.locator(".rt-overview-window").bounding_box()
+    assert window_box
+    page.mouse.move(
+        window_box["x"] + window_box["width"] / 2, window_box["y"] + window_box["height"] / 2
+    )
+    page.mouse.down()
+    page.mouse.move(window_box["x"] - 40, window_box["y"] + window_box["height"] / 2, steps=5)
+    page.mouse.up()
+    expect(region).not_to_have_attribute(
+        "data-window-from", str(int(original[0]) - 2 * 24 * 3600000)
+    )
+    page.locator(".rt-map").focus()
+    page.locator(".rt-map").press("0")
+    assert abs(int(region.get_attribute("data-window-from")) - int(original[0])) < 10000
+    assert abs(int(region.get_attribute("data-window-to")) - int(original[1])) < 10000
+    page.get_by_role("button", name="How to read this map", exact=True).click()
+    expect(page.get_by_role("region", name="How to read this map")).to_contain_text(
+        "Plain vertical scrolling"
+    )
+    page.get_by_role("button", name="How to read this map", exact=True).click()
+    if width == 390:
+        page.get_by_role("button", name="7D", exact=True).click()
+        before_pinch = int(region.get_attribute("data-window-to")) - int(
+            region.get_attribute("data-window-from")
+        )
+        region.scroll_into_view_if_needed()
+        box = region.bounding_box()
+        assert box
+        cx = box["x"] + box["width"] / 2
+        cy = max(80, min(760, box["y"] + 80))
+        cdp = page.context.new_cdp_session(page)
+        try:
+            cdp.send(
+                "Input.dispatchTouchEvent",
+                {
+                    "type": "touchStart",
+                    "touchPoints": [
+                        {"x": cx - 30, "y": cy, "id": 1},
+                        {"x": cx + 30, "y": cy, "id": 2},
+                    ],
+                },
+            )
+            cdp.send(
+                "Input.dispatchTouchEvent",
+                {
+                    "type": "touchMove",
+                    "touchPoints": [
+                        {"x": cx - 55, "y": cy, "id": 1},
+                        {"x": cx + 55, "y": cy, "id": 2},
+                    ],
+                },
+            )
+            cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+        finally:
+            cdp.detach()
+        assert (
+            int(region.get_attribute("data-window-to"))
+            - int(region.get_attribute("data-window-from"))
+            < before_pinch
+        )
+        page.locator(".rt-map").focus()
+        page.locator(".rt-map").press("0")
     graph = region.locator("svg").first
     assert graph.bounding_box()
     assert page.locator("main").last.evaluate(
         "element => element.scrollWidth <= element.clientWidth"
     )
+    page.locator(".tb-page-header").scroll_into_view_if_needed()
     title = page.locator(".tb-page-header").bounding_box()
     header = page.get_by_role("banner").bounding_box()
     assert title and header and title["y"] >= header["y"] + header["height"]
@@ -322,20 +461,69 @@ def test_task_board_display_switch_and_source_list(
     expect(
         page.get_by_role("region", name="Log").get_by_text("Keep confirmed chunks")
     ).to_be_visible()
-    page.get_by_label("Group by", exact=True).select_option("mother")
+    page.get_by_role("region", name="Log", exact=True).get_by_role(
+        "button", name="By root session", exact=True
+    ).click()
     expect(
         page.get_by_role("region", name="Log").get_by_role("heading", name="Transfer reliability")
     ).to_be_visible()
+    log = page.get_by_role("region", name="Log", exact=True)
+    log.get_by_role("button", name="Retry failed uploads", exact=True).click()
+    log_detail = log.get_by_role("region", name="Details: Retry failed uploads", exact=True)
+    expect(log_detail).to_be_visible()
+    expect(log.get_by_text("Keep confirmed chunks")).to_be_visible()
+    log_detail.get_by_role("button", name="Close", exact=True).click()
     page.get_by_role("button", name="History", exact=True).click()
-    expect(page.get_by_title("Week of 2019-12-30: 23 closed")).to_be_visible()
-    page.get_by_label("Find month").select_option("2020-01")
-    expect(
-        page.get_by_text("This month is outside the retained task window.", exact=False)
-    ).to_be_visible()
+    history = page.get_by_role("region", name="History", exact=True)
+    history.get_by_role("button", name="1 year", exact=True).click()
+    history.get_by_role("button", name=re.compile(r"\bexample\b")).click()
+    history.get_by_role("button", name=re.compile("Earlier checks")).click()
+    expect(history.get_by_text("Earlier recovery check", exact=True)).to_be_visible()
+    old_requests: list[dict[str, list[str]]] = []
+
+    def archived_page(route) -> None:
+        query = parse_qs(urlparse(route.request.url).query)
+        if "closed_before" not in query:
+            route.fallback()
+            return
+        old_requests.append(query)
+        second = "cursor" in query
+        route.fulfill(
+            json={
+                "entries": [
+                    {
+                        "uid": "archived-second" if second else "archived-first",
+                        "title": "Archived second check" if second else "Archived first check",
+                        "omnigent.ai:source": "example",
+                        "omnigent.ai:group": {"id": "archive", "name": "Archive checks"},
+                        "progress": "completed",
+                        "created": "2020-01-01T00:00:00Z",
+                        "progressUpdated": "2020-01-01T02:00:00Z",
+                    }
+                ],
+                **({} if second else {"omnigent.ai:cursor": "second-page"}),
+            }
+        )
+
+    browser_contract.route(
+        re.compile(rf"^{re.escape(appearance_url)}/v1/me/tasks(?:\?.*)?$"), archived_page
+    )
+    history.get_by_role("button", name="Find by month", exact=True).click()
+    history.get_by_label("Find month", exact=True).fill("2020-01")
+    history.get_by_role("button", name="Load month", exact=True).click()
+    expect(history.locator(".h-stat>b").first).to_have_text("2")
+    history.get_by_role("button", name=re.compile(r"\bexample\b")).click()
+    history.get_by_role("button", name=re.compile("Archive checks")).click()
+    expect(history.get_by_text("Archived first check", exact=True)).to_be_visible()
+    expect(history.get_by_text("Archived second check", exact=True)).to_be_visible()
+    assert len(old_requests) == 2 and old_requests[1]["cursor"] == ["second-page"]
+    history.get_by_role("button", name="Back to recent", exact=True).click()
+    expect(history.get_by_text("Archived first check", exact=True)).to_have_count(0)
     page.get_by_role("button", name="Today", exact=True).click()
-    expect(page.get_by_text("Active sessions today", exact=True)).to_be_visible()
-    expect(page.locator(".tb-number-tiles dt").filter(has_text="Closed today")).to_be_visible()
-    expect(page.get_by_text("toclosedDay.closed", exact=True)).to_have_count(0)
+    today = page.get_by_role("region", name="Today", exact=True)
+    expect(today.get_by_role("heading", name=re.compile("Who worked today"))).to_be_visible()
+    expect(today.get_by_text("Closed today", exact=True)).to_be_visible()
+    expect(today.get_by_text("Task-linked commits", exact=True)).to_be_visible()
     page.get_by_role("button", name="Settings", exact=True).click()
     display = page.get_by_role("region", name="Settings", exact=True)
     display.get_by_role("button", name="Dark" if theme == "dark" else "Light", exact=True).click()
@@ -369,3 +557,349 @@ def test_task_board_display_switch_and_source_list(
     output = Path(request.config.getoption("--output"))
     output.mkdir(parents=True, exist_ok=True)
     page.screenshot(path=str(output / f"task-board-{width}-{theme}.png"), full_page=True)
+    if width == 390:
+        browser_contract.json(
+            "/v1/me/tasks",
+            {"entries": [], "updated": "2026-11-06T06:30:00Z"},
+        )
+        browser_contract.json("/v1/me/tasks/history", {"entries": []})
+        page.evaluate(
+            "localStorage.setItem('omnigent.taskBoard.display', "
+            "JSON.stringify({theme:'dark', defaultView:'log'}))"
+        )
+        for route in ("/task-board", "/frame/task-board"):
+            page.goto(appearance_url + route)
+            expect(page.get_by_text("No activity to show.", exact=True)).to_be_visible()
+            measured = page.locator(".tb-page").evaluate(
+                """board => {
+                  const tabs = board.querySelector('.tb-view-tabs');
+                  const b = board.getBoundingClientRect(), n = tabs.getBoundingClientRect();
+                  return { boardBottom:b.bottom, navTop:n.top };
+                }"""
+            )
+            page.screenshot(
+                path=str(output / f"empty-{route.strip('/').replace('/', '-')}-dark.png")
+            )
+            assert measured["boardBottom"] >= measured["navTop"], measured
+            navigation = page.get_by_role("navigation", name="Board views")
+            expect(navigation).to_have_css("background-color", "rgb(24, 31, 37)")
+            navigation.get_by_role("button", name="Sessions", exact=True).click()
+            expect(page.get_by_role("region", name="Sessions", exact=True)).to_be_visible()
+    observed = datetime.now(UTC).isoformat()
+    ref = {"source": "example", "uid": "observations"}
+    checks = [
+        {"id": verdict, "host": f"host-{verdict}", "verdict": verdict, "count": 7, "at": observed}
+        for verdict in ("passed", "failed", "flaky")
+    ]
+    browser_contract.json(
+        "/v1/me/tasks",
+        {
+            "entries": [
+                {
+                    "uid": "observations",
+                    "title": "Recovery observations",
+                    "omnigent.ai:source": "example",
+                    "omnigent.ai:sourceDisplay": {
+                        "version": 1,
+                        "state": "blocked",
+                        "current": "Verify the recovery path",
+                        "identity": {
+                            "key": "ENG-2",
+                            "label": "Recovery observations",
+                            "groupId": "v2",
+                            "groupLabel": "Version two",
+                        },
+                        "actors": [{"id": "owner", "agentId": "codex", "label": "Recovery owner"}],
+                        "sessions": [
+                            {
+                                "id": "source-stale",
+                                "task": ref,
+                                "role": "root",
+                                "agentId": "codex",
+                                "label": "Source stale",
+                                "title": "Source stale",
+                                "status": "running",
+                                "createdAt": observed,
+                                "lastActivityAt": observed,
+                                "idleSeconds": 1300,
+                                "context": 0.9,
+                                "steps": [
+                                    {
+                                        "id": "step",
+                                        "kind": "you",
+                                        "label": "Review recovered output",
+                                        "state": "current",
+                                    }
+                                ],
+                            },
+                            {
+                                "id": "source-archive",
+                                "task": ref,
+                                "role": "root",
+                                "agentId": "codex",
+                                "label": "Source archive",
+                                "title": "Source archive",
+                                "status": "archived",
+                                "createdAt": observed,
+                                "lastActivityAt": observed,
+                                "archivedAt": observed,
+                                "context": 0.85,
+                            },
+                        ],
+                        "checks": checks,
+                        "events": [
+                            {
+                                "id": check["id"],
+                                "at": observed,
+                                "kind": "check",
+                                "task": ref,
+                                "checkId": check["id"],
+                            }
+                            for check in checks
+                        ],
+                    },
+                }
+            ],
+            "updated": observed,
+        },
+    )
+    page.evaluate(
+        "localStorage.setItem('omnigent.taskBoard.display', "
+        f"JSON.stringify({{theme:{json.dumps(theme)}, defaultView:'sessions'}}))"
+    )
+    page.goto(appearance_url + "/task-board")
+    marker = page.locator('[data-session-id="source-stale"] .tb-session-station.current')
+    danger = "rgb(231, 98, 125)" if theme == "dark" else "rgb(193, 49, 74)"
+    expect(marker).to_have_css("background-color", danger)
+    expect(marker).to_have_css("border-top-color", danger)
+    expect(marker).to_have_css("color", "rgb(255, 255, 255)")
+    failed = page.get_by_role("button", name=re.compile("host-failed failed"))
+    expect(failed.locator(".tb-recent-kind")).to_have_css("color", danger)
+    flaky = page.get_by_role("button", name=re.compile("host-flaky flaky"))
+    expect(flaky.locator(".tb-recent-kind")).to_have_css(
+        "color", "rgb(212, 151, 42)" if theme == "dark" else "rgb(129, 95, 34)"
+    )
+    if width >= 621:
+        page.get_by_role("button", name="Session details: Source stale", exact=True).hover()
+        expect(page.get_by_role("tooltip").locator(".tb-session-context b.hot")).to_have_css(
+            "background-color", danger
+        )
+        page.get_by_role("button", name="2 archived today", exact=True).click()
+        page.get_by_role("button", name="Session details: Source archive", exact=True).hover()
+        expect(page.get_by_role("tooltip")).to_contain_text("Archived")
+        expect(page.get_by_role("tooltip")).to_contain_text(str(datetime.now(UTC).year))
+        expect(page.get_by_role("tooltip").locator(".tb-session-context b.hot")).to_have_count(0)
+        failed.focus()
+        expect(page.get_by_role("tooltip")).to_contain_text("Recovery owner")
+        expect(page.get_by_role("tooltip")).to_contain_text("Verify the recovery path")
+        expect(page.get_by_role("tooltip")).to_contain_text("host-failed failed")
+        page.keyboard.press("Escape")
+        expect(page.get_by_role("tooltip")).to_have_count(0)
+    navigation_checks = []
+    for boundary in ["source", "group", "focus"] + (["phone"] if width == 390 else []):
+        count = {"source": 13, "group": 11, "focus": 2, "phone": 9}[boundary]
+        navigation_tasks = [
+            {
+                "uid": f"nav-{index}",
+                "title": f"Navigation task {index + 1}",
+                "created": observed,
+                "updated": observed,
+                "progress": "in-process",
+                "omnigent.ai:source": f"source-{index}" if boundary == "source" else "example",
+                "omnigent.ai:group": {
+                    "id": "shared" if boundary == "phone" else f"group-{index}",
+                    "name": "Shared group" if boundary == "phone" else f"Group {index + 1}",
+                },
+                "omnigent.ai:sourceDisplay": {
+                    "version": 1,
+                    "state": "running",
+                    "lastActivity": observed,
+                },
+            }
+            for index in range(count)
+        ]
+        first, last = navigation_tasks[0], navigation_tasks[-1]
+        first["omnigent.ai:sourceDisplay"]["relations"] = [
+            {
+                "id": "navigation",
+                "from": {"source": first["omnigent.ai:source"], "uid": first["uid"]},
+                "to": {"source": last["omnigent.ai:source"], "uid": last["uid"]},
+                "kind": "dependency",
+                "origin": "manual",
+                "provenance": "Example dependency",
+            }
+        ]
+        source_ids = list(dict.fromkeys(task["omnigent.ai:source"] for task in navigation_tasks))
+        browser_contract.json(
+            "/v1/me/tasks/sources",
+            {
+                "sources": [
+                    {
+                        "id": source,
+                        "name": source,
+                        "source": None,
+                        "created": observed,
+                        "issues": [],
+                    }
+                    for source in source_ids
+                ]
+            },
+        )
+        browser_contract.json("/v1/me/tasks", {"entries": navigation_tasks, "updated": observed})
+        browser_contract.json("/v1/me/tasks/history", {"entries": []})
+        browser_contract.json(
+            "/v1/me/tasks/item",
+            lambda incoming, items=navigation_tasks: next(
+                task
+                for task in items
+                if task["uid"] == parse_qs(urlparse(incoming.url).query)["uid"][0]
+            ),
+        )
+        preferences = {
+            "theme": theme,
+            "defaultView": "routes",
+            "defaultMode": "order",
+            "refresh": 0,
+        }
+        if boundary == "focus":
+            preferences["focus"] = [json.dumps(["example", "group-0"], separators=(",", ":"))]
+        page.evaluate(
+            "value => localStorage.setItem('omnigent.taskBoard.display', JSON.stringify(value))",
+            preferences,
+        )
+        page.goto(appearance_url + "/task-board")
+        origin, target = (last, first) if boundary == "source" else (first, last)
+        trigger = page.locator(f'button[data-route-task="{origin["uid"]}"]')
+        expect(trigger).to_be_visible()
+        expect(page.locator(f'button[data-route-task="{target["uid"]}"]')).to_have_count(0)
+        trigger.click()
+        current_detail = page.get_by_role("region", name=f"Details: {origin['title']}", exact=True)
+        expect(current_detail).to_be_visible()
+        anchor_top = current_detail.evaluate("el => el.closest('.rt-panel')?.style.top ?? null")
+        current_detail.get_by_role("button", name=re.compile(re.escape(target["title"]))).click()
+        destination = page.get_by_role("region", name=f"Details: {target['title']}", exact=True)
+        expect(destination).to_be_visible()
+        if width == 390:
+            assert (
+                destination.evaluate(
+                    "el => el.closest('li').querySelector(':scope > button').dataset.routeTask"
+                )
+                == origin["uid"]
+            )
+        else:
+            assert anchor_top != "0px"
+            assert destination.evaluate("el => el.closest('.rt-panel').style.top") == anchor_top
+        expect(page.locator(f'button[data-route-task="{target["uid"]}"]')).to_have_count(0)
+        page.screenshot(
+            path=str(output / f"route-related-{boundary}-{width}-{theme}.png"), full_page=True
+        )
+        destination.get_by_role("button", name="Close", exact=True).click()
+        expect(trigger).to_be_focused()
+        navigation_checks.append(boundary)
+    print("ROUTE_RELATED_NAVIGATION", width, theme, navigation_checks, flush=True)
+    assert not errors
+
+
+@pytest.mark.parametrize(
+    "width,theme", [(1440, "dark"), (1440, "light"), (390, "dark"), (390, "light")]
+)
+def test_task_board_history_source_names_and_scroll(
+    page: Page,
+    appearance_url: str,
+    browser_contract: BrowserContract,
+    width: int,
+    theme: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    browser_contract.json(
+        "/v1/info",
+        {
+            "single_user": True,
+            "accounts_enabled": False,
+            "features": {},
+            "task_board_enabled": True,
+        },
+    )
+    preferences = {
+        "user_id": "local",
+        "is_admin": True,
+        "preferences": {
+            "version": 1,
+            "settings": {"session_navigation": {"showTaskBoard": True}},
+        },
+    }
+    browser_contract.json("/v1/me", preferences)
+    browser_contract.json("/v1/me/preferences", preferences)
+    browser_contract.json(
+        "/v1/agents/with-sessions", {"agent_ids": [], "template_by_agent_id": {}}
+    )
+    browser_contract.json(
+        "/v1/me/preferences/keep_warm/convert", {"layers": {}, "already": True}, method="POST"
+    )
+    browser_contract.json(
+        "/v1/system/settings",
+        {"health_check": {"project_id": None, "host_id": None, "prompt": None}},
+    )
+    browser_contract.json("/v1/me/usage", {"accounts": []})
+    browser_contract.json("/v1/scheduled-tasks", {"scheduled_tasks": []})
+    browser_contract.json("/v1/me/tasks/history", {"entries": []})
+    observed = datetime.now(UTC).isoformat()
+    errors: list[str] = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.set_viewport_size({"width": width, "height": 900})
+    output = Path(request.config.getoption("--output"))
+    output.mkdir(parents=True, exist_ok=True)
+    source_ids = [f"project-{index:02d}" for index in range(1, 11)]
+    browser_contract.json(
+        "/v1/me/tasks/sources",
+        {
+            "sources": [
+                {"id": source, "name": source, "source": None, "created": observed, "issues": []}
+                for source in source_ids
+            ]
+        },
+    )
+    closed_at = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+    browser_contract.json(
+        "/v1/me/tasks",
+        {
+            "entries": [
+                {
+                    "uid": "closed-check",
+                    "title": f"Closed check in {source}",
+                    "omnigent.ai:source": source,
+                    "omnigent.ai:group": {"id": "checks", "name": "Recovery checks"},
+                    "progress": "completed",
+                    "created": closed_at,
+                    "progressUpdated": closed_at,
+                }
+                for source in source_ids
+            ],
+            "updated": observed,
+        },
+    )
+    browser_contract.json("/v1/me/tasks/closed-counts", {"days": []})
+    page.add_init_script(
+        "localStorage.setItem('omnigent.taskBoard.display', "
+        + json.dumps(json.dumps({"theme": theme, "defaultView": "history", "refresh": 0}))
+        + ")"
+    )
+    page.goto(appearance_url + "/task-board")
+    names = page.locator(".h-p .h-name b")
+    expect(names).to_have_text(source_ids)
+    wait_for_history_list(page, len(source_ids))
+    if width == 390:
+        scrolling = []
+        for row in page.locator(".h-p").all():
+            scrolling.append(scroll_to_history_row(row))
+        last = page.locator(".h-p").last.bounding_box()
+        navigation = page.locator(".tb-view-tabs").bounding_box()
+        assert last and navigation and last["y"] + last["height"] <= navigation["y"]
+        print(
+            "HISTORY_SOURCE_SCROLL",
+            theme,
+            json.dumps({"last": last, "navigation": navigation, "rows": scrolling}),
+            flush=True,
+        )
+        page.screenshot(path=str(output / f"history-source-scroll-{width}-{theme}.png"))
+    assert not errors

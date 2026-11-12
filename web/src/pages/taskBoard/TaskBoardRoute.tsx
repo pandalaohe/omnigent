@@ -34,7 +34,11 @@ function TaskBoardContent() {
 }
 export function TaskBoardRoute() {
   return (
-    <PageScroll maxWidthClassName="max-w-none" contentClassName="px-3 sm:px-6">
+    <PageScroll
+      maxWidthClassName="max-w-none"
+      className="flex flex-col"
+      contentClassName="flex flex-1 flex-col px-3 sm:px-6"
+    >
       <TaskBoardContent />
     </PageScroll>
   );

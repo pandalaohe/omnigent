@@ -1,6 +1,7 @@
 import Claude from "@lobehub/icons/es/Claude/components/Mono";
 import Codex from "@lobehub/icons/es/Codex/components/Mono";
 import Antigravity from "@lobehub/icons/es/Antigravity/components/Mono";
+import Pi from "@lobehub/icons/es/Pi/components/Mono";
 
 const colours = [
   "#ee352e",
@@ -16,27 +17,55 @@ const colours = [
   "#6cbe45",
   "#996633",
 ];
+function agentIcon(product?: string | null) {
+  return product === "claude"
+    ? Claude
+    : product === "codex"
+      ? Codex
+      : product === "antigravity"
+        ? Antigravity
+        : product === "pi"
+          ? Pi
+          : null;
+}
+
+export function BoardAgentLogo({
+  id,
+  size = 18,
+  compact = false,
+}: {
+  id: string;
+  size?: number;
+  compact?: boolean;
+}) {
+  const Icon = agentIcon(id);
+  return (
+    <span
+      className={`tb-agent-logo${compact ? " compact" : ""} ag-${Icon ? id : "unknown"}`}
+      aria-hidden="true"
+      style={{ width: size, height: size }}
+    >
+      {Icon ? <Icon size={compact ? Math.round(size * 0.69) : size} /> : <span>{"?"}</span>}
+    </span>
+  );
+}
+
 export function BoardIdentityMark({
   id,
   label,
   product,
   size = 16,
+  neutral = false,
 }: {
   id: string;
   label: string;
   product?: string | null;
   size?: number;
+  neutral?: boolean;
 }) {
   let hash = 0;
   for (let index = 0; index < id.length; index++) hash = (hash * 31 + id.charCodeAt(index)) >>> 0;
-  const Icon =
-    product === "claude"
-      ? Claude
-      : product === "codex"
-        ? Codex
-        : product === "antigravity"
-          ? Antigravity
-          : null;
+  const Icon = agentIcon(product);
   return (
     <span
       className={`tb-identity-mark${Icon ? ` tb-brand-${product}` : ""}`}
@@ -45,7 +74,12 @@ export function BoardIdentityMark({
         width: size,
         height: size,
         borderRadius: size * 0.28,
-        background: Icon ? undefined : colours[hash % colours.length],
+        background: Icon
+          ? undefined
+          : neutral
+            ? "var(--secondary)"
+            : colours[hash % colours.length],
+        color: !Icon && neutral ? "var(--muted-foreground)" : undefined,
         fontSize: Math.round(size * 0.58),
       }}
     >

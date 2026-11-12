@@ -6,6 +6,7 @@
   --tb-line-4: var(--chart-5, #bd558e);
   width: 100%;
   min-width: 0;
+  flex: 1;
   font-size: 14px;
   padding-bottom: 24px;
 }
@@ -1230,6 +1231,12 @@
 .tb-brand-antigravity {
   background: #1a73e8;
 }
+.tb-brand-pi {
+  background: #7c2d92;
+}
+.tb-page.dark .tb-brand-pi {
+  background: #9b46b3;
+}
 .tb-project-bullet {
   display: inline-grid;
   place-items: center;
@@ -1288,6 +1295,9 @@
   gap: 12.5px;
 }
 @container (max-width:620px) {
+  .tb-page > .tb-activity-final {
+    padding-bottom: calc(50px + var(--omnigent-inset-bottom, 0px));
+  }
   .tb-page .tb-page-header {
     min-height: 54px;
   }
@@ -1298,7 +1308,7 @@
     bottom: var(--omnigent-inset-bottom, 0px);
     z-index: 30;
     gap: 0;
-    background: var(--card);
+    background: var(--card-solid);
     border-top: 1px solid var(--border);
     padding: 3.5px;
   }

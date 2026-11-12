@@ -1,4 +1,4 @@
-import dagre from "@dagrejs/dagre";
+import { graphlib, layout as layoutGraph } from "@dagrejs/dagre";
 import { bisector } from "d3-array";
 import { timeDay, timeHour, timeMonday, timeMonth, timeYear } from "d3-time";
 import {
@@ -177,7 +177,7 @@ export function routeRows(tasks: BoardTask[], sources: TaskSource[]): RouteRow[]
   const linked = new Set(links.flat());
   let order = new Map<string, number>();
   if (linked.size > 0 && linked.size <= 150) {
-    const graph = new dagre.graphlib.Graph({ compound: true })
+    const graph = new graphlib.Graph({ compound: true })
       .setGraph({ rankdir: "LR", nodesep: 10, ranksep: 40 })
       .setDefaultEdgeLabel(() => ({}));
     for (const row of rows.filter((candidate) => linked.has(candidate.id))) {
@@ -191,7 +191,7 @@ export function routeRows(tasks: BoardTask[], sources: TaskSource[]): RouteRow[]
       graph.setEdge(a, joint);
       graph.setEdge(b, joint);
     });
-    dagre.layout(graph);
+    layoutGraph(graph);
     order = new Map([...linked].map((id) => [id, graph.node(id).y as number]));
   }
   const sourceOrder = new Map<string, number>();
@@ -367,6 +367,7 @@ export function routeLayout(
   now: number,
   label: (node: RouteNode) => string,
   thresholds = { station: 2, phase: 14 },
+  detailGap?: { rowId: string; height: number },
 ): RouteLayout {
   const levelOf = (span: number) => detailLevel(span, thresholds.station, thresholds.phase);
   const rowHeight = levelOf(window.to - window.from) === "station" || mode === "order" ? 136 : 92;
@@ -385,6 +386,7 @@ export function routeLayout(
     previousSource = row.source;
     const y = top + rowHeight / 2;
     top += rowHeight;
+    if (detailGap?.rowId === row.id) top += detailGap.height;
     const sorted =
       mode === "order"
         ? row.tasks

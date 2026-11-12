@@ -85,15 +85,17 @@ it.each([
   );
   wrap(<TaskBoardActivity view="log" tasks={tasks} sessions={sessions} onSelect={vi.fn()} />);
   await screen.findByRole("button", { name: "Upload task 0" });
-  fireEvent.change(screen.getByLabelText("Group by"), { target: { value: group } });
-  const headings = screen.getAllByRole("heading", { name: label });
+  fireEvent.click(
+    screen.getByRole("button", { name: group === "mother" ? "By root session" : "By task group" }),
+  );
+  const headings = screen.getAllByRole("heading", { name: new RegExp(label) });
   expect(headings).toHaveLength(2);
   const first = within(headings[0].parentElement!);
   const second = within(headings[1].parentElement!);
-  expect(first.getAllByRole("listitem")).toHaveLength(2);
+  expect(first.getAllByRole("button", { name: /^Upload task \d$/ })).toHaveLength(2);
   expect(first.getByRole("button", { name: "Upload task 0" })).toBeTruthy();
   expect(first.getByRole("button", { name: "Upload task 2" })).toBeTruthy();
-  expect(second.getAllByRole("listitem")).toHaveLength(1);
+  expect(second.getAllByRole("button", { name: /^Upload task \d$/ })).toHaveLength(1);
   expect(second.getByRole("button", { name: "Upload task 1" })).toBeTruthy();
 });
 it("renders full-past counts without inventing old task bodies", async () => {
@@ -105,10 +107,11 @@ it("renders full-past counts without inventing old task bodies", async () => {
     ),
   );
   wrap(<TaskBoardActivity view="history" tasks={[]} sessions={[]} onSelect={vi.fn()} />);
-  await screen.findByTitle("Week of 2019-12-30: 23 closed");
-  fireEvent.click(screen.getByTitle("Week of 2019-12-30: 23 closed"));
-  expect((screen.getByLabelText("Find month") as HTMLSelectElement).value).toBe("2020-01");
-  expect(screen.getByText(/outside the retained task window/)).toBeTruthy();
+  await waitFor(() =>
+    expect(screen.getByRole("group", { name: /Closed tasks by date/ }).textContent).toContain("23"),
+  );
+  expect(screen.queryByText("2020-01-01", { selector: ".h-name b" })).toBeNull();
+  expect(screen.getByText("No records match these filters.")).toBeTruthy();
 });
 it("translates the Today closed-count tile", async () => {
   fetcher.mockImplementation(async (url: string) =>
@@ -117,7 +120,7 @@ it("translates the Today closed-count tile", async () => {
   const { container } = wrap(
     <TaskBoardActivity view="today" tasks={[]} sessions={[]} onSelect={vi.fn()} />,
   );
-  expect(await screen.findByText("Closed today", { selector: "dt" })).toBeTruthy();
+  expect(await screen.findByText("Closed today")).toBeTruthy();
   expect(container.textContent).not.toContain("toclosedDay.closed");
 });
 it("keeps aliases local and requires a named counted confirmation before deletion", async () => {
@@ -211,7 +214,7 @@ it("loads History counts through the query boundary across a daylight transition
   });
   try {
     wrap(<TaskBoardActivity view="history" tasks={[]} sessions={[]} onSelect={vi.fn()} />);
-    await screen.findByTitle("Week of 2026-03-09: 2 closed");
+    await waitFor(() => expect(segments).toHaveLength(2));
     expect(segments.map((query) => query.get("offset"))).toEqual(["-480", "-420"]);
     expect(segments.every((query) => !query.has("client"))).toBe(true);
   } finally {

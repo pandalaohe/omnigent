@@ -181,9 +181,11 @@ export function mergeDisplaySession(source: DisplaySession, native?: BoardSessio
     tool: native.current_tool,
     questions: native.questions,
     need:
-      native.status === "waiting" || (native.pending_elicitations_count ?? 0) > 0
+      native.need ??
+      (!native.questions?.length &&
+      (native.status === "waiting" || (native.pending_elicitations_count ?? 0) > 0)
         ? t("session.waiting")
-        : native.need,
+        : undefined),
   };
 }
 
