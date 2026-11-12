@@ -417,7 +417,9 @@ export function TaskBoardSessions({
   sourceCaches,
   onSelect,
   onView,
+  inlineDetail,
 }: {
+  inlineDetail?: ReactNode;
   sessions: BoardSession[];
   tasks: BoardTask[];
   sourceCaches?: Record<string, SourceCache>;
@@ -433,6 +435,7 @@ export function TaskBoardSessions({
   const [hover, setHover] = useState<ReactNode>(null),
     [pointer, setPointer] = useState({ x: 0, y: 0 });
   const [hoverEvent, setHoverEvent] = useState<string | null>(null);
+  const [recentDetail, setRecentDetail] = useState<string | null>(null);
   const tooltipId = useId();
   const tooltip = useRef<HTMLDivElement>(null);
   const [hoverSize, setHoverSize] = useState({ width: 330, height: 180 });
@@ -525,6 +528,7 @@ export function TaskBoardSessions({
           (row.task ? (
             <TaskBoardDetail
               task={row.task}
+              selectedSessionId={row.session.id}
               tasks={tasks}
               sessions={hydrated}
               sourceCache={sourceCaches?.[row.task["omnigent.ai:source"]]}
@@ -624,64 +628,67 @@ export function TaskBoardSessions({
                   )
                 : undefined;
             return (
-              <button
-                type="button"
-                className="tb-recent-event"
-                key={eventKey}
-                aria-describedby={hover && hoverEvent === eventKey ? tooltipId : undefined}
-                onMouseEnter={(pointerEvent) => {
-                  setHoverEvent(eventKey);
-                  setPointer({ x: pointerEvent.clientX, y: pointerEvent.clientY });
-                  setHover(taskHover);
-                }}
-                onMouseMove={(pointerEvent) =>
-                  setPointer({ x: pointerEvent.clientX, y: pointerEvent.clientY })
-                }
-                onMouseLeave={() => setHover(null)}
-                onFocus={(focusEvent) => {
-                  setHoverEvent(eventKey);
-                  const rect = focusEvent.currentTarget.getBoundingClientRect();
-                  setPointer({ x: rect.left, y: rect.top });
-                  setHover(taskHover);
-                }}
-                onBlur={() => setHover(null)}
-                onKeyDown={(keyEvent) => {
-                  if (keyEvent.key === "Escape") setHover(null);
-                }}
-                onClick={() => {
-                  setHover(null);
-                  onSelect(task);
-                }}
-              >
-                <time dateTime={event.at}>{clock(event.at)}</time>
-                <BoardIdentityMark
-                  id={event.agentId ?? event.host ?? ""}
-                  product={event.agentId}
-                  label={event.agentId ?? event.host ?? "?"}
-                  neutral
-                  size={24}
-                />
-                <i className={`tb-recent-kind ${event.kind} ${check?.verdict ?? ""}`}>
-                  <Icon size={12} />
-                </i>
-                <span>
-                  <b>{task["omnigent.ai:sourceDisplay"]?.identity?.label || taskTitle(task)}</b>{" "}
-                  <small className={check?.verdict}>
+              <Fragment key={eventKey}>
+                <button
+                  type="button"
+                  className="tb-recent-event"
+                  aria-describedby={hover && hoverEvent === eventKey ? tooltipId : undefined}
+                  onMouseEnter={(pointerEvent) => {
+                    setHoverEvent(eventKey);
+                    setPointer({ x: pointerEvent.clientX, y: pointerEvent.clientY });
+                    setHover(taskHover);
+                  }}
+                  onMouseMove={(pointerEvent) =>
+                    setPointer({ x: pointerEvent.clientX, y: pointerEvent.clientY })
+                  }
+                  onMouseLeave={() => setHover(null)}
+                  onFocus={(focusEvent) => {
+                    setHoverEvent(eventKey);
+                    const rect = focusEvent.currentTarget.getBoundingClientRect();
+                    setPointer({ x: rect.left, y: rect.top });
+                    setHover(taskHover);
+                  }}
+                  onBlur={() => setHover(null)}
+                  onKeyDown={(keyEvent) => {
+                    if (keyEvent.key === "Escape") setHover(null);
+                  }}
+                  onClick={() => {
+                    setHover(null);
+                    setRecentDetail(eventKey);
+                    onSelect(task);
+                  }}
+                >
+                  <time dateTime={event.at}>{clock(event.at)}</time>
+                  <BoardIdentityMark
+                    id={event.agentId ?? event.host ?? ""}
+                    product={event.agentId}
+                    label={event.agentId ?? event.host ?? "?"}
+                    neutral
+                    size={24}
+                  />
+                  <i className={`tb-recent-kind ${event.kind} ${check?.verdict ?? ""}`}>
+                    <Icon size={12} />
+                  </i>
+                  <span>
+                    <b>{task["omnigent.ai:sourceDisplay"]?.identity?.label || taskTitle(task)}</b>{" "}
+                    <small className={check?.verdict}>
+                      {check
+                        ? `${check.host} ${t(`sessions.check.${check.verdict}`)}`
+                        : event.kind === "check"
+                          ? event.label || t("sessions.check.unknown")
+                          : event.label || t(`sessions.event.${event.kind}`)}
+                    </small>
+                  </span>
+                  <em>
                     {check
-                      ? `${check.host} ${t(`sessions.check.${check.verdict}`)}`
-                      : event.kind === "check"
-                        ? event.label || t("sessions.check.unknown")
-                        : event.label || t(`sessions.event.${event.kind}`)}
-                  </small>
-                </span>
-                <em>
-                  {check
-                    ? t("sessions.checkCount", { count: check.count })
-                    : event.workSeconds
-                      ? duration(event.workSeconds)
-                      : ""}
-                </em>
-              </button>
+                      ? t("sessions.checkCount", { count: check.count })
+                      : event.workSeconds
+                        ? duration(event.workSeconds)
+                        : ""}
+                  </em>
+                </button>
+                {recentDetail === eventKey && inlineDetail}
+              </Fragment>
             );
           })}
         </section>
@@ -694,26 +701,31 @@ export function TaskBoardSessions({
             </button>
           </h4>
           {recent.quotes.map(({ quote, task }) => (
-            <button
-              type="button"
-              className="tb-recent-quote"
-              key={JSON.stringify([taskIdentity(task), quote.id])}
-              onClick={() => onSelect(task)}
-              title={quote.date || quote.at}
-            >
-              <blockquote>
-                {"「"}
-                {quote.text.slice(0, 58)}
-                {quote.text.length > 58 ? "…」" : "」"}
-                <cite>
-                  {task["omnigent.ai:sourceDisplay"]?.identity?.label || taskTitle(task)}
-                  {" · "}
-                  {task["omnigent.ai:sourceDisplay"]?.identity?.key ||
-                    task["omnigent.ai:key"] ||
-                    task.uid}
-                </cite>
-              </blockquote>
-            </button>
+            <Fragment key={JSON.stringify([taskIdentity(task), quote.id])}>
+              <button
+                type="button"
+                className="tb-recent-quote"
+                onClick={() => {
+                  setRecentDetail(JSON.stringify([taskIdentity(task), quote.id]));
+                  onSelect(task);
+                }}
+                title={quote.date || quote.at}
+              >
+                <blockquote>
+                  {"「"}
+                  {quote.text.slice(0, 58)}
+                  {quote.text.length > 58 ? "…」" : "」"}
+                  <cite>
+                    {task["omnigent.ai:sourceDisplay"]?.identity?.label || taskTitle(task)}
+                    {" · "}
+                    {task["omnigent.ai:sourceDisplay"]?.identity?.key ||
+                      task["omnigent.ai:key"] ||
+                      task.uid}
+                  </cite>
+                </blockquote>
+              </button>
+              {recentDetail === JSON.stringify([taskIdentity(task), quote.id]) && inlineDetail}
+            </Fragment>
           ))}
         </section>
       </div>

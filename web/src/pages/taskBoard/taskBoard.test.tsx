@@ -270,8 +270,8 @@ it("maps source tasks to routes and keeps unsafe source URLs as text", async () 
   expect(await within(detail).findByRole("link", { name: "Open source" })).toBeTruthy();
   fireEvent.click(screen.getAllByRole("button", { name: "Remove old endpoint" })[0]);
   const noPage = await screen.findByRole("region", { name: "Details: Remove old endpoint" });
-  expect(within(noPage).getByText("The source gives no page")).toBeTruthy();
-  expect(await within(noPage).findByText("not_planned")).toBeTruthy();
+  expect(within(noPage).queryByRole("link", { name: "Open source" })).toBeNull();
+  expect(await within(noPage).findByText("This task is closed.")).toBeTruthy();
   expect(document.querySelector('a[href^="javascript:"]')).toBeNull();
   expect(mocks.fetch.mock.calls.every((call) => call.length === 1)).toBe(true);
 });
@@ -294,11 +294,11 @@ it("joins task waits with native prompts and opens real session links", async ()
   const detail = await screen.findByRole("region", { name: "Details: Choose the retry budget" });
   expect(within(detail).getByText("Approve a limit of three retries.")).toBeTruthy();
   expect(within(detail).getByText("Depends on")).toBeTruthy();
-  fireEvent.click(within(detail).getByRole("button", { name: "ENG-123" }));
+  fireEvent.click(within(detail).getByRole("button", { name: /ENG-123/ }));
   const changed = await screen.findByRole("region", {
     name: "Details: Recover interrupted uploads",
   });
-  expect(await within(changed).findByText("65%")).toBeTruthy();
+  expect(within(changed).queryByText("65%")).toBeNull();
   expect(await within(changed).findByText("$1.90")).toBeTruthy();
 });
 it("keeps native sessions usable with no source and retries a failed source read", async () => {

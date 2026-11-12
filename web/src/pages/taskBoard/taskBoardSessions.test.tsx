@@ -118,6 +118,7 @@ it("reorders a newly waiting child from refreshed detail without fetching hidden
   ];
   const { container, client } = mount([], list);
   await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(9));
+  await waitFor(() => expect(client.isFetching()).toBe(0));
   await act(async () =>
     client.setQueryData(["taskBoard", "session", "two"], {
       ...list[2],
@@ -125,8 +126,10 @@ it("reorders a newly waiting child from refreshed detail without fetching hidden
       need: "Approve the next step",
     }),
   );
-  expect(container.querySelector(".tb-session-line.child")?.getAttribute("data-session-id")).toBe(
-    "two",
+  await waitFor(() =>
+    expect(container.querySelector(".tb-session-line.child")?.getAttribute("data-session-id")).toBe(
+      "two",
+    ),
   );
   expect(fetcher.mock.calls.some(([path]) => path.includes("later-7"))).toBe(false);
 });

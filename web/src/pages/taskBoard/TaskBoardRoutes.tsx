@@ -1,5 +1,5 @@
 import { boardExitProps } from "@/lib/boardFrame";
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode, type CSSProperties } from "react";
 import {
   ChevronDownIcon,
   ChevronLeftIcon,
@@ -37,6 +37,8 @@ import { TaskProgressIcon } from "./TaskProgressIcon";
 import { formatDate, formatNumber, t } from "./taskBoardText";
 
 export function TaskBoardRoutes({
+  selectedTask,
+  inlineDetail,
   tasks,
   sources,
   aliases,
@@ -50,6 +52,8 @@ export function TaskBoardRoutes({
   lodStation = 2,
   lodPhase = 14,
 }: {
+  selectedTask?: BoardTask | null;
+  inlineDetail?: ReactNode;
   boardHours?: number;
   lodStation?: number;
   lodPhase?: number;
@@ -137,10 +141,34 @@ export function TaskBoardRoutes({
     node.tasks.length > 1
       ? t("routes.stops", { count: node.tasks.length })
       : taskTitle(node.tasks[0]).slice(0, 23) + (taskTitle(node.tasks[0]).length > 23 ? "…" : "");
-  const layout = routeLayout(mapped, mode, window, width, now, label, {
-    station: lodStation,
-    phase: lodPhase,
-  });
+  const detailElement = useRef<HTMLDivElement>(null);
+  const [detailHeight, setDetailHeight] = useState(420);
+  const selectedRow = mapped.find((row) =>
+    row.tasks.some((task) => selectedTask && taskIdentity(task) === taskIdentity(selectedTask)),
+  );
+  useEffect(() => {
+    const element = detailElement.current;
+    if (!element || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() =>
+      setDetailHeight(element.getBoundingClientRect().height),
+    );
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [selectedTask, mode, width]);
+  const layout = routeLayout(
+    mapped,
+    mode,
+    window,
+    width,
+    now,
+    label,
+    {
+      station: lodStation,
+      phase: lodPhase,
+    },
+    selectedRow && inlineDetail ? { rowId: selectedRow.id, height: detailHeight } : undefined,
+  );
+  const detailTop = layout.rails.find((rail) => rail.row.id === selectedRow?.id);
   const clusterTasks = tasks.filter((task) => clusterIds?.includes(taskIdentity(task)));
   const currentClusterPage = Math.min(
     clusterPage,
@@ -429,6 +457,21 @@ export function TaskBoardRoutes({
               </div>
             )}
             <div className="tb-route-graph" style={{ height: graphHeight }}>
+              {detailTop && inlineDetail && (width > 620 || mode === "time") && (
+                <div
+                  ref={detailElement}
+                  className="tb-route-inline-detail"
+                  style={{
+                    position: "absolute",
+                    top: detailTop.y + layout.rowHeight / 2,
+                    left: 0,
+                    right: 0,
+                    zIndex: 2,
+                  }}
+                >
+                  {inlineDetail}
+                </div>
+              )}
               <svg
                 width={width}
                 height={graphHeight}
@@ -783,6 +826,11 @@ export function TaskBoardRoutes({
                               {task["omnigent.ai:key"] && <small>{task["omnigent.ai:key"]}</small>}
                             </span>
                           </button>
+                          {width <= 620 &&
+                            mode === "order" &&
+                            selectedTask &&
+                            taskIdentity(task) === taskIdentity(selectedTask) &&
+                            inlineDetail}
                           {relations
                             .filter(
                               (edge) => edge.to && taskIdentity(edge.from) === taskIdentity(task),

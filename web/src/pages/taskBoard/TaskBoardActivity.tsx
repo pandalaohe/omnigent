@@ -1,7 +1,7 @@
 import { useBoardCadence } from "./taskBoardPreferences";
 import { sourceHistory, type SourceCache } from "./taskBoardSnapshotData";
 import { boardExitProps, boardPath } from "@/lib/boardFrame";
-import { useState } from "react";
+import { Fragment, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { timeMonday } from "d3-time";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -28,9 +28,11 @@ export function TaskBoardActivity({
   tasks,
   sessions,
   onSelect,
+  inlineDetail,
   sourceCaches,
   hiddenSources = EMPTY_HIDDEN_SOURCES,
 }: {
+  inlineDetail?: ReactNode;
   hiddenSources?: string[];
   sourceCaches?: Record<string, SourceCache>;
   view: "log" | "history" | "today";
@@ -39,6 +41,7 @@ export function TaskBoardActivity({
   onSelect: (task: BoardTask) => void;
 }) {
   const cadence = useBoardCadence();
+  const [detailRow, setDetailRow] = useState<string | null>(null);
   const visibleTasks = tasks.filter((task) => !hiddenSources.includes(task["omnigent.ai:source"]));
   const [group, setGroup] = useState("time"),
     [page, setPage] = useState(0),
@@ -249,16 +252,27 @@ export function TaskBoardActivity({
           )}
           <ul className="tb-activity-list">
             {held.slice(current * 30, current * 30 + 30).map((task) => (
-              <li key={taskIdentity(task)}>
-                <button type="button" onClick={() => onSelect(task)}>
-                  {taskTitle(task)}
-                </button>
-                <span>{t(`progress.${task.progress ?? "needs-action"}`)}</span>
-                <BoardDate
-                  value={task.progressUpdated ?? task["omnigent.ai:closedSeen"]}
-                  observed={!task.progressUpdated && !!task["omnigent.ai:closedSeen"]}
-                />
-              </li>
+              <Fragment key={taskIdentity(task)}>
+                <li>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDetailRow(taskIdentity(task));
+                      onSelect(task);
+                    }}
+                  >
+                    {taskTitle(task)}
+                  </button>
+                  <span>{t(`progress.${task.progress ?? "needs-action"}`)}</span>
+                  <BoardDate
+                    value={task.progressUpdated ?? task["omnigent.ai:closedSeen"]}
+                    observed={!task.progressUpdated && !!task["omnigent.ai:closedSeen"]}
+                  />
+                </li>
+                {detailRow === taskIdentity(task) && inlineDetail && (
+                  <li className="tb-inline-row">{inlineDetail}</li>
+                )}
+              </Fragment>
             ))}
           </ul>
           {!held.length && <p className="tb-empty">{t("activity.empty")}</p>}
@@ -287,11 +301,22 @@ export function TaskBoardActivity({
               </div>
               <ul className="tb-activity-list">
                 {closed.map((task) => (
-                  <li key={taskIdentity(task)}>
-                    <button type="button" onClick={() => onSelect(task)}>
-                      {taskTitle(task)}
-                    </button>
-                  </li>
+                  <Fragment key={taskIdentity(task)}>
+                    <li>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDetailRow(taskIdentity(task));
+                          onSelect(task);
+                        }}
+                      >
+                        {taskTitle(task)}
+                      </button>
+                    </li>
+                    {detailRow === taskIdentity(task) && inlineDetail && (
+                      <li className="tb-inline-row">{inlineDetail}</li>
+                    )}
+                  </Fragment>
                 ))}
                 {active.map((session) => (
                   <li key={session.id}>
@@ -354,25 +379,35 @@ export function TaskBoardActivity({
                   {visible.map((event) => {
                     const task = byId.get(JSON.stringify([event.source, event.uid]));
                     return (
-                      <li key={JSON.stringify([event.source, event.uid, event.id])}>
-                        <BoardDate value={event.time} />
-                        <div>
-                          {task ? (
-                            <button type="button" onClick={() => onSelect(task)}>
-                              {taskTitle(task)}
-                            </button>
-                          ) : (
-                            <span>{event.uid}</span>
-                          )}
-                          <p>
-                            {event.label ||
-                              (t(`history.${event.kind}`) === `history.${event.kind}`
-                                ? event.kind
-                                : t(`history.${event.kind}`))}
-                          </p>
-                          {event.note && <p>{event.note}</p>}
-                        </div>
-                      </li>
+                      <Fragment key={JSON.stringify([event.source, event.uid, event.id])}>
+                        <li>
+                          <BoardDate value={event.time} />
+                          <div>
+                            {task ? (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setDetailRow(JSON.stringify([event.source, event.uid, event.id]));
+                                  onSelect(task);
+                                }}
+                              >
+                                {taskTitle(task)}
+                              </button>
+                            ) : (
+                              <span>{event.uid}</span>
+                            )}
+                            <p>
+                              {event.label ||
+                                (t(`history.${event.kind}`) === `history.${event.kind}`
+                                  ? event.kind
+                                  : t(`history.${event.kind}`))}
+                            </p>
+                            {event.note && <p>{event.note}</p>}
+                          </div>
+                        </li>
+                        {detailRow === JSON.stringify([event.source, event.uid, event.id]) &&
+                          inlineDetail && <li className="tb-inline-row">{inlineDetail}</li>}
+                      </Fragment>
                     );
                   })}
                 </ul>

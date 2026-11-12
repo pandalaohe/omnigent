@@ -215,3 +215,29 @@ it("preserves unique parent membership counts for ordinary and clustered stops",
   expect(counts.get(tasks[2])).toBeUndefined();
   expect(counts.get(tasks[3])).toBeUndefined();
 });
+
+it("leaves space for the inline card after its band without shifting that band's stations", () => {
+  const now = 1_800_000_000_000;
+  const tasks: BoardTask[] = ["one", "two"].map((uid) => ({
+    uid,
+    title: uid,
+    "omnigent.ai:source": "example",
+    "omnigent.ai:group": { id: uid },
+    created: new Date(now).toISOString(),
+  }));
+  const rows = routeRows(tasks, [{ id: "example", name: null, source: null }]);
+  const before = routeLayout(rows, "order", initialWindow(now), 900, now, (node) => node.id);
+  const after = routeLayout(
+    rows,
+    "order",
+    initialWindow(now),
+    900,
+    now,
+    (node) => node.id,
+    undefined,
+    { rowId: rows[0].id, height: 360 },
+  );
+  expect(after.nodes[0].y).toBe(before.nodes[0].y);
+  expect(after.nodes[1].y - before.nodes[1].y).toBe(360);
+  expect(after.height - before.height).toBe(360);
+});

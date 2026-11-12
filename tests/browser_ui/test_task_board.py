@@ -300,6 +300,12 @@ def test_task_board_display_switch_and_source_list(
     waiting = page.get_by_role("region", name="Waiting on me", exact=True)
     expect(waiting.get_by_text("Approve the retry budget")).to_be_visible()
     expect(waiting.locator('a[href="/c/child"]')).to_be_visible()
+    waiting.get_by_role("button", name=re.compile("Approve the retry budget")).click()
+    waiting_detail = waiting.get_by_role(
+        "region", name="Details: Retry failed uploads", exact=True
+    )
+    expect(waiting_detail).to_be_visible()
+    waiting_detail.get_by_role("button", name="Close", exact=True).click()
     waiting.get_by_role("button", name="Close", exact=True).click()
     page.get_by_role("navigation", name="Board views").get_by_role(
         "button", name="Routes", exact=True
@@ -313,16 +319,23 @@ def test_task_board_display_switch_and_source_list(
     expect(detail.get_by_text("Check a slow connection")).to_be_visible()
     expect(detail.locator('a[href="https://tracker.example.com/retry"]')).to_be_visible()
     expect(detail.locator('a[href="/c/parent"]')).to_be_visible()
-    detail.get_by_text("History and commits", exact=True).click()
-    expect(detail.get_by_text("Keep confirmed chunks")).to_be_visible()
+    expect(detail.locator(".tb-dc-tiles")).to_be_visible()
+    expect(detail.locator('a[href="/c/parent"]')).to_have_attribute("target", "_blank")
+    if width >= 621:
+        expect(detail.locator(".tb-dc-body")).to_have_css(
+            "grid-template-columns", re.compile(r".+ .+")
+        )
     detail.get_by_role("button", name="Close", exact=True).click()
     region.get_by_role("button", name=re.compile(r"Drop the legacy endpoint")).first.click()
     no_page = page.get_by_role("region", name="Details: Drop the legacy endpoint", exact=True)
-    expect(no_page.get_by_text("The source gives no page")).to_be_visible()
+    expect(no_page.locator("a[href^=javascript]")).to_have_count(0)
     expect(page.locator('a[href^="javascript:"]')).to_have_count(0)
     no_page.get_by_role("button", name="Close", exact=True).click()
     page.get_by_role("button", name="By time", exact=True).click()
     expect(region.locator(".tb-axis")).to_be_visible()
+    region.locator('.tb-station[aria-label="Retry failed uploads"]').click()
+    expect(detail).to_be_visible()
+    detail.get_by_role("button", name="Close", exact=True).click()
     graph = region.locator("svg").first
     assert graph.bounding_box()
     assert page.locator("main").last.evaluate(
@@ -343,6 +356,15 @@ def test_task_board_display_switch_and_source_list(
     expect(
         page.get_by_role("region", name="Log").get_by_role("heading", name="Transfer reliability")
     ).to_be_visible()
+    log = page.get_by_role("region", name="Log", exact=True)
+    log.get_by_role("button", name="Retry failed uploads", exact=True).click()
+    log_detail = log.get_by_role("region", name="Details: Retry failed uploads", exact=True)
+    expect(log_detail).to_be_visible()
+    assert log_detail.evaluate(
+        "el => el.closest('li').previousElementSibling.textContent"
+        ".includes('Keep confirmed chunks')"
+    )
+    log_detail.get_by_role("button", name="Close", exact=True).click()
     page.get_by_role("button", name="History", exact=True).click()
     expect(page.get_by_title("Week of 2019-12-30: 23 closed")).to_be_visible()
     page.get_by_label("Find month").select_option("2020-01")
