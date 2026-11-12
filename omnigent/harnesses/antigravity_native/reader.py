@@ -109,6 +109,7 @@ from omnigent.harnesses.antigravity_native.steps import (
 )
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.native._native_post_delivery import post_session_event_with_retry
+from omnigent.onboarding.providers import find_catalog_models
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 from omnigent.usage_export.runtime import capture_antigravity_step, capture_enabled
 from omnigent.util.atomic_json import atomic_write_json
@@ -388,11 +389,11 @@ def _resolve_display_name(model_enum: str, catalog: dict[str, object]) -> str:
     return model_enum
 
 
-_MODEL_PAREN_GROUP_RE = re.compile(r"\s*\([^()]*\)\s*")
+_MODEL_PAREN_GROUP_RE = re.compile(r"\s*\((?:low|medium|high|thinking)\)\s*", re.IGNORECASE)
 
 
 def _catalog_model_id(display_name: str) -> str:
-    """Convert a tiered agy label to a catalog id, preserving unresolved enums."""
+    """Derive an id candidate, stripping known effort tiers but retaining other qualifiers."""
     label = _MODEL_PAREN_GROUP_RE.sub(" ", display_name).strip()
     if not label:
         return display_name
@@ -3023,7 +3024,18 @@ async def _maybe_emit_session_usage(
     model_id: str | None = None
     if isinstance(model_enum, str) and model_enum:
         catalog = await _ensure_catalog(state)
-        model_id = _catalog_model_id(_resolve_display_name(model_enum, catalog))
+        candidate = _catalog_model_id(_resolve_display_name(model_enum, catalog))
+        model_id = model_enum
+        if candidate != model_enum:
+            try:
+                matches = await asyncio.to_thread(find_catalog_models, candidate)
+                # Family matches cannot establish identity for agy's derived names.
+                if any(info.name.rsplit("/", 1)[-1].lower() == candidate for info in matches):
+                    model_id = candidate
+            except Exception:
+                _logger.warning(
+                    "agy usage catalog lookup failed; retaining model enum", exc_info=True
+                )
     # Build the cumulative payload (SET-semantics running totals).
     payload: dict[str, object] = {}
     if state.cumulative_input_tokens > 0:

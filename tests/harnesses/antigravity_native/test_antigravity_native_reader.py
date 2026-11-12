@@ -69,6 +69,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
 from omnigent.harnesses.antigravity_native.rpc import AntigravityRpcError
 from omnigent.harnesses.antigravity_native.steps import PendingInteraction
 from omnigent.native.native_bridge_common import wrap_agent_instructions
+from omnigent.onboarding.providers import ModelInfo
 
 _WRAPPED_PLAN_TURN = wrap_agent_instructions("be terse", "Call the tool.")
 
@@ -3017,6 +3018,18 @@ async def _run_with_telemetry(
 ) -> None:
     """Drive ``supervise_reader`` in STREAM mode with a fake model catalog."""
     fake_catalog = catalog if catalog is not None else _FAKE_CATALOG
+    monkeypatch.setattr(
+        "omnigent.onboarding.providers.get_models",
+        lambda provider, **kwargs: (
+            [
+                ModelInfo(name="gemini-2.5-flash", provider="gemini"),
+                ModelInfo(name="gemini-2.5-pro", provider="gemini"),
+                ModelInfo(name="gemini-3.8-flash", provider="gemini"),
+            ]
+            if provider == "gemini"
+            else []
+        ),
+    )
     monkeypatch.setattr(reader, "stream_agent_state_updates", stream)
     monkeypatch.setattr(reader, "get_trajectory_steps", poll_steps)
     monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
@@ -3262,9 +3275,9 @@ async def test_tiered_display_name_usage_posts_catalog_id(
         ("Codestral", "codestral"),
         ("GPT-5", "gpt-5"),
         ("O3", "o3"),
-        # Parenthetical qualifiers are stripped wherever they sit, not just at the end.
-        ("Gemini 3 (Preview) (Medium)", "gemini-3"),
-        ("Gemini 3 (Preview) Flash", "gemini-3-flash"),
+        # Effort tiers are stripped; other qualifiers can distinguish models.
+        ("Gemini 3 (Preview) (Medium)", "gemini-3-(preview)"),
+        ("Gemini 3 (Preview) Flash", "gemini-3-(preview)-flash"),
         # Id-shaped labels and unresolved raw enums pass through untouched.
         ("gemini-3.8-flash", "gemini-3.8-flash"),
         ("MODEL_PLACEHOLDER_M20", "MODEL_PLACEHOLDER_M20"),
