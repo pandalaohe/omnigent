@@ -15,7 +15,7 @@ from xml.etree import ElementTree as ET
 import pytest
 
 from omnigent.host import service, service_entry, windows_task, windows_upgrade
-from omnigent.util import private_files
+from omnigent.util import console_output, private_files
 
 
 @pytest.fixture
@@ -94,6 +94,36 @@ def test_enable_query_start_disable_windows_task(scheduler, target, monkeypatch)
     assert not installed.path.exists()
     assert not windows_task.env_path(installed).exists()
     assert scheduler.forgotten == [installed]
+
+
+@pytest.mark.parametrize(
+    "encoding,description",
+    [
+        ("utf-16", "中文"),
+        ("utf-16-le", "中文"),
+        ("utf-16-be", "中文"),
+        ("gbk", "中文"),
+        ("ascii", "plain"),
+    ],
+)
+def test_query_decodes_scheduler_xml_bytes(monkeypatch, tmp_path, encoding, description):
+    service_info = service.HostService("windows_task", tmp_path / "task.xml", "test-task")
+    xml = (
+        '<?xml version="1.0" encoding="UTF-16"?>\r\r\n'
+        f"<Task><Description>{description}</Description></Task>"
+    ).encode(encoding)
+
+    def run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, xml)
+
+    monkeypatch.setattr(windows_task, "_run", run)
+    monkeypatch.setattr(console_output, "_windows_code_pages", lambda: (936,))
+
+    task = windows_task.query(service_info)
+
+    assert task is not None
+    assert task.tag == "Task"
+    assert task.findtext("Description") == description
 
 
 def test_failed_task_refresh_restores_previous_environment(scheduler):
@@ -432,12 +462,27 @@ def test_temporary_cleanup_warning_preserves_success(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("codes", [[1, 75, 0], [78]])
-def test_windows_restart_loop_restarts_only_transient_failures(monkeypatch, codes):
+@pytest.mark.parametrize("interpreter", ["pythonw.exe", "PYTHONW.EXE", "python.exe"])
+def test_windows_restart_loop_restarts_only_transient_failures(
+    monkeypatch, tmp_path, codes, interpreter
+):
     results = iter(codes)
     calls, sleeps = [], []
 
-    def run(args, **_):
+    python = tmp_path / "Scripts" / interpreter
+    monkeypatch.setattr(service_entry.sys, "executable", str(python))
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+
+    def run(args, **kwargs):
         calls.append(args)
+        assert args[0] == str(python.with_name("python.exe"))
+        assert kwargs == {
+            "check": False,
+            "creationflags": 0x08000000,
+            "stdin": subprocess.DEVNULL,
+            "stdout": sys.stdout,
+            "stderr": sys.stderr,
+        }
         return subprocess.CompletedProcess(args, next(results))
 
     monkeypatch.setattr(service_entry.subprocess, "run", run)
@@ -453,6 +498,12 @@ def test_service_environment_loads_before_cli(monkeypatch, tmp_path):
 
     file = tmp_path / "environment.json"
     file.write_text('{"PATH": "captured"}')
+    monkeypatch.setattr(service_entry.sys, "platform", "linux")
+    monkeypatch.setattr(
+        service_entry,
+        "_windows_supervise",
+        lambda _: pytest.fail("Non-Windows services must not start a Windows supervisor"),
+    )
     monkeypatch.setattr(
         service_entry.sys,
         "argv",

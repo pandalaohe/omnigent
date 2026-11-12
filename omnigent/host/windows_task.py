@@ -6,6 +6,7 @@ import contextlib
 import csv
 import io
 import json
+import re
 import subprocess
 import sys
 import warnings
@@ -22,6 +23,7 @@ from omnigent.util.private_files import atomic_write_private, windows_user_sid
 
 TASK_NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 SUPERVISOR_ENV = "OMNIGENT_HOST_SERVICE_BACKEND"
+_XML_DECLARATION = re.compile(r"^<\?xml\s[^>]*\?>", re.IGNORECASE)
 
 
 def description() -> HostService:
@@ -56,6 +58,20 @@ def _run(args: Sequence[str], *, check: bool = True) -> subprocess.CompletedProc
     return result
 
 
+def _decode_task_xml(output: bytes | str) -> str:
+    """Decode scheduler XML despite inconsistent bytes and declarations."""
+    if isinstance(output, str):
+        text = output
+    elif output.startswith((b"\xff\xfe", b"\xfe\xff")):
+        text = output.decode("utf-16")
+    elif b"\x00" in output[:256]:
+        encoding = "utf-16-be" if output.startswith(b"\x00") else "utf-16-le"
+        text = output.decode(encoding)
+    else:
+        text = decode_console_output(output)
+    return _XML_DECLARATION.sub("", text.lstrip("\ufeff \t\r\n"), count=1)
+
+
 def query(service: HostService) -> ET.Element | None:
     result = _run(["/Query", "/TN", service.label, "/XML"], check=False)
     if result.returncode:
@@ -67,8 +83,8 @@ def query(service: HostService) -> ET.Element | None:
             raise HostServiceError("Cannot read the installed Windows host task.")
         return None
     try:
-        return ET.fromstring(result.stdout)
-    except ET.ParseError as exc:
+        return ET.fromstring(_decode_task_xml(result.stdout))
+    except (ET.ParseError, UnicodeDecodeError) as exc:
         raise HostServiceError("Cannot parse the Windows host task definition.") from exc
 
 

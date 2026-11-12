@@ -6119,7 +6119,6 @@ def _upgrade_host_service(*, force: bool) -> Iterator[None]:
     """Keep an enabled service stopped until the install and version check finish."""
     from omnigent.host.service import (
         HostServiceError,
-        enable_user_host_service,
         installed_user_host_service,
         start_user_host_service,
         stop_user_host_service,
@@ -6150,9 +6149,30 @@ def _upgrade_host_service(*, force: bool) -> Iterator[None]:
         try:
             stop_user_host_service(service)
             yield
-            enable_user_host_service(
-                server_url, environment=_build_host_daemon_env(server_url=server_url)
-            )
+            # The install replaced modules on disk; refresh in a new interpreter.
+            mode = ["--server", server_url or ""]
+            try:
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-P",
+                        "-m",
+                        "omnigent",
+                        "host",
+                        "enable",
+                        "--non-interactive",
+                        *mode,
+                    ],
+                    check=False,
+                )
+            except OSError as exc:
+                raise click.ClickException(
+                    f"Failed to refresh the host user service: {exc}"
+                ) from exc
+            if result.returncode:
+                raise click.ClickException(
+                    f"Failed to refresh the host user service (exit {result.returncode})."
+                )
             succeeded = True
         finally:
             if not succeeded:
