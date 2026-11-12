@@ -1,3 +1,4 @@
+import { t } from "./taskBoardText";
 import { isFramePath } from "@/lib/boardFrame";
 import { Link } from "@/lib/routing";
 import { lazy, Suspense, useState } from "react";
@@ -45,7 +46,7 @@ export function TaskBoardActions({ actions }: { actions: SessionAction[] }) {
   if (isFramePath())
     return actions.length ? (
       <Link to="/" target="_blank" rel="noopener">
-        Open in Omnigent
+        {t("actions.openInApp")}
       </Link>
     ) : null;
   return (

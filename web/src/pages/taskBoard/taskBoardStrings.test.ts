@@ -1,3 +1,4 @@
+import { boardDefaults } from "./taskBoardPreferences";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -160,7 +161,8 @@ it("builds the production bundle without and with a complete override.json and c
           createElement(TaskBoardSources, {
             sources: [source],
             preferences: {
-              view: "sources",
+              ...boardDefaults,
+              view: "settings",
               mode: "order",
               focus: [],
               aliases: {},

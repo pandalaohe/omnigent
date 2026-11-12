@@ -1,3 +1,4 @@
+import { useBoardCadence } from "./taskBoardPreferences";
 import { sourceHistory, type SourceCache } from "./taskBoardSnapshotData";
 import { boardExitProps, boardPath } from "@/lib/boardFrame";
 import { useState } from "react";
@@ -20,19 +21,25 @@ import {
 } from "./taskBoardActivityData";
 import { formatDate, formatNumber, t } from "./taskBoardText";
 
+const EMPTY_HIDDEN_SOURCES: string[] = [];
+
 export function TaskBoardActivity({
   view,
   tasks,
   sessions,
   onSelect,
   sourceCaches,
+  hiddenSources = EMPTY_HIDDEN_SOURCES,
 }: {
+  hiddenSources?: string[];
   sourceCaches?: Record<string, SourceCache>;
   view: "log" | "history" | "today";
   tasks: BoardTask[];
   sessions: BoardSession[];
   onSelect: (task: BoardTask) => void;
 }) {
+  const cadence = useBoardCadence();
+  const visibleTasks = tasks.filter((task) => !hiddenSources.includes(task["omnigent.ai:source"]));
   const [group, setGroup] = useState("time"),
     [page, setPage] = useState(0),
     [month, setMonth] = useState(""),
@@ -42,7 +49,7 @@ export function TaskBoardActivity({
     queryFn: () => readBoardHistory(),
     enabled: !sourceCaches,
     retry: false,
-    refetchInterval: () => (document.visibilityState === "visible" ? 60_000 : false),
+    refetchInterval: cadence,
   });
   const offset = -new Date().getTimezoneOffset();
   const counts = useQuery({
@@ -50,7 +57,7 @@ export function TaskBoardActivity({
     queryFn: () => readLocalClosedCounts(),
     enabled: !sourceCaches,
     retry: false,
-    refetchInterval: () => (document.visibilityState === "visible" ? 60_000 : false),
+    refetchInterval: cadence,
   });
   const today = localDay(Date.now());
   const info = useServerInfo();
@@ -60,24 +67,38 @@ export function TaskBoardActivity({
     retry: false,
     queryFn: () =>
       readBoardJson<UsageActivity>(`/v1/me/usage/activity?${usageRangeQuery({ key: "today" })}`),
-    refetchInterval: () => (document.visibilityState === "visible" ? 60_000 : false),
+    refetchInterval: cadence,
   });
-  const byId = new Map(tasks.map((task) => [taskIdentity(task), task]));
-  const cachedHistory = sourceCaches ? sourceHistory(sourceCaches) : undefined;
+  const byId = new Map(visibleTasks.map((task) => [taskIdentity(task), task]));
+  const cachedHistory = sourceCaches
+    ? sourceHistory(
+        Object.fromEntries(
+          Object.entries(sourceCaches).filter(([id]) => !hiddenSources.includes(id)),
+        ),
+      )
+    : undefined;
   const cachedCounts = sourceCaches
-    ? Object.values(sourceCaches).flatMap((cache) => cache.counts)
+    ? Object.entries(sourceCaches)
+        .filter(([id]) => !hiddenSources.includes(id))
+        .flatMap(([, cache]) => cache.counts)
     : undefined;
   const events = (cachedHistory ?? history.data ?? []).filter(
-    (event) => view !== "today" || localDay(event.time) === today,
+    (event) =>
+      !hiddenSources.includes(event.source) && (view !== "today" || localDay(event.time) === today),
   );
   const weeks = new Map<string, number>(),
     months = new Map<string, number>();
-  for (const day of cachedCounts ?? counts.data?.days ?? []) {
-    const week = localDay(timeMonday.floor(new Date(`${day.day}T12:00:00`)));
-    weeks.set(week, (weeks.get(week) ?? 0) + day.closed);
-    months.set(day.day.slice(0, 7), (months.get(day.day.slice(0, 7)) ?? 0) + day.closed);
+  for (const closedDay of (cachedCounts ?? counts.data?.days ?? []).filter(
+    (candidate) => !hiddenSources.includes(candidate.source),
+  )) {
+    const week = localDay(timeMonday.floor(new Date(`${closedDay.day}T12:00:00`)));
+    weeks.set(week, (weeks.get(week) ?? 0) + closedDay.closed);
+    months.set(
+      closedDay.day.slice(0, 7),
+      (months.get(closedDay.day.slice(0, 7)) ?? 0) + closedDay.closed,
+    );
   }
-  const closed = tasks.filter(
+  const closed = visibleTasks.filter(
     (task) =>
       !isOpenTask(task) &&
       localDay(task.progressUpdated ?? task["omnigent.ai:closedSeen"] ?? "") === today,
@@ -85,7 +106,7 @@ export function TaskBoardActivity({
   const active = sessions.filter(
     (session) => session.updated_at && localDay(session.updated_at * 1000) === today,
   );
-  const held = tasks.filter(
+  const held = visibleTasks.filter(
     (task) =>
       isOpenTask(task) ||
       (Date.parse(task.progressUpdated ?? task["omnigent.ai:closedSeen"] ?? "") >=
@@ -248,7 +269,7 @@ export function TaskBoardActivity({
             <>
               <div className="tb-number-tiles">
                 <div>
-                  <dt>{t("today.closed")}</dt>
+                  <dt>{t("toclosedDay.closed")}</dt>
                   <dd>{formatNumber(closed.length)}</dd>
                 </div>
                 <div>

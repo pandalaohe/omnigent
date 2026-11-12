@@ -1,3 +1,4 @@
+import { boardDefaults } from "./taskBoardPreferences";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
@@ -117,7 +118,8 @@ it("keeps aliases local and requires a named counted confirmation before deletio
     <TaskBoardSources
       sources={[source]}
       preferences={{
-        view: "sources",
+        ...boardDefaults,
+        view: "settings",
         mode: "order",
         focus: [],
         aliases: {},
@@ -215,7 +217,8 @@ it("reports browser storage failures and interpolates issue paths", () => {
     <TaskBoardSources
       sources={[source]}
       preferences={{
-        view: "sources",
+        ...boardDefaults,
+        view: "settings",
         mode: "order",
         focus: [],
         aliases: {},
@@ -237,7 +240,8 @@ it("offers an available standards reference before a source is connected", () =>
     <TaskBoardSources
       sources={[]}
       preferences={{
-        view: "sources",
+        ...boardDefaults,
+        view: "settings",
         mode: "order",
         focus: [],
         aliases: {},

@@ -1,3 +1,4 @@
+import { useBoardCadence } from "./taskBoardPreferences";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { readPinnedSources, type SourceCache, type SourcePin } from "./taskBoardSnapshotData";
 import { readBoardJson } from "./taskBoardRead";
@@ -192,11 +193,12 @@ export async function readTaskBoard(previous?: BoardData, now = Date.now()): Pro
 }
 
 export function useTaskBoardData() {
+  const cadence = useBoardCadence();
   const client = useQueryClient();
   return useQuery({
     queryKey: ["taskBoard", "list"],
     queryFn: () => readTaskBoard(client.getQueryData<BoardData>(["taskBoard", "list"])),
-    refetchInterval: () => (document.visibilityState === "visible" ? 60_000 : false),
+    refetchInterval: cadence,
     refetchOnWindowFocus: true,
     retry: false,
   });

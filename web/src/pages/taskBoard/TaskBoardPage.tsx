@@ -1,4 +1,6 @@
-import { boardExitProps, boardPath } from "@/lib/boardFrame";
+import { boardAttention } from "./boardAttentionData";
+import { TaskBoardAttention } from "./TaskBoardAttention";
+import { boardExitProps } from "@/lib/boardFrame";
 import { useState } from "react";
 import {
   ActivityIcon,
@@ -8,7 +10,6 @@ import {
   HandIcon,
   ListTreeIcon,
   RouteIcon,
-  PinIcon,
   HistoryIcon,
   CalendarDaysIcon,
   ScrollTextIcon,
@@ -17,7 +18,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Link } from "@/lib/routing";
 import { Spinner } from "@/components/ui/spinner";
-import { taskIdentity, taskProgress, useTaskBoardData, type BoardTask } from "./taskBoardData";
+import { taskIdentity, useTaskBoardData, type BoardTask } from "./taskBoardData";
 import {
   sessionTree,
   useBoardQuota,
@@ -28,7 +29,15 @@ import {
   useBoardSystem,
   type BoardSession,
 } from "./taskBoardNative";
-import { useBoardPreferences } from "./taskBoardPreferences";
+import { BoardRefreshContext, useBoardPreferences } from "./taskBoardPreferences";
+import {
+  BoardAppearanceControls,
+  BoardClock,
+  TaskBoardDisplaySettings,
+  useBoardAppearance,
+} from "./TaskBoardDisplaySettings";
+import { TaskBoardQuotaBand, TaskBoardQuotaPanel } from "./TaskBoardQuota";
+import { TaskBoardHostsBand, TaskBoardHostsPanel } from "./TaskBoardHosts";
 import { TaskBoardDetail, BoardDate, taskTitle } from "./TaskBoardDetail";
 import { TaskBoardRoutes, BoardPager } from "./TaskBoardRoutes";
 import { TaskBoardSearch } from "./TaskBoardSearch";
@@ -36,7 +45,6 @@ import { TaskProgressIcon } from "./TaskProgressIcon";
 import { formatNumber, t } from "./taskBoardText";
 
 import { TaskBoardActivity } from "./TaskBoardActivity";
-import { TaskBoardSources } from "./TaskBoardSources";
 
 function ReadFailure({ label, retry }: { label: string; retry: () => void }) {
   return (
@@ -212,72 +220,61 @@ function SessionsView({
 }
 
 export function TaskBoardPage() {
+  const [preferences, updatePreferences, storage] = useBoardPreferences();
+  return (
+    <BoardRefreshContext.Provider value={preferences.refresh}>
+      <TaskBoardContent
+        preferences={preferences}
+        updatePreferences={updatePreferences}
+        storage={storage}
+      />
+    </BoardRefreshContext.Provider>
+  );
+}
+function TaskBoardContent({
+  preferences,
+  updatePreferences,
+  storage,
+}: {
+  preferences: ReturnType<typeof useBoardPreferences>[0];
+  updatePreferences: ReturnType<typeof useBoardPreferences>[1];
+  storage: string;
+}) {
   const tasksQuery = useTaskBoardData(),
     sessionsQuery = useBoardSessions(),
     system = useBoardSystem(),
     quota = useBoardQuota(),
     schedule = useBoardSchedule();
-  const [preferences, updatePreferences] = useBoardPreferences();
+  const appearance = useBoardAppearance(preferences);
   const [selectedTask, setSelectedTask] = useState<BoardTask | null>(null);
   const [sessionSelection, setSessionSelection] = useState<string[]>([]);
   const [taskSelection, setTaskSelection] = useState<string[]>([]);
-  const [panel, setPanel] = useState<"waiting" | "exceptions" | "running" | null>(null);
+  const [panel, setPanel] = useState<
+    "waiting" | "exceptions" | "running" | "quota" | "hosts" | null
+  >(null);
   const tasks = tasksQuery.data?.tasks ?? [],
     sources = tasksQuery.data?.sources ?? [],
     sessions = sessionsQuery.data ?? [];
   const selected =
     selectedTask && tasks.find((task) => taskIdentity(task) === taskIdentity(selectedTask));
-  const waitingTasks = tasks.filter((task) => task["omnigent.ai:waiting"]?.on === "user");
-  const waitingSessions = sessions.filter(
-    (session) => (session.pending_elicitations_count ?? 0) > 0,
-  );
-  const failedTasks = tasks.filter((task) => taskProgress(task) === "failed");
   const silentSessions = useBoardSilentSessions(sessions);
   const silentIds = new Set(silentSessions.map((session) => session.id));
-  const failedSessions = sessions.filter((session) => session.status === "failed");
-  const running = sessions.filter(
-    (session) => session.status === "running" && !silentIds.has(session.id),
-  );
-  const freshAccounts = (quota.data?.accounts ?? []).filter(
-    (account) => account.freshness === "fresh" && account.state !== "paused",
-  );
-  const quotaReading = (account: (typeof freshAccounts)[number]) => {
-    const readings = account.windows.filter(
-      (reading) =>
-        !reading.past_reset &&
-        !["paused", "stale"].includes(reading.state) &&
-        reading.percent_used !== null,
-    );
-    return (
-      readings.find((reading) => reading.id === account.deciding_window) ??
-      readings.sort((a, b) => (b.percent_used ?? 0) - (a.percent_used ?? 0))[0]
-    );
-  };
-  const rankedAccounts = [...freshAccounts].sort(
-    (a, b) =>
-      Number(preferences.pinnedQuota.includes(b.id)) -
-        Number(preferences.pinnedQuota.includes(a.id)) ||
-      Number((quotaReading(b)?.percent_used ?? 0) >= 80) -
-        Number((quotaReading(a)?.percent_used ?? 0) >= 80) ||
-      (quotaReading(b)?.percent_used ?? 0) - (quotaReading(a)?.percent_used ?? 0),
-  );
-  const waiting = waitingTasks.length + waitingSessions.length,
-    exceptions = failedTasks.length + failedSessions.length + silentSessions.length;
-  const selectedPanelTasks =
-    panel === "waiting" ? waitingTasks : panel === "exceptions" ? failedTasks : [];
-  const selectedPanelSessions =
+  const attention = boardAttention(tasks, sessions, silentIds);
+  const waiting = attention.waiting.length,
+    exceptions = attention.anomalies.length;
+  const running = attention.running;
+  const selectedRows =
     panel === "waiting"
-      ? waitingSessions
+      ? attention.waiting
       : panel === "exceptions"
-        ? [...failedSessions, ...silentSessions]
+        ? attention.anomalies
         : running;
   const select = (task: BoardTask) => {
     setSelectedTask(task);
   };
   return (
-    <div className="tb-page">
+    <div className={`tb-page ${appearance.dark ? "dark" : ""}`} style={appearance.style}>
       <header className="tb-page-header">
-        <h1>{t("board.title")}</h1>
         <nav className="tb-view-tabs" aria-label={t("board.views")}>
           <Button
             variant={preferences.view === "sessions" ? "secondary" : "ghost"}
@@ -300,7 +297,6 @@ export function TaskBoardPage() {
               ["log", ScrollTextIcon],
               ["history", HistoryIcon],
               ["today", CalendarDaysIcon],
-              ["sources", SettingsIcon],
             ] as const
           ).map(([view, Icon]) => (
             <Button
@@ -314,9 +310,19 @@ export function TaskBoardPage() {
             </Button>
           ))}
         </nav>
-        <span className="ml-auto text-xs text-muted-foreground">
-          {t("board.tasks", { count: tasks.length })}
-        </span>
+        <div className="tb-header-controls">
+          <BoardClock />
+          <BoardAppearanceControls preferences={preferences} update={updatePreferences} />
+          <button
+            type="button"
+            className="tb-gear"
+            aria-label={t("display.settings")}
+            aria-pressed={preferences.view === "settings"}
+            onClick={() => updatePreferences({ view: "settings" })}
+          >
+            <SettingsIcon size={17} />
+          </button>
+        </div>
       </header>
       <div className="tb-top-band">
         <section className="tb-status-band" aria-label={t("band.status")}>
@@ -339,126 +345,46 @@ export function TaskBoardPage() {
               >
                 <strong>{formatNumber(count)}</strong>
                 <span>
-                  <Icon className="size-3.5" />
-                  {t(`band.${id}`)}
+                  <b>
+                    <Icon className="size-3.5" />
+                    {t(`band.${id}`)}
+                  </b>
+                  <small>
+                    {sessionsQuery.isError || tasksQuery.isError
+                      ? t("band.unavailable")
+                      : id === "waiting"
+                        ? attention.waiting[0]?.text || t("band.noWaiting")
+                        : id === "exceptions"
+                          ? attention.anomalies[0]?.text || t("band.noExceptions")
+                          : running.length
+                            ? t("band.runningPreview", {
+                                tools: running.filter((row) => row.session?.tool).length,
+                                idle: attention.idle,
+                              })
+                            : t("band.noRunning")}
+                  </small>
                 </span>
               </button>
             ))}
           </div>
         </section>
-        <section className="tb-quota-band" aria-label={t("band.quota")}>
-          <h2>{t("band.quota")}</h2>
-          {quota.isError ? (
-            <ReadFailure label={t("quota.failed")} retry={() => void quota.refetch()} />
-          ) : !freshAccounts.length ? (
-            <p className="tb-band-empty">{t(quota.isPending ? "board.loading" : "quota.empty")}</p>
-          ) : (
-            <>
-              <ul>
-                {rankedAccounts.slice(0, 4).map((account) => {
-                  const usageWindow = quotaReading(account);
-                  return (
-                    <li key={account.id}>
-                      <Link to={boardPath(`/usage/board/${encodeURIComponent(account.id)}`)}>
-                        <b>
-                          {account.display_name}
-                          {preferences.pinnedQuota.includes(account.id) && (
-                            <PinIcon className="ml-1 inline size-3" />
-                          )}
-                        </b>
-                        <span>
-                          {usageWindow?.percent_used == null
-                            ? t("quota.unknown")
-                            : formatNumber(usageWindow.percent_used / 100, {
-                                style: "percent",
-                                maximumFractionDigits: 0,
-                              })}
-                        </span>
-                      </Link>
-                      {usageWindow?.percent_used != null && (
-                        <meter
-                          min="0"
-                          max="100"
-                          value={usageWindow.percent_used}
-                          aria-label={account.display_name}
-                        />
-                      )}
-                    </li>
-                  );
-                })}
-                {Array.from({ length: Math.max(0, 4 - rankedAccounts.length) }, (_, index) => (
-                  <li key={`empty:${index}`} className="tb-band-empty">
-                    {t("quota.unknown")}
-                  </li>
-                ))}
-              </ul>
-              <details className="mt-2 text-xs">
-                <summary className="cursor-pointer">
-                  {t("quota.all", { count: freshAccounts.length })}
-                </summary>
-                <div className="mt-2 space-y-2">
-                  {rankedAccounts.map((account) => (
-                    <div className="flex items-center gap-2" key={account.id}>
-                      <Link
-                        className="min-w-0 flex-1 truncate"
-                        to={boardPath(`/usage/board/${encodeURIComponent(account.id)}`)}
-                      >
-                        {account.display_name}
-                      </Link>
-                      <Button
-                        size="icon-sm"
-                        variant={
-                          preferences.pinnedQuota.includes(account.id) ? "secondary" : "ghost"
-                        }
-                        aria-label={t(
-                          preferences.pinnedQuota.includes(account.id)
-                            ? "quota.unpin"
-                            : "quota.pin",
-                          { name: account.display_name },
-                        )}
-                        aria-pressed={preferences.pinnedQuota.includes(account.id)}
-                        onClick={() =>
-                          updatePreferences({
-                            pinnedQuota: preferences.pinnedQuota.includes(account.id)
-                              ? preferences.pinnedQuota.filter((id) => id !== account.id)
-                              : [...preferences.pinnedQuota.slice(-3), account.id],
-                          })
-                        }
-                      >
-                        <PinIcon className="size-3" />
-                      </Button>
-                    </div>
-                  ))}
-                </div>
-              </details>
-            </>
-          )}
-        </section>
-        <section className="tb-host-band" aria-label={t("band.hosts")}>
-          <h2>{t("band.hosts")}</h2>
-          {system.isError ? (
-            <ReadFailure label={t("hosts.failed")} retry={() => void system.refetch()} />
-          ) : (
-            <ul>
-              {(system.data?.hosts ?? []).slice(0, 4).map((host) => (
-                <li key={host.host_id}>
-                  <Link {...boardExitProps()} to="/settings/hosts">
-                    {host.name}
-                  </Link>
-                  <span>
-                    {host.state !== "online"
-                      ? t("hosts.offline")
-                      : host.load_per_core == null
-                        ? t("quota.unknown")
-                        : formatNumber(host.load_per_core, { maximumFractionDigits: 2 })}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
+        <TaskBoardQuotaBand
+          accounts={quota.data?.accounts ?? []}
+          preferences={preferences}
+          onOpen={() => setPanel(panel === "quota" ? null : "quota")}
+          loading={quota.isPending}
+          failed={quota.isError}
+          retry={() => void quota.refetch()}
+        />
+        <TaskBoardHostsBand
+          hosts={system.data?.hosts ?? []}
+          onOpen={() => setPanel(panel === "hosts" ? null : "hosts")}
+          loading={system.isPending}
+          failed={system.isError}
+          retry={() => void system.refetch()}
+        />
       </div>
-      {panel && (
+      {(panel === "quota" || panel === "hosts") && (
         <section className="tb-attention" aria-label={t(`band.${panel}`)}>
           <header>
             <h2>{t(`band.${panel}`)}</h2>
@@ -466,48 +392,27 @@ export function TaskBoardPage() {
               {t("detail.close")}
             </Button>
           </header>
-          {!selectedPanelTasks.length && !selectedPanelSessions.length && (
-            <p>{t("waiting.empty")}</p>
+          {panel === "quota" ? (
+            <TaskBoardQuotaPanel
+              accounts={quota.data?.accounts ?? []}
+              preferences={preferences}
+              update={updatePreferences}
+            />
+          ) : (
+            <TaskBoardHostsPanel hosts={system.data?.hosts ?? []} />
           )}
-          <ul>
-            {selectedPanelTasks.map((task) => (
-              <li key={taskIdentity(task)}>
-                <button type="button" onClick={() => select(task)}>
-                  <TaskProgressIcon
-                    progress={taskProgress(task)}
-                    waiting={!!task["omnigent.ai:waiting"]}
-                  />
-                  <span>
-                    <b>{taskTitle(task)}</b>
-                    {task["omnigent.ai:waiting"]?.note && (
-                      <small>{task["omnigent.ai:waiting"]!.note}</small>
-                    )}
-                  </span>
-                </button>
-              </li>
-            ))}
-            {selectedPanelSessions.map((session) => (
-              <li key={session.id}>
-                <Link {...boardExitProps()} to={`/c/${encodeURIComponent(session.id)}`}>
-                  <TaskProgressIcon
-                    progress={
-                      session.status === "failed"
-                        ? "failed"
-                        : session.status === "running"
-                          ? "in-process"
-                          : "needs-action"
-                    }
-                    waiting={(session.pending_elicitations_count ?? 0) > 0}
-                  />
-                  <span>
-                    {session.title || session.id}
-                    {silentIds.has(session.id) && <small>{t("sessions.silent")}</small>}
-                  </span>
-                  <ChevronRightIcon className="size-4" />
-                </Link>
-              </li>
-            ))}
-          </ul>
+        </section>
+      )}
+      {panel && panel !== "quota" && panel !== "hosts" && (
+        <section className="tb-attention" aria-label={t(`band.${panel}`)}>
+          <header>
+            <h2>{t(`band.${panel}`)}</h2>
+            <Button variant="ghost" size="sm" onClick={() => setPanel(null)}>
+              {t("detail.close")}
+            </Button>
+          </header>
+          {!selectedRows.length && <p>{t("waiting.empty")}</p>}
+          <TaskBoardAttention key={panel} rows={selectedRows} onSelect={select} />
         </section>
       )}
       {tasksQuery.isError && (
@@ -541,6 +446,7 @@ export function TaskBoardPage() {
           <TaskBoardActivity
             key={view}
             view={view}
+            hiddenSources={view === "history" ? preferences.hiddenSources : []}
             sourceCaches={tasksQuery.data?.sourceCaches}
             tasks={tasks}
             sessions={sessions}
@@ -548,8 +454,14 @@ export function TaskBoardPage() {
           />
         ) : null,
       )}
-      {preferences.view === "sources" && (
-        <TaskBoardSources sources={sources} preferences={preferences} update={updatePreferences} />
+      {preferences.view === "settings" && (
+        <TaskBoardDisplaySettings
+          preferences={preferences}
+          update={updatePreferences}
+          storage={storage}
+          sources={sources}
+          accounts={quota.data?.accounts ?? []}
+        />
       )}
       {(preferences.view === "sessions" || preferences.view === "routes") &&
         (preferences.view === "sessions" ? (
@@ -575,6 +487,9 @@ export function TaskBoardPage() {
             )}
             sources={sources}
             aliases={preferences.aliases}
+            boardHours={preferences.boardHours}
+            lodStation={preferences.lodStation}
+            lodPhase={preferences.lodPhase}
             mode={preferences.mode}
             onMode={(mode) => updatePreferences({ mode })}
             focus={preferences.focus}

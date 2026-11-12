@@ -1,3 +1,4 @@
+import { useBoardCadence } from "./taskBoardPreferences";
 import type { SourceCache } from "./taskBoardSnapshotData";
 import { boardExitProps } from "@/lib/boardFrame";
 import { useQuery } from "@tanstack/react-query";
@@ -55,6 +56,7 @@ export function TaskBoardDetail({
   onSelect: (task: BoardTask) => void;
   onClose: () => void;
 }) {
+  const cadence = useBoardCadence();
   const query = useQuery({
     queryKey: ["taskBoard", "item", task["omnigent.ai:source"], task.uid, task.updated],
     queryFn: () =>
@@ -64,7 +66,7 @@ export function TaskBoardDetail({
     enabled: !sourceCache,
     retry: false,
     staleTime: 30_000,
-    refetchInterval: () => (document.visibilityState === "visible" ? 60_000 : false),
+    refetchInterval: cadence,
   });
   const current = sourceCache ? task : (query.data ?? task);
   const actions = taskActions(current["omnigent.ai:actions"]);
