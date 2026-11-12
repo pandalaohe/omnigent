@@ -1,5 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import userEvent from "@testing-library/user-event";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { PhoneBarScroller } from "./PhoneBarScroller";
 
 function sizeScroller(element: HTMLElement, scrollWidth: number, clientWidth: number) {
@@ -8,6 +9,10 @@ function sizeScroller(element: HTMLElement, scrollWidth: number, clientWidth: nu
 }
 
 describe("PhoneBarScroller", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("leaves desktop children unwrapped", () => {
     render(
       <div data-testid="bar">
@@ -40,5 +45,23 @@ describe("PhoneBarScroller", () => {
     fireEvent.scroll(scroller);
     expect(scroller).toHaveAttribute("data-hidden-start", "true");
     expect(scroller).not.toHaveAttribute("data-hidden-end");
+  });
+
+  it("scrolls a keyboard-focused control clear of the faded edges", async () => {
+    const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+    render(
+      <PhoneBarScroller enabled>
+        <button type="button">Ring</button>
+        <button type="button">Approval</button>
+      </PhoneBarScroller>,
+    );
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("button", { name: "Ring" }));
+    expect(scrollIntoView).not.toHaveBeenCalled();
+
+    await user.tab();
+    expect(screen.getByRole("button", { name: "Approval" })).toHaveFocus();
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest", inline: "nearest" });
   });
 });

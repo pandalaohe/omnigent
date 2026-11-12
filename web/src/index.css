@@ -105,6 +105,11 @@
   display: none;
 }
 
+/* The scrolling row clips paint outside its 36px controls, so their focus rings draw inside. */
+.phone-session-bar-scroll :is(button, a):focus-visible {
+  --tw-ring-inset: inset;
+}
+
 .phone-session-bar-scroll[data-hidden-start] {
   --bar-fade-start: 20px;
 }

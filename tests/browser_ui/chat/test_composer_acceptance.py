@@ -643,12 +643,8 @@ _REVEAL_AND_PROBE = """(scroller, index) => {
 }"""
 
 
-@pytest.mark.browser_context_args(has_touch=True, is_mobile=True)
-def test_phone_bar_keeps_every_control_reachable_at_360(
-    page: Page, chat_session_contract: ChatSessionContract
-) -> None:
-    """At 360px every session-bar control keeps its own 44x36 box in one scrolling row."""
-    chat = chat_session_contract
+def _open_full_phone_bar(page: Page, chat: ChatSessionContract) -> tuple[Locator, Locator]:
+    """A 360px phone session with every session-bar control present; returns bar and scroller."""
     _stub_session_bar(page, chat, 1234)
     chat.update_session(
         labels={
@@ -675,6 +671,15 @@ def test_phone_bar_keeps_every_control_reachable_at_360(
         expect(bar.get_by_test_id(test_id)).to_be_attached(timeout=30_000)
     expect(bar.get_by_role("button", name=re.compile(r"^Standing approval:"))).to_be_attached()
     expect(bar).to_have_attribute("data-labels", "collapsed")
+    return bar, scroller
+
+
+@pytest.mark.browser_context_args(has_touch=True, is_mobile=True)
+def test_phone_bar_keeps_every_control_reachable_at_360(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    """At 360px every session-bar control keeps its own 44x36 box in one scrolling row."""
+    bar, scroller = _open_full_phone_bar(page, chat_session_contract)
 
     # One 40px row that scrolls: the far edge fades, the near edge does not.
     assert bar.bounding_box()["height"] == pytest.approx(40, abs=1)
@@ -702,3 +707,105 @@ def test_phone_bar_keeps_every_control_reachable_at_360(
         rotation["x"] + rotation["width"] - 2, rotation["y"] + rotation["height"] / 2
     )
     expect(page.get_by_text("Auto-rotation", exact=True).first).to_be_visible()
+
+
+_FOCUS_SETTLED = """(scroller) =>
+  (scroller.scrollLeft > 1) === scroller.hasAttribute("data-hidden-start") &&
+  (scroller.scrollLeft + scroller.clientWidth < scroller.scrollWidth - 1) ===
+    scroller.hasAttribute("data-hidden-end")"""
+
+_FOCUS_RING_REPORT = """(scroller) => {
+  const controls = [...scroller.querySelectorAll("button, a")].filter(
+    (control) => control.getBoundingClientRect().width > 0,
+  );
+  const control = document.activeElement;
+  // Painted ring: the border box plus any outer box-shadow or outline.
+  const style = getComputedStyle(control);
+  const shadows = style.boxShadow === "none" ? [] : style.boxShadow.split(/,(?![^(]*\\))/);
+  let painted = false;
+  let outset = 0;
+  for (const shadow of shadows) {
+    const [x = 0, y = 0, blur = 0, spread = 0] = (shadow.match(/-?[\\d.]+px/g) ?? []).map(
+      parseFloat,
+    );
+    if (blur === 0 && spread === 0) continue;
+    painted = true;
+    if (!/\\binset\\b/.test(shadow)) {
+      outset = Math.max(outset, spread + blur + Math.max(Math.abs(x), Math.abs(y)));
+    }
+  }
+  if (style.outlineStyle !== "none" && parseFloat(style.outlineWidth) > 0) {
+    painted = true;
+    outset = Math.max(outset, parseFloat(style.outlineWidth) + parseFloat(style.outlineOffset));
+  }
+  const box = control.getBoundingClientRect();
+  const ring = {
+    left: box.left - outset,
+    right: box.right + outset,
+    top: box.top - outset,
+    bottom: box.bottom + outset,
+  };
+  // Visible area: every clipping ancestor, minus the scroller's faded edges.
+  const clip = { left: 0, right: innerWidth, top: 0, bottom: innerHeight };
+  for (let node = control.parentElement; node !== document.body; node = node.parentElement) {
+    const nodeStyle = getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    const fade = (side) =>
+      node === scroller ? parseFloat(nodeStyle.getPropertyValue(`--bar-fade-${side}`)) : 0;
+    if (nodeStyle.overflowX !== "visible") {
+      clip.left = Math.max(clip.left, rect.left + node.clientLeft + fade("start"));
+      clip.right = Math.min(
+        clip.right,
+        rect.left + node.clientLeft + node.clientWidth - fade("end"),
+      );
+    }
+    if (nodeStyle.overflowY !== "visible") {
+      clip.top = Math.max(clip.top, rect.top + node.clientTop);
+      clip.bottom = Math.min(clip.bottom, rect.top + node.clientTop + node.clientHeight);
+    }
+  }
+  return {
+    index: controls.indexOf(control),
+    name: control.getAttribute("aria-label") || control.textContent.trim(),
+    focusVisible: control.matches(":focus-visible"),
+    painted,
+    visible:
+      ring.left >= clip.left - 0.5 &&
+      ring.right <= clip.right + 0.5 &&
+      ring.top >= clip.top - 0.5 &&
+      ring.bottom <= clip.bottom + 0.5,
+    ring,
+    clip,
+    boxShadow: style.boxShadow,
+  };
+}"""
+
+
+@pytest.mark.browser_context_args(has_touch=True, is_mobile=True)
+def test_phone_bar_focus_rings_stay_visible_at_360(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    """Tabbing along the scrolling 360px bar shows each control's whole focus ring."""
+    _, scroller = _open_full_phone_bar(page, chat_session_contract)
+    count = len(scroller.evaluate(_SCROLLER_REPORT))
+    scroller.evaluate(
+        """(scroller) => [...scroller.querySelectorAll("button, a")]
+          .find((control) => control.getBoundingClientRect().width > 0)
+          .focus()"""
+    )
+    # Arrive by keyboard so the browser shows its focus-visible ring.
+    page.keyboard.press("Shift+Tab")
+    page.keyboard.press("Tab")
+
+    visited = []
+    for _ in range(count + 1):
+        page.wait_for_function(_FOCUS_SETTLED, arg=scroller.element_handle())
+        report = scroller.evaluate(_FOCUS_RING_REPORT)
+        if report["index"] < 0:
+            break
+        assert report["focusVisible"] and report["painted"] and report["visible"], report
+        visited.append(report["index"])
+        page.keyboard.press("Tab")
+    # Tab reached the first, at least one middle and the last control, in order.
+    assert visited[0] == 0 and visited[-1] == count - 1 and len(visited) >= 3, visited
+    assert visited == sorted(set(visited)), visited
