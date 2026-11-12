@@ -23,6 +23,8 @@ interface UsageBoardFrameProps {
   children: ReactNode;
 }
 
+import { UsageModelPoolsLink } from "./UsageModelPoolsLink";
+
 export function UsageBoardFrame({
   title,
   back,
@@ -53,7 +55,10 @@ export function UsageBoardFrame({
               : `Data ${formatAge(Math.max(0, Date.now() / 1000 - generatedAt))} ago`}
           </span>
         ) : null}
-        <span className="usage-top-actions">{actions}</span>
+        <span className="usage-top-actions">
+          {location.pathname.endsWith("/usage/board") || analysis ? <UsageModelPoolsLink /> : null}
+          {actions}
+        </span>
       </header>
       {back ? (
         <Button variant="ghost" size="sm" asChild>

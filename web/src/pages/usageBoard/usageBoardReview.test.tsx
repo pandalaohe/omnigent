@@ -16,6 +16,7 @@ import type * as UsageBoardDataModule from "@/pages/usageBoard/usageBoardData";
 
 import { UsageBoardRoute } from "../usageBoard/UsageBoardRoute";
 import { UsageBoardSettings } from "../usageBoard/UsageBoardSettings";
+import { sampleTotals } from "./usageActivityFixtures";
 import { usageBoardData } from "../usageBoard/usageBoardFixtures";
 import {
   buildConnectCommand,
@@ -25,6 +26,7 @@ import {
 import { boardBands, moveTile, seedBands } from "../usageBoard/usageBoardLayout";
 
 const mocks = vi.hoisted(() => ({
+  extensions: { current: [] as unknown[] },
   patched: { current: [] as Record<string, unknown>[] },
   overview: { current: undefined as unknown },
   info: { current: undefined as unknown },
@@ -32,6 +34,10 @@ const mocks = vi.hoisted(() => ({
     current: undefined as unknown,
   },
   collab: { current: undefined as unknown },
+}));
+
+vi.mock("@/extensions/ExtensionProvider", () => ({
+  useExtensions: () => mocks.extensions.current,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -96,6 +102,7 @@ function renderBoard(path = "/usage/board") {
 }
 
 beforeEach(() => {
+  mocks.extensions.current = [];
   mocks.info.current = SERVER_INFO;
   mocks.overview.current = { ...LOADED, data: usageBoardData() };
   mocks.board.current = {
@@ -304,7 +311,7 @@ describe("detail tips on a phone", () => {
     const ring = (await screen.findAllByTestId("usage-ring"))[0];
     fireEvent.click(ring);
     await waitFor(() => {
-      expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Codex");
+      expect(screen.getByRole("heading", { name: "Codex" }).textContent).toBe("Codex");
     });
     expect(screen.queryByTestId("usage-tip-card")).toBeNull();
   });
@@ -382,7 +389,7 @@ it("keeps imperative account navigation and back/settings links inside a frame",
     renderBoard("/frame/usage/board");
     fireEvent.click((await screen.findAllByTestId("usage-ring"))[0]);
     await waitFor(() =>
-      expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Codex"),
+      expect(screen.getByRole("heading", { name: "Codex" }).textContent).toBe("Codex"),
     );
     expect(screen.getByRole("link", { name: "Account settings" }).getAttribute("href")).toBe(
       "/frame/usage/board/codex/settings",
@@ -392,4 +399,138 @@ it("keeps imperative account navigation and back/settings links inside a frame",
   } finally {
     window.history.replaceState({}, "", "/");
   }
+});
+
+describe("Account detail composition", () => {
+  it("prioritizes the requested quota group and retains support workflows", () => {
+    const data = usageBoardData();
+    const account = data.accounts[0];
+    account.windows = [
+      { ...account.windows[0], id: "first", group: "Pool A" },
+      { ...account.windows[0], id: "second", group: "Pool B" },
+    ];
+    mocks.overview.current = { ...LOADED, data };
+    const view = renderBoard(`/usage/board/${encodeURIComponent(account.id)}?focus=Pool%20B`);
+    expect(view.container.querySelector("[data-pool]")?.getAttribute("data-pool")).toBe("Pool B");
+    expect(screen.getByRole("group", { name: "Cost time range" })).toBeTruthy();
+    expect(screen.getByText("Hosts", { exact: true }).closest("details")?.open).toBe(false);
+    expect(screen.getByText("Records", { exact: true })).toBeTruthy();
+    expect(screen.getAllByText(/Model pools · Not available yet/).length).toBeGreaterThan(0);
+    expect(screen.getByRole("link", { name: "Account settings" })).toHaveProperty(
+      "href",
+      expect.stringContaining("/settings"),
+    );
+  });
+
+  it("keeps failed overview reads visible instead of claiming the account was removed", () => {
+    mocks.overview.current = { ...LOADED, error: new Error("Source unavailable"), data: undefined };
+    renderBoard("/usage/board/example");
+    expect(screen.getByText("Usage could not be read")).toBeTruthy();
+    expect(screen.queryByText("This account is not on the board any more.")).toBeNull();
+  });
+});
+
+describe("Mounted model pools page", () => {
+  it("uses the selected installed page and withdraws its link when unavailable", () => {
+    mocks.extensions.current = [
+      {
+        id: "example.pools",
+        display_name: "Pool manager",
+        pages: [{ id: "example.pools.main", title: "Model pools", route: "main" }],
+      },
+    ];
+    mocks.board.current = {
+      ...(mocks.board.current as object),
+      modelPoolsPage: "/extensions/example.pools/main",
+    };
+    const view = renderBoard();
+    expect(screen.getByRole("link", { name: "Model pools ↗" }).getAttribute("href")).toBe(
+      "/extensions/example.pools/main",
+    );
+    view.unmount();
+    mocks.extensions.current = [];
+    renderBoard();
+    expect(screen.queryByRole("link", { name: "Model pools ↗" })).toBeNull();
+    expect(screen.getByText(/Model pools · Not available yet/)).toBeTruthy();
+  });
+});
+
+describe("Proven pool usage", () => {
+  it("keeps all cost cells and model detail inside the selected pool", async () => {
+    const account = usageBoardData().accounts[0].id;
+    mocks.board.current = { ...(mocks.board.current as object), unit: "tokens" };
+    const totals = sampleTotals(3.2, 1000);
+    const now = Date.now() / 1000;
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () =>
+        new Response(
+          JSON.stringify({
+            generated_at: now,
+            accounts: [],
+            span: {
+              requested_from: now - 86400,
+              counted_from: now - 86400,
+              until: now,
+              approx: false,
+            },
+            account_spans: {},
+            pool_catalog: [
+              {
+                parent_account_id: account,
+                pool_id: "pool-a",
+                display_name: "Pool A",
+                usage_available: true,
+              },
+            ],
+            pools: [
+              { parent_account_id: account, pool_id: "pool-a", channel: "usage", totals },
+              {
+                parent_account_id: account,
+                pool_id: "pool-b",
+                channel: "usage",
+                totals: sampleTotals(99, 99999),
+              },
+            ],
+            rows: [
+              {
+                parent_account_id: account,
+                pool_id: "pool-a",
+                channel: "usage",
+                hour: now - 3600,
+                model: "selected-model",
+                cost_usd: 3.2,
+                tokens: 1000,
+                contributes_money: true,
+                contributes_usage: true,
+              },
+              {
+                parent_account_id: account,
+                pool_id: "pool-b",
+                channel: "usage",
+                hour: now - 3600,
+                model: "other-model",
+                cost_usd: 99,
+                tokens: 99999,
+                contributes_money: true,
+                contributes_usage: true,
+              },
+            ],
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        ),
+    );
+    try {
+      renderBoard(`/usage/board/${encodeURIComponent(account)}?focus=Pool%20A`);
+      const cells = screen.getByRole("group", { name: "Cost time range" });
+      await waitFor(() => expect(within(cells).getAllByText("$3.20")).toHaveLength(3));
+      fireEvent.click(screen.getByText("Cost breakdown", { exact: true }));
+      expect(
+        screen.getByText("selected-model", { exact: true }).parentElement?.textContent,
+      ).toContain("$3.20");
+      expect(screen.queryByText("other-model", { exact: true })).toBeNull();
+      expect(within(cells).queryByText("$99.00")).toBeNull();
+    } finally {
+      fetch.mockRestore();
+    }
+  });
 });

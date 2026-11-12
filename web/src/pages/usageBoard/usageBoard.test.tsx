@@ -181,7 +181,7 @@ describe("board", () => {
     const tile = (await screen.findByText("Codex")).closest("[data-account]") as HTMLElement;
     tile.click();
     await waitFor(() => {
-      expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Codex");
+      expect(screen.getByRole("heading", { name: "Codex" }).textContent).toBe("Codex");
     });
     // The detail page lists every window, with the reset written out.
     expect(screen.getAllByText(/^Resets /).length).toBeGreaterThan(0);
@@ -205,7 +205,7 @@ describe("board", () => {
     // A bookmark to the account still resolves: the switch hides it from the
     // board, it does not delete its reading.
     renderRoute("/usage/board/codex");
-    expect(await screen.findByRole("heading", { level: 1 })).toBeTruthy();
+    expect(await screen.findByRole("heading", { level: 2, name: "Codex" })).toBeTruthy();
   });
 
   it("says an unknown account is gone rather than rendering an empty page", async () => {
@@ -225,7 +225,9 @@ describe("board", () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
     mocks.board.current = { ...mocks.board.current, enabled: false };
     renderRoute("/usage/board/codex");
-    expect((await screen.findByRole("heading", { level: 1 })).textContent).toBe("Codex");
+    expect((await screen.findByRole("heading", { level: 2, name: "Codex" })).textContent).toBe(
+      "Codex",
+    );
     expect(screen.queryByText("Usage board is off")).toBeNull();
     cleanup();
     renderRoute("/usage/board/codex/settings");

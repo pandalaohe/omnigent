@@ -26,6 +26,7 @@ import { formatFullDate, isPercentWindow, windowName } from "./usageBoardFormat"
 import { AUTO_WINDOW, fromDateInput, pickWindow, toDateInput } from "./usageBoardSelect";
 import { renewalOf } from "./UsageBoardPage";
 import { UsageSourceConnect } from "./UsageSourceConnect";
+import { QuotaFloorControl } from "@/pages/settings/sessionChoice/QuotaFloorControl";
 import { t } from "./usageText";
 
 export function UsageAccountSettingsPage() {
@@ -44,7 +45,7 @@ export function UsageAccountSettingsPage() {
     patchUsageBoardPreferences(patch);
   }
 
-  if (!overview.isPending && !account) {
+  if (!overview.isPending && !overview.error && !account) {
     return (
       <UsageBoardFrame title="Account settings" back={{ to: "/usage/board", label: "Usage board" }}>
         <p className="text-sm text-muted-foreground">This account is not on the board any more.</p>
@@ -130,6 +131,13 @@ export function UsageAccountSettingsPage() {
                 ))}
               </datalist>
             </label>
+            <QuotaFloorControl tile={account.id} label={account.display_name} account={account} />
+            <Link
+              className="flex min-h-11 items-center text-sm underline"
+              to={boardPath(`/usage/board/${encodeURIComponent(account.id)}/issues`)}
+            >
+              Issues
+            </Link>
             <WindowRow
               account={account}
               board={board}

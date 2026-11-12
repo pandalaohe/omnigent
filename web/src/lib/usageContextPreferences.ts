@@ -84,6 +84,8 @@ export interface UsageBoardBand {
 }
 
 export interface UsageBoardPreferences {
+  /** Installed page used for model-pool management. */
+  modelPoolsPage?: string;
   range?: {
     key: "today" | "h24" | "d7" | "period" | "d30" | "d90" | "custom";
     from?: string;
@@ -335,6 +337,7 @@ export function normalizeUsageBoardPreferences(value: unknown): UsageBoardPrefer
     range?: UsageBoardPreferences["range"];
     unit?: unknown;
     fees?: unknown;
+    modelPoolsPage?: unknown;
   };
   const bands: UsageBoardBand[] = [];
   const seenBands = new Set<string>();
@@ -364,6 +367,10 @@ export function normalizeUsageBoardPreferences(value: unknown): UsageBoardPrefer
     enabled: raw.enabled !== false,
     density: raw.density === "mini" ? "mini" : "std",
     bands,
+    ...(typeof raw.modelPoolsPage === "string" &&
+    /^\/extensions\/[a-z0-9.-]+\/[a-z0-9_-]+$/.test(raw.modelPoolsPage)
+      ? { modelPoolsPage: raw.modelPoolsPage }
+      : {}),
     windows: idMap(raw.windows),
     renewals: dateMap(raw.renewals),
     hidden: Array.isArray(raw.hidden)
@@ -410,6 +417,7 @@ export function isDefaultUsageBoardPreferences(board: UsageBoardPreferences): bo
     board.hidden.length === 0 &&
     (!board.range || board.range.key === "d7") &&
     board.unit !== "tokens" &&
+    !board.modelPoolsPage &&
     Object.keys(board.fees ?? {}).length === 0
   );
 }

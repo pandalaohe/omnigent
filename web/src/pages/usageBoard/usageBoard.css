@@ -389,3 +389,55 @@ html:not(.dark) .usage-board {
     margin-top: 4px;
   }
 }
+
+.usage-account-detail {
+  max-width: 908px;
+  margin: 0 auto;
+}
+.usage-account-detail [data-focused="true"] {
+  border-left: 2px solid var(--primary);
+  padding-left: 8px;
+}
+.usage-detail-cost {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+.usage-detail-cells {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+.usage-detail-cells button {
+  display: grid;
+  gap: 2px;
+  min-height: 52px;
+  padding: 7px 8px;
+  border-radius: 10px;
+  background: var(--background);
+}
+.usage-detail-cells button[aria-pressed="true"] {
+  outline: 1.5px solid var(--primary);
+  outline-offset: -1.5px;
+}
+.usage-detail-cells span {
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+.usage-detail-cells b {
+  font-size: 15px;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-detail-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+@container (min-width: 728px) {
+  .usage-detail-grid {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}
