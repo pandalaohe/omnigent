@@ -95,6 +95,15 @@ it("honours refresh off and all three intervals, and hides polling with the page
   expect(detailLevel(3 * 86400000, 3, 7)).toBe("station");
   expect(detailLevel(8 * 86400000, 3, 7)).toBe("segment");
 });
+it("falls back from unsupported saved values with a visible storage explanation", () => {
+  localStorage.setItem(
+    BOARD_PREFERENCES_KEY,
+    JSON.stringify({ defaultView: "unknown", refresh: 7 }),
+  );
+  const hook = renderHook(useBoardPreferences);
+  expect(hook.result.current[0]).toMatchObject({ view: "sessions", refresh: 60 });
+  expect(hook.result.current[2]).toBe("invalid");
+});
 it("uses pin order then fullest window and excludes expired readings", () => {
   const base = usageBoardData().accounts[0];
   const accounts = Array.from({ length: 5 }, (_, index) => ({
@@ -214,4 +223,24 @@ it("renders individual archived questions and near-context facts without inventi
     "Context at 95% of the compaction limit",
   ]);
   expect(boardAttention([task], native, new Set()).waiting).toEqual([]);
+  const now = Date.parse("2026-11-12T04:00:00Z");
+  task["omnigent.ai:sourceDisplay"]!.sessions = [
+    {
+      ...source,
+      status: "running",
+      idleSeconds: 0,
+      now: "Checking results",
+      tool: {
+        id: "tool",
+        name: "check",
+        label: "Tool is running",
+        startedAt: "2026-11-12T03:59:00Z",
+        limitSeconds: 30,
+      },
+    },
+  ];
+  expect(boardAttention([task], [], new Set(), now).running[0]).toMatchObject({
+    text: "Checking results",
+    toolRunning: false,
+  });
 });

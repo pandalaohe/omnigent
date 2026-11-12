@@ -4,6 +4,8 @@ import type { UsageAccountView, UsageWindowView } from "@/pages/usageBoard/usage
 import type { BoardPreferences } from "./taskBoardPreferences";
 import { BoardPager } from "./TaskBoardRoutes";
 import { formatDate, formatNumber, t } from "./taskBoardText";
+import { BoardIdentityMark } from "./BoardIdentityMark";
+import type { UsageAccountActivity } from "@/pages/usageBoard/usageActivityData";
 
 export const quotaWindows = (account: UsageAccountView) =>
   account.windows.filter(
@@ -92,17 +94,22 @@ export function TaskBoardQuotaBand({
             return (
               <button
                 type="button"
-                className={value >= 95 ? "hot" : value >= preferences.watch ? "warm" : ""}
+                className={value >= 90 ? "hot" : value >= preferences.watch ? "warm" : ""}
                 key={account.id}
                 onClick={onOpen}
                 title={resetLabel(window)}
               >
                 <span>
-                  <b>{account.display_name}</b>
+                  <BoardIdentityMark
+                    id={account.id}
+                    label={account.display_name}
+                    product={account.product}
+                  />
+                  <b>{account.display_name.split(/[（(]/)[0].trim()}</b>
                   <em>{percent(window)}</em>
                   <small>{windowLabel(window)}</small>
                 </span>
-                <BoardMeter value={value} warm={value >= preferences.watch} hot={value >= 95} />
+                <BoardMeter value={value} warm={value >= preferences.watch} hot={value >= 90} />
               </button>
             );
           })}
@@ -120,10 +127,12 @@ export function TaskBoardQuotaPanel({
   accounts,
   preferences,
   update,
+  costs,
 }: {
   accounts: UsageAccountView[];
   preferences: BoardPreferences;
   update: (change: Partial<BoardPreferences>) => boolean | void;
+  costs?: UsageAccountActivity[];
 }) {
   const [page, setPage] = useState(0);
   const live = quotaAccounts(accounts, []),
@@ -144,6 +153,8 @@ export function TaskBoardQuotaPanel({
         {live.slice(current * 12, (current + 1) * 12).map((account) => {
           const deciding = quotaReading(account)!,
             pinned = preferences.pinnedQuota.includes(account.id);
+          const totals = costs?.find((cost) => cost.account === account.id)?.totals;
+          const amount = totals?.cost_usd;
           return (
             <article key={account.id} className="tb-account-card">
               <button
@@ -165,8 +176,20 @@ export function TaskBoardQuotaPanel({
               >
                 <PinIcon size={14} />
               </button>
-              <h3>{account.display_name}</h3>
-              <small>{account.plan || account.kind}</small>
+              <h3>
+                <BoardIdentityMark
+                  id={account.id}
+                  label={account.display_name}
+                  product={account.product}
+                  size={24}
+                />
+                {account.display_name}
+              </h3>
+              <small>
+                {account.plan || account.kind}
+                {amount != null &&
+                  ` · ${t("quota.todayCost", { amount: formatNumber(amount, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) })}`}
+              </small>
               <div className="tb-quota-big">
                 <b>{percent(deciding)}</b>
                 <span>
@@ -177,7 +200,7 @@ export function TaskBoardQuotaPanel({
               <BoardMeter
                 value={deciding.percent_used!}
                 warm={deciding.percent_used! >= preferences.watch}
-                hot={deciding.percent_used! >= 95}
+                hot={deciding.percent_used! >= 90}
               />
               {quotaWindows(account)
                 .filter((window) => window !== deciding)

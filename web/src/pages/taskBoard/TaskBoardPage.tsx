@@ -22,6 +22,7 @@ import { taskIdentity, useTaskBoardData, type BoardTask } from "./taskBoardData"
 import {
   sessionTree,
   useBoardQuota,
+  useBoardQuotaCosts,
   useBoardSchedule,
   useBoardSessionDetails,
   useBoardSessions,
@@ -252,6 +253,7 @@ function TaskBoardContent({
   const [panel, setPanel] = useState<
     "waiting" | "exceptions" | "running" | "quota" | "hosts" | null
   >(null);
+  const quotaCosts = useBoardQuotaCosts(panel === "quota");
   const tasks = tasksQuery.data?.tasks ?? [],
     sources = tasksQuery.data?.sources ?? [],
     sessions = sessionsQuery.data ?? [];
@@ -358,7 +360,7 @@ function TaskBoardContent({
                           ? attention.anomalies[0]?.text || t("band.noExceptions")
                           : running.length
                             ? t("band.runningPreview", {
-                                tools: running.filter((row) => row.session?.tool).length,
+                                tools: running.filter((row) => row.toolRunning).length,
                                 idle: attention.idle,
                               })
                             : t("band.noRunning")}
@@ -395,6 +397,7 @@ function TaskBoardContent({
           {panel === "quota" ? (
             <TaskBoardQuotaPanel
               accounts={quota.data?.accounts ?? []}
+              costs={quotaCosts.data?.accounts}
               preferences={preferences}
               update={updatePreferences}
             />

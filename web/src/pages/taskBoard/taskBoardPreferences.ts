@@ -49,8 +49,20 @@ function readPreferences(): { preferences: BoardPreferences; storage: StorageSta
       return { preferences: boardDefaults, storage: "invalid" };
     const defaultView = boardViews.includes(value.defaultView) ? value.defaultView : "sessions";
     const defaultMode = value.defaultMode === "time" ? "time" : "order";
+    const valid =
+      (value.defaultView == null || boardViews.includes(value.defaultView)) &&
+      (value.defaultMode == null || ["order", "time"].includes(value.defaultMode)) &&
+      (value.theme == null || ["system", "light", "dark"].includes(value.theme)) &&
+      (value.palette == null || isThemePalette(value.palette)) &&
+      Object.entries({
+        refresh: [0, 30, 60, 300],
+        lodStation: [1, 2, 3],
+        lodPhase: [7, 14, 30],
+        boardHours: [12, 24, 48, 72],
+        watch: [60, 70, 75, 80, 85, 90],
+      }).every(([key, options]) => value[key] == null || options.includes(value[key]));
     return {
-      storage: "local",
+      storage: valid ? "local" : "invalid",
       preferences: {
         ...boardDefaults,
         defaultView,
@@ -71,7 +83,11 @@ function readPreferences(): { preferences: BoardPreferences; storage: StorageSta
           ? value.hiddenSources.filter((item: unknown) => typeof item === "string")
           : [],
         pinnedQuota: Array.isArray(value.pinnedQuota)
-          ? value.pinnedQuota.filter((item: unknown) => typeof item === "string").slice(-4)
+          ? [
+              ...new Set<string>(
+                value.pinnedQuota.filter((item: unknown) => typeof item === "string"),
+              ),
+            ].slice(0, 4)
           : [],
         aliases:
           value.aliases && typeof value.aliases === "object"

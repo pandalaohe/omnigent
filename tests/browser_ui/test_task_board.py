@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -170,7 +171,7 @@ def test_task_board_display_switch_and_source_list(
                 {
                     "@type": "Task",
                     "uid": "drop",
-                    "updated": "2026-11-06T06:30:00Z",
+                    "updated": datetime.now(UTC).isoformat(),
                     "title": "Drop the legacy endpoint",
                     "progress": "cancelled",
                     "omnigent.ai:source": "example",
@@ -283,7 +284,9 @@ def test_task_board_display_switch_and_source_list(
     expect(waiting.get_by_text("Approve the retry budget")).to_be_visible()
     expect(waiting.locator('a[href="/c/child"]')).to_be_visible()
     waiting.get_by_role("button", name="Close", exact=True).click()
-    page.get_by_role("button", name="Routes", exact=True).click()
+    page.get_by_role("navigation", name="Board views").get_by_role(
+        "button", name="Routes", exact=True
+    ).click()
     region = page.get_by_role("region", name="Routes", exact=True)
     expect(region.get_by_role("heading", name="Version two")).to_be_visible()
     region.get_by_role(
@@ -334,11 +337,15 @@ def test_task_board_display_switch_and_source_list(
     page.get_by_role("button", name="Settings", exact=True).click()
     display = page.get_by_role("region", name="Settings", exact=True)
     display.get_by_role("button", name="Off", exact=True).click()
-    expect(display.get_by_role("button", name="Off", exact=True)).to_have_attribute("aria-pressed", "true")
+    expect(display.get_by_role("button", name="Off", exact=True)).to_have_attribute(
+        "aria-pressed", "true"
+    )
     display.get_by_label("Station level up to", exact=True).select_option("3")
     display.get_by_label("Board window", exact=True).select_option("72")
     display.get_by_role("button", name=source_name, exact=True).click()
-    page.get_by_role("button", name="Routes", exact=True).click()
+    page.get_by_role("navigation", name="Board views").get_by_role(
+        "button", name="Routes", exact=True
+    ).click()
     expect(page.get_by_role("heading", name="Version two")).to_have_count(0)
     page.get_by_role("button", name="Settings", exact=True).click()
     display.get_by_role("button", name="Restore defaults", exact=True).click()

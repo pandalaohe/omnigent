@@ -110,6 +110,8 @@ beforeEach(() => {
     if (url.pathname === "/v1/system/status")
       return Response.json({ hosts: [], findings: [], level: "ok" });
     if (url.pathname === "/v1/me/usage") return Response.json(mocks.quota ?? { accounts: [] });
+    if (url.pathname === "/v1/me/usage/activity")
+      return Response.json({ accounts: [{ account: "account-0", totals: { cost_usd: 123.456 } }] });
     if (url.pathname === "/v1/scheduled-tasks") return Response.json({ scheduled_tasks: [] });
     throw new Error(`Unexpected board read: ${path}`);
   });
@@ -227,6 +229,7 @@ it("prioritizes quota attention, exposes every account and saves pins locally", 
   const quota = await screen.findByRole("region", { name: "Quota" });
   expect(await within(quota).findByRole("button", { name: /Account 5\s*93%/ })).toBeTruthy();
   fireEvent.click(within(quota).getByRole("button", { name: "Show all 5 accounts" }));
+  expect(await screen.findByText(/Today’s estimate \$123.46/)).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Pin Account 1" }));
   expect(JSON.parse(localStorage.getItem(BOARD_PREFERENCES_KEY)!).pinnedQuota).toEqual([
     "account-0",

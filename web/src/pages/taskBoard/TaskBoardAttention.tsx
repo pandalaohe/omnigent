@@ -4,6 +4,7 @@ import { boardExitProps } from "@/lib/boardFrame";
 import { BoardPager } from "./TaskBoardRoutes";
 import type { BoardTask } from "./taskBoardData";
 import type { AttentionRow } from "./boardAttentionData";
+import { BoardIdentityMark } from "./BoardIdentityMark";
 
 export function TaskBoardAttention({
   rows,
@@ -29,6 +30,12 @@ export function TaskBoardAttention({
               </button>
             ) : (
               <Link {...boardExitProps()} to={`/c/${encodeURIComponent(row.session!.id)}`}>
+                <BoardIdentityMark
+                  id={row.session!.agentId}
+                  label={row.session!.label}
+                  product={row.session!.agentId}
+                  size={26}
+                />
                 <span>
                   <b>{row.text}</b>
                   <small>{row.caption}</small>

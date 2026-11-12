@@ -10,6 +10,7 @@ export interface AttentionRow {
   caption: string;
   session?: DisplaySession;
   task?: BoardTask;
+  toolRunning?: boolean;
 }
 /** Source identity is explicit; native observations replace the runtime tuple as a unit. */
 export function boardAttention(
@@ -54,6 +55,12 @@ export function boardAttention(
     if (session.need)
       waiting.push({ id: `${session.id}:need`, text: session.need, caption, session });
     const observation = sessionObservation(session, asOf);
+    const toolElapsed = session.tool ? (now - Date.parse(session.tool.startedAt)) / 1000 : null;
+    const toolRunning =
+      toolElapsed != null &&
+      Number.isFinite(toolElapsed) &&
+      toolElapsed >= 0 &&
+      (session.tool!.limitSeconds == null || toolElapsed < session.tool!.limitSeconds);
     if (session.status !== "archived") {
       const stale = nativeById.has(session.id)
         ? silent.has(session.id)
@@ -84,9 +91,10 @@ export function boardAttention(
       if (session.status === "running" && !stale)
         running.push({
           id: session.id,
-          text: session.tool?.label || session.now || session.title,
+          text: (toolRunning ? session.tool?.label : undefined) || session.now || session.title,
           caption,
           session,
+          toolRunning,
         });
     }
   }

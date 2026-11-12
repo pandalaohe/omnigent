@@ -256,5 +256,6 @@
   "sources.openSettings": "Manage task sources in Settings",
   "actions.openInApp": "Open in Omnigent",
   "band.more": "+{{count}}",
-  "band.retryFailure": "{{message}} · {{retry}}"
+  "band.retryFailure": "{{message}} · {{retry}}",
+  "quota.todayCost": "Today’s estimate ${{amount}}"
 }

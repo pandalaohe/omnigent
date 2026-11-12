@@ -5,6 +5,8 @@ import { boardDefaults, boardViews, type BoardPreferences } from "./taskBoardPre
 import type { TaskSource } from "./taskBoardData";
 import type { UsageAccountView } from "@/pages/usageBoard/usageBoardData";
 import { formatDate, t } from "./taskBoardText";
+import { BoardIdentityMark } from "./BoardIdentityMark";
+import { quotaAccounts } from "./TaskBoardQuota";
 
 type Update = (change: Partial<BoardPreferences>) => boolean | void;
 export function useBoardAppearance(preferences: BoardPreferences) {
@@ -35,43 +37,53 @@ export function useBoardAppearance(preferences: BoardPreferences) {
 export function BoardAppearanceControls({
   preferences,
   update,
+  part = "all",
+  labelled = false,
 }: {
   preferences: BoardPreferences;
   update: Update;
+  part?: "all" | "theme" | "palette";
+  labelled?: boolean;
 }) {
   return (
     <>
-      <div className="tb-segment" role="group" aria-label={t("display.theme")}>
-        {(
-          [
-            ["system", MonitorIcon],
-            ["light", SunIcon],
-            ["dark", MoonIcon],
-          ] as const
-        ).map(([theme, Icon]) => (
-          <button
-            key={theme}
-            type="button"
-            aria-label={t(`display.${theme}`)}
-            title={t(`display.${theme}`)}
-            aria-pressed={preferences.theme === theme}
-            onClick={() => update({ theme })}
-          >
-            <Icon size={15} />
-          </button>
-        ))}
-      </div>
-      <select
-        aria-label={t("display.palette")}
-        value={preferences.palette}
-        onChange={(event) => update({ palette: event.target.value as BoardPreferences["palette"] })}
-      >
-        {PALETTES.map((palette) => (
-          <option key={palette.id} value={palette.id}>
-            {palette.label}
-          </option>
-        ))}
-      </select>
+      {part !== "palette" && (
+        <div className="tb-segment" role="group" aria-label={t("display.theme")}>
+          {(
+            [
+              ["system", MonitorIcon],
+              ["light", SunIcon],
+              ["dark", MoonIcon],
+            ] as const
+          ).map(([theme, Icon]) => (
+            <button
+              key={theme}
+              type="button"
+              aria-label={t(`display.${theme}`)}
+              title={t(`display.${theme}`)}
+              aria-pressed={preferences.theme === theme}
+              onClick={() => update({ theme })}
+            >
+              {labelled ? t(`display.${theme}`) : <Icon size={15} />}
+            </button>
+          ))}
+        </div>
+      )}
+      {part !== "theme" && (
+        <select
+          aria-label={t("display.palette")}
+          value={preferences.palette}
+          onChange={(event) =>
+            update({ palette: event.target.value as BoardPreferences["palette"] })
+          }
+        >
+          {PALETTES.map((palette) => (
+            <option key={palette.id} value={palette.id}>
+              {palette.label}
+            </option>
+          ))}
+        </select>
+      )}
     </>
   );
 }
@@ -84,7 +96,7 @@ export function BoardClock() {
   return (
     <time className="tb-clock" dateTime={new Date(now).toISOString()}>
       <b>{formatDate(now, { hour: "2-digit", minute: "2-digit", hourCycle: "h23" })}</b>
-      <span>{formatDate(now, { year: "numeric", month: "2-digit", day: "2-digit" })}</span>
+      <span>{formatDate(now, { weekday: "short", month: "long", day: "numeric" })}</span>
     </time>
   );
 }
@@ -179,7 +191,15 @@ export function TaskBoardDisplaySettings({
         <section>
           <h2>{t("display.appearance")}</h2>
           <Row label={t("display.theme")}>
-            <BoardAppearanceControls preferences={preferences} update={update} />
+            <BoardAppearanceControls
+              preferences={preferences}
+              update={update}
+              part="theme"
+              labelled
+            />
+          </Row>
+          <Row label={t("display.palette")}>
+            <BoardAppearanceControls preferences={preferences} update={update} part="palette" />
           </Row>
           <Row label={t("display.refresh")}>
             <div className="tb-segment">
@@ -202,35 +222,31 @@ export function TaskBoardDisplaySettings({
           <h2>{t("band.quota")}</h2>
           <Row label={t("display.pins")} hint={t("display.pinsHint")}>
             <div className="tb-setting-chips">
-              {accounts
-                .filter(
-                  (account) =>
-                    account.freshness === "fresh" &&
-                    account.state !== "paused" &&
-                    account.windows.some(
-                      (window) => !window.past_reset && window.percent_used != null,
-                    ),
-                )
-                .map((account) => {
-                  const pinned = preferences.pinnedQuota.includes(account.id);
-                  return (
-                    <button
-                      type="button"
-                      key={account.id}
-                      aria-pressed={pinned}
-                      disabled={!pinned && preferences.pinnedQuota.length >= 4}
-                      onClick={() =>
-                        update({
-                          pinnedQuota: pinned
-                            ? preferences.pinnedQuota.filter((id) => id !== account.id)
-                            : [...preferences.pinnedQuota, account.id],
-                        })
-                      }
-                    >
-                      {account.display_name}
-                    </button>
-                  );
-                })}
+              {quotaAccounts(accounts, []).map((account) => {
+                const pinned = preferences.pinnedQuota.includes(account.id);
+                return (
+                  <button
+                    type="button"
+                    key={account.id}
+                    aria-pressed={pinned}
+                    disabled={!pinned && preferences.pinnedQuota.length >= 4}
+                    onClick={() =>
+                      update({
+                        pinnedQuota: pinned
+                          ? preferences.pinnedQuota.filter((id) => id !== account.id)
+                          : [...preferences.pinnedQuota, account.id],
+                      })
+                    }
+                  >
+                    <BoardIdentityMark
+                      id={account.id}
+                      label={account.display_name}
+                      product={account.product}
+                    />
+                    {account.display_name}
+                  </button>
+                );
+              })}
             </div>
           </Row>
           <Row label={t("display.watch")} hint={t("display.watchHint")}>
@@ -254,6 +270,10 @@ export function TaskBoardDisplaySettings({
                     })
                   }
                 >
+                  <BoardIdentityMark
+                    id={source.id}
+                    label={preferences.aliases[source.id] || source.name || source.id}
+                  />
                   {preferences.aliases[source.id] || source.name || source.id}
                 </button>
               ))}

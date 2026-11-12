@@ -69,6 +69,12 @@ it("clamps the phone page after tasks disappear", () => {
   expect(phone.getByText("Task 1")).toBeTruthy();
   expect(phone.queryByText("Task 13")).toBeNull();
 });
+it("keeps an unresolved failure visible after the recent board window", () => {
+  vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-11-12T13:00:00Z"));
+  const view = render(board(rows(1).map((task) => ({ ...task, progress: "failed" }))));
+  const phone = within(view.container.querySelector(".tb-route-phone")! as HTMLElement);
+  expect(phone.getByText("Task 1")).toBeTruthy();
+});
 it("zooms observed-close clusters around their observed time", () => {
   const now = Date.parse("2026-11-06T13:00:00Z");
   vi.spyOn(Date, "now").mockReturnValue(now);

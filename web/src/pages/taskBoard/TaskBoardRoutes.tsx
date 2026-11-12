@@ -98,6 +98,7 @@ export function TaskBoardRoutes({
           (task) =>
             !!task["omnigent.ai:waiting"] ||
             taskProgress(task) === "in-process" ||
+            taskProgress(task) === "failed" ||
             (taskTime(task, now) >= cutoff && taskTime(task, now) <= now),
         ),
       );

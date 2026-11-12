@@ -6,6 +6,8 @@ import { resolveWebSocketUrl } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
 import type { SystemStatusView } from "@/hooks/useSystemStatus";
 import type { UsageOverview } from "@/pages/usageBoard/usageBoardData";
+import type { UsageActivity } from "@/pages/usageBoard/usageActivityData";
+import { usageRangeQuery } from "@/pages/usageBoard/UsageRangeControl";
 import { readBoardJson } from "./taskBoardData";
 
 export interface BoardSession {
@@ -196,6 +198,18 @@ export function useBoardSchedule() {
   return useQuery({
     queryKey: ["taskBoard", "schedule"],
     queryFn: () => readBoardJson<{ scheduled_tasks: BoardSchedule[] }>("/v1/scheduled-tasks"),
+    refetchInterval: cadence,
+    retry: false,
+  });
+}
+
+export function useBoardQuotaCosts(enabled: boolean) {
+  const cadence = useBoardCadence();
+  return useQuery({
+    queryKey: ["taskBoard", "quotaCosts", new Date().toDateString()],
+    queryFn: () =>
+      readBoardJson<UsageActivity>(`/v1/me/usage/activity?${usageRangeQuery({ key: "today" })}`),
+    enabled,
     refetchInterval: cadence,
     retry: false,
   });
