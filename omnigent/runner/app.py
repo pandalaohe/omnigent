@@ -9500,7 +9500,8 @@ def create_runner_app(
                     if initializations:
                         try:
                             await asyncio.wait_for(
-                                asyncio.shield(asyncio.gather(*initializations)), timeout=60.0
+                                asyncio.shield(asyncio.gather(*initializations)),
+                                timeout=INITIALIZATION_WAIT_TIMEOUT_S,
                             )
                         except TimeoutError:
                             raise RuntimeError(

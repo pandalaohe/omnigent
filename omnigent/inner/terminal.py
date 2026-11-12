@@ -1277,6 +1277,10 @@ class TerminalInstance:
         text = _strip_ansi(snapshot).strip()
         return text or None
 
+    def startup_diagnostic_text(self) -> str | None:
+        """Read private startup output, including a probe's final exit frame."""
+        return self.last_pane_text()
+
     def _remember_pane_snapshot(self, snapshot: str) -> None:
         """Store a pane capture for later exit diagnostics."""
         self._last_pane_snapshot = snapshot

@@ -101,7 +101,7 @@ async def test_first_pi_turn_waits_for_permission_bootstrap(monkeypatch, install
             assert response.status_code == 202, response.text
             turn = app.state.active_turns.get("cold-pi")
             assert turn is not None
-            wait = 21.0 if installed and phase == "bootstrap" else 0.05
+            wait = 61.2 if installed and phase == "bootstrap" else 0.05
             done, _ = await asyncio.wait([turn], timeout=wait)
             assert not done, "first turn failed while permission bootstrap was still running"
             state = app.state.permission_tiers.state("cold-pi")

@@ -320,6 +320,9 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
         ("missing", None, []),
         ("missing-lifecycle", None, []),
         ("dead", None, []),
+        ("conpty-live", None, []),
+        ("conpty-exited", None, []),
+        ("posix-final", None, []),
         (
             "missing",
             " OPENAI_API_KEY,ANTHROPIC_AUTH_TOKEN,OPENAI_API_KEY, ",
@@ -397,18 +400,41 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
 
     captured: dict[str, Any] = {}
 
+    final_frame = [None]
+
     async def alive():
-        return instruction_spec != "dead"
+        if instruction_spec == "posix-final":
+            final_frame[0] = "pi-subagents is missing ./native-child-lifecycle"
+        return instruction_spec not in {"dead", "posix-final"}
 
     class _FakeTerminalRegistry:
         def get(self, *_args: Any) -> Any:
+            if instruction_spec in {"conpty-live", "conpty-exited"}:
+                from omnigent.terminals.conpty import ConPtyTerminalInstance
+
+                terminal = ConPtyTerminalInstance(
+                    name="pi",
+                    session_key="main",
+                    private_dir=tmp_path,
+                    socket_path=tmp_path / "unused",
+                    running=True,
+                )
+                terminal._process = SimpleNamespace(
+                    pid=os.getpid(),
+                    exit_code=lambda: 1 if instruction_spec == "conpty-exited" else None,
+                )
+                with terminal._output_lock:
+                    terminal._output.append(b"\x1b[31mpi-subagents is missing ")
+                    terminal._output.append(b"./native-child-lifecycle\x1b[0m\r\n")
+                assert terminal._last_pane_snapshot is None
+                return terminal
             return SimpleNamespace(
                 pane_pid_sync=lambda: os.getpid(),
                 is_alive=alive,
-                last_pane_text=lambda: (
+                startup_diagnostic_text=lambda: (
                     "pi-subagents is missing ./native-child-lifecycle"
                     if instruction_spec == "missing-lifecycle"
-                    else None
+                    else final_frame[0]
                 ),
             )
 
@@ -480,7 +506,14 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     seed_pi_permission_state(tmp_path, "47f049b9d13df4db397c7f46859b825f", permission_tier)
     instructions = "  Follow the authored role. π\nKeep this whitespace.  "
     agent_spec = None
-    if instruction_spec not in {"missing", "missing-lifecycle", "dead"}:
+    if instruction_spec not in {
+        "missing",
+        "missing-lifecycle",
+        "dead",
+        "conpty-live",
+        "conpty-exited",
+        "posix-final",
+    }:
         agent_spec = AgentSpec(
             spec_version=1,
             name="pi",
@@ -496,7 +529,13 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     instructions_path = bridge_dir / "agent_instructions.md"
     instructions_path.write_text("Stale role")
 
-    if permission_tier != "full" and instruction_spec in ("missing-lifecycle", "dead"):
+    if permission_tier != "full" and instruction_spec in (
+        "missing-lifecycle",
+        "dead",
+        "conpty-live",
+        "conpty-exited",
+        "posix-final",
+    ):
         from omnigent.inner.pi_executor import PiPermissionBootstrapError
 
         with pytest.raises(PiPermissionBootstrapError) as failure:
@@ -510,7 +549,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
             )
         assert failure.value.reason == (
             "dependency_missing (code=native_child_lifecycle)"
-            if instruction_spec == "missing-lifecycle"
+            if instruction_spec != "dead"
             else "process_exit (status=None)"
         )
         assert not verifications

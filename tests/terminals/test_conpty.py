@@ -185,6 +185,19 @@ def test_conpty_tool_outputs_have_identity_without_tmux_socket(instance):
         assert "tmux_socket" not in result
 
 
+@pytest.mark.parametrize("running", [False, True])
+def test_startup_diagnostics_read_buffer_without_screen_read(instance, running):
+    instance.running = running
+    with instance._output_lock:
+        instance._output.append(b"\x1b[31mpi-subagents is missing ")
+        instance._output.append(b"./native-child-lifecycle\x1b[0m\r\n")
+    assert instance._last_pane_snapshot is None
+    assert instance.startup_diagnostic_text() == (
+        "pi-subagents is missing ./native-child-lifecycle"
+    )
+    assert instance._last_pane_snapshot is None
+
+
 @pytest.mark.asyncio
 async def test_launch_read_send_exit_and_cleanup(instance, monkeypatch):
     process = _Process()

@@ -3798,10 +3798,13 @@ async def _auto_create_pi_terminal(
             while True:
                 from omnigent.inner.pi_executor import PiPermissionBootstrapError
 
-                dependency = startup_dependency_failure(terminal_instance.last_pane_text() or "")
+                alive = await terminal_instance.is_alive()
+                dependency = startup_dependency_failure(
+                    terminal_instance.startup_diagnostic_text() or ""
+                )
                 if dependency is not None:
                     raise PiPermissionBootstrapError(f"dependency_missing (code={dependency})")
-                if not await terminal_instance.is_alive():
+                if not alive:
                     raise PiPermissionBootstrapError("process_exit (status=None)")
                 confirmed = scoped_launch[0].handle_launcher(
                     {"protocol": 1, "op": "confirm", "launch_id": scoped_launch[1]}
