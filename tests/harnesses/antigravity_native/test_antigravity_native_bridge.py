@@ -1299,7 +1299,7 @@ def test_inject_user_message_via_tui_submits_shortcut_suffix(
 
     monkeypatch.setattr("subprocess.run", fake_run)
     inject_user_message_via_tui(
-        tmp_path, content="Explain the shortcut (shift+tab to cycle)", timeout_s=0.01
+        tmp_path, content="Explain the shortcut (shift+tab to cycle)", timeout_s=2.0
     )
     assert actions == ["C-a", "C-k", "paste", "Enter"]
     assert pane == agy134_paste_captures["idle_empty"]
@@ -1349,7 +1349,7 @@ def test_inject_user_message_via_tui_replaces_idle_hints(
     inject_user_message_via_tui(
         tmp_path,
         content="<omnigent_agent_instructions>\nbe terse\nReply with exactly PONG_FINAL",
-        timeout_s=0.01,
+        timeout_s=2.0,
     )
     assert actions == ["C-a", "C-k", *(["C-w"] * expected_batches), "paste", "Enter"]
     assert pane == agy134_paste_captures[submitted]
@@ -1532,11 +1532,11 @@ def test_inject_user_message_via_tui_delivers_long_draft(
 
     monkeypatch.setattr("subprocess.run", fake_run)
     if submit_clears:
-        inject_user_message_via_tui(tmp_path, content=content, timeout_s=0.01)
+        inject_user_message_via_tui(tmp_path, content=content, timeout_s=2.0)
         assert actions == ["C-a", "C-k", "paste", "Enter"]
     else:
         with pytest.raises(RuntimeError, match="did not accept the submitted message"):
-            inject_user_message_via_tui(tmp_path, content=content, timeout_s=0.01)
+            inject_user_message_via_tui(tmp_path, content=content, timeout_s=2.0)
         assert actions == ["C-a", "C-k", "paste", *(["Enter"] * _mod._MAX_SUBMIT_ATTEMPTS)]
 
 
@@ -1604,7 +1604,7 @@ def test_inject_user_message_via_tui_delivers_beside_background_task_panel(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", fake_run)
-    inject_user_message_via_tui(tmp_path, content=content, timeout_s=0.01)
+    inject_user_message_via_tui(tmp_path, content=content, timeout_s=2.0)
     assert actions == ["C-a", "C-k", "paste", "Enter"]
 
 
@@ -1711,7 +1711,7 @@ def test_inject_user_message_via_tui_distinguishes_footer_and_retries_baseline_c
     inject_user_message_via_tui(
         tmp_path,
         content="<omnigent_agent_instructions>\nesc to cancel\nReply with exactly PONG_FINAL",
-        timeout_s=0.01,
+        timeout_s=2.0,
     )
     assert actions == (
         ["C-a", "C-k", "paste", "Enter"]
@@ -1879,6 +1879,8 @@ def test_inject_user_message_via_tui_clears_idle_leftovers_and_submits_visible_t
     submit_attempts: int,
     clear_delay: int,
 ) -> None:
+    # These cropped composer fixtures start after the readiness gate.
+    monkeypatch.setattr(_mod, "_wait_for_agy_prompt_ready", lambda *args, **kwargs: None)
     write_tmux_target(tmp_path, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
     active = initial == "active"
     shape = (
@@ -1924,7 +1926,7 @@ def test_inject_user_message_via_tui_clears_idle_leftovers_and_submits_visible_t
 
     monkeypatch.setattr("subprocess.run", fake_run)
     content = "<omnigent_agent_instructions>\nbe terse\nReply with exactly PONG_FINAL"
-    inject_user_message_via_tui(tmp_path, content=content, timeout_s=0.01)
+    inject_user_message_via_tui(tmp_path, content=content, timeout_s=2.0)
     assert actions == [
         "C-a",
         "C-k",
@@ -1940,6 +1942,8 @@ def test_inject_user_message_via_tui_rejects_uncleared_idle_composer(
     _fast_tmux_timeouts: None,
     agy134_paste_captures: dict[str, str],
 ) -> None:
+    # These cropped composer fixtures start after the readiness gate.
+    monkeypatch.setattr(_mod, "_wait_for_agy_prompt_ready", lambda *args, **kwargs: None)
     write_tmux_target(tmp_path, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
     actions: list[str] = []
     pane = agy134_paste_captures["collapsed"]
@@ -1960,7 +1964,7 @@ def test_inject_user_message_via_tui_rejects_uncleared_idle_composer(
     monkeypatch.setattr("subprocess.run", fake_run)
     with pytest.raises(RuntimeError, match="draft_candidates_empty=False") as exc:
         inject_user_message_via_tui(
-            tmp_path, content="Reply with exactly PONG_FINAL", timeout_s=0.01
+            tmp_path, content="Reply with exactly PONG_FINAL", timeout_s=2.0
         )
     assert actions == ["C-a", "C-k", "C-w", "C-w", "C-w", "C-w"]
     assert "composer_tail:" in str(exc.value)
@@ -2036,7 +2040,7 @@ def test_inject_user_message_via_tui_cleans_failed_idle_render(
         inject_user_message_via_tui(
             tmp_path,
             content="<omnigent_agent_instructions>\nReply with exactly PONG_FINAL",
-            timeout_s=0.01,
+            timeout_s=2.0,
         )
     assert actions == ["C-a", "C-k", "paste", *(["C-w"] * expected_batches)]
     if after_wait == "draft":
@@ -4588,3 +4592,101 @@ def test_agy_old_active_marker_does_not_block_idle_footer(tmp_path, monkeypatch)
     pane = "Old tool output: esc to cancel\n? for shortcuts    Gemini · high"
     monkeypatch.setattr(_mod, "_agy_control_pane", lambda _: pane)
     assert _mod._require_agy_idle(tmp_path) == pane
+
+
+@pytest.mark.parametrize("slow_phase", ["ready", "baseline", "clear", "paste", "submit"])
+def test_delivery_survives_slow_pane_phases(tmp_path, monkeypatch, slow_phase):
+    clock = [0.0]
+    phase = ["ready"]
+    started = [0.0]
+    enters = []
+    write_tmux_target(tmp_path, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="main")
+    monkeypatch.setattr(_mod.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        _mod.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+
+    def run(cmd, **kwargs):
+        pane = ">\n? for shortcuts"
+        elapsed = clock[0] - started[0]
+        delayed = phase[0] == slow_phase and elapsed < (31 if slow_phase == "ready" else 6)
+        if "capture-pane" in cmd:
+            if phase[0] == "ready" and delayed:
+                pane = "Starting"
+            elif phase[0] == "baseline" and delayed:
+                pane = ""
+            elif (
+                slow_phase == "clear"
+                and phase[0] in ("baseline", "clear")
+                and (phase[0] == "baseline" or delayed)
+            ):
+                pane = "> old draft\nsecond line\n? for shortcuts"
+            elif phase[0] == "paste" and not delayed:
+                pane = "> hello\n? for shortcuts"
+            elif phase[0] == "submit":
+                pane = "> hello\n? for shortcuts" if delayed else ">\nesc to cancel"
+        elif cmd[-1] in ("C-k", "C-w", "Enter") or "paste-buffer" in cmd:
+            phase[0] = (
+                "paste"
+                if "paste-buffer" in cmd
+                else {"C-k": "baseline", "C-w": "clear", "Enter": "submit"}[cmd[-1]]
+            )
+            started[0] = clock[0]
+            if cmd[-1] == "Enter":
+                enters.append(clock[0])
+        return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+
+    monkeypatch.setattr(_mod.subprocess, "run", run)
+    inject_user_message_via_tui(tmp_path, content="hello")
+    assert len(enters) == 1
+    assert clock[0] >= (31 if slow_phase == "ready" else 6)
+    assert clock[0] < 180
+
+
+def test_agent_mode_survives_old_step_timeout(tmp_path, monkeypatch):
+    clock = [0.0]
+    keys = []
+    monkeypatch.setattr(_mod.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        _mod.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+    monkeypatch.setattr(_mod, "send_interaction_keys_via_tui", lambda _, *sent: keys.extend(sent))
+    monkeypatch.setattr(
+        _mod,
+        "_agy_control_pane",
+        lambda _: "? for shortcuts " + ("plan · model" if clock[0] >= 4 else "model"),
+    )
+    _mod._set_agy_agent_mode(tmp_path, "plan", timeout_s=_mod.AGY_SWITCH_STEP_TIMEOUT_S)
+    assert keys == ["BTab"]
+    assert clock[0] >= 4
+
+
+def test_nested_pane_operations_share_deadline_and_stop_late_keys(monkeypatch):
+    clock = [0.0]
+    commands = []
+    monkeypatch.setattr(_mod.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        _mod.subprocess,
+        "run",
+        lambda command, **kwargs: (
+            commands.append((command, kwargs["timeout"]))
+            or SimpleNamespace(returncode=0, stdout="", stderr="")
+        ),
+    )
+
+    @_mod._bounded_control(60)
+    def inner():
+        _mod._run_tmux("/tmp/example/tmux.sock", "send-keys", "Enter")
+        clock[0] = 180
+        _mod._run_tmux("/tmp/example/tmux.sock", "send-keys", "Enter")
+
+    @_mod._bounded_control(180)
+    def outer():
+        clock[0] = 175
+        inner()
+
+    with pytest.raises(RuntimeError, match="deadline expired"):
+        outer()
+    assert len(commands) == 1
+    assert commands[0][1] == 5
+    assert _mod._CONTROL_DEADLINE.get() == float("inf")

@@ -176,7 +176,7 @@ _CASCADE_RUN_STATUS_IDLE = "CASCADE_RUN_STATUS_IDLE"
 _QUIESCENT_TICKS_TO_CLOSE = 2
 # Bound unavailable completion observations without blocking the stream's error path.
 _IDLE_READ_TIMEOUT_S = 2.0
-_UNCONFIRMED_TURN_TIMEOUT_S = 120.0
+_UNCONFIRMED_TURN_TIMEOUT_S = 600.0
 # Terminal-failure session status (a valid ``external_session_status``; see the
 # ``Literal["idle", "running", "failed"]`` schema). Emitted when an agy turn
 # closes on a model/turn ERROR so the web UI shows the turn FAILED instead of a
@@ -1300,6 +1300,7 @@ class _ReaderState:
     turn_error: str | None = None
     idle_ticks: int = 0
     last_work_at: float = field(default_factory=lambda: monotonic())
+    observation_notice_at: float = float("-inf")
     last_text: str = ""
     posted_model_enum: str | None = None
     model_catalog: dict[str, object] | None = None
@@ -1841,11 +1842,15 @@ async def _reconcile_idle_turn(
             if state.turn_error:
                 event.data["output"] = state.turn_error
         elif monotonic() - state.last_work_at >= _UNCONFIRMED_TURN_TIMEOUT_S:
-            event = _status_event(_STATUS_FAILED)
-            event.data["output"] = (
-                state.last_text + "\n\nAntigravity completion could not be confirmed after "
-                "120 seconds without evidence of work; the last received text is shown above."
-            ).strip()
+            if state.observation_notice_at < state.last_work_at:
+                event = _status_event(_STATUS_RUNNING)
+                event.data["output"] = (
+                    "Antigravity observation unconfirmed; still watching for completion."
+                )
+                event.data["observation_status"] = "observation_unconfirmed"
+                await _post_event(client, session_id, event)
+                state.observation_notice_at = monotonic()
+            return body
         else:
             return body
         state.turn_active = False
@@ -1896,7 +1901,8 @@ async def _mirror_subagent_cascade(
             await _sleep(_SUBAGENT_POLL_INTERVAL_S)
     finally:
         if child_state.turn_active:
-            event = _status_event(_STATUS_FAILED)
+            event = _status_event(_STATUS_RUNNING)
+            event.data["observation_status"] = "observation_unconfirmed"
             event.data["output"] = (
                 "Helper mirroring ended before native completion could be confirmed."
             )

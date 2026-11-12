@@ -15,9 +15,11 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, ParamSpec, TypeVar, cast
 
 from omnigent.harnesses.antigravity_native.steps import PendingInteraction
 from omnigent.install_ledger import atomic_write_json
@@ -1394,25 +1396,24 @@ def update_conversation_id(
 # per the established per-harness convention.
 
 # Per-command tmux budget. These are local IPC calls to the runner's own tmux
-# server, but that server can stall past 5s under parallel worker boots on a
-# large worktree while still healthy — 10s matches every other native bridge.
-_TMUX_SEND_TIMEOUT_S = 10.0
+# server; use the local-control backstop, capped by the operation deadline.
+_TMUX_SEND_TIMEOUT_S = 60.0
 # Per-readiness-gate wait (tmux.json advertised, then the agy input box mounted).
-_TMUX_READY_TIMEOUT_S = 30.0
+_TMUX_READY_TIMEOUT_S = 180.0
 # Poll cadence for the readiness / paste-commit / submit-verify loops.
 _TMUX_POLL_INTERVAL_S = 0.2
 # Five intervals let an RPC-driven prompt close before a selection is sent.
 _INTERACTION_DISMISSAL_POLLS = 6
 # How long to wait for the pasted draft to render in the input box before Enter.
-_PASTE_COMMIT_TIMEOUT_S = 5.0
+_PASTE_COMMIT_TIMEOUT_S = 60.0
 # Settle pause after the draft renders, before the submit Enter.
 _PASTE_SETTLE_S = 0.2
 _IDLE_CLEAR_BATCH_SIZE = 300
 _IDLE_CLEAR_MAX_BATCHES = 4
-_IDLE_CLEAR_TIMEOUT_S = 5.0
-_BASELINE_CAPTURE_TIMEOUT_S = 5.0
+_IDLE_CLEAR_TIMEOUT_S = 60.0
+_BASELINE_CAPTURE_TIMEOUT_S = 60.0
 # How long one submit Enter is given to start a turn before it is re-sent.
-_SUBMIT_VERIFY_TIMEOUT_S = 5.0
+_SUBMIT_VERIFY_TIMEOUT_S = 60.0
 # Re-send budget for a submit Enter that the TUI folded into the paste burst.
 _MAX_SUBMIT_ATTEMPTS = 3
 # Named tmux buffer used to stream the paste (avoids the ~16KB send-keys argv cap).
@@ -1451,7 +1452,7 @@ _AGY_VERIFYING_MARKER = "verifying your account eligibility"
 # against agy 1.1.8), so this only bounds the fail-open path.
 _VERIFY_PROBE_TIMEOUT_S = 2.0
 # Total budget for re-delivering a turn agy rejected while verifying the account.
-_VERIFY_RETRY_TIMEOUT_S = 90.0
+_VERIFY_RETRY_TIMEOUT_S = 180.0
 # Pause between re-delivery attempts. agy asks the user to "try again shortly".
 _VERIFY_RETRY_INTERVAL_S = 3.0
 # Patterns redacted from a pane tail before it is surfaced in a delivery-failure
@@ -1560,7 +1561,7 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
     :returns: The advertised ``{socket_path, tmux_target}``.
     :raises RuntimeError: When the target is not advertised within *timeout_s*.
     """
-    deadline = time.monotonic() + timeout_s
+    deadline = _deadline_after(timeout_s)
     while True:
         info = read_tmux_info(bridge_dir)
         if info is not None:
@@ -1571,6 +1572,42 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
                 "(is the agy terminal running on this host?)"
             )
         time.sleep(_TMUX_POLL_INTERVAL_S)
+
+
+_CONTROL_DEADLINE: ContextVar[float] = ContextVar("agy_control_deadline", default=float("inf"))
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _deadline_after(timeout_s: float) -> float:
+    return min(_CONTROL_DEADLINE.get(), time.monotonic() + timeout_s)
+
+
+def _control_remaining(timeout_s: float) -> float:
+    remaining = min(timeout_s, _CONTROL_DEADLINE.get() - time.monotonic())
+    if remaining <= 0:
+        raise RuntimeError(
+            "Antigravity control unavailable: deadline expired; retry after checking the terminal"
+        )
+    return remaining
+
+
+def _bounded_control(default_timeout_s: float) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    """Nested pane operations consume their caller's deadline, including tmux IPC."""
+
+    def decorate(function: Callable[_P, _R]) -> Callable[_P, _R]:
+        @wraps(function)
+        def bounded(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            budget = cast(float, kwargs.get("timeout_s", default_timeout_s))
+            token = _CONTROL_DEADLINE.set(_deadline_after(budget))
+            try:
+                return function(*args, **kwargs)
+            finally:
+                _CONTROL_DEADLINE.reset(token)
+
+        return bounded
+
+    return decorate
 
 
 def _run_tmux(socket_path: str, *args: str) -> None:
@@ -1589,7 +1626,7 @@ def _run_tmux(socket_path: str, *args: str) -> None:
             check=False,
             capture_output=True,
             text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
+            timeout=_control_remaining(_TMUX_SEND_TIMEOUT_S),
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"tmux command timed out after {_TMUX_SEND_TIMEOUT_S:.0f}s") from exc
@@ -1614,7 +1651,7 @@ def _capture_pane(socket_path: str, tmux_target: str) -> str:
             check=False,
             capture_output=True,
             text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
+            timeout=_control_remaining(_TMUX_SEND_TIMEOUT_S),
         )
     except (subprocess.TimeoutExpired, OSError):
         return ""
@@ -1635,7 +1672,7 @@ def _session_alive(socket_path: str, tmux_target: str) -> bool:
             check=False,
             capture_output=True,
             text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
+            timeout=_control_remaining(_TMUX_SEND_TIMEOUT_S),
         )
     except (subprocess.TimeoutExpired, OSError):
         return False
@@ -1873,7 +1910,7 @@ def _wait_for_agy_prompt_ready(socket_path: str, tmux_target: str, *, timeout_s:
     :param timeout_s: Maximum seconds to wait for a footer to render.
     :returns: None.
     """
-    deadline = time.monotonic() + timeout_s
+    deadline = _deadline_after(timeout_s)
     while time.monotonic() < deadline:
         pane = _capture_pane(socket_path, tmux_target)
         if _AGY_IDLE_MARKER in pane or _AGY_ACTIVE_MARKER in pane:
@@ -1886,6 +1923,7 @@ def _wait_for_agy_prompt_ready(socket_path: str, tmux_target: str, *, timeout_s:
         time.sleep(_TMUX_POLL_INTERVAL_S)
 
 
+@_bounded_control(60.0)
 def _submit_and_verify(
     socket_path: str,
     tmux_target: str,
@@ -1953,7 +1991,7 @@ def _submit_and_verify(
                 "restart the session"
             )
         submit()
-        deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
+        deadline = _deadline_after(_SUBMIT_VERIFY_TIMEOUT_S)
         while time.monotonic() < deadline:
             if not _session_alive(socket_path, tmux_target):
                 raise RuntimeError(
@@ -1995,7 +2033,7 @@ def _account_verification_rejected(socket_path: str, tmux_target: str) -> bool:
     :param tmux_target: tmux pane target.
     :returns: ``True`` when the turn was rejected and should be re-delivered.
     """
-    deadline = time.monotonic() + _VERIFY_PROBE_TIMEOUT_S
+    deadline = _deadline_after(_VERIFY_PROBE_TIMEOUT_S)
     pane = ""
     while True:
         pane = _capture_pane(socket_path, tmux_target) or pane
@@ -2006,6 +2044,7 @@ def _account_verification_rejected(socket_path: str, tmux_target: str) -> bool:
         time.sleep(_TMUX_POLL_INTERVAL_S)
 
 
+@_bounded_control(60.0)
 def _clear_idle_composer(socket_path: str, tmux_target: str, pane: str) -> str:
     """Clear idle drafts in bounded batches; allow unchanged one-line hints for paste.
     A composer whose draft cannot be cleared raises.
@@ -2025,7 +2064,7 @@ def _clear_idle_composer(socket_path: str, tmux_target: str, pane: str) -> str:
             str(_IDLE_CLEAR_BATCH_SIZE),
             "C-w",
         )
-        deadline = time.monotonic() + _IDLE_CLEAR_TIMEOUT_S
+        deadline = _deadline_after(_IDLE_CLEAR_TIMEOUT_S)
         captured_pane_seen = False
         while True:
             captured_pane = _capture_pane(socket_path, tmux_target)
@@ -2056,6 +2095,35 @@ def _clear_idle_composer(socket_path: str, tmux_target: str, pane: str) -> str:
     )
 
 
+@_bounded_control(60.0)
+def _prepare_composer(socket_path: str, tmux_target: str) -> str:
+    """Capture and clear the old draft under one input-preparation budget."""
+    pane = _capture_pane(socket_path, tmux_target)
+    if (
+        _AGY_IDLE_MARKER not in pane
+        and _AGY_ACTIVE_MARKER not in pane
+        and _agy_notice_footer(pane)
+    ):
+        _logger.info("agy TUI showing dismissable notice banner; auto-dismissing with Escape")
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+        time.sleep(_TMUX_POLL_INTERVAL_S)
+    # C-a/C-k and Escape leave multi-line drafts; C-w batches clear an idle composer.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    capture_deadline = _deadline_after(_BASELINE_CAPTURE_TIMEOUT_S)
+    while True:
+        baseline_pane = _capture_pane(socket_path, tmux_target)
+        if baseline_pane:
+            break
+        if time.monotonic() >= capture_deadline:
+            raise RuntimeError(
+                "agy baseline capture-pane failed before paste; captured_pane_empty=True"
+            )
+        time.sleep(_TMUX_POLL_INTERVAL_S)
+    return _clear_idle_composer(socket_path, tmux_target, baseline_pane)
+
+
+@_bounded_control(180.0)
 def _paste_and_submit(
     bridge_dir: Path,
     socket_path: str,
@@ -2080,29 +2148,7 @@ def _paste_and_submit(
     :raises RuntimeError: When the TUI has exited, a tmux command fails, the
         pasted draft never renders, or the submit never starts a turn.
     """
-    pane = _capture_pane(socket_path, tmux_target)
-    if (
-        _AGY_IDLE_MARKER not in pane
-        and _AGY_ACTIVE_MARKER not in pane
-        and _agy_notice_footer(pane)
-    ):
-        _logger.info("agy TUI showing dismissable notice banner; auto-dismissing with Escape")
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
-        time.sleep(_TMUX_POLL_INTERVAL_S)
-    # C-a/C-k and Escape leave multi-line drafts; C-w batches clear an idle composer.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
-    capture_deadline = time.monotonic() + _BASELINE_CAPTURE_TIMEOUT_S
-    while True:
-        baseline_pane = _capture_pane(socket_path, tmux_target)
-        if baseline_pane:
-            break
-        if time.monotonic() >= capture_deadline:
-            raise RuntimeError(
-                "agy baseline capture-pane failed before paste; captured_pane_empty=True"
-            )
-        time.sleep(_TMUX_POLL_INTERVAL_S)
-    baseline_pane = _clear_idle_composer(socket_path, tmux_target, baseline_pane)
+    baseline_pane = _prepare_composer(socket_path, tmux_target)
     baseline_region = _agy_input_region(baseline_pane)
     # ``delete=False`` + name captured BEFORE the write, so a write failure still
     # leaves a path the finally can unlink (no leaked temp file in the bridge dir).
@@ -2145,7 +2191,7 @@ def _paste_and_submit(
     mid_turn = _agy_turn_running(_capture_pane(socket_path, tmux_target))
     draft_seen = False
     last_commit_pane = ""
-    commit_deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+    commit_deadline = _deadline_after(_PASTE_COMMIT_TIMEOUT_S)
     while time.monotonic() < commit_deadline:
         pane = _capture_pane(socket_path, tmux_target)
         last_commit_pane = pane or last_commit_pane
@@ -2328,6 +2374,7 @@ def reconcile_plan_input_echo(
     return text
 
 
+@_bounded_control(_TMUX_READY_TIMEOUT_S)
 def inject_user_message_via_tui(
     bridge_dir: Path,
     *,
@@ -2360,10 +2407,9 @@ def inject_user_message_via_tui(
 
     :param bridge_dir: Native Antigravity bridge directory holding ``tmux.json``.
     :param content: User text from the web UI. Must be non-empty.
-    :param timeout_s: Total readiness budget, shared across the two gates
+    :param timeout_s: Total delivery budget, shared across all phases
         (``tmux.json`` advertised, then the input box mounted) so the worst case
-        is one ``timeout_s``, not two stacked. Does NOT cover the
-        account-verification re-delivery budget.
+        is one ``timeout_s``, including account-verification retries.
     :param before_submit: Persist a delivery fence immediately before Enter.
         A failure before this callback has not submitted the input.
     :returns: None.
@@ -2377,7 +2423,7 @@ def inject_user_message_via_tui(
     # only the budget the tmux-target gate did not consume, capping total
     # readiness latency at timeout_s (the gates were previously each given a full
     # timeout_s, so a stuck launch cost 2x before delivery even began).
-    deadline = time.monotonic() + timeout_s
+    deadline = _deadline_after(timeout_s)
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
@@ -2395,7 +2441,7 @@ def inject_user_message_via_tui(
     # account-verification notice (see ``_account_verification_rejected``). The
     # happy path costs one extra pane capture: a started turn is detected on the
     # first poll and returns immediately.
-    retry_deadline = time.monotonic() + _VERIFY_RETRY_TIMEOUT_S
+    retry_deadline = _deadline_after(_VERIFY_RETRY_TIMEOUT_S)
     while True:
         try:
             receipt = _record_plan_input_receipt(bridge_dir, content)
@@ -2622,7 +2668,7 @@ class AgyPermissionRollbackError(RuntimeError):
 # Verification budget for one live tier-switch step. The runner passes it as
 # ``timeout_s`` to ``switch_agy_permission_tier`` and the server derives its
 # forward timeout from it, so both sides budget from one number.
-AGY_SWITCH_STEP_TIMEOUT_S = 3.0
+AGY_SWITCH_STEP_TIMEOUT_S = 60.0
 
 
 def _agy_control_pane(bridge_dir: Path) -> str:
@@ -2678,6 +2724,7 @@ def split_agy_effort_suffix(slug: str) -> tuple[str, str | None]:
     return slug[: match.start()], match.group(1)
 
 
+@_bounded_control(60.0)
 def run_agy_slash_command(bridge_dir: Path, command: str, *, expect: str, timeout_s: float) -> str:
     """Submit one idle slash command and verify its new pane confirmation."""
     if not command.startswith("/") or "\n" in command or "\r" in command:
@@ -2686,7 +2733,7 @@ def run_agy_slash_command(bridge_dir: Path, command: str, *, expect: str, timeou
     info = read_tmux_info(bridge_dir)
     assert info is not None
     _paste_and_submit(bridge_dir, info["socket_path"], info["tmux_target"], content=command)
-    deadline = time.monotonic() + timeout_s
+    deadline = _deadline_after(timeout_s)
     while True:
         pane = _agy_control_pane(bridge_dir)
         matches = [line.strip() for line in pane.splitlines() if expect in line]
@@ -2701,6 +2748,7 @@ def run_agy_slash_command(bridge_dir: Path, command: str, *, expect: str, timeou
         time.sleep(_TMUX_POLL_INTERVAL_S)
 
 
+@_bounded_control(60.0)
 def _set_agy_config_row(bridge_dir: Path, row: str, target: str, *, timeout_s: float) -> None:
     row_filter = {"Tool Permission": "tool perm", "Non-Workspace Access": "non-work"}[row]
 
@@ -2709,7 +2757,7 @@ def _set_agy_config_row(bridge_dir: Path, row: str, target: str, *, timeout_s: f
         info = read_tmux_info(bridge_dir)
         assert info is not None
         _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "-l", row_filter)
-        deadline = time.monotonic() + timeout_s
+        deadline = _deadline_after(timeout_s)
         while True:
             pane = _agy_control_pane(bridge_dir)
             value = parse_agy_config_row(pane, row)
@@ -2727,7 +2775,7 @@ def _set_agy_config_row(bridge_dir: Path, row: str, target: str, *, timeout_s: f
         send_interaction_keys_via_tui(bridge_dir, "Escape")
         time.sleep(_TMUX_POLL_INTERVAL_S)
         send_interaction_keys_via_tui(bridge_dir, "Escape")
-        deadline = time.monotonic() + timeout_s
+        deadline = _deadline_after(timeout_s)
         while parse_agy_agent_mode(_agy_control_pane(bridge_dir)) is None:
             if time.monotonic() >= deadline:
                 raise RuntimeError("Antigravity config did not close")
@@ -2739,7 +2787,7 @@ def _set_agy_config_row(bridge_dir: Path, row: str, target: str, *, timeout_s: f
             if value == target:
                 break
             send_interaction_keys_via_tui(bridge_dir, "Right")
-            deadline = time.monotonic() + timeout_s
+            deadline = _deadline_after(timeout_s)
             while True:
                 observed = parse_agy_config_row(_agy_control_pane(bridge_dir), row)
                 if observed is not None and observed != value:
@@ -2767,13 +2815,14 @@ def _set_agy_config_row(bridge_dir: Path, row: str, target: str, *, timeout_s: f
         close_row()
 
 
+@_bounded_control(60.0)
 def _set_agy_agent_mode(bridge_dir: Path, target: str, *, timeout_s: float) -> None:
     value = parse_agy_agent_mode(_require_agy_idle(bridge_dir))
     for _ in range(3):
         if value == target:
             return
         send_interaction_keys_via_tui(bridge_dir, "BTab")
-        deadline = time.monotonic() + timeout_s
+        deadline = _deadline_after(timeout_s)
         while True:
             observed = parse_agy_agent_mode(_agy_control_pane(bridge_dir))
             if observed is not None and observed != value:
@@ -2832,13 +2881,16 @@ def switch_agy_permission_tier(
     else:
         steps = [("mode", mode, previous_mode)]
 
+    deadline = time.monotonic() + timeout_s
+
     def apply(component: str, value: str) -> None:
+        remaining = max(0.0, deadline - time.monotonic())
         if component == "tier":
             reassert_agy_permission_tier(bridge_dir, value)
         elif component == "mode":
-            _set_agy_agent_mode(bridge_dir, value, timeout_s=timeout_s)
+            _set_agy_agent_mode(bridge_dir, value, timeout_s=remaining)
         else:
-            _set_agy_config_row(bridge_dir, component, value, timeout_s=timeout_s)
+            _set_agy_config_row(bridge_dir, component, value, timeout_s=remaining)
 
     attempted: list[tuple[str, str, str]] = []
     try:
@@ -2848,6 +2900,7 @@ def switch_agy_permission_tier(
             apply(step[0], step[1])
         apply_agy_permission_tier(bridge_dir, tier)
     except (OSError, RuntimeError, ValueError) as exc:
+        deadline = time.monotonic() + timeout_s
         try:
             for component, _, old in reversed(attempted):
                 apply(component, old)

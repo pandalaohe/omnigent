@@ -450,10 +450,8 @@ _CODEX_SETTINGS_RESTORED_MESSAGE = (
 )
 
 
-#: Forward budget for an agy live tier switch: the runner's worst case is a
-#: four-step cross-family sweep (ten per-step budgets each) plus its reverse
-#: undo on failure, so both sides derive from the runner's step constant.
-_AGY_PERMISSION_SWITCH_FORWARD_TIMEOUT_S = AGY_SWITCH_STEP_TIMEOUT_S * 10 * 4 * 2
+#: One shared forward budget, one rollback budget, then reply transport slack.
+_AGY_PERMISSION_SWITCH_FORWARD_TIMEOUT_S = AGY_SWITCH_STEP_TIMEOUT_S * 2 + 5
 
 
 def _runner_reply_field(body: str, key: str) -> object:
