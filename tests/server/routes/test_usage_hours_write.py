@@ -112,8 +112,12 @@ def _usage(store: SqlAlchemyConversationStore, conv_id: str) -> dict:
 @pytest.mark.parametrize(
     ("harness", "kind", "basis"),
     [
-        ("claude-native", "subscription", "subscription"),
-        ("claude-native", "api_key", "metered"),
+        ("claude-native", {"kind": "subscription", "auth_method": "claudeai"}, "subscription"),
+        ("claude-native", {"kind": "subscription", "auth_method": "oauth_token"}, "unknown"),
+        ("claude-native", {"kind": "subscription", "auth_method": "future"}, "unknown"),
+        ("claude-native", "subscription", "unknown"),
+        ("claude-native", {"kind": "api_key", "auth_method": "api_key"}, "metered"),
+        ("claude-native", "api_key", "unknown"),
         ("codex-native", "chatgpt", "subscription"),
         ("codex-native", "api_key", "metered"),
         ("pi-native", "providers", "unknown"),

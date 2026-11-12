@@ -2221,8 +2221,13 @@ def create_app(
                 is True
             ):
                 return None
+        if agent_key == "claude":
+            method = account.get("auth_method")
+            if method == "claudeai":
+                return "subscription"
+            return "api_key" if method == "api_key" else None
         kind = account.get("kind")
-        known = {"api_key", "subscription"} if agent_key == "claude" else {"api_key", "chatgpt"}
+        known = {"api_key", "chatgpt"}
         return kind if isinstance(kind, str) and kind in known else None
 
     configure_usage_hours(

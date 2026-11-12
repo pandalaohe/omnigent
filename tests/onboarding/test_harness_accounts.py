@@ -175,6 +175,7 @@ else:
     accounts = harness_accounts.harness_account_map()
     assert accounts["claude"] == {
         "kind": "subscription",
+        "auth_method": "claudeai",
         "email": "claude@example.test",
         "org": "Example",
         "plan": "max",
@@ -503,16 +504,18 @@ def test_json_command_preserves_utf8_with_non_utf8_diagnostics() -> None:
     [
         ("api_key", "api_key"),
         ("claudeai", "subscription"),
-        ("oauth", "unknown"),
-        ("future", "unknown"),
-        (None, "unknown"),
+        ("oauth", "subscription"),
+        ("oauth_token", "subscription"),
+        ("future", "subscription"),
+        (None, "subscription"),
     ],
 )
-def test_claude_probe_requires_a_known_auth_method(monkeypatch, method, kind):
+def test_claude_probe_preserves_display_kind_and_reports_raw_method(monkeypatch, method, kind):
     monkeypatch.setattr(harness_accounts.shutil, "which", lambda command: command)
     monkeypatch.setattr(
         harness_accounts,
         "_run_json_command",
         lambda *a, **kw: (0, {"loggedIn": True, "authMethod": method}),
     )
-    assert harness_accounts.probe_harness_account("claude") == {"kind": kind}
+    expected = {"kind": kind, **({"auth_method": method} if method else {})}
+    assert harness_accounts.probe_harness_account("claude") == expected

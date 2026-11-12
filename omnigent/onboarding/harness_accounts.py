@@ -256,10 +256,10 @@ def _claude_account(
     source = nested if isinstance(nested, dict) else payload
     auth_method = payload.get("authMethod")
     account: HarnessAccount = {
-        "kind": {"api_key": "api_key", "claudeai": "subscription"}.get(auth_method, "unknown")
-        if isinstance(auth_method, str)
-        else "unknown",
+        "kind": "api_key" if auth_method == "api_key" else "subscription",
     }
+    if isinstance(auth_method, str) and auth_method:
+        account["auth_method"] = auth_method
     for target, candidates in {
         "email": ("email",),
         "org": ("organization", "org"),

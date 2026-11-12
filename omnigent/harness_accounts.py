@@ -22,7 +22,7 @@ def normalize_harness_accounts(value: object) -> HarnessAccounts | None:
         if kind not in _ACCOUNT_KINDS:
             continue
         account: HarnessAccount = {"kind": kind}
-        for key in ("email", "org", "plan"):
+        for key in ("email", "org", "plan", "auth_method"):
             field = raw_account.get(key)
             if isinstance(field, str) and field:
                 account[key] = field
