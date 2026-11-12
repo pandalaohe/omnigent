@@ -3517,11 +3517,21 @@ async def _persist_agy_model_notice(
     if result == "persisted":
         _publish_error_event(session_id, error)
     if actual is not None and conv.parent_conversation_id:
-        key = f"{_AGY_PENDING_MODEL_NOTICE}.{generate_task_id()}"
+        from omnigent.stores.conversation_store import LabelGroupChange
+
+        def append(labels: dict[str, str]) -> LabelGroupChange:
+            summary = _agy_notice_summary(labels)
+            summary["m"].append(actual)
+            return LabelGroupChange(
+                {_AGY_PENDING_MODEL_NOTICE: _encode_agy_notice(summary)},
+                set(labels),
+            )
+
         await asyncio.to_thread(
-            conversation_store.set_labels,
+            conversation_store.mutate_label_group,
             session_id,
-            {key: message},
+            _AGY_PENDING_MODEL_NOTICE,
+            append,
         )
         fresh = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if fresh is not None:
@@ -3531,36 +3541,114 @@ async def _persist_agy_model_notice(
 _AGY_PENDING_MODEL_NOTICE = "omnigent.agy_model_parent_notice_pending"
 
 
+def _agy_notice_summary(labels: dict[str, str]) -> dict[str, Any]:
+    """Read the compact summary, including pending values from earlier versions."""
+    summary: dict[str, Any] = {"m": [], "n": 0, "at": 0, "stop": False}
+    for key, value in labels.items():
+        if not key.startswith(_AGY_PENDING_MODEL_NOTICE):
+            continue
+        if key == _AGY_PENDING_MODEL_NOTICE:
+            try:
+                decoded = json.loads(value)
+                if isinstance(decoded, dict) and isinstance(decoded.get("m"), list):
+                    summary.update(decoded)
+                    continue
+            except ValueError:
+                pass
+        summary["m"].append(
+            value.removeprefix("Antigravity is running ").split("; requested model", 1)[0]
+        )
+    return summary
+
+
+def _encode_agy_notice(summary: dict[str, Any]) -> str:
+    from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
+
+    # The child history retains full names and transitions beyond this summary.
+    summary["m"] = [name[:32] + "…" if len(name) > 32 else name for name in summary["m"]]
+    while True:
+        encoded = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+        if len(summary["m"]) <= 10 and len(encoded) <= LABEL_VALUE_MAX_LEN:
+            return encoded
+        summary["m"].pop(0)
+        summary["n"] += 1
+
+
 async def _retry_agy_parent_notice(
     session_id: str,
     conv: Conversation,
     conversation_store: ConversationStore,
 ) -> None:
-    """Retain failed delivery independently of model and child-item deduplication."""
-    if conv.parent_conversation_id is None:
+    """Bound pending state and delivery work; retain a summary for retired parents."""
+    labels = {
+        key: value
+        for key, value in conv.labels.items()
+        if key.startswith(_AGY_PENDING_MODEL_NOTICE)
+    }
+    if not labels:
         return
+    summary = _agy_notice_summary(labels)
+    now = now_epoch()
+    if summary["stop"] or summary["at"] > now:
+        return
+    from omnigent.harnesses.antigravity_native.reader import _DEFAULT_ROTATION_INTERVAL_S
     from omnigent.server.routes._sessions.orchestration import _post_system_message
+    from omnigent.stores.conversation_store import LabelGroupChange
+    from omnigent.util.session_lifecycle import is_session_closed
 
-    for key, pending in conv.labels.items():
-        # Also drain the single pending label written by older readers.
-        if key != _AGY_PENDING_MODEL_NOTICE and not key.startswith(
-            _AGY_PENDING_MODEL_NOTICE + "."
-        ):
-            continue
-        delivered = await _post_system_message(
-            conv.parent_conversation_id,
-            f"[System: Antigravity model substitution in child {session_id}: {pending}]",
-            conversation_store=conversation_store,
-            runner_router=None,
+    parent = (
+        await asyncio.to_thread(conversation_store.get_conversation, conv.parent_conversation_id)
+        if conv.parent_conversation_id
+        else None
+    )
+    stopped = (
+        parent is None
+        or parent.archived_at is not None
+        or is_session_closed(parent.labels, parent.title)
+    )
+    claimed = False
+
+    def claim(current: dict[str, str]) -> LabelGroupChange:
+        nonlocal claimed
+        claimed = False
+        if not current:
+            return LabelGroupChange({}, set())
+        state = _agy_notice_summary(current)
+        if state["stop"] or state["at"] > now:
+            return LabelGroupChange({}, set())
+        state["stop"] = stopped
+        state["at"] = now + _DEFAULT_ROTATION_INTERVAL_S
+        claimed = True
+        return LabelGroupChange(
+            {_AGY_PENDING_MODEL_NOTICE: _encode_agy_notice(state)}, set(current)
         )
-        if delivered:
-            await asyncio.to_thread(
-                conversation_store.compare_and_set_label,
-                session_id,
-                key,
-                pending,
-                None,
-            )
+
+    current = await asyncio.to_thread(
+        conversation_store.mutate_label_group,
+        session_id,
+        _AGY_PENDING_MODEL_NOTICE,
+        claim,
+    )
+    if not claimed or stopped or conv.parent_conversation_id is None:
+        return
+    pending = current[_AGY_PENDING_MODEL_NOTICE]
+    state = json.loads(pending)
+    earlier = f"; and {state['n']} earlier" if state["n"] else ""
+    delivered = await _post_system_message(
+        conv.parent_conversation_id,
+        f"[System: Antigravity model changes in child {session_id}: "
+        f"{' → '.join(state['m'])}{earlier}. Full changes are in the child history.]",
+        conversation_store=conversation_store,
+        runner_router=None,
+    )
+    if delivered:
+        await asyncio.to_thread(
+            conversation_store.compare_and_set_label,
+            session_id,
+            _AGY_PENDING_MODEL_NOTICE,
+            pending,
+            None,
+        )
 
 
 async def _persist_external_session_title(
