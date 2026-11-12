@@ -6,6 +6,8 @@ import { historyCards, historySort, accountTotals, DAY } from "./taskBoardHistor
 import { TaskBoardLog } from "./TaskBoardLog";
 import { TaskBoardHistory } from "./TaskBoardHistory";
 import { TaskBoardToday } from "./TaskBoardToday";
+import { TaskBoardHistoryChart } from "./TaskBoardHistoryChart";
+import { activityMoney } from "./TaskBoardActivityParts";
 import type { BoardTask } from "./taskBoardData";
 import type { SourceCache } from "./taskBoardSnapshotData";
 
@@ -49,7 +51,227 @@ const cache = (tasks: BoardTask[] = []): SourceCache => ({
   history: [],
   counts: [],
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  fetcher.mockReset();
+});
+
+it.each(["source", "group", "node"])("clamps the %s page when refreshed data shrinks", (level) => {
+  const tasks = Array.from(
+    { length: level === "source" ? 11 : level === "group" ? 9 : 1 },
+    (_, i) => {
+      const value = task(`Task ${i}`, level === "source" ? `source-${i}` : "engineering");
+      if (level === "group") value["omnigent.ai:sourceDisplay"]!.identity!.groupId = `group-${i}`;
+      if (level === "node")
+        value["omnigent.ai:sourceDisplay"]!.intervals = Array.from({ length: 9 }, (_entry, n) => ({
+          id: `node-${n}`,
+          from: new Date(now - 3600000).toISOString(),
+          to: new Date(now).toISOString(),
+          agentId: "codex",
+          host: `host-${n}`,
+          origin: "event" as const,
+        }));
+      return value;
+    },
+  );
+  const props = { tasks, sessions: [], caches: {}, counts: [], now, onSelect: vi.fn() };
+  const view = render(
+    <MemoryRouter>
+      <TaskBoardHistory {...props} />
+    </MemoryRouter>,
+  );
+  if (level !== "source") fireEvent.click(view.container.querySelector(".h-p")!);
+  if (level === "node") {
+    fireEvent.click(view.container.querySelector(".h-srow")!);
+    fireEvent.click(view.container.querySelector(".h-trow")!);
+  }
+  fireEvent.click(screen.getByRole("button", { name: "Next page" }));
+  const reduced =
+    level === "node"
+      ? [
+          {
+            ...tasks[0],
+            "omnigent.ai:sourceDisplay": {
+              ...tasks[0]["omnigent.ai:sourceDisplay"]!,
+              intervals: tasks[0]["omnigent.ai:sourceDisplay"]!.intervals!.slice(0, 8),
+            },
+          },
+        ]
+      : tasks.slice(0, -1);
+  view.rerender(
+    <MemoryRouter>
+      <TaskBoardHistory {...props} tasks={reduced} />
+    </MemoryRouter>,
+  );
+  expect(
+    view.container.querySelectorAll(
+      level === "source" ? ".h-p" : level === "group" ? ".h-srow" : ".h-nodes li",
+    ),
+  ).toHaveLength(level === "source" ? 10 : 8);
+  expect(screen.queryByRole("button", { name: "Next page" })).toBeNull();
+});
+
+it.each(["button", "brush"])(
+  "keeps a newer %s range when an old month finishes",
+  async (control) => {
+    fetcher.mockReset();
+    let finish!: (response: Response) => void;
+    fetcher.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const view = render(
+      <MemoryRouter>
+        <TaskBoardHistory
+          tasks={[]}
+          sessions={[]}
+          caches={{}}
+          counts={[{ day: "2020-01-20", source: "engineering", closed: 1 }]}
+          now={now}
+          onSelect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Find by month" }));
+    fireEvent.change(view.container.querySelector("input[type=month]")!, {
+      target: { value: "2020-01" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Load month" }));
+    if (control === "button") fireEvent.click(screen.getByRole("button", { name: "1 week" }));
+    else
+      fireEvent.keyDown(screen.getByRole("slider", { name: "Range start" }), { key: "ArrowRight" });
+    const range = view.container.querySelector(".h-range")!.textContent;
+    expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+    const old = task("Old result");
+    old["omnigent.ai:sourceDisplay"]!.historyState!.end = "2020-01-20T00:00:00Z";
+    await act(async () => finish(Response.json({ entries: [old] })));
+    expect(view.container.querySelector(".h-range")!.textContent).toBe(range);
+    expect(view.container.querySelector(".h-stat>b")?.textContent).toBe("0");
+  },
+);
+
+it("does not let an old generation failure clear a new month's loading", async () => {
+  fetcher.mockReset();
+  const pending: { resolve: (value: Response) => void; reject: (reason: Error) => void }[] = [];
+  fetcher.mockImplementation(
+    () =>
+      new Promise<Response>((resolve, reject) => {
+        pending.push({ resolve, reject });
+      }),
+  );
+  const props = {
+    tasks: [],
+    sessions: [],
+    counts: [{ day: "2020-01-20", source: "engineering", closed: 1 }],
+    now,
+    onSelect: vi.fn(),
+  };
+  const generation = (id: string) => ({ engineering: { ...cache(), pin: { ...cache().pin, id } } });
+  const view = render(
+    <MemoryRouter>
+      <TaskBoardHistory {...props} caches={generation("initial")} />
+    </MemoryRouter>,
+  );
+  view.rerender(
+    <MemoryRouter>
+      <TaskBoardHistory {...props} caches={generation("A")} />
+    </MemoryRouter>,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Find by month" }));
+  fireEvent.change(view.container.querySelector("input[type=month]")!, {
+    target: { value: "2020-01" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Load month" }));
+  view.rerender(
+    <MemoryRouter>
+      <TaskBoardHistory {...props} caches={generation("B")} />
+    </MemoryRouter>,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Load month" }));
+  await act(async () => pending[0].reject(new Error("old pin rejected")));
+  expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+  expect(screen.queryByRole("alert")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  await act(async () => pending[1].resolve(Response.json({ entries: [] })));
+});
+
+it("freezes open intervals at their source observation time", () => {
+  const value = task("Frozen");
+  value["omnigent.ai:sourceDisplay"]!.intervals![0].to = null;
+  const c = cache([value]);
+  c.display.asOf = new Date(now - 3600000).toISOString();
+  const first = historyCards([value], [], now, { engineering: c });
+  const later = historyCards([value], [], now + 2 * 3600000, { engineering: c });
+  expect(first[0].seconds).toBe(3600);
+  expect(later[0].seconds).toBe(first[0].seconds);
+});
+
+it.each([365, 1825])("propagates an unknown account day inside a %s-day chart bucket", (days) => {
+  const from = new Date(2026, 10, 12).getTime() - days * DAY;
+  const view = render(
+    <TaskBoardHistoryChart
+      cards={[]}
+      counts={[]}
+      accounts={
+        new Map([
+          ["2026-11-10", 5],
+          ["2026-11-11", null],
+        ])
+      }
+      from={from}
+      to={now}
+      now={now}
+      historyStart={from}
+      capped={false}
+      sourceOrder={[]}
+      onRange={vi.fn()}
+    />,
+  );
+  const title = [...view.container.querySelectorAll(".r-hit title")].find(
+    (el) => el.textContent?.includes("2026-11-09") || el.textContent?.includes("2026-11-01"),
+  );
+  expect(title).toBeTruthy();
+  expect(title!.textContent).not.toContain("$5");
+  expect(view.container.querySelector(".r-cost")).toBeNull();
+});
+
+it("uses two money decimals around magnitude boundaries", () => {
+  expect([0, 9.999, 10, 99.999, 100, 999.999, 1000, 1234.56].map(activityMoney)).toEqual([
+    "$0.00",
+    "$10.00",
+    "$10.00",
+    "$100.00",
+    "$100.00",
+    "$1,000.00",
+    "$1,000.00",
+    "$1,234.56",
+  ]);
+});
+
+it("limits rendered history counts and token counts to three significant digits", () => {
+  const values = Array.from({ length: 1234 }, (_, i) => task(`Task ${i}`));
+  values[0]["omnigent.ai:sourceDisplay"]!.intervals![0].tokens = 1234567;
+  const view = render(
+    <MemoryRouter>
+      <TaskBoardHistory
+        tasks={values}
+        sessions={[]}
+        caches={{}}
+        counts={[]}
+        now={now}
+        onSelect={vi.fn()}
+      />
+    </MemoryRouter>,
+  );
+  expect(view.container.querySelector(".h-stat>b")?.textContent).toBe("1.23K");
+  fireEvent.click(view.container.querySelector(".h-p")!);
+  fireEvent.click(view.container.querySelector(".h-srow")!);
+  fireEvent.click(screen.getByRole("button", { name: /Task 0.*Completed/ }));
+  expect(screen.getByText("1.23M token")).toBeTruthy();
+  expect(screen.getByText("1.23K total")).toBeTruthy();
+});
 it("keeps pinned/future cards out, includes stale unclosed cards, and prefers native session cost endpoints", () => {
   const a = task("closed"),
     b = task("pinned"),

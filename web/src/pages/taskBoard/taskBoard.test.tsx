@@ -124,6 +124,49 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+it("opens and closes an older-month task through the real page", async () => {
+  enableBoard("history");
+  const old: BoardTask = {
+    uid: "archive",
+    title: "Archive recovery",
+    progress: "completed",
+    "omnigent.ai:source": "tracker",
+    "omnigent.ai:group": { id: "archive", name: "Archive group" },
+    created: "2020-01-01T00:00:00Z",
+    progressUpdated: "2020-01-20T00:00:00Z",
+  };
+  mocks.tasks.mockImplementation(async (path: string) => {
+    const url = new URL(path, "https://example.test");
+    if (url.pathname.endsWith("/sources"))
+      return Response.json({ sources: [{ id: "tracker", name: "Tracker", source: null }] });
+    if (url.pathname.endsWith("/closed-counts"))
+      return Response.json({ days: [{ source: "tracker", day: "2020-01-20", closed: 1 }] });
+    if (url.pathname.endsWith("/history")) return Response.json({ entries: [] });
+    if (url.pathname.endsWith("/item")) return Response.json(old);
+    return Response.json({
+      entries: url.searchParams.has("closed_before") ? [old] : [],
+      updated: new Date().toISOString(),
+    });
+  });
+  const view = renderBoard();
+  fireEvent.click(await screen.findByRole("button", { name: "Find by month" }));
+  fireEvent.change(view.container.querySelector("input[type=month]")!, {
+    target: { value: "2020-01" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Load month" }));
+  await waitFor(() => expect(view.container.querySelector(".h-stat>b")?.textContent).toBe("1"));
+  fireEvent.click(view.container.querySelector(".h-p")!);
+  fireEvent.click(view.container.querySelector(".h-srow")!);
+  fireEvent.click(view.container.querySelector(".h-trow")!);
+  const trigger = screen.getByRole("button", { name: "Open task details" });
+  trigger.focus();
+  fireEvent.click(trigger);
+  const detail = await screen.findByRole("region", { name: "Details: Archive recovery" });
+  fireEvent.click(within(detail).getByRole("button", { name: "Close" }));
+  expect(screen.queryByRole("region", { name: "Details: Archive recovery" })).toBeNull();
+  expect(document.activeElement).toBe(trigger);
+});
+
 it("keeps deployment and user gates ahead of every read", () => {
   mocks.info = { task_board_enabled: false };
   const view = renderBoard();

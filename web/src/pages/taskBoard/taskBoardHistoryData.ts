@@ -32,6 +32,7 @@ export function historyCards(
   tasks: BoardTask[],
   sessions: BoardSession[],
   now: number,
+  caches: Record<string, SourceCache> = {},
 ): HistoryCard[] {
   const native = new Map(sessions.map((s) => [s.id, s]));
   return tasks.flatMap((task) => {
@@ -65,7 +66,11 @@ export function historyCards(
         : (d?.intervals ?? []).map((n) => ({
             id: n.id,
             from: Date.parse(n.from),
-            to: Date.parse(n.to ?? new Date(now).toISOString()),
+            to: Date.parse(
+              n.to ??
+                caches[task["omnigent.ai:source"]]?.display.asOf ??
+                new Date(now).toISOString(),
+            ),
             agent: n.agentId,
             host: n.host,
             session: n.sessionId,

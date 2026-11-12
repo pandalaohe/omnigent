@@ -23,10 +23,11 @@ import {
   ActivityTile,
   activityDuration,
   activityMoney,
+  activityNumber,
   activityStamp,
 } from "./TaskBoardActivityParts";
 import { BoardAgentLogo, BoardIdentityMark } from "./BoardIdentityMark";
-import { taskTitle } from "./TaskBoardDetail";
+import { TaskBoardDetail, taskTitle } from "./TaskBoardDetail";
 import { t, formatDate } from "./taskBoardText";
 import { boardExitProps } from "@/lib/boardFrame";
 import { Link } from "@/lib/routing";
@@ -78,9 +79,9 @@ export function HistoryStrip({
     <svg ref={stripRef} className="cl" width={W} height={31} viewBox={`0 0 ${W} 31`}>
       <title>
         {t("g6.stripOutcome", {
-          good: roll.good,
-          muted: roll.muted,
-          warn: roll.n - roll.good - roll.muted,
+          good: activityNumber(roll.good),
+          muted: activityNumber(roll.muted),
+          warn: activityNumber(roll.n - roll.good - roll.muted),
         })}
       </title>
       {ts.length <= 8 && room ? (
@@ -154,14 +155,16 @@ function HistoryNumbers({ cards }: { cards: HistoryCard[] }) {
   return (
     <>
       <span className="h-num">
-        <b>{r.n.toLocaleString()}</b>
+        <b>{activityNumber(r.n)}</b>
       </span>
       <span className="h-num">
         <b>{activityDuration(r.seconds)}</b>
       </span>
       <span className="h-num h-usd">
         <ActivityMoney amount={r.usd} />
-        <small>{t(r.unpriced ? "g6.unpriced" : "g6.allPriced", { count: r.unpriced })}</small>
+        <small>
+          {t(r.unpriced ? "g6.unpriced" : "g6.allPriced", { count: activityNumber(r.unpriced) })}
+        </small>
       </span>
       <ActivityChevron />
     </>
@@ -184,6 +187,8 @@ export function TaskBoardHistory({
   now: number;
 }) {
   const [showMonths, setShowMonths] = useState(false);
+  const [archiveSelection, setArchiveSelection] = useState<BoardTask | null>(null);
+  const archiveTrigger = useRef<HTMLButtonElement | null>(null);
   const hasOldMonths = counts.some((c) => Date.parse(c.day + "T00:00:00") < now - 365 * DAY);
   const [range, setRange] = useState<[number, number]>([now - 84 * DAY, now + 3600000]),
     [sets, setSets] = useState<Record<string, string[]>>({ source: [], agent: [], outcome: [] }),
@@ -213,9 +218,11 @@ export function TaskBoardHistory({
     request.current++;
     setExtra([]);
     setLoading(false);
+    setError(false);
+    setArchiveSelection(null);
     const requestState = request;
     return () => {
-      requestState.current = -1;
+      requestState.current++;
     };
   }, [generationKey]);
   useEffect(() => {
@@ -244,7 +251,7 @@ export function TaskBoardHistory({
   const displayFrom = Math.max(from, historyStart);
   const sourceColor = (source: string) =>
     activityColors[Math.max(0, Object.keys(caches).indexOf(source)) % activityColors.length];
-  const all = historyCards([...merged.values()], sessions, now),
+  const all = historyCards([...merged.values()], sessions, now, caches),
     inRange = all.filter((c) => c.end >= from && c.end <= to);
   const matches = (c: HistoryCard) =>
     (!sets.source.length || sets.source.includes(c.source)) &&
@@ -276,10 +283,14 @@ export function TaskBoardHistory({
     setPages({});
   };
   const setTime = (a: number, b: number) => {
+    request.current++;
+    setLoading(false);
+    setError(false);
+    setArchiveSelection(null);
     setRange([a, b]);
     reset();
   };
-  const pageOf = (id: string, list: HistoryCard[], size: number) => {
+  const pageOf = <T,>(id: string, list: T[], size: number) => {
     const page = Math.min(pages[id] ?? 0, Math.max(0, Math.ceil(list.length / size) - 1));
     return list.slice(page * size, page * size + size);
   };
@@ -363,14 +374,15 @@ export function TaskBoardHistory({
       );
       if (ticket !== request.current || generation !== currentGeneration.current) return;
       setExtra(batches.flat());
-      setTime(
+      setRange([
         new Date(wantedMonth + "-01T00:00:00").getTime(),
         new Date(Number(wantedMonth.slice(0, 4)), Number(wantedMonth.slice(5)), 1).getTime() - 1,
-      );
+      ]);
+      reset();
     } catch {
-      if (ticket === request.current) setError(true);
+      if (ticket === request.current && generation === currentGeneration.current) setError(true);
     } finally {
-      if (ticket === request.current) setLoading(false);
+      if (ticket === request.current && generation === currentGeneration.current) setLoading(false);
     }
   };
   const oldYears = [...new Set(counts.map((c) => c.day.slice(0, 4)))].sort().reverse();
@@ -413,17 +425,19 @@ export function TaskBoardHistory({
       </div>
       <div className="h-stats">
         <ActivityTile
-          value={total.n.toLocaleString()}
+          value={activityNumber(total.n)}
           label={t("g6.cards")}
           note={t("g6.groupCounts", {
-            sources: sources.length,
-            groups: new Set(filtered.map((c) => JSON.stringify([c.source, c.group]))).size,
+            sources: activityNumber(sources.length),
+            groups: activityNumber(
+              new Set(filtered.map((c) => JSON.stringify([c.source, c.group]))).size,
+            ),
           })}
         />
         <ActivityTile
-          value={t("g6.hours", { count: Math.round(total.seconds / 3600).toLocaleString() })}
+          value={t("g6.hours", { count: activityNumber(total.seconds / 3600) })}
           label={t("g6.workTime")}
-          note={t("g6.nodes", { count: total.nodes.toLocaleString() })}
+          note={t("g6.nodes", { count: activityNumber(total.nodes) })}
         />
         <ActivityTile
           value={total.usd ? activityMoney(total.usd) : "—"}
@@ -433,8 +447,8 @@ export function TaskBoardHistory({
             </>
           }
           note={t("g6.pricedNodes", {
-            priced: (total.nodes - total.unpriced).toLocaleString(),
-            unpriced: total.unpriced.toLocaleString(),
+            priced: activityNumber(total.nodes - total.unpriced),
+            unpriced: activityNumber(total.unpriced),
           })}
         />
         <ActivityTile
@@ -490,8 +504,8 @@ export function TaskBoardHistory({
                 >
                   <span>{t("g6.filter." + key)}</span>
                   <em>
-                    {selected.length ? `${selected.length} / ` : ""}
-                    {count.size}
+                    {selected.length ? `${activityNumber(selected.length)} / ` : ""}
+                    {activityNumber(count.size)}
                   </em>
                   <ChevronDown size={13} />
                 </button>
@@ -593,7 +607,7 @@ export function TaskBoardHistory({
                               <i className="dot" style={{ background: sourceColor(v) }} />
                             ) : null}
                             <span>{label(v)}</span>
-                            <em>{count.get(v)}</em>
+                            <em>{activityNumber(count.get(v)!)}</em>
                           </button>
                         </li>
                       ))}
@@ -662,8 +676,8 @@ export function TaskBoardHistory({
       </div>
       <div className="h-list">
         <div className="h-lhead">
-          <h3>{t("g6.sourceCount", { count: sources.length })}</h3>
-          <span>{t("g6.hierarchyHint", { count: total.n })}</span>
+          <h3>{t("g6.sourceCount", { count: activityNumber(sources.length) })}</h3>
+          <span>{t("g6.hierarchyHint", { count: activityNumber(total.n) })}</span>
         </div>
         <div className="h-row h-cols">
           <span />
@@ -678,7 +692,7 @@ export function TaskBoardHistory({
           <span>{t("g6.cost")}</span>
           <span />
         </div>
-        {sourceRows.slice((pages.source ?? 0) * 10, (pages.source ?? 0) * 10 + 10).map((p) => {
+        {pageOf("source", sourceRows, 10).map((p) => {
           const sourceId = JSON.stringify(["source", p.source]),
             groups = [...new Set(p.cards.map((c) => c.group))]
               .map((group) => ({ group, cards: p.cards.filter((c) => c.group === group) }))
@@ -697,7 +711,7 @@ export function TaskBoardHistory({
                 <span className="h-name">
                   <b>{caches[p.source]?.display.identity?.label ?? p.source}</b>
                   <small>
-                    {t("g6.groups", { count: groups.length })}
+                    {t("g6.groups", { count: activityNumber(groups.length) })}
                     {" · "}
                     {localDay(Math.min(...p.cards.map((c) => c.end))).slice(5)} {t("g6.to")}{" "}
                     {localDay(historyRoll(p.cards).latest).slice(5)}
@@ -715,164 +729,164 @@ export function TaskBoardHistory({
               </button>
               {open.includes(sourceId) && (
                 <div className="h-sub">
-                  {groups
-                    .slice((pages[sourceId] ?? 0) * 8, (pages[sourceId] ?? 0) * 8 + 8)
-                    .map((g) => {
-                      const groupId = JSON.stringify([p.source, g.group]);
-                      return (
-                        <div
-                          key={groupId}
-                          className={`h-s ${open.includes(groupId) ? "expanded" : ""}`}
+                  {pageOf(sourceId, groups, 8).map((g) => {
+                    const groupId = JSON.stringify([p.source, g.group]);
+                    return (
+                      <div
+                        key={groupId}
+                        className={`h-s ${open.includes(groupId) ? "expanded" : ""}`}
+                      >
+                        <button
+                          type="button"
+                          className="h-row h-srow"
+                          aria-expanded={open.includes(groupId)}
+                          onClick={() =>
+                            setOpen(open.includes(groupId) ? [sourceId] : [sourceId, groupId])
+                          }
                         >
-                          <button
-                            type="button"
-                            className="h-row h-srow"
-                            aria-expanded={open.includes(groupId)}
-                            onClick={() =>
-                              setOpen(open.includes(groupId) ? [sourceId] : [sourceId, groupId])
-                            }
-                          >
-                            <BoardIdentityMark id={groupId} label={g.group} size={24} />
-                            <span className="h-name">
-                              <b>{g.cards[0].groupLabel}</b>
-                              <small>
-                                {g.group} {" · "} {localDay(historyRoll(g.cards).latest).slice(5)}
-                              </small>
-                            </span>
-                            <span className="h-line">
-                              <HistoryStrip
-                                cards={g.cards}
-                                from={displayFrom}
-                                to={Math.min(to, now)}
-                                color={sourceColor(p.source)}
-                              />
-                            </span>
-                            <HistoryNumbers cards={g.cards} />
-                          </button>
-                          {open.includes(groupId) && (
-                            <div className="h-detail">
-                              <div className="h-toks">
-                                {pageOf(groupId, [...g.cards].sort(historySort(sort)), 10).map(
-                                  (c) => (
-                                    <div
-                                      key={c.id}
-                                      className={`h-t ${open.includes(c.id) ? "expanded" : ""}`}
+                          <BoardIdentityMark id={groupId} label={g.group} size={24} />
+                          <span className="h-name">
+                            <b>{g.cards[0].groupLabel}</b>
+                            <small>
+                              {g.group} {" · "} {localDay(historyRoll(g.cards).latest).slice(5)}
+                            </small>
+                          </span>
+                          <span className="h-line">
+                            <HistoryStrip
+                              cards={g.cards}
+                              from={displayFrom}
+                              to={Math.min(to, now)}
+                              color={sourceColor(p.source)}
+                            />
+                          </span>
+                          <HistoryNumbers cards={g.cards} />
+                        </button>
+                        {open.includes(groupId) && (
+                          <div className="h-detail">
+                            <div className="h-toks">
+                              {pageOf(groupId, [...g.cards].sort(historySort(sort)), 10).map(
+                                (c) => (
+                                  <div
+                                    key={c.id}
+                                    className={`h-t ${open.includes(c.id) ? "expanded" : ""}`}
+                                  >
+                                    <button
+                                      type="button"
+                                      className="h-trow"
+                                      aria-expanded={open.includes(c.id)}
+                                      onClick={() =>
+                                        setOpen(
+                                          open.includes(c.id)
+                                            ? [sourceId, groupId]
+                                            : [sourceId, groupId, c.id],
+                                        )
+                                      }
                                     >
-                                      <button
-                                        type="button"
-                                        className="h-trow"
-                                        aria-expanded={open.includes(c.id)}
-                                        onClick={() =>
-                                          setOpen(
-                                            open.includes(c.id)
-                                              ? [sourceId, groupId]
-                                              : [sourceId, groupId, c.id],
-                                          )
-                                        }
-                                      >
-                                        <span
-                                          className={`o-dot o-${["completed", "merged"].includes(c.outcome) ? "good" : ["dropped", "split"].includes(c.outcome) ? "muted" : "warn"}`}
-                                        />
-                                        <span className="h-ttl">
-                                          <b>{c.task.title || taskTitle(c.task)}</b>
-                                          <small>
-                                            <code>{c.task.uid}</code>
-                                            {" · "}
-                                            {t("g6.outcome." + (c.outcome || "unknown"))}
-                                            {" · "}
-                                            {activityStamp(c.end)}
-                                            {c.task["omnigent.ai:sourceDisplay"]?.historyState
-                                              ?.commitCount
-                                              ? ` · ${c.task["omnigent.ai:sourceDisplay"]?.historyState?.commitCount} ${t("g6.commits")}`
-                                              : ""}
-                                          </small>
-                                        </span>
-                                        <span className="h-ag">
-                                          {c.agents.map((a) => (
-                                            <BoardAgentLogo key={a} id={a} size={13} />
+                                      <span
+                                        className={`o-dot o-${["completed", "merged"].includes(c.outcome) ? "good" : ["dropped", "split"].includes(c.outcome) ? "muted" : "warn"}`}
+                                      />
+                                      <span className="h-ttl">
+                                        <b>{c.task.title || taskTitle(c.task)}</b>
+                                        <small>
+                                          <code>{c.task.uid}</code>
+                                          {" · "}
+                                          {t("g6.outcome." + (c.outcome || "unknown"))}
+                                          {" · "}
+                                          {activityStamp(c.end)}
+                                          {c.task["omnigent.ai:sourceDisplay"]?.historyState
+                                            ?.commitCount
+                                            ? ` · ${activityNumber(c.task["omnigent.ai:sourceDisplay"]!.historyState!.commitCount!)} ${t("g6.commits")}`
+                                            : ""}
+                                        </small>
+                                      </span>
+                                      <span className="h-ag">
+                                        {c.agents.map((a) => (
+                                          <BoardAgentLogo key={a} id={a} size={13} />
+                                        ))}
+                                      </span>
+                                      <span className="h-dur">
+                                        {c.seconds ? activityDuration(c.seconds) : ""}
+                                      </span>
+                                      <ActivityMoney
+                                        amount={c.usd}
+                                        actual={c.nodes
+                                          .filter((n) => n.cost?.amount != null)
+                                          .every((n) => n.cost?.kind === "actual")}
+                                      />
+                                    </button>
+                                    {open.includes(c.id) && (
+                                      <>
+                                        <ul className="h-nodes">
+                                          {pageOf(c.id, c.nodes, 8).map((n) => (
+                                            <li key={n.id}>
+                                              <BoardIdentityMark
+                                                id={n.agent}
+                                                label={n.agent}
+                                                product={n.agent}
+                                                size={22}
+                                              />
+                                              <span className="n-t">
+                                                {activityStamp(n.from)} {t("g6.to")}{" "}
+                                                {activityStamp(n.to)}
+                                              </span>
+                                              <span className="n-d">
+                                                {activityDuration(
+                                                  Math.max(60, (n.to - n.from) / 1000),
+                                                )}
+                                              </span>
+                                              <span className="n-h">{n.host}</span>
+                                              <span className="n-k">
+                                                {n.tokens
+                                                  ? `${activityNumber(n.tokens)} token`
+                                                  : ""}
+                                              </span>
+                                              <ActivityMoney
+                                                amount={n.cost?.amount ?? null}
+                                                actual={n.cost?.kind === "actual"}
+                                              />
+                                              {n.session ? (
+                                                <Link
+                                                  {...boardExitProps()}
+                                                  to={`/c/${encodeURIComponent(n.session)}`}
+                                                >
+                                                  <ArrowUpRight size={14} />
+                                                </Link>
+                                              ) : (
+                                                <span className="n-sp" />
+                                              )}
+                                            </li>
                                           ))}
-                                        </span>
-                                        <span className="h-dur">
-                                          {c.seconds ? activityDuration(c.seconds) : ""}
-                                        </span>
-                                        <ActivityMoney
-                                          amount={c.usd}
-                                          actual={c.nodes
-                                            .filter((n) => n.cost?.amount != null)
-                                            .every((n) => n.cost?.kind === "actual")}
-                                        />
-                                      </button>
-                                      {open.includes(c.id) && (
-                                        <>
-                                          <ul className="h-nodes">
-                                            {c.nodes
-                                              .slice(
-                                                (pages[c.id] ?? 0) * 8,
-                                                (pages[c.id] ?? 0) * 8 + 8,
-                                              )
-                                              .map((n) => (
-                                                <li key={n.id}>
-                                                  <BoardIdentityMark
-                                                    id={n.agent}
-                                                    label={n.agent}
-                                                    product={n.agent}
-                                                    size={22}
-                                                  />
-                                                  <span className="n-t">
-                                                    {activityStamp(n.from)} {t("g6.to")}{" "}
-                                                    {activityStamp(n.to)}
-                                                  </span>
-                                                  <span className="n-d">
-                                                    {activityDuration(
-                                                      Math.max(60, (n.to - n.from) / 1000),
-                                                    )}
-                                                  </span>
-                                                  <span className="n-h">{n.host}</span>
-                                                  <span className="n-k">
-                                                    {n.tokens
-                                                      ? `${n.tokens.toLocaleString()} token`
-                                                      : ""}
-                                                  </span>
-                                                  <ActivityMoney
-                                                    amount={n.cost?.amount ?? null}
-                                                    actual={n.cost?.kind === "actual"}
-                                                  />
-                                                  {n.session ? (
-                                                    <Link
-                                                      {...boardExitProps()}
-                                                      to={`/c/${encodeURIComponent(n.session)}`}
-                                                    >
-                                                      <ArrowUpRight size={14} />
-                                                    </Link>
-                                                  ) : (
-                                                    <span className="n-sp" />
-                                                  )}
-                                                </li>
-                                              ))}
-                                          </ul>
-                                          {!c.nodes.length && (
-                                            <p className="h-nonode">{t("g6.noNodes")}</p>
-                                          )}
-                                          {pager(c.id, c.nodes.length, 8)}
-                                          <button
-                                            type="button"
-                                            className="f-clear"
-                                            onClick={() => onSelect(c.task)}
-                                          >
-                                            {t("g6.openTask")}
-                                          </button>
-                                        </>
-                                      )}
-                                    </div>
-                                  ),
-                                )}
-                              </div>
-                              {pager(groupId, g.cards.length, 10)}
+                                        </ul>
+                                        {!c.nodes.length && (
+                                          <p className="h-nonode">{t("g6.noNodes")}</p>
+                                        )}
+                                        {pager(c.id, c.nodes.length, 8)}
+                                        <button
+                                          type="button"
+                                          className="f-clear"
+                                          onClick={(event) => {
+                                            if (tasks.some((task) => taskIdentity(task) === c.id))
+                                              onSelect(c.task);
+                                            else {
+                                              archiveTrigger.current = event.currentTarget;
+                                              setArchiveSelection(c.task);
+                                            }
+                                          }}
+                                        >
+                                          {t("g6.openTask")}
+                                        </button>
+                                      </>
+                                    )}
+                                  </div>
+                                ),
+                              )}
                             </div>
-                          )}
-                        </div>
-                      );
-                    })}
+                            {pager(groupId, g.cards.length, 10)}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                   {pager(sourceId, groups.length, 8)}
                 </div>
               )}
@@ -882,6 +896,20 @@ export function TaskBoardHistory({
         {pager("source", sourceRows.length, 10)}
         {!filtered.length && <p className="h-empty">{t("g6.noRecords")}</p>}
       </div>
+      {archiveSelection && merged.has(taskIdentity(archiveSelection)) && (
+        <TaskBoardDetail
+          key={taskIdentity(archiveSelection)}
+          task={merged.get(taskIdentity(archiveSelection))!}
+          tasks={[...merged.values()]}
+          sessions={sessions}
+          sourceCache={caches[archiveSelection["omnigent.ai:source"]]}
+          onSelect={setArchiveSelection}
+          onClose={() => {
+            setArchiveSelection(null);
+            archiveTrigger.current?.focus();
+          }}
+        />
+      )}
       {(hasOldMonths || month) && (
         <button type="button" className="f-clear" onClick={() => setShowMonths(!showMonths)}>
           {t("g6.findMonth")}
@@ -912,7 +940,7 @@ export function TaskBoardHistory({
                       }}
                     >
                       <em>{value.slice(5)}</em>
-                      <small>{count.toLocaleString()}</small>
+                      <small>{activityNumber(count)}</small>
                     </button>
                   );
                 })}

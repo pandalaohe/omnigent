@@ -6,7 +6,12 @@ import { latestRelease, type SourceCache } from "./taskBoardSnapshotData";
 import { localDay } from "./taskBoardActivityData";
 import { t } from "./taskBoardText";
 import { BoardIdentityMark } from "./BoardIdentityMark";
-import { activityTaskName, activityStamp, activityMoney } from "./TaskBoardActivityParts";
+import {
+  activityNumber,
+  activityTaskName,
+  activityStamp,
+  activityMoney,
+} from "./TaskBoardActivityParts";
 import type { UsageActivity } from "@/pages/usageBoard/usageActivityData";
 import { Coins, FlaskConical, Network, PackageCheck, Quote } from "lucide-react";
 
@@ -61,7 +66,7 @@ export function TaskBoardToday({
       : [
           ...sources.slice(0, 5),
           [
-            t("g6.otherCount", { count: sources.length - 5 }),
+            t("g6.otherCount", { count: activityNumber(sources.length - 5) }),
             sources.slice(5).reduce((sum, v) => sum + v[1], 0),
           ] as [string, number],
         ];
@@ -127,11 +132,11 @@ export function TaskBoardToday({
         </h3>
         <div className="td-stats">
           <div>
-            <b>{closed.length}</b>
+            <b>{activityNumber(closed.length)}</b>
             <span>{t("today.closed")}</span>
           </div>
           <div>
-            <b>{commits.size}</b>
+            <b>{activityNumber(commits.size)}</b>
             <span title={t("g6.taskCommitsHint")}>{t("g6.taskCommits")}</span>
           </div>
           <div>
@@ -147,7 +152,7 @@ export function TaskBoardToday({
             <span key={source}>
               <i style={{ width: `${Math.max(4, (n / Math.max(1, commits.size)) * 100)}%` }} />
               <b>{source}</b>
-              <em>{n}</em>
+              <em>{activityNumber(n)}</em>
             </span>
           ))}
         </div>
@@ -203,7 +208,7 @@ export function TaskBoardToday({
                     <td key={host} className={`v-${check?.verdict ?? "none"}`}>
                       <i />
                       {check ? t("sessions.check." + check.verdict) : t("g6.noReceipt")}
-                      {check && <small>{check.count}</small>}
+                      {check && <small>{activityNumber(check.count)}</small>}
                     </td>
                   );
                 })}
@@ -270,7 +275,7 @@ export function TaskBoardToday({
                 <u style={{ width: `${(a.n / maxN) * 100}%` }} />
               </i>
               <em>
-                {t("g6.workerCount", { count: a.n, live: a.live })}
+                {t("g6.workerCount", { count: activityNumber(a.n), live: activityNumber(a.live) })}
                 {" · "}
                 {a.cost ? activityMoney(a.cost) : t("g6.unbilled")}
               </em>

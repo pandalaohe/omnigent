@@ -2307,11 +2307,13 @@ export function BoardPager({
   pages,
   onChange,
   total,
+  formatValue = String,
 }: {
   page: number;
   pages: number;
   onChange: (page: number) => void;
   total?: number;
+  formatValue?: (value: number) => string;
 }) {
   if (pages <= 1) return null;
   return (
@@ -2325,7 +2327,7 @@ export function BoardPager({
       >
         <ChevronLeftIcon className="size-4" />
       </Button>
-      <span>{t("pager.page", { page: page + 1, pages })}</span>
+      <span>{t("pager.page", { page: formatValue(page + 1), pages: formatValue(pages) })}</span>
       <Button
         size="icon-sm"
         variant="ghost"
@@ -2335,7 +2337,9 @@ export function BoardPager({
       >
         <ChevronRightIcon className="size-4" />
       </Button>
-      {total !== undefined && <small>{t("routes.pagerTotal", { count: total })}</small>}
+      {total !== undefined && (
+        <small>{t("routes.pagerTotal", { count: formatValue(total) })}</small>
+      )}
     </nav>
   );
 }

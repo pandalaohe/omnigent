@@ -21,6 +21,7 @@ import { boardGroupColors } from "./taskBoardSessionData";
 import { BoardIdentityMark } from "./BoardIdentityMark";
 import { t } from "./taskBoardText";
 import {
+  activityNumber,
   activityTaskName,
   ActivityPages,
   ActivitySegments,
@@ -198,7 +199,7 @@ export function TaskBoardLog({
         >
           {paused ? <Play size={14} /> : <Pause size={14} />}
           <span>{t(paused ? "g6.resume" : "g6.pause")}</span>
-          {buffered > 0 && <i className="l-n">{buffered}</i>}
+          {buffered > 0 && <i className="l-n">{activityNumber(buffered)}</i>}
         </button>
       </div>
       {[...groups].slice(page * 6, page * 6 + 6).map(([key, g]) => (
@@ -209,7 +210,7 @@ export function TaskBoardLog({
             )}
             {g.label}
             {g.subtitle && <small>{g.subtitle}</small>}
-            <em>{g.rows.length}</em>
+            <em>{activityNumber(g.rows.length)}</em>
           </h4>
           <div className="l-rows">
             {g.rows.slice((pages[key] ?? 0) * 25, (pages[key] ?? 0) * 25 + 25).map((row) => {
@@ -300,9 +301,10 @@ export function TaskBoardLog({
                     <span className="lr-sub">
                       {r?.workSeconds ? activityDuration(r.workSeconds) : ""}
                       {check
-                        ? `${check.count} · ${activityDuration(check.seconds ?? 0)} ${check.head ?? ""}`
+                        ? `${activityNumber(check.count)} · ${activityDuration(check.seconds ?? 0)} ${check.head ?? ""}`
                         : r?.host}
-                      {commits.length > 0 && ` · ${commits.length} ${t("g6.commits")}`}
+                      {commits.length > 0 &&
+                        ` · ${activityNumber(commits.length)} ${t("g6.commits")}`}
                     </span>
                     <span className="lr-line">
                       {d?.identity && (
@@ -338,7 +340,7 @@ export function TaskBoardLog({
                             </b>
                             {other && (
                               <small>
-                                {other.count}
+                                {activityNumber(other.count)}
                                 {"·"}
                                 {activityStamp(Date.parse(other.at))}
                               </small>
@@ -356,7 +358,7 @@ export function TaskBoardLog({
                               <div>{activityStamp(Date.parse(r.from))}</div>
                               <div>{activityStamp(Date.parse(row.time))}</div>
                               <div>
-                                {commits.length} {t("g6.commits")}
+                                {activityNumber(commits.length)} {t("g6.commits")}
                               </div>
                             </div>
                           )}

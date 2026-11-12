@@ -4,7 +4,7 @@ import type { HistoryCard } from "./taskBoardHistoryData";
 import { DAY, activityColors } from "./taskBoardHistoryData";
 import type { ClosedDay } from "./taskBoardActivityData";
 import { localDay } from "./taskBoardActivityData";
-import { activityMoney } from "./TaskBoardActivityParts";
+import { activityMoney, activityNumber } from "./TaskBoardActivityParts";
 import { mapAxisTicks } from "./taskBoardRouteModel";
 import { t } from "./taskBoardText";
 
@@ -106,7 +106,8 @@ export function TaskBoardHistoryChart({
       let sum = 0,
         has = false;
       for (const [day, value] of accounts)
-        if (day >= localDay(c.a) && day < localDay(c.b) && value !== null) {
+        if (day >= localDay(c.a) && day < localDay(c.b)) {
+          if (value === null) return null;
           sum += value;
           has = true;
         }
@@ -197,7 +198,7 @@ export function TaskBoardHistoryChart({
               })}
               {total > max && (
                 <text className="r-cap" x={xa + w / 2} y={13}>
-                  {total}
+                  {activityNumber(total)}
                 </text>
               )}
               <rect
@@ -206,12 +207,12 @@ export function TaskBoardHistoryChart({
                   setHover({
                     x: e.clientX,
                     y: e.clientY,
-                    text: `${localDay(c.a)} – ${localDay(c.b - DAY)}，${total} ${t("g6.cards")}\n${[
+                    text: `${localDay(c.a)} – ${localDay(c.b - DAY)}，${activityNumber(total)} ${t("g6.cards")}\n${[
                       ...c.values,
                     ]
                       .sort((a, b) => b[1] - a[1])
                       .slice(0, 5)
-                      .map(([source, count]) => source + " " + count)
+                      .map(([source, count]) => source + " " + activityNumber(count))
                       .join(
                         ", ",
                       )}${costs[i] !== null ? "\n" + t("g6.allAccounts") + " " + activityMoney(costs[i]!) : ""}`,
@@ -226,7 +227,7 @@ export function TaskBoardHistoryChart({
                 <title>
                   {localDay(c.a)} {t("g6.to")} {localDay(c.b - DAY)}
                   {": "}
-                  {total} {t("g6.cards")}
+                  {activityNumber(total)} {t("g6.cards")}
                   {costs[i] !== null ? ` · ${t("g6.allAccounts")} ${activityMoney(costs[i]!)}` : ""}
                 </title>
               </rect>
