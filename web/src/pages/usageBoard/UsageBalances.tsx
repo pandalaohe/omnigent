@@ -1,5 +1,5 @@
 import type { UsageAccountView } from "./usageBoardData";
-import { formatFullDate, formatUsageValue } from "./usageBoardFormat";
+import { formatFullDate, formatTileAmount, formatUsageValue } from "./usageBoardFormat";
 import { t } from "./usageText";
 import { UsageFigure } from "./UsageFigure";
 import { UsageName } from "./UsageName";
@@ -41,7 +41,13 @@ export function UsageBalances({
               <UsageName data-usage-label className="usage-caption">
                 {balance.label ?? t("balance")}
               </UsageName>
-              <span data-usage-amount>{formatUsageValue(balance.remaining, balance.unit)}</span>
+              <span
+                data-usage-amount
+                className="shrink-0"
+                title={formatUsageValue(balance.remaining, balance.unit)}
+              >
+                {formatTileAmount(balance.remaining, balance.unit)}
+              </span>
             </span>
           ) : (
             <UsageFigure

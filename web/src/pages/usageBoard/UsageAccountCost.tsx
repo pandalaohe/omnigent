@@ -40,6 +40,11 @@ export function UsageAccountCost({ account }: { account: UsageAccountView }) {
               <button
                 key={label}
                 type="button"
+                aria-label={
+                  amount && !read.error
+                    ? `${label} ${amount.mark ?? ""}${usageFigure(amount.totals, false)}`
+                    : undefined
+                }
                 aria-pressed={selected === index}
                 onClick={() => setSelected(index)}
               >
@@ -50,7 +55,7 @@ export function UsageAccountCost({ account }: { account: UsageAccountView }) {
                   ) : amount ? (
                     <>
                       {amount.mark ? <span className="usage-approx">{amount.mark}</span> : null}
-                      <FigureText text={usageFigure(amount.totals, false)} />
+                      <FigureText text={usageFigure(amount.totals, false, true)} />
                     </>
                   ) : (
                     "—"

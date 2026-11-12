@@ -102,13 +102,9 @@ export function UsageAccountPage() {
       {account ? (
         <>
           <div className="usage-account-heading">
-            <h2 className="usage-account-name">
-              <UsageName>{account.display_name}</UsageName>
-            </h2>
-            <p className="usage-caption">
-              <UsageName>
-                {`${account.plan ?? ""}${renewal != null ? ` · Renews ${formatFullDate(renewal.at / 1000)}` : ""}`}
-              </UsageName>
+            <h2 className="usage-account-name">{account.display_name}</h2>
+            <p className="usage-caption usage-wrap">
+              {`${account.plan ?? ""}${renewal != null ? ` · Renews ${formatFullDate(renewal.at / 1000)}` : ""}`}
             </p>
           </div>
           <div className="usage-account-meta">
@@ -166,9 +162,7 @@ export function UsageAccountPage() {
                         data-pool={group.key}
                         data-focused={group.key === focus || undefined}
                       >
-                        {group.tag ? (
-                          <UsageName className="usage-group-tag">{group.tag}</UsageName>
-                        ) : null}
+                        {group.tag ? <p className="usage-group-tag">{group.tag}</p> : null}
                         <div className="usage-window-grid">
                           {group.windows.map((window) => {
                             const isOn = picked.window === window && isPercentWindow(window);

@@ -97,7 +97,13 @@ export function UsageRing({
   const elapsed = window ? elapsedFraction(window) : 0;
   const reading = percent !== null && size > 20 ? formatPercentReading(percent) : "";
   const named = showName && Boolean(window) && size > 40;
-  const figure = reading ? ringFigureSize(figureEms(reading, "%"), named ? NAME_BLOCK : 0) : 0;
+  // A small ring (the compact list) drops the % mark and keeps a 10 px floor.
+  const small = size < 64;
+  const figure = reading
+    ? small
+      ? ringFigureSize(figureEms(reading), 0, CLEAR_RADIUS, 30, 1000 / size)
+      : ringFigureSize(figureEms(reading, "%"), named ? NAME_BLOCK : 0, CLEAR_RADIUS)
+    : 0;
   const nameTop = ((named ? NAME_BLOCK : 0) + 0.74 * figure) / 2;
   const nameWidth = 2 * Math.sqrt(Math.max(0, CLEAR_RADIUS ** 2 - nameTop ** 2));
 
@@ -109,6 +115,7 @@ export function UsageRing({
       <span
         className="usage-ring"
         data-testid="usage-ring"
+        aria-label={reading ? `${reading}% used` : undefined}
         data-tone={tone}
         data-state={window?.state ?? "none"}
         data-stale={stale || undefined}
@@ -173,7 +180,7 @@ export function UsageRing({
                 data-usage-percent=""
               >
                 {reading}
-                <span className="usage-unit-mark">%</span>
+                {small ? null : <span className="usage-unit-mark">%</span>}
               </span>
             ) : !window ? (
               <span className="usage-ring-none" aria-label="No reading">

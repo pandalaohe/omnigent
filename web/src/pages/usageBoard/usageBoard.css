@@ -2,7 +2,8 @@
    colours; numbers in tabular figures with reduced unit marks. */
 .usage-board {
   --usage-track: color-mix(in srgb, var(--foreground) 9%, transparent);
-  --usage-time: color-mix(in srgb, var(--foreground) 34%, transparent);
+  /* 50 % keeps the time arc at 3:1 or more on the card in both default themes. */
+  --usage-time: color-mix(in srgb, var(--foreground) 50%, transparent);
   --usage-series: var(--chart-1);
   --usage-inset: color-mix(in srgb, var(--foreground) 3.5%, transparent);
   --usage-rule: color-mix(in srgb, var(--border) 75%, transparent);
@@ -43,8 +44,11 @@
   .usage-unit-mark {
   font-size: max(11px, 0.64em);
   font-weight: 500;
+}
+/* A toned figure keeps its unit in the same (contrast-checked) colour. */
+:is(.usage-ring[data-tone="warn"], .usage-ring[data-tone="crit"], .usage-ring[data-tone="mute"])
+  .usage-unit-mark {
   color: inherit;
-  opacity: 0.6;
 }
 :is(
     .usage-ring-percent,
@@ -464,7 +468,7 @@
   color: var(--muted-foreground);
 }
 .usage-ring-none {
-  font-size: 22cqi;
+  font-size: max(10px, 22cqi);
   line-height: 1;
   color: var(--foreground-tertiary);
 }
@@ -531,6 +535,9 @@
   gap: 2px;
   text-align: center;
 }
+.usage-balance-compact > [data-usage-name] {
+  min-width: 3em;
+}
 .usage-balance-compact {
   display: flex;
   min-width: 0;
@@ -541,6 +548,15 @@
 }
 
 /* Detail page */
+.usage-wrap,
+.usage-account-name,
+.usage-group-tag,
+.usage-figure-label-full {
+  overflow-wrap: anywhere;
+}
+.usage-figure-label-full {
+  text-align: center;
+}
 .usage-account-name {
   font-size: var(--text-xl);
   line-height: 1.3;
@@ -704,7 +720,7 @@
   height: 10px;
   border: 0;
   border-radius: 2px;
-  background: color-mix(in srgb, var(--muted-foreground) 45%, transparent);
+  background: color-mix(in srgb, var(--muted-foreground) 80%, transparent);
 }
 .usage-legend-swatch[data-kind="fee"] {
   border-top: 1.5px dashed var(--warning);

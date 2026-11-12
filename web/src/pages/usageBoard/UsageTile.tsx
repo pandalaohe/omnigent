@@ -30,6 +30,7 @@ import {
 import {
   formatAge,
   formatPercentReading,
+  formatTileAmount,
   formatTimeLeft,
   windowName,
   stateTone,
@@ -150,7 +151,7 @@ export function UsageTile({
             </span>
           ) : first?.window?.used_value !== null && first?.window ? (
             <span className="usage-countdown">
-              {first.window.used_value.toLocaleString("en-US")}
+              {formatTileAmount(first.window.used_value, first.window.unit)}
             </span>
           ) : null}
         </div>

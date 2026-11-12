@@ -62,7 +62,11 @@ export function UsageFigure({
       data-testid="usage-figure"
     >
       <span className="usage-figure-body">
-        {label ? (
+        {label && full ? (
+          <span data-usage-label className="usage-figure-label usage-figure-label-full">
+            {label}
+          </span>
+        ) : label ? (
           <UsageName data-usage-label className="usage-figure-label">
             {label}
           </UsageName>

@@ -42,12 +42,17 @@ const chipTone: Record<UsageTone, string> = {
 /** The card body. Fixed width so nothing wraps out of the frame. */
 export function UsageTipCard({ model }: { model: UsageTipModel }) {
   return (
-    <div className="w-[216px] max-w-full text-xs leading-snug" data-testid="usage-tip-card">
+    <div
+      className="w-max min-w-[216px] max-w-[min(320px,calc(100vw-48px))] text-xs leading-snug"
+      data-testid="usage-tip-card"
+    >
       {model.note ? (
         <UsageName className="mb-0.5 text-[11px] text-muted-foreground">{model.note}</UsageName>
       ) : null}
       <div className="mb-1 flex items-center justify-between gap-2">
-        <UsageName className="flex-1 font-semibold text-foreground">{model.title}</UsageName>
+        <span className="min-w-0 flex-1 font-semibold text-foreground wrap-anywhere">
+          {model.title}
+        </span>
         {model.chip ? (
           <UsageName
             className={cn(
@@ -63,11 +68,11 @@ export function UsageTipCard({ model }: { model: UsageTipModel }) {
         <div key={`${row.label}-${row.value}`}>
           {model.dividerBefore === index ? <div className="my-1 h-px bg-border" /> : null}
           {row.bar === undefined ? (
-            <div className="flex items-center justify-between gap-3 text-muted-foreground">
-              <UsageName className="flex-1">{row.label}</UsageName>
-              <UsageName className="max-w-[60%] font-semibold text-foreground">
+            <div className="flex flex-wrap items-baseline justify-between gap-x-3 text-muted-foreground">
+              <span className="min-w-0">{row.label}</span>
+              <span className="ml-auto text-right font-semibold text-foreground tabular-nums wrap-anywhere">
                 {row.value}
-              </UsageName>
+              </span>
             </div>
           ) : (
             <div className="grid grid-cols-[42px_minmax(0,1fr)_44px] items-center gap-2">

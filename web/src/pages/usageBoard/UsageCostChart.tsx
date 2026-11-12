@@ -20,7 +20,7 @@ import {
   YAxis,
 } from "recharts";
 import type { UsageAccountActivity } from "./usageActivityData";
-import { formatMoney, formatUsageValue } from "./usageBoardFormat";
+import { formatCount, formatMoney, formatTileAmount, formatUsageValue } from "./usageBoardFormat";
 import { UsageTipCard } from "./UsageTip";
 
 export interface UsageChartPoint {
@@ -331,10 +331,7 @@ function ChartTip({
 }) {
   const point = payload?.[0]?.payload;
   if (!active || !point) return null;
-  const figure = (value: number) =>
-    tokens
-      ? new Intl.NumberFormat("en-US", { notation: "compact" }).format(value)
-      : formatMoney(value);
+  const figure = (value: number) => (tokens ? formatCount(value) : formatMoney(value));
   return (
     <div className="rounded-lg border border-border bg-popover p-2.5 shadow-md">
       <UsageTipCard
@@ -360,9 +357,9 @@ function ChartTip({
 }
 
 /** Round axis steps (1, 2, 2.5 or 5 × 10ⁿ) from zero past the series' top. */
-export function niceTicks(top: number, count = 4): number[] {
-  if (!(top > 0)) return [0, 1];
-  const raw = top / count;
+export function niceTicks(top: number, count = 4, minStep = 0): number[] {
+  if (!(top > 0)) return [0, Math.max(1, minStep)];
+  const raw = Math.max(top / count, minStep);
   const power = 10 ** Math.floor(Math.log10(raw));
   const step = ([1, 2, 2.5, 5, 10].find((factor) => factor * power >= raw) ?? 10) * power;
   const ticks: number[] = [];
@@ -392,10 +389,10 @@ export function UsageCostChart({
 }) {
   const points = usageChartPoints(accounts, tokens, total, period, now);
   const last = points.at(-1);
-  const formatter = (value: number) =>
-    tokens
-      ? new Intl.NumberFormat("en-US", { notation: "compact" }).format(value)
-      : formatMoney(value);
+  const formatter = (value: number) => (tokens ? formatCount(value) : formatMoney(value));
+  // Axis ticks are scale labels: two-decimal steps never repeat, large ones shorten.
+  const tickText = (value: number) =>
+    tokens ? formatCount(value) : formatTileAmount(value, "USD");
   const hourly = points.length > 1 && points[1].at - points[0].at <= 3600;
   const dateLabel = (at: number) =>
     new Date(at * 1000).toLocaleString(
@@ -408,9 +405,9 @@ export function UsageCostChart({
     ...points.map((point) => Math.max(point.now, point.previous ?? 0)),
     showFee ? (fee ?? 0) : 0,
   );
-  const ticks = niceTicks(top);
-  const axisWidth = Math.max(44, Math.max(...ticks.map((tick) => formatter(tick).length)) * 7 + 18);
-  const bucketTop = Math.max(...points.map((point) => point.bucket), 0) * 4 || 1;
+  // Bars and lines share this one axis, so a bar's height is its real amount.
+  const ticks = niceTicks(top, 4, tokens ? 1 : 0.01);
+  const axisWidth = Math.max(44, Math.max(...ticks.map((tick) => tickText(tick).length)) * 7 + 18);
   return (
     <figure aria-label="Cumulative usage and usage per bucket" className="usage-chart">
       <figcaption className="usage-legend">
@@ -459,18 +456,17 @@ export function UsageCostChart({
               width={axisWidth}
               ticks={ticks}
               domain={[0, ticks[ticks.length - 1]]}
-              tickFormatter={formatter}
+              tickFormatter={tickText}
               tick={{ fontSize: 12, fill: "var(--muted-foreground)" }}
               tickLine={false}
               axisLine={false}
             />
-            <YAxis yAxisId="bucket" orientation="right" hide domain={[0, bucketTop]} />
             <Tooltip content={<ChartTip tokens={tokens} />} cursor={{ fill: "var(--accent)" }} />
             <Bar
-              yAxisId="bucket"
+              yAxisId="total"
               dataKey="bucket"
               fill="var(--muted-foreground)"
-              fillOpacity={0.45}
+              fillOpacity={0.8}
               radius={[2, 2, 0, 0]}
               maxBarSize={28}
               isAnimationActive={false}

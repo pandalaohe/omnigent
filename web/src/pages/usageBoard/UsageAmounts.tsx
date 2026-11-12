@@ -15,7 +15,7 @@ import { useUsageActivity } from "./usageActivityData";
 import { t } from "./usageText";
 import type { UsageAccountActivity, UsageAmount } from "./usageActivityData";
 import type { UsageAccountView } from "./usageBoardData";
-import { formatFullDate, formatMoney } from "./usageBoardFormat";
+import { formatCount, formatFullDate, formatMoney } from "./usageBoardFormat";
 import { amountTip, boardAmount, sumUsage, usageFigure } from "./usageAmountData";
 import { UsageTip, UsageTipButton } from "./UsageTip";
 import { UsageRangeControl } from "./UsageRangeControl";
@@ -94,7 +94,7 @@ export function UsageAmountFigure({
   const figure = (
     <>
       {!tokens && amount.mark ? <span className="usage-approx">{amount.mark}</span> : null}
-      <FigureText text={usageFigure(amount.totals, tokens)} />
+      <FigureText text={usageFigure(amount.totals, tokens, true)} />
     </>
   );
   return (
@@ -166,7 +166,7 @@ export function UsageSummary({ accountIds }: { accountIds: string[] }) {
                 ) : amount && amount.totals.cost_usd !== null ? (
                   <span className="tabular-nums">
                     {amount.mark ? <span className="usage-approx">{amount.mark}</span> : null}
-                    <FigureText text={usageFigure(amount.totals, false)} />
+                    <FigureText text={usageFigure(amount.totals, false, true)} />
                   </span>
                 ) : (
                   "—"
@@ -303,7 +303,7 @@ export function UsageCostCard({
           <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
           {failures.requests !== null ? (
             <>
-              <span>{failures.requests.toLocaleString("en-US")} requests</span>
+              <span>{formatCount(failures.requests)} requests</span>
               <span>
                 {failures.failed} failed · {(failures.failure_pct ?? 0).toFixed(1)}%
               </span>
