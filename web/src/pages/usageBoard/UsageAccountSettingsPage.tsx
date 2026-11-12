@@ -4,7 +4,7 @@ import { boardPath } from "@/lib/boardFrame";
 // once — no save button — and the tile beside the rows is the preview.
 
 import { useState } from "react";
-import { Link, useNavigate, useParams } from "@/lib/routing";
+import { Link, useNavigate, useParams, useSearchParams } from "@/lib/routing";
 
 import { HelpTip } from "@/components/HelpTip";
 import { Button } from "@/components/ui/button";
@@ -20,16 +20,19 @@ import {
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 
 import { UsageBoardFrame } from "./UsageBoardFrame";
+import { UsagePricingPanel } from "./UsagePricingPanel";
 import { UsageTile } from "./UsageTile";
 import { deleteUsageAccount, useUsageOverview, type UsageAccountView } from "./usageBoardData";
 import { formatFullDate, isPercentWindow, windowName } from "./usageBoardFormat";
 import { AUTO_WINDOW, fromDateInput, pickWindow, toDateInput } from "./usageBoardSelect";
 import { renewalOf } from "./UsageBoardPage";
 import { UsageSourceConnect } from "./UsageSourceConnect";
+import { QuotaFloorControl } from "@/pages/settings/sessionChoice/QuotaFloorControl";
 import { t } from "./usageText";
 
 export function UsageAccountSettingsPage() {
   const { accountId = "" } = useParams();
+  const [search] = useSearchParams();
   const info = useServerInfo();
   const preferences = useUsageContextPreferences();
   const board = preferences.board;
@@ -44,7 +47,7 @@ export function UsageAccountSettingsPage() {
     patchUsageBoardPreferences(patch);
   }
 
-  if (!overview.isPending && !account) {
+  if (!overview.isPending && !overview.error && !account) {
     return (
       <UsageBoardFrame title="Account settings" back={{ to: "/usage/board", label: "Usage board" }}>
         <p className="text-sm text-muted-foreground">This account is not on the board any more.</p>
@@ -130,6 +133,18 @@ export function UsageAccountSettingsPage() {
                 ))}
               </datalist>
             </label>
+            <UsagePricingPanel
+              accounts={overview.data?.accounts ?? []}
+              accountId={account.id}
+              focus={search.get("focus")}
+            />
+            <QuotaFloorControl tile={account.id} label={account.display_name} account={account} />
+            <Link
+              className="flex min-h-11 items-center text-sm underline"
+              to={boardPath(`/usage/board/${encodeURIComponent(account.id)}/issues`)}
+            >
+              Issues
+            </Link>
             <WindowRow
               account={account}
               board={board}

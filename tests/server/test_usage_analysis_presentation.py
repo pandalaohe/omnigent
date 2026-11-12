@@ -235,7 +235,11 @@ async def test_router_reads_multiple_parents_and_previous_without_migration_boot
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
-        params = {"dimension": "account", "selection": json.dumps(["account-a", "account-b"])}
+        params = {
+            "dimension": "account",
+            "selection": json.dumps(["account-a", "account-b"]),
+            "include_previous": "true",
+        }
         with pytest.raises(OmnigentError):
             await client.get("/v1/me/usage/analysis", params=params)
         response = await client.get(
@@ -243,11 +247,47 @@ async def test_router_reads_multiple_parents_and_previous_without_migration_boot
         )
         assert response.status_code == 200, response.text
         assert response.json()["presentation"]["projection"]["paid"]["low"] == "150"
+        previous = response.json()["previous"]
+        assert previous["previous"] is None
+        assert previous["span"] == response.json()["presentation"]["previous"]["span"]
+        assert {row["parent_account_id"] for row in previous["rows"]} == {
+            "account-a",
+            "account-b",
+        }
         assert len(reads) == 2 and reads[1][1]["previous"]
+        assert reads[1][1]["now"] == response.json()["generated_at"]
         assert all(
             owner == "owner" and options["account_ids"] == {"account-a", "account-b"}
             for owner, options in reads
         )
+        reads.clear()
+        params["exclude"] = "account-a"
+        selected = await client.get(
+            "/v1/me/usage/analysis", params=params, headers={"x-owner": "owner"}
+        )
+        assert selected.status_code == 200
+        assert len(reads) == 2
+        assert all(options["account_ids"] == {"account-b"} for _, options in reads)
+        assert {row["parent_account_id"] for row in selected.json()["previous"]["rows"]} == {
+            "account-b"
+        }
+        del params["exclude"]
+        for pricing_store in (service.pricing_store, None):
+            service.pricing_store = pricing_store
+            for range_key in ("d7", "d90"):
+                reads.clear()
+                params["range"] = range_key
+                combined = await client.get(
+                    "/v1/me/usage/analysis", params=params, headers={"x-owner": "owner"}
+                )
+                assert combined.status_code == 200
+                assert len(reads) == (1 if range_key == "d90" else 2)
+                assert (combined.json()["previous"] is None) == (range_key == "d90")
+                assert (combined.json()["presentation"]["previous"] is None) == (
+                    range_key == "d90"
+                )
+        service.pricing_store = SimpleNamespace(read=lambda owner: baseline)
+        del params["range"]
         params["selection"] = "[]"
         assert (
             await client.get("/v1/me/usage/analysis", params=params, headers={"x-owner": "owner"})

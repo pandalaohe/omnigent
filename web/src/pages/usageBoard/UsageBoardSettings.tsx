@@ -20,6 +20,8 @@ import { useSessionCollabPreferences } from "@/hooks/useSessionCollabPreferences
 import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 
+import { UsagePricingPanel } from "./UsagePricingPanel";
+import { UsageModelPoolsLink } from "./UsageModelPoolsLink";
 import { ConnectDialog } from "./UsageSourceConnect";
 import { t } from "./usageText";
 import { UsageRing } from "./UsageRing";
@@ -129,6 +131,8 @@ export function UsageBoardSettings() {
               ›
             </span>
           </Link>
+          <UsageModelPoolsLink settings />
+          <UsagePricingPanel accounts={accounts} />
           <UsagePriceSourceSettings />
           {board.enabled ? (
             <>

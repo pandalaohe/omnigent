@@ -475,6 +475,7 @@ class UsageAnalysisView(BaseModel):
     pricing: dict[str, Any] | None = None
     presentation: dict[str, Any] | None = None
     quota_closings: list[dict[str, Any]] = Field(default_factory=list)
+    previous: UsageAnalysisView | None = None
 
 
 AnalysisTotals.model_rebuild()

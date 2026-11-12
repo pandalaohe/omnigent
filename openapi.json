@@ -18577,6 +18577,16 @@
             ],
             "title": "Presentation"
           },
+          "previous": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UsageAnalysisView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "pricing": {
             "anyOf": [
               {
@@ -29124,6 +29134,16 @@
                 }
               ],
               "title": "Exclude"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_previous",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Previous",
+              "type": "boolean"
             }
           }
         ],

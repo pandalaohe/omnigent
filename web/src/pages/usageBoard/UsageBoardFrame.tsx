@@ -1,8 +1,9 @@
-import { boardPath } from "@/lib/boardFrame";
+import { boardPath, boardExitProps } from "@/lib/boardFrame";
 // Page chrome shared by every Usage board route: the title row, the actions on
 // its right, and the loading / failed / off states, so no route renders a
 // half-filled page while the reading is still arriving.
 
+import { SettingsIcon } from "lucide-react";
 import type { ReactNode } from "react";
 import { useLocation, Link } from "@/lib/routing";
 
@@ -22,6 +23,8 @@ interface UsageBoardFrameProps {
   generatedAt?: number;
   children: ReactNode;
 }
+
+import { UsageModelPoolsLink } from "./UsageModelPoolsLink";
 
 export function UsageBoardFrame({
   title,
@@ -53,7 +56,20 @@ export function UsageBoardFrame({
               : `Data ${formatAge(Math.max(0, Date.now() / 1000 - generatedAt))} ago`}
           </span>
         ) : null}
-        <span className="usage-top-actions">{actions}</span>
+        <span className="usage-top-actions">
+          {location.pathname.endsWith("/usage/board") || analysis ? <UsageModelPoolsLink /> : null}
+          {analysis ? (
+            <Link
+              {...boardExitProps()}
+              className="inline-flex min-h-11 items-center px-2 text-xs underline"
+              to="/settings/general#usage-settings"
+              aria-label="Pricing settings"
+            >
+              <SettingsIcon className="mr-1 size-3.5" aria-hidden="true" /> Pricing
+            </Link>
+          ) : null}
+          {actions}
+        </span>
       </header>
       {back ? (
         <Button variant="ghost" size="sm" asChild>
