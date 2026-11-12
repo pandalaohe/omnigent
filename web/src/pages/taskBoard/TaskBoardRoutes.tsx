@@ -149,7 +149,7 @@ function Station({
   return (
     <span className={`rt-symbol rt-${state}`}>
       {state === "running" && session ? (
-        <BoardIdentityMark
+        <RouteAgentMark
           id={session.agentId}
           label={session.agentId}
           product={session.agentId}
@@ -163,6 +163,22 @@ function Station({
 }
 const taskKey = (task: BoardTask) =>
   task["omnigent.ai:sourceDisplay"]?.identity?.key ?? task["omnigent.ai:key"] ?? task.uid;
+function RouteAgentMark(props: Parameters<typeof BoardIdentityMark>[0]) {
+  return props.product === "claude" ? (
+    <span className="tb-identity-mark tb-brand-claude" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width={props.size} height={props.size}>
+        <path
+          fill="currentColor"
+          fillRule="evenodd"
+          clipRule="evenodd"
+          d="M20.998 10.949H24v3.102h-3v3.028h-1.487V20H18v-2.921h-1.487V20H15v-2.921H9V20H7.488v-2.921H6V20H4.487v-2.921H3V14.05H0V10.95h3V5h17.998v5.949zM6 10.949h1.488V8.102H6v2.847zm10.51 0H18V8.102h-1.49v2.847z"
+        />
+      </svg>
+    </span>
+  ) : (
+    <BoardIdentityMark {...props} />
+  );
+}
 function PhoneStation({ task }: { task: BoardTask }) {
   const state = routeState(task),
     Icon = {
@@ -181,7 +197,7 @@ function PhoneStation({ task }: { task: BoardTask }) {
   return (
     <i className={`rt-phone-icon state-${state}`}>
       {state === "running" && session ? (
-        <BoardIdentityMark
+        <RouteAgentMark
           id={session.agentId}
           label={session.agentId}
           product={session.agentId}
@@ -765,9 +781,11 @@ export function TaskBoardRoutes({
       ? date.getHours() === 0
         ? dayKey(+date) === dayKey(now)
           ? t("routes.today")
-          : dayKey(+date) === dayKey(now + DAY)
-            ? t("routes.tomorrow")
-            : dayKey(+date)
+          : dayKey(+date) === dayKey(now - DAY)
+            ? t("routes.yesterday")
+            : dayKey(+date) === dayKey(now + DAY)
+              ? t("routes.tomorrow")
+              : dayKey(+date)
         : formatDate(date, { hour: "2-digit", minute: "2-digit", hour12: false })
       : step < 28 * DAY
         ? dayKey(+date)

@@ -228,6 +228,9 @@ it("preserves plain vertical scrolling, pans the overview and restores the origi
   });
   expect(plain.defaultPrevented).toBe(false);
   fireEvent.click(screen.getByRole("button", { name: "Zoom out" }));
+  expect(
+    within(view.container.querySelector(".rt-axis")! as HTMLElement).getByText("Yesterday"),
+  ).toBeTruthy();
   expect(Number(map.getAttribute("data-window-to"))).toBe(Number(original[1]));
   expect(
     Number(map.getAttribute("data-window-to")) - Number(map.getAttribute("data-window-from")),

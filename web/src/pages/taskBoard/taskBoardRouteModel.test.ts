@@ -268,6 +268,34 @@ describe("order folding and viewport", () => {
     expect(scene.nodes[0].x1).toBeGreaterThan(scene.nodes[0].x);
     expect(scene.nodes[0].tasks).toEqual(tasks);
   });
+  it("splits collapsed time clusters at the raw gap before widening their drawn extent", () => {
+    const tasks = [task("first"), task("same-moment"), task("separate")],
+      view = { from: now - DAY, to: now + DAY },
+      width = 368,
+      gap = (34 / (width - 28)) * (view.to - view.from);
+    tasks.forEach((item, index) => {
+      item["omnigent.ai:sourceDisplay"]!.lastActivity = new Date(
+        view.from + (index === 2 ? gap : 0),
+      ).toISOString();
+    });
+    const group = mapGroups(tasks, [{ id: "example", name: "Example", source: null }], {})[0];
+    const scene = mapScene(
+      [{ ...group, top: 0, height: 74, nodes: [], header: true, collapsed: true }],
+      "time",
+      view,
+      width,
+      now,
+      "phase",
+      [],
+      new Map(),
+      {},
+      () => "",
+    );
+    expect(scene.nodes.map((node) => node.tasks.map((item) => item.uid))).toEqual([
+      ["first", "same-moment"],
+      ["separate"],
+    ]);
+  });
   it("draws rounded nearby connectors and omits phone order connectors", () => {
     const a = task("from", "running"),
       b = task("to", "user", "beta");

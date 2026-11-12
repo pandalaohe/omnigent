@@ -615,6 +615,7 @@
   pointer-events: none;
 }
 .rt-future {
+  --rt-color: var(--muted-foreground);
   position: absolute;
   left: 0;
   right: 0;
@@ -1139,12 +1140,16 @@
 .rt-focus header > input {
   width: 300px;
   max-width: 100%;
-  padding: 4px 9px;
-  height: 31px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  padding: 0 10px;
+  height: 30px;
+  border: 0;
+  outline: 0;
+  border-radius: 7px;
   background: var(--secondary);
   font-size: 13px;
+}
+.rt-focus header > input:focus {
+  box-shadow: 0 0 0 2px var(--primary);
 }
 .rt-focus header > button {
   height: 26px;

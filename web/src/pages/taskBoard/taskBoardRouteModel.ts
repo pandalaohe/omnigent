@@ -906,14 +906,22 @@ export function mapScene(
     const pinnedX = Math.min(right - 8, x(now)),
       pinnedGap = lane.collapsed ? 38 : 50,
       limit = pinned.length ? pinnedX - (pinned.length - 1) * pinnedGap - minimum : Infinity;
+    const clusters: { x: number; end: number; tasks: BoardTask[] }[] = [];
     for (const task of rest) {
       const px = Math.min(limit, x(routeMoment(task, now)!)),
-        previous = lane.nodes.at(-1);
-      if (previous && px - previous.x1 < minimum) {
+        previous = clusters.at(-1);
+      if (previous && px - previous.end < minimum) {
         previous.tasks.push(task);
-        previous.x1 = Math.max(px, previous.x + 2);
-        previous.timeCluster = true;
-      } else add([task], px);
+        previous.end = px;
+      } else clusters.push({ x: px, end: px, tasks: [task] });
+    }
+    for (const cluster of clusters) {
+      const node = add(
+        cluster.tasks,
+        cluster.x,
+        cluster.tasks.length > 1 ? Math.max(cluster.end, cluster.x + 2) : cluster.x,
+      );
+      node.timeCluster = cluster.tasks.length > 1;
     }
     pinned.forEach((task, index) => add([task], pinnedX - (pinned.length - 1 - index) * pinnedGap));
     if (view.from <= now && view.to >= now && level === "station") {
