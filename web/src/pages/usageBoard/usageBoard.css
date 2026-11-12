@@ -216,24 +216,6 @@
   outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
-@media (max-width: 600px) {
-  .usage-summary {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 6px;
-  }
-  .usage-summary > div:first-child {
-    grid-column: 1/-1;
-  }
-  .usage-tile {
-    flex-basis: calc(50% - 4px);
-  }
-  .usage-tile-wide {
-    flex-basis: 100%;
-  }
-  .usage-band {
-    width: 100%;
-  }
-}
 
 .usage-tile-balance {
   text-align: center;
@@ -300,4 +282,94 @@ html:not(.dark) .usage-board {
 .usage-tile[data-tone="crit"] [data-testid="usage-ring"],
 .usage-box[data-tone="crit"] [data-testid="usage-ring"] {
   color: light-dark(#b1241c, #ff8d89);
+}
+
+.usage-summary {
+  position: relative;
+}
+.usage-summary-link::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 14px;
+  z-index: 1;
+}
+.usage-summary-link:focus-visible::after {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+.usage-summary-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.usage-summary-tip {
+  position: relative;
+  z-index: 2;
+}
+.usage-valuation-pending {
+  margin: -2px 0 8px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+@media (min-width: 600px) and (max-width: 1350px) {
+  .usage-tile {
+    flex-basis: 150px;
+  }
+  .usage-tile-wide {
+    flex-basis: 300px;
+  }
+  .usage-satellite {
+    grid-template-columns: 14px auto auto minmax(0, 1fr);
+    font-size: 11px;
+    column-gap: 3px;
+  }
+}
+@media (max-width: 599px) {
+  .usage-board {
+    padding: 10px 10px 72px;
+  }
+  .usage-band {
+    flex: 1 1 100%;
+    padding: 2px 6px 6px;
+    border-radius: 16px;
+  }
+  .usage-tiles:not(.usage-tiles-compact) {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+  }
+  .usage-tile {
+    flex: none;
+    min-height: 0;
+  }
+  .usage-tile-wide {
+    grid-column: 1/-1;
+  }
+  .usage-summary {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .usage-summary > div:first-child {
+    grid-column: 1/-1;
+  }
+  .usage-tabs {
+    order: 3;
+    flex: 1 1 100%;
+    display: flex;
+  }
+  .usage-tabs > a {
+    flex: 1;
+    height: 34px;
+  }
+  .usage-data-age {
+    order: 4;
+    flex: 1 1 100%;
+  }
+  .usage-top {
+    column-gap: 8px;
+  }
+  .usage-tools > div {
+    position: static;
+    margin-top: 4px;
+  }
 }

@@ -25,7 +25,7 @@ import {
   pickGroups,
   type UsageWindowGroup,
 } from "./usageBoardSelect";
-import { formatAge, formatTimeLeft, windowName } from "./usageBoardFormat";
+import { formatAge, formatTimeLeft, windowName, stateTone } from "./usageBoardFormat";
 import { UsageRing } from "./UsageRing";
 import { UsageTip, UsageTipButton } from "./UsageTip";
 import { readingTip, renewalTip, windowTip } from "./usageBoardTips";
@@ -159,10 +159,15 @@ export function UsageTile({
 
   const balanceGroups = account.balances ?? [];
   const wideBoxes = picks.length + balanceGroups.length > 1;
+  const mainOf = (pick: (typeof picks)[number]) =>
+    pick.pinned ? pick.window : (pick.group.windows.at(-1) ?? null);
+  const firstMain = picks[0] ? mainOf(picks[0]) : null;
+  const displayTone = (window: typeof firstMain) =>
+    stale || empty || !window ? "mute" : stateTone(window.state);
   return (
     <article
       className={cn("usage-tile", wideBoxes && "usage-tile-wide")}
-      data-tone={!wideBoxes ? tone : undefined}
+      data-tone={!wideBoxes ? displayTone(firstMain) : undefined}
       data-testid="usage-tile"
       data-account={account.id}
       onClick={(event) => {
@@ -185,14 +190,12 @@ export function UsageTile({
             ? []
             : [{ group: { key: "", tag: null, windows: [] }, window: null, pinned: false }]
         ).map(({ group, window, pinned }) => {
-          const main = pinned ? window : (group.windows.at(-1) ?? null);
+          const main = mainOf({ group, window, pinned });
           return (
             <Link
               key={group.key}
               className={cn("usage-unit", wideBoxes && "usage-box")}
-              data-tone={
-                wideBoxes ? accountTone({ ...account, windows: group.windows }, stale) : undefined
-              }
+              data-tone={wideBoxes ? displayTone(main) : undefined}
               aria-label={`${name}${group.tag ? ` ${group.tag}` : ""}`}
               to={boardPath(
                 `/usage/board/${encodeURIComponent(account.id)}${group.key ? `?focus=${encodeURIComponent(group.key)}` : ""}`,

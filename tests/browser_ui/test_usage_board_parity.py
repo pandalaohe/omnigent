@@ -12,7 +12,12 @@ from tests.browser_ui.test_sessions_appearance import appearance_features as app
 from tests.browser_ui.test_sessions_appearance import appearance_url as appearance_url
 
 
-@pytest.mark.parametrize("width", [1280, 390])
+@pytest.fixture
+def browser_context_args(browser_context_args):
+    return {**browser_context_args, "has_touch": True}
+
+
+@pytest.mark.parametrize("width", [1280, 900, 390])
 def test_usage_ranges_pools_and_navigation(
     page: Page, appearance_url: str, browser_contract: BrowserContract, width: int
 ):
@@ -71,6 +76,10 @@ def test_usage_ranges_pools_and_navigation(
         }
         for i in range(50)
     ]
+    accounts[1]["windows"] = [
+        {**window, "id": "short", "group": None, "state": "low", "percent_used": 96},
+        {**window, "id": "month", "group": None, "state": "ok", "percent_used": 1.09},
+    ]
     browser_contract.json("/v1/info", {"usage_board_enabled": True, "features": {}})
     browser_contract.json("/v1/me/usage", {"generated_at": now, "accounts": accounts})
     ranges = []
@@ -126,6 +135,54 @@ def test_usage_ranges_pools_and_navigation(
     assert set(ranges) == {"period", "d30", "today", "h24", "d7"}
     assert len(ranges) == 5
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    expect(page.get_by_role("status")).to_contain_text("API valuation unavailable")
+    expect(page.get_by_role("status")).to_be_visible()
+    expect(page.get_by_test_id("usage-tile").nth(1)).to_have_attribute("data-tone", "ok")
+    expect(
+        page.get_by_test_id("usage-tile")
+        .nth(1)
+        .locator('.usage-satellite [data-testid="usage-ring"]')
+    ).to_have_attribute("data-tone", "crit")
+    geometry = page.evaluate("""() => {
+      const box=s=>document.querySelector(s).getBoundingClientRect().toJSON();
+      const style=s=>getComputedStyle(document.querySelector(s));
+      return {head:box('.usage-top h1'),nav:box('.usage-tabs'),age:box('.usage-data-age'),
+        regular:box('[data-account="plan-1"]'),wide:box('[data-account="plan-0"]'),
+        tilesDisplay:style('.usage-tiles').display,gap:style('.usage-tiles').gap,
+        minHeight:style('[data-account="plan-1"]').minHeight,
+        padding:style('.usage-board').paddingLeft,
+        columns:style('.usage-tiles').gridTemplateColumns};
+    }""")
+    if width < 600:
+        assert geometry["tilesDisplay"] == "grid"
+        assert geometry["gap"] == "6px"
+        assert geometry["minHeight"] == "0px"
+        assert geometry["padding"] == "10px"
+        assert len(geometry["columns"].split()) == 2
+        assert geometry["nav"]["top"] >= geometry["head"]["bottom"]
+        assert geometry["age"]["top"] >= geometry["nav"]["bottom"]
+        assert geometry["wide"]["width"] > geometry["regular"]["width"] * 1.9
+    else:
+        assert geometry["regular"]["width"] == 150
+        assert geometry["wide"]["width"] == 300
+    # Large figure, blank summary padding and native keyboard activation all open Analysis.
+    for activation in ["figure", "whitespace", "keyboard"]:
+        summary = page.get_by_role("region", name="Usage summary")
+        if activation == "figure":
+            rect = summary.locator(".usage-summary-big").bounding_box()
+            page.mouse.click(rect["x"] + rect["width"] / 2, rect["y"] + rect["height"] / 2)
+        elif activation == "whitespace":
+            rect = summary.bounding_box()
+            page.touchscreen.tap(rect["x"] + rect["width"] / 2, rect["y"] + rect["height"] - 4)
+        else:
+            summary.get_by_role("link", name="Open usage analysis").focus()
+            page.keyboard.press("Enter")
+        expect(page).to_have_url(appearance_url + "/frame/usage/board/cost")
+        page.get_by_role("link", name="Usage", exact=True).click()
+        expect(page.get_by_test_id("usage-tile")).to_have_count(50)
+    summary.get_by_role("button", name="All accounts · 30-day reported cost details").click()
+    expect(page.get_by_test_id("usage-tip-card")).to_be_visible()
+    page.keyboard.press("Escape")
     first = page.get_by_test_id("usage-tile").first
     expect(first.get_by_role("link", name="Example plan 0 Pool B", exact=True)).to_have_attribute(
         "href", "/frame/usage/board/plan-0?focus=Pool%20B"

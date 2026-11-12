@@ -310,7 +310,7 @@ it("takes the summary tap to Cost, then its failure row to ranged Issues blocks"
   mount("/usage/board");
   const summary = await screen.findByRole("region", { name: "Usage summary" });
   await waitFor(() => expect(summary.textContent).toContain("$"));
-  fireEvent.click(within(summary).getByRole("link", { name: /30-day reported cost/ }));
+  fireEvent.click(within(summary).getByRole("link", { name: "Open usage analysis" }));
   await screen.findByRole("heading", { name: "Usage board", level: 1 });
   fireEvent.click(screen.getByRole("link", { name: /requests.*failed.*unpriced.*Issues/ }));
   await screen.findByRole("heading", { name: "Issues", level: 1 });

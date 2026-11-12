@@ -112,40 +112,66 @@ export function UsageSummary({ accountIds }: { accountIds: string[] }) {
   const d7 = useUsageActivity(undefined, true, { key: "d7" });
   const visible = new Set(accountIds);
   return (
-    <section className="usage-summary" aria-label="Usage summary">
-      {[
-        ["d30", t("reported30"), d30],
-        ["today", t("today"), today],
-        ["h24", t("hours24"), h24],
-        ["d7", t("days7"), d7],
-      ].map(([key, label, query]) => {
-        const reading = query as typeof d30;
-        const amount = reading.data
-          ? boardAmount(
-              reading.data.accounts.filter((account) => visible.has(account.account)),
-              false,
-              false,
-            )
-          : null;
-        return (
-          <div key={String(key)} data-range={String(key)}>
-            <Link to={boardPath("/usage/board/cost")} className="usage-summary-label">
-              {String(label)}
-            </Link>
-            <div className={key === "d30" ? "usage-summary-big" : "usage-summary-value"}>
-              {reading.error ? (
-                "Unavailable"
-              ) : amount && amount.totals.cost_usd !== null ? (
-                <UsageAmountFigure amount={amount} tokens={false} total />
-              ) : (
-                "—"
-              )}
+    <>
+      <section className="usage-summary" aria-label="Usage summary">
+        {[
+          ["d30", t("reported30"), d30],
+          ["today", t("today"), today],
+          ["h24", t("hours24"), h24],
+          ["d7", t("days7"), d7],
+        ].map(([key, label, query]) => {
+          const reading = query as typeof d30;
+          const amount = reading.data
+            ? boardAmount(
+                reading.data.accounts.filter((account) => visible.has(account.account)),
+                false,
+                false,
+              )
+            : null;
+          return (
+            <div key={String(key)} data-range={String(key)}>
+              <div className="usage-summary-label">
+                {key === "d30" ? (
+                  <Link
+                    to={boardPath("/usage/board/cost")}
+                    className="usage-summary-link"
+                    aria-label="Open usage analysis"
+                  >
+                    {String(label)}
+                  </Link>
+                ) : (
+                  String(label)
+                )}
+                {amount ? (
+                  <UsageTipButton
+                    label={`${String(label)} details`}
+                    model={amountTip(amount, true)}
+                    className="usage-summary-tip"
+                  >
+                    ?
+                  </UsageTipButton>
+                ) : null}
+              </div>
+              <div className={key === "d30" ? "usage-summary-big" : "usage-summary-value"}>
+                {reading.error ? (
+                  "Unavailable"
+                ) : amount && amount.totals.cost_usd !== null ? (
+                  <span className="tabular-nums">
+                    {amount.mark}
+                    {usageFigure(amount.totals, false)}
+                  </span>
+                ) : (
+                  "—"
+                )}
+              </div>
             </div>
-          </div>
-        );
-      })}
-      <span className="sr-only">{t("apiPending")}</span>
-    </section>
+          );
+        })}
+      </section>
+      <p className="usage-valuation-pending" role="status">
+        {t("apiPending")}
+      </p>
+    </>
   );
 }
 

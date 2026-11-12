@@ -109,7 +109,7 @@ export function formatPercent(value: number | null | undefined): string {
 
 export function formatMoney(value: number | null | undefined): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return "—";
-  return `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  return `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2, roundingMode: "halfEven" })}`;
 }
 
 export function formatUsageValue(value: number, unit: string | null): string {
@@ -118,6 +118,7 @@ export function formatUsageValue(value: number, unit: string | null): string {
   const figure = value.toLocaleString("en-US", {
     minimumFractionDigits: symbol ? 2 : 0,
     maximumFractionDigits: symbol ? 2 : 3,
+    roundingMode: "halfEven",
   });
   return symbol ? `${symbol}${figure}` : `${figure}${unit ? ` ${unit}` : ""}`;
 }

@@ -47,7 +47,7 @@ export function UsageBoardFrame({
           </Link>
         </nav>
         {generatedAt != null ? (
-          <span className="text-xs text-muted-foreground">
+          <span className="usage-data-age text-xs text-muted-foreground">
             {Date.now() / 1000 - generatedAt < 60
               ? "Data just now"
               : `Data ${formatAge(Math.max(0, Date.now() / 1000 - generatedAt))} ago`}
