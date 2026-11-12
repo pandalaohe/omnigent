@@ -1,0 +1,813 @@
+import { graphlib, layout as layoutGraph } from "@dagrejs/dagre";
+import { timeDay, timeMonday, timeMonth, timeYear } from "d3-time";
+import { taskIdentity, taskProgress, type BoardTask, type TaskSource } from "./taskBoardData";
+import type { TaskDisplay } from "./taskBoardDisplay";
+import {
+  DAY,
+  HOUR,
+  MIN_SPAN,
+  initialWindow,
+  taskLocalTime,
+  taskRelations,
+  type TimeWindow,
+} from "./taskBoardRouteData";
+import type { SourceCache } from "./taskBoardSnapshotData";
+
+export const routeColors = [
+  "#ee352e",
+  "#0091c8",
+  "#00933c",
+  "#b933ad",
+  "#ff6319",
+  "#2f7fd4",
+  "#d4972a",
+  "#00a1a7",
+  "#7c5cdb",
+  "#df3c85",
+  "#6cbe45",
+  "#996633",
+];
+export type RouteState = NonNullable<TaskDisplay["state"]>;
+export const routeState = (task: BoardTask): RouteState =>
+  task["omnigent.ai:sourceDisplay"]?.state ??
+  (task["omnigent.ai:waiting"]
+    ? task["omnigent.ai:waiting"].on === "user"
+      ? "user"
+      : "blocked"
+    : taskProgress(task) === "in-process"
+      ? "running"
+      : ["completed", "cancelled"].includes(taskProgress(task))
+        ? "done"
+        : taskProgress(task) === "failed"
+          ? "failed"
+          : "queued");
+export const routeAttention = (task: BoardTask) =>
+  ["running", "user", "failed"].includes(routeState(task));
+export const routeQueued = (task: BoardTask) => ["queued", "blocked"].includes(routeState(task));
+export function routeMoment(task: BoardTask, now: number): number | undefined {
+  if (["running", "user"].includes(routeState(task))) return now;
+  const display = task["omnigent.ai:sourceDisplay"];
+  const supplied = [
+    display?.historyState?.end,
+    display?.historyState?.last,
+    display?.lastActivity,
+    task.progressUpdated,
+    task["omnigent.ai:closedSeen"],
+  ].flatMap((value) => (value && Number.isFinite(Date.parse(value)) ? [Date.parse(value)] : []));
+  if (supplied.length) return Math.max(...supplied);
+  const fallback = task.updated ?? task.created;
+  return fallback && Number.isFinite(Date.parse(fallback)) ? Date.parse(fallback) : undefined;
+}
+export interface MapGroup {
+  id: string;
+  source: string;
+  name: string;
+  badge: string;
+  color: string;
+  tasks: BoardTask[];
+}
+export function mapGroups(
+  tasks: BoardTask[],
+  sources: TaskSource[],
+  caches: Record<string, SourceCache>,
+): MapGroup[] {
+  const keyed = new Map<string, MapGroup>();
+  for (const task of tasks) {
+    const source = task["omnigent.ai:source"],
+      identity = task["omnigent.ai:sourceDisplay"]?.identity,
+      groupId = identity?.groupId ?? task["omnigent.ai:group"]?.id ?? "",
+      id = JSON.stringify([source, groupId]);
+    if (!keyed.has(id)) {
+      const supplied = caches[source]?.display.groups?.find((group) => group.id === groupId);
+      let name = (
+        supplied?.label ??
+        identity?.groupLabel ??
+        task["omnigent.ai:group"]?.name ??
+        groupId
+      )
+        .split(/[—:：;；,，(（]/)[0]
+        .trim();
+      if (name.toLocaleLowerCase().startsWith(source.toLocaleLowerCase()))
+        name = name.slice(source.length).trim() || name;
+      keyed.set(id, {
+        id,
+        source,
+        name,
+        badge: supplied?.badge ?? identity?.groupBadge ?? groupId,
+        color: "",
+        tasks: [],
+      });
+    }
+    keyed.get(id)!.tasks.push(task);
+  }
+  const groups = [...keyed.values()],
+    used = new Map<string, Set<number>>();
+  const colorOrder = [...groups].sort((a, b) => {
+    const rank = (group: MapGroup) =>
+      caches[group.source]?.display.groups?.find(
+        (item) => JSON.stringify([group.source, item.id]) === group.id,
+      )?.rank ?? Number.MAX_SAFE_INTEGER;
+    return rank(a) - rank(b) || a.id.localeCompare(b.id);
+  });
+  for (const group of colorOrder) {
+    const id = JSON.parse(group.id)[1] as string,
+      seed = `${group.source}/${id}`;
+    let hash = 0;
+    for (let i = 0; i < seed.length; i++) hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
+    const taken = used.get(group.source) ?? new Set<number>();
+    let index = hash % routeColors.length;
+    for (let step = 0; step < routeColors.length; step++) {
+      const candidate = (hash + step) % routeColors.length;
+      if (!taken.has(candidate)) {
+        index = candidate;
+        break;
+      }
+    }
+    group.color = routeColors[index];
+    taken.add(index);
+    used.set(group.source, taken);
+    group.tasks.sort(
+      (a, b) =>
+        (a["omnigent.ai:sourceDisplay"]?.identity?.rank ?? Number.MAX_SAFE_INTEGER) -
+          (b["omnigent.ai:sourceDisplay"]?.identity?.rank ?? Number.MAX_SAFE_INTEGER) ||
+        (a.created ?? "").localeCompare(b.created ?? ""),
+    );
+  }
+  return orderMapGroups(groups, tasks, sources);
+}
+function orderMapGroups(
+  groups: MapGroup[],
+  tasks: BoardTask[],
+  sourceMetadata: TaskSource[],
+): MapGroup[] {
+  const groupByTask = new Map(
+    groups.flatMap((group) => group.tasks.map((task) => [taskIdentity(task), group.id] as const)),
+  );
+  const attention = (group: MapGroup) => group.tasks.filter(routeAttention).length;
+  const recent = (group: MapGroup) =>
+    Math.max(
+      0,
+      ...group.tasks.map((task) => {
+        const display = task["omnigent.ai:sourceDisplay"];
+        return (
+          Date.parse(
+            display
+              ? (display.historyState?.end ?? display.historyState?.last ?? "")
+              : (task.updated ?? task.created ?? ""),
+          ) || 0
+        );
+      }),
+    );
+  const bySource = new Map<string, MapGroup[]>();
+  for (const group of groups)
+    bySource.set(group.source, [...(bySource.get(group.source) ?? []), group]);
+  const priority = (a: MapGroup, b: MapGroup) =>
+    attention(b) - attention(a) || recent(b) - recent(a);
+  const sources = [...bySource]
+    .map(([source, rows]) => ({
+      source,
+      rows: rows.sort(priority),
+      attention: rows.reduce((sum, row) => sum + attention(row), 0),
+      last: Math.max(0, ...rows.map(recent)),
+    }))
+    .sort(
+      (a, b) =>
+        b.attention - a.attention ||
+        b.last - a.last ||
+        sourceMetadata.findIndex((source) => source.id === a.source) -
+          sourceMetadata.findIndex((source) => source.id === b.source),
+    );
+  const relations = mapRelations(tasks).filter(
+    (edge) =>
+      !mapHubMembers(edge.from, tasks).some((task) => taskIdentity(task) === taskIdentity(edge.to)),
+  );
+  const links = relations.flatMap((edge) => {
+    const a = groupByTask.get(taskIdentity(edge.from)),
+      b = groupByTask.get(taskIdentity(edge.to));
+    return a && b && a !== b ? [[a, b] as [string, string]] : [];
+  });
+  const linked = new Set(links.flat()),
+    input = sources.flatMap((source) => source.rows),
+    positions = new Map<string, number>();
+  if (linked.size > 0 && linked.size <= 150) {
+    const graph = new graphlib.Graph({ compound: true })
+      .setGraph({ rankdir: "LR", nodesep: 10, ranksep: 40 })
+      .setDefaultEdgeLabel(() => ({}));
+    for (const group of input.filter((candidate) => linked.has(candidate.id))) {
+      graph.setNode(`source:${group.source}`, {});
+      graph.setNode(group.id, { width: 100, height: 20 });
+      graph.setParent(group.id, `source:${group.source}`);
+    }
+    links.forEach(([a, b], index) => {
+      const joint = `joint:${index}`;
+      graph.setNode(joint, { width: 4, height: 4 });
+      graph.setEdge(a, joint);
+      graph.setEdge(b, joint);
+    });
+    layoutGraph(graph);
+    for (const group of input.filter((candidate) => linked.has(candidate.id)))
+      positions.set(group.id, graph.node(group.id).y as number);
+  }
+  const linkedSources = sources.filter((source) =>
+      source.rows.some((group) => linked.has(group.id)),
+    ),
+    mean = (source: (typeof sources)[number]) => {
+      const values = source.rows.flatMap((group) =>
+        positions.has(group.id) ? [positions.get(group.id)!] : [],
+      );
+      return values.length ? values.reduce((a, b) => a + b, 0) / values.length : 1e12;
+    };
+  const arranged = linkedSources
+    .sort((a, b) => mean(a) - mean(b))
+    .map((source) => ({
+      source: source.source,
+      rows: source.rows
+        .filter((group) => linked.has(group.id))
+        .sort((a, b) => (positions.get(a.id) ?? 1e12) - (positions.get(b.id) ?? 1e12)),
+    }));
+  const cost = () => {
+    const at = new Map(
+        arranged.flatMap((source) => source.rows).map((row, index) => [row.id, index]),
+      ),
+      spans = links.map(([a, b]) => {
+        const x = at.get(a)!,
+          y = at.get(b)!;
+        return [Math.min(x, y), Math.max(x, y)];
+      });
+    let score = spans.reduce((sum, [a, b]) => sum + Math.max(0, b - a - 1), 0);
+    for (let i = 0; i < spans.length; i++)
+      for (let j = i + 1; j < spans.length; j++) {
+        const [a, b] = spans[i],
+          [c, d] = spans[j];
+        if ((a < c && c < b && b < d) || (c < a && a < d && d < b)) score += 2;
+      }
+    return score;
+  };
+  let best = cost(),
+    changed = true;
+  const started = performance.now();
+  while (changed && performance.now() - started < 300) {
+    changed = false;
+    for (let i = 0; i < arranged.length; i++)
+      for (let j = i + 1; j < arranged.length; j++) {
+        [arranged[i], arranged[j]] = [arranged[j], arranged[i]];
+        const next = cost();
+        if (next < best) {
+          best = next;
+          changed = true;
+        } else [arranged[i], arranged[j]] = [arranged[j], arranged[i]];
+      }
+    for (const source of arranged)
+      for (let i = 0; i + 1 < source.rows.length; i++) {
+        [source.rows[i], source.rows[i + 1]] = [source.rows[i + 1], source.rows[i]];
+        const next = cost();
+        if (next < best) {
+          best = next;
+          changed = true;
+        } else [source.rows[i], source.rows[i + 1]] = [source.rows[i + 1], source.rows[i]];
+      }
+  }
+  const attentionCost = (list: typeof arranged) =>
+    list.reduce(
+      (sum, source, index) =>
+        sum + (sources.find((item) => item.source === source.source)?.attention ?? 0) * index,
+      0,
+    );
+  if (attentionCost([...arranged].reverse()) < attentionCost(arranged)) arranged.reverse();
+  const insertRest = (source: (typeof sources)[number], linkedRows: MapGroup[]) => {
+    const rest = source.rows.filter((group) => !linkedRows.includes(group));
+    return [
+      ...rest.filter((group) => attention(group) > 0),
+      ...linkedRows,
+      ...rest.filter((group) => !attention(group)),
+    ];
+  };
+  const connected = new Set(arranged.map((source) => source.source));
+  return [
+    ...sources
+      .filter((source) => source.attention && !connected.has(source.source))
+      .flatMap((source) => insertRest(source, [])),
+    ...arranged.flatMap((source) =>
+      insertRest(
+        sources.find((item) => item.source === source.source)!,
+        source.rows,
+      ),
+    ),
+    ...sources
+      .filter((source) => !source.attention && !connected.has(source.source))
+      .flatMap((source) => insertRest(source, [])),
+  ];
+}
+
+export interface MapRelation {
+  id: string;
+  from: BoardTask;
+  to: BoardTask;
+  kind: "parent" | "dependency" | "include";
+  label?: string;
+  origin?: "observed" | "manual";
+  provenance?: string;
+  since?: string;
+  rank?: number;
+  labelKey?: "relation.next";
+}
+export function mapRelations(tasks: BoardTask[]): MapRelation[] {
+  const byId = new Map(tasks.map((task) => [taskIdentity(task), task]));
+  const out = new Map<string, MapRelation>();
+  for (const task of tasks)
+    for (const relation of task["omnigent.ai:sourceDisplay"]?.relations ?? []) {
+      const from = byId.get(JSON.stringify([relation.from.source, relation.from.uid])),
+        to = byId.get(JSON.stringify([relation.to.source, relation.to.uid]));
+      if (!from || !to) continue;
+      const id = JSON.stringify([taskIdentity(from), taskIdentity(to), relation.kind]);
+      out.set(id, { ...relation, id, from, to });
+    }
+  for (const relation of taskRelations(tasks)) {
+    if (!relation.to) continue;
+    const kind = relation.kind === "next" ? "include" : relation.kind,
+      id = JSON.stringify([taskIdentity(relation.from), taskIdentity(relation.to), kind]);
+    if (!out.has(id))
+      out.set(id, {
+        id,
+        from: relation.from,
+        to: relation.to,
+        kind,
+        ...(relation.kind === "next" ? { labelKey: "relation.next" as const } : {}),
+      });
+  }
+  return [...out.values()].sort(
+    (a, b) => (a.rank ?? Number.MAX_SAFE_INTEGER) - (b.rank ?? Number.MAX_SAFE_INTEGER),
+  );
+}
+export function mapHubMembers(task: BoardTask, tasks: BoardTask[]): BoardTask[] {
+  const members = task["omnigent.ai:sourceDisplay"]?.hub?.members;
+  if (!members) return [];
+  const byId = new Map(tasks.map((item) => [taskIdentity(item), item]));
+  return [...new Set(members.map((ref) => JSON.stringify([ref.source, ref.uid])))].flatMap((id) =>
+    byId.has(id) ? [byId.get(id)!] : [],
+  );
+}
+export interface MapFold {
+  tasks: BoardTask[];
+  queued: boolean;
+}
+export function orderStops(tasks: BoardTask[], room: number, collapsed = false): MapFold[] {
+  const past = tasks.filter((task) => !routeQueued(task)),
+    queued = tasks.filter(routeQueued);
+  if (collapsed)
+    return [
+      past.filter((task) => !routeAttention(task)),
+      ...past.filter(routeAttention).map((task) => [task]),
+      queued,
+    ]
+      .filter((items) => items.length)
+      .map((items) => ({ tasks: items, queued: items.every(routeQueued) }));
+  const sorted = [...past, ...queued];
+  if (sorted.length <= room)
+    return sorted.map((task) => ({ tasks: [task], queued: routeQueued(task) }));
+  const keep = new Set(past.filter(routeAttention));
+  let left = room - keep.size - 2;
+  const queuedCount = queued.length
+    ? Math.min(queued.length, Math.max(1, Math.floor(left * 0.3)))
+    : 0;
+  queued.slice(0, queuedCount).forEach((task) => keep.add(task));
+  left -= queuedCount;
+  for (let i = past.length - 1; i >= 0 && left > 0; i--)
+    if (!keep.has(past[i])) {
+      keep.add(past[i]);
+      left--;
+    }
+  const out: MapFold[] = [];
+  let run: BoardTask[] = [];
+  const flush = () => {
+    if (run.length) {
+      out.push({ tasks: run, queued: run.every(routeQueued) });
+      run = [];
+    }
+  };
+  for (const task of sorted) {
+    if (keep.has(task)) {
+      flush();
+      out.push({ tasks: [task], queued: routeQueued(task) });
+    } else run.push(task);
+  }
+  flush();
+  return out;
+}
+export const routePresetHours = [12, 48, 96, 192, 744, 2184, 8784] as const;
+export function clampMapWindow(view: TimeWindow, oldest: number, now: number): TimeWindow {
+  const maximum = Math.max(2 * DAY, now - oldest + DAY),
+    span = Math.min(maximum, Math.max(MIN_SPAN, view.to - view.from));
+  const future = span <= 2 * DAY ? span / 2 : Math.max(DAY, span * 0.02);
+  const from = Math.max(oldest - 3 * HOUR, Math.min(now + future - span, view.from));
+  return { from, to: from + span };
+}
+export function stepMapWindow(
+  view: TimeWindow,
+  direction: number,
+  oldest: number,
+  now: number,
+): TimeWindow {
+  const span = view.to - view.from,
+    hasNow = view.from <= now && view.to >= now;
+  const rungs = [
+    ...routePresetHours.map((hours) => hours * HOUR),
+    Math.max(2 * DAY, now - oldest + DAY),
+  ]
+    .filter((value, index, list) => list.indexOf(value) === index)
+    .sort((a, b) => a - b);
+  if (direction < 0 && hasNow && span < 2 * DAY * 0.95) return view;
+  if (direction < 0 && hasNow && span <= 2 * DAY * 1.05) return initialWindow(now);
+  const next =
+    direction > 0
+      ? rungs.find((value) => value > span * 1.05)
+      : [...rungs].reverse().find((value) => value < span * 0.95);
+  if (!next) return view;
+  if (hasNow && Math.abs(next - 2 * DAY) < HOUR) return initialWindow(now);
+  return clampMapWindow({ from: view.to - next, to: view.to }, oldest, now);
+}
+export interface MapDensity {
+  from: number;
+  to: number;
+  count: number;
+  tasks: BoardTask[];
+}
+export function mapDensity(
+  tasks: BoardTask[],
+  view: TimeWindow,
+  width: number,
+  now: number,
+  cache?: SourceCache,
+): MapDensity[] {
+  const interval =
+    [timeDay, timeMonday, timeMonth, timeMonth.every(3)!, timeYear].find(
+      (item) => item.range(new Date(view.from), new Date(view.to)).length <= Math.max(2, width / 5),
+    ) ?? timeYear;
+  const buckets = new Map<number, MapDensity>();
+  const put = (at: number, count: number, task?: BoardTask) => {
+    if (!Number.isFinite(at) || at > now || at < view.from || at > view.to) return;
+    const from = +interval.floor(new Date(at)),
+      to = +interval.offset(new Date(from), 1);
+    const bucket = buckets.get(from) ?? { from, to, count: 0, tasks: [] };
+    bucket.count += count;
+    if (task) bucket.tasks.push(task);
+    buckets.set(from, bucket);
+  };
+  if (cache?.display.closedDays?.length) {
+    for (const day of cache.display.closedDays)
+      put(taskLocalTime(`${day.date}T00:00:00`, cache.display.timeZone), day.count);
+  } else
+    for (const task of tasks) {
+      const historical = task["omnigent.ai:sourceDisplay"]?.historyState;
+      const at = historical
+        ? Date.parse(historical.end ?? historical.last)
+        : routeMoment(task, now);
+      if (at !== undefined && !routeQueued(task)) put(at, 1, task);
+    }
+  return [...buckets.values()].sort((a, b) => a.from - b.from);
+}
+export function mapOverview(
+  tasks: BoardTask[],
+  caches: Record<string, SourceCache>,
+  view: TimeWindow,
+  width: number,
+  now: number,
+): MapDensity[] {
+  const buckets = new Map<number, MapDensity>();
+  const sources = new Set([
+    ...tasks.map((task) => task["omnigent.ai:source"]),
+    ...Object.keys(caches),
+  ]);
+  for (const source of sources)
+    for (const bucket of mapDensity(
+      tasks.filter((task) => task["omnigent.ai:source"] === source),
+      view,
+      width,
+      now,
+      caches[source],
+    )) {
+      const held = buckets.get(bucket.from);
+      if (held) {
+        held.count += bucket.count;
+        held.tasks.push(...bucket.tasks);
+      } else buckets.set(bucket.from, { ...bucket, tasks: [...bucket.tasks] });
+    }
+  return [...buckets.values()].sort((a, b) => a.from - b.from);
+}
+export function roundedRoutePath(points: { x: number; y: number }[], radius = 16) {
+  let path = `M${points[0].x} ${points[0].y}`;
+  for (let i = 1; i < points.length - 1; i++) {
+    const point = points[i],
+      previous = points[i - 1],
+      next = points[i + 1],
+      a = Math.hypot(point.x - previous.x, point.y - previous.y),
+      b = Math.hypot(next.x - point.x, next.y - point.y);
+    if (!a || !b) continue;
+    const r = Math.min(radius, a / 2, b / 2);
+    path += ` L${point.x + ((previous.x - point.x) / a) * r} ${point.y + ((previous.y - point.y) / a) * r} Q${point.x} ${point.y} ${point.x + ((next.x - point.x) / b) * r} ${point.y + ((next.y - point.y) / b) * r}`;
+  }
+  return path + ` L${points.at(-1)!.x} ${points.at(-1)!.y}`;
+}
+
+export interface MapLane {
+  id: string;
+  source: string;
+  name: string;
+  badge: string;
+  color: string;
+  tasks: BoardTask[];
+  height: number;
+  top: number;
+  header?: boolean;
+  collapsed?: boolean;
+  quiet?: number;
+  pager?: boolean;
+  page?: number;
+  pages?: number;
+  nodes: MapNode[];
+  count?: number;
+}
+export interface MapNode {
+  id: string;
+  lane: string;
+  tasks: BoardTask[];
+  x: number;
+  x1: number;
+  y: number;
+  top: number;
+  height: number;
+  color: string;
+  queued: boolean;
+  label?: { x: number; y: number; width: number };
+  density?: MapDensity;
+}
+export interface MapEdge {
+  id: string;
+  from: MapNode;
+  to: MapNode;
+  path: string;
+  long: boolean;
+  hub: boolean;
+  relations: MapRelation[];
+}
+export function mapScene(
+  lanes: MapLane[],
+  mode: "order" | "time",
+  view: TimeWindow,
+  width: number,
+  now: number,
+  level: "station" | "phase" | "segment",
+  relations: MapRelation[],
+  hubs: Map<string, Set<string>>,
+  caches: Record<string, SourceCache>,
+  label: (node: MapNode) => string,
+) {
+  const phone = width <= 620;
+  if (phone && mode === "order") return { nodes: [] as MapNode[], edges: [] as MapEdge[], lanes };
+  const gutter = phone ? 14 : 208,
+    right = width - (mode === "order" ? 58 : 14),
+    nodes: MapNode[] = [];
+  const items = new Map(
+    lanes
+      .filter((lane) => !lane.quiet && !lane.pager && (!lane.header || lane.collapsed))
+      .map((lane) => [
+        lane.id,
+        orderStops(lane.tasks, Math.max(3, Math.floor((right - gutter) / 104) + 1), lane.collapsed),
+      ]),
+  );
+  const maxStops = Math.max(3, ...[...items.values()].map((stops) => stops.length)),
+    gap = Math.min(176, (right - gutter) / Math.max(1, maxStops - 1));
+  const maxDensity = Math.max(
+    1,
+    ...lanes.flatMap((lane) =>
+      mapDensity(
+        lane.tasks,
+        view,
+        width,
+        now,
+        lane.collapsed ? caches[lane.source] : undefined,
+      ).map((bucket) => bucket.count),
+    ),
+  );
+  for (const lane of lanes) {
+    lane.nodes = [];
+    if (lane.quiet || lane.pager || (lane.header && !lane.collapsed)) continue;
+    const y = lane.top + lane.height / 2 + (phone && mode === "time" ? 12 : 0);
+    const add = (tasks: BoardTask[], x: number, x1 = x, density?: MapDensity) => {
+      const node: MapNode = {
+        id: `${lane.id}:${nodes.length}`,
+        lane: lane.id,
+        tasks,
+        x,
+        x1,
+        y,
+        top: lane.top,
+        height: lane.height,
+        color: lane.color,
+        queued: tasks.length > 0 && tasks.every(routeQueued),
+        density,
+      };
+      nodes.push(node);
+      lane.nodes.push(node);
+      return node;
+    };
+    if (mode === "order") {
+      (items.get(lane.id) ?? []).forEach((item, index) => add(item.tasks, gutter + index * gap));
+      continue;
+    }
+    if (level === "segment") {
+      for (const bucket of mapDensity(
+        lane.tasks,
+        view,
+        width - gutter,
+        now,
+        lane.collapsed ? caches[lane.source] : undefined,
+      )) {
+        const x =
+            gutter +
+            Math.max(0, (bucket.from - view.from) / (view.to - view.from)) * (right - gutter),
+          x1 =
+            gutter +
+            Math.min(1, (bucket.to - view.from) / (view.to - view.from)) * (right - gutter);
+        const node = add(bucket.tasks, x, x1, bucket);
+        node.height = Math.max(3, Math.sqrt(bucket.count / maxDensity) * (lane.height - 14));
+      }
+      continue;
+    }
+    const timed = lane.tasks
+      .filter(
+        (task) =>
+          !routeQueued(task) &&
+          routeMoment(task, now) !== undefined &&
+          routeMoment(task, now)! >= view.from &&
+          routeMoment(task, now)! <= view.to,
+      )
+      .sort((a, b) => routeMoment(a, now)! - routeMoment(b, now)!);
+    const pinned = timed.filter((task) => ["running", "user"].includes(routeState(task))),
+      rest = timed.filter((task) => !pinned.includes(task));
+    const x = (time: number) =>
+      gutter + ((time - view.from) / (view.to - view.from)) * (right - gutter);
+    const minimum = lane.collapsed ? 34 : level === "station" ? 60 : 84;
+    const pinnedX = Math.min(right - 8, x(now)),
+      pinnedGap = lane.collapsed ? 38 : 50,
+      limit = pinned.length ? pinnedX - (pinned.length - 1) * pinnedGap - minimum : Infinity;
+    for (const task of rest) {
+      const px = Math.min(
+          limit,
+          Math.min(right - 10, Math.max(gutter + 10, x(routeMoment(task, now)!))),
+        ),
+        previous = lane.nodes.at(-1);
+      if (previous && px - previous.x1 < minimum) {
+        previous.tasks.push(task);
+        previous.x1 = px;
+      } else add([task], px);
+    }
+    pinned.forEach((task, index) =>
+      add([task], Math.max(gutter + 12, pinnedX - (pinned.length - 1 - index) * pinnedGap)),
+    );
+    if (view.from <= now && view.to >= now && level === "station") {
+      const queue = lane.tasks.filter(routeQueued),
+        end = Math.max(x(now), ...lane.nodes.map((node) => node.x1)),
+        first = end + (lane.collapsed ? 34 : 44),
+        gapQ = Math.min(132, Math.max(84, (right - 40 - end - 44) / Math.max(1, queue.length)));
+      const fit = lane.collapsed
+        ? first < right - 16
+          ? 1
+          : 0
+        : Math.max(0, Math.floor((right - 26 - first) / gapQ) + 1);
+      const shown =
+        queue.length > fit || lane.collapsed ? queue.slice(0, Math.max(0, fit - 1)) : queue;
+      shown.forEach((task, index) => add([task], first + index * gapQ));
+      const more = queue.slice(shown.length);
+      if (more.length && fit > 0) add(more, first + shown.length * gapQ);
+    }
+    lane.nodes.sort((a, b) => a.x - b.x);
+  }
+  const positions = new Map(
+      nodes.flatMap((node) => node.tasks.map((task) => [taskIdentity(task), node] as const)),
+    ),
+    edgeMap = new Map<string, MapEdge>();
+  if (!(mode === "time" && level === "segment") && !(mode === "order" && phone))
+    for (const relation of relations) {
+      const a = positions.get(taskIdentity(relation.from)),
+        b = positions.get(taskIdentity(relation.to));
+      if (!a || !b || a === b || a.lane === b.lane) continue;
+      const hub = hubs.get(taskIdentity(relation.from))?.has(taskIdentity(relation.to)) ?? false,
+        key = JSON.stringify([a.id, b.id, hub]),
+        existing = edgeMap.get(key);
+      if (existing) {
+        existing.relations.push(relation);
+        continue;
+      }
+      const rowA = lanes
+          .filter((lane) => (!lane.header || lane.collapsed) && !lane.quiet && !lane.pager)
+          .findIndex((lane) => lane.id === a.lane),
+        rowB = lanes
+          .filter((lane) => (!lane.header || lane.collapsed) && !lane.quiet && !lane.pager)
+          .findIndex((lane) => lane.id === b.lane);
+      const long = Math.abs(rowA - rowB) >= 2 || Math.abs(a.x - b.x) > width * 0.3,
+        dy = b.y - a.y,
+        sign = Math.sign(dy) || 1,
+        dx = Math.sign(b.x - a.x) || 1,
+        middle = a.y + sign * (a.height / 2 - 2),
+        d1 = Math.abs(middle - a.y),
+        d2 = Math.abs(b.y - middle),
+        rail = a.x + 26,
+        step = Math.min(30, Math.abs(dy) / 3);
+      const points =
+        long || hub
+          ? [a, b]
+          : Math.abs(a.x - b.x) < 10
+            ? [a, { x: rail, y: a.y + sign * step }, { x: rail, y: b.y - sign * step }, b]
+            : Math.abs(a.x - b.x) <= Math.abs(dy) * 1.3
+              ? [a, b]
+              : [a, { x: a.x + dx * d1, y: middle }, { x: b.x - dx * d2, y: middle }, b];
+      edgeMap.set(key, {
+        id: key,
+        from: a,
+        to: b,
+        path: roundedRoutePath(points),
+        long,
+        hub,
+        relations: [relation],
+      });
+    }
+  const edges = [...edgeMap.values()];
+  const occupied: { x: number; y: number; w: number; h: number }[] = nodes.map((node) => ({
+    x: node.x - 20,
+    y: node.y - 20,
+    w: node.x1 - node.x + 40,
+    h: 40,
+  }));
+  const intersects = (
+    a: { x: number; y: number },
+    b: { x: number; y: number },
+    box: { x: number; y: number; w: number; h: number },
+  ) => {
+    let low = 0,
+      high = 1;
+    const dx = b.x - a.x,
+      dy = b.y - a.y;
+    for (const [p, q] of [
+      [-dx, a.x - box.x],
+      [dx, box.x + box.w - a.x],
+      [-dy, a.y - box.y],
+      [dy, box.y + box.h - a.y],
+    ]) {
+      if (!p) {
+        if (q < 0) return false;
+        continue;
+      }
+      const ratio = q / p;
+      if (p < 0) low = Math.max(low, ratio);
+      else high = Math.min(high, ratio);
+      if (low > high) return false;
+    }
+    return true;
+  };
+  for (const node of [...nodes]
+    .filter((item) => !item.density && !lanes.find((lane) => lane.id === item.lane)?.header)
+    .sort(
+      (a, b) =>
+        Number(b.tasks.some(routeAttention)) - Number(a.tasks.some(routeAttention)) || b.x - a.x,
+    )) {
+    const text = label(node),
+      w = Math.min(
+        146,
+        Math.max(
+          64,
+          [...text].reduce((sum, char) => sum + ((char.codePointAt(0) ?? 0) > 127 ? 12 : 6.5), 0) /
+            1.6,
+        ),
+      ),
+      h = 38;
+    for (const y of [node.y - 62, node.y + 24])
+      for (const offset of [0, 10, -10, 24, -24]) {
+        if (node.label) break;
+        const x = (node.x + node.x1) / 2 - w / 2 + offset;
+        if (
+          x < gutter - 24 ||
+          x + w > width - 6 ||
+          y < node.top + 4 ||
+          y + h > node.top + node.height - 3
+        )
+          continue;
+        const box = { x, y, w, h };
+        if (
+          occupied.some(
+            (other) =>
+              box.x < other.x + other.w + 3 &&
+              other.x < box.x + box.w + 3 &&
+              box.y < other.y + other.h + 3 &&
+              other.y < box.y + box.h + 3,
+          )
+        )
+          continue;
+        if (edges.some((edge) => !edge.long && !edge.hub && intersects(edge.from, edge.to, box)))
+          continue;
+        node.label = { x, y, width: w };
+        occupied.push(box);
+      }
+  }
+  return { nodes, edges, lanes };
+}

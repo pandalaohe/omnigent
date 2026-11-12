@@ -125,8 +125,10 @@ it("reorders a newly waiting child from refreshed detail without fetching hidden
       need: "Approve the next step",
     }),
   );
-  expect(container.querySelector(".tb-session-line.child")?.getAttribute("data-session-id")).toBe(
-    "two",
+  await waitFor(() =>
+    expect(container.querySelector(".tb-session-line.child")?.getAttribute("data-session-id")).toBe(
+      "two",
+    ),
   );
   expect(fetcher.mock.calls.some(([path]) => path.includes("later-7"))).toBe(false);
 });

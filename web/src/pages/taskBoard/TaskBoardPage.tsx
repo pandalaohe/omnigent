@@ -315,12 +315,13 @@ function TaskBoardContent({
           <Spinner aria-label={t("board.loading")} className="mx-auto my-12 size-5" />
         ) : (
           <TaskBoardRoutes
+            sourceCaches={tasksQuery.data?.sourceCaches}
             tasks={tasks.filter(
               (task) =>
                 !preferences.hiddenSources.includes(task["omnigent.ai:source"]) &&
                 (!taskSelection.length || taskSelection.includes(taskIdentity(task))),
             )}
-            sources={sources}
+            sources={sources.filter((source) => !preferences.hiddenSources.includes(source.id))}
             aliases={preferences.aliases}
             boardHours={preferences.boardHours}
             lodStation={preferences.lodStation}

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -163,6 +163,7 @@ def test_task_board_display_switch_and_source_list(
                         {"session": "parent", "from": "2026-11-06T05:00:00Z"}
                     ],
                     "omnigent.ai:group": {"id": "v2", "name": "Version two"},
+                    "relatedTo": {"drop": {"relation": {"next": True}}},
                     "links": {
                         "page": {
                             "@type": "Link",
@@ -185,6 +186,14 @@ def test_task_board_display_switch_and_source_list(
                             "href": "javascript:alert(1)",
                         }
                     },
+                },
+                {
+                    "uid": "past",
+                    "title": "Earlier recovery check",
+                    "progress": "completed",
+                    "omnigent.ai:source": "example",
+                    "omnigent.ai:group": {"id": "past", "name": "Earlier checks"},
+                    "progressUpdated": (datetime.now(UTC) - timedelta(days=180)).isoformat(),
                 },
             ],
         },
@@ -307,7 +316,7 @@ def test_task_board_display_switch_and_source_list(
     region = page.get_by_role("region", name="Routes", exact=True)
     expect(region.get_by_role("heading", name="Version two")).to_be_visible()
     region.get_by_role(
-        "button", name=re.compile(r"Retry failed uploads(?:\s*ENG-1)?$")
+        "button", name=re.compile(r"^Retry failed uploads(?:\s+Waiting on you.*)?$")
     ).first.click()
     detail = page.get_by_role("region", name="Details: Retry failed uploads", exact=True)
     expect(detail.get_by_text("Check a slow connection")).to_be_visible()
@@ -316,18 +325,106 @@ def test_task_board_display_switch_and_source_list(
     detail.get_by_text("History and commits", exact=True).click()
     expect(detail.get_by_text("Keep confirmed chunks")).to_be_visible()
     detail.get_by_role("button", name="Close", exact=True).click()
-    region.get_by_role("button", name=re.compile(r"Drop the legacy endpoint")).first.click()
+    region.get_by_role(
+        "button", name=re.compile(r"^Drop the legacy endpoint(?:\s+Completed.*)?$")
+    ).first.click()
     no_page = page.get_by_role("region", name="Details: Drop the legacy endpoint", exact=True)
     expect(no_page.get_by_text("The source gives no page")).to_be_visible()
     expect(page.locator('a[href^="javascript:"]')).to_have_count(0)
     no_page.get_by_role("button", name="Close", exact=True).click()
+    if width == 1440:
+        edge = region.locator(".rt-edge-hit").first
+        hit = edge.evaluate(
+            """el => {
+              const p = el.getPointAtLength(el.getTotalLength()/2), m = el.getScreenCTM();
+              return {x:p.x*m.a+p.y*m.c+m.e, y:p.x*m.b+p.y*m.d+m.f};
+            }"""
+        )
+        page.mouse.move(hit["x"], hit["y"])
+        expect(page.get_by_role("tooltip")).to_contain_text("No relationship date supplied")
+        page.mouse.click(hit["x"], hit["y"])
+        relation = page.get_by_role("region", name="Related tasks", exact=True)
+        expect(relation).to_contain_text("Predecessor / successor")
+        relation.get_by_role("button", name="Close", exact=True).click()
     page.get_by_role("button", name="By time", exact=True).click()
-    expect(region.locator(".tb-axis")).to_be_visible()
+    expect(region.locator(".rt-axis")).to_be_visible()
+    overview = page.get_by_role(
+        "region", name="All-history overview: drag the window or its edges"
+    )
+    expect(overview).to_be_visible()
+    original = [region.get_attribute("data-window-from"), region.get_attribute("data-window-to")]
+    page.get_by_role("button", name="Zoom out", exact=True).click()
+    assert int(region.get_attribute("data-window-to")) == int(original[1])
+    assert (
+        int(region.get_attribute("data-window-to")) - int(region.get_attribute("data-window-from"))
+        == 4 * 24 * 3600000
+    )
+    window_box = overview.locator(".rt-overview-window").bounding_box()
+    assert window_box
+    page.mouse.move(
+        window_box["x"] + window_box["width"] / 2, window_box["y"] + window_box["height"] / 2
+    )
+    page.mouse.down()
+    page.mouse.move(window_box["x"] - 40, window_box["y"] + window_box["height"] / 2, steps=5)
+    page.mouse.up()
+    expect(region).not_to_have_attribute(
+        "data-window-from", str(int(original[0]) - 2 * 24 * 3600000)
+    )
+    page.get_by_role("button", name="Now", exact=True).click()
+    assert abs(int(region.get_attribute("data-window-from")) - int(original[0])) < 10000
+    assert abs(int(region.get_attribute("data-window-to")) - int(original[1])) < 10000
+    page.get_by_role("button", name="How to read this map", exact=True).click()
+    expect(page.get_by_role("region", name="How to read this map")).to_contain_text(
+        "Plain vertical scrolling"
+    )
+    page.get_by_role("button", name="How to read this map", exact=True).click()
+    if width == 390:
+        page.get_by_role("button", name="7D", exact=True).click()
+        before_pinch = int(region.get_attribute("data-window-to")) - int(
+            region.get_attribute("data-window-from")
+        )
+        region.scroll_into_view_if_needed()
+        box = region.bounding_box()
+        assert box
+        cx = box["x"] + box["width"] / 2
+        cy = max(80, min(760, box["y"] + 80))
+        cdp = page.context.new_cdp_session(page)
+        try:
+            cdp.send(
+                "Input.dispatchTouchEvent",
+                {
+                    "type": "touchStart",
+                    "touchPoints": [
+                        {"x": cx - 30, "y": cy, "id": 1},
+                        {"x": cx + 30, "y": cy, "id": 2},
+                    ],
+                },
+            )
+            cdp.send(
+                "Input.dispatchTouchEvent",
+                {
+                    "type": "touchMove",
+                    "touchPoints": [
+                        {"x": cx - 55, "y": cy, "id": 1},
+                        {"x": cx + 55, "y": cy, "id": 2},
+                    ],
+                },
+            )
+            cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+        finally:
+            cdp.detach()
+        assert (
+            int(region.get_attribute("data-window-to"))
+            - int(region.get_attribute("data-window-from"))
+            < before_pinch
+        )
+        page.get_by_role("button", name="Now", exact=True).click()
     graph = region.locator("svg").first
     assert graph.bounding_box()
     assert page.locator("main").last.evaluate(
         "element => element.scrollWidth <= element.clientWidth"
     )
+    page.locator(".tb-page-header").scroll_into_view_if_needed()
     title = page.locator(".tb-page-header").bounding_box()
     header = page.get_by_role("banner").bounding_box()
     assert title and header and title["y"] >= header["y"] + header["height"]
