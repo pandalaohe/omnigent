@@ -66,8 +66,8 @@ export function UsageAccountSettingsPage() {
       error={overview.error}
     >
       {account ? (
-        <div className="grid max-w-[760px] gap-3.5 sm:grid-cols-[172px_minmax(0,1fr)] sm:items-start">
-          <div className="sm:sticky sm:top-0">
+        <div className="grid min-w-0 max-w-[760px] gap-3.5 sm:grid-cols-[172px_minmax(0,1fr)] sm:items-start">
+          <div className="min-w-0 sm:sticky sm:top-0">
             <UsageTile
               account={account}
               pinnedWindowId={board.windows[account.id]}
@@ -77,7 +77,7 @@ export function UsageAccountSettingsPage() {
               onOpen={() => navigate(boardPath(`/usage/board/${encodeURIComponent(account.id)}`))}
             />
           </div>
-          <div className="rounded-[11px] border border-border bg-card px-3.5 py-1">
+          <div className="min-w-0 rounded-[11px] border border-border bg-card px-3.5 py-1">
             <div className="border-b border-border py-3 text-xs text-muted-foreground">
               <p>{t("preferencesHelp")}</p>
               {account.source_type ? <p>{t("sourceKind", { type: account.source_type })}</p> : null}

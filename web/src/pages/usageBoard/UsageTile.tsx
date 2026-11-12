@@ -209,6 +209,7 @@ export function UsageTile({
             >
               {wideBoxes ? <span className="usage-unit-tag">{group.tag || "\u00a0"}</span> : null}
               <UsageTip
+                className="usage-ring-trigger"
                 model={
                   main
                     ? windowTip(account, main, group.tag, {
@@ -244,6 +245,7 @@ export function UsageTile({
                         <span>{windowName(item)}</span>
                         <b>
                           {item.percent_used?.toLocaleString("en-US", {
+                            minimumFractionDigits: 2,
                             maximumFractionDigits: 2,
                           }) ?? "—"}
                           %

@@ -4,6 +4,7 @@
 // reading at all gets the dashed ring and nothing — never a `0`.
 
 import { cn } from "@/lib/utils";
+import type { CSSProperties } from "react";
 
 import type { UsageWindowView } from "./usageBoardData";
 import {
@@ -51,7 +52,7 @@ interface UsageRingProps {
   window: UsageWindowView | null;
   /** The whole account's reading is old: no colour, no pace claim. */
   stale?: boolean;
-  /** Diameter in px. */
+  /** Maximum diameter in px; the containing tile may make it smaller. */
   size?: number;
   /** Write the window name above the figure, as the board does. */
   showName?: boolean;
@@ -73,8 +74,8 @@ export function UsageRing({
   const color = TONE_STROKE[tone];
   const dashed = !window || !isPercentWindow(window);
   const percent = window && isPercentWindow(window) ? (window.percent_used ?? 0) : null;
+  const percentText = percent === null ? "" : `${percent.toFixed(2)}%`;
   const elapsed = window ? elapsedFraction(window) : 0;
-  const [whole, decimals] = (percent ?? 0).toFixed(2).split(".");
   const value =
     window && !isPercentWindow(window)
       ? window.used_value !== null && window.used_value !== undefined
@@ -84,14 +85,14 @@ export function UsageRing({
 
   return (
     <span
-      className={cn("relative inline-flex shrink-0 items-center justify-center", className)}
-      style={{ width: size, height: size }}
+      className={cn("usage-ring relative inline-flex items-center justify-center", className)}
+      style={{ "--usage-ring-size": `${size}px` } as CSSProperties}
       data-testid="usage-ring"
       data-tone={tone}
       data-state={window?.state ?? "none"}
     >
       <svg
-        viewBox="0 0 100 100"
+        viewBox="-2 -2 104 104"
         aria-hidden="true"
         className="absolute inset-0 h-full w-full"
         style={{ opacity: stale ? 0.45 : 1 }}
@@ -139,24 +140,25 @@ export function UsageRing({
           </>
         )}
       </svg>
-      <span className="relative flex flex-col items-center leading-none">
+      <span className="usage-ring-content relative flex flex-col items-center leading-none">
         {showName && window ? (
-          <span className="mb-0.5 w-full truncate px-1 text-center text-[10.5px] font-bold text-muted-foreground">
+          <span className="usage-ring-name mb-0.5 w-full truncate px-1 text-center font-bold text-muted-foreground">
             {windowName(window)}
           </span>
         ) : null}
         {percent !== null && size > 20 ? (
-          <span className="flex flex-col items-center font-bold leading-none">
-            <span style={{ fontSize: size * 0.285 }}>{whole}</span>
-            <span
-              style={{ fontSize: Math.max(10, size * 0.122) }}
-              className="mt-0.5 text-muted-foreground"
-            >
-              .{decimals}%
-            </span>
+          <span
+            className="usage-ring-percent font-bold leading-none"
+            style={{ fontSize: `${110 / percentText.length}cqw` }}
+          >
+            {percentText}
           </span>
         ) : value ? (
-          <span className="max-w-[80%] text-center text-[13px] font-semibold text-foreground">
+          <span
+            className="usage-ring-value text-center font-semibold text-foreground"
+            style={{ fontSize: `min(13px, ${110 / value.length}cqw)` }}
+            data-usage-amount
+          >
             {value}
           </span>
         ) : null}

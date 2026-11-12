@@ -18,9 +18,16 @@ export function UsageBalances({
     return (
       <div className="usage-tile-balance" data-testid="usage-balances">
         {account.balances.map((balance) => (
-          <div key={balance.id}>
+          <div key={balance.id} className="usage-balance-item">
             <div className="usage-balance-ring">
-              {formatUsageValue(balance.remaining, balance.unit)}
+              <span
+                data-usage-amount
+                style={{
+                  fontSize: `min(16px, ${110 / formatUsageValue(balance.remaining, balance.unit).length}cqw)`,
+                }}
+              >
+                {formatUsageValue(balance.remaining, balance.unit)}
+              </span>
             </div>
             <span>{balance.label ?? t("balance")}</span>
             {stale ? <span className="block text-muted-foreground">{t("balanceOld")}</span> : null}
@@ -39,13 +46,13 @@ export function UsageBalances({
             className={
               compact
                 ? "font-medium tabular-nums"
-                : "flex size-[88px] flex-col items-center justify-center rounded-full border border-dashed border-muted-foreground/40 px-1"
+                : "usage-balance-detail flex flex-col items-center justify-center rounded-full border border-dashed border-muted-foreground/40 px-1"
             }
           >
             <span className="max-w-full break-words text-[10px] text-muted-foreground">
               {balance.label ?? t("balance")}
             </span>
-            <span className="max-w-full break-all font-semibold tabular-nums">
+            <span data-usage-amount className="max-w-full break-all font-semibold tabular-nums">
               {formatUsageValue(balance.remaining, balance.unit)}
             </span>
           </span>

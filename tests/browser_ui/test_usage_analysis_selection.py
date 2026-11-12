@@ -13,6 +13,7 @@ from omnigent.usage.pricing_projection import value_usage
 from tests.browser_ui.conftest import BrowserContract
 from tests.browser_ui.test_sessions_appearance import appearance_features as appearance_features
 from tests.browser_ui.test_sessions_appearance import appearance_url as appearance_url
+from tests.browser_ui.usage_geometry import assert_usage_geometry
 
 
 @pytest.mark.parametrize("width", [1280, 900, 390])
@@ -184,6 +185,7 @@ def test_analysis_selection(
     page.goto(appearance_url + "/frame/usage/board/cost")
     picks = page.get_by_role("group", name="Select items")
     expect(picks.get_by_role("button", name="Alpha", exact=True)).to_be_visible()
+    assert_usage_geometry(page)
     picks.get_by_role("button", name="Alpha", exact=True).click()
     table = page.get_by_role("table", name="Each item")
     expect(table).to_contain_text("Alpha")
@@ -198,8 +200,10 @@ def test_analysis_selection(
     page.get_by_role("button", name="Model", exact=True).click()
     picks.get_by_role("button", name="GPT", exact=True).click()
     expect(table).to_contain_text("GPT")
+    assert_usage_geometry(page)
     expect(table).not_to_contain_text("Claude")
     expect(table).to_contain_text("Unknown")
+    assert_usage_geometry(page)
     expect(
         page.get_by_role("figure", name="Cumulative selected tokens and paid")
     ).not_to_contain_text("Previous selected hourly series not available yet")
@@ -214,6 +218,7 @@ def test_analysis_selection(
     expect(cards).to_contain_text("Alpha card")
     expect(cards).to_contain_text("$10.00")
     expect(cards).to_contain_text("$100.00")
+    assert_usage_geometry(page)
     expect(page.get_by_role("region", name="Failure rate")).to_have_count(0)
     expect(page.get_by_role("group", name="Selected weekday and hour tokens")).to_have_count(0)
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")

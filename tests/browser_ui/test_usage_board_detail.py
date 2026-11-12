@@ -9,6 +9,7 @@ from playwright.sync_api import Page, expect
 from tests.browser_ui.conftest import BrowserContract
 from tests.browser_ui.test_sessions_appearance import appearance_features as appearance_features
 from tests.browser_ui.test_sessions_appearance import appearance_url as appearance_url
+from tests.browser_ui.usage_geometry import assert_usage_geometry
 
 
 @pytest.fixture
@@ -76,8 +77,20 @@ def test_account_detail_keyboard_ranges_and_return(
         for i in range(2)
     ]
     accounts[1]["windows"] = [
-        {**window, "id": "short", "group": None, "state": "low", "percent_used": 96},
+        {**window, "id": "short", "group": None, "state": "low", "percent_used": 100},
         {**window, "id": "month", "group": None, "state": "ok", "percent_used": 1.09},
+        {
+            **window,
+            "id": "amount",
+            "group": "Amount only",
+            "percent_used": None,
+            "used_value": 1234567890123.45,
+            "unit": "USD",
+        },
+    ]
+    accounts[0]["balances"] = [
+        {"id": "balance", "remaining": 298.24, "unit": "CNY", "label": "Balance"},
+        {"id": "large", "remaining": 1234567890123.45, "unit": "USD", "label": "Large balance"},
     ]
     browser_contract.json("/v1/info", {"usage_board_enabled": True, "features": {}})
     browser_contract.json("/v1/me/usage", {"generated_at": now, "accounts": accounts})
@@ -175,6 +188,7 @@ def test_account_detail_keyboard_ranges_and_return(
     first.get_by_role("link", name="Example plan 0 Pool B", exact=True).focus()
     page.keyboard.press("Enter")
     expect(page.locator("[data-pool]").first).to_have_attribute("data-pool", "Pool B")
+    assert_usage_geometry(page)
     expect(
         page.locator(".usage-detail-cost").get_by_text(
             "Not reported · No proven usage for this pool."
@@ -188,6 +202,11 @@ def test_account_detail_keyboard_ranges_and_return(
     expect(page.get_by_role("group", name="Cost time range")).not_to_contain_text("$12.34")
     page.get_by_role("link", name="Usage board", exact=True).click()
     expect(page.get_by_test_id("usage-tile")).to_have_count(2)
+    assert_usage_geometry(page)
+    page.get_by_text("Board tools", exact=True).click()
+    page.get_by_role("button", name="Compact view", exact=True).click()
+    assert_usage_geometry(page)
+    page.get_by_role("button", name="Rings view", exact=True).click()
     page.goto(appearance_url + "/frame/usage/board/plan-0")
     cells = page.get_by_role("group", name="Cost time range")
     expect(cells.get_by_text("$12.34", exact=True)).to_have_count(3)
@@ -197,10 +216,12 @@ def test_account_detail_keyboard_ranges_and_return(
         page.keyboard.press("Enter")
         expect(button).to_have_attribute("aria-pressed", "true")
     expect(page.get_by_text("Hosts", exact=True)).to_be_visible()
+    assert_usage_geometry(page)
     page.get_by_role("link", name="Account settings").click()
     expect(page.get_by_role("link", name="Models", exact=True)).to_be_visible()
     expect(page.get_by_role("link", name="Issues", exact=True)).to_be_visible()
     expect(page.get_by_text("Connect a source", exact=True)).to_be_visible()
+    assert_usage_geometry(page)
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
 
     page.get_by_text("Pricing", exact=True).click()
@@ -218,4 +239,5 @@ def test_account_detail_keyboard_ranges_and_return(
         saved_request.value.post_data_json["cards"][0]["retail_amount"] == "100.000000000000000001"
     )
     expect(page.get_by_text("Pricing saved. History recalculated.")).to_be_visible()
+    assert_usage_geometry(page)
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")

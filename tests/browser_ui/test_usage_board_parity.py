@@ -10,6 +10,7 @@ from playwright.sync_api import Page, expect
 from tests.browser_ui.conftest import BrowserContract
 from tests.browser_ui.test_sessions_appearance import appearance_features as appearance_features
 from tests.browser_ui.test_sessions_appearance import appearance_url as appearance_url
+from tests.browser_ui.usage_geometry import assert_usage_geometry
 
 
 @pytest.fixture
@@ -125,10 +126,33 @@ def test_usage_ranges_pools_and_navigation(
         }
 
     browser_contract.json("/v1/me/usage/activity", activity)
+    browser_contract.json(
+        "/v1/me/usage/analysis",
+        {
+            "generated_at": now,
+            "rows": [],
+            "pool_catalog": [],
+            "pools": [],
+            "span": {"requested_from": now - 86400, "counted_from": now - 86400, "until": now},
+        },
+    )
+    browser_contract.json(
+        "/v1/me/usage/pricing-baseline",
+        {
+            "revision": 0,
+            "defaults": {
+                "default_discount": "1",
+                "display_currency": "USD",
+                "fx_to_display": {"USD": "1"},
+            },
+            "cards": [],
+        },
+    )
     page.set_viewport_size({"width": width, "height": 900})
     started = time.perf_counter()
     page.goto(appearance_url + "/frame/usage/board")
     expect(page.get_by_test_id("usage-tile")).to_have_count(50)
+    assert_usage_geometry(page)
     summary = page.get_by_role("region", name="Usage summary")
     expect(summary.get_by_text("$617.00")).to_have_count(4)
     # The target question glyph must not inherit a full-height button row.

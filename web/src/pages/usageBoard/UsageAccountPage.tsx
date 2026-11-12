@@ -169,16 +169,18 @@ export function UsageAccountPage() {
                             {group.tag}
                           </div>
                         ) : null}
-                        <div className="grid grid-cols-[repeat(auto-fill,minmax(112px,1fr))] gap-x-2 gap-y-3">
+                        <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,112px),1fr))] gap-x-2 gap-y-3">
                           {group.windows.map((window) => {
                             const isOn = picked.window === window && isPercentWindow(window);
                             const tone = stale || empty ? "mute" : stateTone(window.state);
                             return (
                               <div
                                 key={window.id}
+                                data-usage-window
                                 className="relative flex min-w-0 flex-col items-center gap-0.5 text-center"
                               >
                                 <UsageTip
+                                  className="usage-ring-trigger"
                                   model={windowTip(account, window, group.tag, {
                                     pinned: picked.pinned,
                                     stale: stale || empty,
