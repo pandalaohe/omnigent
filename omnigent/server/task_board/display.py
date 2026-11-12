@@ -460,6 +460,16 @@ class Snapshot(Closed):
     abandons: Id | None = None
 
 
+class RepositoryDailyCommits(Closed):
+    repository: Label
+    date: Date
+    timeZone: Zone
+    totalCommits: Count
+    refs: list[Id] = Field(max_length=8)
+    head: Id
+    collectedAt: UTCDateTime
+
+
 class SourceDisplayV1(Closed):
     version: Literal[1]
     asOf: UTCDateTime
@@ -473,6 +483,9 @@ class SourceDisplayV1(Closed):
     accounts: list[Account] = Field(default_factory=list, max_length=1000)
     accountDays: list[AccountDay] = Field(default_factory=list, max_length=36600)
     releases: list[Release] = Field(default_factory=list, max_length=200)
+    repositoryDailyCommits: list[RepositoryDailyCommits] = Field(
+        default_factory=list, max_length=400
+    )
 
     @model_validator(mode="after")
     def unique_records(self) -> SourceDisplayV1:
@@ -481,10 +494,12 @@ class SourceDisplayV1(Closed):
         accounts = [(a.ref.namespace, a.ref.id) for a in self.accounts]
         days = [(d.account.namespace, d.account.id, d.date) for d in self.accountDays]
         dates = [day.date for day in self.closedDays]
+        repository_days = [(d.repository, d.date) for d in self.repositoryDailyCommits]
         if (
             len(accounts) != len(set(accounts))
             or len(days) != len(set(days))
             or len(dates) != len(set(dates))
+            or len(repository_days) != len(set(repository_days))
         ):
             raise ValueError("Duplicate account or date")
         declared = set(accounts)

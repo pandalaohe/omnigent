@@ -2316,6 +2316,14 @@
           "maxItems": 200,
           "title": "Releases",
           "type": "array"
+        },
+        "repositoryDailyCommits": {
+          "items": {
+            "$ref": "#/$defs/DisplayRepositoryDailyCommits"
+          },
+          "maxItems": 400,
+          "title": "Repositorydailycommits",
+          "type": "array"
         }
       },
       "required": [
@@ -2325,6 +2333,68 @@
         "snapshot"
       ],
       "title": "SourceDisplayV1",
+      "type": "object"
+    },
+    "DisplayRepositoryDailyCommits": {
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "date": {
+          "pattern": "^(?![\\s\\S]*[\\r\\n])(?!0000)(?:(?:\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|02-(?:0[1-9]|1\\d|2[0-8])))|(?:(?:\\d{2}(?:0[48]|[2468][048]|[13579][26])|(?:0[48]|[2468][048]|[13579][26])00)-02-29))$",
+          "title": "Date",
+          "type": "string"
+        },
+        "timeZone": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Timezone",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "totalCommits": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Count",
+          "type": "integer"
+        },
+        "refs": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string",
+            "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+          }
+        },
+        "head": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "collectedAt": {
+          "$ref": "#/$defs/UTCDateTime"
+        }
+      },
+      "required": [
+        "repository",
+        "date",
+        "timeZone",
+        "totalCommits",
+        "refs",
+        "head",
+        "collectedAt"
+      ],
+      "title": "DisplayRepositoryDailyCommits",
       "type": "object"
     }
   }

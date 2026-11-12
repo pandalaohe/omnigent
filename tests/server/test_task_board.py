@@ -68,6 +68,81 @@ async def board_client(store):
         yield client
 
 
+async def test_repository_daily_snapshot_hash_and_pinned_paging(board_client):
+    from omnigent.stores.task_board_snapshots import digest
+
+    days = [
+        {
+            "repository": f"Repository {i}",
+            "date": "2026-11-03",
+            "timeZone": "Asia/Taipei",
+            "totalCommits": count,
+            "refs": ["refs/heads/main"],
+            "head": "a" * 40,
+            "collectedAt": STAMP,
+        }
+        for i, count in enumerate([26, 18, 18, 155, 4, 4])
+    ]
+    metadata = group(
+        **{
+            "omnigent.ai:sourceDisplay": {
+                "version": 1,
+                "asOf": STAMP,
+                "timeZone": "Asia/Taipei",
+                "repositoryDailyCommits": days,
+            }
+        }
+    )
+    del metadata["entries"]
+    header = {
+        "id": "daily",
+        "baseId": None,
+        "chunkCount": 0,
+        "expectedTaskCount": 0,
+        "contentHash": digest({"group": metadata, "tasks": [], "removedUids": []}),
+        "coverageFrom": "2026-11-03",
+        "coverageTo": "2026-11-04",
+    }
+
+    def envelope(operation):
+        display = metadata["omnigent.ai:sourceDisplay"]
+        if operation != "begin":
+            display = {
+                key: value for key, value in display.items() if key != "repositoryDailyCommits"
+            }
+        return {
+            **metadata,
+            "entries": [],
+            "omnigent.ai:sourceDisplay": {
+                **display,
+                "snapshot": {**header, "operation": operation},
+            },
+        }
+
+    begin = await board_client.put("/v1/me/tasks/sources/example", json=envelope("begin"))
+    assert begin.status_code == 200
+    header["sourceGeneration"] = begin.json()["snapshot"]["sourceGeneration"]
+    published = await board_client.put("/v1/me/tasks/sources/example", json=envelope("publish"))
+    assert published.status_code == 200
+    params = {
+        "snapshot": "daily",
+        "source_generation": header["sourceGeneration"],
+        "part": "repositoryDailyCommits",
+        "limit": 2,
+    }
+    rows = []
+    while True:
+        page = await board_client.get("/v1/me/tasks/sources/example/display", params=params)
+        assert page.status_code == 200
+        rows.extend(page.json()["entries"])
+        cursor = page.json().get("cursor")
+        if not cursor:
+            break
+        params["cursor"] = cursor
+    assert rows == days
+    assert sum(row["totalCommits"] for row in rows) == 225
+
+
 async def test_report_read_replay_and_owner_isolation(board_client, store, db_uri):
     locations = {"room": {"@type": "Location", "name": "Workshop"}}
     body = group(

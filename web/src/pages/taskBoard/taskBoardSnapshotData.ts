@@ -28,6 +28,15 @@ export interface SourceDisplay {
     sourceLabel: string;
   }[];
   releases?: { id: string; name: string; publishedAt: string; source: string }[];
+  repositoryDailyCommits?: {
+    repository: string;
+    date: string;
+    timeZone: string;
+    totalCommits: number;
+    refs: string[];
+    head: string;
+    collectedAt: string;
+  }[];
 }
 export interface AccountRef {
   namespace: string;
@@ -137,7 +146,13 @@ export async function readPinnedSources(
         held.push(...(await pages<BoardTask>("/v1/me/tasks", filters, "omnigent.ai:cursor")));
       }
       const display = identity.display;
-      for (const part of ["future", "closedDays", "accountDays", "releases"] as const) {
+      for (const part of [
+        "future",
+        "closedDays",
+        "accountDays",
+        "releases",
+        "repositoryDailyCommits",
+      ] as const) {
         const filters = new URLSearchParams(query);
         filters.set("part", part);
         // eslint-disable-next-line no-await-in-loop

@@ -378,12 +378,29 @@ Task/history cursors bind the query and source-generation vector. Incremental `c
 reads remain legacy-only; they reject for snapshot-managed sources. A deleted source's pins
 are invalid, including when another source later uses its id.
 
-`GET /v1/me/tasks/sources/{source_id}/display` accepts `part=identity|future|closedDays|accountDays|releases`,
+`GET /v1/me/tasks/sources/{source_id}/display` accepts `part=identity|future|closedDays|accountDays|releases|repositoryDailyCommits`,
 optional half-open `from`/`to`, `cursor`, and `limit` (at most 1000). Identity returns
 `{snapshot,display}` with identity/groups/checkHosts/accounts/asOf/timeZone. Array parts return
 `{snapshot,entries,cursor}`; follow opaque cursors with the same query and both pins. Task-level
 arrays have no paging route: over-bound arrays are rejected. A feeder may explicitly send the
 newest bounded records and `TaskDisplayV1.omitted` counts; it must preserve independent totals.
+
+`SourceDisplayV1.repositoryDailyCommits` optionally supplies at most 400 closed records:
+`{repository,date,timeZone,totalCommits,refs,head,collectedAt}`. Repository is a Label, date is
+the local calendar day, timeZone is its IANA committer-day boundary, totalCommits is a
+nonnegative safe integer, refs contains at most eight identifiers, head is the observed SHA,
+and collectedAt is UTCDateTime. Each repository/date occurs once; violations reject the
+whole report with 422. Count unique SHAs reachable from the declared tracked refs, including
+merges and commits without task links. Omit failed enumerations rather than reporting zero.
+These records participate in the snapshot hash and pinned array paging.
+
+Today shows repository rows and their sum separately from the existing task-linked count;
+it makes no repository-to-task association. Only records matching the browser-local day and
+time zone contribute. Duplicate observations across sources contribute once; conflicting totals
+are unavailable. Known repositories lacking a compatible day record show unavailable and the
+sum is partial. Keep earlier day records within the bound to identify repositories whose current
+enumeration failed; an omitted repository with no supplied history has no discoverable identity.
+Legacy sources remain usable with unavailable repository totals.
 
 The native client assembles each source's pages and metadata privately and publishes a complete
 cache in one step. A warm client retains its prior complete cache while updating; a cold client

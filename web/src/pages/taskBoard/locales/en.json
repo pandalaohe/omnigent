@@ -513,5 +513,9 @@
   "g6.unbilled": "Not billed",
   "g6.recent": "Back to recent",
   "g6.taskCommits": "Task-linked commits",
-  "g6.taskCommitsHint": "Only commits attached to supplied tasks; excludes repository commits without a task link."
+  "g6.taskCommitsHint": "Only commits attached to supplied tasks; excludes repository commits without a task link.",
+  "g6.repositoryCommits": "Repository commits",
+  "g6.repositoryCommitsHint": "All reported commits for the browser-local day and time zone, including merges and commits without task links.",
+  "g6.unavailable": "Unavailable",
+  "g6.partial": "Partial"
 }

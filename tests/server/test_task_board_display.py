@@ -103,6 +103,62 @@ def test_source_and_declared_accounts():
         report(group)
 
 
+def repository_day():
+    return {
+        "repository": "Example repository",
+        "date": "2026-11-03",
+        "timeZone": "Asia/Taipei",
+        "totalCommits": 225,
+        "refs": ["refs/heads/main"],
+        "head": "a" * 40,
+        "collectedAt": STAMP,
+    }
+
+
+def test_repository_daily_commits_round_trip():
+    display = {**source_display(), "repositoryDailyCommits": [repository_day()]}
+    group = {"@type": "Group", "uid": "group", "updated": STAMP, "entries": [], KEY: display}
+    assert report(group).group == group
+    jsonschema.validate(group, SCHEMA)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"totalCommits": -1},
+        {"totalCommits": True},
+        {"totalCommits": 1.5},
+        {"totalCommits": 9007199254740992},
+        {"repository": " "},
+        {"repository": "r" * 129},
+        {"date": "2026-02-30"},
+        {"timeZone": "Unknown/Zone"},
+        {"refs": ["main"] * 9},
+        {"collectedAt": "2026-11-03T00:00:00+08:00"},
+        {"unknown": 0},
+    ],
+)
+def test_invalid_repository_daily_commits_reject_whole_report(change):
+    display = {
+        **source_display(),
+        "repositoryDailyCommits": [{**repository_day(), **change}],
+    }
+    group = {"@type": "Group", "uid": "group", "updated": STAMP, "entries": [task()], KEY: display}
+    with pytest.raises(ReportError) as error:
+        report(group)
+    assert error.value.status == 422
+    assert "repositoryDailyCommits" in error.value.path
+
+
+@pytest.mark.parametrize("count", [2, 401])
+def test_duplicate_or_oversized_repository_days_rejected(count):
+    display = {**source_display(), "repositoryDailyCommits": [repository_day()] * count}
+    group = {"@type": "Group", "uid": "group", "updated": STAMP, "entries": [], KEY: display}
+    with pytest.raises(ReportError) as error:
+        report(group)
+    assert error.value.status == 422
+
+
 @pytest.mark.parametrize(
     "display",
     [

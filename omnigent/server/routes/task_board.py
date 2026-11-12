@@ -239,7 +239,9 @@ def create_task_board_router(
         request: Request,
         snapshot: str | None = None,
         source_generation: str | None = None,
-        part: Literal["identity", "future", "closedDays", "accountDays", "releases"] = "identity",
+        part: Literal[
+            "identity", "future", "closedDays", "accountDays", "releases", "repositoryDailyCommits"
+        ] = "identity",
         from_: str | None = Query(default=None, alias="from"),
         to: str | None = None,
         cursor: str | None = None,

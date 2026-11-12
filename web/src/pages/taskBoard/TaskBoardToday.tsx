@@ -3,7 +3,7 @@ import type { BoardSession } from "./taskBoardNative";
 import { boardSessionRows } from "./taskBoardSessionData";
 import { accountTotals } from "./taskBoardHistoryData";
 import { latestRelease, type SourceCache } from "./taskBoardSnapshotData";
-import { localDay } from "./taskBoardActivityData";
+import { localDay, repositoryCommitTotals } from "./taskBoardActivityData";
 import { t } from "./taskBoardText";
 import { BoardIdentityMark } from "./BoardIdentityMark";
 import {
@@ -57,19 +57,7 @@ export function TaskBoardToday({
         }),
       ),
   );
-  const bySource = new Map<string, number>();
-  commits.forEach((c) => bySource.set(c.source, (bySource.get(c.source) ?? 0) + 1));
-  const sources = [...bySource].sort((a, b) => b[1] - a[1]);
-  const topSources =
-    sources.length <= 6
-      ? sources
-      : [
-          ...sources.slice(0, 5),
-          [
-            t("g6.otherCount", { count: activityNumber(sources.length - 5) }),
-            sources.slice(5).reduce((sum, v) => sum + v[1], 0),
-          ] as [string, number],
-        ];
+  const repositoryTotals = repositoryCommitTotals(caches, now);
   const release = latestRelease(caches),
     hosts = [...new Set(Object.values(caches).flatMap((c) => c.display.checkHosts ?? []))].slice(
       0,
@@ -130,14 +118,21 @@ export function TaskBoardToday({
           {t("g6.landed")}
           <em>{t("g6.reportedGit")}</em>
         </h3>
-        <div className="td-stats">
+        <div className="td-stats td-commit-stats">
           <div>
-            <b>{activityNumber(closed.length)}</b>
-            <span>{t("today.closed")}</span>
+            <b>{repositoryTotals.total ?? t("g6.unavailable")}</b>
+            <span title={t("g6.repositoryCommitsHint")}>
+              {t("g6.repositoryCommits")}
+              {repositoryTotals.partial ? ` · ${t("g6.partial")}` : ""}
+            </span>
           </div>
           <div>
-            <b>{activityNumber(commits.size)}</b>
+            <b>{commits.size}</b>
             <span title={t("g6.taskCommitsHint")}>{t("g6.taskCommits")}</span>
+          </div>
+          <div>
+            <b>{closed.length}</b>
+            <span>{t("today.closed")}</span>
           </div>
           <div>
             <b>{release?.name ?? "—"}</b>
@@ -148,11 +143,17 @@ export function TaskBoardToday({
           </div>
         </div>
         <div className="td-roots">
-          {topSources.map(([source, n]) => (
-            <span key={source}>
-              <i style={{ width: `${Math.max(4, (n / Math.max(1, commits.size)) * 100)}%` }} />
-              <b>{source}</b>
-              <em>{activityNumber(n)}</em>
+          {repositoryTotals.rows.map(({ repository, count }) => (
+            <span key={repository}>
+              {count !== null && (
+                <i
+                  style={{
+                    width: `${Math.max(4, (count / Math.max(1, repositoryTotals.total ?? 0)) * 100)}%`,
+                  }}
+                />
+              )}
+              <b>{repository}</b>
+              <em>{count ?? t("g6.unavailable")}</em>
             </span>
           ))}
         </div>

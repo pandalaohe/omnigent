@@ -38,3 +38,11 @@ and remove its own temporary data through the fixture's cleanup route.
 The standalone acceptance report proves its component/adapter scenarios, not deployment,
 three-backend transactions, pointer behavior, or visual parity. Additional browser runs require
 the task's explicit browser authorization.
+
+For daily commit totals, supply six neutral repository rows for 2026-11-03 in Asia/Taipei
+with counts 26, 18, 18, 155, 4, 4 and 172 distinct source-scoped task-linked commits.
+With that day/zone selected by the browser clock, Today must show 225 repository commits
+beside 172 task-linked commits. Move one repository record to the preceding day: its row
+must say Unavailable and the sum must say Partial. A supplied zero remains 0. Component
+coverage lives in taskBoardActivityData.test.tsx; run the taskBoard Vitest scope under Node 24
+with TZ=Asia/Taipei. Screenshot trials require explicit authorization, at 1440 and 390 widths.
