@@ -654,4 +654,106 @@ def test_task_board_display_switch_and_source_list(
         expect(page.get_by_role("tooltip")).to_contain_text("host-failed failed")
         page.keyboard.press("Escape")
         expect(page.get_by_role("tooltip")).to_have_count(0)
+    navigation_checks = []
+    for boundary in ["source", "group", "focus"] + (["phone"] if width == 390 else []):
+        count = {"source": 13, "group": 11, "focus": 2, "phone": 9}[boundary]
+        navigation_tasks = [
+            {
+                "uid": f"nav-{index}",
+                "title": f"Navigation task {index + 1}",
+                "created": observed,
+                "updated": observed,
+                "progress": "in-process",
+                "omnigent.ai:source": f"source-{index}" if boundary == "source" else "example",
+                "omnigent.ai:group": {
+                    "id": "shared" if boundary == "phone" else f"group-{index}",
+                    "name": "Shared group" if boundary == "phone" else f"Group {index + 1}",
+                },
+                "omnigent.ai:sourceDisplay": {
+                    "version": 1,
+                    "state": "running",
+                    "lastActivity": observed,
+                },
+            }
+            for index in range(count)
+        ]
+        first, last = navigation_tasks[0], navigation_tasks[-1]
+        first["omnigent.ai:sourceDisplay"]["relations"] = [
+            {
+                "id": "navigation",
+                "from": {"source": first["omnigent.ai:source"], "uid": first["uid"]},
+                "to": {"source": last["omnigent.ai:source"], "uid": last["uid"]},
+                "kind": "dependency",
+                "origin": "manual",
+                "provenance": "Example dependency",
+            }
+        ]
+        source_ids = list(dict.fromkeys(task["omnigent.ai:source"] for task in navigation_tasks))
+        browser_contract.json(
+            "/v1/me/tasks/sources",
+            {
+                "sources": [
+                    {
+                        "id": source,
+                        "name": source,
+                        "source": None,
+                        "created": observed,
+                        "issues": [],
+                    }
+                    for source in source_ids
+                ]
+            },
+        )
+        browser_contract.json("/v1/me/tasks", {"entries": navigation_tasks, "updated": observed})
+        browser_contract.json("/v1/me/tasks/history", {"entries": []})
+        browser_contract.json(
+            "/v1/me/tasks/item",
+            lambda incoming, items=navigation_tasks: next(
+                task
+                for task in items
+                if task["uid"] == parse_qs(urlparse(incoming.url).query)["uid"][0]
+            ),
+        )
+        preferences = {
+            "theme": theme,
+            "defaultView": "routes",
+            "defaultMode": "order",
+            "refresh": 0,
+        }
+        if boundary == "focus":
+            preferences["focus"] = [json.dumps(["example", "group-0"], separators=(",", ":"))]
+        page.evaluate(
+            "value => localStorage.setItem('omnigent.taskBoard.display', JSON.stringify(value))",
+            preferences,
+        )
+        page.goto(appearance_url + "/task-board")
+        origin, target = (last, first) if boundary == "source" else (first, last)
+        trigger = page.locator(f'button[data-route-task="{origin["uid"]}"]')
+        expect(trigger).to_be_visible()
+        expect(page.locator(f'button[data-route-task="{target["uid"]}"]')).to_have_count(0)
+        trigger.click()
+        current_detail = page.get_by_role("region", name=f"Details: {origin['title']}", exact=True)
+        expect(current_detail).to_be_visible()
+        anchor_top = current_detail.evaluate("el => el.closest('.rt-panel')?.style.top ?? null")
+        current_detail.get_by_role("button", name=re.compile(re.escape(target["title"]))).click()
+        destination = page.get_by_role("region", name=f"Details: {target['title']}", exact=True)
+        expect(destination).to_be_visible()
+        if width == 390:
+            assert (
+                destination.evaluate(
+                    "el => el.closest('li').querySelector(':scope > button').dataset.routeTask"
+                )
+                == origin["uid"]
+            )
+        else:
+            assert anchor_top != "0px"
+            assert destination.evaluate("el => el.closest('.rt-panel').style.top") == anchor_top
+        expect(page.locator(f'button[data-route-task="{target["uid"]}"]')).to_have_count(0)
+        page.screenshot(
+            path=str(output / f"route-related-{boundary}-{width}-{theme}.png"), full_page=True
+        )
+        destination.get_by_role("button", name="Close", exact=True).click()
+        expect(trigger).to_be_focused()
+        navigation_checks.append(boundary)
+    print("ROUTE_RELATED_NAVIGATION", width, theme, navigation_checks, flush=True)
     assert not errors

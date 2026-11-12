@@ -78,7 +78,7 @@ import "./taskBoardRoutes.css";
 const emptyCaches: Record<string, SourceCache> = {};
 const emptySessions: BoardSession[] = [];
 type OpenPanel =
-  | { kind: "task"; lane: string; task: BoardTask }
+  | { kind: "task"; lane: string; anchor: string; task: BoardTask }
   | { kind: "cluster"; lane: string; tasks: BoardTask[] }
   | { kind: "edge"; lane: string; edge: MapEdge }
   | { kind: "hub"; lane: string; task: BoardTask };
@@ -373,7 +373,9 @@ export function TaskBoardRoutes({
     const byId = new Map(tasks.map((task) => [taskIdentity(task), task]));
     if (selection.kind === "task" || selection.kind === "hub") {
       const task = byId.get(taskIdentity(selection.task));
-      return task ? { ...selection, task } : null;
+      return task && (selection.kind !== "task" || byId.has(selection.anchor))
+        ? { ...selection, task }
+        : null;
     }
     if (selection.kind === "cluster") {
       const updated = selection.tasks.flatMap((task) =>
@@ -906,7 +908,20 @@ export function TaskBoardRoutes({
     setOpen((current) =>
       current?.kind === "task" && taskIdentity(current.task) === taskIdentity(task)
         ? null
-        : { kind: "task", lane: group.id, task },
+        : { kind: "task", lane: group.id, anchor: taskIdentity(task), task },
+    );
+    setHover(null);
+  };
+  const selectPanelTask = (task: BoardTask) => {
+    setOpen((current) =>
+      current
+        ? {
+            kind: "task",
+            lane: current.lane,
+            anchor: current.kind === "task" ? current.anchor : taskIdentity(task),
+            task,
+          }
+        : null,
     );
     setHover(null);
   };
@@ -1112,15 +1127,14 @@ export function TaskBoardRoutes({
       }}
     />
   );
+  const panelLane = model.lanes.find((lane) => lane.id === open?.lane);
   const renderPanel = () =>
-    open ? (
+    open && panelLane ? (
       <div
         ref={panelRef}
         className="rt-panel"
         style={{
-          top:
-            (model.lanes.find((lane) => lane.id === open.lane)?.top ?? 0) +
-            (model.lanes.find((lane) => lane.id === open.lane)?.height ?? 0),
+          top: panelLane.top + panelLane.height,
         }}
       >
         {open.kind === "task" ? (
@@ -1130,7 +1144,7 @@ export function TaskBoardRoutes({
             tasks={tasks}
             sessions={sessions}
             sourceCache={caches[open.task["omnigent.ai:source"]]}
-            onSelect={selectTask}
+            onSelect={selectPanelTask}
             onClose={closeDetail}
           />
         ) : (
@@ -1159,7 +1173,7 @@ export function TaskBoardRoutes({
               </button>
             </header>
             {open.kind === "edge" ? (
-              <RelationFacts relations={open.edge.relations} onSelect={selectTask} />
+              <RelationFacts relations={open.edge.relations} onSelect={selectPanelTask} />
             ) : (
               <>
                 {open.kind === "hub" && (
@@ -1206,7 +1220,7 @@ export function TaskBoardRoutes({
                             <ul>
                               {children.slice(0, 5).map((task) => (
                                 <li key={taskIdentity(task)}>
-                                  <button type="button" onClick={() => selectTask(task)}>
+                                  <button type="button" onClick={() => selectPanelTask(task)}>
                                     <code>
                                       {task["omnigent.ai:sourceDisplay"]?.identity?.key ?? task.uid}
                                     </code>
@@ -1238,7 +1252,7 @@ export function TaskBoardRoutes({
                         )
                         .map((task) => (
                           <li key={taskIdentity(task)}>
-                            <button type="button" onClick={() => selectTask(task)}>
+                            <button type="button" onClick={() => selectPanelTask(task)}>
                               <code>
                                 {task["omnigent.ai:sourceDisplay"]?.identity?.key ?? task.uid}
                               </code>
@@ -1664,14 +1678,14 @@ export function TaskBoardRoutes({
                                       </span>
                                     </button>
                                     {open?.kind === "task" &&
-                                      taskIdentity(open.task) === taskIdentity(task) && (
+                                      open.anchor === taskIdentity(task) && (
                                         <TaskBoardDetail
-                                          key={taskIdentity(task)}
-                                          task={task}
+                                          key={taskIdentity(open.task)}
+                                          task={open.task}
                                           tasks={tasks}
                                           sessions={sessions}
-                                          sourceCache={caches[task["omnigent.ai:source"]]}
-                                          onSelect={selectTask}
+                                          sourceCache={caches[open.task["omnigent.ai:source"]]}
+                                          onSelect={selectPanelTask}
                                           onClose={closeDetail}
                                         />
                                       )}

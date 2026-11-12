@@ -100,6 +100,89 @@ it("uses eight phone stations per page and clamps after tasks disappear", () => 
   expect(phone.queryByText("Task 13")).toBeNull();
   expect(phone.queryByRole("button", { name: "Next page" })).toBeNull();
 });
+it("retains the originating phone row when a related task is on another eight-stop page", () => {
+  vi.spyOn(Date, "now").mockReturnValue(now);
+  vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(390);
+  const tasks = rows(13);
+  tasks[12].relatedTo = { "task-0": { relation: { next: true } } };
+  render(board(tasks));
+  fireEvent.click(screen.getByRole("button", { name: /Source/ }));
+  const trigger = screen.getByRole("button", { name: "Task 13" });
+  act(() => trigger.focus());
+  fireEvent.click(trigger);
+  const first = screen.getByRole("region", { name: "Details: Task 13" });
+  fireEvent.click(within(first).getByRole("button", { name: /task-0/ }));
+  const destination = screen.getByRole("region", { name: "Details: Task 1" });
+  expect(destination.closest("li")).toBe(trigger.closest("li"));
+  expect(screen.queryByRole("button", { name: "Task 1" })).toBeNull();
+  fireEvent.click(within(destination).getByRole("button", { name: /task-12/ }));
+  const returned = screen.getByRole("region", { name: "Details: Task 13" });
+  expect(returned.closest("li")).toBe(trigger.closest("li"));
+  fireEvent.click(within(returned).getByRole("button", { name: "Close" }));
+  expect(document.activeElement).toBe(trigger);
+});
+it.each(["source", "group", "focus"] as const)(
+  "retains the inline anchor for a related task outside the current %s page or selection",
+  (boundary) => {
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const count = boundary === "source" ? 13 : boundary === "group" ? 11 : 2;
+    const tasks = rows(count).map((task, index): BoardTask => ({
+      ...task,
+      progress: "in-process" as const,
+      created: "2026-11-06T00:00:00Z",
+      "omnigent.ai:source": boundary === "source" ? `source-${index}` : "one",
+      "omnigent.ai:group": { id: `group-${index}`, name: `Group ${index + 1}` },
+      "omnigent.ai:sourceDisplay": {
+        version: 1,
+        state: "running",
+        lastActivity: new Date(now).toISOString(),
+      },
+    }));
+    tasks[0]["omnigent.ai:sourceDisplay"]!.relations = [
+      {
+        id: "related",
+        from: { source: tasks[0]["omnigent.ai:source"], uid: tasks[0].uid },
+        to: { source: tasks.at(-1)!["omnigent.ai:source"], uid: tasks.at(-1)!.uid },
+        kind: "dependency",
+        origin: "manual",
+        provenance: "Example dependency",
+      },
+    ];
+    const onFocus = vi.fn();
+    const sources =
+      boundary === "source"
+        ? tasks.map((task, index) => ({
+            id: task["omnigent.ai:source"],
+            name: `Source ${index + 1}`,
+            source: null,
+          }))
+        : [{ id: "one", name: "Source", source: null }];
+    const view = render(
+      board(tasks, "order", {
+        sources,
+        focus: boundary === "focus" ? [JSON.stringify(["one", "group-0"])] : [],
+        onFocus,
+      }),
+    );
+    const origin = boundary === "source" ? tasks.at(-1)! : tasks[0];
+    const target = boundary === "source" ? tasks[0] : tasks.at(-1)!;
+    const trigger = view.container.querySelector<HTMLButtonElement>(
+      `.rt-stop[data-route-task="${origin.uid}"]`,
+    )!;
+    act(() => trigger.focus());
+    fireEvent.click(trigger);
+    const first = screen.getByRole("region", { name: `Details: ${origin.title}` });
+    const anchorTop = first.closest<HTMLElement>(".rt-panel")!.style.top;
+    fireEvent.click(within(first).getByRole("button", { name: new RegExp(target.uid) }));
+    const destination = screen.getByRole("region", { name: `Details: ${target.title}` });
+    expect(destination.closest<HTMLElement>(".rt-panel")!.style.top).toBe(anchorTop);
+    expect(anchorTop).not.toBe("0px");
+    expect(view.container.querySelector(`.rt-stop[data-route-task="${target.uid}"]`)).toBeNull();
+    expect(onFocus).not.toHaveBeenCalled();
+    fireEvent.click(within(destination).getByRole("button", { name: "Close" }));
+    expect(document.activeElement).toBe(trigger);
+  },
+);
 it("selects an entire source inline and supports filtered keyboard selection", () => {
   vi.spyOn(Date, "now").mockReturnValue(now);
   const tasks = rows(2).map((task, index) => ({
