@@ -3,7 +3,7 @@
 import pytest
 from playwright.sync_api import Page
 
-from tests.browser_ui.usage_geometry import assert_usage_geometry
+from tests.browser_ui.usage_geometry import USAGE_GEOMETRY, assert_usage_geometry
 
 
 @pytest.mark.parametrize(
@@ -119,3 +119,42 @@ def test_usage_geometry_accepts_explicit_horizontal_table_scrolling(page: Page):
     before = scroller.evaluate("el => el.scrollLeft")
     assert_usage_geometry(page, {"[data-usage-label]": 1})
     assert scroller.evaluate("el => el.scrollLeft") == before
+
+
+@pytest.mark.parametrize(
+    ("outer_style", "horizontal", "vertical"),
+    [
+        ("width:40px;height:40px;overflow:hidden", True, True),
+        ("width:40px;height:40px;overflow-y:auto", True, True),
+        ("width:100px;height:40px;overflow-y:auto", False, True),
+        ("width:40px;height:40px;clip-path:inset(0)", True, True),
+        ("width:180px;height:180px;overflow:hidden", False, False),
+    ],
+)
+def test_usage_geometry_checks_outer_ancestors(
+    page: Page, outer_style: str, horizontal: bool, vertical: bool, record_property
+):
+    page.set_content(f"""<div id="outer" style="{outer_style}">
+      <div class="usage-board" style="font-size:12px;width:180px">
+        <div data-testid="usage-tile" style="width:180px;height:180px">
+          <span data-testid="usage-ring" style="display:block;width:92px;height:92px">
+            <span data-usage-label>Quota</span>
+            <span data-usage-amount style="font-size:12px">$10.00</span>
+          </span>
+        </div>
+      </div>
+    </div>""")
+    failures = page.evaluate(USAGE_GEOMETRY, {'[data-testid="usage-ring"]': 1})
+    for axis, clipped in [("horizontally", horizontal), ("vertically", vertical)]:
+        assert (
+            any(
+                message.startswith(f"ancestor clips {axis}: SPAN.")
+                and "Quota" in message
+                and "$10.00" in message
+                for message in failures
+            )
+            is clipped
+        ), failures
+    if not horizontal and not vertical:
+        assert failures == []
+    record_property("outer_clip_failures", str(failures))

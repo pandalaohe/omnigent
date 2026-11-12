@@ -29,12 +29,21 @@ USAGE_GEOMETRY = """expected => {
       if (!scrollPositions.has(parent))
         scrollPositions.set(parent, {left: parent.scrollLeft, top: parent.scrollTop});
       const rect = el.getBoundingClientRect();
+      let visibleTop = rect.top, visibleBottom = rect.bottom;
+      if (!el.children.length && el.textContent?.trim() &&
+          getComputedStyle(el).overflowY === 'visible') {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        const ink = range.getBoundingClientRect();
+        visibleTop = Math.min(visibleTop, ink.top);
+        visibleBottom = Math.max(visibleBottom, ink.bottom);
+      }
       const left = box.left + parent.clientLeft, top = box.top + parent.clientTop;
       const shift = (start, end, near, size) => start < near || end - start > size
         ? start - near : Math.max(0, end - near - size);
       parent.scrollTo({
         top: parent.scrollTop + (verticalScroller(style)
-          ? shift(rect.top, rect.bottom, top, parent.clientHeight) : 0),
+          ? shift(visibleTop, visibleBottom, top, parent.clientHeight) : 0),
         left: parent.scrollLeft + (horizontalScroller(parent, style)
           ? shift(rect.left, rect.right, left, parent.clientWidth) : 0),
         behavior: 'instant',
@@ -60,22 +69,22 @@ USAGE_GEOMETRY = """expected => {
     return inside(bound.getBoundingClientRect(), rect);
   };
   const clipping = (el, rect, ink = false) => {
-    const tile = el.closest('[data-testid="usage-tile"]') || el.closest(
-      '[data-usage-window], [data-testid="usage-balances"], .ua-panel, .ua-kpi, ' +
-      '.usage-pricing, .usage-board');
-    if (el === tile) return;
+    const ring = el.closest('[data-testid="usage-ring"], .usage-balance-ring');
+    const clips = value => ['hidden', 'clip', 'auto', 'scroll'].includes(value);
     for (let parent = ink ? el : el.parentElement; parent; parent = parent.parentElement) {
       const style = getComputedStyle(parent);
       const box = parent.getBoundingClientRect();
       const left = box.left + parent.clientLeft, top = box.top + parent.clientTop;
-      if (style.overflowX !== 'visible' && !horizontalScroller(parent, style) &&
+      const clipPath = style.clipPath !== 'none';
+      if ((clipPath || (clips(style.overflowX) &&
+          (ring || !horizontalScroller(parent, style)))) &&
           (rect.left < left - 1 || rect.right > left + parent.clientWidth + 1))
         failures.push(`ancestor clips horizontally: ${describe(el)}`);
-      if (style.overflowY !== 'visible' && !verticalScroller(style) &&
+      if ((clipPath || (clips(style.overflowY) && (ring || !verticalScroller(style)))) &&
           (rect.top < top - 1 || rect.bottom > top + parent.clientHeight + 1))
         failures.push(`ancestor clips vertically: ${describe(el)}`);
-      rect = scrollProjection(parent, rect);
-      if (parent === tile) break;
+      if (!ring) rect = scrollProjection(parent, rect);
+      if (parent === document.documentElement) break;
     }
   };
   const requireVisible = el => {
