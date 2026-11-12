@@ -107,6 +107,78 @@ def _usage(store: SqlAlchemyConversationStore, conv_id: str) -> dict:
     return dict(conversation.session_usage)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "kind", "basis"),
+    [
+        ("claude-native", "subscription", "subscription"),
+        ("claude-native", "api_key", "metered"),
+        ("codex-native", "chatgpt", "subscription"),
+        ("codex-native", "api_key", "metered"),
+        ("pi-native", "providers", "metered"),
+        ("codex-native", "unknown", "unknown"),
+        ("codex-native", None, "unknown"),
+        ("antigravity-native", None, "unknown"),
+        ("acp", None, "unknown"),
+    ],
+)
+async def test_native_flush_books_the_reported_host_login_without_probing(
+    client,
+    app,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    kind: str | None,
+    basis: str,
+) -> None:
+    from unittest.mock import Mock
+
+    from omnigent.host.frames import (
+        CAP_HARNESS_ACCOUNTS,
+        HostHelloFrame,
+    )
+    from omnigent.runtime.instruction_layers import agent_key_for_harness
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+
+    registry = app.state.host_registry
+    accounts = {agent_key_for_harness(harness): {"kind": kind}} if kind else None
+    registry.register(
+        _HOST,
+        Mock(),
+        HostHelloFrame(
+            version="test",
+            frame_protocol_version=1,
+            name="test-host",
+            capabilities=[CAP_HARNESS_ACCOUNTS],
+            harness_accounts=accounts,
+        ),
+        RESERVED_USER_LOCAL,
+    )
+    probe = Mock(side_effect=AssertionError("usage must not wait for account discovery"))
+    monkeypatch.setattr(registry, "request_harness_accounts", probe)
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(
+        agent_id="0123456789abcdef0123456789abcdef",
+        harness_override=harness,
+        host_id=_HOST,
+        workspace="/opt/work/project",
+    )
+    for cost in (0.25, 0.5):
+        response = await client.post(
+            f"/v1/sessions/{conv.id}/events",
+            json={
+                "type": "external_session_usage",
+                "data": {"cumulative_cost_usd": cost, "model": "m"},
+            },
+        )
+        assert response.status_code == 202, response.text
+
+    [row] = UsageHoursStore(db_uri).read(RESERVED_USER_LOCAL, _this_hour(), _this_hour() + 3600)
+    assert row.basis == basis
+    assert row.cost_usd == pytest.approx(0.5)
+    probe.assert_not_called()
+
+
 def test_relay_turn_writes_one_row_per_model(
     db_uri: str, hours: UsageHoursStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
