@@ -1,31 +1,38 @@
-// The board's one reading mark: a ring whose inner arc is used and whose thin
-// outer arc is time elapsed, in the window's own colour. A window that only
-// carries an amount gets a dashed ring and the figure; a window with no
-// reading at all gets the dashed ring and nothing — never a `0`.
+// The board's one reading mark: a ring whose thick arc is used, in the state's
+// colour, and whose thin outer arc is time elapsed, in a neutral tone. A window
+// that only carries an amount gets a plain figure; a window with no reading at
+// all gets a dashed ring and a dash — never a `0`.
 
 import { cn } from "@/lib/utils";
 import type { CSSProperties } from "react";
-import { useUsageReadingPlacement } from "./useUsageReadingPlacement";
 import { UsageName } from "./UsageName";
 
 import type { UsageWindowView } from "./usageBoardData";
 import {
-  formatUsageValue,
+  figureEms,
+  formatPercentReading,
   isPercentWindow,
+  ringFigureSize,
   stateTone,
   TONE_STROKE,
   windowName,
   type UsageTone,
 } from "./usageBoardFormat";
+import { UsageFigure } from "./UsageFigure";
 
-const RADIUS = 40;
-const STROKE = 8.5;
-const OUTER_RADIUS = 47.6;
-const OUTER_STROKE = 3;
-const CIRCUMFERENCE = Math.PI * 2;
+// Geometry in viewBox units (0–100): time track outside, usage track inside.
+const TIME_RADIUS = 47.5;
+const TIME_STROKE = 3;
+const USAGE_RADIUS = 41;
+const USAGE_STROKE = 7;
+// Clear radius for text: the usage track's inner edge less a 3-unit margin.
+const CLEAR_RADIUS = USAGE_RADIUS - USAGE_STROKE / 2 - 3;
+// Window-name line inside the ring: its height plus the gap above the figure.
+const NAME_BLOCK = 15;
+const TAU = Math.PI * 2;
 
-function arc(radius: number, fraction: number, color: string, stroke: number) {
-  const length = CIRCUMFERENCE * radius;
+function arc(radius: number, fraction: number, color: string, stroke: number, round: boolean) {
+  const length = TAU * radius;
   const drawn = Math.max(0, Math.min(1, fraction)) * length;
   return (
     <circle
@@ -35,7 +42,7 @@ function arc(radius: number, fraction: number, color: string, stroke: number) {
       fill="none"
       stroke={color}
       strokeWidth={stroke}
-      strokeLinecap="butt"
+      strokeLinecap={round && fraction < 0.995 ? "round" : "butt"}
       strokeDasharray={`${drawn.toFixed(2)} ${(length + 2).toFixed(2)}`}
       transform="rotate(-90 50 50)"
     />
@@ -74,110 +81,108 @@ export function UsageRing({
 }: UsageRingProps) {
   const tone = window ? toneForRing(window, stale) : "mute";
   const color = TONE_STROKE[tone];
-  const dashed = !window || !isPercentWindow(window);
   const percent = window && isPercentWindow(window) ? (window.percent_used ?? 0) : null;
-  const percentText = percent === null ? "" : `${percent.toFixed(2)}%`;
+  // An amount-only window is a figure, not a ring, once there is room to read it.
+  if (window && percent === null && size >= 64) {
+    return (
+      <UsageFigure
+        className={className}
+        label={showName ? windowName(window) : undefined}
+        value={window.used_value ?? null}
+        unit={window.unit}
+        size={size}
+      />
+    );
+  }
   const elapsed = window ? elapsedFraction(window) : 0;
-  const value =
-    window && !isPercentWindow(window)
-      ? window.used_value !== null && window.used_value !== undefined
-        ? formatUsageValue(window.used_value, window.unit)
-        : ""
-      : "";
-  const reading = percent !== null && size > 20 ? percentText : value;
-  const { circleRef, readingRef, outside } = useUsageReadingPlacement(reading);
-  const readingNode = reading ? (
-    <span
-      ref={readingRef}
-      className={cn(
-        "usage-ring-reading font-semibold",
-        percent !== null ? "usage-ring-percent font-bold leading-none" : "text-foreground",
-      )}
-      style={
-        percent !== null ? { fontSize: `max(10px, ${110 / percentText.length}cqw)` } : undefined
-      }
-      data-usage-amount={percent === null ? "" : undefined}
-      data-usage-percent={percent !== null ? "" : undefined}
-    >
-      {reading}
-    </span>
-  ) : null;
+  const reading = percent !== null && size > 20 ? formatPercentReading(percent) : "";
+  const named = showName && Boolean(window) && size > 40;
+  const figure = reading ? ringFigureSize(figureEms(reading, "%"), named ? NAME_BLOCK : 0) : 0;
+  const nameTop = ((named ? NAME_BLOCK : 0) + 0.74 * figure) / 2;
+  const nameWidth = 2 * Math.sqrt(Math.max(0, CLEAR_RADIUS ** 2 - nameTop ** 2));
 
   return (
     <span
       className={cn("usage-reading-figure", className)}
       style={{ "--usage-ring-size": `${size}px` } as CSSProperties}
-      data-reading-outside={outside}
     >
       <span
-        ref={circleRef}
-        className="usage-ring relative inline-flex items-center justify-center"
+        className="usage-ring"
         data-testid="usage-ring"
         data-tone={tone}
         data-state={window?.state ?? "none"}
+        data-stale={stale || undefined}
       >
-        <svg
-          viewBox="-2 -2 104 104"
-          aria-hidden="true"
-          className="absolute inset-0 h-full w-full"
-          style={{ opacity: stale ? 0.45 : 1 }}
-        >
-          {dashed ? (
+        <svg viewBox="0 0 100 100" aria-hidden="true" className="usage-ring-art">
+          {percent === null ? (
             <circle
               cx={50}
               cy={50}
-              r={44}
+              r={USAGE_RADIUS}
               fill="none"
-              stroke={window ? color : "var(--foreground)"}
-              strokeWidth={3}
-              strokeDasharray="6 6"
-              opacity={window ? 0.8 : 0.42}
+              className="usage-ring-track"
+              strokeWidth={2}
+              strokeDasharray="5 5"
             />
           ) : (
             <>
               <circle
                 cx={50}
                 cy={50}
-                r={RADIUS}
+                r={TIME_RADIUS}
                 fill="none"
-                stroke="var(--border)"
-                strokeWidth={STROKE}
+                className="usage-ring-track"
+                strokeWidth={TIME_STROKE}
               />
               <circle
                 cx={50}
                 cy={50}
-                r={OUTER_RADIUS}
+                r={USAGE_RADIUS}
                 fill="none"
-                stroke="var(--foreground)"
-                strokeOpacity={0.08}
-                strokeWidth={OUTER_STROKE}
+                className="usage-ring-track"
+                strokeWidth={USAGE_STROKE}
               />
-              {percent !== null ? arc(RADIUS, percent / 100, color, STROKE) : null}
-              {window ? arc(OUTER_RADIUS, elapsed, "var(--info)", OUTER_STROKE) : null}
-              {elapsed > 0 ? (
+              {arc(USAGE_RADIUS, percent / 100, color, USAGE_STROKE, true)}
+              {arc(TIME_RADIUS, elapsed, "var(--usage-time)", TIME_STROKE, false)}
+              {elapsed > 0 && size > 20 ? (
                 <circle
-                  cx={50 + OUTER_RADIUS * Math.sin(2 * Math.PI * elapsed)}
-                  cy={50 - OUTER_RADIUS * Math.cos(2 * Math.PI * elapsed)}
-                  r={3.4}
-                  fill="var(--info)"
+                  cx={50 + TIME_RADIUS * Math.sin(TAU * elapsed)}
+                  cy={50 - TIME_RADIUS * Math.cos(TAU * elapsed)}
+                  r={2.5}
+                  fill="var(--usage-time)"
                 />
               ) : null}
             </>
           )}
         </svg>
-        <span className="usage-ring-content relative flex flex-col items-center leading-none">
-          {showName && window ? (
-            <UsageName
-              data-usage-label
-              className="usage-ring-name mb-0.5 w-full px-1 text-center font-bold text-muted-foreground"
-            >
-              {windowName(window)}
-            </UsageName>
-          ) : null}
-          {!outside ? readingNode : null}
-        </span>
+        {size > 20 ? (
+          <span className="usage-ring-content">
+            {named && window ? (
+              <UsageName
+                data-usage-label
+                className="usage-ring-name"
+                style={{ maxWidth: `${nameWidth.toFixed(1)}cqi` }}
+              >
+                {windowName(window)}
+              </UsageName>
+            ) : null}
+            {reading ? (
+              <span
+                className="usage-ring-percent"
+                style={{ fontSize: `${figure}cqi` }}
+                data-usage-percent=""
+              >
+                {reading}
+                <span className="usage-unit-mark">%</span>
+              </span>
+            ) : !window ? (
+              <span className="usage-ring-none" aria-label="No reading">
+                —
+              </span>
+            ) : null}
+          </span>
+        ) : null}
       </span>
-      {outside ? readingNode : null}
     </span>
   );
 }

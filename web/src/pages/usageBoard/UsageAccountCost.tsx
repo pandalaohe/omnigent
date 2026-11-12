@@ -6,6 +6,7 @@ import { UsageCostChart } from "./UsageCostChart";
 import { usageFigure } from "./usageAmountData";
 import { formatFullDate } from "./usageBoardFormat";
 import { UsageName } from "./UsageName";
+import { FigureText } from "./UsageFigure";
 
 export function UsageAccountCost({ account }: { account: UsageAccountView }) {
   const [selected, setSelected] = useState(1);
@@ -23,16 +24,13 @@ export function UsageAccountCost({ account }: { account: UsageAccountView }) {
   const error = queryState.error;
   return (
     <>
-      <section
-        aria-label="Cost"
-        className="usage-detail-cost rounded-[11px] border border-border bg-card px-3.5 py-3"
-      >
-        <div className="flex items-center justify-between gap-2">
-          <h2 className="text-sm font-semibold">Cost</h2>
-          <span className="text-xs text-muted-foreground">Reported cost</span>
+      <section aria-label="Cost" className="usage-card usage-detail-cost">
+        <div className="usage-card-head">
+          <h2 className="usage-card-title">Cost</h2>
+          <span className="usage-caption">Reported cost</span>
         </div>
         {focus ? (
-          <UsageName className="text-xs text-muted-foreground">{`${focus} · Pool usage only`}</UsageName>
+          <UsageName className="usage-caption">{`${focus} · Pool usage only`}</UsageName>
         ) : null}
         <div className="usage-detail-cells" role="group" aria-label="Cost time range">
           {["Today", "Last 7 days", "This period"].map((label, index) => {
@@ -47,26 +45,30 @@ export function UsageAccountCost({ account }: { account: UsageAccountView }) {
               >
                 <span>{label}</span>
                 <b>
-                  {read.error
-                    ? "Unavailable"
-                    : amount
-                      ? `${amount.mark ?? ""}${usageFigure(amount.totals, false)}`
-                      : "—"}
+                  {read.error ? (
+                    "Unavailable"
+                  ) : amount ? (
+                    <>
+                      {amount.mark ? <span className="usage-approx">{amount.mark}</span> : null}
+                      <FigureText text={usageFigure(amount.totals, false)} />
+                    </>
+                  ) : (
+                    "—"
+                  )}
                 </b>
               </button>
             );
           })}
         </div>
-        <p className="text-xs text-muted-foreground">API price · Not available yet</p>
         {error ? (
-          <p role="alert" className="text-xs text-destructive">
+          <p role="alert" className="usage-caption text-destructive">
             Cost could not be read
           </p>
         ) : queryState.isPending ? (
-          <p className="text-xs text-muted-foreground">Reading cost…</p>
+          <p className="usage-caption">Reading cost…</p>
         ) : own ? (
           <>
-            <p className="text-xs text-muted-foreground">
+            <p className="usage-caption">
               {formatFullDate(own.span.counted_from)} – {formatFullDate(own.span.until)}
             </p>
             <UsageCostChart
@@ -77,25 +79,23 @@ export function UsageAccountCost({ account }: { account: UsageAccountView }) {
             />
           </>
         ) : (
-          <p className="text-xs text-muted-foreground">
+          <p className="usage-caption">
             {focus ? "Not reported · No proven usage for this pool." : "No usage in this range."}
           </p>
         )}
+        <p className="usage-caption usage-card-note">API price · Not available yet</p>
       </section>
-      <details className="rounded-[11px] border border-border bg-card px-3.5 text-sm">
-        <summary className="cursor-pointer py-3 font-semibold">Cost breakdown</summary>
+      <details className="usage-card usage-fold">
+        <summary>Cost breakdown</summary>
         {own?.models?.length ? (
           own.models.map((model) => (
-            <div
-              key={model.model}
-              className="flex min-w-0 items-center gap-3 border-t border-border py-2 text-xs"
-            >
+            <div key={model.model} className="usage-row">
               <UsageName className="flex-1">{model.model}</UsageName>
-              <span className="shrink-0 tabular-nums">{usageFigure(model, false)}</span>
+              <FigureText className="usage-row-figure" text={usageFigure(model, false)} />
             </div>
           ))
         ) : (
-          <p className="pb-3 text-xs text-muted-foreground">No model usage in this range.</p>
+          <p className="usage-caption">No model usage in this range.</p>
         )}
       </details>
     </>

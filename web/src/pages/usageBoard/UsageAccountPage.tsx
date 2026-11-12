@@ -28,6 +28,7 @@ import { useUsageOverview } from "./usageBoardData";
 import {
   formatAge,
   formatFullDate,
+  formatPercentReading,
   formatTimeLeft,
   formatUsageValue,
   isPercentWindow,
@@ -101,16 +102,16 @@ export function UsageAccountPage() {
       {account ? (
         <>
           <div className="usage-account-heading">
-            <h2 className="text-xl font-bold">
+            <h2 className="usage-account-name">
               <UsageName>{account.display_name}</UsageName>
             </h2>
-            <p className="text-sm text-muted-foreground">
+            <p className="usage-caption">
               <UsageName>
                 {`${account.plan ?? ""}${renewal != null ? ` · Renews ${formatFullDate(renewal.at / 1000)}` : ""}`}
               </UsageName>
             </p>
           </div>
-          <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+          <div className="usage-account-meta">
             <UsageTip model={readingTip(account)} tapOpens>
               <span className="inline-flex items-center gap-1">
                 {account.kind === "native" ? (
@@ -142,20 +143,17 @@ export function UsageAccountPage() {
 
           <div className="usage-account-detail">
             <div className="usage-detail-grid">
-              <section className="rounded-[11px] border border-border bg-card px-3.5 py-3">
-                <div className="mb-2 flex min-h-5 items-center gap-1.5 text-[13px] font-semibold">
-                  Quota
-                  <span className="flex-1" />
+              <section className="usage-card">
+                <div className="usage-card-head">
+                  <h2 className="usage-card-title">Quota</h2>
                   {stale && account.age_s !== null ? (
-                    <span className="text-[11px] font-normal text-muted-foreground">
-                      Read {formatAge(account.age_s)} ago
-                    </span>
+                    <span className="usage-caption">Read {formatAge(account.age_s)} ago</span>
                   ) : null}
                 </div>
                 {groups.length === 0 ? (
                   <div className="flex flex-col items-center gap-2 py-6">
-                    <UsageRing window={null} stale size={92} />
-                    <p className="text-xs text-muted-foreground">
+                    <UsageRing window={null} stale size={88} />
+                    <p className="usage-caption">
                       {empty ? "No reading yet." : "The last read returned no window."}
                     </p>
                   </div>
@@ -169,20 +167,14 @@ export function UsageAccountPage() {
                         data-focused={group.key === focus || undefined}
                       >
                         {group.tag ? (
-                          <UsageName className="mb-1 mt-2 text-[11px] text-muted-foreground">
-                            {group.tag}
-                          </UsageName>
+                          <UsageName className="usage-group-tag">{group.tag}</UsageName>
                         ) : null}
-                        <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,112px),1fr))] gap-x-2 gap-y-3">
+                        <div className="usage-window-grid">
                           {group.windows.map((window) => {
                             const isOn = picked.window === window && isPercentWindow(window);
                             const tone = stale || empty ? "mute" : stateTone(window.state);
                             return (
-                              <div
-                                key={window.id}
-                                data-usage-window
-                                className="relative flex min-w-0 flex-col items-center gap-0.5 text-center"
-                              >
+                              <div key={window.id} data-usage-window className="usage-window">
                                 <UsageTip
                                   className="usage-ring-trigger"
                                   model={windowTip(account, window, group.tag, {
@@ -195,21 +187,21 @@ export function UsageAccountPage() {
                                   <UsageRing
                                     window={window}
                                     stale={stale || empty}
-                                    size={92}
+                                    size={88}
                                     showName
                                   />
                                 </UsageTip>
                                 {window.percent_used !== null ? (
                                   <span
                                     className={cn(
-                                      "whitespace-nowrap text-[14px] font-semibold leading-tight",
-                                      stale ? "text-muted-foreground" : "text-info",
+                                      "usage-countdown",
+                                      stale && "text-muted-foreground",
                                     )}
                                   >
                                     {formatTimeLeft(window.time_left_s) || "—"}
                                   </span>
                                 ) : null}
-                                <span className="max-w-full text-[11px] leading-tight text-muted-foreground">
+                                <span className="usage-caption max-w-full">
                                   {window.resets_at !== null ? (
                                     `Resets ${formatFullDate(window.resets_at)}`
                                   ) : (
@@ -217,7 +209,7 @@ export function UsageAccountPage() {
                                   )}
                                 </span>
                                 {window.used_value !== null ? (
-                                  <span className="text-[11px] text-muted-foreground">
+                                  <span className="usage-caption">
                                     Used {formatUsageValue(window.used_value, window.unit)}
                                     {window.limit_value !== null
                                       ? ` / ${formatUsageValue(window.limit_value, window.unit)}`
@@ -225,19 +217,19 @@ export function UsageAccountPage() {
                                   </span>
                                 ) : null}
                                 {window.remaining_pct !== null ? (
-                                  <span className="text-[11px] text-muted-foreground">
-                                    Remaining {Number(window.remaining_pct.toFixed(2))}%
+                                  <span className="usage-caption">
+                                    Remaining {formatPercentReading(window.remaining_pct)}%
                                   </span>
                                 ) : null}
                                 {window.ahead_pts !== null && window.ahead_pts > 0 && !stale ? (
-                                  <span className="text-[11px] text-warning">
-                                    Ahead of time by {Number(window.ahead_pts.toFixed(2))} points
+                                  <span className="usage-caption text-warning">
+                                    Ahead of time by {formatPercentReading(window.ahead_pts)} points
                                   </span>
                                 ) : null}
                                 {isOn ? (
                                   <span
                                     className={cn(
-                                      "inline-flex items-center gap-0.5 text-[11px]",
+                                      "usage-caption inline-flex items-center gap-1",
                                       TONE_TEXT[tone],
                                     )}
                                     title={
@@ -263,7 +255,7 @@ export function UsageAccountPage() {
                   })
                 )}
                 {account.balances?.length ? (
-                  <div className="mt-3 border-t border-border pt-3 [&>div]:justify-start">
+                  <div className="usage-card-section">
                     <UsageBalances account={account} />
                   </div>
                 ) : null}
@@ -272,16 +264,16 @@ export function UsageAccountPage() {
               <div className="grid grid-cols-1 gap-2">
                 <UsageAccountCost account={account} />
                 <UsagePricingSummary accountId={account.id} />
-                <section className="rounded-[11px] border border-border bg-card px-3.5 py-3">
-                  <h2 className="text-sm font-semibold">Used in</h2>
+                <section className="usage-card">
+                  <h2 className="usage-card-title">Used in</h2>
                   <UsageModelPoolsLink />
                 </section>
               </div>
             </div>
-            <details className="mt-2 rounded-[11px] border border-border bg-card px-3.5 py-3 text-sm">
-              <summary className="cursor-pointer font-semibold">Usage tools</summary>
+            <details className="usage-card usage-fold mt-2">
+              <summary>Usage tools</summary>
               {focus && !activity.data?.accounts.length ? (
-                <p className="pt-2 text-xs text-muted-foreground">
+                <p className="usage-caption">
                   {activity.error
                     ? "Cost could not be read"
                     : activity.isPending
@@ -300,15 +292,15 @@ export function UsageAccountPage() {
                 </>
               )}
             </details>
-            <details className="mt-2 rounded-[11px] border border-border bg-card px-3.5 py-3 text-sm">
-              <summary className="cursor-pointer font-semibold">Records</summary>
-              <p className="pt-2 text-xs text-muted-foreground">Not available yet</p>
+            <details className="usage-card usage-fold mt-2">
+              <summary>Records</summary>
+              <p className="usage-caption">Not available yet</p>
             </details>
             <div className="mt-2">
-              <details className="rounded-[11px] border border-border bg-card px-3.5 py-3">
-                <summary className="cursor-pointer text-[13px] font-semibold">Hosts</summary>
+              <details className="usage-card usage-fold">
+                <summary>Hosts</summary>
                 {account.hosts.length === 0 ? (
-                  <p className="py-2 text-xs text-muted-foreground">
+                  <p className="usage-caption">
                     This source reports no hosts. A host's own reading appears here once one sends
                     it.
                   </p>

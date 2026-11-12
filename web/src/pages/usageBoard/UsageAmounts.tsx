@@ -1,6 +1,12 @@
 import { boardPath } from "@/lib/boardFrame";
 import { Link } from "@/lib/routing";
-import { ArrowDownRightIcon, ArrowUpRightIcon, HistoryIcon, TriangleAlertIcon } from "lucide-react";
+import {
+  ArrowDownRightIcon,
+  ArrowUpRightIcon,
+  CircleHelpIcon,
+  HistoryIcon,
+  TriangleAlertIcon,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
@@ -15,6 +21,7 @@ import { UsageTip, UsageTipButton } from "./UsageTip";
 import { UsageRangeControl } from "./UsageRangeControl";
 import { UsageCostChart } from "./UsageCostChart";
 import { UsageName } from "./UsageName";
+import { FigureText } from "./UsageFigure";
 
 export function UsageUnitControl() {
   const tokens = useUsageContextPreferences().board.unit === "tokens";
@@ -86,8 +93,8 @@ export function UsageAmountFigure({
 }) {
   const figure = (
     <>
-      {!tokens ? amount.mark : null}
-      {usageFigure(amount.totals, tokens)}
+      {!tokens && amount.mark ? <span className="usage-approx">{amount.mark}</span> : null}
+      <FigureText text={usageFigure(amount.totals, tokens)} />
     </>
   );
   return (
@@ -149,7 +156,7 @@ export function UsageSummary({ accountIds }: { accountIds: string[] }) {
                     model={amountTip(amount, true)}
                     className="usage-summary-tip"
                   >
-                    ?
+                    <CircleHelpIcon className="size-3.5" aria-hidden="true" />
                   </UsageTipButton>
                 ) : null}
               </div>
@@ -158,8 +165,8 @@ export function UsageSummary({ accountIds }: { accountIds: string[] }) {
                   "Unavailable"
                 ) : amount && amount.totals.cost_usd !== null ? (
                   <span className="tabular-nums">
-                    {amount.mark}
-                    {usageFigure(amount.totals, false)}
+                    {amount.mark ? <span className="usage-approx">{amount.mark}</span> : null}
+                    <FigureText text={usageFigure(amount.totals, false)} />
                   </span>
                 ) : (
                   "—"

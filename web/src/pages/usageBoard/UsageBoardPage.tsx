@@ -197,19 +197,19 @@ export function UsageBoardPage() {
                 data-testid="usage-band"
                 data-band={band.id}
               >
-                <div className="flex min-h-[30px] min-w-0 items-center gap-1.5">
+                <div className="usage-band-head">
                   {arranging ? (
                     <Input
                       aria-label={`Group name for ${band.name}`}
                       title={band.name}
                       value={band.name}
                       onChange={(event) => renameBand(band.id, event.target.value)}
-                      className="h-7 max-w-[260px] flex-1 text-[13px] font-semibold"
+                      className="h-7 max-w-[260px] flex-1 text-ui font-medium"
                     />
                   ) : (
                     <button
                       type="button"
-                      className="flex min-w-0 items-center gap-1.5 text-[13px] font-semibold text-foreground/80"
+                      className="usage-band-title"
                       aria-expanded={open}
                       onClick={() => toggleBand(band.id)}
                     >
@@ -221,7 +221,7 @@ export function UsageBoardPage() {
                       <UsageName>{band.name}</UsageName>
                     </button>
                   )}
-                  <span className="text-[11px] text-muted-foreground">{band.accounts.length}</span>
+                  <span className="usage-band-count">{band.accounts.length}</span>
                   {arranging ? (
                     <span className="ml-auto flex items-center">
                       <Button

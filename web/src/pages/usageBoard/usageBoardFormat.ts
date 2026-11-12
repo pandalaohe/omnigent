@@ -123,6 +123,71 @@ export function formatUsageValue(value: number, unit: string | null): string {
   return symbol ? `${symbol}${figure}` : `${figure}${unit ? ` ${unit}` : ""}`;
 }
 
+/**
+ * A reading's percent: at most three significant digits and two decimals,
+ * trailing zeros dropped. It never rounds up to 100 or down to 0.
+ */
+export function formatPercentReading(value: number): string {
+  if (!Number.isFinite(value)) return "—";
+  if (value >= 100) return String(Math.round(value));
+  if (value >= 99.95) return "99.9";
+  if (value <= 0) return "0";
+  if (value < 0.01) return "<0.01";
+  const decimals = value >= 10 ? 1 : 2;
+  return String(Number(value.toFixed(decimals)));
+}
+
+const COMPACT_STEPS: [number, string][] = [
+  [1e12, "T"],
+  [1e9, "B"],
+  [1e6, "M"],
+  [1e3, "K"],
+];
+
+/**
+ * A money figure for a tile: two decimals, and from six integer digits a
+ * scaled two-decimal form (`$123.46K`); the full value stays in its title.
+ */
+export function formatTileAmount(value: number, unit: string | null): string {
+  const full = formatUsageValue(value, unit);
+  if (Math.abs(value) < 1e5) return full;
+  const symbols: Record<string, string> = { USD: "$", CNY: "¥", HKD: "HK$", $: "$", "¥": "¥" };
+  const symbol = unit ? symbols[unit] : undefined;
+  const [step, suffix] = COMPACT_STEPS.find(([size]) => Math.abs(value) >= size) ?? [1, ""];
+  const scaled = (value / step).toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+    roundingMode: "trunc",
+  });
+  return symbol ? `${symbol}${scaled}${suffix}` : `${scaled}${suffix}${unit ? ` ${unit}` : ""}`;
+}
+
+// Advance widths in em for tabular figures in the system UI stack; symbols and
+// units render at the reduced unit size, so they count at that scale.
+const FIGURE_EMS: Record<string, number> = { ".": 0.3, ",": 0.3, " ": 0.28, "<": 0.6 };
+const UNIT_SCALE = 0.62;
+
+/** Estimated width of a figure in em, with its unit symbols at unit size. */
+export function figureEms(number: string, unit = ""): number {
+  const width = (text: string) =>
+    [...text].reduce((sum, char) => sum + (FIGURE_EMS[char] ?? (/\d/.test(char) ? 0.6 : 0.68)), 0);
+  return (width(number) + width(unit) * UNIT_SCALE) * 1.04;
+}
+
+/**
+ * Largest figure size, in percent of the ring's width, whose line stays inside
+ * the ring's clear inner circle (radius in the same units) under an optional
+ * name block of the given height.
+ */
+export function ringFigureSize(ems: number, nameBlock: number, radius = 35, cap = 22): number {
+  // Corners of the figure line: (ems·F/2)² + ((nameBlock + 0.74·F)/2)² ≤ radius².
+  const a = (ems / 2) ** 2 + (0.74 / 2) ** 2;
+  const b = 2 * (nameBlock / 2) * (0.74 / 2);
+  const c = (nameBlock / 2) ** 2 - radius ** 2;
+  const size = (-b + Math.sqrt(b * b - 4 * a * c)) / (2 * a);
+  return Math.max(8, Math.min(cap, Math.floor(size * 10) / 10));
+}
+
 /** The window's own name: the report's label, else its id. */
 export function windowName(window: UsageWindowView): string {
   return window.label ?? window.id;

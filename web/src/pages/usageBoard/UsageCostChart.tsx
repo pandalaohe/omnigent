@@ -1,4 +1,4 @@
-import { useId, useMemo } from "react";
+import { useMemo } from "react";
 import {
   analysisTotals,
   analysisValueText,
@@ -9,7 +9,8 @@ import {
 } from "./usageAnalysisData";
 import {
   Bar,
-  BarChart,
+  CartesianGrid,
+  ComposedChart,
   Line,
   LineChart,
   ReferenceLine,
@@ -358,6 +359,22 @@ function ChartTip({
   );
 }
 
+/** Round axis steps (1, 2, 2.5 or 5 × 10ⁿ) from zero past the series' top. */
+export function niceTicks(top: number, count = 4): number[] {
+  if (!(top > 0)) return [0, 1];
+  const raw = top / count;
+  const power = 10 ** Math.floor(Math.log10(raw));
+  const step = ([1, 2, 2.5, 5, 10].find((factor) => factor * power >= raw) ?? 10) * power;
+  const ticks: number[] = [];
+  for (let value = 0; value < top + step * 0.001; value += step) ticks.push(value);
+  if (ticks[ticks.length - 1] < top) ticks.push(ticks[ticks.length - 1] + step);
+  return ticks.map((value) => Number(value.toPrecision(12)));
+}
+
+function LegendSwatch({ kind }: { kind: "now" | "previous" | "bucket" | "fee" }) {
+  return <span className="usage-legend-swatch" data-kind={kind} aria-hidden="true" />;
+}
+
 export function UsageCostChart({
   accounts,
   tokens,
@@ -373,109 +390,119 @@ export function UsageCostChart({
   now: number;
   fee?: number;
 }) {
-  const syncId = useId();
   const points = usageChartPoints(accounts, tokens, total, period, now);
   const last = points.at(-1);
   const formatter = (value: number) =>
     tokens
       ? new Intl.NumberFormat("en-US", { notation: "compact" }).format(value)
       : formatMoney(value);
+  const hourly = points.length > 1 && points[1].at - points[0].at <= 3600;
   const dateLabel = (at: number) =>
     new Date(at * 1000).toLocaleString(
       "en-US",
-      points.length > 1 && points[1].at - points[0].at <= 3600
-        ? { hour: "numeric" }
-        : { month: "short", day: "numeric" },
+      hourly ? { hour: "numeric" } : { month: "short", day: "numeric" },
     );
-  if (!points.length)
-    return (
-      <p className="py-10 text-center text-sm text-muted-foreground">
-        No usage recorded in this range.
-      </p>
-    );
+  if (!points.length) return <p className="usage-chart-empty">No usage recorded in this range.</p>;
+  const showFee = !tokens && fee !== undefined && fee <= 4 * (last?.now ?? 0);
+  const top = Math.max(
+    ...points.map((point) => Math.max(point.now, point.previous ?? 0)),
+    showFee ? (fee ?? 0) : 0,
+  );
+  const ticks = niceTicks(top);
+  const axisWidth = Math.max(44, Math.max(...ticks.map((tick) => formatter(tick).length)) * 7 + 18);
+  const bucketTop = Math.max(...points.map((point) => point.bucket), 0) * 4 || 1;
   return (
-    <figure aria-label="Cumulative usage and usage per bucket" className="min-w-0">
-      <figcaption className="mb-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-        <span className="text-info">Now {formatter(last?.now ?? 0)}</span>
-        {last?.previous !== undefined ? <span>Previous {formatter(last.previous)}</span> : null}
-        {!tokens && fee !== undefined ? <span>Monthly fee {formatMoney(fee)}</span> : null}
+    <figure aria-label="Cumulative usage and usage per bucket" className="usage-chart">
+      <figcaption className="usage-legend">
+        <span>
+          <LegendSwatch kind="now" />
+          Now <b>{formatter(last?.now ?? 0)}</b>
+        </span>
+        {last?.previous !== undefined ? (
+          <span>
+            <LegendSwatch kind="previous" />
+            Previous <b>{formatter(last.previous)}</b>
+          </span>
+        ) : null}
+        <span>
+          <LegendSwatch kind="bucket" />
+          {hourly ? "Per hour" : "Per day"}
+        </span>
+        {!tokens && fee !== undefined ? (
+          <span>
+            <LegendSwatch kind="fee" />
+            Monthly fee <b>{formatMoney(fee)}</b>
+          </span>
+        ) : null}
       </figcaption>
-      <div className="h-40 w-full min-w-0">
+      <div className="usage-chart-plot">
         <ResponsiveContainer width="100%" height="100%">
-          <LineChart
-            data={points}
-            syncId={syncId}
-            margin={{ top: 8, right: 10, left: 0, bottom: 0 }}
-          >
-            <XAxis dataKey="at" hide />
+          <ComposedChart data={points} margin={{ top: 6, right: 4, left: 0, bottom: 0 }}>
+            <CartesianGrid
+              yAxisId="total"
+              vertical={false}
+              stroke="var(--border)"
+              strokeDasharray="2 4"
+            />
+            <XAxis
+              dataKey="at"
+              tickFormatter={dateLabel}
+              tick={{ fontSize: 12, fill: "var(--muted-foreground)" }}
+              tickLine={false}
+              axisLine={false}
+              interval="preserveStartEnd"
+              minTickGap={28}
+              tickMargin={6}
+            />
             <YAxis
-              width={52}
+              yAxisId="total"
+              width={axisWidth}
+              ticks={ticks}
+              domain={[0, ticks[ticks.length - 1]]}
               tickFormatter={formatter}
-              tick={{ fontSize: 11 }}
+              tick={{ fontSize: 12, fill: "var(--muted-foreground)" }}
               tickLine={false}
               axisLine={false}
             />
-            <Tooltip content={<ChartTip tokens={tokens} />} />
-            <Line
-              type="stepAfter"
-              dataKey="now"
-              stroke="var(--info)"
-              dot={false}
-              strokeWidth={2}
+            <YAxis yAxisId="bucket" orientation="right" hide domain={[0, bucketTop]} />
+            <Tooltip content={<ChartTip tokens={tokens} />} cursor={{ fill: "var(--accent)" }} />
+            <Bar
+              yAxisId="bucket"
+              dataKey="bucket"
+              fill="var(--muted-foreground)"
+              fillOpacity={0.45}
+              radius={[2, 2, 0, 0]}
+              maxBarSize={28}
               isAnimationActive={false}
             />
             <Line
+              yAxisId="total"
               type="stepAfter"
               dataKey="previous"
               stroke="var(--muted-foreground)"
               strokeDasharray="4 4"
+              strokeWidth={1.25}
               dot={false}
               isAnimationActive={false}
             />
-            {!tokens && fee !== undefined && fee <= 4 * (last?.now ?? 0) ? (
+            <Line
+              yAxisId="total"
+              type="stepAfter"
+              dataKey="now"
+              stroke="var(--usage-series)"
+              strokeWidth={2}
+              dot={false}
+              isAnimationActive={false}
+            />
+            {showFee ? (
               <ReferenceLine
+                yAxisId="total"
                 y={fee}
                 stroke="var(--warning)"
                 strokeDasharray="3 3"
-                ifOverflow="extendDomain"
               />
             ) : null}
-          </LineChart>
-        </ResponsiveContainer>
-      </div>
-      <div className="h-20 w-full min-w-0">
-        <ResponsiveContainer width="100%" height="100%">
-          <BarChart
-            data={points}
-            syncId={syncId}
-            margin={{ top: 4, right: 10, left: 0, bottom: 0 }}
-          >
-            <XAxis
-              dataKey="at"
-              tickFormatter={dateLabel}
-              tick={{ fontSize: 10 }}
-              tickLine={false}
-              axisLine={false}
-              interval="preserveStartEnd"
-              minTickGap={24}
-            />
-            <YAxis
-              width={52}
-              tickFormatter={formatter}
-              tick={{ fontSize: 10 }}
-              tickLine={false}
-              axisLine={false}
-              tickCount={2}
-            />
-            <Tooltip content={<ChartTip tokens={tokens} />} cursor={{ fill: "var(--accent)" }} />
-            <Bar
-              dataKey="bucket"
-              fill="var(--info)"
-              opacity={0.35}
-              radius={[2, 2, 0, 0]}
-              isAnimationActive={false}
-            />
-          </BarChart>
+          </ComposedChart>
         </ResponsiveContainer>
       </div>
     </figure>
