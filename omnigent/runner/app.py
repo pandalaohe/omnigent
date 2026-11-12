@@ -28,6 +28,12 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mappin
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from omnigent.pi_timeouts import (
+    BOOTSTRAP_RESPONSE_TIMEOUT_S,
+    INITIALIZATION_TIMEOUT_S,
+    INITIALIZATION_WAIT_TIMEOUT_S,
+)
+
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
@@ -44,7 +50,6 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from omnigent._platform import IS_WINDOWS
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.debug_logging import (
     PRIMARY_SESSION_ID_ENV_VAR,
@@ -5030,7 +5035,7 @@ def create_runner_app(
                 bridge_dir = permission_tiers.state_path(
                     session_id, harness_name, permission_snapshot.labels
                 ).parent
-                deadline = asyncio.get_running_loop().time() + 60.0
+                deadline = asyncio.get_running_loop().time() + INITIALIZATION_TIMEOUT_S
                 while not verify_pi_permission_installation(bridge_dir, startup_tier):
                     if asyncio.get_running_loop().time() >= deadline:
                         raise ValueError("Pi permission extension did not acknowledge startup")
@@ -9420,8 +9425,10 @@ def create_runner_app(
                 ).admission.principal.launch_epoch
             payload.update(phase="configure", launcher=relay.bootstrap.launcher_descriptor())
         response = await asyncio.wait_for(
-            client.post("/v1/permission-tier/bootstrap", json=payload),
-            timeout=45.0 if IS_WINDOWS else 20.0,
+            client.post(
+                "/v1/permission-tier/bootstrap", json=payload, timeout=BOOTSTRAP_RESPONSE_TIMEOUT_S
+            ),
+            timeout=BOOTSTRAP_RESPONSE_TIMEOUT_S,
         )
         body = response.json()
         if (
@@ -10206,7 +10213,7 @@ def create_runner_app(
     async def _wait_for_permission_initialization(session_id: str) -> JSONResponse | None:
         observed: set[asyncio.Task[JSONResponse]] = set()
         try:
-            async with asyncio.timeout(60.0):
+            async with asyncio.timeout(INITIALIZATION_WAIT_TIMEOUT_S):
                 while True:
                     completed = [
                         task

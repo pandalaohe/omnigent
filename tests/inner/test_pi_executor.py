@@ -353,12 +353,15 @@ class _FakeProcess:
 @pytest.mark.parametrize(
     "windows,ack_at,expected",
     [
-        (False, 1.0, None),
-        (True, 12.0, None),
+        (False, 45.0, None),
+        (True, 45.0, None),
         (False, None, "missing_ack"),
         (True, None, "missing_ack"),
         (False, None, "ack_mismatch (field=permission_expected.json)"),
         (False, None, "process_exit (status=7)"),
+        (False, None, "dependency_missing (code=ERR_MODULE_NOT_FOUND)"),
+        (False, None, "dependency_missing (code=native_child_lifecycle)"),
+        (False, None, "state_changed"),
     ],
 )
 async def test_permission_bootstrap_waits_for_live_process_and_reports_safe_reason(
@@ -393,7 +396,11 @@ async def test_permission_bootstrap_waits_for_live_process_and_reports_safe_reas
         rpc.process.returncode = 7
     rpc._stderr_lines = [
         "private prompt and credentials",
-        "Error [ERR_MODULE_NOT_FOUND]: private path",
+        "Error [ERR_MODULE_NOT_FOUND]: private path"
+        if expected and "ERR_MODULE_NOT_FOUND" in expected
+        else "pi-subagents is missing ./native-child-lifecycle. private path"
+        if expected and "native_child_lifecycle" in expected
+        else "private output",
     ]
     clock = [0.0]
     sleeps = []
@@ -401,6 +408,11 @@ async def test_permission_bootstrap_waits_for_live_process_and_reports_safe_reas
     async def sleep(delay):
         clock[0] += delay
         sleeps.append(delay)
+        if expected == "state_changed":
+            write_host_permission_state(
+                bridge / "permission_state.json",
+                HostPermissionState("cold-pi", "host", str(tmp_path), "auto", 2, "blocked"),
+            )
 
     # Patch only this module's clock/sleep view, leaving pytest's loop intact.
     monkeypatch.setattr(
@@ -430,12 +442,15 @@ async def test_permission_bootstrap_waits_for_live_process_and_reports_safe_reas
         ):
             await executor._await_permission_installation("cold-pi", rpc)
         assert expected in caplog.text
-        assert "ERR_MODULE_NOT_FOUND" in caplog.text
+        if "ERR_MODULE_NOT_FOUND" in expected:
+            assert "ERR_MODULE_NOT_FOUND" in caplog.text
         assert "private" not in caplog.text
-        if expected.startswith("process_exit"):
+        if expected.startswith(("process_exit", "dependency_missing")):
             assert not sleeps
+        elif expected == "state_changed":
+            assert len(sleeps) == 1
         else:
-            bound = 30.0 if windows else 8.0
+            bound = 180.0
             assert bound <= clock[0] < bound + 0.1
 
 
@@ -931,7 +946,7 @@ async def test_reused_rpc_proof_cannot_return_owner_marked_closing(context_v2_pi
     close_entered, close_release = asyncio.Event(), asyncio.Event()
     close = old._close_unobserved
 
-    async def pending_proof(session_key, rpc):
+    async def pending_proof(session_key, rpc, *, deadline=None):
         if rpc is old:
             proof_entered.set()
             await proof_release.wait()

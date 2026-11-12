@@ -11,6 +11,8 @@ from uuid import uuid4
 
 import httpx
 
+from omnigent.pi_timeouts import PERMISSION_CONFIRMATION_TIMEOUT_S
+
 PROCESS_OBSERVATION_ID = uuid4().hex
 
 
@@ -87,9 +89,8 @@ async def wait_for_permission_confirmation(
     expected_revision: int,
     bound_context: dict[str, object],
 ) -> None:
-    # Exact previous polling predicate/order/deadline. A matching response at
-    # the deadline still breaks before checking the deadline, as before.
-    deadline = _now() + 20.0
+    # A matching response still wins over expiry in the same polling iteration.
+    deadline = _now() + PERMISSION_CONFIRMATION_TIMEOUT_S
     while True:
         response = await server_client.get(
             session_path,

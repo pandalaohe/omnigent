@@ -114,6 +114,7 @@ from omnigent.models import model_metadata as _model_metadata
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.native.failure_telemetry import FailureContext
 from omnigent.permission_tiers.pi_private import redact_pi_authority
+from omnigent.pi_timeouts import BOOTSTRAP_CONTROL_TIMEOUT_S, CONTROL_TIMEOUT_S
 from omnigent.runtime.tool_call_deadline import ToolCallDeadline, bind_tool_call_deadline
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -9744,7 +9745,7 @@ def _tool_relay_handler_factory(
             authorization = self.headers.get("Authorization")
             future = asyncio.run_coroutine_threadsafe(_bootstrap_request(authorization), loop)
             try:
-                frame = future.result(timeout=5.0)
+                frame = future.result(timeout=BOOTSTRAP_CONTROL_TIMEOUT_S)
             except Exception as exc:  # noqa: BLE001 - no private frame or exception text
                 future.cancel()
                 _logger.warning(
@@ -9757,7 +9758,7 @@ def _tool_relay_handler_factory(
             self.send_header("Content-Type", "application/x-ndjson")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            self.connection.settimeout(2.0)
+            self.connection.settimeout(CONTROL_TIMEOUT_S)
             while True:
                 stage = "write"
                 try:
@@ -9781,12 +9782,13 @@ def _tool_relay_handler_factory(
                     return
 
         def _handle_bootstrap(self, *, launcher: bool = False) -> None:
+            deadline = time.monotonic() + BOOTSTRAP_CONTROL_TIMEOUT_S
             authorization = self.headers.get("Authorization")
             future = asyncio.run_coroutine_threadsafe(
                 _bootstrap_request(authorization, launcher=launcher), loop
             )
             try:
-                future.result(timeout=5.0)
+                future.result(timeout=max(0.0, deadline - time.monotonic()))
             except Exception as exc:  # noqa: BLE001 - authenticate before body decoding
                 future.cancel()
                 _logger.warning(
@@ -9803,7 +9805,7 @@ def _tool_relay_handler_factory(
                 _bootstrap_request(authorization, payload, launcher=launcher), loop
             )
             try:
-                response = future.result(timeout=5.0)
+                response = future.result(timeout=max(0.0, deadline - time.monotonic()))
             except Exception as exc:  # noqa: BLE001 - no exception or authority in public diagnostics
                 future.cancel()
                 _logger.warning(

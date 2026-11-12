@@ -33,7 +33,7 @@ async def test_real_confirmation_timeout_preserves_each_comparand(monkeypatch, f
         del snapshot[field]
     else:
         snapshot[field] = value
-    times = iter([0.0, 20.0])
+    times = iter([0.0, 240.0])
     monkeypatch.setattr(observation, "_now", lambda: next(times))
 
     async def handler(request):
@@ -67,7 +67,7 @@ async def test_real_confirmation_timeout_preserves_each_comparand(monkeypatch, f
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", [403, 426, 503])
 async def test_real_confirmation_non200_reports_unknown_comparands(monkeypatch, status):
-    times = iter([0.0, 20.0])
+    times = iter([0.0, 240.0])
     monkeypatch.setattr(observation, "_now", lambda: next(times))
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(
@@ -93,7 +93,7 @@ async def test_exact_deadline_matching_response_keeps_existing_admission_order(m
     }
 
     async def handler(request):
-        clock[0] = 20.0
+        clock[0] = 240.0
         return httpx.Response(200, json=snapshot)
 
     async with httpx.AsyncClient(
@@ -103,6 +103,32 @@ async def test_exact_deadline_matching_response_keeps_existing_admission_order(m
             await observation.wait_for_permission_confirmation(client, "/v1/sessions/s", 3, {})
             is None
         )
+
+
+@pytest.mark.asyncio
+async def test_confirmation_waits_past_old_deadline_for_a_live_startup(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(observation, "_now", lambda: clock[0])
+
+    async def pause(delay):
+        clock[0] += 10.0
+
+    monkeypatch.setattr(observation, "_pause", pause)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "permission_tier_state": "ready" if clock[0] >= 90 else "blocked",
+                    "permission_tier_revision": 3,
+                    "permission_tiers_capability": True,
+                },
+            )
+        ),
+        base_url="http://server",
+    ) as client:
+        await observation.wait_for_permission_confirmation(client, "/v1/sessions/s", 3, {})
+    assert clock[0] == 90.0
 
 
 @pytest.mark.asyncio

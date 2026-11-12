@@ -89,6 +89,7 @@ def test_permission_ack_rejects_replayed_or_mismatched_switch(changed):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("superseded", [False, True])
 @pytest.mark.parametrize(
     "proof_tier,proof_revision,accepted", [("auto", 1, False), ("ask", 2, True)]
 )
@@ -98,6 +99,7 @@ async def test_permission_switch_requires_current_installation_proof(
     proof_tier: str,
     proof_revision: int,
     accepted: bool,
+    superseded: bool,
 ) -> None:
     from omnigent.harnesses.pi_native import bridge as pi_bridge
 
@@ -131,24 +133,52 @@ async def test_permission_switch_requires_current_installation_proof(
             }
         )
     )
-    (tmp_path / "permission_ack.json").write_text(
-        json.dumps(
-            {
-                "id": "switch-1",
-                "session_id": "session-1",
-                "target_tier": "ask",
-                "expected_revision": 1,
-                "ok": True,
-                "active_tools": ["read"],
-            }
-        )
+    ack = json.dumps(
+        {
+            "id": "switch-1",
+            "session_id": "session-1",
+            "target_tier": "ask",
+            "expected_revision": 1,
+            "ok": True,
+            "active_tools": ["read"],
+        }
+    )
+    clock = [0.0]
+    sleeps = []
+
+    async def sleep(delay):
+        clock[0] += delay
+        sleeps.append(delay)
+        if superseded:
+            write_host_permission_state(
+                tmp_path / "permission_state.json",
+                HostPermissionState("session-1", "test-host", str(tmp_path), "auto", 2, "blocked"),
+            )
+        if clock[0] >= 12.0:
+            (tmp_path / "permission_ack.json").write_text(ack)
+
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        pi_bridge,
+        "asyncio",
+        SimpleNamespace(
+            get_running_loop=lambda: SimpleNamespace(time=lambda: clock[0]),
+            sleep=sleep,
+        ),
     )
     monkeypatch.setattr(pi_bridge, "bridge_dir_for_session_id", lambda _session_id: tmp_path)
     monkeypatch.setattr(
         pi_bridge, "enqueue_permission_tier_change", lambda *_args, **_kwargs: "switch-1"
     )
 
-    assert await pi_bridge.apply_pi_permission_tier("session-1", "pi-native", "ask") is accepted
+    assert await pi_bridge.apply_pi_permission_tier("session-1", "pi-native", "ask") is (
+        accepted and not superseded
+    )
+    if superseded:
+        assert len(sleeps) == 1
+    else:
+        assert 12.0 <= clock[0] < 12.1
 
 
 @pytest.mark.parametrize("harness", ["pi-native", "pi"])

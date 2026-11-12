@@ -107,6 +107,11 @@ from omnigent.permission_tiers.host import HOST_PERMISSION_STATE_FILE, read_host
 from omnigent.permission_tiers.pi_private import public_pi_value, redact_pi_authority
 from omnigent.permission_tiers.pi_tools import pi_permission_control_path
 from omnigent.pi_prompt import pi_prompt_args
+from omnigent.pi_timeouts import (
+    COLD_START_TIMEOUT_S,
+    CONTROL_TIMEOUT_S,
+    startup_dependency_failure,
+)
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.sdk_peer_delivery import ReportPeerOutcome, SDKPeerInput, SDKPeerOutcome
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
@@ -179,6 +184,10 @@ class PiPermissionBootstrapError(RuntimeError):
     def __init__(self, reason: str) -> None:
         safe = reason in {
             "timeout",
+            "state_changed",
+            "dependency_missing (code=ERR_MODULE_NOT_FOUND)",
+            "dependency_missing (code=MODULE_NOT_FOUND)",
+            "dependency_missing (code=native_child_lifecycle)",
             "missing_ack",
             "ack_mismatch",
             "unknown",
@@ -240,7 +249,7 @@ class _PiScopedLauncher:
         status: int | None = None
         category = "request"
         try:
-            async with httpx.AsyncClient(trust_env=False, timeout=2.0) as client:
+            async with httpx.AsyncClient(trust_env=False, timeout=CONTROL_TIMEOUT_S) as client:
                 response = await client.post(
                     self._endpoint,
                     headers={"Authorization": "Bearer " + self._capability},
@@ -4806,28 +4815,29 @@ class PiExecutor(Executor):
                 )
 
         log_bootstrap("starting")
+        deadline = asyncio.get_running_loop().time() + COLD_START_TIMEOUT_S
         try:
-            await rpc.start(
-                subprocess_config.executable or self._pi_launch_path,
-                env=env,
-                cwd=self._cwd,
-                model=pi_model or None,
-                system_prompt=self._with_bundle_context(system_prompt) or None,
-                system_prompt_mode="append" if permission_bootstrap else self._system_prompt_mode,
-                thinking=thinking,
-                session_id=session_key if session_key != "__default__" else None,
-                extra_args=extra_args or None,
-                launcher_args=subprocess_config.launcher_args,
-            )
-            if launcher is not None and launch_id is not None:
-                await launcher.publish(launch_id, rpc.process)
-            if self._permission_controlled and not scoped_prepare:
+            async with asyncio.timeout_at(deadline):
+                await rpc.start(
+                    subprocess_config.executable or self._pi_launch_path,
+                    env=env,
+                    cwd=self._cwd,
+                    model=pi_model or None,
+                    system_prompt=self._with_bundle_context(system_prompt) or None,
+                    system_prompt_mode="append"
+                    if permission_bootstrap
+                    else self._system_prompt_mode,
+                    thinking=thinking,
+                    session_id=session_key if session_key != "__default__" else None,
+                    extra_args=extra_args or None,
+                    launcher_args=subprocess_config.launcher_args,
+                )
                 if launcher is not None and launch_id is not None:
-                    deadline = asyncio.get_running_loop().time() + (30.0 if IS_WINDOWS else 8.0)
+                    await launcher.publish(launch_id, rpc.process)
+                if self._permission_controlled and not scoped_prepare:
                     await self._await_permission_installation(session_key, rpc, deadline=deadline)
-                    await launcher.confirm(launch_id, rpc, deadline=deadline)
-                else:
-                    await self._await_permission_installation(session_key, rpc)
+                    if launcher is not None and launch_id is not None:
+                        await launcher.confirm(launch_id, rpc, deadline=deadline)
             if (
                 self._session_states.get(session_key) is not state
                 or state.rpc is not previous_rpc
@@ -4865,17 +4875,30 @@ class PiExecutor(Executor):
         state = read_host_permission_state(bridge_dir / HOST_PERMISSION_STATE_FILE)
         if state.session_id != session_key:
             raise RuntimeError("Pi permission state has wrong session")
-        # Starts after spawn returns; includes Node, SDK and extension loading.
+        # The caller shares the cold-start deadline across spawn and confirmation.
         if deadline is None:
-            deadline = asyncio.get_running_loop().time() + (30.0 if IS_WINDOWS else 8.0)
+            deadline = asyncio.get_running_loop().time() + COLD_START_TIMEOUT_S
         reason = "timeout"
         while asyncio.get_running_loop().time() < deadline:
-            if rpc.process is None or rpc.process.returncode is not None:
+            current = read_host_permission_state(bridge_dir / HOST_PERMISSION_STATE_FILE)
+            if (current.session_id, current.revision, current.tier) != (
+                state.session_id,
+                state.revision,
+                state.tier,
+            ):
+                reason = "state_changed"
+                break
+            alive = rpc.process is not None and rpc.process.returncode is None
+            if alive and verify_pi_permission_installation(bridge_dir, state.tier):
+                return
+            dependency = startup_dependency_failure("\n".join(rpc._stderr_lines))
+            if dependency is not None:
+                reason = f"dependency_missing (code={dependency})"
+                break
+            if not alive:
                 status = rpc.process.returncode if rpc.process is not None else None
                 reason = f"process_exit (status={status})"
                 break
-            if verify_pi_permission_installation(bridge_dir, state.tier):
-                return
             await asyncio.sleep(0.05)
         else:
             try:
