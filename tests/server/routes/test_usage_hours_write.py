@@ -108,6 +108,7 @@ def _usage(store: SqlAlchemyConversationStore, conv_id: str) -> dict:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("gateway", [False, True])
 @pytest.mark.parametrize(
     ("harness", "kind", "basis"),
     [
@@ -115,7 +116,45 @@ def _usage(store: SqlAlchemyConversationStore, conv_id: str) -> dict:
         ("claude-native", "api_key", "metered"),
         ("codex-native", "chatgpt", "subscription"),
         ("codex-native", "api_key", "metered"),
-        ("pi-native", "providers", "metered"),
+        ("pi-native", "providers", "unknown"),
+        ("pi-native", {"kind": "providers", "providers": []}, "unknown"),
+        (
+            "pi-native",
+            {
+                "kind": "providers",
+                "providers": [{"id": "anthropic", "label": "Anthropic", "auth_type": "oauth"}],
+            },
+            "unknown",
+        ),
+        (
+            "pi-native",
+            {
+                "kind": "providers",
+                "providers": [{"id": "litellm", "label": "Gateway", "auth_type": "api_key"}],
+            },
+            "unknown",
+        ),
+        (
+            "pi-native",
+            {
+                "kind": "providers",
+                "providers": [{"id": "anthropic", "label": "Anthropic", "auth_type": "api_key"}],
+            },
+            "unknown",
+        ),
+        (
+            "pi-native",
+            {
+                "kind": "providers",
+                "providers": [
+                    {"id": "anthropic", "label": "Anthropic", "auth_type": "api_key"},
+                    {"id": "openai-codex", "label": "Codex", "auth_type": "oauth"},
+                ],
+            },
+            "unknown",
+        ),
+        ("opencode-native", "providers", "unknown"),
+        ("claude-native", "providers", "unknown"),
         ("codex-native", "unknown", "unknown"),
         ("codex-native", None, "unknown"),
         ("antigravity-native", None, "unknown"),
@@ -128,8 +167,9 @@ async def test_native_flush_books_the_reported_host_login_without_probing(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     harness: str,
-    kind: str | None,
+    kind: str | dict | None,
     basis: str,
+    gateway: bool,
 ) -> None:
     from unittest.mock import Mock
 
@@ -141,7 +181,11 @@ async def test_native_flush_books_the_reported_host_login_without_probing(
     from omnigent.server.auth import RESERVED_USER_LOCAL
 
     registry = app.state.host_registry
-    accounts = {agent_key_for_harness(harness): {"kind": kind}} if kind else None
+    accounts = (
+        {agent_key_for_harness(harness): kind if isinstance(kind, dict) else {"kind": kind}}
+        if kind
+        else None
+    )
     registry.register(
         _HOST,
         Mock(),
@@ -151,6 +195,7 @@ async def test_native_flush_books_the_reported_host_login_without_probing(
             name="test-host",
             capabilities=[CAP_HARNESS_ACCOUNTS],
             harness_accounts=accounts,
+            gateway_inference={harness: gateway},
         ),
         RESERVED_USER_LOCAL,
     )
@@ -174,8 +219,12 @@ async def test_native_flush_books_the_reported_host_login_without_probing(
         assert response.status_code == 202, response.text
 
     [row] = UsageHoursStore(db_uri).read(RESERVED_USER_LOCAL, _this_hour(), _this_hour() + 3600)
-    assert row.basis == basis
+    expected_basis = "unknown" if gateway else basis
+    assert row.basis == expected_basis
     assert row.cost_usd == pytest.approx(0.5)
+    from omnigent.stores.usage_hours_store import COUNTED_BASES
+
+    assert (row.basis in COUNTED_BASES) is (expected_basis == "metered")
     probe.assert_not_called()
 
 

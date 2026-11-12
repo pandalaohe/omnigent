@@ -496,3 +496,23 @@ def test_json_command_preserves_utf8_with_non_utf8_diagnostics() -> None:
     )
     assert code == 0
     assert payload == {"email": "用户@example.test"}
+
+
+@pytest.mark.parametrize(
+    ("method", "kind"),
+    [
+        ("api_key", "api_key"),
+        ("claudeai", "subscription"),
+        ("oauth", "unknown"),
+        ("future", "unknown"),
+        (None, "unknown"),
+    ],
+)
+def test_claude_probe_requires_a_known_auth_method(monkeypatch, method, kind):
+    monkeypatch.setattr(harness_accounts.shutil, "which", lambda command: command)
+    monkeypatch.setattr(
+        harness_accounts,
+        "_run_json_command",
+        lambda *a, **kw: (0, {"loggedIn": True, "authMethod": method}),
+    )
+    assert harness_accounts.probe_harness_account("claude") == {"kind": kind}
