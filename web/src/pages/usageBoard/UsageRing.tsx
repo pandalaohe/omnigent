@@ -5,6 +5,7 @@
 
 import { cn } from "@/lib/utils";
 import type { CSSProperties } from "react";
+import { useUsageReadingPlacement } from "./useUsageReadingPlacement";
 
 import type { UsageWindowView } from "./usageBoardData";
 import {
@@ -82,87 +83,101 @@ export function UsageRing({
         ? formatUsageValue(window.used_value, window.unit)
         : ""
       : "";
+  const reading = percent !== null && size > 20 ? percentText : value;
+  const { circleRef, readingRef, outside } = useUsageReadingPlacement(reading);
+  const readingNode = reading ? (
+    <span
+      ref={readingRef}
+      className={cn(
+        "usage-ring-reading font-semibold",
+        percent !== null ? "usage-ring-percent font-bold leading-none" : "text-foreground",
+      )}
+      style={
+        percent !== null ? { fontSize: `max(10px, ${110 / percentText.length}cqw)` } : undefined
+      }
+      data-usage-amount={percent === null ? "" : undefined}
+      data-usage-percent={percent !== null ? "" : undefined}
+    >
+      {reading}
+    </span>
+  ) : null;
 
   return (
     <span
-      className={cn("usage-ring relative inline-flex items-center justify-center", className)}
+      className={cn("usage-reading-figure", className)}
       style={{ "--usage-ring-size": `${size}px` } as CSSProperties}
-      data-testid="usage-ring"
-      data-tone={tone}
-      data-state={window?.state ?? "none"}
+      data-reading-outside={outside}
     >
-      <svg
-        viewBox="-2 -2 104 104"
-        aria-hidden="true"
-        className="absolute inset-0 h-full w-full"
-        style={{ opacity: stale ? 0.45 : 1 }}
+      <span
+        ref={circleRef}
+        className="usage-ring relative inline-flex items-center justify-center"
+        data-testid="usage-ring"
+        data-tone={tone}
+        data-state={window?.state ?? "none"}
       >
-        {dashed ? (
-          <circle
-            cx={50}
-            cy={50}
-            r={44}
-            fill="none"
-            stroke={window ? color : "var(--foreground)"}
-            strokeWidth={3}
-            strokeDasharray="6 6"
-            opacity={window ? 0.8 : 0.42}
-          />
-        ) : (
-          <>
+        <svg
+          viewBox="-2 -2 104 104"
+          aria-hidden="true"
+          className="absolute inset-0 h-full w-full"
+          style={{ opacity: stale ? 0.45 : 1 }}
+        >
+          {dashed ? (
             <circle
               cx={50}
               cy={50}
-              r={RADIUS}
+              r={44}
               fill="none"
-              stroke="var(--border)"
-              strokeWidth={STROKE}
+              stroke={window ? color : "var(--foreground)"}
+              strokeWidth={3}
+              strokeDasharray="6 6"
+              opacity={window ? 0.8 : 0.42}
             />
-            <circle
-              cx={50}
-              cy={50}
-              r={OUTER_RADIUS}
-              fill="none"
-              stroke="var(--foreground)"
-              strokeOpacity={0.08}
-              strokeWidth={OUTER_STROKE}
-            />
-            {percent !== null ? arc(RADIUS, percent / 100, color, STROKE) : null}
-            {window ? arc(OUTER_RADIUS, elapsed, "var(--info)", OUTER_STROKE) : null}
-            {elapsed > 0 ? (
+          ) : (
+            <>
               <circle
-                cx={50 + OUTER_RADIUS * Math.sin(2 * Math.PI * elapsed)}
-                cy={50 - OUTER_RADIUS * Math.cos(2 * Math.PI * elapsed)}
-                r={3.4}
-                fill="var(--info)"
+                cx={50}
+                cy={50}
+                r={RADIUS}
+                fill="none"
+                stroke="var(--border)"
+                strokeWidth={STROKE}
               />
-            ) : null}
-          </>
-        )}
-      </svg>
-      <span className="usage-ring-content relative flex flex-col items-center leading-none">
-        {showName && window ? (
-          <span className="usage-ring-name mb-0.5 w-full truncate px-1 text-center font-bold text-muted-foreground">
-            {windowName(window)}
-          </span>
-        ) : null}
-        {percent !== null && size > 20 ? (
-          <span
-            className="usage-ring-percent font-bold leading-none"
-            style={{ fontSize: `${110 / percentText.length}cqw` }}
-          >
-            {percentText}
-          </span>
-        ) : value ? (
-          <span
-            className="usage-ring-value text-center font-semibold text-foreground"
-            style={{ fontSize: `min(13px, ${110 / value.length}cqw)` }}
-            data-usage-amount
-          >
-            {value}
-          </span>
-        ) : null}
+              <circle
+                cx={50}
+                cy={50}
+                r={OUTER_RADIUS}
+                fill="none"
+                stroke="var(--foreground)"
+                strokeOpacity={0.08}
+                strokeWidth={OUTER_STROKE}
+              />
+              {percent !== null ? arc(RADIUS, percent / 100, color, STROKE) : null}
+              {window ? arc(OUTER_RADIUS, elapsed, "var(--info)", OUTER_STROKE) : null}
+              {elapsed > 0 ? (
+                <circle
+                  cx={50 + OUTER_RADIUS * Math.sin(2 * Math.PI * elapsed)}
+                  cy={50 - OUTER_RADIUS * Math.cos(2 * Math.PI * elapsed)}
+                  r={3.4}
+                  fill="var(--info)"
+                />
+              ) : null}
+            </>
+          )}
+        </svg>
+        <span className="usage-ring-content relative flex flex-col items-center leading-none">
+          {showName && window ? (
+            <span
+              data-usage-label
+              title={windowName(window)}
+              className="usage-ring-name mb-0.5 w-full truncate px-1 text-center font-bold text-muted-foreground"
+            >
+              {windowName(window)}
+            </span>
+          ) : null}
+          {!outside ? readingNode : null}
+        </span>
       </span>
+      {outside ? readingNode : null}
     </span>
   );
 }

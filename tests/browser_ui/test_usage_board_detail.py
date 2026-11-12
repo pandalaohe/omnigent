@@ -61,7 +61,7 @@ def test_account_detail_keyboard_ranges_and_return(
         "windows": [window, {**window, "id": "other", "group": "Pool B", "percent_used": 22.25}],
         "hosts": [],
     }
-    # 50 accounts, 365 daily points and four quota windows per account.
+    # Distinct multi-pool, extreme-reading and unreported accounts, with a year of activity.
     accounts = [
         {
             **account,
@@ -88,6 +88,16 @@ def test_account_detail_keyboard_ranges_and_return(
             "unit": "USD",
         },
     ]
+    accounts[1]["display_name"] = "Long account name with multiple segments and meaningful suffix"
+    accounts.append(
+        {
+            **account,
+            "id": "plan-2",
+            "display_name": "Unreported plan",
+            "windows": [],
+            "read_at": None,
+        }
+    )
     accounts[0]["balances"] = [
         {"id": "balance", "remaining": 298.24, "unit": "CNY", "label": "Balance"},
         {"id": "large", "remaining": 1234567890123.45, "unit": "USD", "label": "Large balance"},
@@ -188,7 +198,15 @@ def test_account_detail_keyboard_ranges_and_return(
     first.get_by_role("link", name="Example plan 0 Pool B", exact=True).focus()
     page.keyboard.press("Enter")
     expect(page.locator("[data-pool]").first).to_have_attribute("data-pool", "Pool B")
-    assert_usage_geometry(page)
+    assert_usage_geometry(
+        page,
+        {
+            '[data-testid="usage-ring"]': 4,
+            ".usage-balance-ring": 2,
+            "[data-usage-amount]": 2,
+            "[data-usage-label]": 6,
+        },
+    )
     expect(
         page.locator(".usage-detail-cost").get_by_text(
             "Not reported · No proven usage for this pool."
@@ -201,27 +219,76 @@ def test_account_detail_keyboard_ranges_and_return(
     # The relation read is real, but this fixture proves no activity channel.
     expect(page.get_by_role("group", name="Cost time range")).not_to_contain_text("$12.34")
     page.get_by_role("link", name="Usage board", exact=True).click()
-    expect(page.get_by_test_id("usage-tile")).to_have_count(2)
-    assert_usage_geometry(page)
+    expect(page.get_by_test_id("usage-tile")).to_have_count(3)
+    assert_usage_geometry(
+        page,
+        {
+            '[data-testid="usage-tile"]': 3,
+            '[data-testid="usage-ring"]': 8,
+            ".usage-balance-ring": 2,
+            "[data-usage-amount]": 3,
+            "[data-usage-label]": 6,
+        },
+    )
     page.get_by_text("Board tools", exact=True).click()
     page.get_by_role("button", name="Compact view", exact=True).click()
-    assert_usage_geometry(page)
+    assert_usage_geometry(
+        page,
+        {
+            '[data-testid="usage-tile"]': 3,
+            '[data-testid="usage-ring"]': 3,
+            ".usage-balance-ring": 0,
+            "[data-usage-amount]": 2,
+            "[data-usage-label]": 2,
+        },
+    )
     page.get_by_role("button", name="Rings view", exact=True).click()
-    page.goto(appearance_url + "/frame/usage/board/plan-0")
-    cells = page.get_by_role("group", name="Cost time range")
-    expect(cells.get_by_text("$12.34", exact=True)).to_have_count(3)
-    for label in ["Today", "This period", "Last 7 days"]:
-        button = cells.get_by_role("button", name=label + " $12.34")
-        button.focus()
-        page.keyboard.press("Enter")
-        expect(button).to_have_attribute("aria-pressed", "true")
-    expect(page.get_by_text("Hosts", exact=True)).to_be_visible()
-    assert_usage_geometry(page)
-    page.get_by_role("link", name="Account settings").click()
+    for item in accounts:
+        page.goto(appearance_url + f"/frame/usage/board/{item['id']}")
+        cells = page.get_by_role("group", name="Cost time range")
+        expect(cells.get_by_text("$12.34", exact=True)).to_have_count(3)
+        for label in ["Today", "This period", "Last 7 days"]:
+            button = cells.get_by_role("button", name=label + " $12.34")
+            button.focus()
+            page.keyboard.press("Enter")
+            expect(button).to_have_attribute("aria-pressed", "true")
+        balances = len(item.get("balances", []))
+        amount_windows = sum(window["percent_used"] is None for window in item["windows"])
+        expected = {
+            '[data-testid="usage-ring"]': max(1, len(item["windows"])),
+            ".usage-balance-ring": balances,
+            "[data-usage-amount]": balances + amount_windows,
+            "[data-usage-label]": len(item["windows"]) + balances,
+        }
+        expect(page.get_by_text("Hosts", exact=True)).to_be_visible()
+        assert_usage_geometry(page, expected)
+        if item["id"] == "plan-1":
+            expect(page.locator("[data-usage-percent]").filter(has_text="100.00%")).to_be_visible()
+            expect(
+                page.locator("[data-usage-amount]").filter(has_text="$1,234,567,890,123.45")
+            ).to_be_visible()
+        page.get_by_role("link", name="Account settings").click()
+        expect(page.get_by_test_id("usage-tile")).to_have_count(1)
+        expected['[data-testid="usage-tile"]'] = 1
+        expected["[data-usage-label]"] = (
+            len({window["group"] for window in item["windows"]}) + balances
+        )
+        assert_usage_geometry(page, expected)
+        expect(page.get_by_role("link", name=item["display_name"], exact=True)).to_have_attribute(
+            "title", item["display_name"]
+        )
+    page.goto(appearance_url + "/frame/usage/board/plan-0/settings")
     expect(page.get_by_role("link", name="Models", exact=True)).to_be_visible()
     expect(page.get_by_role("link", name="Issues", exact=True)).to_be_visible()
     expect(page.get_by_text("Connect a source", exact=True)).to_be_visible()
-    assert_usage_geometry(page)
+    settings_geometry = {
+        '[data-testid="usage-tile"]': 1,
+        '[data-testid="usage-ring"]': 4,
+        ".usage-balance-ring": 2,
+        "[data-usage-amount]": 2,
+        "[data-usage-label]": 4,
+    }
+    assert_usage_geometry(page, settings_geometry)
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
 
     page.get_by_text("Pricing", exact=True).click()
@@ -239,5 +306,5 @@ def test_account_detail_keyboard_ranges_and_return(
         saved_request.value.post_data_json["cards"][0]["retail_amount"] == "100.000000000000000001"
     )
     expect(page.get_by_text("Pricing saved. History recalculated.")).to_be_visible()
-    assert_usage_geometry(page)
+    assert_usage_geometry(page, settings_geometry)
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")

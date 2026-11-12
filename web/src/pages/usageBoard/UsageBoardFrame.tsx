@@ -72,10 +72,14 @@ export function UsageBoardFrame({
         </span>
       </header>
       {back ? (
-        <Button variant="ghost" size="sm" asChild>
-          <Link to={boardPath(back.to)}>
-            <span aria-hidden="true">‹ </span>
-            {back.label}
+        <Button variant="ghost" size="sm" className="max-w-full" asChild>
+          <Link to={boardPath(back.to)} title={back.label}>
+            <span aria-hidden="true" className="shrink-0">
+              ‹{" "}
+            </span>
+            <span className="min-w-0 truncate" title={back.label}>
+              {back.label}
+            </span>
           </Link>
         </Button>
       ) : null}

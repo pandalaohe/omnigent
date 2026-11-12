@@ -15,6 +15,8 @@
   margin-bottom: 10px;
 }
 .usage-top h1 {
+  max-width: 100%;
+  overflow-wrap: anywhere;
   font-size: 22px;
   line-height: 30px;
   font-weight: 700;
@@ -175,7 +177,7 @@
   text-align: center;
 }
 .usage-countdown {
-  font-size: min(17px, 10cqw);
+  font-size: clamp(10px, 10cqw, 17px);
   line-height: 22px;
   font-weight: 700;
   color: var(--info);
@@ -228,20 +230,16 @@
   font-size: 12px;
 }
 .usage-balance-ring {
-  container-type: inline-size;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  width: min(100%, 92px);
+  width: 100%;
   aspect-ratio: 1;
   border: 2px dashed var(--muted-foreground);
   border-radius: 50%;
-  font-size: 16px;
   font-weight: 700;
   margin-bottom: 3px;
-}
-.usage-balance-ring > span {
-  white-space: nowrap;
 }
 .usage-balance-item {
   display: flex;
@@ -253,6 +251,42 @@
   display: block;
   width: 92px;
   max-width: 100%;
+}
+.usage-reading-figure {
+  container-type: inline-size;
+  display: inline-flex;
+  flex: none;
+  flex-direction: column;
+  align-items: center;
+  width: min(100%, var(--usage-ring-size, 92px));
+  max-width: 100%;
+  vertical-align: middle;
+}
+.usage-ring-reading {
+  max-width: 100%;
+  font-size: 13px;
+  text-align: center;
+  white-space: nowrap;
+}
+.usage-reading-figure[data-reading-outside="true"] > .usage-ring-reading {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.usage-reading-figure[data-reading-outside="true"] > .usage-ring-percent {
+  white-space: nowrap;
+}
+.usage-balance-figure {
+  font-size: 16px;
+  font-weight: 700;
+}
+.usage-balance-figure .usage-ring-reading {
+  font-size: inherit;
+}
+.usage-balance-label {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  font-size: 10px;
+  color: var(--muted-foreground);
 }
 .usage-ring {
   container-type: inline-size;
@@ -268,14 +302,11 @@
   white-space: nowrap;
 }
 .usage-ring-name {
-  font-size: min(10.5px, 11cqw);
-}
-.usage-ring-value {
-  white-space: nowrap;
+  font-size: clamp(10px, 11cqw, 10.5px);
 }
 .usage-balance-detail {
-  width: min(100%, 88px);
-  aspect-ratio: 1;
+  --usage-ring-size: 88px;
+  font-size: 12px;
 }
 
 .usage-band:has(.usage-tiles-compact) {

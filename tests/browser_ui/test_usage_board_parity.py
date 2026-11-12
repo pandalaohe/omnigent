@@ -152,7 +152,13 @@ def test_usage_ranges_pools_and_navigation(
     started = time.perf_counter()
     page.goto(appearance_url + "/frame/usage/board")
     expect(page.get_by_test_id("usage-tile")).to_have_count(50)
-    assert_usage_geometry(page)
+    board_geometry = {
+        '[data-testid="usage-tile"]': 50,
+        '[data-testid="usage-ring"]': 198,
+        "[data-usage-label]": 99,
+        "[data-usage-amount]": 0,
+    }
+    assert_usage_geometry(page, board_geometry)
     summary = page.get_by_role("region", name="Usage summary")
     expect(summary.get_by_text("$617.00")).to_have_count(4)
     # The target question glyph must not inherit a full-height button row.
@@ -204,8 +210,13 @@ def test_usage_ranges_pools_and_navigation(
             summary.get_by_role("link", name="Open usage analysis").focus()
             page.keyboard.press("Enter")
         expect(page).to_have_url(appearance_url + "/frame/usage/board/cost")
+        expect(page.locator(".ua-kpi")).to_have_count(4)
+        assert_usage_geometry(
+            page, {'[data-testid="usage-ring"]': 0, ".ua-kpi": 4, '[role="table"]': 1}
+        )
         page.get_by_role("link", name="Usage", exact=True).click()
         expect(page.get_by_test_id("usage-tile")).to_have_count(50)
+        assert_usage_geometry(page, board_geometry)
     summary.get_by_role("button", name="All accounts · 30-day reported cost details").click()
     expect(page.get_by_test_id("usage-tip-card")).to_be_visible()
     page.keyboard.press("Escape")

@@ -70,9 +70,11 @@ it("keeps independent pool links inside a single account tile, with a main ring 
 });
 
 it("keeps navigation and the tools outside the matched tile composition", () => {
+  const name = "Long account name with multiple segments and meaningful suffix";
   mount(
     <UsageBoardFrame
       title="Usage board"
+      back={{ to: "/usage/board/plan", label: name }}
       actions={
         <details>
           <summary>Board tools</summary>
@@ -88,6 +90,7 @@ it("keeps navigation and the tools outside the matched tile composition", () => 
   expect(screen.getByRole("link", { name: "Analysis" }).getAttribute("href")).toBe(
     "/usage/board/cost",
   );
+  expect(screen.getByRole("link", { name }).getAttribute("title")).toBe(name);
 });
 
 it("renders monetary zero, small and large amounts with exactly two decimal places", () => {
@@ -102,6 +105,7 @@ it("renders monetary zero, small and large amounts with exactly two decimal plac
 it("formats monetary balances separately from non-monetary counts", () => {
   expect(formatUsageValue(298.244, "CNY")).toBe("¥298.24");
   expect(formatUsageValue(1.23456, "credits")).toBe("1.235 credits");
+  expect(formatUsageValue(1234567890123.45, "USD")).toBe("$1,234,567,890,123.45");
 });
 
 it("rounds monetary ties half-even only at the final display boundary", () => {

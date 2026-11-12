@@ -1,19 +1,55 @@
-"""Visible usage figures must fit their cards, including narrow previews."""
+"""Count, visibility, clipping and readable text at the usage-board boundary."""
 
 from playwright.sync_api import Page
 
-USAGE_GEOMETRY = """() => {
+USAGE_GEOMETRY = """expected => {
   const failures = [];
-  const visible = el => el.checkVisibility() &&
-    el.getClientRects().length && el.getBoundingClientRect().width;
+  const counts = Object.entries(expected ?? {});
+  if (!counts.some(([, count]) => count > 0))
+    failures.push('expected element counts must include a non-zero view');
+  const visible = el => el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true}) &&
+    el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0;
   const inside = (outer, inner) => inner.left >= outer.left - 1 &&
     inner.right <= outer.right + 1 && inner.top >= outer.top - 1 &&
     inner.bottom <= outer.bottom + 1;
   const describe = el => `${el.tagName}.${el.className?.baseVal ?? el.className}: ` +
     el.textContent?.trim().slice(0, 80);
-  const figures = '[data-testid="usage-ring"], .usage-balance-ring, [data-usage-amount]';
+  const clipping = (el, rect) => {
+    const tile = el.closest('[data-testid="usage-tile"]') || el.closest(
+      '[data-usage-window], [data-testid="usage-balances"], .ua-panel, .ua-kpi, ' +
+      '.usage-pricing, .usage-board');
+    if (el === tile) return;
+    for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+      const style = getComputedStyle(parent);
+      const box = parent.getBoundingClientRect();
+      const left = box.left + parent.clientLeft, top = box.top + parent.clientTop;
+      if (style.overflowX !== 'visible' &&
+          (rect.left < left - 1 || rect.right > left + parent.clientWidth + 1))
+        failures.push(`ancestor clips horizontally: ${describe(el)}`);
+      if (style.overflowY !== 'visible' &&
+          (rect.top < top - 1 || rect.bottom > top + parent.clientHeight + 1))
+        failures.push(`ancestor clips vertically: ${describe(el)}`);
+      if (parent === tile) break;
+    }
+  };
+  const requireVisible = el => {
+    if (!visible(el)) {
+      failures.push(`not visible or zero size: ${describe(el)}`);
+      return false;
+    }
+    clipping(el, el.getBoundingClientRect());
+    return true;
+  };
+  for (const [selector, count] of counts) {
+    const elements = document.querySelectorAll(selector);
+    if (elements.length !== count)
+      failures.push(`expected ${count} ${selector}, found ${elements.length}`);
+    for (const el of elements) requireVisible(el);
+  }
+  const figures = '[data-testid="usage-ring"], .usage-balance-ring, [data-usage-amount], ' +
+    '[data-usage-label], [data-usage-percent]';
   for (const el of document.querySelectorAll(figures)) {
-    if (!visible(el)) continue;
+    if (!requireVisible(el)) continue;
     const card = el.closest('.usage-unit, [data-usage-window], ' +
       '[data-testid="usage-tile"], [data-testid="usage-balances"]');
     if (card && !inside(card.getBoundingClientRect(), el.getBoundingClientRect()))
@@ -21,44 +57,58 @@ USAGE_GEOMETRY = """() => {
     const tile = el.closest('[data-testid="usage-tile"]');
     if (tile && !inside(tile.getBoundingClientRect(), el.getBoundingClientRect()))
       failures.push(`figure outside account: ${describe(el)}`);
-    const range = document.createRange(); range.selectNodeContents(el);
-    for (const rect of range.getClientRects())
-      if (!inside(el.getBoundingClientRect(), rect))
-        failures.push(`text outside figure: ${describe(el)}`);
+    if (el.matches('[data-usage-amount], [data-usage-label], [data-usage-percent]')) {
+      if (parseFloat(getComputedStyle(el).fontSize) < 10)
+        failures.push(`text below 10px: ${describe(el)}`);
+      const range = document.createRange(); range.selectNodeContents(el);
+      for (const rect of range.getClientRects()) {
+        if (!inside(el.getBoundingClientRect(), rect))
+          failures.push(`text outside figure: ${describe(el)}`);
+        clipping(el, rect);
+      }
+      if (el.matches('[data-usage-percent]')) {
+        if (!/^\\d+\\.\\d{2}%$/.test(el.textContent.trim()))
+          failures.push(`split percentage: ${describe(el)}`);
+        const tops = new Set([...range.getClientRects()].map(rect => Math.round(rect.top)));
+        if (tops.size !== 1) failures.push(`wrapped percentage: ${describe(el)}`);
+      }
+    }
   }
   for (const ring of document.querySelectorAll('[data-testid="usage-ring"]')) {
     if (!visible(ring)) continue;
-    for (const circle of ring.querySelectorAll('circle'))
-      if (!inside(ring.getBoundingClientRect(), circle.getBoundingClientRect()))
+    for (const circle of ring.querySelectorAll('circle')) {
+      const box = circle.getBoundingClientRect(), matrix = circle.getScreenCTM();
+      const stroke = parseFloat(getComputedStyle(circle).strokeWidth) / 2;
+      const dx = stroke * Math.hypot(matrix.a, matrix.c);
+      const dy = stroke * Math.hypot(matrix.b, matrix.d);
+      const painted = {left: box.left - dx, right: box.right + dx,
+        top: box.top - dy, bottom: box.bottom + dy};
+      if (!inside(ring.getBoundingClientRect(), painted))
         failures.push(`arc outside ring: ${describe(ring)}`);
-    const text = [...ring.querySelectorAll('span')].find(el =>
-      !el.children.length && /^\\d+\\.\\d{2}%$/.test(el.textContent.trim()));
-    if (ring.textContent.includes('%') && !text)
-      failures.push(`split percentage: ${describe(ring)}`);
-    if (text) {
-      const range = document.createRange(); range.selectNodeContents(text);
-      const tops = new Set([...range.getClientRects()].map(rect => Math.round(rect.top)));
-      if (tops.size !== 1) failures.push(`wrapped percentage: ${describe(text)}`);
+      clipping(circle, painted);
     }
   }
   const texts = '.usage-board :is(p, b, strong, label, button, a, small, span)';
   for (const el of document.querySelectorAll(texts)) {
-    if (!visible(el) || el.children.length || el.closest('[data-testid="usage-tip-card"]'))
-      continue;
+    if (!visible(el) || el.children.length || !el.textContent.trim() ||
+        el.closest('[data-testid="usage-tip-card"]')) continue;
     const style = getComputedStyle(el);
-    if (style.overflowX === 'hidden') continue;
-    const range = document.createRange(); range.selectNodeContents(el);
+    if (parseFloat(style.fontSize) < 10) failures.push(`text below 10px: ${describe(el)}`);
     const card = el.closest('.usage-unit, [data-testid="usage-tile"], ' +
-      '.ua-panel, .ua-kpi, .usage-pricing');
-    if (card) for (const rect of range.getClientRects())
-      if (!inside(card.getBoundingClientRect(), rect))
+      '.ua-panel, .ua-kpi, .usage-pricing, .usage-board');
+    const ellipsis = style.textOverflow === 'ellipsis' && el.title === el.textContent.trim();
+    const range = document.createRange(); range.selectNodeContents(el);
+    for (const rect of ellipsis ? [el.getBoundingClientRect()] : range.getClientRects()) {
+      if (card && !inside(card.getBoundingClientRect(), rect))
         failures.push(`text outside card: ${describe(el)}`);
+      clipping(el, rect);
+    }
   }
   if (document.documentElement.scrollWidth > innerWidth) failures.push('document overflow');
   return [...new Set(failures)];
 }"""
 
 
-def assert_usage_geometry(page: Page) -> None:
-    failures = page.evaluate(USAGE_GEOMETRY)
+def assert_usage_geometry(page: Page, expected: dict[str, int]) -> None:
+    failures = page.evaluate(USAGE_GEOMETRY, expected)
     assert failures == [], (page.url, failures)

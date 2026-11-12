@@ -1,6 +1,32 @@
 import type { UsageAccountView } from "./usageBoardData";
 import { formatFullDate, formatUsageValue } from "./usageBoardFormat";
 import { t } from "./usageText";
+import { useUsageReadingPlacement } from "./useUsageReadingPlacement";
+
+function BalanceCircle({ value, label }: { value: string; label?: string }) {
+  const { circleRef, readingRef, outside } = useUsageReadingPlacement(value);
+  const amount = (
+    <span ref={readingRef} data-usage-amount className="usage-ring-reading">
+      {value}
+    </span>
+  );
+  return (
+    <span
+      className={`usage-reading-figure usage-balance-figure${label ? " usage-balance-detail" : ""}`}
+      data-reading-outside={outside}
+    >
+      <span ref={circleRef} className="usage-balance-ring">
+        {label ? (
+          <span data-usage-label className="usage-balance-label">
+            {label}
+          </span>
+        ) : null}
+        {!outside ? amount : null}
+      </span>
+      {outside ? amount : null}
+    </span>
+  );
+}
 
 /** Balances have their own reading time and never borrow a window's pace. */
 export function UsageBalances({
@@ -19,17 +45,8 @@ export function UsageBalances({
       <div className="usage-tile-balance" data-testid="usage-balances">
         {account.balances.map((balance) => (
           <div key={balance.id} className="usage-balance-item">
-            <div className="usage-balance-ring">
-              <span
-                data-usage-amount
-                style={{
-                  fontSize: `min(16px, ${110 / formatUsageValue(balance.remaining, balance.unit).length}cqw)`,
-                }}
-              >
-                {formatUsageValue(balance.remaining, balance.unit)}
-              </span>
-            </div>
-            <span>{balance.label ?? t("balance")}</span>
+            <BalanceCircle value={formatUsageValue(balance.remaining, balance.unit)} />
+            <span data-usage-label>{balance.label ?? t("balance")}</span>
             {stale ? <span className="block text-muted-foreground">{t("balanceOld")}</span> : null}
           </div>
         ))}
@@ -42,20 +59,19 @@ export function UsageBalances({
           key={balance.id}
           className="flex min-w-0 max-w-full flex-col items-center gap-0.5 text-center text-xs"
         >
-          <span
-            className={
-              compact
-                ? "font-medium tabular-nums"
-                : "usage-balance-detail flex flex-col items-center justify-center rounded-full border border-dashed border-muted-foreground/40 px-1"
-            }
-          >
-            <span className="max-w-full break-words text-[10px] text-muted-foreground">
-              {balance.label ?? t("balance")}
+          {compact ? (
+            <span className="max-w-full break-all font-medium tabular-nums">
+              <span data-usage-label className="text-[10px] text-muted-foreground">
+                {balance.label ?? t("balance")}
+              </span>{" "}
+              <span data-usage-amount>{formatUsageValue(balance.remaining, balance.unit)}</span>
             </span>
-            <span data-usage-amount className="max-w-full break-all font-semibold tabular-nums">
-              {formatUsageValue(balance.remaining, balance.unit)}
-            </span>
-          </span>
+          ) : (
+            <BalanceCircle
+              label={balance.label ?? t("balance")}
+              value={formatUsageValue(balance.remaining, balance.unit)}
+            />
+          )}
           {balance.group ? (
             <span className="max-w-full break-words text-muted-foreground">{balance.group}</span>
           ) : null}

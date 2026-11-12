@@ -116,7 +116,9 @@ export function UsageTile({
           />
         )}
         <div className="flex min-w-0 flex-1 flex-col leading-tight">
-          <span className="truncate font-semibold">{name}</span>
+          <span className="truncate font-semibold" title={name}>
+            {name}
+          </span>
           {plan ? <span className="truncate text-[11px] text-muted-foreground">{plan}</span> : null}
           {shownModel && (
             <span className="truncate text-xs text-muted-foreground">{shownModel}</span>
