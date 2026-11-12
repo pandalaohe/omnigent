@@ -174,15 +174,15 @@ it("does not let an old generation failure clear a new month's loading", async (
       <TaskBoardHistory {...props} caches={generation("initial")} />
     </MemoryRouter>,
   );
+  fireEvent.click(screen.getByRole("button", { name: "Find by month" }));
+  fireEvent.change(view.container.querySelector("input[type=month]")!, {
+    target: { value: "2020-01" },
+  });
   view.rerender(
     <MemoryRouter>
       <TaskBoardHistory {...props} caches={generation("A")} />
     </MemoryRouter>,
   );
-  fireEvent.click(screen.getByRole("button", { name: "Find by month" }));
-  fireEvent.change(view.container.querySelector("input[type=month]")!, {
-    target: { value: "2020-01" },
-  });
   fireEvent.click(screen.getByRole("button", { name: "Load month" }));
   view.rerender(
     <MemoryRouter>
