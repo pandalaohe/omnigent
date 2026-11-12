@@ -3348,6 +3348,13 @@ def register_events_routes(
         if body.type == _STOP_SESSION_TYPE:
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)
+            request_approvals_at_stop = {
+                event["elicitation_id"]
+                for event in pending_elicitations.snapshot_for(session_id)
+                if isinstance(event.get("elicitation_id"), str)
+                and isinstance(event.get("params"), dict)
+                and event["params"].get("phase") == "request"
+            }
             # Harness-agnostic forward: the runner kills the external
             # process for harnesses that have one (claude-native
             # hard-kills its tmux pane) and 204s otherwise. Unlike the
@@ -3537,6 +3544,22 @@ def register_events_routes(
                         conversation_store,
                         int(time.time()) - RUNNER_LIVENESS_TTL_S,
                     )
+            if stop_delivered:
+                # REQUEST gates live on the server, outside the stopped runner.
+                # Cancel only cards captured at this Stop's operation fence.
+                for pending in pending_elicitations.snapshot_for(session_id):
+                    elicitation_id = pending.get("elicitation_id")
+                    if elicitation_id in request_approvals_at_stop:
+                        try:
+                            await _resolve_elicitation(
+                                session_id,
+                                {"elicitation_id": elicitation_id, "action": "cancel"},
+                                runner_router,
+                                conversation_store,
+                            )
+                        except OmnigentError as exc:
+                            if exc.code != ErrorCode.ELICITATION_TIMED_OUT:
+                                raise
             # Stop is non-sticky: no persistent marker is written. The
             # runner tunnel dropping above flips ``runner_online`` to false
             # honestly, and the next message auto-relaunches the session on
