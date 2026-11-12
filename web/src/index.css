@@ -85,39 +85,18 @@ select optgroup {
 }
 
 /* CSS-pixel floor for native shells and touch browsers, independent of width. */
-/* Touch targets keep the control's visible size: an invisible pseudo-element
- * extends the hit area to 44px (as .phone-hit-area), so rows stay compact. */
+/* Phone touch targets: 44px wide, 36px tall. Rows stay compact while every
+ * target keeps a reliable height; isolated icon buttons size themselves to 44px. */
 @utility mobile-touch-target {
   &:is([data-mobile-app="true"], [data-mobile-app="true"] *) {
-    &:not(.absolute, .fixed, .sticky) {
-      position: relative;
-    }
-    &::after {
-      content: "";
-      position: absolute;
-      left: 50%;
-      top: 50%;
-      width: max(100%, 44px);
-      height: max(100%, 44px);
-      transform: translate(-50%, -50%);
-      pointer-events: inherit;
-    }
+    min-width: 44px;
+    min-height: 36px;
   }
+  /* Match the native branch's specificity so row resets like min-h-0 can't win. */
   @media (pointer: coarse) and (hover: none) {
     &:is(:root, :root *) {
-      &:not(.absolute, .fixed, .sticky) {
-        position: relative;
-      }
-      &::after {
-        content: "";
-        position: absolute;
-        left: 50%;
-        top: 50%;
-        width: max(100%, 44px);
-        height: max(100%, 44px);
-        transform: translate(-50%, -50%);
-        pointer-events: inherit;
-      }
+      min-width: 44px;
+      min-height: 36px;
     }
   }
 }
@@ -620,8 +599,8 @@ select optgroup {
 
 @media (width < 48rem) {
   .composer-add-menu [role="menuitem"].mobile-touch-target {
-    @apply h-7 rounded-md px-2 py-[3px] text-ui leading-4;
-    min-height: 28px;
+    @apply h-9 rounded-md px-2 py-[3px] text-ui leading-4;
+    min-height: 36px;
     @apply mobile-touch-target;
   }
 
