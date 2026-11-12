@@ -3430,6 +3430,10 @@ async def _persist_external_model_change(
     :raises OmnigentError: If ``data.model`` is missing or not a
         non-empty string.
     """
+    if body.data.get("confirmed") is False:
+        if conv.reported_model is None:
+            await _persist_agy_model_notice(session_id, conv, conversation_store, None)
+        return
     raw_model = body.data.get("model")
     if not isinstance(raw_model, str) or not raw_model.strip():
         raise OmnigentError(
@@ -3469,6 +3473,56 @@ async def _persist_external_model_change(
         model=model,
     )
     session_stream.publish(session_id, event.model_dump())
+    if body.data.get("confirmed") is True:
+        await _persist_agy_model_notice(session_id, conv, conversation_store, model)
+
+
+async def _persist_agy_model_notice(
+    session_id: str,
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    actual: str | None,
+) -> None:
+    """Surface readback uncertainty or substitution without interrupting the turn."""
+    from omnigent.harnesses.antigravity_native.bridge import split_agy_effort_suffix
+
+    def identity(value: str) -> str:
+        value = re.sub(r"\s*\((?:low|medium|high|xhigh|max)\)$", "", value, flags=re.I)
+        return re.sub(r"[^a-z0-9]", "", split_agy_effort_suffix(value.lower())[0])
+
+    requested = conv.model_override
+    if actual is not None and (not requested or identity(requested) == identity(actual)):
+        return
+    message = (
+        f"Antigravity is running {actual}; requested model was {requested}. "
+        "Continuing with the running model."
+        if actual is not None
+        else "Antigravity's running model is unconfirmed. "
+        "The requested model is retained until reliable readback is available."
+    )
+    error = ErrorData(
+        source="execution",
+        level="info",
+        code="agy_model_substituted" if actual is not None else "agy_model_unconfirmed",
+        message=message,
+    )
+    result = await _relay_persist_error_once(
+        conversation_store,
+        session_id,
+        NewConversationItem(type="error", response_id=generate_task_id(), data=error),
+    )
+    if result != "persisted":
+        return
+    _publish_error_event(session_id, error)
+    if actual is not None and conv.parent_conversation_id:
+        from omnigent.server.routes._sessions.orchestration import _post_system_message
+
+        await _post_system_message(
+            conv.parent_conversation_id,
+            f"[System: Antigravity model substitution in child {session_id}: {message}]",
+            conversation_store=conversation_store,
+            runner_router=None,
+        )
 
 
 async def _persist_external_session_title(

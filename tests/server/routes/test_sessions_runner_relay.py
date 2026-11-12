@@ -4534,3 +4534,58 @@ async def test_relay_leaves_a_turn_on_an_offline_host_to_the_disconnect_hold(
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("actual", "confirmed", "notice"),
+    [
+        ("Claude Opus 5.5", True, None),
+        ("Gemini 3.8 Flash", True, "agy_model_substituted"),
+        ("unconfirmed", False, "agy_model_unconfirmed"),
+    ],
+)
+async def test_agy_readback_preserves_request_and_notifies_parent(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    actual: str,
+    confirmed: bool,
+    notice: str | None,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.server.routes._sessions import helpers, orchestration
+    from omnigent.server.schemas import SessionEventInput
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(
+        parent_conversation_id=parent.id,
+        model_override="claude-opus-5-5",
+        harness_override="antigravity-native",
+    )
+    wake = AsyncMock(return_value=True)
+    monkeypatch.setattr(orchestration, "_post_system_message", wake)
+    event = SessionEventInput(
+        type="external_model_change", data={"model": actual, "confirmed": confirmed}
+    )
+    await helpers._persist_external_model_change(child.id, child, event, store)
+    saved = store.get_conversation(child.id)
+    assert saved is not None
+    assert saved.model_override == "claude-opus-5-5"
+    assert saved.reported_model == (actual if confirmed else None)
+    notices = [item.data for item in store.list_items(child.id).data if item.type == "error"]
+    assert [item.code for item in notices] == ([notice] if notice else [])
+    assert all(item.level == "info" for item in notices)
+    if notice == "agy_model_substituted":
+        wake.assert_awaited_once()
+        assert wake.call_args.args[0] == parent.id
+        assert actual in wake.call_args.args[1]
+    else:
+        wake.assert_not_awaited()
+    # A replay must not emit a second parent wake or duplicate visible notice.
+    await helpers._persist_external_model_change(child.id, saved, event, store)
+    assert len([item for item in store.list_items(child.id).data if item.type == "error"]) == len(
+        notices
+    )
+    assert wake.await_count == (1 if notice == "agy_model_substituted" else 0)
