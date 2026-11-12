@@ -1,6 +1,7 @@
 /* Usage board visual system: the app's own type steps, surfaces and status
    colours; numbers in tabular figures with reduced unit marks. */
 .usage-board {
+  --usage-caption: color-mix(in srgb, var(--muted-foreground) 60%, var(--foreground));
   --usage-track: color-mix(in srgb, var(--foreground) 9%, transparent);
   /* 50 % keeps the time arc at 3:1 or more on the card in both default themes. */
   --usage-time: color-mix(in srgb, var(--foreground) 50%, transparent);
@@ -432,9 +433,6 @@
 .usage-ring-track {
   stroke: var(--usage-track);
 }
-.usage-ring[data-stale] .usage-ring-art {
-  opacity: 0.5;
-}
 .usage-ring-content {
   position: relative;
   display: flex;
@@ -627,6 +625,8 @@
   margin-bottom: 6px;
 }
 .usage-detail-cost {
+  /* Caption contrast must also hold on the range trough and selected cell. */
+  --muted-foreground: var(--usage-caption);
   display: grid;
   gap: 12px;
 }
@@ -659,9 +659,6 @@
 }
 .usage-detail-cells button[aria-pressed="true"] {
   background: color-mix(in srgb, var(--foreground) 14%, transparent);
-  color: var(--foreground);
-}
-.usage-detail-cells button[aria-pressed="true"] .usage-unit-mark {
   color: var(--foreground);
 }
 .usage-detail-cells button > span {
