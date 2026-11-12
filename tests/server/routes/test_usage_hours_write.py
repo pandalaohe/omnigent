@@ -9,9 +9,11 @@ growth the daily rollup receives.
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime
 
+import httpx
 import pytest
 from sqlalchemy.orm import Session
 
@@ -21,7 +23,9 @@ from omnigent.db.db_models import (
     SqlSessionPermission,
 )
 from omnigent.db.utils import get_or_create_engine
-from omnigent.llms.context_window import ModelPricing
+from omnigent.harnesses.antigravity_native import reader as agy_reader
+from omnigent.llms.context_window import ModelPricing, fetch_model_pricing_with_provider
+from omnigent.onboarding.providers import ModelInfo
 from omnigent.server.routes._sessions.orchestration import (
     _accumulate_session_usage,
     _persist_native_cumulative_usage,
@@ -88,6 +92,82 @@ def _today() -> str:
 
 def _this_hour() -> int:
     return hours_of(int(datetime.now(UTC).timestamp()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("label", "catalog_model", "expected_model", "provider", "priced"),
+    [
+        ("Gemini 4 Argon (High)", "gemini-4-argon", "gemini-4-argon", "gemini", True),
+        ("Claude Opus 5.5 (Medium)", "claude-opus-5-5", "claude-opus-5-5", "anthropic", True),
+        ("MODEL_UNKNOWN", "gemini-4-argon", "MODEL_UNKNOWN", "gemini", False),
+        ("Gemini 4 Argon Ultra", "gemini-4-argon", "MODEL_UNKNOWN", "gemini", False),
+        ("Gemini 4 Argon (Experimental)", "gemini-4-argon", "MODEL_UNKNOWN", "gemini", False),
+        ("Gemini 4 Argon (High)", None, "MODEL_UNKNOWN", "gemini", False),
+    ],
+)
+async def test_agy_reader_usage_prices_hourly_catalog_bucket(
+    db_uri: str,
+    hours: UsageHoursStore,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    catalog_model: str | None,
+    expected_model: str,
+    provider: str,
+    priced: bool,
+) -> None:
+    """Reader payloads price through the real lookup; unknown enums retain tokens."""
+    model = ModelInfo(
+        name=catalog_model or "unavailable", provider=provider, input_price=2.0, output_price=10.0
+    )
+
+    def get_models(name: str, **kwargs) -> list[ModelInfo]:
+        if catalog_model is None and name == provider:
+            raise OSError("catalog unavailable")
+        return [model] if name == provider and catalog_model is not None else []
+
+    monkeypatch.setattr("omnigent.onboarding.providers.get_models", get_models)
+    conv_id = _session(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+
+    def receive(request: httpx.Request) -> httpx.Response:
+        frame = json.loads(request.content)
+        assert frame["type"] == "external_session_usage"
+        _persist_native_cumulative_usage(conv_id, frame["data"], store)
+        return httpx.Response(202)
+
+    state = agy_reader._ReaderState(
+        seen=set(),
+        interacted=set(),
+        model_catalog={"models": {"entry": {"model": "MODEL_UNKNOWN", "displayName": label}}},
+    )
+    step: dict[str, object] = {
+        "type": agy_reader._TYPE_PLANNER_RESPONSE,
+        "status": agy_reader._STATUS_DONE,
+        "stepIndex": 1,
+        "metadata": {
+            "modelUsage": {"model": "MODEL_UNKNOWN", "inputTokens": "1000", "outputTokens": "100"}
+        },
+    }
+    async with httpx.AsyncClient(
+        base_url="http://server.example.test", transport=httpx.MockTransport(receive)
+    ) as client:
+        await agy_reader._maybe_emit_session_usage(
+            step, client=client, session_id=conv_id, state=state
+        )
+
+    [row] = hours.read(_OWNER, _this_hour(), _this_hour() + 3600)
+    assert (row.input_tokens, row.output_tokens, row.total_tokens) == (1000, 100, 1100)
+    assert row.priced is priced
+    assert row.cost_usd == pytest.approx(0.003 if priced else 0.0)
+    assert row.model == expected_model
+    if not priced and catalog_model is not None:
+        assert (
+            hours.fill_unpriced(
+                fetch_model_pricing_with_provider, closed_before=_this_hour() + 3600
+            )
+            == 0
+        )
 
 
 def _price(input_per_million: float) -> ModelPricing:

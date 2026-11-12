@@ -69,6 +69,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
 from omnigent.harnesses.antigravity_native.rpc import AntigravityRpcError
 from omnigent.harnesses.antigravity_native.steps import PendingInteraction
 from omnigent.native.native_bridge_common import wrap_agent_instructions
+from omnigent.onboarding.providers import ModelInfo
 
 _WRAPPED_PLAN_TURN = wrap_agent_instructions("be terse", "Call the tool.")
 
@@ -3017,6 +3018,18 @@ async def _run_with_telemetry(
 ) -> None:
     """Drive ``supervise_reader`` in STREAM mode with a fake model catalog."""
     fake_catalog = catalog if catalog is not None else _FAKE_CATALOG
+    monkeypatch.setattr(
+        "omnigent.onboarding.providers.get_models",
+        lambda provider, **kwargs: (
+            [
+                ModelInfo(name="gemini-2.5-flash", provider="gemini"),
+                ModelInfo(name="gemini-2.5-pro", provider="gemini"),
+                ModelInfo(name="gemini-3.8-flash", provider="gemini"),
+            ]
+            if provider == "gemini"
+            else []
+        ),
+    )
     monkeypatch.setattr(reader, "stream_agent_state_updates", stream)
     monkeypatch.setattr(reader, "get_trajectory_steps", poll_steps)
     monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
@@ -3187,7 +3200,8 @@ async def test_planner_done_emits_session_usage(
     - cumulative_input_tokens = inputTokens (int)
     - cumulative_output_tokens = outputTokens (int)
     - cumulative_cache_read_input_tokens = cacheReadTokens (int)
-    - model = the displayName from the catalog (not the raw enum)
+    - model = the catalog-style id derived from the catalog displayName (the
+      server prices by this string), not the raw enum or the human label
     """
     planner = _planner_with_model_usage(
         input_tokens="1000",
@@ -3213,7 +3227,65 @@ async def test_planner_done_emits_session_usage(
     assert usage_data["cumulative_input_tokens"] == 1000
     assert usage_data["cumulative_output_tokens"] == 100
     assert usage_data["cumulative_cache_read_input_tokens"] == 200
-    assert usage_data["model"] == "Gemini 2.5 Flash"
+    assert usage_data["model"] == "gemini-2.5-flash"
+
+
+@pytest.mark.asyncio
+async def test_tiered_display_name_usage_posts_catalog_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A tiered catalog label (``"<Model> (<tier>)"``) is posted as the priceable id."""
+    catalog: dict[str, object] = {
+        "models": {
+            "m20": {
+                "model": "MODEL_PLACEHOLDER_M20",
+                "displayName": "Gemini 3.8 Flash (Medium)",
+            }
+        }
+    }
+    planner = _planner_with_model_usage(model_enum="MODEL_PLACEHOLDER_M20")
+    sink = _PostSink()
+
+    await _run_with_telemetry(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript([_frame([planner])]),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+        catalog=catalog,
+    )
+
+    posted = [d["model"] for et, d in sink.posts if et == "external_session_usage"]
+    assert posted == ["gemini-3.8-flash"]
+
+
+@pytest.mark.parametrize(
+    ("display_name", "expected"),
+    [
+        ("Gemini 3.8 Flash (Medium)", "gemini-3.8-flash"),
+        ("Gemini 2.5 Pro", "gemini-2.5-pro"),
+        ("Gemini 3.1 Flash Lite (Low)", "gemini-3.1-flash-lite"),
+        ("Claude Sonnet 4.6 (Thinking)", "claude-sonnet-4-6"),
+        ("GPT-OSS 120B", "gpt-oss-120b"),
+        # One-word human labels, including all-caps ones, are lowercased: only
+        # an underscore marks the raw-enum fallback, so these are not misread.
+        ("Codestral", "codestral"),
+        ("GPT-5", "gpt-5"),
+        ("O3", "o3"),
+        # Effort tiers are stripped; other qualifiers can distinguish models.
+        ("Gemini 3 (Preview) (Medium)", "gemini-3-(preview)"),
+        ("Gemini 3 (Preview) Flash", "gemini-3-(preview)-flash"),
+        # Id-shaped labels and unresolved raw enums pass through untouched.
+        ("gemini-3.8-flash", "gemini-3.8-flash"),
+        ("MODEL_PLACEHOLDER_M20", "MODEL_PLACEHOLDER_M20"),
+    ],
+)
+def test_catalog_model_id_normalizes_display_names(display_name: str, expected: str) -> None:
+    """Human catalog labels become catalog ids; id-shaped strings are left alone."""
+    assert reader._catalog_model_id(display_name) == expected
 
 
 @pytest.mark.asyncio
