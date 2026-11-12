@@ -14,12 +14,12 @@ USAGE_GEOMETRY = """expected => {
     inner.bottom <= outer.bottom + 1;
   const describe = el => `${el.tagName}.${el.className?.baseVal ?? el.className}: ` +
     el.textContent?.trim().slice(0, 80);
-  const clipping = (el, rect) => {
+  const clipping = (el, rect, ink = false) => {
     const tile = el.closest('[data-testid="usage-tile"]') || el.closest(
       '[data-usage-window], [data-testid="usage-balances"], .ua-panel, .ua-kpi, ' +
       '.usage-pricing, .usage-board');
     if (el === tile) return;
-    for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+    for (let parent = ink ? el : el.parentElement; parent; parent = parent.parentElement) {
       const style = getComputedStyle(parent);
       const box = parent.getBoundingClientRect();
       const left = box.left + parent.clientLeft, top = box.top + parent.clientTop;
@@ -48,6 +48,16 @@ USAGE_GEOMETRY = """expected => {
   }
   const figures = '[data-testid="usage-ring"], .usage-balance-ring, [data-usage-amount], ' +
     '[data-usage-label], [data-usage-percent]';
+  const textRects = el => {
+    const range = document.createRange(), rects = [];
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      if (!node.textContent.trim()) continue;
+      range.selectNodeContents(node);
+      rects.push(...range.getClientRects());
+    }
+    return rects;
+  };
   for (const el of document.querySelectorAll(figures)) {
     if (!requireVisible(el)) continue;
     const card = el.closest('.usage-unit, [data-usage-window], ' +
@@ -60,16 +70,18 @@ USAGE_GEOMETRY = """expected => {
     if (el.matches('[data-usage-amount], [data-usage-label], [data-usage-percent]')) {
       if (parseFloat(getComputedStyle(el).fontSize) < 10)
         failures.push(`text below 10px: ${describe(el)}`);
-      const range = document.createRange(); range.selectNodeContents(el);
-      for (const rect of range.getClientRects()) {
-        if (!inside(el.getBoundingClientRect(), rect))
-          failures.push(`text outside figure: ${describe(el)}`);
-        clipping(el, rect);
+      const rects = textRects(el);
+      for (const rect of rects) {
+        if (card && !inside(card.getBoundingClientRect(), rect))
+          failures.push(`text outside tile: ${describe(el)}`);
+        if (tile && !inside(tile.getBoundingClientRect(), rect))
+          failures.push(`text outside account: ${describe(el)}`);
+        clipping(el, rect, true);
       }
       if (el.matches('[data-usage-percent]')) {
         if (!/^\\d+\\.\\d{2}%$/.test(el.textContent.trim()))
           failures.push(`split percentage: ${describe(el)}`);
-        const tops = new Set([...range.getClientRects()].map(rect => Math.round(rect.top)));
+        const tops = new Set(rects.map(rect => Math.round(rect.top)));
         if (tops.size !== 1) failures.push(`wrapped percentage: ${describe(el)}`);
       }
     }
@@ -97,11 +109,10 @@ USAGE_GEOMETRY = """expected => {
     const card = el.closest('.usage-unit, [data-testid="usage-tile"], ' +
       '.ua-panel, .ua-kpi, .usage-pricing, .usage-board');
     const ellipsis = style.textOverflow === 'ellipsis' && el.title === el.textContent.trim();
-    const range = document.createRange(); range.selectNodeContents(el);
-    for (const rect of ellipsis ? [el.getBoundingClientRect()] : range.getClientRects()) {
+    for (const rect of ellipsis ? [el.getBoundingClientRect()] : textRects(el)) {
       if (card && !inside(card.getBoundingClientRect(), rect))
         failures.push(`text outside card: ${describe(el)}`);
-      clipping(el, rect);
+      clipping(el, rect, !ellipsis);
     }
   }
   if (document.documentElement.scrollWidth > innerWidth) failures.push('document overflow');

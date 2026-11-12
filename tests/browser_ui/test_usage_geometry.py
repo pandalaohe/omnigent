@@ -40,3 +40,22 @@ def test_usage_geometry_rejects_counterexamples(page: Page, counterexample: str,
                 "[data-usage-amount]": 1,
             },
         )
+
+
+def test_usage_geometry_accepts_unclipped_glyphs_outside_their_line_box(page: Page):
+    page.set_content("""<div class="usage-board" style="font-size:16px">
+      <div data-testid="usage-tile" style="width:180px;height:180px;padding:20px">
+        <span data-testid="usage-ring" style="display:block;width:92px;height:92px">
+          <span data-usage-label>Quota</span>
+          <span data-usage-amount style="display:block;line-height:10px">$10.00</span>
+        </span>
+      </div>
+    </div>""")
+    assert_usage_geometry(
+        page,
+        {
+            '[data-testid="usage-ring"]': 1,
+            "[data-usage-label]": 1,
+            "[data-usage-amount]": 1,
+        },
+    )

@@ -1,5 +1,6 @@
 """Usage composition and navigation through the built SPA boundary."""
 
+import json
 import time
 from urllib.parse import parse_qs, urlparse
 
@@ -19,7 +20,7 @@ def browser_context_args(browser_context_args):
 
 @pytest.mark.parametrize("width", [1280, 900, 390])
 def test_account_detail_keyboard_ranges_and_return(
-    page: Page, appearance_url: str, browser_contract: BrowserContract, width: int
+    page: Page, appearance_url: str, browser_contract: BrowserContract, width: int, record_property
 ):
     now = time.time()
     window = {
@@ -243,8 +244,10 @@ def test_account_detail_keyboard_ranges_and_return(
         },
     )
     page.get_by_role("button", name="Rings view", exact=True).click()
+    visited = []
     for item in accounts:
         page.goto(appearance_url + f"/frame/usage/board/{item['id']}")
+        expect(page.get_by_role("heading", name=item["display_name"], exact=True)).to_be_visible()
         cells = page.get_by_role("group", name="Cost time range")
         expect(cells.get_by_text("$12.34", exact=True)).to_have_count(3)
         for label in ["Today", "This period", "Last 7 days"]:
@@ -262,6 +265,7 @@ def test_account_detail_keyboard_ranges_and_return(
         }
         expect(page.get_by_text("Hosts", exact=True)).to_be_visible()
         assert_usage_geometry(page, expected)
+        visited.append({"account": item["id"], "view": "detail", "width": width})
         if item["id"] == "plan-1":
             expect(page.locator("[data-usage-percent]").filter(has_text="100.00%")).to_be_visible()
             expect(
@@ -269,14 +273,17 @@ def test_account_detail_keyboard_ranges_and_return(
             ).to_be_visible()
         page.get_by_role("link", name="Account settings").click()
         expect(page.get_by_test_id("usage-tile")).to_have_count(1)
+        expect(page.get_by_test_id("usage-tile")).to_have_attribute("data-account", item["id"])
         expected['[data-testid="usage-tile"]'] = 1
         expected["[data-usage-label]"] = (
             len({window["group"] for window in item["windows"]}) + balances
         )
         assert_usage_geometry(page, expected)
-        expect(page.get_by_role("link", name=item["display_name"], exact=True)).to_have_attribute(
-            "title", item["display_name"]
+        visited.append({"account": item["id"], "view": "settings", "width": width})
+        back = page.get_by_role("link", name=item["display_name"], exact=True).and_(
+            page.locator('[data-slot="button"]')
         )
+        expect(back).to_have_attribute("title", item["display_name"])
     page.goto(appearance_url + "/frame/usage/board/plan-0/settings")
     expect(page.get_by_role("link", name="Models", exact=True)).to_be_visible()
     expect(page.get_by_role("link", name="Issues", exact=True)).to_be_visible()
@@ -290,6 +297,7 @@ def test_account_detail_keyboard_ranges_and_return(
     }
     assert_usage_geometry(page, settings_geometry)
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    record_property("usage_views", json.dumps(visited))
 
     page.get_by_text("Pricing", exact=True).click()
     expect(page.get_by_label("Card payment preview")).to_contain_text("HKD 80.00 · USD 10.26")

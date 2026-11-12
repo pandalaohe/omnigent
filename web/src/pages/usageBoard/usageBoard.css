@@ -303,6 +303,7 @@
 }
 .usage-ring-name {
   font-size: clamp(10px, 11cqw, 10.5px);
+  line-height: 1.4;
 }
 .usage-balance-detail {
   --usage-ring-size: 88px;

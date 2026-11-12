@@ -10,8 +10,9 @@ export function useUsageReadingPlacement(reading: string) {
     const circle = circleRef.current;
     const text = readingRef.current;
     if (!circle || !text) return;
+    let active = true;
     const measure = () => {
-      if (!circle.clientWidth) return;
+      if (!active || !circle.clientWidth) return;
       const range = document.createRange();
       range.selectNodeContents(text);
       // Sum wrapped lines too, so moving out does not make the reading fit again.
@@ -23,7 +24,11 @@ export function useUsageReadingPlacement(reading: string) {
     observer.observe(circle);
     observer.observe(text);
     void document.fonts?.ready.then(measure);
-    return () => observer.disconnect();
+    return () => {
+      // A font-ready callback must not remeasure the reading's previous location.
+      active = false;
+      observer.disconnect();
+    };
   }, [reading, outside]);
 
   return { circleRef, readingRef, outside };
