@@ -17,7 +17,9 @@ from tests.browser_ui.test_sessions_appearance import appearance_features as app
 from tests.browser_ui.test_sessions_appearance import appearance_url as appearance_url
 
 
-@pytest.mark.parametrize("width,theme", [(1440, "dark"), (1440, "light"), (390, "dark")])
+@pytest.mark.parametrize(
+    "width,theme", [(1440, "dark"), (1440, "light"), (390, "dark"), (390, "light")]
+)
 def test_task_board_display_switch_and_source_list(
     page: Page,
     appearance_url: str,
@@ -384,3 +386,31 @@ def test_task_board_display_switch_and_source_list(
     output = Path(request.config.getoption("--output"))
     output.mkdir(parents=True, exist_ok=True)
     page.screenshot(path=str(output / f"task-board-{width}-{theme}.png"), full_page=True)
+    if width == 390:
+        browser_contract.json(
+            "/v1/me/tasks",
+            {"entries": [], "updated": "2026-11-06T06:30:00Z"},
+        )
+        browser_contract.json("/v1/me/tasks/history", {"entries": []})
+        page.evaluate(
+            "localStorage.setItem('omnigent.taskBoard.display', "
+            "JSON.stringify({theme:'dark', defaultView:'log'}))"
+        )
+        for route in ("/task-board", "/frame/task-board"):
+            page.goto(appearance_url + route)
+            expect(page.get_by_text("No activity to show.", exact=True)).to_be_visible()
+            measured = page.locator(".tb-page").evaluate(
+                """board => {
+                  const tabs = board.querySelector('.tb-view-tabs');
+                  const b = board.getBoundingClientRect(), n = tabs.getBoundingClientRect();
+                  return { boardBottom:b.bottom, navTop:n.top };
+                }"""
+            )
+            page.screenshot(
+                path=str(output / f"empty-{route.strip('/').replace('/', '-')}-dark.png")
+            )
+            assert measured["boardBottom"] >= measured["navTop"], measured
+            navigation = page.get_by_role("navigation", name="Board views")
+            expect(navigation).to_have_css("background-color", "rgb(24, 31, 37)")
+            navigation.get_by_role("button", name="Sessions", exact=True).click()
+            expect(page.get_by_role("region", name="Sessions", exact=True)).to_be_visible()

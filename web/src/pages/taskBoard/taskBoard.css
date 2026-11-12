@@ -6,6 +6,7 @@
   --tb-line-4: var(--chart-5, #bd558e);
   width: 100%;
   min-width: 0;
+  flex: 1;
   font-size: 14px;
   padding-bottom: 24px;
 }
@@ -1304,7 +1305,7 @@
     bottom: var(--omnigent-inset-bottom, 0px);
     z-index: 30;
     gap: 0;
-    background: var(--card);
+    background: var(--card-solid);
     border-top: 1px solid var(--border);
     padding: 3.5px;
   }
