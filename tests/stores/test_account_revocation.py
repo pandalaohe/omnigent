@@ -18,6 +18,9 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+from omnigent.stores.usage_pool_store import UsagePoolStore
+from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
+from omnigent.usage.contract import PoolRelationClaim
 
 
 def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) -> None:
@@ -25,14 +28,25 @@ def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) 
     permissions = SqlAlchemyPermissionStore(db_uri)
     old = accounts.create_user_with_password("alice", "test-password-hash")
     assert old.account_generation is not None
+    UsageSnapshotStore(db_uri).write("alice", "usage.account.parent", {"report": {"windows": []}})
+    pools = UsagePoolStore(db_uri)
+    relation = PoolRelationClaim(
+        parent_account_id="parent",
+        pool_id="source:pool",
+        channel="usage",
+        effective_from_hour=1794304800,
+    )
+    pools.write("alice", "pool", relation)
     assert accounts.delete_user("alice") is True
     assert accounts.get_user("alice") is None
     with pytest.raises(OmnigentError, match="revoked"):
         permissions.ensure_user("alice")
     new = accounts.create_user_with_password("alice", "replacement-password-hash")
+    assert pools.read("alice") == []
     assert new.account_generation and new.account_generation != old.account_generation
     with account_authority_scope("alice", old.account_generation):
         for write in (
+            lambda: pools.write("alice", "pool", relation),
             lambda: permissions.ensure_user("alice"),
             lambda: permissions.grant("alice", uuid.uuid4().hex, 3),
             lambda: HostStore(db_uri).upsert_on_connect(uuid.uuid4().hex, "laptop", "alice"),

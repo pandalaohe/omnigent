@@ -63,6 +63,46 @@ class ActivityHour(BaseModel):
         return self
 
 
+#: Channels a pool relation may name. ``usage`` rows are attributable tokens,
+#: requests and cost; ``metered_cost``/``list_cost`` rows contribute money only;
+#: ``quota`` names a destination that reports windows rather than hourly usage.
+PoolChannel = Literal["usage", "metered_cost", "list_cost", "quota"]
+POOL_CHANNELS: frozenset[str] = frozenset({"usage", "metered_cost", "list_cost", "quota"})
+USAGE_POOL_CHANNEL = "usage"
+MONETARY_POOL_CHANNELS: frozenset[str] = frozenset({"metered_cost", "list_cost"})
+QUOTA_POOL_CHANNEL = "quota"
+
+#: A pool identity is the exporter's namespace plus digest, never a label.
+_PoolId = Annotated[
+    str,
+    Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"),
+]
+
+
+class PoolRelationClaim(BaseModel):
+    """Optional report-v2 metadata naming the pool one destination reports.
+
+    The exporter owns ``pool_id`` (a namespace plus digest). Renaming or
+    reordering a pool's labels does not change this value, so a stored relation
+    stays valid. The claim names no new hourly key: a pool-specific destination
+    keeps reporting its attributable rows under the existing activity
+    ``account_id``.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    parent_account_id: _Id
+    pool_id: _PoolId
+    channel: PoolChannel
+    effective_from_hour: Annotated[StrictInt, Field(ge=0)]
+
+    @model_validator(mode="after")
+    def utc_hour_boundary(self) -> PoolRelationClaim:
+        if self.effective_from_hour % 3600:
+            raise ValueError("effective_from_hour must be a UTC hour boundary")
+        return self
+
+
 class ReportModel(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -216,6 +256,8 @@ class UsageReportV2(_ReportFields):
     activity: Annotated[list[ActivityEntryV2] | None, Field(max_length=500)] = None
     source_type: Literal["subscription", "metered", "relay", "manual", "other"] | None = None
     source: str | None = Field(default=None, max_length=64)
+    # Optional: an older reporter omits it, which never erases a stored relation.
+    pool_relation: PoolRelationClaim | None = None
 
     @model_validator(mode="after")
     def validate_sections(self) -> UsageReportV2:
@@ -303,6 +345,135 @@ class UsageOverview(BaseModel):
     tiers: dict[str, float | None]
     accounts: list[UsageAccountView]
     agents: dict[str, dict[str, Any]]
+
+
+class AnalysisSpan(BaseModel):
+    """The bounded window one analysis read covers."""
+
+    requested_from: float
+    counted_from: int
+    until: float
+    approx: bool
+
+
+class AnalysisTotals(BaseModel):
+    """The nullable figures one grouped analysis value reports.
+
+    A figure that a source did not report stays ``None``; a reported zero is a
+    known zero and survives as ``0``.
+    """
+
+    cost_usd: float | None = None
+    counted_cost_usd: float = 0.0
+    tokens: int | None = None
+    unpriced: int = 0
+    partial_rows: int = 0
+    per_million: float | None = None
+    covered_cost_usd: float = 0.0
+    covered_tokens: int = 0
+    cost_coverage_pct: float | None = None
+    tokens_complete: bool = False
+    requests: int | None = None
+    failed: int | None = None
+    failure_pct: float | None = None
+    reasons: dict[str, int] = Field(default_factory=dict)
+    last_at: int | None = None
+    metered: AnalysisTotals | None = None
+
+
+class PoolCatalogEntry(BaseModel):
+    """One observed pool, listed even while its usage stays unavailable.
+
+    ``usage_available`` states whether a proven ``usage`` channel exists for the
+    pool; a quota-only or monetary-only pool keeps its catalog row with
+    ``usage_available`` false while its value/tokens read as unknown.
+    """
+
+    parent_account_id: str
+    pool_id: str
+    display_name: str
+    channels: list[str] = Field(default_factory=list)
+    usage_available: bool = False
+    effective_from_hour: int | None = None
+
+
+class AnalysisRowView(BaseModel):
+    """One model-hour row of an analysis window, with its pool attribution."""
+
+    account_id: str
+    #: The parent tile this row rolls into (itself when it has no relation).
+    parent_account_id: str
+    pool_id: str | None = None
+    #: ``None`` when the account has no stored relation, so no channel is proven.
+    channel: str | None = None
+    hour: int
+    model: str = ""
+    host_id: str = ""
+    basis: str
+    priced: bool = False
+    coverage: str | None = None
+    tokens: int | None = None
+    uncached_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    output_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    requests: int | None = None
+    failed: int | None = None
+    cost_usd: float | None = None
+    attributed: bool = False
+    contributes_usage: bool = False
+    contributes_money: bool = False
+    reason: str | None = None
+
+
+class AnalysisAccountTotal(BaseModel):
+    account_id: str
+    totals: AnalysisTotals
+
+
+class AnalysisParentTotal(BaseModel):
+    parent_account_id: str
+    totals: AnalysisTotals
+
+
+class PoolTotalView(BaseModel):
+    """A pool's own actual rows, kept per destination and channel."""
+
+    parent_account_id: str
+    pool_id: str
+    account_id: str
+    channel: str
+    totals: AnalysisTotals
+
+
+class AnalysisUnmapped(BaseModel):
+    """Rows held at the parent with a reason instead of being divided."""
+
+    count: int = 0
+    rows: int = 0
+    reasons: dict[str, int] = Field(default_factory=dict)
+
+
+class UsageAnalysisView(BaseModel):
+    schema_version: Literal[1] = 1
+    generated_at: float
+    range: str
+    tz: str
+    span: AnalysisSpan
+    account_spans: dict[str, AnalysisSpan] = Field(default_factory=dict)
+    pool_catalog: list[PoolCatalogEntry] = Field(default_factory=list)
+    rows: list[AnalysisRowView] = Field(default_factory=list)
+    accounts: list[AnalysisAccountTotal] = Field(default_factory=list)
+    parents: list[AnalysisParentTotal] = Field(default_factory=list)
+    pools: list[PoolTotalView] = Field(default_factory=list)
+    unmapped: AnalysisUnmapped = Field(default_factory=AnalysisUnmapped)
+    truncated: bool = False
+    partial: bool = False
+    row_limit: int = 0
+
+
+AnalysisTotals.model_rebuild()
 
 
 @dataclass(frozen=True)

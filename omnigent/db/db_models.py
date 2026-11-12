@@ -2054,6 +2054,82 @@ class SqlUsageHour(OmnigentBase):
     )
 
 
+class SqlUsageAccountRelation(OmnigentBase):
+    """
+    SQLAlchemy model for the ``usage_account_relations`` table.
+
+    One immutable record per owner/workspace destination account asserting
+    that the account reports a stable source pool under a parent account. The
+    row is written only from a validated report-v2 ``pool_relation`` claim, and
+    an older reporter that omits the claim never removes it.
+
+    ``usage_hours`` keeps its original ``account_id`` and ``basis``; this table
+    is joined onto those rows at read time, so a proven ``usage`` channel at or
+    after ``effective_from_hour`` joins that pool while earlier and
+    non-usage rows stay at the parent with no pool. No foreign key is guessed
+    from ``window.group`` or ``band`` (schema Rule R032): the parent's existence
+    in the same owner/workspace scope is enforced by the application under the
+    writer's transaction.
+
+    :param workspace_id: Tenant partition key owning this row.
+    :param owner_id: The authenticated owner of both accounts.
+    :param account_id: The destination account the relation was reported on;
+        the exporter's stable identity, never a display label.
+    :param parent_account_id: The parent account the pool rolls into; it must
+        exist for the same owner in the same workspace.
+    :param pool_id: The exporter's stable pool identity (namespace + digest).
+    :param channel: ``usage``, ``metered_cost``, ``list_cost`` or ``quota``.
+    :param display_name: The pool's last-reported label; a label edit changes
+        this column only, never the identity columns.
+    :param effective_from_hour: Epoch seconds of a UTC hour boundary; rows
+        before it stay unattributed at the parent.
+    :param created_at: Unix epoch seconds the relation was first stored.
+    :param updated_at: Unix epoch seconds of the last display-name refresh.
+    """
+
+    __tablename__ = "usage_account_relations"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    owner_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    parent_account_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    pool_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    channel: Mapped[str] = mapped_column(String(16), nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    effective_from_hour: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        # One logical (parent, pool, channel) per owner: a second destination
+        # account may join the same pool only through its own distinct channel.
+        UniqueConstraint(
+            "workspace_id",
+            "owner_id",
+            "parent_account_id",
+            "pool_id",
+            "channel",
+            name="uq_usage_account_relations_logical",
+        ),
+        Index(
+            "ix_usage_account_relations_owner_parent",
+            "workspace_id",
+            "owner_id",
+            "parent_account_id",
+        ),
+        CheckConstraint(
+            "channel IN ('usage', 'metered_cost', 'list_cost', 'quota')",
+            name="ck_usage_account_relations_channel",
+        ),
+    )
+
+
 class SqlScheduledTask(OmnigentBase):
     """
     SQLAlchemy model for the ``scheduled_tasks`` table.

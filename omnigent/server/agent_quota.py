@@ -14,8 +14,13 @@ from datetime import date
 from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
 from omnigent.codex_rate_limits import fresh_codex_rate_limits
+from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import current_workspace_id, workspace_scope
+from omnigent.db.utils import run_write_transaction
 from omnigent.entities import Conversation
 from omnigent.quota_pace import (
     AgentQuota,
@@ -40,10 +45,28 @@ from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.usage_hours_store import UsageHoursStore
+from omnigent.stores.usage_pool_store import (
+    UsagePoolConflictError,
+    UsagePoolRelationError,
+    UsagePoolStore,
+)
 from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
 from omnigent.usage.activity import MarkSettings, attributed_rows, error_mark, summarize, totals
+from omnigent.usage.analysis import (
+    MAX_ANALYSIS_ROWS,
+    PoolProjection,
+    analysis_totals,
+    attribute_rows,
+    bounded_span,
+    pool_catalog,
+)
 from omnigent.usage.contract import (
+    AnalysisAccountTotal,
+    AnalysisParentTotal,
+    AnalysisSpan,
+    PoolTotalView,
     UsageAccountView,
+    UsageAnalysisView,
     UsageHostView,
     UsageOverview,
     UsagePeriodView,
@@ -58,7 +81,7 @@ from omnigent.usage.contract import (
     window_start,
 )
 from omnigent.usage.otlp import UsageDelta
-from omnigent.usage.ranges import RangeKey, range_spans
+from omnigent.usage.ranges import RangeKey, Span, range_spans
 
 _logger = logging.getLogger(__name__)
 _DELETE = object()
@@ -185,6 +208,7 @@ class AgentQuotaService:
         mark_settings: MarkSettings | None = None,
         agent_store: AgentStore | None = None,
         agent_cache: AgentCache | None = None,
+        pool_store: UsagePoolStore | None = None,
     ) -> None:
         self.conversations = conversation_store
         self.permissions = permission_store
@@ -194,6 +218,7 @@ class AgentQuotaService:
         self.snapshot_store = snapshot_store
         self.usage_enabled = usage_enabled
         self.hours_store = hours_store
+        self.pool_store = pool_store
         self.mark_settings = mark_settings or MarkSettings()
         self.agent_store = agent_store
         self.agent_cache = agent_cache
@@ -392,9 +417,67 @@ class AgentQuotaService:
                             "writer_conflict: account uses OTLP activity"
                         )
             if isinstance(report, UsageReportV2):
-                outcome = self._report_account_v2(
-                    owner, account_id, report, now=now, event=event, source=source
-                )
+                claim = report.pool_relation
+                if claim is not None and self.pool_store is None:
+                    raise UsagePoolRelationError("pool relations are not configured")
+                store = self.hours_store or self.pool_store or self.snapshot_store
+
+                def apply(
+                    session: Session | None,
+                ) -> tuple[WriteOutcome, dict[str, Any], dict[str, Any] | None]:
+                    if session is not None:
+                        require_active_account(session, owner)
+                    if claim is not None:
+                        assert self.pool_store is not None and session is not None
+                        self.pool_store.write_in_session(
+                            session,
+                            owner,
+                            account_id,
+                            claim,
+                            display_name=report.display_name or claim.pool_id,
+                            known_parents=self._pool_relation_parents(owner),
+                        )
+                    result = self._report_account_v2(
+                        owner,
+                        account_id,
+                        report,
+                        now=now,
+                        event=event,
+                        source=source,
+                        session=session,
+                    )
+                    if self.snapshot_store is not None:
+                        assert session is not None
+                        self.snapshot_store.write_in_session(
+                            session, owner, self._account_key(account_id), result[1]
+                        )
+                    return result
+
+                try:
+                    if store is None:
+                        outcome, record, snapshot = apply(None)
+                    else:
+                        outcome, record, snapshot = run_write_transaction(
+                            store._write_session(), "report_usage_account", apply
+                        )
+                except IntegrityError as exc:
+                    if claim is None:
+                        raise
+                    raise UsagePoolConflictError(
+                        "pool relation conflicts with another report"
+                    ) from exc
+                key = (current_workspace_id(), owner, account_id)
+                with self._lock:
+                    self._accounts[key] = record
+                    self._dirty[(key[0], owner, self._account_key(account_id))] = record
+                if snapshot is not None:
+                    self._store_snapshot(
+                        owner,
+                        record.get("host_id"),
+                        record["product"],
+                        snapshot,
+                        now=time.time() if now is None else now,
+                    )
             else:
                 outcome = None
                 self._report_account(owner, account_id, report, now=now)
@@ -405,7 +488,11 @@ class AgentQuotaService:
                         self._append_log(record, "cloudevent", float(report.observed_at), **event)
                         record["source"] = event["source"][:64]
                         record["source_at"] = report.observed_at
-            if report.activity is not None and self.snapshot_store is not None:
+            if (
+                not isinstance(report, UsageReportV2)
+                and report.activity is not None
+                and self.snapshot_store is not None
+            ):
                 key = (current_workspace_id(), owner, account_id)
                 with self._lock:
                     record = deepcopy(self._accounts[key])
@@ -419,6 +506,12 @@ class AgentQuotaService:
             for conv in self.conversations.find_conversations_by_external_session_ids(session_ids)
             if conv.external_session_id is not None and self.context(conv).owner_id == owner
         }
+
+    def _pool_relation_parents(self, owner: str) -> set[str]:
+        """Owner accounts already known, so a parent link can be proven first."""
+        workspace = current_workspace_id()
+        with self._lock:
+            return {key[2] for key in self._accounts if key[:2] == (workspace, owner)}
 
     def note_otlp_issue(
         self, owner: str, account_id: str, kind: str, *, metric: str | None = None
@@ -521,7 +614,8 @@ class AgentQuotaService:
         now: float | None,
         event: dict[str, Any] | None,
         source: str | None,
-    ) -> WriteOutcome:
+        session: Session | None,
+    ) -> tuple[WriteOutcome, dict[str, Any], dict[str, Any] | None]:
         outcome = WriteOutcome()
         now = time.time() if now is None else now
         self._hydrate(owner)
@@ -555,7 +649,8 @@ class AgentQuotaService:
             "observed_at",
             "fresh_until",
         }:
-            stored[name] = data[name]
+            if name != "pool_relation" or data[name] is not None:
+                stored[name] = data[name]
         record["product"] = stored.get("product") or record.get("product")
         if record["product"] is None:
             from omnigent.harness_plugins import native_agents
@@ -614,7 +709,8 @@ class AgentQuotaService:
                 else entry
                 for entry in report.activity
             ]
-            written = self.hours_store.replace_rows(owner, account_id, entries)
+            assert session is not None
+            written = self.hours_store.replace_rows_in_session(session, owner, account_id, entries)
             outcome.applied = written.applied
             outcome.held = written.held
             outcome.skipped = written.skipped
@@ -668,14 +764,7 @@ class AgentQuotaService:
             snapshot = deepcopy(record["routing_snapshot"])
             snapshot["pinned_period"] = record.get("pinned_window")
             record["routing_snapshot"] = deepcopy(snapshot)
-        with self._lock:
-            self._accounts[key] = record
-            self._dirty[(key[0], owner, self._account_key(account_id))] = record
-        if snapshot is not None:
-            self._store_snapshot(
-                owner, record.get("host_id"), record["product"], snapshot, now=now
-            )
-        return outcome
+        return outcome, record, snapshot
 
     def _report_account(
         self,
@@ -1221,6 +1310,257 @@ class AgentQuotaService:
                 ]
             result.append(item)
         return {"generated_at": now, "range": range_key, "tz": tz, "accounts": result}
+
+    def analysis(
+        self,
+        owner: str,
+        *,
+        range_key: RangeKey = "d7",
+        tz: str = "UTC",
+        from_date: date | None = None,
+        to_date: date | None = None,
+        account: str | None = None,
+        now: float | None = None,
+    ) -> UsageAnalysisView:
+        """Read one bounded analysis window with serve pool attribution.
+
+        The read reuses the same owner scope, attribution identities and
+        deduplicated rows as :meth:`activity`, then joins the stored immutable
+        pool relations onto them. It never rewrites ``usage_hours``: a row is
+        either proven pool usage (a ``usage`` channel at or after its effective
+        boundary) or stays at its parent, and a pool's own rows are totalled
+        per destination/channel so two pools under one parent never share a
+        parent's actual usage.
+
+        :param owner: The authenticated owner whose usage is read.
+        :param range_key: The named calendar range, or ``custom`` with dates.
+        :param tz: Zone the calendar range is resolved in.
+        :param from_date: First local day of a ``custom`` range.
+        :param to_date: Last local day of a ``custom`` range.
+        :param account: Restrict the returned rows and totals to one account.
+        :param now: Reference time; injectable for tests.
+        :returns: The bounded, typed analysis view.
+        :raises ValueError: For an invalid range, zone or an empty span.
+        """
+        from omnigent.harness_plugins import native_agents
+
+        now = time.time() if now is None else now
+        zone = ZoneInfo(tz)
+        overview = self.overview(owner, now=now, include_marks=False)
+        views = {item.id: item for item in overview.accounts}
+        workspace = current_workspace_id()
+        with self._lock:
+            records = {
+                key[2]: deepcopy(record)
+                for key, record in self._accounts.items()
+                if key[:2] == (workspace, owner)
+            }
+            display_records = [
+                (key[2], key[3], deepcopy(record))
+                for key, record in self._display.items()
+                if key[:2] == (workspace, owner)
+            ]
+        settings = read_collab_settings(self.preferences, owner)
+        tiers = QuotaTiers(
+            tight_below_pct=cast(float, overview.tiers["tight_below_pct"]),
+            low_below_pct=cast(float, overview.tiers["low_below_pct"]),
+            floor_pct=overview.tiers.get("floor_pct"),
+        )
+        for native in native_agents():
+            if native.key not in views:
+                views[native.key] = self._native_account(
+                    native.key,
+                    [item for item in display_records if item[1] == native.key],
+                    tiers,
+                    settings,
+                    now,
+                )
+        relations = self.pool_store.read_map(owner) if self.pool_store is not None else {}
+        spans = {}
+        for key, view in views.items():
+            parent = relations[key].parent_account_id if key in relations else key
+            spans[key], _ = range_spans(
+                range_key,
+                now,
+                zone,
+                from_date=from_date,
+                to_date=to_date,
+                period=views.get(parent, view).period,
+            )
+        selected_spans = {
+            key: value
+            for key, value in spans.items()
+            if account is None
+            or key == account
+            or (key in relations and relations[key].parent_account_id == account)
+        }
+        if selected_spans:
+            span = Span.starting(
+                min(value.requested_from for value in selected_spans.values()),
+                max(value.until for value in selected_spans.values()),
+            )
+        else:
+            span, _ = range_spans(range_key, now, zone, from_date=from_date, to_date=to_date)
+        since, until, _, clamped = bounded_span(span.requested_from, span.until)
+        non_usage = {key for key, relation in relations.items() if relation.channel != "usage"}
+        usage_records = {key: value for key, value in records.items() if key not in non_usage}
+        meters = {
+            key: matches - non_usage for key, matches in self._activity_meters(owner).items()
+        }
+        cohort: set[str] | None = None
+        native_models: dict[str, tuple[bool, set[str]]] = {}
+        if account is not None:
+            cohort = {account} | {
+                item.account_id for item in relations.values() if item.parent_account_id == account
+            }
+            linked: dict[str, str] = {}
+            for account_id, record in sorted(usage_records.items()):
+                if record.get("product"):
+                    linked.setdefault(str(record["product"]), account_id)
+            products = set(linked) | {product for product, _ in meters} | set(views)
+            for product in products:
+                default = linked.get(product, product)
+                default_selected = default in cohort
+                exceptions: set[str] = set()
+                for (meter_product, model), matches in meters.items():
+                    if meter_product != product or not matches:
+                        continue
+                    meter = next(iter(matches)) if len(matches) == 1 else None
+                    target = (
+                        meter
+                        if meter and (meter in records or meter in views or meter == product)
+                        else product
+                    )
+                    if (target in cohort) != default_selected:
+                        exceptions.add(model)
+                if default_selected or exceptions:
+                    native_models[product] = (default_selected, exceptions)
+        if self.hours_store is not None:
+            rows, truncated = self.hours_store.read_bounded(
+                owner,
+                since,
+                until,
+                MAX_ANALYSIS_ROWS,
+                account_ids=cohort,
+                native_models=native_models,
+            )
+            hostless = self.hours_store.hostless_accounts(owner)
+        else:
+            rows, truncated, hostless = [], False, set()
+        projected = attributed_rows(
+            [row for row in rows if row.account_id not in non_usage],
+            usage_records,
+            meters,
+            list(views),
+            hostless=hostless - non_usage,
+        )
+        selected = [
+            replace(item, account_id=target) if item.account_id.startswith("native:") else item
+            for target, group in projected.items()
+            for item in group
+        ]
+        selected.extend(
+            row for row in rows if row.account_id in non_usage and row.account_id in records
+        )
+        selected = [
+            row
+            for row in selected
+            if (row_span := spans.get(row.account_id, span)).counted_from
+            <= row.hour_utc
+            < row_span.until
+        ]
+        selected.sort(key=lambda item: (item.hour_utc, item.account_id, item.model, item.host_id))
+        projection = attribute_rows(selected, relations, views)
+        if account is not None:
+            # The filter names a tile: the account itself and the pools under it.
+            visible = [
+                item
+                for item in projection.rows
+                if item.account_id == account or item.parent_account_id == account
+            ]
+            projection = PoolProjection(rows=visible, partial=projection.partial)
+        catalog = pool_catalog(list(relations.values()), views)
+        if account is not None:
+            catalog = [item for item in catalog if item.parent_account_id == account]
+        parents = sorted({item.parent_account_id for item in projection.rows})
+        account_ids = sorted({item.account_id for item in projection.rows})
+        pool_keys = sorted(
+            {
+                (item.parent_account_id, item.pool_id, item.account_id, item.channel)
+                for item in projection.rows
+                if item.pool_id is not None and (item.pool_money or item.pool_usage)
+            }
+        )
+        return UsageAnalysisView(
+            generated_at=now,
+            range=range_key,
+            tz=tz,
+            span=AnalysisSpan(
+                requested_from=span.requested_from,
+                counted_from=since if clamped else span.counted_from,
+                until=span.until,
+                approx=span.approx or clamped,
+            ),
+            account_spans={
+                key: AnalysisSpan(
+                    requested_from=value.requested_from,
+                    counted_from=max(since, value.counted_from),
+                    until=value.until,
+                    approx=value.approx or value.counted_from < since,
+                )
+                for key, value in selected_spans.items()
+            },
+            pool_catalog=catalog,
+            rows=[item.view() for item in projection.rows],
+            accounts=[
+                AnalysisAccountTotal(
+                    account_id=value,
+                    totals=analysis_totals(
+                        [
+                            item.row
+                            for item in projection.rows
+                            if item.account_id == value and item.contributes_money
+                        ],
+                        [
+                            item.row
+                            for item in projection.rows
+                            if item.account_id == value and item.contributes_usage
+                        ],
+                    ),
+                )
+                for value in account_ids
+            ],
+            parents=[
+                AnalysisParentTotal(
+                    parent_account_id=value,
+                    totals=analysis_totals(
+                        projection.parent_money(value), projection.parent_usage(value)
+                    ),
+                )
+                for value in parents
+            ],
+            pools=[
+                PoolTotalView(
+                    parent_account_id=parent,
+                    pool_id=cast(str, pool),
+                    account_id=account_id,
+                    channel=cast(str, channel),
+                    totals=analysis_totals(
+                        projection.pool_rows(
+                            parent, cast(str, pool), account_id, cast(str, channel)
+                        ),
+                        projection.pool_usage(
+                            parent, cast(str, pool), account_id, cast(str, channel)
+                        ),
+                    ),
+                )
+                for parent, pool, account_id, channel in pool_keys
+            ],
+            unmapped=projection.unmapped(),
+            truncated=truncated,
+            partial=projection.partial or clamped or truncated,
+            row_limit=MAX_ANALYSIS_ROWS,
+        )
 
     def issues(
         self, owner: str, *, now: float | None = None, **range_options: Any

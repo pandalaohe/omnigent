@@ -93,6 +93,7 @@ def scope_allows(scope: str, method: str, path: str) -> bool:
         return path in {
             "/v1/me/usage",
             "/v1/me/usage/activity",
+            "/v1/me/usage/analysis",
             "/v1/me/usage/issues",
             "/v1/me/usage/models",
         }

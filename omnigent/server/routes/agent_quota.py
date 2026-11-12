@@ -24,6 +24,8 @@ from omnigent.quota_pace import accept_snapshot
 from omnigent.server.agent_quota import (
     AgentQuotaService,
     UsageAccountLimitError,
+    UsagePoolConflictError,
+    UsagePoolRelationError,
     UsageStorageUnavailableError,
     UsageWriterConflictError,
 )
@@ -34,6 +36,7 @@ from omnigent.server.usage_price_source import PriceSourceSelection, UsagePriceS
 from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 from omnigent.stores.host_store import HostStore
 from omnigent.usage.contract import (
+    UsageAnalysisView,
     UsageOverview,
     UsageReport,
     UsageReportV2,
@@ -466,6 +469,10 @@ def create_agent_quota_router(
             )
         except UsageStorageUnavailableError:
             raise HTTPException(503, "Usage storage unavailable; retry later") from None
+        except UsagePoolConflictError as exc:
+            raise HTTPException(409, str(exc)) from None
+        except UsagePoolRelationError as exc:
+            raise HTTPException(422, str(exc)) from None
         except (UsageAccountLimitError, UsageWriterConflictError) as exc:
             raise HTTPException(409, str(exc)) from None
         if outcome is not None:
@@ -536,6 +543,35 @@ def create_agent_quota_router(
             if selected_failures:
                 payload["price_source"] = selected_failures
         return JSONResponse(payload, headers={"Cache-Control": "private, no-store"})
+
+    @router.get("/me/usage/analysis", response_model=UsageAnalysisView)
+    async def read_analysis(
+        request: Request,
+        range_key: Annotated[RangeKey, Query(alias="range")] = "d7",
+        from_date: Annotated[date | None, Query(alias="from")] = None,
+        to_date: Annotated[date | None, Query(alias="to")] = None,
+        tz: str = "UTC",
+        account: str | None = None,
+    ) -> Response:
+        require_usage()
+        from fastapi.responses import JSONResponse
+
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        try:
+            view = await asyncio.to_thread(
+                service.analysis,
+                owner,
+                range_key=range_key,
+                from_date=from_date,
+                to_date=to_date,
+                tz=tz,
+                account=account,
+            )
+        except (ValueError, ZoneInfoNotFoundError):
+            raise HTTPException(422, "Invalid usage range or timezone") from None
+        return JSONResponse(
+            view.model_dump(mode="json"), headers={"Cache-Control": "private, no-store"}
+        )
 
     @router.get("/me/usage/price-source")
     async def read_price_source(request: Request) -> dict[str, Any]:
