@@ -215,7 +215,7 @@ def test_task_board_display_switch_and_source_list(
     )
     browser_contract.json(
         "/v1/me/tasks/closed-counts",
-        {"days": [{"day": "2020-01-01", "source": "example", "closed": 23}]},
+        {"days": [{"day": "2020-01-01", "source": "example", "closed": 2}]},
     )
     browser_contract.json(
         "/v1/me/tasks/item",
@@ -460,7 +460,9 @@ def test_task_board_display_switch_and_source_list(
     expect(
         page.get_by_role("region", name="Log").get_by_text("Keep confirmed chunks")
     ).to_be_visible()
-    page.get_by_label("Group by", exact=True).select_option("mother")
+    page.get_by_role("region", name="Log", exact=True).get_by_role(
+        "button", name="By root session", exact=True
+    ).click()
     expect(
         page.get_by_role("region", name="Log").get_by_role("heading", name="Transfer reliability")
     ).to_be_visible()
@@ -468,21 +470,57 @@ def test_task_board_display_switch_and_source_list(
     log.get_by_role("button", name="Retry failed uploads", exact=True).click()
     log_detail = log.get_by_role("region", name="Details: Retry failed uploads", exact=True)
     expect(log_detail).to_be_visible()
-    assert log_detail.evaluate(
-        "el => el.closest('li').previousElementSibling.textContent"
-        ".includes('Keep confirmed chunks')"
-    )
+    expect(log.get_by_text("Keep confirmed chunks")).to_be_visible()
     log_detail.get_by_role("button", name="Close", exact=True).click()
     page.get_by_role("button", name="History", exact=True).click()
-    expect(page.get_by_title("Week of 2019-12-30: 23 closed")).to_be_visible()
-    page.get_by_label("Find month").select_option("2020-01")
-    expect(
-        page.get_by_text("This month is outside the retained task window.", exact=False)
-    ).to_be_visible()
+    history = page.get_by_role("region", name="History", exact=True)
+    history.get_by_role("button", name="1 year", exact=True).click()
+    history.get_by_role("button", name=re.compile(r"^example\b")).click()
+    history.get_by_role("button", name=re.compile("Earlier checks")).click()
+    expect(history.get_by_text("Earlier recovery check", exact=True)).to_be_visible()
+    old_requests: list[dict[str, list[str]]] = []
+
+    def archived_page(route) -> None:
+        query = parse_qs(urlparse(route.request.url).query)
+        if "closed_before" not in query:
+            route.fallback()
+            return
+        old_requests.append(query)
+        second = "cursor" in query
+        route.fulfill(
+            json={
+                "entries": [
+                    {
+                        "uid": "archived-second" if second else "archived-first",
+                        "title": "Archived second check" if second else "Archived first check",
+                        "omnigent.ai:source": "example",
+                        "omnigent.ai:group": {"id": "archive", "name": "Archive checks"},
+                        "progress": "completed",
+                        "created": "2020-01-01T00:00:00Z",
+                        "progressUpdated": "2020-01-01T02:00:00Z",
+                    }
+                ],
+                **({} if second else {"omnigent.ai:cursor": "second-page"}),
+            }
+        )
+
+    browser_contract.route("/v1/me/tasks", archived_page)
+    history.get_by_role("button", name="Find by month", exact=True).click()
+    history.get_by_label("Find month", exact=True).fill("2020-01")
+    history.get_by_role("button", name="Load month", exact=True).click()
+    expect(history.locator(".h-stat>b").first).to_have_text("2")
+    history.get_by_role("button", name=re.compile(r"^example\b")).click()
+    history.get_by_role("button", name=re.compile("Archive checks")).click()
+    expect(history.get_by_text("Archived first check", exact=True)).to_be_visible()
+    expect(history.get_by_text("Archived second check", exact=True)).to_be_visible()
+    assert len(old_requests) == 2 and old_requests[1]["cursor"] == ["second-page"]
+    history.get_by_role("button", name="Back to recent", exact=True).click()
+    expect(history.get_by_text("Archived first check", exact=True)).to_have_count(0)
     page.get_by_role("button", name="Today", exact=True).click()
-    expect(page.get_by_text("Active sessions today", exact=True)).to_be_visible()
-    expect(page.locator(".tb-number-tiles dt").filter(has_text="Closed today")).to_be_visible()
-    expect(page.get_by_text("toclosedDay.closed", exact=True)).to_have_count(0)
+    today = page.get_by_role("region", name="Today", exact=True)
+    expect(today.get_by_role("heading", name=re.compile("Who worked today"))).to_be_visible()
+    expect(today.get_by_text("Closed today", exact=True)).to_be_visible()
+    expect(today.get_by_text("Task-linked commits", exact=True)).to_be_visible()
     page.get_by_role("button", name="Settings", exact=True).click()
     display = page.get_by_role("region", name="Settings", exact=True)
     display.get_by_role("button", name="Dark" if theme == "dark" else "Light", exact=True).click()
@@ -756,4 +794,58 @@ def test_task_board_display_switch_and_source_list(
         expect(trigger).to_be_focused()
         navigation_checks.append(boundary)
     print("ROUTE_RELATED_NAVIGATION", width, theme, navigation_checks, flush=True)
+    source_ids = [f"project-{index:02d}" for index in range(1, 11)]
+    browser_contract.json(
+        "/v1/me/tasks/sources",
+        {
+            "sources": [
+                {"id": source, "name": source, "source": None, "created": observed, "issues": []}
+                for source in source_ids
+            ]
+        },
+    )
+    closed_at = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+    browser_contract.json(
+        "/v1/me/tasks",
+        {
+            "entries": [
+                {
+                    "uid": "closed-check",
+                    "title": f"Closed check in {source}",
+                    "omnigent.ai:source": source,
+                    "omnigent.ai:group": {"id": "checks", "name": "Recovery checks"},
+                    "progress": "completed",
+                    "created": closed_at,
+                    "progressUpdated": closed_at,
+                }
+                for source in source_ids
+            ],
+            "updated": observed,
+        },
+    )
+    browser_contract.json("/v1/me/tasks/closed-counts", {"days": []})
+    page.evaluate(
+        "value => localStorage.setItem('omnigent.taskBoard.display', JSON.stringify(value))",
+        {"theme": theme, "defaultView": "history", "refresh": 0},
+    )
+    page.goto(appearance_url + "/task-board")
+    names = page.locator(".h-p .h-name b")
+    expect(names).to_have_text(source_ids)
+    if width == 390:
+        for row in page.locator(".h-p").all():
+            row.evaluate("el => el.scrollIntoView({block: 'center'})")
+            assert row.evaluate(
+                "el => { const r = el.getBoundingClientRect(); return el.contains("
+                "document.elementFromPoint(r.x + r.width/2, r.y + r.height/2)); }"
+            )
+        last = page.locator(".h-p").last.bounding_box()
+        navigation = page.locator(".tb-view-tabs").bounding_box()
+        assert last and navigation and last["y"] + last["height"] <= navigation["y"]
+        print(
+            "HISTORY_SOURCE_SCROLL",
+            theme,
+            json.dumps({"last": last, "navigation": navigation}),
+            flush=True,
+        )
+        page.screenshot(path=str(output / f"history-source-scroll-{width}-{theme}.png"))
     assert not errors

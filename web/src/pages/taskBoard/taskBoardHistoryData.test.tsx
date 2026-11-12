@@ -130,6 +130,39 @@ it("freezes selected log rows, buffers arrivals and reconciles on resume", () =>
   fireEvent.click(screen.getByRole("button", { name: "Resume1" }));
   expect(screen.getByRole("button", { name: "B" })).toBeTruthy();
 });
+it("shows the note of legacy history events without a supplied label", () => {
+  render(
+    <TaskBoardLog
+      tasks={[task("Older task")]}
+      sessions={[]}
+      onSelect={vi.fn()}
+      events={[
+        {
+          id: "legacy-commit",
+          source: "engineering",
+          uid: "Older task",
+          time: "2020-01-10T12:00:00Z",
+          kind: "commit",
+          note: "Keep confirmed chunks",
+        },
+        {
+          id: "legacy-open",
+          source: "engineering",
+          uid: "Older task",
+          time: "2020-01-10T11:00:00Z",
+          kind: "open",
+          note: "Opened for recovery",
+        },
+      ]}
+    />,
+  );
+  expect(screen.getByText("Keep confirmed chunks")).toBeTruthy();
+  expect(screen.getByText(/Opened for recovery/)).toBeTruthy();
+});
+it("explains when the log has no events", () => {
+  render(<TaskBoardLog tasks={[]} sessions={[]} onSelect={vi.fn()} events={[]} />);
+  expect(screen.getByText("No activity to show.")).toBeTruthy();
+});
 it("filters before rollups and expands source, group, task and nodes", () => {
   const a = task("Priced"),
     b = task("Unknown");
@@ -180,6 +213,12 @@ it("deduplicates commits by source and id and chooses only typed releases", () =
     />,
   );
   expect(screen.getByText("v2")).toBeTruthy();
+  expect(screen.getByText("Task-linked commits")).toBeTruthy();
+  expect(
+    screen.getByTitle(
+      "Only commits attached to supplied tasks; excludes repository commits without a task link.",
+    ),
+  ).toBeTruthy();
   expect(
     within(screen.getByText("Landed today").closest("section")!).getByText("1", { selector: "b" }),
   ).toBeTruthy();
@@ -234,6 +273,14 @@ it("loads pinned old-month cursor pages and discards a cancelled response", asyn
   expect(container.querySelector(".h-range")?.textContent).toContain("January 1");
   expect(fetcher).toHaveBeenCalledTimes(4);
   expect(fetcher.mock.calls[2][0]).toContain("cursor=later");
+  fireEvent.click(screen.getByRole("button", { name: /engineering.*1 groups/ }));
+  fireEvent.click(screen.getByRole("button", { name: /A group/ }));
+  expect(screen.getByRole("button", { name: /Old A.*Completed/ })).toBeTruthy();
+  expect(screen.getByRole("button", { name: /Old B.*Completed/ })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Back to recent" }));
+  await waitFor(() => expect(container.querySelector(".h-stat>b")?.textContent).toBe("0"));
+  expect(screen.queryByText("Old A")).toBeNull();
+  expect(screen.queryByText("Old B")).toBeNull();
 });
 
 it("keeps native sessions without a supplied task in the Today worker totals", () => {

@@ -1295,6 +1295,9 @@
   gap: 12.5px;
 }
 @container (max-width:620px) {
+  .tb-page > .tb-activity-final {
+    padding-bottom: calc(50px + var(--omnigent-inset-bottom, 0px));
+  }
   .tb-page .tb-page-header {
     min-height: 54px;
   }

@@ -132,7 +132,7 @@ export function TaskBoardToday({
           </div>
           <div>
             <b>{commits.size}</b>
-            <span>{t("g6.commits")}</span>
+            <span title={t("g6.taskCommitsHint")}>{t("g6.taskCommits")}</span>
           </div>
           <div>
             <b>{release?.name ?? "—"}</b>

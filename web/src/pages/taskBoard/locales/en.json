@@ -511,5 +511,7 @@
   "g6.agent.codex": "Codex",
   "g6.agent.antigravity": "Antigravity",
   "g6.unbilled": "Not billed",
-  "g6.recent": "Back to recent"
+  "g6.recent": "Back to recent",
+  "g6.taskCommits": "Task-linked commits",
+  "g6.taskCommitsHint": "Only commits attached to supplied tasks; excludes repository commits without a task link."
 }

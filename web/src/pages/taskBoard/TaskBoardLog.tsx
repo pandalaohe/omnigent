@@ -293,8 +293,8 @@ export function TaskBoardLog({
                         {check
                           ? `${check.host} ${t("sessions.check." + check.verdict)}`
                           : k === "commit"
-                            ? (commits[0]?.subject ?? row.label)
-                            : `${r?.agentId ?? ""} ${row.label ?? t("g6.event." + k)}`}
+                            ? (commits[0]?.subject ?? row.label ?? row.note)
+                            : `${r?.agentId ?? ""} ${row.label ?? row.note ?? t("g6.event." + k)}`}
                       </span>
                     </span>
                     <span className="lr-sub">
@@ -385,6 +385,7 @@ export function TaskBoardLog({
           </div>
         </section>
       ))}
+      {!groups.size && <p>{t("activity.empty")}</p>}
       <ActivityPages page={page} total={groups.size} size={6} onChange={setPage} />
     </div>
   );
