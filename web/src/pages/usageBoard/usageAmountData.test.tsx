@@ -298,7 +298,7 @@ it("keeps hidden accounts out of totals, the account list and By model", async (
   const list = await screen.findByRole("region", { name: "Accounts" });
   expect(within(list).queryByText("LiteLLM")).toBeNull();
   const cost = screen.getByRole("region", { name: "Cost" });
-  expect(within(cost).getByRole("button", { name: "~$0" })).toBeTruthy();
+  expect(within(cost).getByRole("button", { name: "~$0.00" })).toBeTruthy();
   fireEvent.click(screen.getByText("By model"));
   expect(screen.queryByText("model-b")).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Tokens" }));
@@ -310,8 +310,8 @@ it("takes the summary tap to Cost, then its failure row to ranged Issues blocks"
   mount("/usage/board");
   const summary = await screen.findByRole("region", { name: "Usage summary" });
   await waitFor(() => expect(summary.textContent).toContain("$"));
-  fireEvent.click(within(summary).getByRole("link"));
-  await screen.findByRole("heading", { name: "Cost", level: 1 });
+  fireEvent.click(within(summary).getByRole("link", { name: "Open usage analysis" }));
+  await screen.findByRole("heading", { name: "Usage board", level: 1 });
   fireEvent.click(screen.getByRole("link", { name: /requests.*failed.*unpriced.*Issues/ }));
   await screen.findByRole("heading", { name: "Issues", level: 1 });
   expect((await screen.findByRole("region", { name: "Failures" })).textContent).toContain(

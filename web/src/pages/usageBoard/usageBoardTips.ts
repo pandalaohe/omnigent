@@ -9,6 +9,7 @@ import {
   formatShortDate,
   formatTimeLeft,
   formatWindowLength,
+  formatUsageValue,
   paceChip,
   windowName,
 } from "./usageBoardFormat";
@@ -41,12 +42,12 @@ export function windowTip(
   if (window.used_value !== null) {
     rows.push({
       label: "Now",
-      value: `${window.used_value.toLocaleString("en-US")}${window.unit ? ` ${window.unit}` : ""}`,
+      value: formatUsageValue(window.used_value, window.unit),
     });
     if (window.limit_value !== null) {
       rows.push({
         label: "Limit",
-        value: `${window.limit_value.toLocaleString("en-US")}${window.unit ? ` ${window.unit}` : ""}`,
+        value: formatUsageValue(window.limit_value, window.unit),
       });
     }
   }

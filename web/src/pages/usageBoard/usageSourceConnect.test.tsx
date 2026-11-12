@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { UsageSourceConnect } from "./UsageSourceConnect";
 import { UsageTile } from "./UsageTile";
@@ -40,18 +41,20 @@ describe("source connection", () => {
     amount.totals.partial_rows = 1;
     for (const density of ["std", "mini"] as const) {
       const view = render(
-        <TooltipProvider>
-          <UsageTile
-            account={account}
-            amount={amount}
-            density={density}
-            pinnedWindowId={undefined}
-            renewal={null}
-            onOpen={open}
-          />
-        </TooltipProvider>,
+        <MemoryRouter>
+          <TooltipProvider>
+            <UsageTile
+              account={account}
+              amount={amount}
+              density={density}
+              pinnedWindowId={undefined}
+              renewal={null}
+              onOpen={open}
+            />
+          </TooltipProvider>
+        </MemoryRouter>,
       );
-      expect(screen.getByText("0 USD")).toBeTruthy();
+      expect(screen.getByText("$0.00")).toBeTruthy();
       expect(screen.getByText("Incomplete coverage")).toBeTruthy();
       expect(screen.getByText("Balance reading is old")).toBeTruthy();
       expect(screen.queryByTestId("usage-ring")).toBeNull();

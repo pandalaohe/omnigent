@@ -4,10 +4,13 @@ import { boardPath } from "@/lib/boardFrame";
 // half-filled page while the reading is still arriving.
 
 import type { ReactNode } from "react";
-import { Link } from "@/lib/routing";
+import { useLocation, Link } from "@/lib/routing";
 
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { t } from "./usageText";
+import { formatAge } from "./usageBoardFormat";
+import "./usageBoard.css";
 
 interface UsageBoardFrameProps {
   title: ReactNode;
@@ -16,6 +19,7 @@ interface UsageBoardFrameProps {
   actions?: ReactNode;
   loading?: boolean;
   error?: unknown;
+  generatedAt?: number;
   children: ReactNode;
 }
 
@@ -25,23 +29,40 @@ export function UsageBoardFrame({
   actions,
   loading = false,
   error,
+  generatedAt,
   children,
 }: UsageBoardFrameProps) {
+  const location = useLocation();
+  const analysis = location.pathname.endsWith("/cost");
   return (
-    <div className="@container mx-auto w-full max-w-[1120px] px-4 pb-16 pt-4 sm:px-6">
-      <div className="mb-2.5 flex min-h-9 flex-wrap items-center gap-2">
-        {back ? (
-          <Button variant="ghost" size="sm" asChild className="-ml-2 gap-1">
-            <Link to={boardPath(back.to)}>
-              <span aria-hidden="true">‹</span>
-              {back.label}
-            </Link>
-          </Button>
+    <div className="usage-board @container">
+      <header className="usage-top">
+        <h1>{title === "Cost" ? t("boardTitle") : title}</h1>
+        <nav className="usage-tabs" aria-label="Usage pages">
+          <Link to={boardPath("/usage/board")} aria-current={!analysis ? "page" : undefined}>
+            {t("usageTab")}
+          </Link>
+          <Link to={boardPath("/usage/board/cost")} aria-current={analysis ? "page" : undefined}>
+            {t("analysisTab")}
+          </Link>
+        </nav>
+        {generatedAt != null ? (
+          <span className="usage-data-age text-xs text-muted-foreground">
+            {Date.now() / 1000 - generatedAt < 60
+              ? "Data just now"
+              : `Data ${formatAge(Math.max(0, Date.now() / 1000 - generatedAt))} ago`}
+          </span>
         ) : null}
-        <span className="flex-1" />
-        {actions}
-      </div>
-      <h1 className="mb-3 text-2xl font-semibold tracking-tight">{title}</h1>
+        <span className="usage-top-actions">{actions}</span>
+      </header>
+      {back ? (
+        <Button variant="ghost" size="sm" asChild>
+          <Link to={boardPath(back.to)}>
+            <span aria-hidden="true">‹ </span>
+            {back.label}
+          </Link>
+        </Button>
+      ) : null}
       {error ? <FailedReading error={error} /> : null}
       {loading ? (
         <div className="flex items-center gap-2 py-10 text-sm text-muted-foreground">

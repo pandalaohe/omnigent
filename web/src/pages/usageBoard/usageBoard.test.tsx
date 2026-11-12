@@ -136,11 +136,11 @@ describe("board", () => {
     renderRoute();
     const tiles = await screen.findAllByTestId("usage-tile");
     expect(tiles.length).toBe(5);
-    // The deciding window is the one on the tile: 5h, not the less urgent 7d.
+    // The longest reported window is main; the session remains as a satellite.
     const codex = tiles.find((tile) => tile.dataset.account === "codex") as HTMLElement;
     expect(within(codex).getByText("5h")).toBeTruthy();
     expect(within(codex).getByText("4h 0m")).toBeTruthy();
-    expect(within(codex).getByTestId("usage-ring").textContent).toContain("12");
+    expect(within(codex).getAllByTestId("usage-ring")[0].textContent).toContain("72");
     // A weekly window writes its own name inside the ring.
     expect(screen.getAllByText("7d").length).toBeGreaterThan(0);
   });
@@ -171,7 +171,7 @@ describe("board", () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
     renderRoute();
     const tile = (await screen.findByText("LiteLLM")).closest("[data-account]") as HTMLElement;
-    expect(within(tile).getByText("41 USD")).toBeTruthy();
+    expect(within(tile).getByText("$41.00")).toBeTruthy();
     expect(within(tile).queryByText("%")).toBeNull();
   });
 

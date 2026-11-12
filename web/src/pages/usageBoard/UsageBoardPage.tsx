@@ -32,6 +32,7 @@ import { boardBands, moveTile, seedBands } from "./usageBoardLayout";
 import { UsageTile } from "./UsageTile";
 import { useUsageOverview, type UsageAccountView } from "./usageBoardData";
 import { useUsageActivity } from "./usageActivityData";
+import { t } from "./usageText";
 import { UsageSummary } from "./UsageAmounts";
 
 /** The renewal a tile counts down to: the provider's date wins over the user's. */
@@ -52,6 +53,7 @@ export function UsageBoardPage() {
   const activity = useUsageActivity(
     undefined,
     info !== "loading" && info.usage_board_enabled === true,
+    { key: "period" },
   );
   const navigate = useNavigate();
   const [arranging, setArranging] = useState(false);
@@ -110,74 +112,76 @@ export function UsageBoardPage() {
   return (
     <UsageBoardFrame
       title="Usage board"
+      generatedAt={overview.data?.generated_at}
       loading={overview.isPending}
       error={overview.error ?? activity.error}
       actions={
-        arranging ? (
-          <>
-            <Button variant="outline" size="sm" onClick={addBand} className="gap-1.5">
-              <PlusIcon className="size-3.5" aria-hidden="true" />
-              Group
-            </Button>
-            <Button size="sm" onClick={() => setArranging(false)} className="gap-1.5">
-              <CheckIcon className="size-3.5" aria-hidden="true" />
-              Done
-            </Button>
-          </>
-        ) : (
-          <>
-            <Button
-              variant="ghost"
-              size="icon"
-              aria-label="Arrange groups and order"
-              title="Arrange"
-              onClick={() => {
-                // Arranging needs the ring view: a compact row has no room for
-                // handles, and switching here is one line instead of a second
-                // arrangement layout.
-                update({ bands: seedBands(board, accounts), density: "std" });
-                setArranging(true);
-              }}
-            >
-              <MoveIcon className="size-4" aria-hidden="true" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              aria-label={board.density === "std" ? "Compact view" : "Rings view"}
-              title={board.density === "std" ? "Compact view" : "Rings view"}
-              onClick={() => update({ density: board.density === "std" ? "mini" : "std" })}
-            >
-              {board.density === "std" ? (
-                <ListIcon className="size-4" aria-hidden="true" />
-              ) : (
-                <LayoutGridIcon className="size-4" aria-hidden="true" />
-              )}
-            </Button>
-            <Button variant="ghost" size="icon" asChild aria-label="Usage board settings">
-              <Link {...boardExitProps()} to="/settings/general#usage-settings">
-                <SettingsIcon className="size-4" aria-hidden="true" />
-              </Link>
-            </Button>
-          </>
-        )
+        <details className="usage-tools">
+          <summary>{t("boardTools")}</summary>
+          <div>
+            {arranging ? (
+              <>
+                <Button variant="outline" size="sm" onClick={addBand} className="gap-1.5">
+                  <PlusIcon className="size-3.5" aria-hidden="true" />
+                  Group
+                </Button>
+                <Button size="sm" onClick={() => setArranging(false)} className="gap-1.5">
+                  <CheckIcon className="size-3.5" aria-hidden="true" />
+                  Done
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Arrange groups and order"
+                  title="Arrange"
+                  onClick={() => {
+                    // Arranging needs the ring view: a compact row has no room for
+                    // handles, and switching here is one line instead of a second
+                    // arrangement layout.
+                    update({ bands: seedBands(board, accounts), density: "std" });
+                    setArranging(true);
+                  }}
+                >
+                  <MoveIcon className="size-4" aria-hidden="true" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label={board.density === "std" ? "Compact view" : "Rings view"}
+                  title={board.density === "std" ? "Compact view" : "Rings view"}
+                  onClick={() => update({ density: board.density === "std" ? "mini" : "std" })}
+                >
+                  {board.density === "std" ? (
+                    <ListIcon className="size-4" aria-hidden="true" />
+                  ) : (
+                    <LayoutGridIcon className="size-4" aria-hidden="true" />
+                  )}
+                </Button>
+                <Button variant="ghost" size="icon" asChild aria-label="Usage board settings">
+                  <Link {...boardExitProps()} to="/settings/general#usage-settings">
+                    <SettingsIcon className="size-4" aria-hidden="true" />
+                  </Link>
+                </Button>
+              </>
+            )}
+          </div>
+        </details>
       }
     >
       {!arranging ? (
         <UsageSummary
-          accounts={
-            activity.data?.accounts.filter(
-              (item) =>
-                accounts.some((account) => account.id === item.account) &&
-                !board.hidden.includes(item.account),
-            ) ?? []
-          }
+          accountIds={accounts
+            .filter((account) => !board.hidden.includes(account.id))
+            .map((account) => account.id)}
         />
       ) : null}
       {!arranging && total === 0 ? (
         <EmptyBoard />
       ) : (
-        <div className="flex flex-col gap-2.5">
+        <div className="usage-bands">
           {bands.map((band, index) => {
             const open = band.open || arranging;
             // An empty group is only worth a row while it is being arranged.
@@ -186,7 +190,7 @@ export function UsageBoardPage() {
               <section
                 key={band.id}
                 className={cn(
-                  "rounded-[14px] bg-foreground/[0.035] px-2 pb-2 pt-0.5",
+                  "usage-band",
                   arranging && "outline-dashed outline-1 outline-foreground/30 -outline-offset-1",
                 )}
                 data-testid="usage-band"
@@ -254,10 +258,8 @@ export function UsageBoardPage() {
                 {open ? (
                   <div
                     className={cn(
-                      "grid",
-                      board.density === "mini"
-                        ? "grid-cols-[repeat(auto-fill,minmax(236px,1fr))] gap-1.5"
-                        : "grid-cols-[repeat(auto-fill,minmax(146px,1fr))] gap-2",
+                      "usage-tiles",
+                      board.density === "mini" ? "usage-tiles-compact" : "",
                     )}
                   >
                     {band.accounts.map((account) => (
@@ -279,6 +281,13 @@ export function UsageBoardPage() {
                           )
                         }
                         amount={activity.data?.accounts.find((item) => item.account === account.id)}
+                        onOpenGroup={(group) =>
+                          navigate(
+                            boardPath(
+                              `/usage/board/${encodeURIComponent(account.id)}?focus=${encodeURIComponent(group)}`,
+                            ),
+                          )
+                        }
                         tokens={board.unit === "tokens"}
                         onOpen={() =>
                           navigate(boardPath(`/usage/board/${encodeURIComponent(account.id)}`))

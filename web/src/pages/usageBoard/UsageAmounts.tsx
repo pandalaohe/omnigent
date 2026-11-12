@@ -5,6 +5,8 @@ import { Button } from "@/components/ui/button";
 import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { cn } from "@/lib/utils";
+import { useUsageActivity } from "./usageActivityData";
+import { t } from "./usageText";
 import type { UsageAccountActivity, UsageAmount } from "./usageActivityData";
 import type { UsageAccountView } from "./usageBoardData";
 import { formatFullDate, formatMoney } from "./usageBoardFormat";
@@ -103,40 +105,73 @@ export function UsageAmountFigure({
   );
 }
 
-export function UsageSummary({ accounts }: { accounts: UsageAccountActivity[] }) {
-  const tokens = useUsageContextPreferences().board.unit === "tokens";
-  const amount = boardAmount(accounts, false, tokens);
-  const buckets = amount?.series.slice(-24) ?? [];
-  const max = Math.max(1, ...buckets.map((point) => (tokens ? point.tokens : point.cost_usd) ?? 0));
+export function UsageSummary({ accountIds }: { accountIds: string[] }) {
+  const d30 = useUsageActivity(undefined, true, { key: "d30" });
+  const today = useUsageActivity(undefined, true, { key: "today" });
+  const h24 = useUsageActivity(undefined, true, { key: "h24" });
+  const d7 = useUsageActivity(undefined, true, { key: "d7" });
+  const visible = new Set(accountIds);
   return (
-    <section
-      aria-label="Usage summary"
-      className="mb-3 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 rounded-[11px] border border-border bg-card px-3 py-2"
-    >
-      <Link
-        to={boardPath("/usage/board/cost")}
-        className="inline-flex min-h-11 items-center gap-2 text-xl font-semibold md:min-h-[30px]"
-      >
-        {amount ? <UsageAmountFigure amount={amount} tokens={tokens} total /> : "—"}
-        <span aria-hidden="true" className="text-xs text-muted-foreground">
-          ›
-        </span>
-      </Link>
-      <div className="flex h-7 w-24 max-w-24 items-end gap-0.5 overflow-hidden" aria-hidden="true">
-        {buckets.map((point) => (
-          <span
-            key={point.at}
-            className="min-w-0 flex-1 rounded-t-sm bg-info/25"
-            style={{ height: `${(100 * ((tokens ? point.tokens : point.cost_usd) ?? 0)) / max}%` }}
-          />
-        ))}
-      </div>
-      <UsageRangeControl />
-      <UsageDates amount={amount} />
-      <div className="ml-auto">
-        <UsageUnitControl />
-      </div>
-    </section>
+    <>
+      <section className="usage-summary" aria-label="Usage summary">
+        {[
+          ["d30", t("reported30"), d30],
+          ["today", t("today"), today],
+          ["h24", t("hours24"), h24],
+          ["d7", t("days7"), d7],
+        ].map(([key, label, query]) => {
+          const reading = query as typeof d30;
+          const amount = reading.data
+            ? boardAmount(
+                reading.data.accounts.filter((account) => visible.has(account.account)),
+                false,
+                false,
+              )
+            : null;
+          return (
+            <div key={String(key)} data-range={String(key)}>
+              <div className="usage-summary-label">
+                {key === "d30" ? (
+                  <Link
+                    to={boardPath("/usage/board/cost")}
+                    className="usage-summary-link"
+                    aria-label="Open usage analysis"
+                  >
+                    {String(label)}
+                  </Link>
+                ) : (
+                  String(label)
+                )}
+                {amount ? (
+                  <UsageTipButton
+                    label={`${String(label)} details`}
+                    model={amountTip(amount, true)}
+                    className="usage-summary-tip"
+                  >
+                    ?
+                  </UsageTipButton>
+                ) : null}
+              </div>
+              <div className={key === "d30" ? "usage-summary-big" : "usage-summary-value"}>
+                {reading.error ? (
+                  "Unavailable"
+                ) : amount && amount.totals.cost_usd !== null ? (
+                  <span className="tabular-nums">
+                    {amount.mark}
+                    {usageFigure(amount.totals, false)}
+                  </span>
+                ) : (
+                  "—"
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </section>
+      <p className="usage-valuation-pending" role="status">
+        {t("apiPending")}
+      </p>
+    </>
   );
 }
 
