@@ -572,16 +572,17 @@ describe("Composer Escape interrupt", () => {
     (mobile) => {
       if (mobile) {
         const mediaQuery = window.matchMedia("(max-width: 767.98px)");
-        vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+        const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
           ...mediaQuery,
           media: query,
           matches: query === "(max-width: 767.98px)",
         }));
+        onTestFinished(() => matchMedia.mockRestore());
       }
       render(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
       expect(textarea()).toHaveAttribute(
         "placeholder",
-        mobile ? "Send a follow-up (queued)" : "Send a follow-up (queued) — Esc to stop",
+        mobile ? "Queue a follow-up" : "Send a follow-up (queued) — Esc to stop",
       );
     },
   );

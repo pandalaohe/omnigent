@@ -883,6 +883,20 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
   });
 });
 
+describe("ChatHeader — phone session chips", () => {
+  it.each([
+    ["chat view", makeTerminalFirstCtx({ view: "chat" }), false],
+    ["terminal view", makeTerminalFirstCtx({ view: "terminal" }), true],
+    ["shell view", makeTerminalFirstCtx({ isShellView: true }), true],
+  ])("shows the chips in the header only when the composer is hidden (%s)", (_, ctx, shown) => {
+    isMobileMock.mockReturnValue(true);
+    renderHeaderWithSession(ctx);
+    const chip = screen.queryByRole("button", { name: /^Standing approval:/ });
+    if (shown) expect(chip).toBeInTheDocument();
+    else expect(chip).toBeNull();
+  });
+});
+
 describe("ChatHeader — floating mobile controls", () => {
   it("adds glass to the mobile sidebar and shared action container", () => {
     isMobileMock.mockReturnValue(true);

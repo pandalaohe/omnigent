@@ -54,6 +54,7 @@ import { TAB_BADGE_BASE } from "./railTabs";
 import { TerminalSplitControls } from "./TerminalSplitControls";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import { SidebarOpenButton } from "./SidebarOpenButton";
+import { useTerminalFirst } from "./TerminalFirstContext";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { ReceiveAnnotationsButton } from "@/components/ReceiveAnnotationsButton";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -401,6 +402,10 @@ export function ChatHeader({
   mobileMenu,
 }: ChatHeaderProps) {
   const isMobile = useIsMobileViewport();
+  const terminalFirst = useTerminalFirst();
+  // Phone terminal and shell views have no composer bar, so their chips stay here.
+  const phoneComposerHidden =
+    isMobile && !!terminalFirst && (terminalFirst.isShellView || terminalFirst.view === "terminal");
   const rightPanelShortcut = useShortcutHint("toggleWorkspaceSidebar");
   const canvas = useCanvasWorkspace();
   const serverInfo = useServerInfo();
@@ -729,16 +734,18 @@ export function ChatHeader({
           <MobileHeaderControlsSlot sessionId={conversationId ?? null} />
         )}
         {/* Phone: these two live in the bar above the composer (ChatPage). */}
-        {!pending && conversationId && !isMobile && (
+        {!pending && conversationId && (!isMobile || phoneComposerHidden) && (
           <>
             <StandingApprovalChip
               key={`approval:${conversationId}`}
               sessionId={conversationId}
+              appearance={isMobile ? "bar" : "chip"}
               readOnly={isChildSession || archived || !isEditorLevel(permissionLevel ?? null)}
             />
             <AutoRotationChip
               key={`auto-rotation:${conversationId}`}
               sessionId={conversationId}
+              appearance={isMobile ? "bar" : "chip"}
               readOnly={archived || !isEditorLevel(permissionLevel ?? null)}
             />
           </>

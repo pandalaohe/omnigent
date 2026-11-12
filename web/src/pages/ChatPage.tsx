@@ -5362,7 +5362,7 @@ function ComposerImpl(
                       ? "Waiting for agents…"
                       : isStreaming
                         ? isMobile
-                          ? "Send a follow-up (queued)"
+                          ? "Queue a follow-up"
                           : "Send a follow-up (queued) — Esc to stop"
                         : multiMemberSession
                           ? isMobile
