@@ -367,6 +367,7 @@ export function routeLayout(
   now: number,
   label: (node: RouteNode) => string,
   thresholds = { station: 2, phase: 14 },
+  detailGap?: { rowId: string; height: number },
 ): RouteLayout {
   const levelOf = (span: number) => detailLevel(span, thresholds.station, thresholds.phase);
   const rowHeight = levelOf(window.to - window.from) === "station" || mode === "order" ? 136 : 92;
@@ -385,6 +386,7 @@ export function routeLayout(
     previousSource = row.source;
     const y = top + rowHeight / 2;
     top += rowHeight;
+    if (detailGap?.rowId === row.id) top += detailGap.height;
     const sorted =
       mode === "order"
         ? row.tasks

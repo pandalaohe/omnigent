@@ -1,7 +1,7 @@
 import { boardAttention } from "./boardAttentionData";
 import { TaskBoardAttention } from "./TaskBoardAttention";
 import { boardExitProps } from "@/lib/boardFrame";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import {
   ActivityIcon,
   CircleAlertIcon,
@@ -102,9 +102,27 @@ function TaskBoardContent({
       : panel === "exceptions"
         ? attention.anomalies
         : running;
+  const detailTrigger = useRef<HTMLElement | null>(null);
+  const closeDetail = () => {
+    setSelectedTask(null);
+    detailTrigger.current?.focus();
+  };
   const select = (task: BoardTask) => {
+    if (!document.activeElement?.closest(".tb-dc"))
+      detailTrigger.current = document.activeElement as HTMLElement;
     setSelectedTask(task);
   };
+  const inlineDetail = selected && (
+    <TaskBoardDetail
+      key={taskIdentity(selected)}
+      task={selected}
+      sourceCache={tasksQuery.data?.sourceCaches?.[selected["omnigent.ai:source"]]}
+      tasks={tasks}
+      sessions={sessions}
+      onSelect={select}
+      onClose={closeDetail}
+    />
+  );
   return (
     <div className={`tb-page ${appearance.dark ? "dark" : ""}`} style={appearance.style}>
       <header className="tb-page-header">
@@ -246,7 +264,12 @@ function TaskBoardContent({
             </Button>
           </header>
           {!selectedRows.length && <p>{t("waiting.empty")}</p>}
-          <TaskBoardAttention key={panel} rows={selectedRows} onSelect={select} />
+          <TaskBoardAttention
+            inlineDetail={inlineDetail}
+            key={panel}
+            rows={selectedRows}
+            onSelect={select}
+          />
         </section>
       )}
       {tasksQuery.isError && (
@@ -278,6 +301,7 @@ function TaskBoardContent({
       {(["log", "history", "today"] as const).map((view) =>
         preferences.view === view ? (
           <TaskBoardActivity
+            inlineDetail={panel ? undefined : inlineDetail}
             key={view}
             view={view}
             hiddenSources={view === "history" ? preferences.hiddenSources : []}
@@ -303,6 +327,7 @@ function TaskBoardContent({
             <Spinner aria-label={t("board.loading")} className="mx-auto my-12 size-5" />
           ) : (
             <TaskBoardSessions
+              inlineDetail={panel ? undefined : inlineDetail}
               sessions={sessions}
               tasks={tasks}
               sourceCaches={tasksQuery.data?.sourceCaches}
@@ -316,6 +341,7 @@ function TaskBoardContent({
         ) : (
           <TaskBoardRoutes
             sourceCaches={tasksQuery.data?.sourceCaches}
+            sessions={sessions}
             tasks={tasks.filter(
               (task) =>
                 !preferences.hiddenSources.includes(task["omnigent.ai:source"]) &&
@@ -355,17 +381,6 @@ function TaskBoardContent({
             </ul>
           </section>
         )}
-      {selected && (
-        <TaskBoardDetail
-          key={taskIdentity(selected)}
-          task={selected}
-          sourceCache={tasksQuery.data?.sourceCaches?.[selected["omnigent.ai:source"]]}
-          tasks={tasks}
-          sessions={sessions}
-          onSelect={select}
-          onClose={() => setSelectedTask(null)}
-        />
-      )}
     </div>
   );
 }

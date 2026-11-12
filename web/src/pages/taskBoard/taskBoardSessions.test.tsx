@@ -118,6 +118,7 @@ it("reorders a newly waiting child from refreshed detail without fetching hidden
   ];
   const { container, client } = mount([], list);
   await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(9));
+  await waitFor(() => expect(client.isFetching()).toBe(0));
   await act(async () =>
     client.setQueryData(["taskBoard", "session", "two"], {
       ...list[2],

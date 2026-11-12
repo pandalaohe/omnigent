@@ -25,15 +25,8 @@ export interface SessionRow {
   asOf?: string;
 }
 
-/** Source identity stays source-owned; native observations replace its runtime tuple. */
-export function boardSessionRows(
-  tasks: BoardTask[],
-  native: BoardSession[],
-  sourceCaches?: Record<string, SourceCache>,
-): SessionRow[] {
-  const byId = new Map(native.map((session) => [session.id, session]));
-  const tasksById = new Map(tasks.map((task) => [taskIdentity(task), task]));
-  const rows = new Map<string, SessionRow>();
+/** Share the full-board group collision order, including groups without sessions. */
+export function boardGroupColors(tasks: BoardTask[]): Map<string, string> {
   const groups = new Map<string, string>(),
     used = new Map<string, Set<string>>();
   const colorFor = (task?: BoardTask) => {
@@ -61,6 +54,21 @@ export function boardSessionRows(
     return result;
   };
   for (const task of tasks) colorFor(task);
+  return new Map(tasks.map((task) => [taskIdentity(task), colorFor(task)]));
+}
+
+/** Source identity stays source-owned; native observations replace its runtime tuple. */
+export function boardSessionRows(
+  tasks: BoardTask[],
+  native: BoardSession[],
+  sourceCaches?: Record<string, SourceCache>,
+): SessionRow[] {
+  const byId = new Map(native.map((session) => [session.id, session]));
+  const tasksById = new Map(tasks.map((task) => [taskIdentity(task), task]));
+  const rows = new Map<string, SessionRow>();
+  const groupColors = boardGroupColors(tasks);
+  const colorFor = (task?: BoardTask) =>
+    task ? groupColors.get(taskIdentity(task))! : "var(--muted-foreground)";
   for (const task of tasks) {
     for (const source of task["omnigent.ai:sourceDisplay"]?.sessions ?? []) {
       if (rows.has(source.id)) continue;

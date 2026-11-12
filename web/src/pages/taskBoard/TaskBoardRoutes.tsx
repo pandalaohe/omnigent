@@ -33,7 +33,7 @@ import { Button } from "@/components/ui/button";
 import { Link } from "@/lib/routing";
 import { boardExitProps } from "@/lib/boardFrame";
 import { taskIdentity, type BoardTask, type TaskSource } from "./taskBoardData";
-import type { BoardSchedule } from "./taskBoardNative";
+import type { BoardSchedule, BoardSession } from "./taskBoardNative";
 import type { SourceCache } from "./taskBoardSnapshotData";
 import {
   DAY,
@@ -76,6 +76,7 @@ import { formatDate, formatNumber, t } from "./taskBoardText";
 import "./taskBoardRoutes.css";
 
 const emptyCaches: Record<string, SourceCache> = {};
+const emptySessions: BoardSession[] = [];
 type OpenPanel =
   | { kind: "task"; lane: string; task: BoardTask }
   | { kind: "cluster"; lane: string; tasks: BoardTask[] }
@@ -282,6 +283,7 @@ function RelationFacts({
   );
 }
 export function TaskBoardRoutes({
+  sessions = emptySessions,
   tasks,
   sources,
   aliases,
@@ -296,6 +298,7 @@ export function TaskBoardRoutes({
   lodStation = 2,
   lodPhase = 14,
 }: {
+  sessions?: BoardSession[];
   tasks: BoardTask[];
   sources: TaskSource[];
   aliases: Record<string, string>;
@@ -388,6 +391,7 @@ export function TaskBoardRoutes({
       : null;
   }, [selection, tasks]);
   const mapRef = useRef<HTMLDivElement>(null),
+    detailTrigger = useRef<HTMLElement | null>(null),
     overviewRef = useRef<HTMLDivElement>(null),
     axisRef = useRef<HTMLDivElement>(null),
     panelRef = useRef<HTMLDivElement>(null),
@@ -888,6 +892,8 @@ export function TaskBoardRoutes({
     ),
     overviewMax = Math.max(1, ...overview.map((bucket) => bucket.count));
   const selectTask = (task: BoardTask) => {
+    if (!document.activeElement?.closest(".tb-dc"))
+      detailTrigger.current = document.activeElement as HTMLElement;
     const group = groups.find((item) =>
       item.tasks.some((candidate) => taskIdentity(candidate) === taskIdentity(task)),
     );
@@ -903,6 +909,10 @@ export function TaskBoardRoutes({
         : { kind: "task", lane: group.id, task },
     );
     setHover(null);
+  };
+  const closeDetail = () => {
+    setOpen(null);
+    detailTrigger.current?.focus();
   };
   const openNode = (node: MapNode) => {
     if (node.density) {
@@ -1115,12 +1125,13 @@ export function TaskBoardRoutes({
       >
         {open.kind === "task" ? (
           <TaskBoardDetail
+            key={taskIdentity(open.task)}
             task={open.task}
             tasks={tasks}
-            sessions={[]}
+            sessions={sessions}
             sourceCache={caches[open.task["omnigent.ai:source"]]}
             onSelect={selectTask}
-            onClose={() => setOpen(null)}
+            onClose={closeDetail}
           />
         ) : (
           <section
@@ -1655,12 +1666,13 @@ export function TaskBoardRoutes({
                                     {open?.kind === "task" &&
                                       taskIdentity(open.task) === taskIdentity(task) && (
                                         <TaskBoardDetail
+                                          key={taskIdentity(task)}
                                           task={task}
                                           tasks={tasks}
-                                          sessions={[]}
+                                          sessions={sessions}
                                           sourceCache={caches[task["omnigent.ai:source"]]}
                                           onSelect={selectTask}
-                                          onClose={() => setOpen(null)}
+                                          onClose={closeDetail}
                                         />
                                       )}
                                   </li>
