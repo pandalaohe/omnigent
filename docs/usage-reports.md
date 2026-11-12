@@ -245,7 +245,7 @@ Omitting the account filter includes source-wide rows.
 
 Evidence remains in the server database for `usage.evidence.retention_days`
 (default 400). A daily task deletes old events by their event time and status
-by `observed_at`, falling back to receipt time when absent. Intake skips older
+by `updated_at`, the last time a producer confirmed the row. Intake skips older
 observations, so replay cannot recreate pruned history. Account removal deletes
 that account's evidence; user removal also deletes source-wide evidence. A code
 rollback leaves the archive tables in place; an explicit schema downgrade drops

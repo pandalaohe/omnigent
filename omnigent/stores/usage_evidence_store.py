@@ -229,12 +229,7 @@ class UsageEvidenceStore:
             result = {}
             for table, column in (
                 (SqlUsageSourceEvent, SqlUsageSourceEvent.time_utc),
-                (
-                    SqlUsageSourceStatus,
-                    func.coalesce(
-                        SqlUsageSourceStatus.observed_at, SqlUsageSourceStatus.updated_at
-                    ),
-                ),
+                (SqlUsageSourceStatus, SqlUsageSourceStatus.updated_at),
             ):
                 if table.__tablename__ in before:
                     result[table.__tablename__] = cast(

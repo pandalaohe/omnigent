@@ -4,9 +4,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
-from omnigent.db.db_models import SqlUsageHour, workspace_scope
+from omnigent.db.db_models import SqlUsageHour, SqlUsageSourceStatus, workspace_scope
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.usage_evidence import UsageEvidenceService
@@ -142,7 +142,8 @@ def test_identity_case_is_significant(db_uri):
     assert store.insert_events(OWNER, [event("case"), event("CASE")])["accepted"] == 2
 
 
-def test_daily_prune_covers_workspaces_and_observation_fallback(db_uri):
+@pytest.mark.parametrize("confirmation_age_days", [0, 31], ids=["recently_confirmed", "expired"])
+def test_daily_prune_covers_workspaces_and_last_confirmation(db_uri, confirmation_age_days):
     store = UsageEvidenceStore(db_uri)
     service = UsageEvidenceService(store, retention_days=30)
     old = now_epoch() - 31 * 86400
@@ -163,8 +164,19 @@ def test_daily_prune_covers_workspaces_and_observation_fallback(db_uri):
                     SourceStatus(source="new", state="ok"),
                 ],
             )
+            with get_or_create_engine(db_uri).begin() as connection:
+                connection.execute(
+                    update(SqlUsageSourceStatus)
+                    .where(
+                        SqlUsageSourceStatus.workspace_id == workspace,
+                        SqlUsageSourceStatus.owner_id == OWNER,
+                        SqlUsageSourceStatus.source == "old",
+                    )
+                    .values(updated_at=now_epoch() - confirmation_age_days * 86400)
+                )
     service.prune()
     for workspace in (0, 9):
         with workspace_scope(workspace):
             assert store.read_events(OWNER)[2] == 0
-            assert [row["source"] for row in store.read_sources(OWNER)] == ["new"]
+            expected = ["new", "old"] if confirmation_age_days == 0 else ["new"]
+            assert [row["source"] for row in store.read_sources(OWNER)] == expected
