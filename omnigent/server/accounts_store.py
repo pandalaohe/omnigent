@@ -34,7 +34,11 @@ from omnigent.db.db_models import (
     SqlProject,
     SqlScheduledTask,
     SqlSessionPermission,
+    SqlUsageAccountRelation,
     SqlUsageHour,
+    SqlUsagePricingCard,
+    SqlUsagePricingDefaults,
+    SqlUsageQuotaClosing,
     SqlUser,
     SqlUserDailyCost,
     current_workspace_id,
@@ -99,6 +103,16 @@ def _revoke_durable_authority(session: Session, user_id: str, *, now: int) -> No
             SqlUsageHour.owner_id == user_id,
         )
     )
+    session.execute(
+        delete(SqlUsageAccountRelation).where(
+            SqlUsageAccountRelation.workspace_id == workspace_id,
+            SqlUsageAccountRelation.owner_id == user_id,
+        )
+    )
+    for table in (SqlUsagePricingDefaults, SqlUsagePricingCard, SqlUsageQuotaClosing):
+        session.execute(
+            delete(table).where(table.workspace_id == workspace_id, table.owner_id == user_id)
+        )
     session.execute(
         delete(SqlConnection).where(
             SqlConnection.workspace_id == workspace_id,

@@ -24,6 +24,8 @@ from omnigent.quota_pace import accept_snapshot
 from omnigent.server.agent_quota import (
     AgentQuotaService,
     UsageAccountLimitError,
+    UsagePoolConflictError,
+    UsagePoolRelationError,
     UsageStorageUnavailableError,
     UsageWriterConflictError,
 )
@@ -34,6 +36,7 @@ from omnigent.server.usage_price_source import PriceSourceSelection, UsagePriceS
 from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 from omnigent.stores.host_store import HostStore
 from omnigent.usage.contract import (
+    UsageAnalysisView,
     UsageOverview,
     UsageReport,
     UsageReportV2,
@@ -186,6 +189,9 @@ def create_agent_quota_router(
     import_max_body_bytes: int = 5 * 1024 * 1024,
 ) -> APIRouter:
     router = APIRouter()
+    from omnigent.server.routes.usage_pricing import create_usage_pricing_router
+
+    router.include_router(create_usage_pricing_router(service, auth_provider))
     otlp_receiver = OtlpReceiver(service)
 
     @router.get("/me/usage/lines")
@@ -466,6 +472,10 @@ def create_agent_quota_router(
             )
         except UsageStorageUnavailableError:
             raise HTTPException(503, "Usage storage unavailable; retry later") from None
+        except UsagePoolConflictError as exc:
+            raise HTTPException(409, str(exc)) from None
+        except UsagePoolRelationError as exc:
+            raise HTTPException(422, str(exc)) from None
         except (UsageAccountLimitError, UsageWriterConflictError) as exc:
             raise HTTPException(409, str(exc)) from None
         if outcome is not None:
@@ -536,6 +546,79 @@ def create_agent_quota_router(
             if selected_failures:
                 payload["price_source"] = selected_failures
         return JSONResponse(payload, headers={"Cache-Control": "private, no-store"})
+
+    @router.get("/me/usage/analysis", response_model=UsageAnalysisView)
+    async def read_analysis(
+        request: Request,
+        range_key: Annotated[RangeKey, Query(alias="range")] = "d7",
+        from_date: Annotated[date | None, Query(alias="from")] = None,
+        to_date: Annotated[date | None, Query(alias="to")] = None,
+        tz: str = "UTC",
+        account: str | None = None,
+        pool: str | None = None,
+        model: str | None = None,
+        card: str | None = None,
+    ) -> Response:
+        require_usage()
+        from fastapi.responses import JSONResponse
+
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        try:
+            view = await asyncio.to_thread(
+                service.analysis,
+                owner,
+                range_key=range_key,
+                from_date=from_date,
+                to_date=to_date,
+                tz=tz,
+                account=account,
+            )
+            if service.pricing_store is not None:
+                from fastapi.encoders import jsonable_encoder
+
+                from omnigent.usage.pricing_projection import compare_periods, value_usage
+
+                baseline = await asyncio.to_thread(service.pricing_store.read, owner)
+                projection = await asyncio.to_thread(
+                    value_usage, view, baseline, pool=pool, model=model, card_id=card
+                )
+                if range_key != "d90":
+                    prior = await asyncio.to_thread(
+                        service.analysis,
+                        owner,
+                        range_key=range_key,
+                        from_date=from_date,
+                        to_date=to_date,
+                        tz=tz,
+                        account=account,
+                        now=view.generated_at,
+                        previous=True,
+                    )
+                    previous_values = await asyncio.to_thread(
+                        value_usage, prior, baseline, pool=pool, model=model, card_id=card
+                    )
+                    projection["previous"] = previous_values
+                    projection["comparison"] = compare_periods(projection, previous_values)
+                else:
+                    projection["comparison"] = {"reason": "no_previous_period_for_d90"}
+                view.pricing = jsonable_encoder(projection)
+            if service.quota_closing_store is not None:
+                view.quota_closings = await asyncio.to_thread(
+                    service.quota_closing_store.read,
+                    owner,
+                    int(view.span.counted_from),
+                    int(view.span.until),
+                    as_of=int(view.generated_at),
+                )
+                if account is not None:
+                    view.quota_closings = [
+                        item for item in view.quota_closings if item["account_id"] == account
+                    ]
+        except (ValueError, ZoneInfoNotFoundError):
+            raise HTTPException(422, "Invalid usage range or timezone") from None
+        return JSONResponse(
+            view.model_dump(mode="json"), headers={"Cache-Control": "private, no-store"}
+        )
 
     @router.get("/me/usage/price-source")
     async def read_price_source(request: Request) -> dict[str, Any]:

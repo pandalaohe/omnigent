@@ -21,12 +21,13 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Insert
+from sqlalchemy.sql.elements import ColumnElement
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import SqlUsageHour, current_workspace_id
@@ -311,92 +312,97 @@ class UsageHoursStore:
         self, owner: str, account_id: str, rows: Sequence[ActivityEntryV2]
     ) -> WriteOutcome:
         """Replace named rows only and report every held or skipped entry."""
+        return run_write_transaction(
+            self._write_session(),
+            "replace_usage_hours",
+            lambda session: self.replace_rows_in_session(session, owner, account_id, rows),
+        )
+
+    @staticmethod
+    def replace_rows_in_session(
+        session: Session, owner: str, account_id: str, rows: Sequence[ActivityEntryV2]
+    ) -> WriteOutcome:
+        """Apply replacements within the caller's transaction."""
         now = now_epoch()
-        if not rows:
-            return WriteOutcome()
-
-        def write(session: Session) -> WriteOutcome:
-            require_active_account(session, owner)
-            outcome = WriteOutcome()
-            for row in rows:
-                entry_key = {
-                    "hour": row.hour,
-                    "host": row.host,
-                    "model": row.model,
-                    "cost_basis": row.cost_basis,
-                }
-                if row.hour > now or row.hour < now - _ACTIVITY_MAX_AGE_S:
-                    outcome.skipped.append(EntryOutcome(**entry_key, reason="out_of_range"))
-                    continue
-                predicates = (
-                    SqlUsageHour.workspace_id == current_workspace_id(),
-                    SqlUsageHour.owner_id == owner,
-                    SqlUsageHour.account_id == account_id,
-                    SqlUsageHour.hour_utc == hours_of(row.hour),
-                    SqlUsageHour.model == row.model,
-                    SqlUsageHour.host_id == row.host,
-                    (
-                        SqlUsageHour.basis == "billed"
-                        if row.cost_basis == "billed"
-                        else SqlUsageHour.basis != "billed"
-                    ),
-                )
-                previous = list(
-                    session.scalars(select(SqlUsageHour).where(*predicates).with_for_update())
-                )
-                complete = [old for old in previous if old.coverage == "complete"]
-                if not row.removed and complete and not isinstance(row, _V1ActivityEntry):
-                    if row.coverage == "partial":
-                        outcome.skipped.append(
-                            EntryOutcome(**entry_key, reason="partial_over_complete")
-                        )
-                        continue
-                    comparisons = (
-                        (row.total(), [old.total_tokens for old in complete]),
-                        (row.requests, [old.requests for old in complete]),
-                        (row.cost_usd, [old.cost_usd for old in complete if old.priced]),
+        require_active_account(session, owner)
+        outcome = WriteOutcome()
+        for row in rows:
+            entry_key = {
+                "hour": row.hour,
+                "host": row.host,
+                "model": row.model,
+                "cost_basis": row.cost_basis,
+            }
+            if row.hour > now or row.hour < now - _ACTIVITY_MAX_AGE_S:
+                outcome.skipped.append(EntryOutcome(**entry_key, reason="out_of_range"))
+                continue
+            predicates = (
+                SqlUsageHour.workspace_id == current_workspace_id(),
+                SqlUsageHour.owner_id == owner,
+                SqlUsageHour.account_id == account_id,
+                SqlUsageHour.hour_utc == hours_of(row.hour),
+                SqlUsageHour.model == row.model,
+                SqlUsageHour.host_id == row.host,
+                (
+                    SqlUsageHour.basis == "billed"
+                    if row.cost_basis == "billed"
+                    else SqlUsageHour.basis != "billed"
+                ),
+            )
+            previous = list(
+                session.scalars(select(SqlUsageHour).where(*predicates).with_for_update())
+            )
+            complete = [old for old in previous if old.coverage == "complete"]
+            if not row.removed and complete and not isinstance(row, _V1ActivityEntry):
+                if row.coverage == "partial":
+                    outcome.skipped.append(
+                        EntryOutcome(**entry_key, reason="partial_over_complete")
                     )
-                    if not row.correction and any(
-                        value is not None and known and value < sum(known)
-                        for value, old_values in comparisons
-                        if (known := [old for old in old_values if old is not None])
-                    ):
-                        outcome.held.append(EntryOutcome(**entry_key, reason="lower_reread"))
-                        continue
-                for old in previous:
-                    session.delete(old)
-                # A replacement may have the same primary key as the old row.
-                session.flush()
-                outcome.applied += 1
-                if row.removed:
                     continue
-                session.add(
-                    SqlUsageHour(
-                        workspace_id=current_workspace_id(),
-                        owner_id=owner,
-                        account_id=account_id,
-                        hour_utc=hours_of(row.hour),
-                        model=row.model,
-                        host_id=row.host,
-                        basis=row.cost_basis,
-                        priced=int(row.cost_usd is not None),
-                        input_tokens=row.uncached_input_tokens,
-                        cached_tokens=row.cache_read_input_tokens,
-                        cache_write_tokens=row.cache_creation_input_tokens,
-                        output_tokens=row.output_tokens,
-                        total_tokens=row.total(),
-                        reasoning_tokens=row.reasoning_tokens,
-                        coverage=row.coverage,
-                        requests=row.requests,
-                        failed=row.failed,
-                        reasons=json.dumps(row.reasons, sort_keys=True) if row.reasons else None,
-                        cost_usd=float(row.cost_usd or 0),
-                        updated_at=now,
-                    )
+                comparisons = (
+                    (row.total(), [old.total_tokens for old in complete]),
+                    (row.requests, [old.requests for old in complete]),
+                    (row.cost_usd, [old.cost_usd for old in complete if old.priced]),
                 )
-            return outcome
-
-        return run_write_transaction(self._write_session(), "replace_usage_hours", write)
+                if not row.correction and any(
+                    value is not None and known and value < sum(known)
+                    for value, old_values in comparisons
+                    if (known := [old for old in old_values if old is not None])
+                ):
+                    outcome.held.append(EntryOutcome(**entry_key, reason="lower_reread"))
+                    continue
+            for old in previous:
+                session.delete(old)
+            # A replacement may have the same primary key as the old row.
+            session.flush()
+            outcome.applied += 1
+            if row.removed:
+                continue
+            session.add(
+                SqlUsageHour(
+                    workspace_id=current_workspace_id(),
+                    owner_id=owner,
+                    account_id=account_id,
+                    hour_utc=hours_of(row.hour),
+                    model=row.model,
+                    host_id=row.host,
+                    basis=row.cost_basis,
+                    priced=int(row.cost_usd is not None),
+                    input_tokens=row.uncached_input_tokens,
+                    cached_tokens=row.cache_read_input_tokens,
+                    cache_write_tokens=row.cache_creation_input_tokens,
+                    output_tokens=row.output_tokens,
+                    total_tokens=row.total(),
+                    reasoning_tokens=row.reasoning_tokens,
+                    coverage=row.coverage,
+                    requests=row.requests,
+                    failed=row.failed,
+                    reasons=json.dumps(row.reasons, sort_keys=True) if row.reasons else None,
+                    cost_usd=float(row.cost_usd or 0),
+                    updated_at=now,
+                )
+            )
+        return outcome
 
     def delete_account(self, owner: str, account_id: str) -> None:
         """Remove one account's hours."""
@@ -505,6 +511,47 @@ class UsageHoursStore:
                 SqlUsageHour.model,
             )
             return [_row_from_orm(row) for row in session.execute(query).scalars()]
+
+    def read_bounded(
+        self,
+        owner: str,
+        since_hour: int,
+        until_hour: float,
+        limit: int,
+        *,
+        account_ids: set[str] | None = None,
+        native_models: Mapping[str, tuple[bool, set[str]]] | None = None,
+    ) -> tuple[list[HourRow], bool]:
+        """Read at most limit rows, probing one more to report truncation."""
+        with self._read_session()("read_bounded_usage_hours") as session:
+            query = select(SqlUsageHour).where(
+                SqlUsageHour.workspace_id == current_workspace_id(),
+                SqlUsageHour.owner_id == owner,
+                SqlUsageHour.hour_utc >= since_hour,
+                SqlUsageHour.hour_utc < until_hour,
+            )
+            if account_ids is not None:
+                filters: list[ColumnElement[bool]] = [SqlUsageHour.account_id.in_(account_ids)]
+                for product, (default_selected, exceptions) in (native_models or {}).items():
+                    model_filter = (
+                        SqlUsageHour.model.not_in(exceptions)
+                        if default_selected
+                        else SqlUsageHour.model.in_(exceptions)
+                    )
+                    filters.append(
+                        and_(SqlUsageHour.account_id == f"native:{product}", model_filter)
+                    )
+                query = query.where(or_(*filters))
+            query = query.order_by(
+                SqlUsageHour.hour_utc.desc(),
+                SqlUsageHour.account_id,
+                SqlUsageHour.model,
+                SqlUsageHour.host_id,
+                SqlUsageHour.basis,
+                SqlUsageHour.priced,
+            ).limit(limit + 1)
+            found = [_row_from_orm(row) for row in session.execute(query).scalars()]
+        return found[:limit], len(found) > limit
 
     def hostless_accounts(self, owner: str) -> set[str]:
         """Accounts holding host-less figures in any hour, scoped to this owner."""
