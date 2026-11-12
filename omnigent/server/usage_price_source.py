@@ -84,11 +84,13 @@ class PriceSourceSelection(BaseModel):
                 )
             except ValueError:
                 raise ValueError(
-                    "Use HTTPS, or HTTP on a private host, without credentials or a fragment"
+                    "Use an HTTPS URL, or HTTP on a private host, "
+                    "without credentials or a fragment"
                 ) from None
             if not valid:
                 raise ValueError(
-                    "Use HTTPS, or HTTP on a private host, without credentials or a fragment"
+                    "Use an HTTPS URL, or HTTP on a private host, "
+                    "without credentials or a fragment"
                 )
             if "?" in self.url:
                 raise ValueError("Price source URLs cannot contain a query string")

@@ -58,8 +58,13 @@ def price_source(service, tmp_path, monkeypatch):
     ],
 )
 def test_custom_requires_https_without_credentials(url):
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError) as failure:
         PriceSourceSelection(source="custom", format="litellm", url=url)
+    if url == "http://8.8.8.8/prices":
+        assert failure.value.errors()[0]["msg"] == (
+            "Value error, Use an HTTPS URL, or HTTP on a private host, "
+            "without credentials or a fragment"
+        )
 
 
 @pytest.mark.parametrize(
@@ -213,6 +218,15 @@ async def test_failed_daily_read_keeps_last_map_and_becomes_an_issue(
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
+        public_http = await client.put(
+            "/v1/me/usage/price-source",
+            json={"source": "custom", "format": "litellm", "url": "http://8.8.8.8/prices"},
+        )
+        assert public_http.status_code == 422
+        assert public_http.json()["detail"][0]["msg"] == (
+            "Value error, Use an HTTPS URL, or HTTP on a private host, "
+            "without credentials or a fragment"
+        )
         assert (await client.get("/v1/me/usage/issues")).json()["price_source"][0]["error"]
         failed = await client.put(
             "/v1/me/usage/price-source", json={"source": "custom", "format": "litellm", "url": URL}
