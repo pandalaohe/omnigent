@@ -38,10 +38,14 @@ def _windows_supervise(arguments: list[str]) -> int:
     Remove when Task Scheduler restarts non-zero action exits or upstream
     supplies a Windows host service.
     """
+    # A console interpreter gives descendants a hidden console to inherit.
+    python = Path(sys.executable)
+    if python.name.casefold() == "pythonw.exe":
+        python = python.with_name("python.exe")
     while True:
         result = subprocess.run(
             [
-                sys.executable,
+                str(python),
                 "-P",
                 "-m",
                 "omnigent.host.service_entry",
@@ -49,6 +53,10 @@ def _windows_supervise(arguments: list[str]) -> int:
                 "--service-worker",
             ],
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            stdin=subprocess.DEVNULL,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
         )
         if result.returncode in (0, HOST_FATAL_EXIT_CODE):
             return 0

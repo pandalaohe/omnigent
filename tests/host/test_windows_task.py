@@ -462,12 +462,27 @@ def test_temporary_cleanup_warning_preserves_success(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("codes", [[1, 75, 0], [78]])
-def test_windows_restart_loop_restarts_only_transient_failures(monkeypatch, codes):
+@pytest.mark.parametrize("interpreter", ["pythonw.exe", "PYTHONW.EXE", "python.exe"])
+def test_windows_restart_loop_restarts_only_transient_failures(
+    monkeypatch, tmp_path, codes, interpreter
+):
     results = iter(codes)
     calls, sleeps = [], []
 
-    def run(args, **_):
+    python = tmp_path / "Scripts" / interpreter
+    monkeypatch.setattr(service_entry.sys, "executable", str(python))
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+
+    def run(args, **kwargs):
         calls.append(args)
+        assert args[0] == str(python.with_name("python.exe"))
+        assert kwargs == {
+            "check": False,
+            "creationflags": 0x08000000,
+            "stdin": subprocess.DEVNULL,
+            "stdout": sys.stdout,
+            "stderr": sys.stderr,
+        }
         return subprocess.CompletedProcess(args, next(results))
 
     monkeypatch.setattr(service_entry.subprocess, "run", run)
@@ -483,6 +498,12 @@ def test_service_environment_loads_before_cli(monkeypatch, tmp_path):
 
     file = tmp_path / "environment.json"
     file.write_text('{"PATH": "captured"}')
+    monkeypatch.setattr(service_entry.sys, "platform", "linux")
+    monkeypatch.setattr(
+        service_entry,
+        "_windows_supervise",
+        lambda _: pytest.fail("Non-Windows services must not start a Windows supervisor"),
+    )
     monkeypatch.setattr(
         service_entry.sys,
         "argv",
