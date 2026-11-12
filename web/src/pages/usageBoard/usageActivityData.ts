@@ -53,15 +53,24 @@ export interface UsageIssues {
   price_source?: { at: number; error: string }[];
 }
 
-export function useUsageActivity(account?: string, enabled = true) {
-  return useUsageRead<UsageActivity>("activity", account, enabled);
+export function useUsageActivity(
+  account?: string,
+  enabled = true,
+  range?: Parameters<typeof usageRangeQuery>[0],
+) {
+  return useUsageRead<UsageActivity>("activity", account, enabled, range);
 }
 export function useUsageIssues(account?: string, enabled = true) {
   return useUsageRead<UsageIssues>("issues", account, enabled);
 }
-function useUsageRead<T>(path: string, account: string | undefined, enabled: boolean) {
+function useUsageRead<T>(
+  path: string,
+  account: string | undefined,
+  enabled: boolean,
+  range?: Parameters<typeof usageRangeQuery>[0],
+) {
   const board = useUsageContextPreferences().board;
-  const params = usageRangeQuery(board.range ?? { key: "d7" });
+  const params = usageRangeQuery(range ?? board.range ?? { key: "d7" });
   if (account) params.set("account", account);
   params.set("include", "models");
   return useQuery({

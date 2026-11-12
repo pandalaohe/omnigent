@@ -109,10 +109,17 @@ export function formatPercent(value: number | null | undefined): string {
 
 export function formatMoney(value: number | null | undefined): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return "—";
-  if (value === 0) return "$0";
-  if (value >= 100) return `$${Math.round(value).toLocaleString("en-US")}`;
-  if (value < 0.01) return "<$0.01";
-  return `$${value.toFixed(2)}`;
+  return `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+export function formatUsageValue(value: number, unit: string | null): string {
+  const symbols: Record<string, string> = { USD: "$", CNY: "¥", HKD: "HK$", $: "$", "¥": "¥" };
+  const symbol = unit ? symbols[unit] : undefined;
+  const figure = value.toLocaleString("en-US", {
+    minimumFractionDigits: symbol ? 2 : 0,
+    maximumFractionDigits: symbol ? 2 : 3,
+  });
+  return symbol ? `${symbol}${figure}` : `${figure}${unit ? ` ${unit}` : ""}`;
 }
 
 /** The window's own name: the report's label, else its id. */

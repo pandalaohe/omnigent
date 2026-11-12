@@ -1,17 +1,33 @@
 import type { UsageAccountView } from "./usageBoardData";
-import { formatFullDate } from "./usageBoardFormat";
+import { formatFullDate, formatUsageValue } from "./usageBoardFormat";
 import { t } from "./usageText";
 
 /** Balances have their own reading time and never borrow a window's pace. */
 export function UsageBalances({
   account,
   compact = false,
+  tile = false,
 }: {
   account: UsageAccountView;
   compact?: boolean;
+  tile?: boolean;
 }) {
   if (!account.balances?.length) return null;
   const stale = account.balance_freshness !== "fresh";
+  if (tile)
+    return (
+      <div className="usage-tile-balance" data-testid="usage-balances">
+        {account.balances.map((balance) => (
+          <div key={balance.id}>
+            <div className="usage-balance-ring">
+              {formatUsageValue(balance.remaining, balance.unit)}
+            </div>
+            <span>{balance.label ?? t("balance")}</span>
+            {stale ? <span className="block text-muted-foreground">{t("balanceOld")}</span> : null}
+          </div>
+        ))}
+      </div>
+    );
   return (
     <div className="flex min-w-0 flex-wrap justify-center gap-2" data-testid="usage-balances">
       {account.balances.map((balance) => (
@@ -30,7 +46,7 @@ export function UsageBalances({
               {balance.label ?? t("balance")}
             </span>
             <span className="max-w-full break-all font-semibold tabular-nums">
-              {balance.remaining.toLocaleString()} {balance.unit}
+              {formatUsageValue(balance.remaining, balance.unit)}
             </span>
           </span>
           {balance.group ? (

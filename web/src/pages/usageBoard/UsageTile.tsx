@@ -10,6 +10,8 @@ import {
   ChevronRightIcon,
   GripVerticalIcon,
 } from "lucide-react";
+import { boardPath } from "@/lib/boardFrame";
+import { Link } from "@/lib/routing";
 import type { ReactNode } from "react";
 
 import { cn } from "@/lib/utils";
@@ -46,6 +48,7 @@ interface UsageTileProps {
   /** Arrange mode: the tile shows move handles instead of the footer. */
   arrange?: boolean;
   onOpen: () => void;
+  onOpenGroup?: (group: string) => void;
   onMove?: (direction: -1 | 1) => void;
   shownModel?: string;
   floorControl?: ReactNode;
@@ -60,6 +63,7 @@ export function UsageTile({
   density,
   arrange = false,
   onOpen,
+  onOpenGroup,
   onMove,
   shownModel,
   floorControl,
@@ -70,9 +74,6 @@ export function UsageTile({
   const empty = neverRead(account);
   const tone = accountTone(account, stale);
   const picks = pickGroups(account, pinnedWindowId);
-  // An account whose provider groups its windows needs the extra width for a
-  // second ring; one group stays a normal tile.
-  const wide = picks.length > 1 && density === "std";
   const renewDays = renewal ? daysUntil(renewal.at) : null;
 
   const name = account.display_name;
@@ -156,155 +157,169 @@ export function UsageTile({
     );
   }
 
+  const balanceGroups = account.balances ?? [];
+  const wideBoxes = picks.length + balanceGroups.length > 1;
   return (
-    <div
-      role="link"
-      tabIndex={0}
-      aria-label={tileLabel(account, picks, stale)}
-      onClick={activate}
-      onKeyDown={(event) => {
-        if (event.target !== event.currentTarget) return;
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          activate();
-        }
-      }}
-      draggable={arrange}
-      className={cn(
-        "relative flex min-w-0 cursor-pointer flex-col rounded-[11px] border border-border bg-card px-2.5 pb-2 pt-2 transition-colors hover:border-foreground/30",
-        wide && "col-span-2",
-        TONE_TILE[tone],
-        arrange && "cursor-grab outline-dashed outline-1 outline-foreground/30 -outline-offset-1",
-      )}
+    <article
+      className={cn("usage-tile", wideBoxes && "usage-tile-wide")}
+      data-tone={!wideBoxes ? tone : undefined}
       data-testid="usage-tile"
       data-account={account.id}
+      onClick={(event) => {
+        if (!wideBoxes && !arrange && !(event.target as HTMLElement).closest("a, button"))
+          activate();
+      }}
     >
-      <div className="flex min-h-9 min-w-0 items-start gap-1">
-        <div className="flex min-w-0 flex-1 flex-col leading-tight">
-          <span className="truncate font-semibold">{name}</span>
-          {plan ? <span className="truncate text-[11px] text-muted-foreground">{plan}</span> : null}
-          {shownModel && (
-            <span className="truncate text-xs text-muted-foreground">{shownModel}</span>
-          )}
-        </div>
+      <div className="usage-tile-head">
+        <button type="button" className="usage-tile-title" onClick={activate}>
+          {name}
+        </button>
+        {plan ? <span className="usage-tile-plan">{plan}</span> : null}
         <ReadingButton account={account} />
         <UsageErrorMark account={account} />
       </div>
-
-      {floorControl && (
-        <div className="mb-1" onClick={(e) => e.stopPropagation()}>
-          {floorControl}
-        </div>
-      )}
-
-      <div className="mb-2 mt-0.5 flex min-w-0 justify-evenly gap-2.5">
-        {picks.length === 0 && !account.balances?.length ? (
-          <div className="flex min-w-0 flex-col items-center gap-0.5">
-            <UsageRing window={null} stale size={88} />
-          </div>
-        ) : (
-          picks.map(({ group, window, pinned }) => (
-            <div key={group.key || "main"} className="flex min-w-0 flex-col items-center gap-0.5">
-              {picks.length > 1 && group.tag ? (
-                <span className="whitespace-nowrap text-[11px] leading-tight text-muted-foreground">
-                  {group.tag}
+      <div className="usage-units">
+        {(picks.length
+          ? picks
+          : balanceGroups.length
+            ? []
+            : [{ group: { key: "", tag: null, windows: [] }, window: null, pinned: false }]
+        ).map(({ group, window, pinned }) => {
+          const main = pinned ? window : (group.windows.at(-1) ?? null);
+          return (
+            <Link
+              key={group.key}
+              className={cn("usage-unit", wideBoxes && "usage-box")}
+              data-tone={
+                wideBoxes ? accountTone({ ...account, windows: group.windows }, stale) : undefined
+              }
+              aria-label={`${name}${group.tag ? ` ${group.tag}` : ""}`}
+              to={boardPath(
+                `/usage/board/${encodeURIComponent(account.id)}${group.key ? `?focus=${encodeURIComponent(group.key)}` : ""}`,
+              )}
+              onClick={(event) => {
+                if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                event.preventDefault();
+                if (group.key && onOpenGroup) onOpenGroup(group.key);
+                else activate();
+              }}
+            >
+              {wideBoxes ? <span className="usage-unit-tag">{group.tag || "\u00a0"}</span> : null}
+              <UsageTip
+                model={
+                  main
+                    ? windowTip(account, main, group.tag, {
+                        pinned,
+                        stale: stale || empty,
+                        auto: !pinnedWindowId || pinnedWindowId === "auto",
+                      })
+                    : readingTip(account)
+                }
+              >
+                <UsageRing window={main} stale={stale || empty} size={92} />
+              </UsageTip>
+              <span className={cn("usage-countdown", stale && "text-muted-foreground")}>
+                {main ? formatTimeLeft(main.time_left_s) || "—" : t("notReported")}
+              </span>
+              {pinned ? (
+                <span className="usage-tile-plan">
+                  {t("pinned")} {main ? windowName(main) : ""}
                 </span>
               ) : null}
-              {window ? (
-                <UsageTip
-                  model={windowTip(account, window, group.tag, {
-                    pinned,
-                    stale: stale || empty,
-                    auto: !pinnedWindowId || pinnedWindowId === "auto",
-                  })}
-                >
-                  <UsageRing window={window} stale={stale || empty} size={88} />
-                </UsageTip>
-              ) : (
-                <UsageRing window={null} stale size={88} />
-              )}
-              {window && window.percent_used !== null ? (
-                <span
-                  className={cn(
-                    "whitespace-nowrap text-[14px] font-semibold leading-tight",
-                    stale ? "text-muted-foreground" : "text-info",
-                  )}
-                >
-                  {formatTimeLeft(window.time_left_s) || "—"}
-                </span>
-              ) : window && window.used_value !== null ? (
-                <span className="whitespace-nowrap text-[11px] leading-tight text-muted-foreground">
-                  {windowName(window)}
-                </span>
-              ) : (
-                <span className="whitespace-nowrap text-[11px] leading-tight text-muted-foreground">
-                  Not read
-                </span>
-              )}
-            </div>
-          ))
-        )}
+              {!pinned ? (
+                <div className="usage-satellites">
+                  {group.windows
+                    .filter((item) => item !== main)
+                    .map((item) => (
+                      <div key={item.id} className="usage-satellite">
+                        <UsageRing
+                          window={item}
+                          stale={stale || empty}
+                          size={16}
+                          showName={false}
+                        />
+                        <span>{windowName(item)}</span>
+                        <b>
+                          {item.percent_used?.toLocaleString("en-US", {
+                            maximumFractionDigits: 2,
+                          }) ?? "—"}
+                          %
+                        </b>
+                        <span>{formatTimeLeft(item.time_left_s)}</span>
+                      </div>
+                    ))}
+                </div>
+              ) : null}
+            </Link>
+          );
+        })}
+        {balanceGroups.map((balance) => (
+          <Link
+            key={`balance:${balance.id}`}
+            className={cn("usage-unit", wideBoxes && "usage-box")}
+            aria-label={`${name} ${balance.label ?? balance.group ?? t("balance")}`}
+            onClick={(event) => {
+              if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+              event.preventDefault();
+              if (onOpenGroup) onOpenGroup(balance.group ?? balance.id);
+              else activate();
+            }}
+            to={boardPath(
+              `/usage/board/${encodeURIComponent(account.id)}?focus=${encodeURIComponent(balance.group ?? balance.id)}`,
+            )}
+          >
+            {wideBoxes ? <span className="usage-unit-tag">{balance.group || "\u00a0"}</span> : null}
+            <UsageBalances tile account={{ ...account, balances: [balance] }} />
+          </Link>
+        ))}
       </div>
-
-      <UsageBalances account={account} />
       {(amount?.totals.partial_rows ?? 0) > 0 ? (
-        <p className="mb-1 text-center text-[11px] text-muted-foreground">{t("incomplete")}</p>
+        <p className="text-center text-[11px] text-muted-foreground">{t("incomplete")}</p>
       ) : null}
-
       {arrange ? (
-        <div className="mt-1.5 flex items-center justify-between">
-          <GripVerticalIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
-          <div className="flex items-center">
-            <button
-              type="button"
-              className="grid min-h-11 min-w-11 place-items-center rounded text-muted-foreground hover:text-foreground md:min-h-7 md:min-w-7"
-              aria-label={`Move ${name} back`}
-              onClick={(event) => {
-                event.stopPropagation();
-                onMove?.(-1);
-              }}
-            >
-              <ChevronLeftIcon className="size-3.5" aria-hidden="true" />
-            </button>
-            <button
-              type="button"
-              className="grid min-h-11 min-w-11 place-items-center rounded text-muted-foreground hover:text-foreground md:min-h-7 md:min-w-7"
-              aria-label={`Move ${name} forward`}
-              onClick={(event) => {
-                event.stopPropagation();
-                onMove?.(1);
-              }}
-            >
-              <ChevronRightIcon className="size-3.5" aria-hidden="true" />
-            </button>
-          </div>
+        <div className="usage-tile-footer">
+          <GripVerticalIcon className="size-3.5" />
+          <button
+            type="button"
+            aria-label={`Move ${name} back`}
+            className="min-h-11 min-w-11 md:min-h-7"
+            onClick={() => onMove?.(-1)}
+          >
+            <ChevronLeftIcon className="size-4" />
+          </button>
+          <button
+            type="button"
+            aria-label={`Move ${name} forward`}
+            className="min-h-11 min-w-11 md:min-h-7"
+            onClick={() => onMove?.(1)}
+          >
+            <ChevronRightIcon className="size-4" />
+          </button>
         </div>
       ) : (
-        <div className="mt-auto flex min-h-[26px] min-w-0 items-center justify-between gap-1.5 border-t border-foreground/12 pt-1.5 text-[11px] text-muted-foreground">
+        <div className="usage-tile-footer">
           {renewal && renewDays !== null ? (
             <UsageTip model={renewalTip(renewal.at, renewal.official)}>
-              <span
-                className={cn(
-                  "inline-flex items-center gap-1 whitespace-nowrap",
-                  renewDays <= 3 && "text-warning",
-                )}
-              >
-                <CalendarClockIcon className="size-3" aria-hidden="true" />
-                <b className="font-semibold">{renewDays}d</b>
+              <span>
+                <CalendarClockIcon className="inline size-3" /> <b>{renewDays}d</b>
               </span>
             </UsageTip>
           ) : (
-            <span />
+            <span>{t("renewalUnknown")}</span>
           )}
-          {amount &&
-          (tokens
-            ? amount.totals.tokens !== null
-            : amount.totals.cost_usd !== null || amount.totals.unpriced > 0) ? (
-            <UsageAmountFigure amount={amount} tokens={tokens} />
-          ) : null}
+          <span>
+            {t("periodCost")}{" "}
+            <b>
+              {amount && amount.totals.cost_usd !== null ? (
+                <UsageAmountFigure amount={amount} tokens={false} />
+              ) : (
+                "—"
+              )}
+            </b>
+          </span>
         </div>
       )}
-    </div>
+    </article>
   );
 }
 

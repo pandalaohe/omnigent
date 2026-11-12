@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils";
 
 import type { UsageWindowView } from "./usageBoardData";
 import {
-  formatPercent,
+  formatUsageValue,
   isPercentWindow,
   stateTone,
   TONE_STROKE,
@@ -73,10 +73,12 @@ export function UsageRing({
   const color = TONE_STROKE[tone];
   const dashed = !window || !isPercentWindow(window);
   const percent = window && isPercentWindow(window) ? (window.percent_used ?? 0) : null;
+  const elapsed = window ? elapsedFraction(window) : 0;
+  const [whole, decimals] = (percent ?? 0).toFixed(2).split(".");
   const value =
     window && !isPercentWindow(window)
       ? window.used_value !== null && window.used_value !== undefined
-        ? `${window.used_value.toLocaleString("en-US")}${window.unit ? ` ${window.unit}` : ""}`
+        ? formatUsageValue(window.used_value, window.unit)
         : ""
       : "";
 
@@ -125,22 +127,33 @@ export function UsageRing({
               strokeWidth={OUTER_STROKE}
             />
             {percent !== null ? arc(RADIUS, percent / 100, color, STROKE) : null}
-            {window
-              ? arc(OUTER_RADIUS, elapsedFraction(window), "var(--info)", OUTER_STROKE)
-              : null}
+            {window ? arc(OUTER_RADIUS, elapsed, "var(--info)", OUTER_STROKE) : null}
+            {elapsed > 0 ? (
+              <circle
+                cx={50 + OUTER_RADIUS * Math.sin(2 * Math.PI * elapsed)}
+                cy={50 - OUTER_RADIUS * Math.cos(2 * Math.PI * elapsed)}
+                r={3.4}
+                fill="var(--info)"
+              />
+            ) : null}
           </>
         )}
       </svg>
       <span className="relative flex flex-col items-center leading-none">
         {showName && window ? (
-          <span className="mb-0.5 w-full truncate px-1 text-center text-[10.5px] text-muted-foreground">
+          <span className="mb-0.5 w-full truncate px-1 text-center text-[10.5px] font-bold text-muted-foreground">
             {windowName(window)}
           </span>
         ) : null}
-        {percent !== null ? (
-          <span className="flex items-baseline text-[25px] font-semibold tracking-tight text-foreground">
-            {formatPercent(percent)}
-            <span className="text-[11px] font-medium text-muted-foreground">%</span>
+        {percent !== null && size > 20 ? (
+          <span className="flex flex-col items-center font-bold leading-none">
+            <span style={{ fontSize: size * 0.285 }}>{whole}</span>
+            <span
+              style={{ fontSize: Math.max(10, size * 0.122) }}
+              className="mt-0.5 text-muted-foreground"
+            >
+              .{decimals}%
+            </span>
           </span>
         ) : value ? (
           <span className="max-w-[80%] text-center text-[13px] font-semibold text-foreground">
