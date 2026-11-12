@@ -9,7 +9,7 @@ import { readBoardJson, type BoardTask } from "./taskBoardData";
 import type { BoardSession } from "./taskBoardNative";
 import { localDay, readBoardHistory, readLocalClosedCounts } from "./taskBoardActivityData";
 import { TaskBoardLog } from "./TaskBoardLog";
-import { TaskBoardHistory } from "./TaskBoardHistory";
+import { TaskBoardHistory, type HistoryDetailSelection } from "./TaskBoardHistory";
 import { TaskBoardToday } from "./TaskBoardToday";
 import { t } from "./taskBoardText";
 import "./taskBoardActivity.css";
@@ -22,6 +22,7 @@ export function TaskBoardActivity({
   sessions,
   onSelect,
   inlineDetail,
+  detailSelection,
   sourceCaches,
   hiddenSources = EMPTY_HIDDEN,
 }: {
@@ -30,6 +31,7 @@ export function TaskBoardActivity({
   sessions: BoardSession[];
   onSelect: (task: BoardTask) => void;
   inlineDetail?: ReactNode;
+  detailSelection?: HistoryDetailSelection;
   sourceCaches?: Record<string, SourceCache>;
   hiddenSources?: string[];
 }) {
@@ -112,6 +114,7 @@ export function TaskBoardActivity({
           counts={closedCounts}
           now={now}
           onSelect={select}
+          detailSelection={detailSelection}
         />
       ) : (
         <TaskBoardToday

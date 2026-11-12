@@ -302,6 +302,9 @@ function TaskBoardContent({
         preferences.view === view ? (
           <TaskBoardActivity
             inlineDetail={panel ? undefined : inlineDetail}
+            detailSelection={
+              panel || selected ? undefined : { task: selectedTask, close: closeDetail }
+            }
             key={view}
             view={view}
             hiddenSources={view === "history" ? preferences.hiddenSources : []}

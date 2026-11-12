@@ -124,48 +124,101 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-it("opens and closes an older-month task through the real page", async () => {
-  enableBoard("history");
-  const old: BoardTask = {
-    uid: "archive",
-    title: "Archive recovery",
-    progress: "completed",
-    "omnigent.ai:source": "tracker",
-    "omnigent.ai:group": { id: "archive", name: "Archive group" },
-    created: "2020-01-01T00:00:00Z",
-    progressUpdated: "2020-01-20T00:00:00Z",
-  };
-  mocks.tasks.mockImplementation(async (path: string) => {
-    const url = new URL(path, "https://example.test");
-    if (url.pathname.endsWith("/sources"))
-      return Response.json({ sources: [{ id: "tracker", name: "Tracker", source: null }] });
-    if (url.pathname.endsWith("/closed-counts"))
-      return Response.json({ days: [{ source: "tracker", day: "2020-01-20", closed: 1 }] });
-    if (url.pathname.endsWith("/history")) return Response.json({ entries: [] });
-    if (url.pathname.endsWith("/item")) return Response.json(old);
-    return Response.json({
-      entries: url.searchParams.has("closed_before") ? [old] : [],
-      updated: new Date().toISOString(),
+it.each(["none", "recent", "archive"])(
+  "opens one history detail through the real page with %s relation navigation",
+  async (relation) => {
+    enableBoard("history");
+    const old: BoardTask = {
+      uid: "archive",
+      title: "Archive recovery",
+      progress: "completed",
+      "omnigent.ai:source": "tracker",
+      "omnigent.ai:group": { id: "archive", name: "Archive group" },
+      created: "2020-01-01T00:00:00Z",
+      progressUpdated: "2020-01-20T00:00:00Z",
+    };
+    const recent: BoardTask = {
+      ...old,
+      uid: "recent",
+      title: "Recent selection",
+      created: new Date(Date.now() - 3600000).toISOString(),
+      progressUpdated: new Date().toISOString(),
+    };
+    const related: BoardTask = {
+      ...(relation === "recent" ? recent : old),
+      uid: "related",
+      title: "Related task",
+    };
+    const current =
+      relation === "none" ? [] : [recent, ...(relation === "recent" ? [related] : [])];
+    const archived = [old, ...(relation === "archive" ? [related] : [])];
+    if (relation !== "none") old.relatedTo = { related: { relation: { parent: true } } };
+    mocks.tasks.mockImplementation(async (path: string) => {
+      const url = new URL(path, "https://example.test");
+      if (url.pathname.endsWith("/sources"))
+        return Response.json({ sources: [{ id: "tracker", name: "Tracker", source: null }] });
+      if (url.pathname.endsWith("/closed-counts"))
+        return Response.json({
+          days: [{ source: "tracker", day: "2020-01-20", closed: archived.length }],
+        });
+      if (url.pathname.endsWith("/history")) return Response.json({ entries: [] });
+      if (url.pathname.endsWith("/item"))
+        return Response.json(
+          [...current, ...archived].find((task) => task.uid === url.searchParams.get("uid")),
+        );
+      return Response.json({
+        entries: url.searchParams.has("closed_before")
+          ? archived
+          : url.searchParams.get("state") === "closed"
+            ? current
+            : [],
+        updated: new Date().toISOString(),
+      });
     });
-  });
-  const view = renderBoard();
-  fireEvent.click(await screen.findByRole("button", { name: "Find by month" }));
-  fireEvent.change(view.container.querySelector("input[type=month]")!, {
-    target: { value: "2020-01" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Load month" }));
-  await waitFor(() => expect(view.container.querySelector(".h-stat>b")?.textContent).toBe("1"));
-  fireEvent.click(view.container.querySelector(".h-p")!);
-  fireEvent.click(view.container.querySelector(".h-srow")!);
-  fireEvent.click(view.container.querySelector(".h-trow")!);
-  const trigger = screen.getByRole("button", { name: "Open task details" });
-  trigger.focus();
-  fireEvent.click(trigger);
-  const detail = await screen.findByRole("region", { name: "Details: Archive recovery" });
-  fireEvent.click(within(detail).getByRole("button", { name: "Close" }));
-  expect(screen.queryByRole("region", { name: "Details: Archive recovery" })).toBeNull();
-  expect(document.activeElement).toBe(trigger);
-});
+    const view = renderBoard();
+    if (relation !== "none") {
+      await waitFor(() => expect(view.container.querySelector(".h-p")).toBeTruthy());
+      fireEvent.click(view.container.querySelector(".h-p")!);
+      fireEvent.click(view.container.querySelector(".h-srow")!);
+      fireEvent.click(screen.getByRole("button", { name: /Recent selection.*Completed/ }));
+      const recentTrigger = screen.getByRole("button", { name: "Open task details" });
+      recentTrigger.focus();
+      fireEvent.click(recentTrigger);
+      expect(await screen.findByRole("region", { name: "Details: Recent selection" })).toBeTruthy();
+    }
+    fireEvent.click(await screen.findByRole("button", { name: "Find by month" }));
+    fireEvent.change(view.container.querySelector("input[type=month]")!, {
+      target: { value: "2020-01" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Load month" }));
+    await waitFor(() =>
+      expect(view.container.querySelector(".h-stat>b")?.textContent).toBe(String(archived.length)),
+    );
+    fireEvent.click(view.container.querySelector(".h-p")!);
+    fireEvent.click(view.container.querySelector(".h-srow")!);
+    fireEvent.click(screen.getByRole("button", { name: /Archive recovery.*Completed/ }));
+    const trigger = screen.getByRole("button", { name: "Open task details" });
+    trigger.focus();
+    fireEvent.click(trigger);
+    const detail = await screen.findByRole("region", { name: "Details: Archive recovery" });
+    expect(view.container.querySelectorAll(".tb-dc")).toHaveLength(1);
+    fireEvent.click(within(detail).getByRole("button", { name: "Close" }));
+    expect(view.container.querySelectorAll(".tb-dc")).toHaveLength(0);
+    expect(document.activeElement).toBe(trigger);
+    if (relation !== "none") {
+      fireEvent.click(trigger);
+      const reopened = await screen.findByRole("region", { name: "Details: Archive recovery" });
+      fireEvent.click(within(reopened).getByRole("button", { name: /related.*Related task/ }));
+      const target = await screen.findByRole("region", { name: "Details: Related task" });
+      expect(view.container.querySelectorAll(".tb-dc")).toHaveLength(1);
+      expect(screen.queryByRole("region", { name: "Details: Archive recovery" })).toBeNull();
+      expect(screen.queryByRole("region", { name: "Details: Recent selection" })).toBeNull();
+      fireEvent.click(within(target).getByRole("button", { name: "Close" }));
+      expect(view.container.querySelectorAll(".tb-dc")).toHaveLength(0);
+      expect(document.activeElement).toBe(trigger);
+    }
+  },
+);
 
 it("keeps deployment and user gates ahead of every read", () => {
   mocks.info = { task_board_enabled: false };
@@ -193,7 +246,9 @@ it("opens an empty board with source management in Settings", async () => {
 it("defaults to native parent/child sessions and watches without device activity", async () => {
   enableBoard();
   const fixture = taskBoardFixture();
-  mocks.sessions = fixture.sessions;
+  mocks.sessions = fixture.sessions.map((session) =>
+    session.archived ? { ...session, archived_at: Date.now() / 1000 } : session,
+  );
   renderBoard();
   const region = await screen.findByRole("region", { name: "Sessions" });
   expect(await within(region).findByText("Verifying resumed chunks")).toBeTruthy();

@@ -171,12 +171,18 @@ function HistoryNumbers({ cards }: { cards: HistoryCard[] }) {
   );
 }
 
+export interface HistoryDetailSelection {
+  task: BoardTask | null;
+  close: () => void;
+}
+
 export function TaskBoardHistory({
   tasks,
   sessions,
   caches,
   counts,
   onSelect,
+  detailSelection,
   now,
 }: {
   tasks: BoardTask[];
@@ -184,11 +190,11 @@ export function TaskBoardHistory({
   caches: Record<string, SourceCache>;
   counts: ClosedDay[];
   onSelect: (task: BoardTask) => void;
+  detailSelection?: HistoryDetailSelection;
   now: number;
 }) {
   const [showMonths, setShowMonths] = useState(false);
-  const [archiveSelection, setArchiveSelection] = useState<BoardTask | null>(null);
-  const archiveTrigger = useRef<HTMLButtonElement | null>(null);
+  const archiveGeneration = useRef<string | null>(null);
   const hasOldMonths = counts.some((c) => Date.parse(c.day + "T00:00:00") < now - 365 * DAY);
   const [range, setRange] = useState<[number, number]>([now - 84 * DAY, now + 3600000]),
     [sets, setSets] = useState<Record<string, string[]>>({ source: [], agent: [], outcome: [] }),
@@ -219,7 +225,7 @@ export function TaskBoardHistory({
     setExtra([]);
     setLoading(false);
     setError(false);
-    setArchiveSelection(null);
+    archiveGeneration.current = null;
     const requestState = request;
     return () => {
       requestState.current++;
@@ -240,6 +246,14 @@ export function TaskBoardHistory({
     [from, to] = range,
     merged = new Map(tasks.map((task) => [taskIdentity(task), task]));
   extra.forEach((task) => merged.set(taskIdentity(task), task));
+  const archiveTask =
+    detailSelection?.task && archiveGeneration.current === generationKey
+      ? merged.get(taskIdentity(detailSelection.task))
+      : undefined;
+  const selectTask = (task: BoardTask) => {
+    archiveGeneration.current = generationKey;
+    onSelect(task);
+  };
   const historyStart = Math.min(
     now,
     ...[...merged.values()]
@@ -286,7 +300,7 @@ export function TaskBoardHistory({
     request.current++;
     setLoading(false);
     setError(false);
-    setArchiveSelection(null);
+    archiveGeneration.current = null;
     setRange([a, b]);
     reset();
   };
@@ -864,14 +878,7 @@ export function TaskBoardHistory({
                                         <button
                                           type="button"
                                           className="f-clear"
-                                          onClick={(event) => {
-                                            if (tasks.some((task) => taskIdentity(task) === c.id))
-                                              onSelect(c.task);
-                                            else {
-                                              archiveTrigger.current = event.currentTarget;
-                                              setArchiveSelection(c.task);
-                                            }
-                                          }}
+                                          onClick={() => selectTask(c.task)}
                                         >
                                           {t("g6.openTask")}
                                         </button>
@@ -896,18 +903,15 @@ export function TaskBoardHistory({
         {pager("source", sourceRows.length, 10)}
         {!filtered.length && <p className="h-empty">{t("g6.noRecords")}</p>}
       </div>
-      {archiveSelection && merged.has(taskIdentity(archiveSelection)) && (
+      {archiveTask && detailSelection && (
         <TaskBoardDetail
-          key={taskIdentity(archiveSelection)}
-          task={merged.get(taskIdentity(archiveSelection))!}
+          key={taskIdentity(archiveTask)}
+          task={archiveTask}
           tasks={[...merged.values()]}
           sessions={sessions}
-          sourceCache={caches[archiveSelection["omnigent.ai:source"]]}
-          onSelect={setArchiveSelection}
-          onClose={() => {
-            setArchiveSelection(null);
-            archiveTrigger.current?.focus();
-          }}
+          sourceCache={caches[archiveTask["omnigent.ai:source"]]}
+          onSelect={selectTask}
+          onClose={detailSelection.close}
         />
       )}
       {(hasOldMonths || month) && (
