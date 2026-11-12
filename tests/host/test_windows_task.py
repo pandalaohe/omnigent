@@ -15,7 +15,7 @@ from xml.etree import ElementTree as ET
 import pytest
 
 from omnigent.host import service, service_entry, windows_task, windows_upgrade
-from omnigent.util import private_files
+from omnigent.util import console_output, private_files
 
 
 @pytest.fixture
@@ -94,6 +94,36 @@ def test_enable_query_start_disable_windows_task(scheduler, target, monkeypatch)
     assert not installed.path.exists()
     assert not windows_task.env_path(installed).exists()
     assert scheduler.forgotten == [installed]
+
+
+@pytest.mark.parametrize(
+    "encoding,description",
+    [
+        ("utf-16", "中文"),
+        ("utf-16-le", "中文"),
+        ("utf-16-be", "中文"),
+        ("gbk", "中文"),
+        ("ascii", "plain"),
+    ],
+)
+def test_query_decodes_scheduler_xml_bytes(monkeypatch, tmp_path, encoding, description):
+    service_info = service.HostService("windows_task", tmp_path / "task.xml", "test-task")
+    xml = (
+        '<?xml version="1.0" encoding="UTF-16"?>'
+        f"<Task><Description>{description}</Description></Task>"
+    ).encode(encoding)
+
+    def run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, xml)
+
+    monkeypatch.setattr(windows_task, "_run", run)
+    monkeypatch.setattr(console_output, "_windows_code_pages", lambda: (936,))
+
+    task = windows_task.query(service_info)
+
+    assert task is not None
+    assert task.tag == "Task"
+    assert task.findtext("Description") == description
 
 
 def test_failed_task_refresh_restores_previous_environment(scheduler):
