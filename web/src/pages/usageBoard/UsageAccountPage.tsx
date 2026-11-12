@@ -1,3 +1,4 @@
+import { boardPath } from "@/lib/boardFrame";
 // One account in detail: every window the last read returned, in its group,
 // with the countdown and the reset written out, and the hosts that reported.
 
@@ -56,7 +57,7 @@ export function UsageAccountPage() {
           This account is not on the board any more.
           <div className="mt-3">
             <Button variant="outline" size="sm" asChild>
-              <Link to="/usage/board">Back to the board</Link>
+              <Link to={boardPath("/usage/board")}>Back to the board</Link>
             </Button>
           </div>
         </div>
@@ -77,7 +78,7 @@ export function UsageAccountPage() {
       error={overview.error ?? activity.error}
       actions={
         <Button variant="ghost" size="icon" asChild aria-label="Account settings">
-          <Link to={`/usage/board/${encodeURIComponent(accountId)}/settings`}>
+          <Link to={boardPath(`/usage/board/${encodeURIComponent(accountId)}/settings`)}>
             <SettingsIcon className="size-4" aria-hidden="true" />
           </Link>
         </Button>
@@ -277,7 +278,7 @@ export function UsageAccountPage() {
               variant="ghost"
               size="sm"
               className="-ml-2"
-              onClick={() => navigate("/usage/board")}
+              onClick={() => navigate(boardPath("/usage/board"))}
             >
               Board
             </Button>

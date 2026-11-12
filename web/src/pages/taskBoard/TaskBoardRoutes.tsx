@@ -1,3 +1,4 @@
+import { boardExitProps } from "@/lib/boardFrame";
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   ChevronDownIcon,
@@ -653,6 +654,7 @@ export function TaskBoardRoutes({
                       height="30"
                     >
                       <Link
+                        {...boardExitProps()}
                         to={`/tasks/${encodeURIComponent(task.id)}`}
                         className="block truncate text-xs underline"
                         title={task.name}

@@ -1,3 +1,4 @@
+import { boardExitProps } from "@/lib/boardFrame";
 import { useQuery } from "@tanstack/react-query";
 import { ExternalLinkIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -325,6 +326,7 @@ export function TaskBoardDetail({
             {ids.map((id) => (
               <li key={id}>
                 <Link
+                  {...boardExitProps()}
                   to={`/c/${encodeURIComponent(id)}`}
                   className="block truncate text-sm underline underline-offset-2"
                 >

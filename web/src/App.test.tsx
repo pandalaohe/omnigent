@@ -1,3 +1,4 @@
+import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { Link, Outlet, MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -443,6 +444,36 @@ describe("Settings routes", () => {
 
     expect(await screen.findByTestId("settings-location")).toHaveTextContent(
       "/settings/appearance",
+    );
+  });
+});
+
+describe("board frame routes", () => {
+  beforeEach(() => patchUsageBoardPreferences({ enabled: false }));
+  afterEach(() => {
+    cleanup();
+    patchUsageBoardPreferences({ enabled: true });
+  });
+  it.each(["/frame/task-board", "/frame/usage/board"])(
+    "mounts %s without app chrome",
+    async (path) => {
+      renderRoute(path, {}, { ...FALLBACK_SERVER_INFO, usage_board_enabled: true });
+      await screen.findByRole("heading", {
+        name: path.includes("usage") ? "Usage board is off" : "Task board is off on this server",
+      });
+      expect(screen.queryByText("app shell")).toBeNull();
+      expect(screen.queryByText("not found")).toBeNull();
+    },
+  );
+  it("keeps first-run setup outside the frame", () => {
+    renderRoute(
+      "/frame/task-board",
+      {},
+      { ...FALLBACK_SERVER_INFO, accounts_enabled: true, needs_setup: true },
+    );
+    expect(screen.getByRole("heading", { name: "Omnigent is not set up yet" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Open Omnigent" }).getAttribute("target")).toBe(
+      "_blank",
     );
   });
 });

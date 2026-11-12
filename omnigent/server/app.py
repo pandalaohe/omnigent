@@ -2019,6 +2019,9 @@ def create_app(
             auth_provider.set_api_keys(api_keys)
         elif api_keys:
             _logger.warning("api_keys ignored without accounts authentication")
+    from omnigent.server.server_config import frame_ancestors_policy
+
+    framing_policy = frame_ancestors_policy(resolved_server_config)
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     picker_curation = load_picker_curation(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
@@ -6994,7 +6997,12 @@ def create_app(
         app.mount(
             "/",
             _RangeAwareGZipMiddleware(
-                _SPAStaticFiles(directory=web_ui_dist, html=True, base_path=resolved_base_path),
+                _SPAStaticFiles(
+                    directory=web_ui_dist,
+                    html=True,
+                    base_path=resolved_base_path,
+                    framing_policy=framing_policy,
+                ),
                 minimum_size=_WEB_UI_GZIP_MINIMUM_SIZE,
             ),
             name="web-ui",
@@ -7044,15 +7052,19 @@ class _SPAStaticFiles(StaticFiles):
     a content ``etag`` so ``If-None-Match`` revalidation still yields ``304``.
     """
 
-    def __init__(self, *args: Any, base_path: str = "", **kwargs: Any) -> None:
+    def __init__(
+        self, *args: Any, base_path: str = "", framing_policy: str | None = None, **kwargs: Any
+    ) -> None:
         super().__init__(*args, **kwargs)
+        self._framing_policy = framing_policy
         self._index_html: bytes | None = None
         self._index_etag: str | None = None
         index_file = Path(self.directory) / "index.html"  # type: ignore[arg-type]
         if index_file.is_file():
             html = _rewrite_web_ui_index(index_file.read_text(encoding="utf-8"), base_path)
             self._index_html = html.encode("utf-8")
-            self._index_etag = f'"{hashlib.md5(self._index_html).hexdigest()}"'
+            validator = self._index_html + b"\nframe-ancestors:" + (framing_policy or "-").encode()
+            self._index_etag = f'"{hashlib.md5(validator).hexdigest()}"'
 
     def _shell_response(self, scope: Scope) -> Response:
         """Serve the rebased HTML shell from memory, honoring ``If-None-Match``."""
@@ -7061,9 +7073,11 @@ class _SPAStaticFiles(StaticFiles):
             (v.decode("latin-1") for k, v in scope.get("headers", []) if k == b"if-none-match"),
             None,
         )
-        if self._index_etag is not None and if_none_match == self._index_etag:
-            return Response(status_code=304, headers={"etag": self._index_etag})
         headers = {"etag": self._index_etag} if self._index_etag else {}
+        if self._framing_policy:
+            headers["Content-Security-Policy"] = self._framing_policy
+        if self._index_etag is not None and if_none_match == self._index_etag:
+            return Response(status_code=304, headers=headers)
         return Response(self._index_html, media_type="text/html", headers=headers)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:

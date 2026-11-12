@@ -1,3 +1,4 @@
+import { BoardFrameLayout, BoardFrameSetup } from "@/pages/BoardFrameLayout";
 import { lazy, Suspense, useEffect, type ComponentType, type ReactNode } from "react";
 import { Route, Routes } from "react-router-dom";
 import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
@@ -200,6 +201,7 @@ function AppRoutes({ basename }: AppProps) {
     return (
       <Suspense fallback={<PageLoading />}>
         <Routes>
+          <Route path={`${prefix}/frame/*`} element={<BoardFrameSetup />} />
           <Route path={basename ? `${prefix}/*` : "*"} element={<SetupPage />} />
         </Routes>
       </Suspense>
@@ -216,6 +218,35 @@ function AppRoutes({ basename }: AppProps) {
           </>
         )}
         <Route path={`${prefix}/approve/:sessionId/:elicitationId`} element={<ApprovePage />} />
+        <Route element={<BoardFrameLayout />}>
+          <Route path={`${prefix}/frame/task-board`} element={<TaskBoardPage />} />
+          {usageBoardAvailable(info) && (
+            <>
+              <Route path={`${prefix}/frame/usage/board`} element={<UsageBoardPage />} />
+              <Route path={`${prefix}/frame/usage/board/cost`} element={<UsageBoardCostPage />} />
+              <Route
+                path={`${prefix}/frame/usage/board/issues`}
+                element={<UsageBoardIssuesPage />}
+              />
+              <Route
+                path={`${prefix}/frame/usage/board/:accountId/issues`}
+                element={<UsageBoardIssuesPage />}
+              />
+              <Route
+                path={`${prefix}/frame/usage/board/:accountId/models`}
+                element={<UsageBoardModelsPage />}
+              />
+              <Route
+                path={`${prefix}/frame/usage/board/:accountId`}
+                element={<UsageBoardAccountPage />}
+              />
+              <Route
+                path={`${prefix}/frame/usage/board/:accountId/settings`}
+                element={<UsageBoardAccountSettingsPage />}
+              />
+            </>
+          )}
+        </Route>
         <Route element={<AppShell />}>
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
