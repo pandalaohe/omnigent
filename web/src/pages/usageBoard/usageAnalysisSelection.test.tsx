@@ -16,6 +16,7 @@ const state = vi.hoisted(() => ({
   partial: false,
   rows: [] as unknown[],
   hidden: [] as string[],
+  readKeys: [] as string[],
 }));
 vi.mock("./usageActivityData", () => ({ useUsageActivity: () => ({ data: { accounts: [] } }) }));
 vi.mock("./usageBoardData", () => ({
@@ -31,23 +32,26 @@ vi.mock("./usageBoardData", () => ({
 }));
 vi.mock("./usageAnalysisData", async (original) => ({
   ...(await original<object>()),
-  useUsageAnalysis: () => ({
-    data: {
-      generated_at: 10000,
-      span: { requested_from: 0, counted_from: 0, until: 10000 },
-      rows: state.rows,
-      partial: state.partial,
-      pool_catalog: [
-        { parent_account_id: "a", pool_id: "p", display_name: "Pool P", usage_available: true },
-        {
-          parent_account_id: "a",
-          pool_id: "q",
-          display_name: "Quota only",
-          usage_available: false,
-        },
-      ],
-    },
-  }),
+  useUsageAnalysis: (_range: unknown, selection?: { keys: string[] }) => {
+    if (selection) state.readKeys = selection.keys;
+    return {
+      data: {
+        generated_at: 10000,
+        span: { requested_from: 0, counted_from: 0, until: 10000 },
+        rows: state.rows,
+        partial: state.partial,
+        pool_catalog: [
+          { parent_account_id: "a", pool_id: "p", display_name: "Pool P", usage_available: true },
+          {
+            parent_account_id: "a",
+            pool_id: "q",
+            display_name: "Quota only",
+            usage_available: false,
+          },
+        ],
+      },
+    };
+  },
 }));
 vi.mock("@/hooks/useUsageContextPreferences", () => ({
   useUsageContextPreferences: () => ({
@@ -156,6 +160,26 @@ it("changes grouping without reusing a different dimension's picks", () => {
   fireEvent.click(screen.getByRole("button", { name: "GPT" }));
   expect(screen.getByTestId("selected-chart")).toHaveTextContent("GPTprevious unavailable");
   expect(screen.queryByRole("button", { name: /Claude token share/ })).toBeNull();
+});
+it("keeps an unavailable model selection empty until the user actively chooses All", () => {
+  const result = mount();
+  fireEvent.click(screen.getByRole("button", { name: "Model" }));
+  fireEvent.click(screen.getByRole("button", { name: "GPT" }));
+  expect(state.readKeys).toEqual(["GPT"]);
+  state.rows = [row()];
+  state.range = "d30";
+  result.rerender(
+    <MemoryRouter initialEntries={["/usage/board/cost"]}>
+      <UsageCostPage />
+    </MemoryRouter>,
+  );
+  expect(state.readKeys).toEqual([]);
+  expect(screen.getByRole("button", { name: "All" })).toHaveAttribute("aria-pressed", "false");
+  expect(screen.getByRole("status")).toHaveTextContent("Selected items are unavailable");
+  expect(screen.getByTestId("selected-chart")).not.toHaveTextContent("Claude");
+  fireEvent.click(screen.getByRole("button", { name: "All" }));
+  expect(state.readKeys).toEqual(["Claude"]);
+  expect(screen.getByTestId("selected-chart")).toHaveTextContent("Claude");
 });
 it("keeps a quota-only pool unknown instead of falling back to parent data", () => {
   mount();

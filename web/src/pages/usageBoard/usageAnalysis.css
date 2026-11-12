@@ -281,6 +281,9 @@
   }
 }
 @container (max-width: 780px) {
+  .ua-comparisons {
+    grid-template-columns: minmax(0, 1fr);
+  }
   .ua-kpis {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }

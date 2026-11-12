@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import json
-from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 from fractions import Fraction
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from omnigent.usage.contract import UsageAnalysisView
 from omnigent.usage.pricing import PricingBaseline
@@ -17,20 +16,7 @@ Dimension = Literal["account", "pool", "model", "card"]
 
 def display_values(value: Any) -> Any:
     if isinstance(value, Value):
-
-        def rounded(text):
-            if text is None:
-                return None
-            with localcontext() as context:
-                context.prec = max(60, len(text) + 4)
-                return format(
-                    Decimal(text).quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN), ".2f"
-                )
-
-        return {
-            **value.model_dump(),
-            "formatted": {"low": rounded(value.low), "high": rounded(value.high)},
-        }
+        return {**value.model_dump(), "formatted": value.display()}
     if isinstance(value, dict):
         if {"state", "unit", "low", "cohort_id", "as_of"}.issubset(value):
             return display_values(Value.model_validate(value))
@@ -177,6 +163,9 @@ def present_analysis(
             )
         ):
             comparison = compare_periods(projection, old)
+            comparison["same_spend_difference"] = subtract(
+                projection["tokens"], cast(Value, comparison["same_spend"])
+            )
             now_efficiency = divide(
                 projection["tokens"], projection["paid"], unit="tokens_per_money"
             )

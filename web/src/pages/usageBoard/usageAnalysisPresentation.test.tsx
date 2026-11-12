@@ -91,6 +91,10 @@ it("uses server half-even display endpoints without converting the monetary deci
     "$9,007,199,254,740,993.01",
   );
 });
+it("keeps bounded display uncertainty even when the formatted endpoints match", () => {
+  const range = { ...value("49", "49.00"), state: "range" };
+  expect(analysisValueText(range)).toBe("$49.00–$49.00");
+});
 it("renders purchased card payment, original currency, allowance and paid per quota", () => {
   render(
     <AnalysisCards data={fixture()} sort={{ key: "paid", direction: -1 }} onSort={() => {}} />,
@@ -123,6 +127,13 @@ it("shows directional same-usage and same-spend comparisons and suppresses 90 da
   const result = render(<AnalysisComparisons data={fixture()} ninety={false} />);
   expect(screen.getByText("More spent $1.00")).toBeVisible();
   expect(screen.getByText("More used 20%")).toBeVisible();
+  expect(screen.getByText("Token difference: 200")).toBeVisible();
+  const lower = fixture();
+  lower.comparison.same_spend_percent = value("-20", "-20.00", null);
+  lower.comparison.same_spend_difference = value("-200", "-200.00", null);
+  result.rerender(<AnalysisComparisons data={lower} ninety={false} />);
+  expect(screen.getByText("Less used 20%")).toBeVisible();
+  expect(screen.getByText("Token difference: -200")).toBeVisible();
   result.rerender(<AnalysisComparisons data={fixture()} ninety />);
   expect(screen.getAllByText("90 days has no previous period")).toHaveLength(2);
   expect(screen.queryByText("More spent $1.00")).toBeNull();
@@ -130,11 +141,13 @@ it("shows directional same-usage and same-spend comparisons and suppresses 90 da
 it("keeps quota-closing evidence independent of the payment display", () => {
   const names = new Map([["a", "Alpha"]]);
   const data = fixture();
+  data.quota_closings[0].remaining.high = "30.004";
+  data.quota_closings[0].remaining.formatted!.high = "30.01";
   const result = render(<AnalysisClosings data={data} names={names} model={false} />);
-  expect(screen.getByText("≤30%")).toBeVisible();
+  expect(screen.getByText("≤30.01%")).toBeVisible();
   data.projection.paid = value("1", "1.00");
   result.rerender(<AnalysisClosings data={data} names={names} model={false} />);
-  expect(screen.getByText("≤30%")).toBeVisible();
+  expect(screen.getByText("≤30.01%")).toBeVisible();
   expect(screen.getByText("Alpha")).toBeVisible();
 });
 it("uses selected UTC hours for heatmap values and keeps partial data unknown", () => {

@@ -83,9 +83,11 @@ export function UsageCostPage() {
       (model) => ({ key: model, name: model || "Unknown model" }),
     );
   }, [dimension, visible, analysis.data, names, rows, board.hidden]);
-  const live = picks[dimension]?.filter((key) => items.some((item) => item.key === key));
-  const all = !live?.length || live.length === items.length;
-  const keys = all ? items.map((item) => item.key) : live;
+  const pick = picks[dimension];
+  const all = pick == null;
+  const keys = all
+    ? items.map((item) => item.key)
+    : pick.filter((key) => items.some((item) => item.key === key));
   const selected = useUsageAnalysis(range, {
     dimension,
     keys,
@@ -202,6 +204,9 @@ export function UsageCostPage() {
           </button>
         ))}
       </div>
+      {!all && !keys.length ? (
+        <p role="status">Selected items are unavailable in this range. Choose items or All.</p>
+      ) : null}
       {dimension === "card" ? (
         <AnalysisCards
           data={presentation}

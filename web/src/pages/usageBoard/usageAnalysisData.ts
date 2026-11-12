@@ -173,5 +173,5 @@ export function analysisValueText(
   };
   const low = text(value.formatted.low),
     high = value.formatted.high === null ? null : text(value.formatted.high);
-  return high === null ? `≥${low}` : low === high ? low : `${low}–${high}`;
+  return high === null ? `≥${low}` : value.state === "exact" ? low : `${low}–${high}`;
 }

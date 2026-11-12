@@ -5,8 +5,9 @@ from fractions import Fraction
 
 import pytest
 
-from omnigent.usage.analysis_presentation import present_analysis
+from omnigent.usage.analysis_presentation import display_values, present_analysis
 from omnigent.usage.pricing import PricingBaseline, PricingDefaults
+from omnigent.usage.value import Value
 from tests.server.test_usage_pricing_math import card, view
 
 
@@ -95,6 +96,24 @@ def test_money_is_rounded_half_even_once_after_summing_raw_purchase_allocations(
     ]
 
 
+@pytest.mark.parametrize(
+    "state,low,high,formatted",
+    [
+        ("exact", "1.005", "1.005", {"low": "1.00", "high": "1.00"}),
+        ("range", "49.006", "70.004", {"low": "49.00", "high": "70.01"}),
+        ("range", "-70.004", "-49.006", {"low": "-70.01", "high": "-49.00"}),
+        ("range", "0", "30.004", {"low": "0.00", "high": "30.01"}),
+        ("partial", "49.006", None, {"low": "49.00", "high": None}),
+    ],
+)
+def test_display_preserves_exact_rounding_and_encloses_bounded_values(state, low, high, formatted):
+    result = display_values(
+        Value(state=state, low=low, high=high, unit="money", cohort_id="selected", as_of=1)
+    )
+    assert result["formatted"] == formatted
+    assert (result["state"], result["low"], result["high"]) == (state, low, high)
+
+
 def test_pool_identity_includes_parent_and_models_never_borrow_a_shared_payment():
     source, baseline = sample()
     for row in source.rows:
@@ -163,6 +182,9 @@ def test_previous_comparisons_and_closing_evidence_follow_the_same_selection():
     )
     assert Fraction(result["comparison"]["same_usage_difference"]["low"]) == 100
     assert result["comparison"]["same_spend_percent"]["formatted"]["low"] == "100.00"
+    assert Fraction(result["comparison"]["same_spend_difference"]["low"]) == (
+        source.rows[0].tokens - previous.rows[0].tokens
+    )
     assert result["quota_closings"][0]["remaining"]["formatted"]["high"] == "30.00"
     other = present_analysis(
         source, previous, baseline, dimension="account", keys=["account-b"], excluded=set()
