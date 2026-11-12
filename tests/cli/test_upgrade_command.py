@@ -76,28 +76,39 @@ def _wheel_install(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize(
-    "outcome", ["success", "install-failure", "no-op", "refresh-failure", "write-failure"]
+    "outcome",
+    ["success", "install-failure", "no-op", "refresh-failure", "write-failure", "spawn-failure"],
 )
 @pytest.mark.parametrize("origin", ["registry", "git", "nightly"])
+@pytest.mark.parametrize("target", ["https://remote.example/space%2Fname", None])
 def test_upgrade_preserves_enabled_service(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _wheel_install: None,
     outcome: str,
     origin: str,
+    target: str | None,
 ) -> None:
     from omnigent.host import service
 
-    target = "https://remote.example/space%2Fname"
     installed = service.HostService("systemd_user", tmp_path / "host.service", "host.service")
     original = service._systemd_unit(
-        command=["python", "-m", "omnigent.host.service_entry", "--server", target],
+        command=[
+            "python",
+            "-m",
+            "omnigent.host.service_entry",
+            *(["--server", target] if target else ["--local"]),
+        ],
         environment={"PATH": "/old/bin"},
     )
     installed.path.write_bytes(original)
     monkeypatch.setattr(service, "_service_for_current_platform", lambda: installed)
     monkeypatch.setattr(service, "_record_service", lambda _: None)
-    monkeypatch.setattr("omnigent.cli._build_host_daemon_env", lambda **_: {"PATH": "/new/bin"})
+
+    def _unexpected_environment(**_: object) -> dict[str, str]:
+        pytest.fail("The old upgrade process must not load post-install host modules")
+
+    monkeypatch.setattr("omnigent.cli._build_host_daemon_env", _unexpected_environment)
     monkeypatch.setattr("omnigent.cli._find_daemon_record", lambda _: None)
     events: list[str] = []
 
@@ -114,6 +125,36 @@ def test_upgrade_preserves_enabled_service(
             raise PermissionError("definition is read-only")
 
         monkeypatch.setattr(service, "_atomic_write", _write)
+
+    def _refresh(argv: list[str], **kwargs: object):
+        import subprocess
+        import sys
+
+        assert argv == [
+            sys.executable,
+            "-P",
+            "-m",
+            "omnigent",
+            "host",
+            "enable",
+            "--non-interactive",
+            "--server",
+            target or "",
+        ]
+        from omnigent.cli import host_enable
+
+        with host_enable.make_context("enable", argv[6:]) as context:
+            assert context.params["server"] == (target or "")
+        assert kwargs == {"check": False}
+        if outcome == "spawn-failure":
+            raise OSError("interpreter unavailable")
+        try:
+            service.enable_user_host_service(target, environment={"PATH": "/new/bin"})
+        except (service.HostServiceError, OSError):
+            return subprocess.CompletedProcess(argv, 1)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr("omnigent.cli.subprocess.run", _refresh)
     monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda **_: "0.2.0")
 
     def _install(*_: object) -> int:
@@ -145,9 +186,8 @@ def test_upgrade_preserves_enabled_service(
     else:
         assert events.index("install") < events.index("start")
         assert installed.path.read_bytes() == original
-    if outcome == "write-failure":
-        assert isinstance(result.exception, PermissionError)
-        assert str(result.exception) == "definition is read-only"
+    if outcome in {"refresh-failure", "write-failure", "spawn-failure"}:
+        assert "Failed to refresh the host user service" in result.output
 
 
 @pytest.mark.parametrize("origin", ["registry", "git", "nightly"])
