@@ -2229,8 +2229,26 @@ def create_app(
         account = accounts.get(agent_key) if accounts else None
         if not isinstance(account, dict):
             return None
+        # Provider inventories do not identify the provider a session used.
+        # In particular, Pi may route through a separately billed gateway.
+        if agent_key not in {"claude", "codex"}:
+            return None
+        if conn is not None:
+            from omnigent.gateway_inference import gateway_inference_state
+
+            if (
+                gateway_inference_state(conn.hello.gateway_inference, f"{agent_key}-native")
+                is True
+            ):
+                return None
+        if agent_key == "claude":
+            method = account.get("auth_method")
+            if method == "claudeai":
+                return "subscription"
+            return "api_key" if method == "api_key" else None
         kind = account.get("kind")
-        return kind if isinstance(kind, str) else None
+        known = {"api_key", "chatgpt"}
+        return kind if isinstance(kind, str) and kind in known else None
 
     configure_usage_hours(
         UsageHoursRecorder(

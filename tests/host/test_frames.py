@@ -1176,12 +1176,13 @@ def test_hello_frame_platform_round_trip() -> None:
 
 def test_hello_and_readiness_frames_round_trip_harness_accounts() -> None:
     accounts = {
+        "claude": {"kind": "subscription", "auth_method": "oauth_token"},
         "codex": {
             "kind": "chatgpt",
             "email": "person@example.test",
             "plan": "pro",
             "expired": False,
-        }
+        },
     }
     hello = decode_host_frame(
         encode_host_frame(

@@ -195,6 +195,12 @@ def _no_real_model_catalog_prewarm(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_real_account_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep startup account discovery independent of installed vendor CLIs."""
+    monkeypatch.setattr("omnigent.host.connect.probe_harness_account", lambda *a, **kw: None)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_host_maintenance(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep host-loop tests from sweeping machine-global developer state."""
 
@@ -7273,8 +7279,22 @@ async def test_dispatch_refresh_harnesses_updates_capabilities(
     assert host._gateway_inference == {"codex-native": False}
 
 
-async def test_startup_capability_discovery_does_not_probe_accounts(
+@pytest.mark.parametrize(
+    "accounts",
+    [
+        {
+            "codex": {"kind": "chatgpt"},
+            "claude": {"kind": "subscription"},
+            "pi": {"kind": "providers"},
+        },
+        {"codex": {"kind": "api_key"}, "claude": {"kind": "api_key"}},
+        {"codex": {"kind": "unknown"}},
+        {},
+    ],
+)
+async def test_startup_capability_discovery_reports_accounts_in_hello(
     monkeypatch: pytest.MonkeyPatch,
+    accounts: dict[str, dict[str, str]],
 ) -> None:
     host = _make_host_process()
 
@@ -7284,17 +7304,63 @@ async def test_startup_capability_discovery_does_not_probe_accounts(
     async def _gateway(*, startup: bool) -> dict[str, bool]:
         return {"codex": False}
 
-    async def _accounts(*, explicit_refresh: bool) -> dict[str, object]:
-        raise AssertionError("account probes must not run during startup discovery")
+    probe = AsyncMock(return_value=accounts)
 
     monkeypatch.setattr(host, "_probe_configured_harnesses", _configured)
     monkeypatch.setattr(host, "_probe_gateway_inference", _gateway)
-    monkeypatch.setattr(host, "_probe_harness_accounts", _accounts)
+    monkeypatch.setattr(host, "_probe_harness_accounts", probe)
 
     await host._initialize_capabilities()
 
     assert host._configured_harnesses == {"codex": True}
-    assert host._harness_accounts is None
+    tunnel = _FakeTunnel()
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type]
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.harness_accounts == accounts
+    probe.assert_awaited_once_with(explicit_refresh=False)
+
+
+async def test_startup_account_probe_cannot_overwrite_newer_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _make_host_process()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _accounts(*, explicit_refresh: bool):
+        started.set()
+        await release.wait()
+        return {"codex": {"kind": "chatgpt"}}
+
+    monkeypatch.setattr(host, "_probe_harness_accounts", _accounts)
+    monkeypatch.setattr(host, "_probe_configured_harnesses", AsyncMock(return_value={}))
+    monkeypatch.setattr(host, "_probe_gateway_inference", AsyncMock(return_value={}))
+    task = asyncio.create_task(host._initialize_capabilities())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        host._replace_capabilities(None, None, {"codex": {"kind": "api_key"}})
+    finally:
+        release.set()
+        await task
+    assert host._harness_accounts == {"codex": {"kind": "api_key"}}
+
+
+async def test_startup_account_timeout_preserves_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = _make_host_process()
+    monkeypatch.setattr(host, "_probe_configured_harnesses", AsyncMock(return_value={}))
+    monkeypatch.setattr(host, "_probe_gateway_inference", AsyncMock(return_value={}))
+    monkeypatch.setattr("omnigent.host.connect.HARNESS_ACCOUNT_KEYS", ("codex",))
+    monkeypatch.setattr(host, "_run_harness_account_probe", AsyncMock(side_effect=TimeoutError))
+    tunnel = _FakeTunnel()
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type]
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.harness_accounts == {"codex": {"kind": "unknown"}}
 
 
 async def test_connected_host_never_probes_accounts_without_request(

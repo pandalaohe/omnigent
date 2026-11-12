@@ -5611,16 +5611,18 @@ class HostProcess:
         if self._capabilities_initialized:
             return
         generation = self._capability_generation
+        account_generation = self._account_generation
         try:
-            configured, gateway = await asyncio.wait_for(
+            configured, gateway, accounts = await asyncio.wait_for(
                 asyncio.gather(
                     self._probe_configured_harnesses(startup=True),
                     self._probe_gateway_inference(startup=True),
+                    self._probe_harness_accounts(explicit_refresh=False),
                 ),
                 timeout=_HOST_CAPABILITY_INIT_TIMEOUT_S,
             )
         except TimeoutError:
-            configured = gateway = None
+            configured = gateway = accounts = None
             _logger.error(
                 "Host capability discovery exceeded %.0fs; continuing with unknown metadata",
                 _HOST_CAPABILITY_INIT_TIMEOUT_S,
@@ -5629,8 +5631,13 @@ class HostProcess:
                 "⚠ Host capability discovery timed out; connecting with readiness unknown.",
                 stderr=True,
             )
-        if self._capability_generation == generation:
-            self._replace_capabilities(configured, gateway)
+        if self._capability_generation != generation:
+            configured = gateway = None
+        self._replace_capabilities(
+            configured,
+            gateway,
+            accounts if self._account_generation == account_generation else None,
+        )
         self._capabilities_initialized = True
 
     def _replace_capabilities(

@@ -258,6 +258,8 @@ def _claude_account(
     account: HarnessAccount = {
         "kind": "api_key" if auth_method == "api_key" else "subscription",
     }
+    if isinstance(auth_method, str) and auth_method:
+        account["auth_method"] = auth_method
     for target, candidates in {
         "email": ("email",),
         "org": ("organization", "org"),
