@@ -109,7 +109,7 @@ def test_enable_query_start_disable_windows_task(scheduler, target, monkeypatch)
 def test_query_decodes_scheduler_xml_bytes(monkeypatch, tmp_path, encoding, description):
     service_info = service.HostService("windows_task", tmp_path / "task.xml", "test-task")
     xml = (
-        '<?xml version="1.0" encoding="UTF-16"?>'
+        '<?xml version="1.0" encoding="UTF-16"?>\r\r\n'
         f"<Task><Description>{description}</Description></Task>"
     ).encode(encoding)
 
