@@ -41,12 +41,15 @@ def test_native_message_event_preserves_typed_retry_metadata(harness, automatic)
             "role": "user",
             "content": [{"type": "input_text", "text": "retry"}],
             "stable_id": "b" * 32,
+            "_input_admission_required": True,
+            "_input_admission_deadline": 1300.0,
             **({"auto_retry": marker} if automatic else {}),
         },
     )
     event = _build_native_terminal_message_event(conv, body)
     assert event["content"] == [{"type": "input_text", "text": "retry"}]
     assert event["stable_id"] == "b" * 32
+    assert event["input_admission_deadline"] == 1300.0
     if automatic:
         assert event["auto_retry"] == marker
     else:
@@ -430,3 +433,15 @@ async def test_uncertain_or_interrupted_input_does_not_report_missing_message(
     assert all(item.type != "error" for item in saved.values())
     assert "item_id" not in attrs and "error_item_id" not in attrs
     assert pending_inputs.snapshot_for(conv.id) == []
+
+
+@pytest.mark.parametrize("elapsed", [31.0, 61.0, 181.0])
+def test_native_admission_keeps_original_startup_deadline(monkeypatch, elapsed):
+    from types import SimpleNamespace
+
+    from omnigent.server.routes._sessions import common
+
+    monkeypatch.setattr(common, "time", SimpleNamespace(time=lambda: 1000.0 + elapsed))
+    assert common._input_admission_deadline({"_input_admission_deadline": 1300.0}) == 1300.0
+    assert common._input_admission_deadline({}) == 1300.0 + elapsed
+    assert common._RUNNER_FORWARD_TIMEOUT.read > 300.0

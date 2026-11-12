@@ -1778,3 +1778,22 @@ def test_tool_advertisement_and_actor_cannot_be_an_argument():
         assert "caller_id" not in schema["function"]["parameters"]["properties"]
     finally:
         manager.shutdown()
+
+
+async def test_parent_receipt_can_take_longer_than_five_seconds(tree, monkeypatch):
+    import time
+
+    append = tree.store.append
+
+    def slow_append(session_id, items):
+        if session_id == tree.root_id:
+            time.sleep(5.05)
+        return append(session_id, items)
+
+    await _publish(tree, _claude_params())
+    future = asyncio.get_running_loop().create_future()
+    orchestration._harness_elicitation_registry["elicit_pi_dialog"] = future
+    orchestration._harness_elicitation_owners["elicit_pi_dialog"] = tree.child_id
+    monkeypatch.setattr(tree.store, "append", slow_append)
+    assert await _answer(tree) == {"status": "answered"}
+    assert future.done()

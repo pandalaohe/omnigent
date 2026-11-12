@@ -44,7 +44,7 @@ from omnigent.stores.file_store import FileStore
 logger = logging.getLogger(__name__)
 APPROVAL_KIND = "answer-child-approvals"
 OFFER_TIMEOUT_S = 60.0
-RECEIPT_TIMEOUT_S = 5.0
+RECEIPT_TIMEOUT_S = 60.0
 USER_ONLY_TOOLS = frozenset(
     {
         "AskUserQuestion",

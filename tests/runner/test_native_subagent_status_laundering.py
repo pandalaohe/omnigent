@@ -65,7 +65,7 @@ async def test_launch_reaper_checks_server_before_reporting_failure(status: str 
     entry = subagent_work.register_subagent_work(
         parent_session_id=parent_id, child_session_id=child_id, agent="codex", title="impl"
     )
-    entry.created_at -= 181
+    entry.created_at -= 301
 
     async def reconciled() -> None:
         swept.set()
@@ -85,8 +85,8 @@ async def test_launch_reaper_checks_server_before_reporting_failure(status: str 
             assert entry.status == "running"
             assert inbox.empty()
         elif status in {None, "launching", "idle"}:
-            assert entry.status == "failed"
-            assert "no start acknowledgment" in inbox.get_nowait()["output"]
+            assert entry.status == "launch_unconfirmed"
+            assert inbox.get_nowait()["status"] == "launch_unconfirmed"
         else:
             # Terminal delivery must keep the child's real result, not invent a timeout.
             assert entry.status == "launching"
@@ -257,25 +257,8 @@ async def test_late_failed_report_must_not_be_discarded_by_delivered_completed()
 
 
 @pytest.mark.asyncio
-async def test_wedged_launching_dispatch_fails_loudly_to_parent() -> None:
-    """
-    A dispatch wedged in ``launching`` must fail loudly, never be swallowed.
-
-    User journey: a parent dispatches a native sub-agent turn; the child
-    never emits any edge (no running/waiting/terminal status — e.g. the
-    native pane never came up, or the send was buffered against a turn that
-    never ends). A message buffered against a healthy active turn drains as
-    a continuation turn once that turn settles — that path is contractual
-    and covered elsewhere — but a child that produces NO edge at all leaves
-    the work entry in ``launching`` forever: the parent never hears back and
-    the dispatched work is silently lost with no error surfaced anywhere.
-
-    The runner must enforce a launch-liveness budget: a dispatch still in
-    ``launching`` past the budget is failed and that failure is delivered to
-    the parent inbox, so the send is run-or-failed — never accepted and
-    dropped in silence.
-    """
-
+async def test_unconfirmed_launch_remains_tracked_until_start() -> None:
+    """Missing launch proof stays nonterminal and a later start uses the same child."""
     parent_id = uuid.uuid4().hex
     child_id = uuid.uuid4().hex
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -300,17 +283,12 @@ async def test_wedged_launching_dispatch_fails_loudly_to_parent() -> None:
             # Past the budget with no edge ever seen: the sweep must act.
             reap(now=entry.created_at + 200.0, timeout_s=180.0)
 
-        assert entry.status == "failed", (
-            f"work entry is {entry.status!r} long past any reasonable launch "
-            f"budget: a child that never produced a single edge is wedged, the "
-            f"parent is never told, and the dispatched work is silently lost. "
-            f"The runner must fail the dispatch loudly."
-        )
-        payload = inbox.get_nowait()
-        assert payload["status"] == "failed", payload
-        assert "no start acknowledgment" in str(payload["output"]), (
-            f"the parent must receive an explanatory failure, got {payload['output']!r}"
-        )
+        assert entry.status == "launch_unconfirmed"
+        assert not entry.delivered and entry.completed_at is None
+        assert inbox.get_nowait()["status"] == "launch_unconfirmed"
+        assert reap(now=entry.created_at + 400.0, timeout_s=180.0) == []
+        reap(now=entry.created_at + 500.0, timeout_s=180.0, child_statuses={child_id: "running"})
+        assert entry.status == "running"
     finally:
         subagent_work.unregister_subagent_work(child_id)
         subagent_work._session_inboxes_ref.pop(parent_id, None)
@@ -350,67 +328,26 @@ async def test_started_dispatch_is_not_reaped_by_launch_liveness() -> None:
         subagent_work._session_inboxes_ref.pop(parent_id, None)
 
 
-@pytest.mark.asyncio
-async def test_reaped_dispatch_wakes_parent_not_just_inbox() -> None:
-    """
-    A launch-reaped failure must schedule the parent wake POST.
-
-    The wake POST is the sole delivery signal for an idle parent: it only
-    drains its inbox when a turn is triggered, and nothing else will rouse a
-    parent whose child wedged in ``launching``. A reap that inserts the
-    failure into the inbox without the wake leaves the parent hanging exactly
-    as before — the failure is recorded where nobody will ever read it.
-    """
-
-    parent_id = uuid.uuid4().hex
-    child_id = uuid.uuid4().hex
+@pytest.mark.parametrize("terminal_status", ["failed", "stopped", "killed", "cancelled"])
+def test_unconfirmed_launch_accepts_real_terminal_immediately(terminal_status: str) -> None:
+    parent_id, child_id = uuid.uuid4().hex, uuid.uuid4().hex
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    wake_bodies: list[dict[str, Any]] = []
-    wake_seen = asyncio.Event()
-
-    class _WakeRecordingServerClient(NullServerClient):
-        """Records wake POSTs aimed at the parent session's events route."""
-
-        async def post(self, url: str, **kwargs: Any) -> Any:
-            if url.rstrip("/").endswith(f"/v1/sessions/{parent_id}/events"):
-                wake_bodies.append(kwargs.get("json") or {})
-                wake_seen.set()
-            return self._Response()
-
-    app = create_runner_app(
-        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        server_client=_WakeRecordingServerClient(),  # type: ignore[arg-type]
-    )
-
     subagent_work._session_inboxes_ref[parent_id] = inbox
     entry = subagent_work.register_subagent_work(
-        parent_session_id=parent_id,
-        child_session_id=child_id,
-        agent="claude-native",
-        title="impl",
+        parent_session_id=parent_id, child_session_id=child_id, agent="worker", title="work"
     )
-
     try:
-        reaped = subagent_work.reap_stalled_subagent_launches(
-            now=entry.created_at + 200.0,
-            timeout_s=180.0,
-            mark_terminal=app.state.mark_subagent_terminal_and_wake,
+        subagent_work.reap_stalled_subagent_launches(now=entry.created_at + 301)
+        assert entry.status == "launch_unconfirmed"
+        assert inbox.get_nowait()["status"] == "launch_unconfirmed"
+        ack = subagent_work.mark_subagent_work_terminal(
+            child_id, status=terminal_status, output="done"
         )
-        assert reaped == [entry]
-        assert entry.status == "failed"
-        payload = inbox.get_nowait()
-        assert payload["status"] == "failed"
-
-        await asyncio.wait_for(wake_seen.wait(), timeout=5.0)
+        assert ack.delivered_now and inbox.get_nowait()["status"] == terminal_status
+        assert not entry.launch_timed_out
     finally:
         subagent_work.unregister_subagent_work(child_id)
         subagent_work._session_inboxes_ref.pop(parent_id, None)
-
-    notice = wake_bodies[0]["data"]["content"][0]["text"]
-    assert payload["output"] in notice
-    assert "finished (failed)" in notice, (
-        f"the reap's wake notice must tell the parent the dispatch failed, got {notice!r}"
-    )
 
 
 def test_launch_timeout_resolver_rejects_non_finite(
@@ -439,18 +376,8 @@ def test_launch_timeout_resolver_rejects_non_finite(
 
 
 @pytest.mark.asyncio
-async def test_real_completion_replaces_a_launch_timeout_failure() -> None:
-    """
-    A child's own terminal edge overrides the reaper's "no start acknowledgment".
-
-    User journey: a parent sends a follow-up to a worker that is already busy;
-    no fresh ``running`` edge is relayed, so the launch-liveness reaper fails
-    the dispatch at the budget and tells the parent. Minutes later the worker
-    genuinely finishes and its ``idle`` edge arrives as ``completed``. That
-    completion must be delivered — the reaper's failure was a guess made
-    without a single edge from the child — or the parent waits forever on a
-    report that is sitting in the child's transcript.
-    """
+async def test_real_completion_settles_unconfirmed_launch() -> None:
+    """A late real completion settles the original dispatch exactly once."""
     parent_id = uuid.uuid4().hex
     child_id = uuid.uuid4().hex
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -463,8 +390,8 @@ async def test_real_completion_replaces_a_launch_timeout_failure() -> None:
     )
     try:
         subagent_work.reap_stalled_subagent_launches(now=entry.created_at + 200.0, timeout_s=180.0)
-        assert entry.status == "failed" and entry.delivered
-        assert inbox.get_nowait()["status"] == "failed"
+        assert entry.status == "launch_unconfirmed" and not entry.delivered
+        assert inbox.get_nowait()["status"] == "launch_unconfirmed"
 
         ack = subagent_work.mark_subagent_work_terminal(
             child_id, status="completed", output="Both assessments are in. Full report: ..."
@@ -486,7 +413,7 @@ async def test_real_completion_replaces_a_launch_timeout_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_real_failure_still_replaces_a_launch_timeout_failure() -> None:
+async def test_real_failure_settles_unconfirmed_launch() -> None:
     """A genuine ``failed`` edge after the reaper's guess carries the real error text."""
     parent_id = uuid.uuid4().hex
     child_id = uuid.uuid4().hex
@@ -497,7 +424,7 @@ async def test_real_failure_still_replaces_a_launch_timeout_failure() -> None:
     )
     try:
         subagent_work.reap_stalled_subagent_launches(now=entry.created_at + 200.0, timeout_s=180.0)
-        inbox.get_nowait()
+        assert inbox.get_nowait()["status"] == "launch_unconfirmed"
         ack = subagent_work.mark_subagent_work_terminal(
             child_id, status="failed", output="Error: 400 from the model API"
         )
@@ -535,3 +462,57 @@ async def test_native_prompt_delivery_acknowledges_the_launch() -> None:
         )
     finally:
         subagent_work.unregister_subagent_work(child_id)
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_launch_wakes_parent_without_terminal_delivery() -> None:
+    """The observation wakes the parent without declaring the child finished."""
+    parent_id = uuid.uuid4().hex
+    child_id = uuid.uuid4().hex
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    wake_bodies: list[dict[str, Any]] = []
+    wake_seen = asyncio.Event()
+
+    class _WakeRecordingServerClient(NullServerClient):
+        """Records wake POSTs aimed at the parent session's events route."""
+
+        async def post(self, url: str, **kwargs: Any) -> Any:
+            if url.rstrip("/").endswith(f"/v1/sessions/{parent_id}/events"):
+                wake_bodies.append(kwargs.get("json") or {})
+                wake_seen.set()
+            return self._Response()
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=_WakeRecordingServerClient(),  # type: ignore[arg-type]
+    )
+
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="claude-native",
+        title="impl",
+    )
+
+    try:
+        reaped = subagent_work.reap_stalled_subagent_launches(
+            now=entry.created_at + 200.0,
+            timeout_s=180.0,
+            mark_terminal=app.state.mark_subagent_terminal_and_wake,
+        )
+        assert reaped == [entry]
+        assert entry.status == "launch_unconfirmed"
+        assert not entry.delivered and entry.completed_at is None
+        payload = inbox.get_nowait()
+        assert payload["status"] == "launch_unconfirmed"
+
+        await asyncio.wait_for(wake_seen.wait(), timeout=5.0)
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+    notice = wake_bodies[0]["data"]["content"][0]["text"]
+    assert "launch unconfirmed" in notice, (
+        f"the reap's wake notice must tell the parent the dispatch failed, got {notice!r}"
+    )
