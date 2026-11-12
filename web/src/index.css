@@ -2124,6 +2124,33 @@ html[data-electron-mac] .breadcrumb-folder {
   position: static;
 }
 
+/* Phone code block header: the 24px controls keep their look but sit 46px apart
+ * centre to centre, so each keeps its own 44px target. Streamdown's download
+ * button (centre 28px from the block edge) gets the same target; copy's centre
+ * sits 46px left of it. */
+.chat-code-actions {
+  @variant phone {
+    gap: 22px;
+    margin-right: 14px;
+  }
+}
+
+.chat-code-block [data-streamdown="code-block-download-button"] {
+  @variant phone {
+    position: relative;
+
+    &::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 44px;
+      height: 44px;
+      transform: translate(-50%, -50%);
+    }
+  }
+}
+
 /* Word-wrap toggle for chat code blocks (see ChatCodeBlockPre in message.tsx).
  * Streamdown renders the body with `overflow-x-auto` and the <code> with
  * `white-space: pre`, so long lines scroll horizontally. When `.chat-code-wrap`
