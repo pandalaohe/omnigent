@@ -118,7 +118,7 @@ async def main():
                         side.bootstrap.attach_listener(relay._httpd, relay._advertised_url)
                     await asyncio.sleep(0.4)  # custom-lint: disable=sleep-then-assert -- hold ACK
                     assert runtime.state("session-a").revision == 3
-                    assert process_identity(process.pid) == identity
+                    assert await asyncio.wait_for(process.wait(), 3) == 1
                 return {"executed": executed}
             counts["finish"] += 1
             return {
@@ -182,7 +182,19 @@ async def main():
             output, error = await asyncio.wait_for(process.communicate(), 20)
             print(output.decode())
             print(error.decode(), file=sys.stderr)
-            assert process.returncode == 0, process.returncode
+            if mode in ("loss", "replacement"):
+                assert process.returncode == 1, process.returncode
+                assert not output, "lost authority must terminate the SDK before it continues"
+                assert b"Scoped Pi authority transport lost" in error
+                for journal in (root / "sessions").glob("*.jsonl"):
+                    assert "REAL_SCOPED_READ" not in journal.read_text()
+                print(
+                    json.dumps(
+                        {"terminated": True, "receiptExcluded": True}, separators=(",", ":")
+                    )
+                )
+            else:
+                assert process.returncode == 0, process.returncode
             expected = (
                 {"evaluate": 0, "execute": 0, "finish": 0}
                 if mode == "missing-bootstrap"

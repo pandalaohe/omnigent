@@ -138,7 +138,7 @@ function createScopedClient({scope, transport, readState, recheck, report=diagno
 }
 
 /** A pinned, loopback-only control/continuity channel; capabilities stay in this closure. */
-async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoch,report=diagnostic}) {
+async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoch,report=diagnostic,onLoss=diagnostic}) {
   const url=new URL(endpoint);
   if(url.protocol!=="http:" || !["127.0.0.1","[::1]"].includes(url.hostname) || !url.port ||
     url.username || url.password || url.search || url.hash || !["","/"].includes(url.pathname))
@@ -150,6 +150,7 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
     live=false;ready=false;
     reportDiagnostic(report,{event:"continuity_lost",cause});
     for(const callback of listeners)callback("transport_lost");
+    if(cause!=="connection_close")onLoss();
   };
   function request(route,body,token,onResponse,signal) {
     return new Promise((resolve,reject)=>{
@@ -288,7 +289,11 @@ async function connectFromHandoff(locator, {timeoutMs=8000}={}) {
     !/^pi_attestor_[A-Za-z0-9_-]{43}$/.test(descriptor.credential||"") ||
     descriptor.bridgeDir!==path.dirname(directory) || !path.isAbsolute(descriptor.statePath||""))
     throw new Error("Scoped Pi handoff binding unavailable");
-  const connection=await connectAttestor({...descriptor,report:fileDiagnostic(descriptor.bridgeDir)});
+  const connection=await connectAttestor({...descriptor,report:fileDiagnostic(descriptor.bridgeDir),onLoss:()=>{
+    // A launched SDK cannot reuse authority from a dead runner incarnation.
+    process.stderr.write("Scoped Pi authority transport lost; restart the Pi session to establish fresh authority.\n");
+    process.exit(1);
+  }});
   return Object.freeze({connection,bridgeDir:descriptor.bridgeDir,statePath:descriptor.statePath});
 }
 

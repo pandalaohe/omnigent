@@ -1316,6 +1316,30 @@ async def test_continuity_ends_on_launch_rebind_with_same_process_and_tier(attes
 
 
 @pytest.mark.asyncio
+async def test_continuity_survives_runner_loop_delay_and_still_revokes(attestor_relay):
+    import time
+
+    runtime, broker, relay, _source, _registry = attestor_relay
+    actor, _admission = await bind_ready(runtime, broker, relay)
+    async with httpx.AsyncClient(base_url=relay._advertised_url, trust_env=False) as client:
+        async with client.stream(
+            "GET", "/pi/bootstrap/watch", headers={"Authorization": "Bearer " + actor.token}
+        ) as response:
+            assert response.status_code == 200
+            lines = response.aiter_lines()
+            assert json.loads(await anext(lines))["live"] is True
+            # Permission inspection runs synchronously on this loop in production.
+            time.sleep(2.5)
+            for _ in range(5):
+                frame = json.loads(await asyncio.wait_for(anext(lines), 3))
+                assert frame["incarnation"] == broker.incarnation
+                assert frame["live"] is True
+            runtime.pi_scopes.invalidate("session-a")
+            with pytest.raises(StopAsyncIteration):
+                await asyncio.wait_for(anext(lines), 3)
+
+
+@pytest.mark.asyncio
 async def test_reload_replaces_installation_without_revoking_sibling(attestor_relay):
     runtime, broker, relay, _source, _registry = attestor_relay
     actor, parent = await bind_ready(runtime, broker, relay)
@@ -1349,7 +1373,10 @@ async def test_process_identity_loss_revokes_all_hosted_scopes(attestor_relay, m
 
 
 @pytest.mark.asyncio
-async def test_real_node_client_seals_before_local_evaluation_on_broker_loss(attestor_relay):
+@pytest.mark.parametrize("handoff", [False, True])
+async def test_real_node_client_seals_before_local_evaluation_on_broker_loss(
+    attestor_relay, handoff
+):
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required for private client consumer proof")
@@ -1363,12 +1390,14 @@ const http = require('node:http');
 let posts = 0;
 const request = http.request;
 http.request = (...args) => { posts++; return request(...args); };
-const { connectAttestor } = require(process.argv[1]);
+const { connectAttestor, connectFromHandoff } = require(process.argv[1]);
 const lines = readline.createInterface({input:process.stdin});
 lines.once('line', async line => {
   try {
     const descriptor = JSON.parse(line);
-    const connection = await connectAttestor(descriptor);
+    const connection = descriptor.locator
+      ? (await connectFromHandoff(descriptor.locator)).connection
+      : await connectAttestor(descriptor);
     const client = connection.client(descriptor.binding, 'root-manager',
       () => ({status:'ready',revision:3}), async () => ({}));
     console.log('connected');
@@ -1400,6 +1429,10 @@ lines.once('line', async line => {
             "launchEpoch": actor.launch_epoch,
             "binding": {"scope": asdict(admission.principal), "credential": admission.credential},
         }
+        if handoff:
+            locator = broker.reserve_handoff()
+            broker.publish_handoff(actor, locator)
+            descriptor["locator"] = str(locator)
         process.stdin.write(json.dumps(descriptor).encode() + b"\n")
         await process.stdin.drain()
         assert await asyncio.wait_for(process.stdout.readline(), 5) == b"connected\n"
@@ -1407,10 +1440,15 @@ lines.once('line', async line => {
         process.stdin.write(b"evaluate\n")
         await process.stdin.drain()
         output, error = await asyncio.wait_for(process.communicate(), 5)
-        assert process.returncode == 0, error.decode()
-        result = json.loads(output)
-        assert result["verdict"]["block"] is True
-        assert result["posts"] == 0
+        if handoff:
+            assert process.returncode == 1, (output, error)
+            assert b"Scoped Pi authority transport lost" in error
+            assert not output, "a launched Pi must stop instead of continuing without tools"
+        else:
+            assert process.returncode == 0, error.decode()
+            result = json.loads(output)
+            assert result["verdict"]["block"] is True
+            assert result["posts"] == 0
         assert actor.token.encode() not in output + error
         assert admission.credential.encode() not in output + error
     finally:

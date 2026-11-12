@@ -9735,7 +9735,17 @@ def _tool_relay_handler_factory(
                     future = asyncio.run_coroutine_threadsafe(
                         _bootstrap_request(authorization), loop
                     )
-                    frame = future.result(timeout=2.0)
+                    # A busy runner loop is not a lost attestor. Await this check
+                    # without publishing an unvalidated frame or replacing its future.
+                    while True:
+                        try:
+                            frame = future.result(timeout=0.1)
+                            break
+                        except TimeoutError:
+                            if future.done():
+                                raise
+                            if closed is not None and closed.is_set():
+                                raise ConnectionAbortedError("Pi bootstrap relay closed") from None
                 except Exception as exc:  # noqa: BLE001 - EOF/error seals the private client
                     future.cancel()
                     _logger.warning(
