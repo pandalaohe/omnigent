@@ -15,6 +15,7 @@
   margin-bottom: 10px;
 }
 .usage-top h1 {
+  min-width: 0;
   max-width: 100%;
   overflow-wrap: anywhere;
   font-size: 22px;
@@ -136,6 +137,8 @@
   padding: 0 2px;
 }
 .usage-tile-title {
+  min-width: 0;
+  max-width: 100%;
   flex: 1 1 100%;
   text-align: left;
   font-weight: 700;
@@ -550,6 +553,9 @@ html:not(.dark) .usage-board {
   border-radius: 6px;
   background: var(--background);
   padding: 4px 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .usage-pricing input {
   min-width: 0;

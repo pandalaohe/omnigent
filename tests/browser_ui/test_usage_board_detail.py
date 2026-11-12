@@ -11,6 +11,7 @@ from tests.browser_ui.conftest import BrowserContract
 from tests.browser_ui.test_sessions_appearance import appearance_features as appearance_features
 from tests.browser_ui.test_sessions_appearance import appearance_url as appearance_url
 from tests.browser_ui.usage_geometry import assert_usage_geometry
+from tests.browser_ui.usage_long_names import LONG_NAMES
 
 
 @pytest.fixture
@@ -89,7 +90,29 @@ def test_account_detail_keyboard_ranges_and_return(
             "unit": "USD",
         },
     ]
-    accounts[1]["display_name"] = "Long account name with multiple segments and meaningful suffix"
+    accounts[1]["display_name"] = LONG_NAMES["account"]
+    long_window = LONG_NAMES["window"]
+    accounts[1]["windows"][1]["label"] = long_window
+    accounts[1]["windows"][2]["group"] = LONG_NAMES["pool"]
+    accounts[1].update(
+        plan=LONG_NAMES["plan"],
+        band=LONG_NAMES["band"],
+        source=LONG_NAMES["source"],
+        models=[{"id": LONG_NAMES["model"]}],
+        hosts=[
+            {"host_id": "host-1", "name": LONG_NAMES["host"], "read_at": now, "windows": [window]}
+        ],
+        balances=[
+            {
+                "id": "large",
+                "remaining": 1234567890123.45,
+                "unit": "USD",
+                "label": LONG_NAMES["balance"],
+                "group": LONG_NAMES["pool"],
+                "note": LONG_NAMES["note"],
+            }
+        ],
+    )
     accounts.append(
         {
             **account,
@@ -140,6 +163,7 @@ def test_account_detail_keyboard_ranges_and_return(
                     },
                     "mark": None,
                     "totals": totals,
+                    "models": [{"model": LONG_NAMES["model"], **totals}],
                     "previous": None,
                     "series": [{"at": now - day * 86400, **totals} for day in range(365)],
                 }
@@ -162,7 +186,7 @@ def test_account_detail_keyboard_ranges_and_return(
         "cards": [
             {
                 "id": "card-a",
-                "name": "Used card",
+                "name": LONG_NAMES["card"],
                 "retail_amount": "100.000000000000000001",
                 "purchase_currency": "HKD",
                 "allowance_usd": "100",
@@ -193,7 +217,99 @@ def test_account_detail_keyboard_ranges_and_return(
     browser_contract.json(
         "/v1/me/session-choice/meters", {"meters": [], "running": {}, "floors": {}}
     )
+    browser_contract.json(
+        "/v1/me/usage/models",
+        {
+            "display_name": LONG_NAMES["account"],
+            "span": None,
+            "models": [
+                {
+                    "id": LONG_NAMES["model"],
+                    "pricing": None,
+                    "usage": None,
+                    "sources": [
+                        {
+                            "kind": "host",
+                            "label": LONG_NAMES["host"],
+                            "configuration": {
+                                "label": LONG_NAMES["pool"],
+                                "name": LONG_NAMES["source"],
+                            },
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    browser_contract.json(
+        "/v1/me/usage/issues",
+        {
+            "failures": [{"account": "plan-1", **totals}],
+            "unpriced_models": [{"account": "plan-1", "model": LONG_NAMES["model"], **totals}],
+            "source_reports": [{"account": "plan-1", "kind": "read_failed", "at": now}],
+        },
+    )
+    browser_contract.json(
+        "/v1/me/usage/price-source",
+        {
+            "source": "builtin",
+            "can_edit": False,
+            "model_count": 0,
+            "fetched_at": None,
+            "error": None,
+        },
+    )
+    browser_contract.json("/v1/me/preferences", {"preferences": {"version": 1, "settings": {}}})
+    browser_contract.json("/v1/me/preferences/usage_context", {"ok": True}, method="PATCH")
+    browser_contract.json(
+        "/v1/extensions",
+        {
+            "object": "list",
+            "data": [
+                {
+                    "id": "example.pools",
+                    "status": "enabled",
+                    "display_name": LONG_NAMES["source"],
+                    "pages": [
+                        {"id": "example.pools.main", "title": LONG_NAMES["pool"], "route": "main"}
+                    ],
+                }
+            ],
+        },
+    )
     page.set_viewport_size({"width": width, "height": 900})
+    page.add_init_script(
+        "localStorage.setItem('omnigent:usage-context-preferences',"
+        + json.dumps(
+            json.dumps(
+                {
+                    "version": 1,
+                    "board": {
+                        "enabled": True,
+                        "bands": [
+                            {
+                                "id": "long-band",
+                                "name": LONG_NAMES["band"],
+                                "accounts": [item["id"] for item in accounts],
+                                "open": True,
+                            }
+                        ],
+                    },
+                    "shownModels": {"plan-1": LONG_NAMES["model"]},
+                }
+            )
+        )
+        + ")"
+    )
+    name_views = []
+
+    def names_in_view(view, names):
+        for name in names:
+            own = page.locator("[data-usage-name]:visible").filter(has_text=name)
+            expect(own.first).to_be_visible()
+            assert name in own.first.get_attribute("title")
+        name_views.append({"view": view, "width": width, "names": list(names)})
+
     page.goto(appearance_url + "/frame/usage/board")
     first = page.get_by_test_id("usage-tile").first
     first.get_by_role("link", name="Example plan 0 Pool B", exact=True).focus()
@@ -226,24 +342,39 @@ def test_account_detail_keyboard_ranges_and_return(
         {
             '[data-testid="usage-tile"]': 3,
             '[data-testid="usage-ring"]': 8,
-            ".usage-balance-ring": 2,
-            "[data-usage-amount]": 3,
-            "[data-usage-label]": 6,
+            ".usage-balance-ring": 3,
+            "[data-usage-amount]": 4,
+            "[data-usage-label]": 7,
         },
     )
     page.get_by_text("Board tools", exact=True).click()
     page.get_by_role("button", name="Compact view", exact=True).click()
+    # The density change persists the product-normalized group name.
+    shown_names = {
+        **LONG_NAMES,
+        "band": page.evaluate(
+            "JSON.parse(localStorage.getItem('omnigent:usage-context-preferences'))"
+            ".board.bands.find(band => band.id === 'long-band').name"
+        ),
+    }
     assert_usage_geometry(
         page,
         {
             '[data-testid="usage-tile"]': 3,
             '[data-testid="usage-ring"]': 3,
             ".usage-balance-ring": 0,
-            "[data-usage-amount]": 2,
-            "[data-usage-label]": 2,
+            "[data-usage-amount]": 3,
+            "[data-usage-label]": 3,
         },
     )
+    names_in_view(
+        "compact", [shown_names[key] for key in ["account", "band", "plan", "model", "balance"]]
+    )
     page.get_by_role("button", name="Rings view", exact=True).click()
+    names_in_view(
+        "rings",
+        [shown_names[key] for key in ["account", "band", "pool", "plan", "window", "balance"]],
+    )
     visited = []
     for item in accounts:
         page.goto(appearance_url + f"/frame/usage/board/{item['id']}")
@@ -266,11 +397,44 @@ def test_account_detail_keyboard_ranges_and_return(
         expect(page.get_by_text("Hosts", exact=True)).to_be_visible()
         assert_usage_geometry(page, expected)
         visited.append({"account": item["id"], "view": "detail", "width": width})
+        if item["id"] == "plan-0":
+            names_in_view("detail-card", [LONG_NAMES["card"]])
         if item["id"] == "plan-1":
             expect(page.locator("[data-usage-percent]").filter(has_text="100.00%")).to_be_visible()
             expect(
                 page.locator("[data-usage-amount]").filter(has_text="$1,234,567,890,123.45")
-            ).to_be_visible()
+            ).to_have_count(balances + amount_windows)
+            page.get_by_text("Hosts", exact=True).click()
+            page.get_by_text("Usage tools", exact=True).click()
+            page.get_by_text("By model", exact=True).click()
+            page.get_by_text("Cost breakdown", exact=True).click()
+            names_in_view(
+                "detail",
+                [
+                    LONG_NAMES[key]
+                    for key in [
+                        "account",
+                        "pool",
+                        "window",
+                        "host",
+                        "model",
+                        "balance",
+                        "note",
+                    ]
+                ],
+            )
+            window_tip = (
+                page.locator("[data-usage-window]")
+                .filter(has=page.get_by_title(long_window, exact=True))
+                .locator(".usage-ring-trigger")
+            )
+            window_tip.click()
+            tip = page.get_by_test_id("usage-tip-card")
+            expect(tip.get_by_title(long_window, exact=True)).to_be_visible()
+            assert_usage_geometry(page, expected)
+            names_in_view("window-tooltip", [long_window])
+            page.keyboard.press("Escape")
+            expect(tip).to_have_count(0)
         page.get_by_role("link", name="Account settings").click()
         expect(page.get_by_test_id("usage-tile")).to_have_count(1)
         expect(page.get_by_test_id("usage-tile")).to_have_attribute("data-account", item["id"])
@@ -278,8 +442,56 @@ def test_account_detail_keyboard_ranges_and_return(
         expected["[data-usage-label]"] = (
             len({window["group"] for window in item["windows"]}) + balances
         )
-        assert_usage_geometry(page, expected)
-        visited.append({"account": item["id"], "view": "settings", "width": width})
+        for choice in [long_window, "Auto"] if item["id"] == "plan-1" else [None]:
+            if choice is not None:
+                radio = page.get_by_role("radio", name=choice, exact=True)
+                expect(radio).to_have_attribute("title", choice)
+                radio.click()
+                expect(radio).to_have_attribute("aria-checked", "true")
+            selected = page.get_by_role("radio", checked=True)
+            selected_label = selected.get_attribute("title") if selected.count() else None
+            selected_id = next(
+                (
+                    window["id"]
+                    for window in item["windows"]
+                    if (window.get("label") or window["id"]) == selected_label
+                ),
+                None,
+            )
+            groups = {}
+            for window in item["windows"]:
+                groups.setdefault(window.get("group") or "", []).append(window)
+            expected['[data-testid="usage-ring"]'] = max(
+                1,
+                sum(
+                    1 if any(window["id"] == selected_id for window in windows) else len(windows)
+                    for windows in groups.values()
+                ),
+            )
+            assert_usage_geometry(page, expected)
+            visited.append(
+                {
+                    "account": item["id"],
+                    "view": "settings",
+                    "width": width,
+                    "selected_window": selected_id,
+                    "expected_rings": expected['[data-testid="usage-ring"]'],
+                }
+            )
+            if item["id"] == "plan-1":
+                names_in_view(
+                    "settings-" + choice,
+                    [
+                        LONG_NAMES[key]
+                        for key in [
+                            "account",
+                            "window",
+                            "source",
+                            "balance",
+                        ]
+                    ]
+                    + (["Pinned " + long_window] if selected_id else []),
+                )
         back = page.get_by_role("link", name=item["display_name"], exact=True).and_(
             page.locator('[data-slot="button"]')
         )
@@ -300,6 +512,15 @@ def test_account_detail_keyboard_ranges_and_return(
     record_property("usage_views", json.dumps(visited))
 
     page.get_by_text("Pricing", exact=True).click()
+    expect(page.get_by_label("Purchased card", exact=True)).to_have_attribute(
+        "title", LONG_NAMES["card"] + " · 2026-11-02"
+    )
+    expect(page.get_by_label("Card name", exact=True)).to_have_attribute(
+        "title", LONG_NAMES["card"]
+    )
+    name_views.append(
+        {"view": "pricing", "width": width, "names": [LONG_NAMES["card"]], "native_control": True}
+    )
     expect(page.get_by_label("Card payment preview")).to_contain_text("HKD 80.00 · USD 10.26")
     field = page.get_by_label("Card discount", exact=True)
     field.fill("0.6")
@@ -316,3 +537,29 @@ def test_account_detail_keyboard_ranges_and_return(
     expect(page.get_by_text("Pricing saved. History recalculated.")).to_be_visible()
     assert_usage_geometry(page, settings_geometry)
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    page.goto(appearance_url + "/frame/usage/board/plan-1/models")
+    expect(page.get_by_role("table")).to_be_visible()
+    names_in_view(
+        "models", [LONG_NAMES[key] for key in ["account", "model", "host", "pool", "source"]]
+    )
+    assert_usage_geometry(page, {"table": 1})
+    page.goto(appearance_url + "/frame/usage/board/plan-1/issues")
+    expect(page.get_by_role("region", name="Failures", exact=True)).to_be_visible()
+    names_in_view("issues", [LONG_NAMES[key] for key in ["account", "model"]])
+    assert_usage_geometry(page, {".usage-board section": 3})
+    page.goto(appearance_url + "/settings/general#usage-settings")
+    usage_settings = page.get_by_test_id("settings-group-usage-settings")
+    expect(usage_settings).to_be_visible()
+    expect(
+        usage_settings.get_by_role(
+            "switch", name="Show " + LONG_NAMES["account"] + " on the board", exact=True
+        )
+    ).to_be_visible()
+    pools_page = usage_settings.get_by_label("Model pools page", exact=True)
+    pools_page.select_option("/extensions/example.pools/main")
+    expect(pools_page).to_have_attribute(
+        "title", LONG_NAMES["source"] + " · " + LONG_NAMES["pool"]
+    )
+    names_in_view("board-settings", [LONG_NAMES["account"]])
+    assert_usage_geometry(page, {'[data-testid="settings-group-usage-settings"]': 1})
+    record_property("usage_name_views", json.dumps(name_views))

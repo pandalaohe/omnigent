@@ -5,6 +5,7 @@ import type { UsageAccountView } from "./usageBoardData";
 import { UsageCostChart } from "./UsageCostChart";
 import { usageFigure } from "./usageAmountData";
 import { formatFullDate } from "./usageBoardFormat";
+import { UsageName } from "./UsageName";
 
 export function UsageAccountCost({ account }: { account: UsageAccountView }) {
   const [selected, setSelected] = useState(1);
@@ -30,7 +31,9 @@ export function UsageAccountCost({ account }: { account: UsageAccountView }) {
           <h2 className="text-sm font-semibold">Cost</h2>
           <span className="text-xs text-muted-foreground">Reported cost</span>
         </div>
-        {focus ? <p className="text-xs text-muted-foreground">{focus} · Pool usage only</p> : null}
+        {focus ? (
+          <UsageName className="text-xs text-muted-foreground">{`${focus} · Pool usage only`}</UsageName>
+        ) : null}
         <div className="usage-detail-cells" role="group" aria-label="Cost time range">
           {["Today", "Last 7 days", "This period"].map((label, index) => {
             const read = reads[index];
@@ -87,7 +90,7 @@ export function UsageAccountCost({ account }: { account: UsageAccountView }) {
               key={model.model}
               className="flex min-w-0 items-center gap-3 border-t border-border py-2 text-xs"
             >
-              <span className="min-w-0 flex-1 break-all">{model.model}</span>
+              <UsageName className="flex-1">{model.model}</UsageName>
               <span className="shrink-0 tabular-nums">{usageFigure(model, false)}</span>
             </div>
           ))

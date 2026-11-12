@@ -7,6 +7,7 @@ import {
 import { AnalysisPanel, AnalysisUnknown } from "./UsageAnalysisPanel";
 import { UsageTip } from "./UsageTip";
 import { AnalysisTrend, compareAnalysisDecimals } from "./UsageAnalysisDetails";
+import { UsageName } from "./UsageName";
 
 interface Item {
   key: string;
@@ -89,7 +90,7 @@ export function UsageAnalysisTable({
         {data.map((item) => (
           <div role="row" className="ua-table-row" key={item.key} data-item={item.key}>
             <span role="cell" className="ua-name">
-              {item.name}
+              <UsageName>{item.name}</UsageName>
             </span>
             <span role="cell">
               <AnalysisTrend rows={item.rows} />
@@ -179,7 +180,7 @@ export function UsageAnalysisShares({
             {shares.map(({ model, tokens }, index) => (
               <span key={model}>
                 <i style={{ background: colors[index % colors.length] }} />
-                {model || "Unknown model"}
+                <UsageName className="flex-1">{model || "Unknown model"}</UsageName>
                 <b>{percent(tokens === null ? null : (tokens / total) * 100)} / —</b>
               </span>
             ))}
@@ -227,7 +228,7 @@ export function UsageAnalysisFailures({
                 className="ua-bar"
                 aria-label={`${item.name} failure rate ${percent(item.failure)}`}
               >
-                <span>{item.name}</span>
+                <UsageName>{item.name}</UsageName>
                 <span className="ua-track">
                   <i style={{ width: `${(item.failure! / max) * 100}%` }} />
                 </span>

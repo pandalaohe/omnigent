@@ -29,6 +29,7 @@ import { renewalOf } from "./UsageBoardPage";
 import { UsageSourceConnect } from "./UsageSourceConnect";
 import { QuotaFloorControl } from "@/pages/settings/sessionChoice/QuotaFloorControl";
 import { t } from "./usageText";
+import { UsageName } from "./UsageName";
 
 export function UsageAccountSettingsPage() {
   const { accountId = "" } = useParams();
@@ -80,8 +81,12 @@ export function UsageAccountSettingsPage() {
           <div className="min-w-0 rounded-[11px] border border-border bg-card px-3.5 py-1">
             <div className="border-b border-border py-3 text-xs text-muted-foreground">
               <p>{t("preferencesHelp")}</p>
-              {account.source_type ? <p>{t("sourceKind", { type: account.source_type })}</p> : null}
-              {account.source ? <p>{t("source", { source: account.source })}</p> : null}
+              {account.source_type ? (
+                <UsageName>{t("sourceKind", { type: account.source_type })}</UsageName>
+              ) : null}
+              {account.source ? (
+                <UsageName>{t("source", { source: account.source })}</UsageName>
+              ) : null}
               {account.source_at != null ? (
                 <p>{t("sourceAt", { date: formatFullDate(account.source_at) })}</p>
               ) : null}
@@ -117,6 +122,7 @@ export function UsageAccountSettingsPage() {
                 className="h-8 w-52"
                 maxLength={128}
                 value={preferences.shownModels?.[account.id] ?? ""}
+                title={preferences.shownModels?.[account.id] ?? ""}
                 list="shown-model-options"
                 placeholder="None"
                 onChange={(event) => {
@@ -129,7 +135,7 @@ export function UsageAccountSettingsPage() {
               />
               <datalist id="shown-model-options">
                 {account.models?.map((model) => (
-                  <option key={model.id} value={model.id} />
+                  <option key={model.id} value={model.id} title={model.id} />
                 ))}
               </datalist>
             </label>
@@ -291,6 +297,7 @@ function WindowRow({
           <button
             key={option.id}
             type="button"
+            title={option.label}
             role="radio"
             aria-checked={
               current === option.id ||
@@ -298,13 +305,13 @@ function WindowRow({
             }
             onClick={() => onPick(option.id)}
             className={cn(
-              "min-h-7 rounded-md px-2 text-xs",
+              "min-h-7 min-w-0 max-w-full truncate rounded-md px-2 text-xs",
               current === option.id
                 ? "bg-background font-medium text-foreground shadow-sm"
                 : "text-muted-foreground hover:text-foreground",
             )}
           >
-            {option.label}
+            <UsageName>{option.label}</UsageName>
           </button>
         ))}
       </div>

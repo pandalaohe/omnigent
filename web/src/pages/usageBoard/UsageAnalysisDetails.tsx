@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { AnalysisPanel, AnalysisUnknown } from "./UsageAnalysisPanel";
 import { UsageTip } from "./UsageTip";
+import { UsageName } from "./UsageName";
 import {
   analysisTotals,
   analysisValueText,
@@ -156,7 +157,7 @@ export function AnalysisCards({
           {cards.map((card) => (
             <div className="ua-card-row" role="row" key={card.id}>
               <span role="cell">
-                <b>{card.name}</b>
+                <UsageName className="font-bold">{card.name}</UsageName>
                 <small>
                   {card.original_paid ? `Original ${analysisValueText(card.original_paid)} · ` : ""}
                   {card.reset_count} resets · {new Date(card.starts_at * 1000).toLocaleDateString()}
@@ -213,7 +214,7 @@ export function AnalysisPayback({
               tapOpens
             >
               <button type="button" className="ua-bar ua-payback">
-                <span>{item.name}</span>
+                <UsageName>{item.name}</UsageName>
                 <span className="ua-track">
                   <s style={{ left: "50%" }} />
                   {position === null ? null : <i style={{ left: `${position}%` }} />}
@@ -266,7 +267,7 @@ export function AnalysisClosings({
               tapOpens
             >
               <button type="button" className="ua-closing">
-                <span>{names.get(reading.account_id) ?? reading.account_id}</span>
+                <UsageName>{names.get(reading.account_id) ?? reading.account_id}</UsageName>
                 <b>
                   {reading.remaining.state === "unknown"
                     ? "Unknown"

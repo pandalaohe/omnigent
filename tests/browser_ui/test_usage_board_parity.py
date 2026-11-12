@@ -200,14 +200,29 @@ def test_usage_ranges_pools_and_navigation(
     # Large figure, blank summary padding and native keyboard activation all open Analysis.
     for activation in ["figure", "whitespace", "keyboard"]:
         summary = page.get_by_role("region", name="Usage summary")
+        link = summary.get_by_role("link", name="Open usage analysis")
         if activation == "figure":
-            rect = summary.locator(".usage-summary-big").bounding_box()
-            page.mouse.click(rect["x"] + rect["width"] / 2, rect["y"] + rect["height"] / 2)
+            summary.scroll_into_view_if_needed()
+            figure = summary.locator(".usage-summary-big").bounding_box()
+            anchor = link.bounding_box()
+            link.click(
+                position={
+                    "x": figure["x"] + figure["width"] / 2 - anchor["x"],
+                    "y": figure["y"] + figure["height"] / 2 - anchor["y"],
+                }
+            )
         elif activation == "whitespace":
+            summary.scroll_into_view_if_needed()
             rect = summary.bounding_box()
-            page.touchscreen.tap(rect["x"] + rect["width"] / 2, rect["y"] + rect["height"] - 4)
+            anchor = link.bounding_box()
+            link.tap(
+                position={
+                    "x": rect["x"] + rect["width"] / 2 - anchor["x"],
+                    "y": rect["y"] + rect["height"] - 4 - anchor["y"],
+                }
+            )
         else:
-            summary.get_by_role("link", name="Open usage analysis").focus()
+            link.focus()
             page.keyboard.press("Enter")
         expect(page).to_have_url(appearance_url + "/frame/usage/board/cost")
         expect(page.locator(".ua-kpi")).to_have_count(4)

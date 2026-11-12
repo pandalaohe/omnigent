@@ -29,6 +29,7 @@ import {
   AnalysisHeatmap,
 } from "./UsageAnalysisDetails";
 import "./usageAnalysis.css";
+import { UsageName } from "./UsageName";
 
 const compact = (value: number | null) =>
   value === null
@@ -149,6 +150,7 @@ export function UsageCostPage() {
             <button
               type="button"
               key={key}
+              title={label}
               aria-pressed={dimension === key}
               onClick={() => setDimension(key)}
             >
@@ -168,6 +170,7 @@ export function UsageCostPage() {
             <button
               type="button"
               key={key}
+              title={label}
               aria-pressed={range.key === key}
               onClick={() => patchUsageBoardPreferences({ range: { key } })}
             >
@@ -188,6 +191,7 @@ export function UsageCostPage() {
           <button
             type="button"
             key={item.key}
+            title={item.name}
             aria-pressed={!all && keys.includes(item.key)}
             onClick={() =>
               setPicks({
@@ -200,7 +204,7 @@ export function UsageCostPage() {
               })
             }
           >
-            {item.name}
+            <UsageName>{item.name}</UsageName>
           </button>
         ))}
       </div>

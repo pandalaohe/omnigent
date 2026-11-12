@@ -10,6 +10,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { cn } from "@/lib/utils";
 
 import { TONE_TEXT, type UsageTone } from "./usageBoardFormat";
+import { UsageName } from "./UsageName";
 
 const HOVER_CLOSE_DELAY_MS = 150;
 
@@ -41,21 +42,21 @@ const chipTone: Record<UsageTone, string> = {
 /** The card body. Fixed width so nothing wraps out of the frame. */
 export function UsageTipCard({ model }: { model: UsageTipModel }) {
   return (
-    <div className="w-[216px] text-xs leading-snug" data-testid="usage-tip-card">
+    <div className="w-[216px] max-w-full text-xs leading-snug" data-testid="usage-tip-card">
       {model.note ? (
-        <div className="mb-0.5 text-[11px] text-muted-foreground">{model.note}</div>
+        <UsageName className="mb-0.5 text-[11px] text-muted-foreground">{model.note}</UsageName>
       ) : null}
       <div className="mb-1 flex items-center justify-between gap-2">
-        <span className="min-w-0 truncate font-semibold text-foreground">{model.title}</span>
+        <UsageName className="flex-1 font-semibold text-foreground">{model.title}</UsageName>
         {model.chip ? (
-          <span
+          <UsageName
             className={cn(
-              "inline-flex shrink-0 items-center rounded-full bg-current/12 px-1.5 py-px text-[10px] font-medium",
+              "max-w-[50%] shrink-0 rounded-full bg-current/12 px-1.5 py-px text-[10px] font-medium",
               chipTone[model.chip.tone],
             )}
           >
             {model.chip.label}
-          </span>
+          </UsageName>
         ) : null}
       </div>
       {model.rows.map((row, index) => (
@@ -63,12 +64,14 @@ export function UsageTipCard({ model }: { model: UsageTipModel }) {
           {model.dividerBefore === index ? <div className="my-1 h-px bg-border" /> : null}
           {row.bar === undefined ? (
             <div className="flex items-center justify-between gap-3 text-muted-foreground">
-              <span className="min-w-0 truncate">{row.label}</span>
-              <span className="shrink-0 font-semibold text-foreground">{row.value}</span>
+              <UsageName className="flex-1">{row.label}</UsageName>
+              <UsageName className="max-w-[60%] font-semibold text-foreground">
+                {row.value}
+              </UsageName>
             </div>
           ) : (
             <div className="grid grid-cols-[42px_minmax(0,1fr)_44px] items-center gap-2">
-              <span className="truncate text-muted-foreground">{row.label}</span>
+              <UsageName className="text-muted-foreground">{row.label}</UsageName>
               <span className="h-1 overflow-hidden rounded-full bg-foreground/10">
                 <span
                   className="block h-full rounded-full"
@@ -78,14 +81,14 @@ export function UsageTipCard({ model }: { model: UsageTipModel }) {
                   }}
                 />
               </span>
-              <span
+              <UsageName
                 className={cn(
                   "text-right font-semibold",
                   row.tone ? TONE_TEXT[row.tone] : "text-foreground",
                 )}
               >
                 {row.value}
-              </span>
+              </UsageName>
             </div>
           )}
         </div>

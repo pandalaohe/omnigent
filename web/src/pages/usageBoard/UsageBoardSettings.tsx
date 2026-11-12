@@ -27,6 +27,7 @@ import { t } from "./usageText";
 import { UsageRing } from "./UsageRing";
 import { UsagePriceSourceSettings } from "./UsagePriceSourceSettings";
 import { useUsageOverview, type UsageWindowView } from "./usageBoardData";
+import { UsageName } from "./UsageName";
 
 /** A synthetic reading, so the colour line shows what each tier looks like. */
 function sampleWindow(percentUsed: number): UsageWindowView {
@@ -180,7 +181,7 @@ export function UsageBoardSettings() {
                     reports through the usage API.
                   </p>
                 ) : (
-                  <div className="grid gap-x-6 sm:grid-cols-2">
+                  <div className="grid grid-cols-1 gap-x-6 sm:grid-cols-2">
                     {accounts.map((account) => {
                       const on = !board.hidden.includes(account.id);
                       return (
@@ -200,7 +201,7 @@ export function UsageBoardSettings() {
                                 aria-hidden="true"
                               />
                             )}
-                            <span className="truncate">{account.display_name}</span>
+                            <UsageName>{account.display_name}</UsageName>
                           </span>
                           <Switch
                             checked={on}

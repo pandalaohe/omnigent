@@ -42,6 +42,7 @@ import { useUsageAccountActivity } from "./usageActivityData";
 
 import { renewalOf } from "./UsageBoardPage";
 import { UsageBalances } from "./UsageBalances";
+import { UsageName } from "./UsageName";
 
 export function UsageAccountPage() {
   const { accountId = "" } = useParams();
@@ -100,10 +101,13 @@ export function UsageAccountPage() {
       {account ? (
         <>
           <div className="usage-account-heading">
-            <h2 className="text-xl font-bold">{account.display_name}</h2>
+            <h2 className="text-xl font-bold">
+              <UsageName>{account.display_name}</UsageName>
+            </h2>
             <p className="text-sm text-muted-foreground">
-              {account.plan}
-              {renewal != null ? ` · Renews ${formatFullDate(renewal.at / 1000)}` : ""}
+              <UsageName>
+                {`${account.plan ?? ""}${renewal != null ? ` · Renews ${formatFullDate(renewal.at / 1000)}` : ""}`}
+              </UsageName>
             </p>
           </div>
           <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
@@ -117,7 +121,7 @@ export function UsageAccountPage() {
                 {account.kind === "native" ? "Built in, read on your hosts" : "Reported"}
               </span>
             </UsageTip>
-            {account.band ? <span>{account.band}</span> : null}
+            {account.band ? <UsageName>{account.band}</UsageName> : null}
             {stale && account.age_s !== null ? (
               <span className="inline-flex items-center gap-1">
                 <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
@@ -165,9 +169,9 @@ export function UsageAccountPage() {
                         data-focused={group.key === focus || undefined}
                       >
                         {group.tag ? (
-                          <div className="mb-1 mt-2 text-[11px] text-muted-foreground">
+                          <UsageName className="mb-1 mt-2 text-[11px] text-muted-foreground">
                             {group.tag}
-                          </div>
+                          </UsageName>
                         ) : null}
                         <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,112px),1fr))] gap-x-2 gap-y-3">
                           {group.windows.map((window) => {
@@ -205,10 +209,12 @@ export function UsageAccountPage() {
                                     {formatTimeLeft(window.time_left_s) || "—"}
                                   </span>
                                 ) : null}
-                                <span className="text-[11px] leading-tight text-muted-foreground">
-                                  {window.resets_at !== null
-                                    ? `Resets ${formatFullDate(window.resets_at)}`
-                                    : windowName(window)}
+                                <span className="max-w-full text-[11px] leading-tight text-muted-foreground">
+                                  {window.resets_at !== null ? (
+                                    `Resets ${formatFullDate(window.resets_at)}`
+                                  ) : (
+                                    <UsageName>{windowName(window)}</UsageName>
+                                  )}
                                 </span>
                                 {window.used_value !== null ? (
                                   <span className="text-[11px] text-muted-foreground">
@@ -263,7 +269,7 @@ export function UsageAccountPage() {
                 ) : null}
               </section>
 
-              <div className="grid gap-2">
+              <div className="grid grid-cols-1 gap-2">
                 <UsageAccountCost account={account} />
                 <UsagePricingSummary accountId={account.id} />
                 <section className="rounded-[11px] border border-border bg-card px-3.5 py-3">
@@ -313,7 +319,7 @@ export function UsageAccountPage() {
                         key={host.host_id || host.name}
                         className="flex min-h-9 items-center justify-between gap-2 border-t border-border/60 py-1.5 first:border-t-0 text-xs"
                       >
-                        <span className="min-w-0 truncate font-medium">{host.name}</span>
+                        <UsageName className="font-medium">{host.name}</UsageName>
                         {(() => {
                           const own = activity.data?.accounts[0];
                           const part = own?.hosts?.find((item) => item.host_id === host.host_id);

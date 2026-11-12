@@ -14,6 +14,7 @@ import { amountTip, boardAmount, sumUsage, usageFigure } from "./usageAmountData
 import { UsageTip, UsageTipButton } from "./UsageTip";
 import { UsageRangeControl } from "./UsageRangeControl";
 import { UsageCostChart } from "./UsageCostChart";
+import { UsageName } from "./UsageName";
 
 export function UsageUnitControl() {
   const tokens = useUsageContextPreferences().board.unit === "tokens";
@@ -339,7 +340,7 @@ export function UsageByModel({
               key={model}
               className="flex min-w-0 items-center gap-3 border-t border-border py-2 text-xs"
             >
-              <span className="min-w-0 flex-1 break-all">{model}</span>
+              <UsageName className="flex-1">{model}</UsageName>
               <span className="shrink-0 tabular-nums">{usageFigure(totals, tokens)}</span>
             </div>
           );

@@ -25,6 +25,7 @@ interface UsageBoardFrameProps {
 }
 
 import { UsageModelPoolsLink } from "./UsageModelPoolsLink";
+import { UsageName } from "./UsageName";
 
 export function UsageBoardFrame({
   title,
@@ -40,7 +41,13 @@ export function UsageBoardFrame({
   return (
     <div className="usage-board @container">
       <header className="usage-top">
-        <h1>{title === "Cost" ? t("boardTitle") : title}</h1>
+        <h1>
+          {typeof title === "string" ? (
+            <UsageName>{title === "Cost" ? t("boardTitle") : title}</UsageName>
+          ) : (
+            title
+          )}
+        </h1>
         <nav className="usage-tabs" aria-label="Usage pages">
           <Link to={boardPath("/usage/board")} aria-current={!analysis ? "page" : undefined}>
             {t("usageTab")}
@@ -77,9 +84,7 @@ export function UsageBoardFrame({
             <span aria-hidden="true" className="shrink-0">
               ‹{" "}
             </span>
-            <span className="min-w-0 truncate" title={back.label}>
-              {back.label}
-            </span>
+            <UsageName>{back.label}</UsageName>
           </Link>
         </Button>
       ) : null}

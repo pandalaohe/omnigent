@@ -2,6 +2,7 @@ import type { UsageAccountView } from "./usageBoardData";
 import { formatFullDate, formatUsageValue } from "./usageBoardFormat";
 import { t } from "./usageText";
 import { useUsageReadingPlacement } from "./useUsageReadingPlacement";
+import { UsageName } from "./UsageName";
 
 function BalanceCircle({ value, label }: { value: string; label?: string }) {
   const { circleRef, readingRef, outside } = useUsageReadingPlacement(value);
@@ -17,9 +18,9 @@ function BalanceCircle({ value, label }: { value: string; label?: string }) {
     >
       <span ref={circleRef} className="usage-balance-ring">
         {label ? (
-          <span data-usage-label className="usage-balance-label">
+          <UsageName data-usage-label className="usage-balance-label w-full">
             {label}
-          </span>
+          </UsageName>
         ) : null}
         {!outside ? amount : null}
       </span>
@@ -46,7 +47,7 @@ export function UsageBalances({
         {account.balances.map((balance) => (
           <div key={balance.id} className="usage-balance-item">
             <BalanceCircle value={formatUsageValue(balance.remaining, balance.unit)} />
-            <span data-usage-label>{balance.label ?? t("balance")}</span>
+            <UsageName data-usage-label>{balance.label ?? t("balance")}</UsageName>
             {stale ? <span className="block text-muted-foreground">{t("balanceOld")}</span> : null}
           </div>
         ))}
@@ -61,9 +62,9 @@ export function UsageBalances({
         >
           {compact ? (
             <span className="max-w-full break-all font-medium tabular-nums">
-              <span data-usage-label className="text-[10px] text-muted-foreground">
+              <UsageName data-usage-label className="text-[10px] text-muted-foreground">
                 {balance.label ?? t("balance")}
-              </span>{" "}
+              </UsageName>{" "}
               <span data-usage-amount>{formatUsageValue(balance.remaining, balance.unit)}</span>
             </span>
           ) : (
@@ -73,10 +74,10 @@ export function UsageBalances({
             />
           )}
           {balance.group ? (
-            <span className="max-w-full break-words text-muted-foreground">{balance.group}</span>
+            <UsageName className="text-muted-foreground">{balance.group}</UsageName>
           ) : null}
           {balance.note ? (
-            <span className="max-w-full break-words text-muted-foreground">{balance.note}</span>
+            <UsageName className="text-muted-foreground">{balance.note}</UsageName>
           ) : null}
           <span className="text-[10px] text-muted-foreground">
             {account.balance_read_at == null

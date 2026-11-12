@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type { UsageAccountView } from "./usageBoardData";
 import { usageJson } from "./usagePriceSourceData";
+import { UsageName } from "./UsageName";
 import {
   CURRENCIES,
   RATE_KEYS,
@@ -285,12 +286,16 @@ function PricingEditor({
       </details>
       <div className="usage-pricing-card-list">
         <Field label="Purchased card">
-          <select value={card?.id ?? ""} onChange={(event) => setSelected(event.target.value)}>
+          <select
+            value={card?.id ?? ""}
+            title={card ? `${card.name} · ${card.starts_on}` : "No saved cards"}
+            onChange={(event) => setSelected(event.target.value)}
+          >
             {!cards.length ? (
               <option value="">No saved cards</option>
             ) : (
               cards.map((item) => (
-                <option value={item.id} key={item.id}>
+                <option value={item.id} key={item.id} title={`${item.name} · ${item.starts_on}`}>
                   {item.name} · {item.starts_on}
                 </option>
               ))
@@ -312,6 +317,7 @@ function PricingEditor({
             <Field label="Card name" error={errors[prefix + "name"]}>
               <Input
                 value={card.name}
+                title={card.name}
                 maxLength={128}
                 onChange={(event) => editCard({ name: event.target.value })}
               />
@@ -319,6 +325,7 @@ function PricingEditor({
             <Field label="Account or pool" error={errors[prefix + "target_id"]}>
               <select
                 value={target}
+                title={targets.find((item) => item.key === target)?.label ?? target}
                 onChange={(event) => {
                   const [kind, id, parent] = JSON.parse(event.target.value) as [
                     PricingCard["target_kind"],
@@ -329,7 +336,7 @@ function PricingEditor({
                 }}
               >
                 {targets.map((item) => (
-                  <option value={item.key} key={item.key}>
+                  <option value={item.key} key={item.key} title={item.label}>
                     {item.label}
                   </option>
                 ))}
@@ -436,6 +443,7 @@ function PricingEditor({
                 <Field label="Rate model (optional)">
                   <Input
                     value={card.rates_usd_per_million.model ?? ""}
+                    title={card.rates_usd_per_million.model ?? ""}
                     onChange={(event) =>
                       editCard({
                         rates_usd_per_million: {
@@ -622,9 +630,7 @@ export function UsagePricingSummary({ accountId }: { accountId: string }) {
             key={card.id}
             className="flex min-w-0 flex-wrap items-center justify-between gap-2 border-t border-border py-2 text-xs"
           >
-            <span className="min-w-0 break-words">
-              {card.name} · {card.starts_on}
-            </span>
+            <UsageName className="flex-1">{`${card.name} · ${card.starts_on}`}</UsageName>
             <span>
               {card.purchase_currency}{" "}
               {decimalDisplay(

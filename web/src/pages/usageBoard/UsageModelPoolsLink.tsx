@@ -18,13 +18,14 @@ export function UsageModelPoolsLink({ settings = false }: { settings?: boolean }
         Model pools page
         <select
           aria-label="Model pools page"
-          className="min-h-11 max-w-full rounded border border-border bg-background px-2"
+          className="min-h-11 min-w-0 max-w-full truncate rounded border border-border bg-background px-2"
+          title={page?.title ?? "Not configured"}
           value={page?.path ?? ""}
           onChange={(event) => patchUsageBoardPreferences({ modelPoolsPage: event.target.value })}
         >
           <option value="">Not configured</option>
           {pages.map((item) => (
-            <option key={item.path} value={item.path}>
+            <option key={item.path} value={item.path} title={item.title}>
               {item.title}
             </option>
           ))}

@@ -7,6 +7,7 @@ import { UsageBoardFrame } from "./UsageBoardFrame";
 import { UsageRangeControl, usageRangeQuery } from "./UsageRangeControl";
 import { usageJson } from "./usagePriceSourceData";
 import { formatMoney, formatShortDate } from "./usageBoardFormat";
+import { UsageName } from "./UsageName";
 
 interface ModelSource {
   kind: "host" | "report";
@@ -79,7 +80,7 @@ export function UsageModelsPage() {
         </p>
       ) : (
         <div className="overflow-x-auto rounded-[11px] border border-border bg-card">
-          <table className="w-full text-left text-sm">
+          <table className="w-full table-fixed text-left text-sm">
             <caption className="sr-only">
               Available models, their sources, list prices per million tokens and use in the
               selected range
@@ -103,18 +104,15 @@ export function UsageModelsPage() {
               {query.data?.models.map((model) => (
                 <tr key={model.id} className="border-b border-border last:border-0">
                   <th scope="row" className="max-w-[360px] p-3 font-normal">
-                    <span className="break-all font-medium">{model.id}</span>
+                    <UsageName className="font-medium">{model.id}</UsageName>
                     <div className="mt-1 flex flex-wrap gap-1">
                       {model.sources.map((source) => (
-                        <span
+                        <UsageName
                           key={`${source.kind}:${source.host_id ?? source.label}:${source.harness ?? ""}`}
                           className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground"
                         >
-                          {source.label}
-                          {source.stale ? " · old" : ""}
-                          {source.configuration?.label ? ` · ${source.configuration.label}` : ""}
-                          {source.configuration?.name ? `: ${source.configuration.name}` : ""}
-                        </span>
+                          {`${source.label}${source.stale ? " · old" : ""}${source.configuration?.label ? ` · ${source.configuration.label}` : ""}${source.configuration?.name ? `: ${source.configuration.name}` : ""}`}
+                        </UsageName>
                       ))}
                     </div>
                   </th>

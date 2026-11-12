@@ -33,6 +33,7 @@ import type { UsageAmount } from "./usageActivityData";
 import { UsageAmountFigure, UsageErrorMark } from "./UsageAmounts";
 import { UsageBalances } from "./UsageBalances";
 import { t } from "./usageText";
+import { UsageName } from "./UsageName";
 
 const TONE_TILE: Record<string, string> = {
   warn: "border-warning/60 bg-warning/13",
@@ -116,12 +117,12 @@ export function UsageTile({
           />
         )}
         <div className="flex min-w-0 flex-1 flex-col leading-tight">
-          <span className="truncate font-semibold" title={name}>
-            {name}
-          </span>
-          {plan ? <span className="truncate text-[11px] text-muted-foreground">{plan}</span> : null}
+          <UsageName className="font-semibold">{name}</UsageName>
+          {plan ? (
+            <UsageName className="text-[11px] text-muted-foreground">{plan}</UsageName>
+          ) : null}
           {shownModel && (
-            <span className="truncate text-xs text-muted-foreground">{shownModel}</span>
+            <UsageName className="text-xs text-muted-foreground">{shownModel}</UsageName>
           )}
           <UsageBalances account={account} compact />
           {(amount?.totals.partial_rows ?? 0) > 0 ? (
@@ -179,9 +180,9 @@ export function UsageTile({
     >
       <div className="usage-tile-head">
         <button type="button" className="usage-tile-title" onClick={activate}>
-          {name}
+          <UsageName>{name}</UsageName>
         </button>
-        {plan ? <span className="usage-tile-plan">{plan}</span> : null}
+        {plan ? <UsageName className="usage-tile-plan">{plan}</UsageName> : null}
         <ReadingButton account={account} />
         <UsageErrorMark account={account} />
       </div>
@@ -209,7 +210,9 @@ export function UsageTile({
                 else activate();
               }}
             >
-              {wideBoxes ? <span className="usage-unit-tag">{group.tag || "\u00a0"}</span> : null}
+              {wideBoxes ? (
+                <UsageName className="usage-unit-tag">{group.tag || "\u00a0"}</UsageName>
+              ) : null}
               <UsageTip
                 className="usage-ring-trigger"
                 model={
@@ -228,9 +231,9 @@ export function UsageTile({
                 {main ? formatTimeLeft(main.time_left_s) || "—" : t("notReported")}
               </span>
               {pinned ? (
-                <span className="usage-tile-plan">
-                  {t("pinned")} {main ? windowName(main) : ""}
-                </span>
+                <UsageName className="usage-tile-plan">
+                  {`${t("pinned")} ${main ? windowName(main) : ""}`}
+                </UsageName>
               ) : null}
               {!pinned ? (
                 <div className="usage-satellites">
@@ -244,7 +247,7 @@ export function UsageTile({
                           size={16}
                           showName={false}
                         />
-                        <span>{windowName(item)}</span>
+                        <UsageName>{windowName(item)}</UsageName>
                         <b>
                           {item.percent_used?.toLocaleString("en-US", {
                             minimumFractionDigits: 2,
@@ -275,7 +278,9 @@ export function UsageTile({
               `/usage/board/${encodeURIComponent(account.id)}?focus=${encodeURIComponent(balance.group ?? balance.id)}`,
             )}
           >
-            {wideBoxes ? <span className="usage-unit-tag">{balance.group || "\u00a0"}</span> : null}
+            {wideBoxes ? (
+              <UsageName className="usage-unit-tag">{balance.group || "\u00a0"}</UsageName>
+            ) : null}
             <UsageBalances tile account={{ ...account, balances: [balance] }} />
           </Link>
         ))}

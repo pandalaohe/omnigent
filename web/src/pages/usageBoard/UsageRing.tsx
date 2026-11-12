@@ -6,6 +6,7 @@
 import { cn } from "@/lib/utils";
 import type { CSSProperties } from "react";
 import { useUsageReadingPlacement } from "./useUsageReadingPlacement";
+import { UsageName } from "./UsageName";
 
 import type { UsageWindowView } from "./usageBoardData";
 import {
@@ -166,13 +167,12 @@ export function UsageRing({
         </svg>
         <span className="usage-ring-content relative flex flex-col items-center leading-none">
           {showName && window ? (
-            <span
+            <UsageName
               data-usage-label
-              title={windowName(window)}
-              className="usage-ring-name mb-0.5 w-full truncate px-1 text-center font-bold text-muted-foreground"
+              className="usage-ring-name mb-0.5 w-full px-1 text-center font-bold text-muted-foreground"
             >
               {windowName(window)}
-            </span>
+            </UsageName>
           ) : null}
           {!outside ? readingNode : null}
         </span>

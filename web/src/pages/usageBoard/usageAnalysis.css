@@ -250,6 +250,10 @@
 }
 .ua-picks button {
   height: 26px;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   padding: 0 10px;
   border-radius: 13px;
   background: var(--card);
@@ -352,6 +356,10 @@
 .ua-card-table [role="cell"]:not(:first-child),
 .ua-card-table [role="columnheader"]:not(:first-child) {
   text-align: right;
+}
+.ua-card-table [role="cell"],
+.ua-card-table [role="columnheader"] {
+  min-width: 0;
 }
 .ua-card-row small {
   display: block;

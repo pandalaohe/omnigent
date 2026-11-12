@@ -34,6 +34,7 @@ import { useUsageOverview, type UsageAccountView } from "./usageBoardData";
 import { useUsageActivity } from "./usageActivityData";
 import { t } from "./usageText";
 import { UsageSummary } from "./UsageAmounts";
+import { UsageName } from "./UsageName";
 
 /** The renewal a tile counts down to: the provider's date wins over the user's. */
 export function renewalOf(
@@ -200,6 +201,7 @@ export function UsageBoardPage() {
                   {arranging ? (
                     <Input
                       aria-label={`Group name for ${band.name}`}
+                      title={band.name}
                       value={band.name}
                       onChange={(event) => renameBand(band.id, event.target.value)}
                       className="h-7 max-w-[260px] flex-1 text-[13px] font-semibold"
@@ -216,7 +218,7 @@ export function UsageBoardPage() {
                       ) : (
                         <ChevronRightIcon className="size-3.5 shrink-0" aria-hidden="true" />
                       )}
-                      <span className="truncate">{band.name}</span>
+                      <UsageName>{band.name}</UsageName>
                     </button>
                   )}
                   <span className="text-[11px] text-muted-foreground">{band.accounts.length}</span>
