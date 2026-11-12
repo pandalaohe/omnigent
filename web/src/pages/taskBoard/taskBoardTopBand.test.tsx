@@ -15,6 +15,8 @@ import { usageBoardData } from "@/pages/usageBoard/usageBoardFixtures";
 import type { SystemStatusHost } from "@/hooks/useSystemStatus";
 import { detailLevel } from "./taskBoardRouteData";
 import type { BoardTask } from "./taskBoardData";
+import { MemoryRouter } from "react-router-dom";
+import { TaskBoardAttention } from "./TaskBoardAttention";
 
 beforeEach(() => localStorage.clear());
 afterEach(() => {
@@ -214,6 +216,45 @@ it("renders individual archived questions and near-context facts without inventi
     "Choose B",
     "Approve the plan",
   ]);
+  const select = vi.fn();
+  const { rerender } = render(
+    <MemoryRouter>
+      <TaskBoardAttention rows={boardAttention([task], [], new Set()).waiting} onSelect={select} />
+    </MemoryRouter>,
+  );
+  expect(screen.queryByRole("link")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: /Choose A/ }));
+  expect(select).toHaveBeenCalledWith(task);
+  const oldPath = window.location.pathname;
+  window.history.replaceState({}, "", "/frame/task-board");
+  try {
+    rerender(
+      <MemoryRouter>
+        <TaskBoardAttention
+          rows={
+            boardAttention(
+              [task],
+              [
+                {
+                  id: "session",
+                  status: "waiting",
+                  questions: [{ id: "native-q", text: "Native question" }],
+                },
+              ],
+              new Set(),
+            ).waiting
+          }
+          onSelect={select}
+        />
+      </MemoryRouter>,
+    );
+    const link = screen.getAllByRole("link")[0];
+    expect(link.getAttribute("href")).toBe("/c/session");
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toBe("noopener");
+  } finally {
+    window.history.replaceState({}, "", oldPath);
+  }
   const source = task["omnigent.ai:sourceDisplay"]!.sessions![0];
   task["omnigent.ai:sourceDisplay"]!.sessions = [
     { ...source, status: "running", context: 0.95, compactAt: 1 },
@@ -243,4 +284,34 @@ it("renders individual archived questions and near-context facts without inventi
     text: "Checking results",
     toolRunning: false,
   });
+});
+
+it("keeps same-brand quota accounts distinct only when both occupy a visible slot", () => {
+  const base = usageBoardData().accounts[0];
+  const accounts = ["Claude Code（Team）", "Claude Code (Personal)", "Codex (Work)"].map(
+    (display_name, index) => ({
+      ...base,
+      id: `account-${index}`,
+      display_name,
+      windows: base.windows.map((window) => ({
+        ...window,
+        past_reset: false,
+        state: "ok",
+        percent_used: 50,
+      })),
+    }),
+  );
+  render(
+    <TaskBoardQuotaBand
+      accounts={accounts}
+      preferences={boardDefaults}
+      onOpen={vi.fn()}
+      loading={false}
+      failed={false}
+      retry={vi.fn()}
+    />,
+  );
+  expect(screen.getByRole("button", { name: /Claude Code.*Team/ })).toBeTruthy();
+  expect(screen.getByRole("button", { name: /Claude Code.*Personal/ })).toBeTruthy();
+  expect(screen.getByRole("button", { name: /Codex/ }).textContent).not.toContain("Work");
 });

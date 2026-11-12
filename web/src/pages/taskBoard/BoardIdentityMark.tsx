@@ -39,16 +39,29 @@ export function BoardIdentityMark({
           : null;
   return (
     <span
-      className="tb-identity-mark"
+      className={`tb-identity-mark${Icon ? ` tb-brand-${product}` : ""}`}
       aria-hidden="true"
       style={{
         width: size,
         height: size,
+        borderRadius: size * 0.28,
         background: Icon ? undefined : colours[hash % colours.length],
         fontSize: Math.round(size * 0.58),
       }}
     >
-      {Icon ? <Icon size={Math.round(size * 0.7)} /> : label.slice(0, 1).toUpperCase()}
+      {Icon ? <Icon size={Math.round(size * 0.62)} /> : label.slice(0, 1).toUpperCase()}
+    </span>
+  );
+}
+
+export function BoardProjectBullet({ label, index }: { label: string; index: number }) {
+  return (
+    <span
+      className="tb-project-bullet"
+      aria-hidden="true"
+      style={{ background: colours[index % colours.length] }}
+    >
+      {label.slice(0, 1).toUpperCase()}
     </span>
   );
 }

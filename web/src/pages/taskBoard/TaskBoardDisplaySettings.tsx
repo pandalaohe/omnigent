@@ -5,7 +5,7 @@ import { boardDefaults, boardViews, type BoardPreferences } from "./taskBoardPre
 import type { TaskSource } from "./taskBoardData";
 import type { UsageAccountView } from "@/pages/usageBoard/usageBoardData";
 import { formatDate, t } from "./taskBoardText";
-import { BoardIdentityMark } from "./BoardIdentityMark";
+import { BoardIdentityMark, BoardProjectBullet } from "./BoardIdentityMark";
 import { quotaAccounts } from "./TaskBoardQuota";
 
 type Update = (change: Partial<BoardPreferences>) => boolean | void;
@@ -257,7 +257,7 @@ export function TaskBoardDisplaySettings({
           <h2>{t("display.hidden")}</h2>
           <Row label={t("display.hideLabel")} hint={t("display.hideHint")}>
             <div className="tb-setting-chips">
-              {sources.map((source) => (
+              {sources.map((source, index) => (
                 <button
                   type="button"
                   key={source.id}
@@ -270,8 +270,8 @@ export function TaskBoardDisplaySettings({
                     })
                   }
                 >
-                  <BoardIdentityMark
-                    id={source.id}
+                  <BoardProjectBullet
+                    index={index}
                     label={preferences.aliases[source.id] || source.name || source.id}
                   />
                   {preferences.aliases[source.id] || source.name || source.id}

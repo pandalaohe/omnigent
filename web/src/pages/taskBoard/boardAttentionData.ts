@@ -21,10 +21,13 @@ export function boardAttention(
 ) {
   const nativeById = new Map(native.map((session) => [session.id, session]));
   const supplied = new Map<string, DisplaySession>();
+  const sourceTasks = new Map<string, BoardTask>();
   for (const task of tasks)
     for (const session of task["omnigent.ai:sourceDisplay"]?.sessions ?? [])
-      if (!supplied.has(session.id))
+      if (!supplied.has(session.id)) {
         supplied.set(session.id, mergeDisplaySession(session, nativeById.get(session.id)));
+        sourceTasks.set(session.id, task);
+      }
   for (const session of native)
     if (!supplied.has(session.id))
       supplied.set(
@@ -50,10 +53,19 @@ export function boardAttention(
   const asOf = new Date(now).toISOString();
   for (const session of supplied.values()) {
     const caption = [session.title, session.host].filter(Boolean).join(" · ");
+    const target = {
+      session,
+      task: nativeById.has(session.id) ? undefined : sourceTasks.get(session.id),
+    };
     for (const question of session.questions ?? [])
-      waiting.push({ id: `${session.id}:q:${question.id}`, text: question.text, caption, session });
+      waiting.push({
+        id: `${session.id}:q:${question.id}`,
+        text: question.text,
+        caption,
+        ...target,
+      });
     if (session.need)
-      waiting.push({ id: `${session.id}:need`, text: session.need, caption, session });
+      waiting.push({ id: `${session.id}:need`, text: session.need, caption, ...target });
     const observation = sessionObservation(session, asOf);
     const toolElapsed = session.tool ? (now - Date.parse(session.tool.startedAt)) / 1000 : null;
     const toolRunning =
@@ -70,7 +82,7 @@ export function boardAttention(
           id: `${session.id}:silent`,
           text: t("sessions.silent"),
           caption,
-          session,
+          ...target,
         });
       if (
         session.context != null &&
@@ -84,16 +96,21 @@ export function boardAttention(
             percent: Math.round((session.context / session.compactAt) * 100),
           }),
           caption,
-          session,
+          ...target,
         });
       if (session.nativeStatus === "failed")
-        anomalies.push({ id: `${session.id}:failed`, text: t("session.failed"), caption, session });
+        anomalies.push({
+          id: `${session.id}:failed`,
+          text: t("session.failed"),
+          caption,
+          ...target,
+        });
       if (session.status === "running" && !stale)
         running.push({
           id: session.id,
           text: (toolRunning ? session.tool?.label : undefined) || session.now || session.title,
           caption,
-          session,
+          ...target,
           toolRunning,
         });
     }

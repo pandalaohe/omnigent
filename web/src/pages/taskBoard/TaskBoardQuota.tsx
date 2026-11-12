@@ -68,6 +68,8 @@ export function TaskBoardQuotaBand({
   retry: () => void;
 }) {
   const shown = quotaAccounts(accounts, preferences.pinnedQuota).slice(0, 4);
+  const shortName = (name: string) => name.split(/[（(]/)[0].trim();
+  const names = shown.map((account) => shortName(account.display_name));
   return (
     <section className="tb-quota-band" aria-label={t("band.quota")}>
       <h2>
@@ -105,7 +107,15 @@ export function TaskBoardQuotaBand({
                     label={account.display_name}
                     product={account.product}
                   />
-                  <b>{account.display_name.split(/[（(]/)[0].trim()}</b>
+                  <b>
+                    {shortName(account.display_name)}
+                    {names.filter((name) => name === shortName(account.display_name)).length >
+                      1 && (
+                      <small className="tb-quota-provider">
+                        {account.display_name.match(/[（(]([^）)]*)[）)]/)?.[1]}
+                      </small>
+                    )}
+                  </b>
                   <em>{percent(window)}</em>
                   <small>{windowLabel(window)}</small>
                 </span>

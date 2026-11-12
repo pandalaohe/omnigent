@@ -110,6 +110,16 @@ it("renders full-past counts without inventing old task bodies", async () => {
   expect((screen.getByLabelText("Find month") as HTMLSelectElement).value).toBe("2020-01");
   expect(screen.getByText(/outside the retained task window/)).toBeTruthy();
 });
+it("translates the Today closed-count tile", async () => {
+  fetcher.mockImplementation(async (url: string) =>
+    Response.json(url.includes("closed-counts") ? { days: [] } : { entries: [] }),
+  );
+  const { container } = wrap(
+    <TaskBoardActivity view="today" tasks={[]} sessions={[]} onSelect={vi.fn()} />,
+  );
+  expect(await screen.findByText("Closed today", { selector: "dt" })).toBeTruthy();
+  expect(container.textContent).not.toContain("toclosedDay.closed");
+});
 it("keeps aliases local and requires a named counted confirmation before deletion", async () => {
   const source = { ...taskBoardFixture().sources[0], counts: { open: 2, closed: 3, gone: 1 } };
   const update = vi.fn();

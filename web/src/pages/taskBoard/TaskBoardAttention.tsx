@@ -23,6 +23,14 @@ export function TaskBoardAttention({
           <li key={row.id}>
             {row.task ? (
               <button type="button" onClick={() => onSelect(row.task!)}>
+                {row.session && (
+                  <BoardIdentityMark
+                    id={row.session.agentId}
+                    label={row.session.label}
+                    product={row.session.agentId}
+                    size={26}
+                  />
+                )}
                 <span>
                   <b>{row.text}</b>
                   <small>{row.caption}</small>

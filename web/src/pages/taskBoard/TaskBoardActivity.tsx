@@ -269,7 +269,7 @@ export function TaskBoardActivity({
             <>
               <div className="tb-number-tiles">
                 <div>
-                  <dt>{t("toclosedDay.closed")}</dt>
+                  <dt>{t("today.closed")}</dt>
                   <dd>{formatNumber(closed.length)}</dd>
                 </div>
                 <div>

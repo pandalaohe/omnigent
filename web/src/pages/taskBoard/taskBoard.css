@@ -918,14 +918,24 @@
   color: var(--muted-foreground);
 }
 .tb-page .tb-segment button {
-  padding: 5px 7px;
-  border-radius: 6px;
-  font-size: 12.5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5.5px;
+  height: 27px;
+  padding: 0 11.5px;
+  border-radius: 6.5px;
+  font-size: 13px;
   font-weight: 400;
+  color: var(--muted-foreground);
 }
-.tb-page button[aria-pressed="true"] {
+.tb-page .tb-segment {
+  padding: 3px;
   background: var(--secondary);
-  color: var(--primary);
+}
+.tb-page .tb-segment button[aria-pressed="true"] {
+  background: var(--card-solid);
+  color: var(--foreground);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.14);
 }
 .tb-gear {
   display: grid;
@@ -1104,6 +1114,7 @@
   padding: 0 9px;
   border-radius: 8px;
   border: 1px solid var(--border);
+  background: var(--background);
   font-size: 12.5px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1205,7 +1216,37 @@
   color: white;
   font-weight: 800;
   line-height: 1;
-  background: var(--primary);
+  background: var(--secondary);
+}
+.tb-brand-claude {
+  background: #d97757;
+}
+.tb-brand-codex {
+  background: #3b4bdb;
+}
+.tb-page.dark .tb-brand-codex {
+  background: #5566e8;
+}
+.tb-brand-antigravity {
+  background: #1a73e8;
+}
+.tb-project-bullet {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  flex: none;
+  color: white;
+  font-size: 8.64px;
+  font-weight: 800;
+  line-height: 1;
+}
+.tb-quota-grid b .tb-quota-provider {
+  margin-left: 4px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  font-weight: 400;
 }
 .tb-setting-chips button {
   display: inline-flex;
@@ -1234,9 +1275,14 @@
   color: var(--muted-foreground);
 }
 .tb-page .tb-view-tabs > button[aria-pressed="true"],
-.tb-page button[aria-pressed="true"] {
+.tb-page .tb-gear[aria-pressed="true"],
+.tb-page .tb-pin[aria-pressed="true"],
+.tb-page .tb-setting-chips button[aria-pressed="true"] {
   background: var(--sidebar-active);
   color: var(--sidebar-active-foreground);
+}
+.tb-page .tb-setting-chips button[aria-pressed="true"] {
+  border-color: var(--primary);
 }
 .tb-header-controls {
   gap: 12.5px;

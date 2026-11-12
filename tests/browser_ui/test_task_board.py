@@ -334,11 +334,21 @@ def test_task_board_display_switch_and_source_list(
     ).to_be_visible()
     page.get_by_role("button", name="Today", exact=True).click()
     expect(page.get_by_text("Active sessions today", exact=True)).to_be_visible()
+    expect(page.locator(".tb-number-tiles dt").filter(has_text="Closed today")).to_be_visible()
+    expect(page.get_by_text("toclosedDay.closed", exact=True)).to_have_count(0)
     page.get_by_role("button", name="Settings", exact=True).click()
     display = page.get_by_role("region", name="Settings", exact=True)
+    display.get_by_role("button", name="Dark" if theme == "dark" else "Light", exact=True).click()
     display.get_by_role("button", name="Off", exact=True).click()
     expect(display.get_by_role("button", name="Off", exact=True)).to_have_attribute(
         "aria-pressed", "true"
+    )
+    assert display.get_by_role("button", name="Off", exact=True).evaluate(
+        "el => getComputedStyle(el).backgroundColor"
+    ) == ("rgb(24, 31, 37)" if theme == "dark" else "rgb(255, 255, 255)")
+    assert display.locator(".tb-project-bullet").evaluate(
+        "el => getComputedStyle(el).borderRadius === '50%' && "
+        "getComputedStyle(el).backgroundColor === 'rgb(238, 53, 46)'"
     )
     display.get_by_label("Station level up to", exact=True).select_option("3")
     display.get_by_label("Board window", exact=True).select_option("72")
