@@ -2908,6 +2908,7 @@ class SessionResponse(BaseModel):
     agent_template_id: str | None = None
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
+    blocked_on: str | None = None
     background_agents: list[BackgroundTaskInfo] | None = None
     background_task_count: int | None = None
     background_tasks: list[BackgroundTaskInfo] | None = None

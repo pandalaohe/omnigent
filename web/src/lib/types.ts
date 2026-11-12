@@ -390,6 +390,7 @@ export interface Session {
    */
   archived?: boolean;
   status: SessionStatus;
+  blockedOn?: string;
   /**
    * Background shells (claude-native) still running as of the last status
    * edge, so a reload re-shows "N background tasks still running" even though the

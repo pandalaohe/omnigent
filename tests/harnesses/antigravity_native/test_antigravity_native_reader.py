@@ -5817,7 +5817,7 @@ async def test_helper_without_native_work_keeps_watching_after_silence_deadline(
             timeout=_MIRROR_HANG_GUARD_S,
         )
     assert clock[0] >= 660
-    assert sink.statuses() == ["running", "idle"]
+    assert sink.statuses() == ["running", "running", "idle"]
     assert any(
         data.get("observation_status") == "observation_unconfirmed" for _, data in sink.posts
     )
@@ -6021,6 +6021,7 @@ async def test_running_child_reads_status_once_per_tick_without_closing(
     assert idle_checks == polls
     assert sink.statuses() == ["running"]
     assert sink.posts[-1][1]["observation_status"] == "observation_unconfirmed"
+    assert sink.posts[-1][1]["blocked_on"] == "completion observer stopped"
     assert "completion could be confirmed" in sink.posts[-1][1]["output"]
 
 

@@ -6281,7 +6281,9 @@ async def test_antigravity_control_dispatch_sends_one_command(
     assert calls == [expected]
 
 
-@pytest.mark.parametrize("outcome", ["commit", "rollback", "prepare-failure", "rollback-failure"])
+@pytest.mark.parametrize(
+    "outcome", ["commit", "rollback", "prepare-failure", "rollback-failure", "snapshot-timeout"]
+)
 async def test_antigravity_tier_transaction_keeps_confirmed_state_or_blocks(
     monkeypatch, tmp_path, isolate_antigravity_controls_launch, outcome
 ):
@@ -6295,10 +6297,19 @@ async def test_antigravity_tier_transaction_keeps_confirmed_state_or_blocks(
 
     monkeypatch.setattr(agy, "_BRIDGE_ROOT", tmp_path)
     monkeypatch.setattr(orchestration, "_AGY_CONFIRMED_PERMISSION_TIERS", {})
-    monkeypatch.setattr(agy, "_require_agy_idle", lambda *_: None)
+    preflight_deadlines = []
+    monkeypatch.setattr(
+        agy,
+        "_require_agy_idle",
+        lambda *_: preflight_deadlines.append(agy._CONTROL_DEADLINE.get()),
+    )
     server_labels = ConfirmedPermissionState("ask", 1, "blocked").labels("antigravity-native")
 
+    snapshot_unavailable = [False]
+
     async def snapshot(*a, **kw):
+        if snapshot_unavailable[0]:
+            raise TimeoutError("server snapshot unavailable")
         return {"labels": server_labels, "terminal_launch_args": []}
 
     monkeypatch.setattr(orchestration, "_session_payload_for_host_spawn_check", snapshot)
@@ -6306,6 +6317,8 @@ async def test_antigravity_tier_transaction_keeps_confirmed_state_or_blocks(
     switches = []
 
     def switch(directory, **kw):
+        assert kw["deadline"] == preflight_deadlines[-1]
+        assert kw["deadline"] != float("inf")
         switches.append((kw["previous"], kw["tier"]))
         if outcome == "prepare-failure" or (outcome == "rollback-failure" and len(switches) == 2):
             raise agy.AgyPermissionRollbackError("native state could not be verified")
@@ -6349,6 +6362,7 @@ async def test_antigravity_tier_transaction_keeps_confirmed_state_or_blocks(
             ConfirmedPermissionState(final_tier, revision, "ready").labels("antigravity-native")
         )
         server_labels[PERMISSION_CAPABILITY_LABEL_KEY] = PERMISSION_CAPABILITY_VALUE
+        snapshot_unavailable[0] = outcome == "snapshot-timeout"
         settled = await client.post(
             f"/v1/sessions/{sid}/events",
             json={
@@ -6361,6 +6375,12 @@ async def test_antigravity_tier_transaction_keeps_confirmed_state_or_blocks(
             },
         )
         state = runtime.state(sid)
+        if outcome == "snapshot-timeout":
+            assert settled.status_code == 503, settled.text
+            assert settled.json()["error"] == "server_state_unavailable"
+            assert state.status == "switching"
+            assert switches == [("ask", "auto")]
+            return
         if outcome == "rollback-failure":
             assert settled.status_code == 503, settled.text
             assert state.status == "blocked"

@@ -3097,6 +3097,7 @@ def _build_session_response(
         ),
         agent_name=agent_name,
         status=status,
+        blocked_on=_blocked_on_for(conv.id, conv.blocked_on),
         background_agents=background_agents or None,
         background_task_count=background_task_count,
         background_tasks=background_tasks,

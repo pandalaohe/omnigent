@@ -1143,6 +1143,15 @@ describe("shouldShowWorkingIndicator", () => {
 // ── workingIndicatorLabel ───────────────────────────────────────────────────
 
 describe("workingIndicatorLabel — parked on a dialog", () => {
+  it("shows completion uncertainty without asking for an approval", () => {
+    expect(workingIndicatorLabel(0, "completion observation unavailable")).toBe(
+      "Antigravity completion is unconfirmed. Still watching for completion.",
+    );
+    expect(workingIndicatorLabel(0, "completion observer stopped")).toBe(
+      "Antigravity observation stopped before completion was confirmed. Check the terminal.",
+    );
+  });
+
   it("names what the agent is waiting on beside a chat card that can answer it", () => {
     expect(workingIndicatorLabel(0, "permission prompt", { answerableInChat: true })).toBe(
       "Blocked on: permission prompt",

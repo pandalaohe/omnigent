@@ -5889,7 +5889,10 @@ async function bindStream(
         backgroundTaskCount: session.backgroundTaskCount ?? 0,
         backgroundTasks: session.backgroundTasks ?? [],
         backgroundAgents: snapshotBackgroundAgents(session),
-        blockedOn: null,
+        blockedOn:
+          state.blockedOn !== stateBeforeFetch.blockedOn
+            ? state.blockedOn
+            : (session.blockedOn ?? null),
         // This conversation's own effective effort, which is what a warm switch
         // back re-projects (it does not re-bind, so it cannot recompute it).
         sessionReasoningEffort: effectiveEffort,
@@ -6131,6 +6134,7 @@ function reconnectStatusPatch(
   readingBeforeFetch: ConversationState["reportedContextReading"],
   latchBeforeFetch: SendLatchEvidence = s,
   settleTurn = true,
+  blockedOnBeforeFetch: ChatState["blockedOn"] = s.blockedOn,
 ): Partial<ChatState> {
   const patch: Partial<ChatState> = {
     ...mcpStartupSnapshotPatch(session, s, launchBeforeFetch),
@@ -6154,6 +6158,7 @@ function reconnectStatusPatch(
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
   patch.backgroundTasks = session.backgroundTasks ?? [];
   patch.backgroundAgents = snapshotBackgroundAgents(session);
+  if (s.blockedOn === blockedOnBeforeFetch) patch.blockedOn = session.blockedOn ?? null;
   if (s.reportedContextReading === readingBeforeFetch) {
     if (session.contextWindow !== undefined) patch.contextWindow = session.contextWindow;
     if (session.autoCompactTokenLimit !== undefined)
@@ -6367,6 +6372,8 @@ async function reconcileActiveSessionStatus(
       stateBeforeFetch.startup,
       stateBeforeFetch.reportedContextReading,
       stateBeforeFetch,
+      true,
+      stateBeforeFetch.blockedOn,
     );
     const blocks = snapshotCompactionSpinners(s.blocks, s.activeResponse, patch.activeResponse);
     return blocks === null ? patch : { ...patch, blocks };
@@ -6981,6 +6988,7 @@ async function reconcileOnReconnect(
           (streamTurnEdgeRevisions.get(id) ?? 0) === turnEdgesBeforeFetch &&
             s.sendLatchedAt === stateBeforeFetch.sendLatchedAt &&
             s.sendLatchSeenRunning === stateBeforeFetch.sendLatchSeenRunning,
+          stateBeforeFetch.blockedOn,
         )
       : {};
 

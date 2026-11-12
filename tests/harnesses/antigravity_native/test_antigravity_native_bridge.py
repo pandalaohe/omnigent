@@ -1727,6 +1727,11 @@ def test_submit_and_verify_rejects_draft_with_marker_outside_footer(
     _fast_tmux_timeouts: None,
     marker_location: str,
 ) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(_mod.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        _mod.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
     pane = "────────\n> Keep this draft\n────────\n? for shortcuts"
     if marker_location == "draft":
         pane = pane.replace("Keep this draft", "Keep this draft esc to cancel")
@@ -4689,4 +4694,68 @@ def test_nested_pane_operations_share_deadline_and_stop_late_keys(monkeypatch):
         outer()
     assert len(commands) == 1
     assert commands[0][1] == 5
+    assert _mod._CONTROL_DEADLINE.get() == float("inf")
+
+
+def test_submit_reserves_time_for_coalesced_enter_retry(monkeypatch):
+    clock = [0.0]
+    enters = []
+    monkeypatch.setattr(_mod.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        _mod.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+
+    def run(command, **kwargs):
+        if command[-1] == "Enter":
+            enters.append(clock[0])
+        pane = "> hello\n? for shortcuts" if len(enters) < 2 else ">\nesc to cancel"
+        return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+
+    monkeypatch.setattr(_mod.subprocess, "run", run)
+    _mod._submit_and_verify("/tmp/example/tmux.sock", "main", needle="hello", draft_seen=True)
+    assert len(enters) == 2
+    assert 19 <= enters[1] <= 21
+    assert clock[0] < 60
+
+
+@pytest.mark.parametrize("rollback_delay", [10, 60])
+def test_permission_switch_charges_preflight_and_diagnostics_to_deadline(
+    tmp_path, monkeypatch, rollback_delay
+):
+    clock = [0.0]
+    captures = []
+    changes = []
+    (tmp_path / "agy_user_settings.json").write_text(
+        '{"allowNonWorkspaceAccess": {"present": false, "value": null}}'
+    )
+    monkeypatch.setattr(_mod.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        _mod,
+        "read_tmux_info",
+        lambda _: {"socket_path": "/tmp/example/tmux.sock", "tmux_target": "main"},
+    )
+
+    def run(command, **kwargs):
+        captures.append(kwargs["timeout"])
+        clock[0] += min(30 if len(captures) == 1 else 10, kwargs["timeout"])
+        return SimpleNamespace(returncode=0, stdout="? for shortcuts model", stderr="")
+
+    def config(*args, **kwargs):
+        changes.append(kwargs["timeout_s"])
+        clock[0] += 20 if len(changes) == 1 else rollback_delay
+        raise RuntimeError("control stalled")
+
+    monkeypatch.setattr(_mod.subprocess, "run", run)
+    monkeypatch.setattr(_mod, "_set_agy_config_row", config)
+    deadline = 60.0
+    with _mod.agy_control_deadline(deadline):
+        _mod._require_agy_idle(tmp_path)
+    with pytest.raises(_mod.AgyPermissionRollbackError, match="rollback unverified"):
+        _mod.switch_agy_permission_tier(
+            tmp_path, tier="ask", previous="auto", timeout_s=60, deadline=deadline
+        )
+    assert changes == [20, 60]
+    assert captures == ([60, 30] if rollback_delay == 60 else [60, 30, 50])
+    assert clock[0] == (120 if rollback_delay == 60 else 80)
+    assert clock[0] < 125
     assert _mod._CONTROL_DEADLINE.get() == float("inf")

@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
@@ -1583,6 +1583,16 @@ def _deadline_after(timeout_s: float) -> float:
     return min(_CONTROL_DEADLINE.get(), time.monotonic() + timeout_s)
 
 
+@contextlib.contextmanager
+def agy_control_deadline(deadline: float) -> Iterator[None]:
+    """Charge runner preflight and nested pane calls to the same deadline."""
+    token = _CONTROL_DEADLINE.set(min(deadline, _CONTROL_DEADLINE.get()))
+    try:
+        yield
+    finally:
+        _CONTROL_DEADLINE.reset(token)
+
+
 def _control_remaining(timeout_s: float) -> float:
     remaining = min(timeout_s, _CONTROL_DEADLINE.get() - time.monotonic())
     if remaining <= 0:
@@ -1980,31 +1990,33 @@ def _submit_and_verify(
         submit()
         return
     last_pane = _capture_pane(socket_path, tmux_target)
-    for _ in range(_MAX_SUBMIT_ATTEMPTS):
-        # Re-check liveness each attempt: if the TUI exited between the paste and
-        # now, every capture returns "" and the draft never clears — so fail
-        # fast with the real cause instead of spinning the full budget and then
-        # blaming paste-coalescing.
-        if not _session_alive(socket_path, tmux_target):
-            raise RuntimeError(
-                "the agy terminal exited before the message could be submitted; "
-                "restart the session"
-            )
-        submit()
-        deadline = _deadline_after(_SUBMIT_VERIFY_TIMEOUT_S)
-        while time.monotonic() < deadline:
+    for attempt in range(_MAX_SUBMIT_ATTEMPTS):
+        remaining = _control_remaining(_SUBMIT_VERIFY_TIMEOUT_S)
+        deadline = _deadline_after(remaining / (_MAX_SUBMIT_ATTEMPTS - attempt))
+        with agy_control_deadline(deadline):
+            # Re-check liveness each attempt: if the TUI exited between the paste and
+            # now, every capture returns "" and the draft never clears — so fail
+            # fast with the real cause instead of spinning the full budget and then
+            # blaming paste-coalescing.
             if not _session_alive(socket_path, tmux_target):
                 raise RuntimeError(
                     "the agy terminal exited before the message could be submitted; "
                     "restart the session"
                 )
-            pane = _capture_pane(socket_path, tmux_target)
-            last_pane = pane or last_pane
-            if pane and not _draft_in_input_region(
-                pane, needle, baseline_region, tail_needle=tail_needle
-            ):
-                return
-            time.sleep(_TMUX_POLL_INTERVAL_S)
+            submit()
+            while time.monotonic() < deadline:
+                if not _session_alive(socket_path, tmux_target):
+                    raise RuntimeError(
+                        "the agy terminal exited before the message could be submitted; "
+                        "restart the session"
+                    )
+                pane = _capture_pane(socket_path, tmux_target)
+                last_pane = pane or last_pane
+                if pane and not _draft_in_input_region(
+                    pane, needle, baseline_region, tail_needle=tail_needle
+                ):
+                    return
+                time.sleep(_TMUX_POLL_INTERVAL_S)
     draft_visible = _draft_in_input_region(
         last_pane, needle, baseline_region, tail_needle=tail_needle
     )
@@ -2839,7 +2851,34 @@ def _set_agy_agent_mode(bridge_dir: Path, target: str, *, timeout_s: float) -> N
 
 
 def switch_agy_permission_tier(
-    bridge_dir: Path, *, tier: str, previous: str, timeout_s: float
+    bridge_dir: Path,
+    *,
+    tier: str,
+    previous: str,
+    timeout_s: float,
+    deadline: float | None = None,
+) -> str:
+    """Budget preflight, forward changes, rollback and diagnostics before the reply."""
+    forward_deadline = min(
+        _deadline_after(timeout_s), deadline if deadline is not None else float("inf")
+    )
+    with agy_control_deadline(forward_deadline):
+        return _switch_agy_permission_tier(
+            bridge_dir,
+            tier=tier,
+            previous=previous,
+            timeout_s=timeout_s,
+            rollback_deadline=forward_deadline + timeout_s,
+        )
+
+
+def _switch_agy_permission_tier(
+    bridge_dir: Path,
+    *,
+    tier: str,
+    previous: str,
+    timeout_s: float,
+    rollback_deadline: float,
 ) -> str:
     """Switch live controls in guard-safe order and verify reverse undo on failure."""
     if tier not in AGY_PERMISSION_TIERS or previous not in AGY_PERMISSION_TIERS:
@@ -2881,10 +2920,8 @@ def switch_agy_permission_tier(
     else:
         steps = [("mode", mode, previous_mode)]
 
-    deadline = time.monotonic() + timeout_s
-
     def apply(component: str, value: str) -> None:
-        remaining = max(0.0, deadline - time.monotonic())
+        remaining = _control_remaining(timeout_s)
         if component == "tier":
             reassert_agy_permission_tier(bridge_dir, value)
         elif component == "mode":
@@ -2900,7 +2937,9 @@ def switch_agy_permission_tier(
             apply(step[0], step[1])
         apply_agy_permission_tier(bridge_dir, tier)
     except (OSError, RuntimeError, ValueError) as exc:
-        deadline = time.monotonic() + timeout_s
+        rollback_token = _CONTROL_DEADLINE.set(
+            min(rollback_deadline, time.monotonic() + timeout_s)
+        )
         try:
             for component, _, old in reversed(attempted):
                 apply(component, old)
@@ -2928,6 +2967,8 @@ def switch_agy_permission_tier(
             raise AgyPermissionRollbackError(
                 f"Antigravity rollback unverified: {detail}; pane: {_format_pane_debug_tail(pane)}"
             ) from exc
+        finally:
+            _CONTROL_DEADLINE.reset(rollback_token)
         raise RuntimeError(
             f"Antigravity permission switch failed; restored {previous}: {exc}"
         ) from exc
