@@ -25,7 +25,6 @@ import contextlib
 import dataclasses
 import json
 import logging
-import math
 import mimetypes
 import os
 import re
@@ -40,7 +39,6 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
-from omnigent.runtime.tool_call_deadline import pause_tool_call_deadline
 from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -356,7 +354,6 @@ _SESSION_START_DEADLINE: ContextVar[float | None] = ContextVar(
 _INITIAL_MESSAGE_LABEL = "omnigent.initial_message"
 _INITIAL_MESSAGE_LABEL_RETRY_DELAY_S = 0.5
 _SESSION_CREATE_DELIVERIES: set[asyncio.Task[str]] = set()
-_CHILD_APPROVAL_POLL_S = 1.0
 
 
 @dataclass
@@ -1981,121 +1978,44 @@ async def _post_child_message_event(
     *,
     content: list[_JsonObject],
     created_by: str | None,
-    deadline: float | None = None,
 ) -> httpx.Response:
     """Post a child message, retrying once without best-effort attribution."""
-    if deadline is not None:
-        _SESSION_START_DEADLINE.set(deadline)
     from omnigent.server.session_collab import AGENT_SESSION_HEADER
 
     def _payload(actor: str | None) -> _JsonObject:
-        deadline = _SESSION_START_DEADLINE.get()
         return {
             "type": "message",
             "data": {
                 "role": "user",
                 "content": content,
-                **({"_input_admission_deadline": deadline} if deadline is not None else {}),
             },
             **({"created_by": actor} if actor is not None else {}),
         }
 
-    async def post(actor: str | None) -> httpx.Response:
-        request_id = uuid.uuid4().hex
-        payload = _payload(actor)
-        cast(_JsonObject, payload["data"])["_input_request_id"] = request_id
-        deadline = _SESSION_START_DEADLINE.get()
-        budget = _REMOTE_CHILD_READY_TIMEOUT_S if deadline is None else deadline - time.time()
-        machine_deadline = time.monotonic() + max(0.0, budget)
-        paused_at: float | None = None
-        approval_deadline = 0.0
-        pause = contextlib.ExitStack()
-        request_task = asyncio.create_task(
-            server_client.post(
-                f"{_session_url(session_id)}/events",
-                json=payload,
-                headers={AGENT_SESSION_HEADER: "agent"},
-                timeout=_ASK_GATE_DELIVERY_TIMEOUT,
-            )
-        )
-
-        def resume() -> None:
-            nonlocal paused_at, machine_deadline
-            if paused_at is not None:
-                machine_deadline += time.monotonic() - paused_at
-                paused_at = None
-            pause.close()
-
-        try:
-            while not request_task.done():
-                if paused_at is not None and time.time() >= approval_deadline:
-                    resume()
-                remaining = machine_deadline - (
-                    paused_at if paused_at is not None else time.monotonic()
-                )
-                if remaining <= 0:
-                    raise httpx.ReadTimeout("Child message machine admission deadline expired")
-                interval = min(_CHILD_APPROVAL_POLL_S, remaining)
-                if paused_at is not None:
-                    interval = min(interval, max(0.0, approval_deadline - time.time()))
-                done, _ = await asyncio.wait({request_task}, timeout=interval)
-                if done:
-                    break
-                # Only a server-owned, request-correlated REQUEST card is proof
-                # of a human wait. Missing/unreadable proof resumes machine time.
-                pending_until = 0.0
-                try:
-                    async with asyncio.timeout(min(1.0, remaining)):
-                        snapshot = await server_client.get(
-                            f"{_session_url(session_id)}",
-                            params={**_SESSION_METADATA_PARAMS, "include_live_status": "false"},
-                            timeout=min(1.0, remaining),
-                        )
-                    if snapshot.status_code == 200:
-                        entries = snapshot.json().get("pending_elicitations", [])
-                        for entry in entries:
-                            params = entry.get("params", {}) if isinstance(entry, dict) else {}
-                            expires = params.get("input_approval_deadline")
-                            if (
-                                params.get("phase") == "request"
-                                and params.get("input_request_id") == request_id
-                                and isinstance(expires, (int, float))
-                                and math.isfinite(expires)
-                                and expires > time.time()
-                            ):
-                                pending_until = expires
-                                break
-                except (httpx.HTTPError, TimeoutError, ValueError, AttributeError):
-                    pending_until = 0.0
-                if pending_until:
-                    if paused_at is None:
-                        paused_at = time.monotonic()
-                        approval_deadline = pending_until
-                        pause.enter_context(pause_tool_call_deadline(pending_until - time.time()))
-                else:
-                    resume()
-            response = request_task.result()
-        finally:
-            resume()
-            if not request_task.done():
-                request_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await request_task
-        waited = getattr(response, "headers", {}).get("X-Omnigent-Approval-Wait-Seconds")
-        if waited is not None:
-            try:
-                seconds = float(waited)
-            except ValueError:
-                seconds = 0.0
-            current = _SESSION_START_DEADLINE.get()
-            if current is not None and math.isfinite(seconds) and seconds > 0:
-                _SESSION_START_DEADLINE.set(current + seconds)
-        return response
-
-    resp = await post(created_by)
+    resp = await server_client.post(
+        f"{_session_url(session_id)}/events",
+        json=_payload(created_by),
+        headers={AGENT_SESSION_HEADER: "agent"},
+        # This message is gated at the recipient's REQUEST phase, which can
+        # PARK on a human ASK (e.g. session_cost_budget) up to the policy's
+        # ``ask_timeout``. A 30s read budget severed that park → fail-closed
+        # /retry → duplicate cards. Wait for the real verdict (one-day read
+        # budget, fast connect); a non-parking eval still returns immediately.
+        timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+    )
     if created_by is None or resp.status_code != 403:
         return resp
-    return await post(None)
+
+    _logger.debug(
+        "Child message POST attribution rejected for session=%s; retrying without actor",
+        session_id,
+    )
+    return await server_client.post(
+        f"{_session_url(session_id)}/events",
+        json=_payload(None),
+        headers={AGENT_SESSION_HEADER: "agent"},
+        timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+    )
 
 
 async def _send_to_in_flight_child(
@@ -2337,8 +2257,8 @@ _REMOTE_CHILD_READY_POLL_S = 3.0
 # relaunches the runner server-side (host-bound grace + launch +
 # _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S + session init). Tests patch the
 # wait to stay fast.
-_BY_ID_CHILD_READY_TIMEOUT_S = 60.0
-_RETRY_SESSION_TIMEOUT = httpx.Timeout(300.0, connect=60.0)
+_BY_ID_CHILD_READY_TIMEOUT_S = 30.0
+_RETRY_SESSION_TIMEOUT = httpx.Timeout(120.0, connect=30.0)
 
 # Must cover the server relaunching an offline receiver:
 # grace + launch + _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S + init.
@@ -5516,46 +5436,27 @@ async def _post_child_message_recovering(
     :param created_by: Human actor that sent the message, if known.
     :returns: The accepted repost, or the last refused/error response.
     """
-    deadline = time.time() + _REMOTE_CHILD_READY_TIMEOUT_S
-    inherited_deadline = _SESSION_START_DEADLINE.get()
-    if inherited_deadline is not None:
-        deadline = min(deadline, inherited_deadline)
-    token = _SESSION_START_DEADLINE.set(deadline)
-    try:
-        resp = await _post_child_message_event(
-            server_client, session_id, content=content, created_by=created_by
-        )
-        if _message_post_accepted(resp) or not _message_post_needs_runner_wait(resp):
-            return resp
-        deadline = _SESSION_START_DEADLINE.get() or deadline
-        try:
-            async with asyncio.timeout(max(0.0, deadline - time.time())):
-                if await _wait_for_runner_online(
-                    server_client, session_id, timeout_s=_BY_ID_CHILD_READY_TIMEOUT_S
-                ):
-                    retry = None
-                else:
-                    if time.time() >= deadline:
-                        return resp
-                    retry = await server_client.post(
-                        f"/v1/sessions/{session_id}/events",
-                        json={"type": "retry_session", "data": {}},
-                        timeout=httpx.Timeout(
-                            max(0.001, deadline - time.time()),
-                            connect=_RETRY_SESSION_TIMEOUT.connect,
-                            write=_RETRY_SESSION_TIMEOUT.write,
-                            pool=_RETRY_SESSION_TIMEOUT.pool,
-                        ),
-                    )
-        except TimeoutError as exc:
-            raise httpx.ReadTimeout("Child runner recovery deadline expired") from exc
-        if retry is not None and retry.status_code >= 400:
-            return retry
+    resp = await _post_child_message_event(
+        server_client, session_id, content=content, created_by=created_by
+    )
+    if _message_post_accepted(resp) or not _message_post_needs_runner_wait(resp):
+        return resp
+    if await _wait_for_runner_online(
+        server_client, session_id, timeout_s=_BY_ID_CHILD_READY_TIMEOUT_S
+    ):
         return await _post_child_message_event(
             server_client, session_id, content=content, created_by=created_by
         )
-    finally:
-        _SESSION_START_DEADLINE.reset(token)
+    retry = await server_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "retry_session", "data": {}},
+        timeout=_RETRY_SESSION_TIMEOUT,
+    )
+    if retry.status_code >= 400:
+        return retry
+    return await _post_child_message_event(
+        server_client, session_id, content=content, created_by=created_by
+    )
 
 
 # The created session exists, and a transport error can hide whether its

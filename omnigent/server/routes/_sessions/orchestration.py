@@ -4859,14 +4859,6 @@ async def _hold_native_ask_gate_impl(
     )
     # Per-policy ``ask_timeout`` override wins over the spec-level default.
     timeout_s = float(resolve_ask_timeout(engine, result))
-    request_id = data.get("_input_request_id")
-    if phase == Phase.REQUEST and isinstance(request_id, str):
-        params = params.model_copy(
-            update={
-                "input_request_id": request_id,
-                "input_approval_deadline": time.time() + timeout_s,
-            }
-        )
     # Use the caller-supplied id when present (hook retries re-attach to
     # the same elicitation); otherwise mint a fresh one so we can surface
     # this ASK in the native terminal before parking on the web verdict.
@@ -13689,9 +13681,6 @@ async def _evaluate_input_policy(
         body.data["_input_approval_wait_seconds"] = (
             body.data.get("_input_approval_wait_seconds", 0.0) + waited
         )
-        deadline = body.data.get("_input_admission_deadline")
-        if isinstance(deadline, (int, float)) and not isinstance(deadline, bool):
-            body.data["_input_admission_deadline"] = deadline + waited
     if approved:
         return None
     return {

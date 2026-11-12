@@ -798,7 +798,7 @@ async def test_input_ask_approved_falls_through_to_allow(monkeypatch):
     # (the regressed "pending"/silent-deny path); a non-REQUEST phase
     # would mean the wrong gate fired.
     assert held_phases == [Phase.REQUEST]
-    assert body.data["_input_admission_deadline"] == 1900.0
+    assert body.data["_input_admission_deadline"] == 1300.0
     assert body.data["_input_approval_wait_seconds"] == 600.0
     # Approve -> None -> the /events handler forwards the message. A dict
     # here would mean the message was wrongly blocked despite approval.
