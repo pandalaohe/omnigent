@@ -13,6 +13,8 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
+    SqlUsagePriceAliases,
+    SqlUsagePriceEvidence,
     SqlUsageSourceEvent,
     SqlUsageSourceStatus,
     SqlUsageSpeedPoint,
@@ -21,9 +23,16 @@ from omnigent.db.db_models import (
 from omnigent.db.utils import now_epoch, run_write_transaction
 from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
 from omnigent.usage.evidence import SourceEvent, SourceStatus
+from omnigent.usage.prices import PriceAliases, PriceEvidence
 from omnigent.usage.speed import SpeedPoint
 
-EVIDENCE_TABLES = (SqlUsageSourceStatus, SqlUsageSourceEvent, SqlUsageSpeedPoint)
+EVIDENCE_TABLES = (
+    SqlUsageSourceStatus,
+    SqlUsageSourceEvent,
+    SqlUsageSpeedPoint,
+    SqlUsagePriceEvidence,
+    SqlUsagePriceAliases,
+)
 
 
 class UsageEvidenceStore:
@@ -77,6 +86,75 @@ class UsageEvidenceStore:
         UsageSnapshotStore.write_in_session(
             session, owner, "usage.evidence.lock", {"schema_version": 1}
         )
+
+    def upsert_prices(
+        self, owner: str, rows: Sequence[PriceEvidence], aliases: Sequence[PriceAliases]
+    ) -> None:
+        def write(session: Session) -> None:
+            self._lock(session, owner)
+            for row in rows:
+                values: dict[str, Any] = {
+                    "workspace_id": current_workspace_id(),
+                    "owner_id": owner,
+                    "account_id": row.account,
+                    "hour_utc": row.hour,
+                    "model": row.model,
+                    "updated_at": now_epoch(),
+                }
+                if row.estimate is not None:
+                    values.update(row.estimate.model_dump())
+                if row.partitions is not None:
+                    values["partitions"] = [part.model_dump() for part in row.partitions]
+                self._write(session, SqlUsagePriceEvidence, values)
+            for row in aliases:
+                self._write(
+                    session,
+                    SqlUsagePriceAliases,
+                    {
+                        "workspace_id": current_workspace_id(),
+                        "owner_id": owner,
+                        "account_id": row.account,
+                        "mappings": row.mappings,
+                        "observed_at": row.observed_at,
+                        "updated_at": now_epoch(),
+                    },
+                )
+
+        run_write_transaction(self.sessions._write_session(), "report_price_evidence", write)
+
+    def read_prices(
+        self,
+        owner: str,
+        start: int,
+        end: float,
+        account: str | None = None,
+        model: str | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        table = SqlUsagePriceEvidence
+        query = select(table).where(
+            *self.scope(table, owner), table.hour_utc >= start, table.hour_utc < end
+        )
+        alias_query = select(SqlUsagePriceAliases).where(*self.scope(SqlUsagePriceAliases, owner))
+        if account is not None:
+            query = query.where(table.account_id == account)
+            alias_query = alias_query.where(SqlUsagePriceAliases.account_id == account)
+        if model is not None:
+            query = query.where(table.model == model)
+        with self.sessions._read_session()("read_price_evidence") as session:
+            rows = [
+                {column.name: getattr(row, column.name) for column in table.__table__.columns}
+                for row in session.scalars(query)
+            ]
+            aliases = [
+                {
+                    "account": row.account_id,
+                    "mappings": row.mappings,
+                    "observed_at": row.observed_at,
+                    "updated_at": row.updated_at,
+                }
+                for row in session.scalars(alias_query.order_by(SqlUsagePriceAliases.account_id))
+            ]
+            return rows, aliases
 
     def upsert_speed(self, owner: str, rows: Sequence[SpeedPoint]) -> int:
         def write(session: Session) -> int:
@@ -287,6 +365,8 @@ class UsageEvidenceStore:
                 (SqlUsageSourceEvent, SqlUsageSourceEvent.time_utc),
                 (SqlUsageSourceStatus, SqlUsageSourceStatus.updated_at),
                 (SqlUsageSpeedPoint, SqlUsageSpeedPoint.end_utc),
+                (SqlUsagePriceEvidence, SqlUsagePriceEvidence.hour_utc),
+                (SqlUsagePriceAliases, SqlUsagePriceAliases.updated_at),
             ):
                 if table.__tablename__ in before:
                     result[table.__tablename__] = cast(

@@ -3402,6 +3402,41 @@ def _usage_evidence_key(length: int) -> String:
     )
 
 
+class SqlUsagePriceEvidence(OmnigentBase):
+    __tablename__ = "usage_price_evidence"
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, default=0)
+    owner_id: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    account_id: Mapped[str] = mapped_column(_usage_evidence_key(64), primary_key=True, default="")
+    hour_utc: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    model: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    low_usd: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    high_usd: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    missing: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    priced_units: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    usage_units: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    cache_savings_low_usd: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    cache_savings_high_usd: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    rates: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    priced_as: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    price_source: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    price_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    fetched_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    as_of: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    partitions: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[int] = mapped_column(BigInteger)
+
+
+class SqlUsagePriceAliases(OmnigentBase):
+    __tablename__ = "usage_price_aliases"
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, default=0)
+    owner_id: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    account_id: Mapped[str] = mapped_column(_usage_evidence_key(64), primary_key=True, default="")
+    mappings: Mapped[dict[str, str | None]] = mapped_column(JSON)
+    observed_at: Mapped[int | None] = mapped_column(BigInteger)
+    updated_at: Mapped[int] = mapped_column(BigInteger)
+
+
 class SqlUsageSpeedPoint(OmnigentBase):
     __tablename__ = "usage_speed_points"
 

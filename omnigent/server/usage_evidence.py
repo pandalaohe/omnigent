@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from omnigent.db.utils import now_epoch
 from omnigent.stores.usage_evidence_store import EVIDENCE_TABLES, UsageEvidenceStore
 from omnigent.usage.evidence import EvidenceBody, Rejected, SourceEvent, SourceStatus
+from omnigent.usage.prices import PriceAliases, PriceEvidence, aggregate_prices
 from omnigent.usage.ranges import RangeKey, range_spans
 from omnigent.usage.speed import aggregate_speed
 
@@ -41,9 +42,31 @@ class UsageEvidenceService:
                 skipped.append({"section": "sources", "index": index, "reason": "out_of_range"})
                 continue
             rows.append(row)
+        prices = []
+        aliases = []
+        for section, raws, schema, target in (
+            ("prices", body.prices, PriceEvidence, prices),
+            ("price_aliases", body.price_aliases, PriceAliases, aliases),
+        ):
+            for index, raw in enumerate(raws):
+                try:
+                    row = schema.model_validate(raw)
+                except ValidationError:
+                    skipped.append({"section": section, "index": index, "reason": "invalid_value"})
+                    continue
+                stamp = row.hour if isinstance(row, PriceEvidence) else row.observed_at
+                if stamp is not None and (
+                    stamp < cutoff
+                    or (isinstance(row, PriceEvidence) and stamp + 3600 > now_epoch())
+                ):
+                    skipped.append({"section": section, "index": index, "reason": "out_of_range"})
+                    continue
+                target.append(row)
+        if prices or aliases:
+            self.store.upsert_prices(owner, prices, aliases)
         applied = self.store.upsert_status(owner, rows) if rows else 0
         return {
-            "applied": {"prices": 0, "price_aliases": 0, "sources": applied},
+            "applied": {"prices": len(prices), "price_aliases": len(aliases), "sources": applied},
             "skipped": skipped,
         }
 
@@ -70,6 +93,42 @@ class UsageEvidenceService:
             self.store.insert_events(owner, events) if events else {"accepted": 0, "duplicates": 0}
         )
         return dict(result, rejected=rejected)
+
+    def read_prices(
+        self,
+        owner: str,
+        range_key: RangeKey = "h24",
+        tz: str = "UTC",
+        account: str | None = None,
+        model: str | None = None,
+        detail: str | None = None,
+        from_date: date | None = None,
+        to_date: date | None = None,
+    ) -> dict[str, Any]:
+        if range_key == "period":
+            raise ValueError("Invalid price range")
+        now = now_epoch()
+        try:
+            span, _ = range_spans(
+                range_key, now, ZoneInfo(tz), from_date=from_date, to_date=to_date
+            )
+        except KeyError:
+            raise ValueError("Invalid timezone") from None
+        rows, aliases = self.store.read_prices(
+            owner, span.counted_from, span.until, account, model
+        )
+        return {
+            "generated_at": now,
+            "range": range_key,
+            "span": {
+                "requested_from": span.requested_from,
+                "counted_from": span.counted_from,
+                "until": span.until,
+                "approx": span.approx,
+            },
+            "rows": aggregate_prices(rows, detail == "hours"),
+            "aliases": aliases,
+        }
 
     def read_speed(
         self,

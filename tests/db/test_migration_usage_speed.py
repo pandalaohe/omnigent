@@ -26,6 +26,6 @@ def test_speed_migration_roundtrip(db_uri):
         config = Config()
         config.set_main_option("script_location", "omnigent/db/migrations")
         script = ScriptDirectory.from_config(config)
-        assert script.get_heads() == ["a67c20261112"]
+        assert script.get_heads() == ["a68c20261112"]
     finally:
         _alembic_command(db_uri, migration_engine, "upgrade", "head")

@@ -79,6 +79,29 @@ def create_usage_evidence_router(
             raise HTTPException(422, "Invalid CloudEvents envelope") from None
         return await call(service.report_events, user, parsed)
 
+    @router.get("/me/usage/prices")
+    async def prices(
+        request: Request,
+        range_key: Annotated[RangeKey, Query(alias="range")] = "h24",
+        tz: str = "UTC",
+        account: Account | None = None,
+        model: Annotated[str | None, Query(max_length=128)] = None,
+        detail: Literal["hours"] | None = None,
+        from_date: Annotated[date | None, Query(alias="from")] = None,
+        to_date: Annotated[date | None, Query(alias="to")] = None,
+    ) -> JSONResponse:
+        return await call(
+            service.read_prices,
+            owner(request),
+            range_key,
+            tz,
+            account,
+            model,
+            detail,
+            from_date,
+            to_date,
+        )
+
     @router.get("/me/usage/speed")
     async def speed(
         request: Request,

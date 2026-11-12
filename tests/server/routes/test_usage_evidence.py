@@ -2,6 +2,7 @@
 
 import json
 from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 import pytest
@@ -165,6 +166,7 @@ async def test_indexed_event_rejections_and_single_mode(request, db_uri):
         ("GET", "events"),
         ("GET", "sources"),
         ("GET", "speed"),
+        ("GET", "prices"),
         ("POST", "events"),
         ("PUT", "evidence"),
     ],
@@ -264,6 +266,7 @@ async def test_real_key_scope_and_disabled_gate(db_uri):
                 ("GET", "events", {}),
                 ("GET", "sources", {}),
                 ("GET", "speed", {}),
+                ("GET", "prices", {}),
                 ("PUT", "evidence", {"json": {"schema_version": 1}}),
                 (
                     "POST",
@@ -276,9 +279,8 @@ async def test_real_key_scope_and_disabled_gate(db_uri):
                     },
                 ),
             ]:
-                response = await client.request(
-                    method, "/v1/me/usage/" + suffix, **dict({"headers": headers}, **kwargs)
-                )
+                request_kwargs: dict[str, Any] = dict({"headers": headers}, **kwargs)
+                response = await client.request(method, "/v1/me/usage/" + suffix, **request_kwargs)
                 assert response.status_code == expected, response.text
     disabled = FastAPI()
     disabled.include_router(
@@ -288,3 +290,43 @@ async def test_real_key_scope_and_disabled_gate(db_uri):
         transport=httpx.ASGITransport(app=disabled), base_url="http://test"
     ) as client:
         assert (await client.get("/v1/me/usage/events", headers=headers)).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_price_door_read_labels_and_owner_isolation(request, db_uri):
+    app = request.getfixturevalue("authenticated_app")
+    _make_user(db_uri, "owner@example.test", is_admin=False)
+    _make_user(db_uri, "other@example.test", is_admin=False)
+    headers = _headers("owner@example.test")
+    hour = (now_epoch() // 3600 - 1) * 3600
+    payload = {
+        "schema_version": 1,
+        "prices": [
+            {
+                "account": "a",
+                "hour": hour,
+                "model": "model-a",
+                "estimate": {
+                    "state": "exact",
+                    "low_usd": "0.10",
+                    "high_usd": "0.10",
+                    "price_source": "public",
+                    "price_version": "v1",
+                    "fetched_at": hour,
+                },
+            }
+        ],
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.put("/v1/me/usage/evidence", headers=headers, json=payload)
+        assert response.status_code == 200, response.text
+        assert response.json()["applied"]["prices"] == 1
+        response = await client.get("/v1/me/usage/prices?detail=hours", headers=headers)
+        assert response.status_code == 200, response.text
+        assert response.json()["rows"][0]["hourly"][0]["estimate"]["price_source"] == "public"
+        assert (
+            await client.get("/v1/me/usage/prices", headers=_headers("other@example.test"))
+        ).json()["rows"] == []
+        assert (await client.get("/v1/me/usage/prices?tz=bad", headers=headers)).status_code == 422

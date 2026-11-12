@@ -47,6 +47,8 @@ class EvidenceBody(BaseModel):
 
     schema_version: Annotated[StrictInt, Field(ge=1, le=1)]
     sources: Annotated[list[dict[str, Any]], Field(max_length=128)] = []
+    prices: Annotated[list[dict[str, Any]], Field(max_length=500)] = []
+    price_aliases: Annotated[list[dict[str, Any]], Field(max_length=64)] = []
 
 
 class SourceEvent(BaseModel):
