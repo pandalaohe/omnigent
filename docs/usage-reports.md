@@ -187,6 +187,70 @@ between accounts requires a removal and replacement; it is complete only when
 neither response holds or skips an entry. There is no cross-account transaction.
 See **Usage → Issues** for attributable rejected or failed source reports.
 
+## Source status and events
+
+External collectors can push status snapshots and notifications independently of
+account report v2. Both doors require the authenticated owner's `usage` scope
+and store evidence in the current workspace. They create no accounts, activity
+or activity-writer claims. A v2 receipt does not confirm either evidence channel.
+
+Send `PUT /v1/me/usage/evidence` with `Content-Type: application/json`:
+
+```json
+{
+  "schema_version": 1,
+  "sources": [{"account": null, "source": "collector", "state": "ok"}]
+}
+```
+
+`sources` accepts up to 128 rows. Omit `account` or use null for source-wide
+status; otherwise use the same account id pattern as report v2. Optional
+`last_ok`, `last_error_at`, `observed_at` and `fresh_until` are Unix seconds.
+States are `ok`, `auth_failed`, `credential_missing`, `not_configured`,
+`format_changed`, `unreachable`, `paused`, `never_read`, `session_expired`,
+`access_denied`, `expiring` and `unknown`. Repeating `(account, source)` replaces
+the snapshot; omitting `sources` changes nothing. The 200 reply contains
+`applied: {prices, price_aliases, sources}` and indexed `skipped` entries with
+`invalid_value` or `out_of_range`. This version accepts the sources section;
+price sections become available with the price-evidence routes.
+
+Send events to `POST /v1/me/usage/events` in CloudEvents 1.0 structured mode
+(`application/cloudevents+json`, one object) or batch mode
+(`application/cloudevents-batch+json`, up to 500 objects). Required attributes:
+`specversion: "1.0"`, `id`, `source` (a URI-reference), `type`, and RFC 3339 `time`.
+The three identity/type strings are limited to 128 characters. Optional `subject`
+is an account id; omit it for a source-wide event. Optional `severity` is `error`,
+`warn`, `info` (default) or `recover`. `data` is a JSON object up to 4 KiB and 16
+levels deep; `datacontenttype`, when supplied, must be `application/json`.
+
+The first event with `(source, id)` wins. Replays return duplicates without
+changing the stored event. A 200 reply contains `accepted`, `duplicates` and
+indexed `rejected` entries: `invalid_attribute`, `data_too_large`, `out_of_range`
+or `future_time` (over 300 seconds ahead). An invalid envelope, more than 500
+events or a body over 1 MiB returns 422 with nothing stored. Both doors cap
+bodies at 1 MiB; `usage.ingest.max_body_bytes.evidence` may lower this limit.
+Retry an unknown-outcome body before newer writes on that channel. Duplicates
+are successful receipts; skipped/rejected rows require producer corrections.
+
+Read `GET /v1/me/usage/sources[?account=...]` for snapshots with
+`current: true|false|null`: freshness is unknown without `fresh_until`, and an
+old `ok` has `current: false`. Read `GET /v1/me/usage/events` with optional
+`account`, `source`, `severity`, `before` and `limit` (1–200, default 50).
+Events are newest first, with descending `(source, id)` ties. Return
+`next_before` unchanged as `before` to fetch another page with the same filters.
+Event `time`, `generated_at` and `earliest_time` are Unix seconds; `stored` counts
+all stored events matching the filters before cursor pagination.
+`history_complete` remains false: the oldest stored event proves no continuity.
+Omitting the account filter includes source-wide rows.
+
+Evidence remains in the server database for `usage.evidence.retention_days`
+(default 400). A daily task deletes old events by their event time and status
+by `observed_at`, falling back to receipt time when absent. Intake skips older
+observations, so replay cannot recreate pruned history. Account removal deletes
+that account's evidence; user removal also deletes source-wide evidence. A code
+rollback leaves the archive tables in place; an explicit schema downgrade drops
+their rows and requires a database backup and deliberate removal procedure.
+
 ## State, changes and removal
 
 The server database stores account readings, report outcomes and hourly activity

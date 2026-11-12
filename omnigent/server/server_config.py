@@ -157,6 +157,31 @@ def task_board_enabled(config: Mapping[str, Any]) -> bool:
     return not isinstance(raw, Mapping) or raw.get("enabled", True) is not False
 
 
+def usage_evidence_retention_days(config: Mapping[str, Any]) -> int:
+    """Keep evidence intake and the daily prune on the same configured horizon."""
+    raw: Any = config
+    for name in ("usage", "evidence"):
+        raw = raw.get(name) or {}
+        if not isinstance(raw, Mapping):
+            raise ValueError("usage.evidence.retention_days requires a positive integer")
+    days = raw.get("retention_days", 400)
+    if type(days) is not int or not 1 <= days <= 36500:
+        raise ValueError("usage.evidence.retention_days requires an integer from 1 to 36500")
+    return days
+
+
+def usage_evidence_body_limit(config: Mapping[str, Any]) -> int:
+    raw: Any = config
+    for name in ("usage", "ingest", "max_body_bytes"):
+        raw = raw.get(name) or {}
+        if not isinstance(raw, Mapping):
+            raise ValueError("usage.ingest.max_body_bytes.evidence requires a positive integer")
+    limit = raw.get("evidence", 1024 * 1024)
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("usage.ingest.max_body_bytes.evidence requires a positive integer")
+    return limit
+
+
 def usage_import_body_limit(config: Mapping[str, Any]) -> int:
     """Validate the import door's byte cap at server startup."""
     raw: Any = config

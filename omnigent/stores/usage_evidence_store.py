@@ -1,0 +1,250 @@
+"""Workspace-scoped source evidence with idempotent dialect-native writes."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from typing import Any, cast
+
+from sqlalchemy import CursorResult, delete, func, select
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.orm import Session
+
+from omnigent.db.account_authority import require_active_account
+from omnigent.db.db_models import SqlUsageSourceEvent, SqlUsageSourceStatus, current_workspace_id
+from omnigent.db.utils import now_epoch, run_write_transaction
+from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
+from omnigent.usage.evidence import SourceEvent, SourceStatus
+
+EVIDENCE_TABLES = (SqlUsageSourceStatus, SqlUsageSourceEvent)
+
+
+class UsageEvidenceStore:
+    def __init__(self, storage_location: str) -> None:
+        self.sessions = UsageSnapshotStore(storage_location)
+
+    @staticmethod
+    def scope(table: Any, owner: str) -> tuple[Any, ...]:
+        return (table.workspace_id == current_workspace_id(), table.owner_id == owner)
+
+    @staticmethod
+    def _write(
+        session: Session, table: Any, values: dict[str, Any], *, once: bool = False
+    ) -> bool:
+        dialect = session.get_bind().dialect.name
+        key = [column.name for column in table.__table__.primary_key]
+        insert = (
+            mysql_insert
+            if dialect == "mysql"
+            else sqlite_insert
+            if dialect == "sqlite"
+            else pg_insert
+        )
+        proposed: Any = insert(table).values(**values)
+        if dialect == "mysql":
+            if once:
+                # IGNORE can hide invalid values; a no-op conflict update cannot.
+                statement = proposed.on_duplicate_key_update(event_id=proposed.inserted.event_id)
+                # MySQL reports a no-op update as 1 with FOUND_ROWS; check under
+                # the owner lock instead of using ambiguous affected-row counts.
+                if session.get(table, tuple(values[name] for name in key)) is not None:
+                    return False
+            else:
+                statement = proposed.on_duplicate_key_update(
+                    **{name: value for name, value in values.items() if name not in key}
+                )
+        elif once:
+            statement = proposed.on_conflict_do_nothing(index_elements=key).returning(
+                table.event_id
+            )
+            return session.execute(statement).scalar_one_or_none() is not None
+        else:
+            statement = proposed.on_conflict_do_update(
+                index_elements=key,
+                set_={name: value for name, value in values.items() if name not in key},
+            )
+        return cast(CursorResult[Any], session.execute(statement)).rowcount == 1
+
+    def _lock(self, session: Session, owner: str) -> None:
+        require_active_account(session, owner)
+        UsageSnapshotStore.write_in_session(
+            session, owner, "usage.evidence.lock", {"schema_version": 1}
+        )
+
+    def upsert_status(self, owner: str, rows: Sequence[SourceStatus]) -> int:
+        def write(session: Session) -> int:
+            self._lock(session, owner)
+            for row in rows:
+                values = row.model_dump(exclude={"account"})
+                self._write(
+                    session,
+                    SqlUsageSourceStatus,
+                    dict(
+                        values,
+                        workspace_id=current_workspace_id(),
+                        owner_id=owner,
+                        account_id=row.account or "",
+                        updated_at=now_epoch(),
+                    ),
+                )
+            return len(rows)
+
+        return run_write_transaction(self.sessions._write_session(), "report_source_status", write)
+
+    def insert_events(self, owner: str, events: Sequence[SourceEvent]) -> dict[str, int]:
+        def write(session: Session) -> dict[str, int]:
+            self._lock(session, owner)
+            accepted = 0
+            for event in events:
+                accepted += self._write(
+                    session,
+                    SqlUsageSourceEvent,
+                    {
+                        "workspace_id": current_workspace_id(),
+                        "owner_id": owner,
+                        "source": event.source,
+                        "event_id": event.id,
+                        "account_id": event.subject or "",
+                        "type": event.type,
+                        "time_utc": event.time_utc,
+                        "severity": event.severity,
+                        "data": event.data,
+                        "received_at": now_epoch(),
+                    },
+                    once=True,
+                )
+            return {"accepted": accepted, "duplicates": len(events) - accepted}
+
+        return run_write_transaction(
+            self.sessions._write_session(), "archive_source_events", write
+        )
+
+    def read_sources(self, owner: str, account: str | None = None) -> list[dict[str, Any]]:
+        table = SqlUsageSourceStatus
+        query = select(table).where(*self.scope(table, owner))
+        if account is not None:
+            query = query.where(table.account_id == account)
+        with self.sessions._read_session()("read_source_status") as session:
+            return [
+                dict(
+                    account=row.account_id or None,
+                    **{
+                        name: getattr(row, name)
+                        for name in (
+                            "source",
+                            "state",
+                            "last_ok",
+                            "last_error_at",
+                            "observed_at",
+                            "fresh_until",
+                            "updated_at",
+                        )
+                    },
+                )
+                for row in session.scalars(query.order_by(table.account_id, table.source))
+            ]
+
+    def read_events(
+        self,
+        owner: str,
+        *,
+        account: str | None = None,
+        source: str | None = None,
+        severity: str | None = None,
+        before: tuple[int, str, str] | None = None,
+        limit: int = 50,
+    ) -> tuple[list[dict[str, Any]], int | None, int]:
+        table = SqlUsageSourceEvent
+        query = select(table).where(*self.scope(table, owner))
+        for column, value in (
+            (table.account_id, account),
+            (table.source, source),
+            (table.severity, severity),
+        ):
+            if value is not None:
+                query = query.where(column == value)
+        with self.sessions._read_session()("read_source_events") as session:
+            filtered = query.subquery()
+            oldest, stored = session.execute(
+                select(func.min(filtered.c.time_utc), func.count()).select_from(filtered)
+            ).one()
+            if before is not None:
+                stamp, source_key, event_id = before
+                query = query.where(
+                    (table.time_utc < stamp)
+                    | ((table.time_utc == stamp) & (table.source < source_key))
+                    | (
+                        (table.time_utc == stamp)
+                        & (table.source == source_key)
+                        & (table.event_id < event_id)
+                    )
+                )
+            rows = session.scalars(
+                query.order_by(
+                    table.time_utc.desc(), table.source.desc(), table.event_id.desc()
+                ).limit(limit + 1)
+            )
+            return (
+                [
+                    {
+                        "id": row.event_id,
+                        "source": row.source,
+                        "type": row.type,
+                        "time": row.time_utc,
+                        "account": row.account_id or None,
+                        "severity": row.severity,
+                        "data": row.data,
+                    }
+                    for row in rows
+                ],
+                oldest,
+                stored,
+            )
+
+    @staticmethod
+    def delete_in_session(session: Session, owner: str, account: str | None = None) -> None:
+        for table in EVIDENCE_TABLES:
+            query = delete(table).where(*UsageEvidenceStore.scope(table, owner))
+            if account is not None:
+                query = query.where(table.account_id == account)
+            session.execute(query)
+
+    def delete_account(self, owner: str, account: str) -> None:
+        run_write_transaction(
+            self.sessions._write_session(),
+            "remove_account_evidence",
+            lambda session: self.delete_in_session(session, owner, account),
+        )
+
+    def delete_owner(self, owner: str) -> None:
+        run_write_transaction(
+            self.sessions._write_session(),
+            "remove_owner_evidence",
+            lambda session: self.delete_in_session(session, owner),
+        )
+
+    def prune(self, before: Mapping[str, int]) -> Mapping[str, int]:
+        def write(session: Session) -> dict[str, int]:
+            result = {}
+            for table, column in (
+                (SqlUsageSourceEvent, SqlUsageSourceEvent.time_utc),
+                (
+                    SqlUsageSourceStatus,
+                    func.coalesce(
+                        SqlUsageSourceStatus.observed_at, SqlUsageSourceStatus.updated_at
+                    ),
+                ),
+            ):
+                if table.__tablename__ in before:
+                    result[table.__tablename__] = cast(
+                        CursorResult[Any],
+                        session.execute(
+                            delete(table).where(
+                                column < before[table.__tablename__],
+                            )
+                        ),
+                    ).rowcount
+            return result
+
+        return run_write_transaction(self.sessions._write_session(), "prune_usage_evidence", write)

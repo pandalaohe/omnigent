@@ -97,6 +97,9 @@ def _revoke_durable_authority(session: Session, user_id: str, *, now: int) -> No
     )
     # The hourly usage rows are this user's alone; nothing else reads them and
     # a re-registered account must not inherit the old one's hours.
+    from omnigent.stores.usage_evidence_store import UsageEvidenceStore
+
+    UsageEvidenceStore.delete_in_session(session, user_id)
     session.execute(
         delete(SqlUsageHour).where(
             SqlUsageHour.workspace_id == workspace_id,

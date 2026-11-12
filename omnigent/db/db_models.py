@@ -3391,6 +3391,51 @@ class SqlUsageProducer(OmnigentBase):
     binding: Mapped[str] = mapped_column(Text, nullable=False)
 
 
+def _usage_evidence_key(length: int) -> String:
+    return String(length).with_variant(
+        MySQLVarchar(length, charset="utf8mb4", collation="utf8mb4_0900_bin"), "mysql"
+    )
+
+
+class SqlUsageSourceStatus(OmnigentBase):
+    __tablename__ = "usage_source_status"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, default=0)
+    owner_id: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    account_id: Mapped[str] = mapped_column(_usage_evidence_key(64), primary_key=True, default="")
+    source: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    state: Mapped[str] = mapped_column(String(24))
+    last_ok: Mapped[int | None] = mapped_column(BigInteger)
+    last_error_at: Mapped[int | None] = mapped_column(BigInteger)
+    observed_at: Mapped[int | None] = mapped_column(BigInteger)
+    fresh_until: Mapped[int | None] = mapped_column(BigInteger)
+    updated_at: Mapped[int] = mapped_column(BigInteger)
+
+
+class SqlUsageSourceEvent(OmnigentBase):
+    __tablename__ = "usage_source_events"
+    __table_args__ = (
+        Index(
+            "ix_usage_source_events_account_time",
+            "workspace_id",
+            "owner_id",
+            "account_id",
+            "time_utc",
+        ),
+    )
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, default=0)
+    owner_id: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    source: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    event_id: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    account_id: Mapped[str] = mapped_column(_usage_evidence_key(64), default="")
+    type: Mapped[str] = mapped_column(String(128))
+    time_utc: Mapped[int] = mapped_column(BigInteger)
+    severity: Mapped[str] = mapped_column(String(8))
+    data: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    received_at: Mapped[int] = mapped_column(BigInteger)
+
+
 class SqlUsagePricingDefaults(OmnigentBase):
     """Revision authority and defaults, outside the preferences envelope."""
 
