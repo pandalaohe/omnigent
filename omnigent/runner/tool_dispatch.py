@@ -8949,9 +8949,12 @@ async def _session_info_item(
         ),
         "sub_agent_name": snap.get("sub_agent_name"),
         "reasoning_effort": snap.get("reasoning_effort"),
-        # Effective model: a per-session override wins over the
-        # agent spec's default; both may be None when unset.
-        "model": snap.get("model_override") or snap.get("llm_model"),
+        # Native agy's snapshot carries readback; the override is only a request.
+        "model": (
+            snap.get("llm_model") or snap.get("model_override")
+            if snap.get("harness") == "antigravity-native"
+            else snap.get("model_override") or snap.get("llm_model")
+        ),
         "workspace": snap.get("workspace"),
         "worktree": snap.get("worktree"),
         "git_branch": snap.get("git_branch"),

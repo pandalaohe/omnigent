@@ -6528,3 +6528,58 @@ async def test_root_exit_drains_child_observation_after_row_registration_fails(
             for pending_task in leftovers:
                 pending_task.cancel()
             await asyncio.gather(*leftovers, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_actual_response_model_overrides_requested_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+    state = reader._ReaderState(
+        seen=set(),
+        interacted=set(),
+        model_catalog=_FAKE_CATALOG,
+        model_observed_at=reader.datetime(2026, 1, 1, tzinfo=reader.UTC),
+    )
+    client = cast(httpx.AsyncClient, object())
+    for step in [_user_input_with_model("MODEL_PLACEHOLDER_M132"), _planner_with_model_usage()]:
+        await reader._maybe_emit_model_change(
+            step, client=client, session_id=_SESSION_ID, state=state
+        )
+    reports = [data for kind, data in sink.posts if kind == "external_model_change"]
+    assert reports[-1] == {"model": "Gemini 2.5 Flash", "confirmed": True}
+    assert reports[0]["confirmed"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        "accept-edits · Claude Opus 5.5 · high\n\n\n",
+        "? for shortcuts accept-edits · Claude Opus 5.5 · high\n\n\n",
+        "loading",
+        "",
+    ],
+)
+async def test_body_cannot_confirm_a_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body: str,
+) -> None:
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+    monkeypatch.setattr(
+        reader,
+        "read_tmux_info",
+        lambda path: {"socket_path": "/example/socket", "tmux_target": "main"},
+    )
+    state = reader._ReaderState(seen=set(), interacted=set(), bridge_dir=tmp_path)
+    step = copy.deepcopy(_load("planner_response_text"))
+    step["metadata"].pop("modelUsage", None)
+    step["plannerResponse"]["response"] = body
+    client = cast(httpx.AsyncClient, object())
+    await reader._maybe_emit_model_change(step, client=client, session_id=_SESSION_ID, state=state)
+    await reader._repeat_model_report(client, _SESSION_ID, state)
+    reports = [data for kind, data in sink.posts if kind == "external_model_change"]
+    assert reports == [{"model": "unconfirmed", "confirmed": False}]

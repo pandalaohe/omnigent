@@ -4534,3 +4534,333 @@ async def test_relay_leaves_a_turn_on_an_offline_host_to_the_disconnect_hold(
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("actual", "confirmed", "notice"),
+    [
+        ("Claude Opus 5.5", True, None),
+        ("Gemini 3.8 Flash", True, "agy_model_substituted"),
+        ("unconfirmed", False, "agy_model_unconfirmed"),
+    ],
+)
+async def test_agy_readback_preserves_request_and_notifies_parent(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    actual: str,
+    confirmed: bool,
+    notice: str | None,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.server.routes._sessions import helpers, orchestration
+    from omnigent.server.schemas import SessionEventInput
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(
+        parent_conversation_id=parent.id,
+        model_override="claude-opus-5-5",
+        harness_override="antigravity-native",
+    )
+    wake = AsyncMock(return_value=True)
+    monkeypatch.setattr(orchestration, "_post_system_message", wake)
+    event = SessionEventInput(
+        type="external_model_change", data={"model": actual, "confirmed": confirmed}
+    )
+    await helpers._persist_external_model_change(child.id, child, event, store)
+    saved = store.get_conversation(child.id)
+    assert saved is not None
+    assert saved.model_override == "claude-opus-5-5"
+    assert saved.reported_model == (actual if confirmed else None)
+    notices = [item.data for item in store.list_items(child.id).data if item.type == "error"]
+    assert [item.code for item in notices] == ([notice] if notice else [])
+    assert all(item.level == "info" for item in notices)
+    if notice == "agy_model_substituted":
+        wake.assert_awaited_once()
+        assert wake.call_args.args[0] == parent.id
+        assert actual in wake.call_args.args[1]
+    else:
+        wake.assert_not_awaited()
+    # A replay must not emit a second parent wake or duplicate visible notice.
+    await helpers._persist_external_model_change(child.id, saved, event, store)
+    assert len([item for item in store.list_items(child.id).data if item.type == "error"]) == len(
+        notices
+    )
+    assert wake.await_count == (1 if notice == "agy_model_substituted" else 0)
+
+
+@pytest.mark.asyncio
+async def test_agy_parent_notice_retries_after_failed_delivery(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.server.routes._sessions import helpers, orchestration
+    from omnigent.server.schemas import SessionEventInput
+
+    clock = [1_000_000]
+    monkeypatch.setattr(helpers, "now_epoch", lambda: clock[0])
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(
+        parent_conversation_id=parent.id,
+        model_override="claude-opus-5-5",
+        harness_override="antigravity-native",
+    )
+    wake = AsyncMock(side_effect=[False, True])
+    monkeypatch.setattr(orchestration, "_post_system_message", wake)
+    event = SessionEventInput(
+        type="external_model_change", data={"model": "Gemini 3.8 Flash", "confirmed": True}
+    )
+    for attempt in range(3):
+        clock[0] += 3
+        fresh = store.get_conversation(child.id)
+        assert fresh is not None
+        await helpers._persist_external_model_change(child.id, fresh, event, store)
+        saved = store.get_conversation(child.id)
+        assert saved is not None
+        assert any(key.startswith(helpers._AGY_PENDING_MODEL_NOTICE) for key in saved.labels) == (
+            attempt == 0
+        )
+    assert wake.await_count == 2
+    assert wake.call_args_list[0] == wake.call_args_list[1]
+    notices = [item for item in store.list_items(child.id).data if item.type == "error"]
+    assert len(notices) == 1
+    assert notices[0].data.code == "agy_model_substituted"
+
+
+@pytest.mark.asyncio
+async def test_agy_historical_response_cannot_replace_current_model(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import UTC, datetime
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.antigravity_native import reader
+    from omnigent.server.routes._sessions import helpers, orchestration
+    from omnigent.server.schemas import SessionEventInput
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(
+        parent_conversation_id=parent.id,
+        model_override="gemini-3-8-flash",
+        harness_override="antigravity-native",
+    )
+    store.update_conversation(child.id, reported_model="Gemini 3.8 Flash")
+    wake = AsyncMock(return_value=True)
+    monkeypatch.setattr(orchestration, "_post_system_message", wake)
+
+    async def post(client: Any, session_id: str, event: Any) -> None:
+        if event.event_type == "external_model_change":
+            fresh = store.get_conversation(session_id)
+            assert fresh is not None
+            await helpers._persist_external_model_change(
+                session_id, fresh, SessionEventInput(type=event.event_type, data=event.data), store
+            )
+
+    monkeypatch.setattr(reader, "_post_event", post)
+    monkeypatch.setattr(
+        reader,
+        "read_tmux_info",
+        lambda path: {"socket_path": "/example/socket", "tmux_target": "main"},
+    )
+    state = reader._ReaderState(
+        seen=set(),
+        interacted=set(),
+        bridge_dir=tmp_path,
+        current_model="Gemini 3.8 Flash",
+        model_catalog={},
+        model_observed_at=datetime(2026, 11, 12, 9, tzinfo=UTC),
+    )
+    stale = {
+        "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+        "status": "CORTEX_STEP_STATUS_DONE",
+        "metadata": {
+            "completedAt": "2026-11-12T08:00:00Z",
+            "modelUsage": {"model": "Claude Opus 5.5"},
+        },
+    }
+    await reader._repeat_model_report(cast(Any, None), child.id, state)
+    await reader._maybe_emit_model_change(
+        stale, client=cast(Any, None), session_id=child.id, state=state
+    )
+    await reader._repeat_model_report(cast(Any, None), child.id, state)
+    saved = store.get_conversation(child.id)
+    assert saved is not None and saved.reported_model == "Gemini 3.8 Flash"
+    wake.assert_not_awaited()
+    assert not [item for item in store.list_items(child.id).data if item.type == "error"]
+    fresh_step = {
+        **stale,
+        "metadata": {**stale["metadata"], "completedAt": "2026-11-12T09:01:00Z"},
+    }
+    await reader._maybe_emit_model_change(
+        fresh_step, client=cast(Any, None), session_id=child.id, state=state
+    )
+    # Replaying old A and repeating the current observation cannot undo fresh readback.
+    await reader._maybe_emit_model_change(
+        stale, client=cast(Any, None), session_id=child.id, state=state
+    )
+    await reader._repeat_model_report(cast(Any, None), child.id, state)
+    saved = store.get_conversation(child.id)
+    assert saved is not None and saved.reported_model == "Claude Opus 5.5"
+    wake.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial_recovery", [False, True])
+async def test_agy_two_substitutions_survive_parent_outage(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    partial_recovery: bool,
+) -> None:
+    from omnigent.server.routes._sessions import helpers, orchestration
+    from omnigent.server.schemas import SessionEventInput
+
+    clock = [1_000_000]
+    monkeypatch.setattr(helpers, "now_epoch", lambda: clock[0])
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(
+        parent_conversation_id=parent.id,
+        model_override="claude-opus-5-5",
+        harness_override="antigravity-native",
+    )
+    available = False
+    failed_once = False
+    delivered: list[str] = []
+
+    async def wake(parent_id: str, text: str, **kwargs: Any) -> bool:
+        nonlocal failed_once
+        assert parent_id == parent.id
+        if not available:
+            return False
+        if partial_recovery and not failed_once:
+            failed_once = True
+            return False
+        delivered.append(text)
+        return True
+
+    monkeypatch.setattr(orchestration, "_post_system_message", wake)
+    models = ["Gemini 3.8 Flash", "Gemini 3.8 Pro"]
+    for index, model in enumerate(models):
+        fresh = store.get_conversation(child.id)
+        assert fresh is not None
+        event = SessionEventInput(
+            type="external_model_change", data={"model": model, "confirmed": True}
+        )
+        await helpers._persist_external_model_change(child.id, fresh, event, store)
+        saved = store.get_conversation(child.id)
+        assert saved is not None
+        pending = [
+            value
+            for key, value in saved.labels.items()
+            if key.startswith(helpers._AGY_PENDING_MODEL_NOTICE)
+        ]
+        assert len(pending) == 1
+        assert json.loads(pending[0])["m"] == models[: index + 1]
+    assert delivered == []
+    available = True
+    for _ in range(3):
+        clock[0] += 3
+        fresh = store.get_conversation(child.id)
+        assert fresh is not None
+        await helpers._persist_external_model_change(child.id, fresh, event, store)
+    assert len(delivered) == 1
+    assert all(model in delivered[0] for model in models)
+    saved = store.get_conversation(child.id)
+    assert saved is not None and saved.reported_model == models[-1]
+    assert not any(key.startswith(helpers._AGY_PENDING_MODEL_NOTICE) for key in saved.labels)
+    notices = [item for item in store.list_items(child.id).data if item.type == "error"]
+    assert len(notices) == 2
+    assert all(item.data.code == "agy_model_substituted" for item in notices)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent_end", ["offline", "archived", "closed", "deleted"])
+async def test_agy_unreachable_parent_has_bounded_summary_and_retries(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    parent_end: str,
+) -> None:
+    from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
+    from omnigent.server.routes._sessions import helpers, orchestration
+    from omnigent.server.schemas import SessionEventInput
+
+    clock = [1_000_000]
+    monkeypatch.setattr(helpers, "now_epoch", lambda: clock[0])
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(
+        parent_conversation_id=parent.id,
+        model_override="requested-model",
+        harness_override="antigravity-native",
+    )
+    sends: list[str] = []
+    available = False
+
+    async def wake(parent_id: str, text: str, **kwargs: Any) -> bool:
+        sends.append(text)
+        return available
+
+    monkeypatch.setattr(orchestration, "_post_system_message", wake)
+    for index in range(100):
+        fresh = store.get_conversation(child.id)
+        assert fresh is not None
+        event = SessionEventInput(
+            type="external_model_change", data={"model": f"substitute-{index}", "confirmed": True}
+        )
+        await helpers._persist_external_model_change(child.id, fresh, event, store)
+        saved = store.get_conversation(child.id)
+        assert saved is not None
+        pending = {
+            key: value
+            for key, value in saved.labels.items()
+            if key.startswith(helpers._AGY_PENDING_MODEL_NOTICE)
+        }
+        assert len(pending) == 1
+        value = pending[helpers._AGY_PENDING_MODEL_NOTICE]
+        assert len(value) <= LABEL_VALUE_MAX_LEN
+        summary = json.loads(value)
+        assert len(summary["m"]) <= 10
+        assert summary["n"] + len(summary["m"]) == index + 1
+    assert len(sends) == 1  # New substitutions do not bypass redelivery cadence.
+    if parent_end == "archived":
+        store.update_conversation(parent.id, archived=True)
+    elif parent_end == "closed":
+        store.set_labels(parent.id, {"omnigent.closed": "true"})
+    elif parent_end == "deleted":
+        get_conversation = store.get_conversation
+        monkeypatch.setattr(
+            store,
+            "get_conversation",
+            lambda sid: None if sid == parent.id else get_conversation(sid),
+        )
+    for _ in range(5):
+        clock[0] += 3
+        fresh = store.get_conversation(child.id)
+        assert fresh is not None
+        await helpers._persist_external_model_change(child.id, fresh, event, store)
+    saved = store.get_conversation(child.id)
+    assert saved is not None
+    summary = json.loads(saved.labels[helpers._AGY_PENDING_MODEL_NOTICE])
+    assert summary["n"] + len(summary["m"]) == 100
+    assert summary["m"][-1] == "substitute-99"
+    if parent_end == "offline":
+        assert len(sends) == 6  # One attempt per existing 3-second cadence.
+        available = True
+        clock[0] += 3
+        await helpers._persist_external_model_change(child.id, saved, event, store)
+        assert "substitute-99" in sends[-1]
+        assert f"and {summary['n']} earlier" in sends[-1]
+        assert "child history" in sends[-1]
+        saved = store.get_conversation(child.id)
+        assert saved is not None and helpers._AGY_PENDING_MODEL_NOTICE not in saved.labels
+    else:
+        assert summary["stop"] is True
+        assert len(sends) == 1

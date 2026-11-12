@@ -10324,7 +10324,19 @@ async def test_sys_session_share_public_allows_public_grant(level: str, number: 
 
 
 @pytest.mark.asyncio
-async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() -> None:
+@pytest.mark.parametrize(
+    ("harness", "llm_model", "expected_model"),
+    [
+        (None, "anthropic/claude-sonnet-4-6", "claude-opus-4-8"),
+        ("antigravity-native", "Gemini 3.8 Flash", "Gemini 3.8 Flash"),
+        ("antigravity-native", None, "claude-opus-4-8"),
+    ],
+)
+async def test_sys_session_get_info_projects_metadata_and_runner_connectivity(
+    harness: str | None,
+    llm_model: str | None,
+    expected_model: str,
+) -> None:
     """
     ``sys_session_get_info`` projects ``GET /v1/sessions/{id}`` metadata
     and folds in live runner connectivity from ``GET
@@ -10332,8 +10344,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     /v1/hosts/{id}``.
 
     Proves the full runner-dispatch path: read the session snapshot,
-    derive the effective model (a per-session ``model_override`` wins
-    over the spec's ``llm_model``), count pending approval prompts, and
+    derive the effective model (native agy readback wins over its request),
+    count pending approval prompts, and
     attach ``runner_online``. If the projection regressed (dropped a
     field, skipped the runner-status call, or picked the wrong model),
     the asserted values would differ. The transcript is intentionally
@@ -10361,7 +10373,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "reasoning_effort": "high",
                     "parent_session_id": "conv_parent",
                     "sub_agent_name": "researcher",
-                    "llm_model": "anthropic/claude-sonnet-4-6",
+                    "llm_model": llm_model,
+                    "harness": harness,
                     "model_override": "claude-opus-4-8",
                     "workspace": "/repo",
                     "worktree": "/repo/.omnigent/worktrees/conv_target",
@@ -10407,10 +10420,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     }
     assert info["parent_session_id"] == "conv_parent"
     assert info["worktree"] == "/repo/.omnigent/worktrees/conv_target"
-    # Effective model: the per-session override wins over the spec
-    # default. "anthropic/claude-sonnet-4-6" here would mean the
-    # override was ignored.
-    assert info["model"] == "claude-opus-4-8"
+    assert info["model"] == expected_model
     # Two outstanding approval prompts surfaced from the snapshot — both
     # the prompts themselves and a count. If the projection dropped the
     # prompts (count-only), the orchestrator couldn't tell what the

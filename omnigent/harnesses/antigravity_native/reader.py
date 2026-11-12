@@ -72,6 +72,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     AntigravityNativeBridgeState,
     is_placeholder_conversation_id,
     read_bridge_state,
+    read_tmux_info,
     rebind_unmapped_plan_input_receipts,
     reconcile_plan_input_echo,
     write_bridge_state,
@@ -1045,6 +1046,7 @@ async def supervise_reader(
         port=port,
         bridge_dir=bridge_dir,
     )
+    await _repeat_model_report(client, session_id, state)
 
     # Task T-G: the rotation detector records the new cascade id here and the
     # ``stop`` predicate the reader body consults flips to True so the body exits
@@ -1076,6 +1078,7 @@ async def supervise_reader(
                 body_holder[0].cancel()
 
     async def _read_summaries_and_close() -> dict[str, object]:
+        await _repeat_model_report(client, session_id, state)
         return await _reconcile_idle_turn(
             port=port,
             cascade_id=cascade_id,
@@ -1303,6 +1306,9 @@ class _ReaderState:
     observation_notice_at: float = float("-inf")
     last_text: str = ""
     posted_model_enum: str | None = None
+    posted_model_confirmed: bool = False
+    current_model: str | None = None
+    model_observed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     model_catalog: dict[str, object] | None = None
     port: int = 0
     bridge_dir: Path | None = None
@@ -1629,7 +1635,7 @@ async def _commit_step(
             turn_active=state.turn_active,
             bridge_dir=state.bridge_dir,
         )
-        # Telemetry: model-change detection on USER_INPUT (design §10.4).
+        # Requests remain unconfirmed until fresh structured response readback.
         await _maybe_emit_model_change(
             step,
             client=client,
@@ -3055,42 +3061,67 @@ async def _maybe_emit_model_change(
     session_id: str,
     state: _ReaderState,
 ) -> None:
-    """
-    Emit ``external_model_change`` when a USER_INPUT step carries a new model enum.
-
-    Tracks the per-run ``state.posted_model_enum`` baseline; emits only when the
-    turn's requested model differs from the last-emitted enum (design §10.4).
-    Effort is encoded in the model enum (no separate field), so one change event
-    covers both. The catalog is fetched once per run and cached in ``state``.
-
-    De-dup: this function is only called inside the ``key not in state.seen``
-    branch, so a replayed USER_INPUT (already in ``seen``) never reaches here.
-    The enum-vs-posted_enum comparison further deduplicates same-model turns.
-
-    :param step: One RPC step dict (must be a USER_INPUT).
-    :param client: HTTP client for Omnigent event posts.
-    :param session_id: Omnigent conversation id.
-    :param state: Per-run trackers (posted_model_enum + model_catalog + port).
-    :returns: None.
-    """
-    model_enum = _requested_model_enum_from_step(step)
-    if model_enum is None:
+    """Confirm only responses newer than attachment and the last observation."""
+    usage = _model_usage_from_step(step)
+    actual_model = usage.get("model") if usage else None
+    confirmed = isinstance(actual_model, str)
+    if confirmed:
+        metadata = step.get("metadata")
+        observed_at = (
+            _parse_activity_timestamp(metadata.get("completedAt"))
+            or _parse_activity_timestamp(metadata.get("finishedGeneratingAt"))
+            if isinstance(metadata, dict)
+            else None
+        )
+        if observed_at is None or observed_at <= state.model_observed_at:
+            return
+        state.model_observed_at = observed_at
+        model_enum = actual_model
+    else:
+        model_enum = _requested_model_enum_from_step(step)
+    if not isinstance(model_enum, str):
         return
-    if model_enum == state.posted_model_enum:
+    if model_enum == state.posted_model_enum and confirmed == state.posted_model_confirmed:
         return
     catalog = await _ensure_catalog(state)
     display_name = _resolve_display_name(model_enum, catalog)
-    step_idx = _step_index(step) or 0
+    if confirmed:
+        state.current_model = display_name
     await _post_event(
         client,
         session_id,
         OutboundEvent(
             event_type=_EXTERNAL_MODEL_CHANGE,
-            data={"model": display_name},
-            step_index=step_idx,
+            data={"model": display_name, "confirmed": confirmed},
+            step_index=_step_index(step) or 0,
         ),
     )
     state.posted_model_enum = model_enum
+    state.posted_model_confirmed = confirmed
+
+
+async def _repeat_model_report(
+    client: httpx.AsyncClient, session_id: str, state: _ReaderState
+) -> None:
+    """Repeat current evidence so pending parent notices can retry independently."""
+    if (
+        state.bridge_dir is None
+        or await asyncio.to_thread(read_tmux_info, state.bridge_dir) is None
+    ):
+        return
+    async with state.commit_lock:
+        await _post_event(
+            client,
+            session_id,
+            OutboundEvent(
+                event_type=_EXTERNAL_MODEL_CHANGE,
+                data={
+                    "model": state.current_model or "unconfirmed",
+                    "confirmed": state.current_model is not None,
+                },
+                step_index=0,
+            ),
+        )
 
 
 async def _ensure_catalog(state: _ReaderState) -> dict[str, object]:
