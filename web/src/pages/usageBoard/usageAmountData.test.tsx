@@ -416,3 +416,35 @@ it("loads Issues, account activity and account models while the board switch is 
   mount("/usage/board/litellm/models");
   await screen.findByText("model-a");
 });
+
+it("does not compare a subset of account Previous against the selected total", async () => {
+  const { UsageAnalysisChart } = await import("./UsageCostChart");
+  const account = usageActivityFixture().accounts[0];
+  const rows = [account.account, "other"].map((id) => ({
+    account_id: id,
+    parent_account_id: id,
+    pool_id: null,
+    hour: account.span.counted_from,
+    model: "Claude",
+    basis: "metered",
+    tokens: 100,
+    requests: 10,
+    failed: 0,
+    cost_usd: null,
+    contributes_usage: true,
+    contributes_money: false,
+    attributed: false,
+    coverage: "complete",
+    reason: null,
+  }));
+  render(
+    <UsageAnalysisChart
+      rows={rows}
+      span={account.span}
+      unknown={false}
+      previousUnavailable
+      previousAccounts={[account]}
+    />,
+  );
+  expect(screen.getByText("Previous selected hourly series not available yet")).toBeTruthy();
+});

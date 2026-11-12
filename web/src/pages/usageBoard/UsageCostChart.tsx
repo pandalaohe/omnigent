@@ -35,18 +35,25 @@ export function UsageAnalysisChart({
   previousUnavailable: boolean;
   previousAccounts?: UsageAccountActivity[];
 }) {
-  const prior = useMemo(
-    () =>
-      previousAccounts?.length &&
+  const prior = useMemo(() => {
+    const current = new Map<string, number>();
+    for (const row of rows) {
+      if (!row.contributes_usage) continue;
+      if (row.account_id !== row.parent_account_id || row.tokens === null) return [];
+      current.set(row.parent_account_id, (current.get(row.parent_account_id) ?? 0) + row.tokens);
+    }
+    return previousAccounts?.length &&
+      previousAccounts.length === current.size &&
       previousAccounts.every(
         (account) =>
+          current.get(account.account) === account.totals.tokens &&
+          account.totals.tokens_complete &&
           account.previous?.totals.tokens_complete &&
           account.previous.series.every((point) => point.tokens_complete),
       )
-        ? usageChartPoints(previousAccounts, true, false, false, span?.until ?? 0)
-        : [],
-    [previousAccounts, span?.until],
-  );
+      ? usageChartPoints(previousAccounts, true, false, false, span?.until ?? 0)
+      : [];
+  }, [previousAccounts, span?.until, rows]);
   const points = useMemo(() => {
     const buckets = new Map<number, number>();
     for (const row of rows)

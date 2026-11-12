@@ -44,7 +44,7 @@ def test_analysis_selection(
             "coverage": "complete",
             "reason": None,
         }
-        for key, model, tokens, failed in [("a", "M1", 1000000, 0), ("b", "M2", 3000000, 30)]
+        for key, model, tokens, failed in [("a", "Claude", 1000000, 0), ("b", "GPT", 3000000, 30)]
     ]
     browser_contract.json("/v1/info", {"usage_board_enabled": True, "features": {}})
     browser_contract.json("/v1/me/usage", {"generated_at": now, "accounts": accounts})
@@ -78,15 +78,17 @@ def test_analysis_selection(
     table = page.get_by_role("table", name="Each item")
     expect(table).to_contain_text("Alpha")
     expect(table).not_to_contain_text("Beta")
-    expect(page.get_by_role("button", name="M1 token share 100.0%", exact=True)).to_be_visible()
+    expect(
+        page.get_by_role("button", name="Claude token share 100.0%", exact=True)
+    ).to_be_visible()
     page.get_by_role("button", name="Model", exact=True).click()
-    picks.get_by_role("button", name="M2", exact=True).click()
-    expect(table).to_contain_text("M2")
-    expect(table).not_to_contain_text("M1")
+    picks.get_by_role("button", name="GPT", exact=True).click()
+    expect(table).to_contain_text("GPT")
+    expect(table).not_to_contain_text("Claude")
     page.get_by_role("button", name="Pool", exact=True).click()
     picks.get_by_role("button", name="Quota only", exact=True).click()
     expect(table).to_contain_text("Unknown")
-    expect(page.get_by_role("button", name="M2 token share 100.0%", exact=True)).to_have_count(0)
+    expect(page.get_by_role("button", name="GPT token share 100.0%", exact=True)).to_have_count(0)
     page.get_by_role("button", name="90 days", exact=True).click()
     expect(page.get_by_text("90 days has no previous period", exact=True)).to_have_count(2)
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")

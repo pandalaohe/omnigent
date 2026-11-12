@@ -93,6 +93,15 @@ export function UsageAnalysisTable({
     </AnalysisPanel>
   );
 }
+function shareFamily(model: string): string {
+  const name = model.split("/").at(-1) ?? model;
+  if (/^claude(?:[- .]|$)/i.test(name)) return "Claude";
+  if (/^gpt(?:-|$)/i.test(name)) return "GPT";
+  if (/^deepseek(?:[- .]|$)/i.test(name)) return "DeepSeek";
+  if (/^kimi(?:[- .]|$)/i.test(name)) return "Kimi";
+  return "Other";
+}
+
 export function UsageAnalysisShares({
   rows,
   incomplete,
@@ -102,9 +111,10 @@ export function UsageAnalysisShares({
 }) {
   const models = new Map<string, AnalysisRow[]>();
   for (const row of rows.filter((entry) => entry.contributes_usage)) {
-    const group = models.get(row.model) ?? [];
+    const family = shareFamily(row.model);
+    const group = models.get(family) ?? [];
     group.push(row);
-    models.set(row.model, group);
+    models.set(family, group);
   }
   const total = analysisTotals(rows, incomplete).tokens;
   const shares = [...models].map(([model, group]) => ({

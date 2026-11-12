@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 import { UsageCostPage } from "./UsageCostPage";
+import { UsageAnalysisShares } from "./UsageAnalysisAmounts";
 import {
   analysisTotals,
   analysisKey,
@@ -74,7 +75,7 @@ function row(overrides: Partial<AnalysisRow> = {}): AnalysisRow {
     parent_account_id: "a",
     pool_id: null,
     hour: 3600,
-    model: "M1",
+    model: "Claude",
     basis: "metered",
     tokens: 100,
     requests: 10,
@@ -94,7 +95,7 @@ function mount() {
     row({
       account_id: "b",
       parent_account_id: "b",
-      model: "M2",
+      model: "GPT",
       tokens: 300,
       requests: 30,
       failed: 3,
@@ -141,10 +142,10 @@ it("selects the same account for KPI table shares failures and chart", () => {
       name: "Alpha",
     }),
   );
-  expect(screen.getByTestId("selected-chart").textContent).toBe("M1previous unavailable");
+  expect(screen.getByTestId("selected-chart").textContent).toBe("Claudeprevious unavailable");
   expect(screen.getByRole("table")).toHaveTextContent("Alpha");
   expect(screen.getByRole("table")).not.toHaveTextContent("Beta");
-  expect(screen.getByRole("button", { name: "M1 token share 100.0%" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Claude token share 100.0%" })).toBeVisible();
   expect(screen.queryByRole("button", { name: /Beta failure rate/ })).toBeNull();
 });
 it("changes grouping without reusing a different dimension's picks", () => {
@@ -152,9 +153,9 @@ it("changes grouping without reusing a different dimension's picks", () => {
   fireEvent.click(screen.getByRole("button", { name: "Alpha" }));
   fireEvent.click(screen.getByRole("button", { name: "Model" }));
   expect(screen.getByRole("button", { name: "All" })).toHaveAttribute("aria-pressed", "true");
-  fireEvent.click(screen.getByRole("button", { name: "M2" }));
-  expect(screen.getByTestId("selected-chart")).toHaveTextContent("M2previous unavailable");
-  expect(screen.queryByRole("button", { name: /M1 token share/ })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "GPT" }));
+  expect(screen.getByTestId("selected-chart")).toHaveTextContent("GPTprevious unavailable");
+  expect(screen.queryByRole("button", { name: /Claude token share/ })).toBeNull();
 });
 it("keeps a quota-only pool unknown instead of falling back to parent data", () => {
   mount();
@@ -183,7 +184,7 @@ it("does not include hidden accounts in any panel", () => {
   state.hidden = ["b"];
   mount();
   expect(screen.queryByRole("button", { name: "Beta" })).toBeNull();
-  expect(screen.getByTestId("selected-chart")).not.toHaveTextContent("M2");
+  expect(screen.getByTestId("selected-chart")).not.toHaveTextContent("GPT");
 });
 it("labels incomplete data and never publishes a complete share population", () => {
   state.partial = true;
@@ -195,4 +196,19 @@ it("keeps price evidence unavailable rather than presenting reported cost as API
   mount();
   expect(screen.getAllByText("Not available yet · price evidence")[0]).toBeVisible();
   expect(screen.getByRole("table")).not.toHaveTextContent("$2.00");
+});
+
+it("combines versioned model identities into the target families and keeps other models together", () => {
+  render(
+    <UsageAnalysisShares
+      incomplete={false}
+      rows={[
+        row({ model: "anthropic/claude-sonnet", tokens: 100 }),
+        row({ model: "claude-opus", tokens: 200 }),
+        row({ model: "unclassified", tokens: 100 }),
+      ]}
+    />,
+  );
+  expect(screen.getByRole("button", { name: "Claude token share 75.0%" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Other token share 25.0%" })).toBeVisible();
 });
