@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from playwright.sync_api import Page, Request, expect
 
+from tests.browser_ui._task_board_scroll import scroll_to_history_row, wait_for_history_list
 from tests.browser_ui.conftest import BrowserContract
 from tests.browser_ui.test_sessions_appearance import appearance_features as appearance_features
 from tests.browser_ui.test_sessions_appearance import appearance_url as appearance_url
@@ -886,20 +887,18 @@ def test_task_board_history_source_names_and_scroll(
     page.goto(appearance_url + "/task-board")
     names = page.locator(".h-p .h-name b")
     expect(names).to_have_text(source_ids)
+    wait_for_history_list(page, len(source_ids))
     if width == 390:
+        scrolling = []
         for row in page.locator(".h-p").all():
-            row.evaluate("el => el.scrollIntoView({block: 'center'})")
-            assert row.evaluate(
-                "el => { const r = el.getBoundingClientRect(); return el.contains("
-                "document.elementFromPoint(r.x + r.width/2, r.y + r.height/2)); }"
-            )
+            scrolling.append(scroll_to_history_row(row))
         last = page.locator(".h-p").last.bounding_box()
         navigation = page.locator(".tb-view-tabs").bounding_box()
         assert last and navigation and last["y"] + last["height"] <= navigation["y"]
         print(
             "HISTORY_SOURCE_SCROLL",
             theme,
-            json.dumps({"last": last, "navigation": navigation}),
+            json.dumps({"last": last, "navigation": navigation, "rows": scrolling}),
             flush=True,
         )
         page.screenshot(path=str(output / f"history-source-scroll-{width}-{theme}.png"))
