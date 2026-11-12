@@ -24801,6 +24801,38 @@
           },
           {
             "in": "query",
+            "name": "snapshot",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_generation",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source Generation"
+            }
+          },
+          {
+            "in": "query",
             "name": "include_gone",
             "required": false,
             "schema": {
@@ -24884,6 +24916,38 @@
       "get": {
         "operationId": "read_closed_counts_v1_me_tasks_closed_counts_get",
         "parameters": [
+          {
+            "in": "query",
+            "name": "snapshot",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_generation",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source Generation"
+            }
+          },
           {
             "in": "query",
             "name": "from",
@@ -24972,6 +25036,38 @@
       "get": {
         "operationId": "read_history_v1_me_tasks_history_get",
         "parameters": [
+          {
+            "in": "query",
+            "name": "snapshot",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_generation",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source Generation"
+            }
+          },
           {
             "in": "query",
             "name": "after",
@@ -25094,6 +25190,38 @@
               "title": "Uid",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "snapshot",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_generation",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source Generation"
+            }
           }
         ],
         "responses": {
@@ -25200,6 +25328,152 @@
           }
         },
         "summary": "Report Tasks"
+      }
+    },
+    "/v1/me/tasks/sources/{source_id}/display": {
+      "get": {
+        "operationId": "read_display_v1_me_tasks_sources__source_id__display_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "snapshot",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source_generation",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Source Generation"
+            }
+          },
+          {
+            "in": "query",
+            "name": "part",
+            "required": false,
+            "schema": {
+              "default": "identity",
+              "enum": [
+                "identity",
+                "future",
+                "closedDays",
+                "accountDays",
+                "releases"
+              ],
+              "title": "Part",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "From"
+            }
+          },
+          {
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "To"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 1000,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Display"
       }
     },
     "/v1/me/usage": {
