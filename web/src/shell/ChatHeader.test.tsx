@@ -883,6 +883,20 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
   });
 });
 
+describe("ChatHeader — phone session chips", () => {
+  it.each([
+    ["chat view", makeTerminalFirstCtx({ view: "chat" }), false],
+    ["terminal view", makeTerminalFirstCtx({ view: "terminal" }), true],
+    ["shell view", makeTerminalFirstCtx({ isShellView: true }), true],
+  ])("shows the chips in the header only when the composer is hidden (%s)", (_, ctx, shown) => {
+    isMobileMock.mockReturnValue(true);
+    renderHeaderWithSession(ctx);
+    const chip = screen.queryByRole("button", { name: /^Standing approval:/ });
+    if (shown) expect(chip).toBeInTheDocument();
+    else expect(chip).toBeNull();
+  });
+});
+
 describe("ChatHeader — floating mobile controls", () => {
   it("adds glass to the mobile sidebar and shared action container", () => {
     isMobileMock.mockReturnValue(true);
@@ -916,7 +930,8 @@ describe("ChatHeader — floating mobile controls", () => {
         "stdDeviation",
         "4.4",
       );
-      expect(surface).toHaveStyle({ borderRadius: button === toggle ? "22px" : "20px" });
+      // On a session the menu button shares the title pill, so both read the group glass.
+      expect(surface).toHaveStyle({ borderRadius: "20px" });
       expect(button).toHaveClass(
         "size-11",
         "rounded-full",
@@ -965,7 +980,11 @@ describe("ChatHeader — floating mobile controls", () => {
         "active:transform-none!",
       );
     }
-    const sidebarSurface = toggle.querySelector<HTMLElement>(".glass-surface")!;
+    expect(screen.getByTestId("mobile-header-title")).toHaveTextContent("Greeting");
+    expect(toggle.querySelector(".glass-surface")).toBeNull();
+    const sidebarSurface = toggle
+      .closest("[data-mobile-header-group]")!
+      .querySelector<HTMLElement>(".glass-surface")!;
     expect(trigger.querySelector(".glass-surface")).toBeNull();
     const group = trigger.closest("[data-mobile-header-group]")!;
     const menuSurface = group.querySelector<HTMLElement>(".glass-surface")!;

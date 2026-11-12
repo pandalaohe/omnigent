@@ -37,14 +37,18 @@
       pointer-events: inherit;
     }
 
-    /* Edge handles keep the entire target inside the viewport. */
+    /* Edge handles keep the entire target inside the viewport. A side handle's
+     * target stays in the 16px content gutter (the screen edge extends it), so it
+     * never takes a tap meant for a message or a code block. */
     &[data-dock-edge="left"]::after {
       left: 0;
+      width: 16px;
       transform: translateY(-50%);
     }
     &[data-dock-edge="right"]::after {
       left: auto;
       right: 0;
+      width: 16px;
       transform: translateY(-50%);
     }
     &[data-dock-edge="top"]::after {
@@ -57,6 +61,61 @@
       transform: translateX(-50%);
     }
   }
+}
+
+/* Phone session bar: each control owns a real 44x36 box instead of overflow slop,
+ * so a tap near one control's edge never lands on its neighbour. */
+.phone-session-bar :is(button, a) {
+  min-width: 44px;
+  min-height: 36px;
+  justify-content: center;
+}
+
+.phone-session-bar :is(button, a)::after {
+  display: none;
+}
+
+/* Phone session bar row: when its controls outgrow a narrow phone it scrolls
+ * sideways (no scrollbar) and fades the edge that hides more controls. */
+.phone-session-bar-scroll {
+  --bar-fade-start: 0px;
+  --bar-fade-end: 0px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+  scroll-padding-inline: 20px;
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent,
+    black var(--bar-fade-start),
+    black calc(100% - var(--bar-fade-end)),
+    transparent
+  );
+  mask-image: linear-gradient(
+    to right,
+    transparent,
+    black var(--bar-fade-start),
+    black calc(100% - var(--bar-fade-end)),
+    transparent
+  );
+}
+
+.phone-session-bar-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+/* The scrolling row clips paint outside its 36px controls, so their focus rings draw inside. */
+.phone-session-bar-scroll :is(button, a):focus-visible {
+  --tw-ring-inset: inset;
+}
+
+.phone-session-bar-scroll[data-hidden-start] {
+  --bar-fade-start: 20px;
+}
+
+.phone-session-bar-scroll[data-hidden-end] {
+  --bar-fade-end: 20px;
 }
 
 /* Native popup menus use the browser's color scheme, including on Windows. */
@@ -85,16 +144,18 @@ select optgroup {
 }
 
 /* CSS-pixel floor for native shells and touch browsers, independent of width. */
+/* Phone touch targets: 44px wide, 36px tall. Rows stay compact while every
+ * target keeps a reliable height; isolated icon buttons size themselves to 44px. */
 @utility mobile-touch-target {
   &:is([data-mobile-app="true"], [data-mobile-app="true"] *) {
     min-width: 44px;
-    min-height: 44px;
+    min-height: 36px;
   }
   /* Match the native branch's specificity so row resets like min-h-0 can't win. */
   @media (pointer: coarse) and (hover: none) {
     &:is(:root, :root *) {
       min-width: 44px;
-      min-height: 44px;
+      min-height: 36px;
     }
   }
 }
@@ -582,10 +643,23 @@ select optgroup {
   @apply mobile-touch-target;
 }
 
+/* Phone menus keep 16px text but a tighter line box, so rows stay compact;
+ * .mobile-touch-target still gives each row a 44px hit area. */
+@media (width < 48rem) {
+  [data-slot="dropdown-menu-content"]
+    :is(
+      [data-slot="dropdown-menu-item"],
+      [data-slot="dropdown-menu-checkbox-item"],
+      [data-slot="dropdown-menu-radio-item"]
+    ) {
+    line-height: 1.4;
+  }
+}
+
 @media (width < 48rem) {
   .composer-add-menu [role="menuitem"].mobile-touch-target {
-    @apply h-7 rounded-md px-2 py-[3px] text-ui leading-4;
-    min-height: 28px;
+    @apply h-9 rounded-md px-2 py-[3px] text-ui leading-4;
+    min-height: 36px;
     @apply mobile-touch-target;
   }
 
@@ -1175,12 +1249,16 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
 
 @media (width < 48rem) {
   .session-chat-transcript > [role="log"] {
+    /* Fade content out under the floating header (below the safe area) and before
+     * it reaches the composer stack (session bar, card, quota line). */
+    --chat-composer-fade-start: calc(100% - max(64px, var(--session-composer-height, 0px)) - 8px);
+    --chat-composer-fade-end: calc(100% - max(64px, var(--session-composer-height, 0px)) + 24px);
     --chat-edge-fade: linear-gradient(
       to bottom,
-      transparent 0,
-      black max(64px, var(--omnigent-safe-top)),
-      black calc(100% - max(64px, var(--omnigent-safe-bottom))),
-      transparent 100%
+      transparent calc(var(--omnigent-safe-top) + 44px),
+      black calc(var(--omnigent-safe-top) + 84px),
+      black var(--chat-composer-fade-start),
+      transparent var(--chat-composer-fade-end)
     );
     -webkit-mask-image: var(--chat-edge-fade);
     mask-image: var(--chat-edge-fade);
@@ -1324,6 +1402,11 @@ aside[aria-label="Workspace"][data-maximized] {
 
   .mobile-menu-glass [data-slot="command"] {
     background: transparent;
+  }
+
+  /* Chromium can drop the blur inside a popper wrapper; the tint keeps menus readable. */
+  .mobile-menu-glass-layer {
+    --omni-glass-background: color-mix(in oklab, var(--background) 84%, transparent);
   }
 }
 
@@ -1700,15 +1783,15 @@ html[data-electron-mac] .breadcrumb-folder {
       to bottom,
       transparent calc(48px + var(--omnigent-inset-top)),
       black calc(80px + var(--omnigent-inset-top)),
-      black calc(100% - 32px),
-      transparent 100%
+      black var(--chat-composer-fade-start, calc(100% - 32px)),
+      transparent var(--chat-composer-fade-end, 100%)
     );
     -webkit-mask-image: linear-gradient(
       to bottom,
       transparent calc(48px + var(--omnigent-inset-top)),
       black calc(80px + var(--omnigent-inset-top)),
-      black calc(100% - 32px),
-      transparent 100%
+      black var(--chat-composer-fade-start, calc(100% - 32px)),
+      transparent var(--chat-composer-fade-end, 100%)
     );
   }
 
@@ -1728,15 +1811,15 @@ html[data-electron-mac] .breadcrumb-folder {
       to bottom,
       transparent var(--fade-start),
       black calc(var(--fade-start) + 32px),
-      black calc(100% - 32px),
-      transparent 100%
+      black var(--chat-composer-fade-start, calc(100% - 32px)),
+      transparent var(--chat-composer-fade-end, 100%)
     );
     -webkit-mask-image: linear-gradient(
       to bottom,
       transparent var(--fade-start),
       black calc(var(--fade-start) + 32px),
-      black calc(100% - 32px),
-      transparent 100%
+      black var(--chat-composer-fade-start, calc(100% - 32px)),
+      transparent var(--chat-composer-fade-end, 100%)
     );
   }
 
@@ -2039,6 +2122,33 @@ html[data-electron-mac] .breadcrumb-folder {
 .chat-code-block > [data-streamdown="code-block"] > .sticky,
 .chat-mermaid > [data-streamdown="mermaid-block"] > .sticky {
   position: static;
+}
+
+/* Phone code block header: the 24px controls keep their look but sit 46px apart
+ * centre to centre, so each keeps its own 44px target. Streamdown's download
+ * button (centre 28px from the block edge) gets the same target; copy's centre
+ * sits 46px left of it. */
+.chat-code-actions {
+  @variant phone {
+    gap: 22px;
+    margin-right: 14px;
+  }
+}
+
+.chat-code-block [data-streamdown="code-block-download-button"] {
+  @variant phone {
+    position: relative;
+
+    &::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 44px;
+      height: 44px;
+      transform: translate(-50%, -50%);
+    }
+  }
 }
 
 /* Word-wrap toggle for chat code blocks (see ChatCodeBlockPre in message.tsx).

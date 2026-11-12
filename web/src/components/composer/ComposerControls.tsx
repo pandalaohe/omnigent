@@ -630,7 +630,7 @@ export const ComposerHarnessTrigger = forwardRef<
   const Trigger = appearance === "header" ? MobileHeaderButton : Button;
   return (
     <Trigger
-      {...(appearance === "header" ? { glass: false } : {})}
+      {...(appearance === "header" ? { glass: false, fit: true } : {})}
       ref={ref}
       type="button"
       variant="ghost"

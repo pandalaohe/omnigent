@@ -47,12 +47,14 @@ const MAIN_SIZE = 52;
 const ACTION_SIZE = 46;
 const ACTION_GAP = 8;
 const ACTION_EDGE_MARGIN = 6;
-const HANDLE_THICKNESS = 18;
+// Fits the 16px phone content gutter, so a docked handle never covers messages.
+const HANDLE_THICKNESS = 14;
 const HANDLE_LENGTH = 48;
 const DOCK_THRESHOLD = 38;
-// On portrait phones this clears the composer band (input, action row, queued
-// messages), keyboard-shortened viewport included; a stored or docked spot wins.
-const FIRST_USE_POINT = { x: 0.86, y: 0.2 };
+// A new device starts docked as a right-edge handle, clear of the header and the
+// composer band (keyboard-shortened viewport included); tapping it restores the
+// floating button. A stored spot or dock wins.
+const FIRST_USE_DOCK: MobileAssistantDock = { edge: "right", offset: 0.42 };
 type WheelItem = MobileAssistantButton | TerminalBarKey;
 
 function repeats(item: WheelItem): boolean {
@@ -413,7 +415,8 @@ export function MobileFloatingAssistant() {
     };
   }, []);
 
-  const point = preferences.position ?? FIRST_USE_POINT;
+  const dock = preferences.dock ?? (preferences.position ? undefined : FIRST_USE_DOCK);
+  const point = preferences.position ?? { x: 1, y: FIRST_USE_DOCK.offset };
   const center = {
     x: clamp(point.x * viewport.width, MAIN_SIZE / 2, viewport.width - MAIN_SIZE / 2),
     y: clamp(point.y * viewport.height, MAIN_SIZE / 2, viewport.height - MAIN_SIZE / 2),
@@ -543,19 +546,18 @@ export function MobileFloatingAssistant() {
     setDragPreview(null);
     suppressClickRef.current = drag.moved;
     if (!drag.moved) return;
-    const dock = nearestDock(event.clientX, event.clientY, viewport);
     const next = {
       ...preferences,
       position: normalizedPoint(event.clientX, event.clientY),
-      dock,
+      dock: nearestDock(event.clientX, event.clientY, viewport),
     };
     setPreferences(next);
     writeMobileAssistantDeviceState(next);
   };
 
   const undock = () => {
-    if (!preferences.dock) return;
-    const restored = restoredPoint(preferences.dock, viewport);
+    if (!dock) return;
+    const restored = restoredPoint(dock, viewport);
     const next = {
       ...preferences,
       dock: undefined,
@@ -581,11 +583,11 @@ export function MobileFloatingAssistant() {
       className="pointer-events-none fixed inset-0 z-40"
       data-testid="mobile-floating-assistant"
     >
-      {preferences.dock ? (
+      {dock ? (
         <button
           type="button"
           aria-label="Expand floating assistant"
-          data-dock-edge={preferences.dock.edge}
+          data-dock-edge={dock.edge}
           title="Drag away from the edge to restore"
           {...commonPointerProps}
           onClick={() => {
@@ -598,26 +600,20 @@ export function MobileFloatingAssistant() {
           className={cn(
             "phone-hit-area pointer-events-auto fixed flex touch-none select-none items-center justify-center border border-primary/30 bg-primary text-primary-foreground shadow-lg",
             "focus-visible:ring-2 focus-visible:ring-ring active:brightness-110",
-            preferences.dock.edge === "left" || preferences.dock.edge === "right"
-              ? "h-12 w-[18px]"
-              : "h-[18px] w-12",
-            preferences.dock.edge === "left" && "rounded-r-lg border-l-0",
-            preferences.dock.edge === "right" && "rounded-l-lg border-r-0",
-            preferences.dock.edge === "top" && "rounded-b-lg border-t-0",
-            preferences.dock.edge === "bottom" && "rounded-t-lg border-b-0",
+            dock.edge === "left" || dock.edge === "right" ? "h-12 w-3.5" : "h-3.5 w-12",
+            dock.edge === "left" && "rounded-r-lg border-l-0",
+            dock.edge === "right" && "rounded-l-lg border-r-0",
+            dock.edge === "top" && "rounded-b-lg border-t-0",
+            dock.edge === "bottom" && "rounded-t-lg border-b-0",
           )}
           style={{
-            left: (dragPreview ?? dockPoint(preferences.dock, viewport)).x,
-            top: (dragPreview ?? dockPoint(preferences.dock, viewport)).y,
+            left: (dragPreview ?? dockPoint(dock, viewport)).x,
+            top: (dragPreview ?? dockPoint(dock, viewport)).y,
             transform: "translate(-50%, -50%)",
           }}
         >
           <GripVerticalIcon
-            className={cn(
-              "h-4 w-4",
-              (preferences.dock.edge === "top" || preferences.dock.edge === "bottom") &&
-                "rotate-90",
-            )}
+            className={cn("size-3", (dock.edge === "top" || dock.edge === "bottom") && "rotate-90")}
           />
         </button>
       ) : (

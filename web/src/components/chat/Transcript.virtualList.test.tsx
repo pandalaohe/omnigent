@@ -708,39 +708,39 @@ it("toggles mobile message actions on tap and shows the latest assistant's actio
     });
     const footers = screen.getAllByRole("button", { name: "Copy" }).map(actionFooter);
 
-    expect(footers[0]).toHaveClass("invisible", "opacity-0");
-    expect(footers[1]).toHaveClass("invisible", "opacity-0");
+    expect(footers[0]).toHaveClass("hidden");
+    expect(footers[1]).toHaveClass("hidden");
     expect(footers[2]).toHaveClass("opacity-100");
-    expect(footers[2]).not.toHaveClass("invisible");
-    expect(footers[3]).toHaveClass("invisible", "opacity-0");
+    expect(footers[2]).not.toHaveClass("hidden");
+    expect(footers[3]).toHaveClass("hidden");
 
     const olderMessage = view.container.querySelector<HTMLElement>(
       '[data-message-id="response-1"]',
     )!;
     fireEvent.click(within(olderMessage).getByRole("link", { name: "Details" }));
-    expect(footers[1]).toHaveClass("invisible");
+    expect(footers[1]).toHaveClass("hidden");
     const reveal = within(olderMessage).getByRole("button", { name: "Show message actions" });
     expect(document.getElementById(reveal.getAttribute("aria-controls")!)).toBe(footers[1]);
     reveal.focus();
     await user.keyboard("{Enter}");
     expect(reveal).toHaveAttribute("aria-expanded", "true");
-    expect(footers[1]).not.toHaveClass("invisible");
+    expect(footers[1]).not.toHaveClass("hidden");
     await user.click(within(olderMessage).getByRole("button", { name: "Copy" }));
-    expect(footers[1]).not.toHaveClass("invisible");
+    expect(footers[1]).not.toHaveClass("hidden");
     reveal.focus();
     await user.keyboard(" ");
     expect(reveal).toHaveAttribute("aria-expanded", "false");
-    expect(footers[1]).toHaveClass("invisible");
+    expect(footers[1]).toHaveClass("hidden");
 
     fireEvent.click(view.container.querySelector('[data-message-id="user-1"]')!);
     fireEvent.click(view.container.querySelector('[data-message-id="response-1"]')!);
-    expect(footers[0]).not.toHaveClass("invisible");
-    expect(footers[1]).not.toHaveClass("invisible");
-    expect(footers[3]).toHaveClass("invisible");
+    expect(footers[0]).not.toHaveClass("hidden");
+    expect(footers[1]).not.toHaveClass("hidden");
+    expect(footers[3]).toHaveClass("hidden");
     fireEvent.click(view.container.querySelector('[data-message-id="user-1"]')!);
     fireEvent.click(view.container.querySelector('[data-message-id="response-1"]')!);
-    expect(footers[0]).toHaveClass("invisible");
-    expect(footers[1]).toHaveClass("invisible");
+    expect(footers[0]).toHaveClass("hidden");
+    expect(footers[1]).toHaveClass("hidden");
 
     view.rerender(
       messageList(
@@ -756,13 +756,13 @@ it("toggles mobile message actions on tap and shows the latest assistant's actio
       ),
     );
     const updatedFooters = screen.getAllByRole("button", { name: "Copy" }).map(actionFooter);
-    expect(updatedFooters[2]).toHaveClass("invisible");
+    expect(updatedFooters[2]).toHaveClass("hidden");
     expect(updatedFooters[4]).toHaveClass("opacity-100");
-    expect(updatedFooters[4]).not.toHaveClass("invisible");
+    expect(updatedFooters[4]).not.toHaveClass("hidden");
     fireEvent.click(view.container.querySelector('[data-message-id="response-3"]')!);
-    expect(updatedFooters[4]).toHaveClass("invisible");
+    expect(updatedFooters[4]).toHaveClass("hidden");
     fireEvent.click(view.container.querySelector('[data-message-id="response-3"]')!);
-    expect(updatedFooters[4]).not.toHaveClass("invisible");
+    expect(updatedFooters[4]).not.toHaveClass("hidden");
   } finally {
     matchMedia.mockRestore();
   }

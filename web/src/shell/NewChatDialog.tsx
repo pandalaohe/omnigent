@@ -8045,7 +8045,7 @@ function NewChatLandingContent({
     <NewChatWorkspaceControls disabled={creating || checkingDbcert}>
       {/* Keep the tray mounted while the execution target changes. */}
       <div
-        className="mb-1.5 px-2 text-xs text-muted-foreground"
+        className="mb-1.5 px-2 text-xs text-muted-foreground max-md:mb-0 max-md:px-3.5 max-md:pt-2.5"
         data-testid="new-chat-landing-project-line"
       >
         Project: <span className="text-foreground">{selectedProject || "No Project"}</span>

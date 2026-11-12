@@ -344,6 +344,91 @@ def test_code_block_wrap_toggle_controls_horizontal_overflow(
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
 
 
+_CODE_CONTROL_TARGETS = """(block) => {
+  const header = block
+    .querySelector('[data-streamdown="code-block-header"]')
+    .getBoundingClientRect();
+  const controls = [...block.querySelectorAll("button")].filter((button) => {
+    const rect = button.getBoundingClientRect();
+    return rect.width > 0 && rect.top < header.bottom && rect.bottom > header.top;
+  });
+  const owner = (x, y) => {
+    const hit = document.elementFromPoint(x, y);
+    return controls.find((control) => control.contains(hit)) ?? null;
+  };
+  return controls.map((control) => {
+    const rect = control.getBoundingClientRect();
+    // Every point across the button resolves to the button itself.
+    let stray = 0;
+    for (let x = Math.ceil(rect.left); x < rect.right; x++) {
+      for (let y = Math.ceil(rect.top); y < rect.bottom; y++) {
+        if (owner(x, y) !== control) stray++;
+      }
+    }
+    // Its own target: the run it owns through its centre on each axis.
+    const midX = Math.floor(rect.left + rect.width / 2);
+    const midY = Math.floor(rect.top + rect.height / 2);
+    const run = (dx, dy) => {
+      let steps = 0;
+      while (steps < 80 && owner(midX + dx * (steps + 1), midY + dy * (steps + 1)) === control) {
+        steps++;
+      }
+      return steps;
+    };
+    return {
+      name: control.getAttribute("aria-label") || control.title,
+      stray,
+      width: run(-1, 0) + run(1, 0) + 1,
+      height: run(0, -1) + run(0, 1) + 1,
+    };
+  });
+}"""
+
+
+@pytest.mark.parametrize("width", [360, 390, 402])
+@pytest.mark.browser_context_args(has_touch=True, is_mobile=True)
+def test_phone_code_block_controls_keep_separate_targets(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    width: int,
+) -> None:
+    """On phones each code block control owns all of itself and a 44x36 target of its own."""
+    chat = chat_session_contract
+    _seed_assistant_message(chat, f"```ts\n{_SCROLL_CODE}```")
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(chat.url)
+
+    block = page.locator('[data-streamdown="code-block"]').first.locator("..")
+    expect(block.get_by_role("button", name="Copy Code", exact=True)).to_be_visible(timeout=20_000)
+    _position_code_block(block)
+    controls = block.evaluate(_CODE_CONTROL_TARGETS)
+    names = {control["name"] for control in controls}
+    assert {"Toggle word wrap", "Copy Code", "Download file"} <= names, controls
+    for control in controls:
+        assert control["stray"] == 0, controls
+        assert control["width"] >= 44 and control["height"] >= 36, controls
+
+
+def test_desktop_code_block_controls_keep_compact_spacing(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    """Desktop keeps the compact header: 2px between controls and no added download target."""
+    chat = chat_session_contract
+    _seed_assistant_message(chat, f"```ts\n{_SCROLL_CODE}```")
+    page.set_viewport_size({"width": 1280, "height": 844})
+    page.goto(chat.url)
+
+    block = page.locator('[data-streamdown="code-block"]').first.locator("..")
+    wrap = block.get_by_role("button", name="Toggle word wrap", exact=True)
+    copy = block.get_by_role("button", name="Copy Code", exact=True)
+    expect(copy).to_be_visible(timeout=20_000)
+    wrap_box, copy_box = wrap.bounding_box(), copy.bounding_box()
+    assert wrap_box is not None and copy_box is not None
+    assert copy_box["x"] - (wrap_box["x"] + wrap_box["width"]) == pytest.approx(2, abs=0.5)
+    download = block.get_by_role("button", name="Download file", exact=True)
+    assert download.evaluate("(button) => getComputedStyle(button, '::after').content") == "none"
+
+
 def test_code_block_highlights_against_the_built_bundle(
     page: Page,
     chat_session_contract: ChatSessionContract,
@@ -1089,7 +1174,7 @@ def test_tool_rows_read_as_actions_with_their_outcome(
         # The path must retain a readable prefix beside its verb, not disappear atomically.
         assert geometry["visiblePathWidth"] >= 44, geometry
         if app_kind:
-            assert geometry["path"]["height"] >= 44, geometry
+            assert geometry["path"]["height"] >= 36, geometry
             assert geometry["path"]["width"] >= 44, geometry
             assert geometry["path"]["left"] >= geometry["verb"]["right"], geometry
             assert geometry["path"]["right"] <= geometry["title"]["right"] + 1, geometry

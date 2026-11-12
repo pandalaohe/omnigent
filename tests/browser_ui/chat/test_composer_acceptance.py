@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import UTC, datetime
 from itertools import pairwise
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Locator, Page, Route, expect
 
 from tests._helpers.workspace_geometry import workspace_bar_needs_collapse
 from tests.browser_ui.chat.session_contract import ChatSessionContract
@@ -21,64 +22,14 @@ _MONITOR_TASK = {
 }
 
 
-@pytest.mark.parametrize("theme", ["light", "dark"])
-@pytest.mark.parametrize(
-    ("viewport_width", "font_size", "pr_number", "font_family"),
-    [
-        pytest.param(1280, 13, 1234, None, id="desktop-default"),
-        pytest.param(
-            390,
-            18,
-            1234,
-            None,
-            marks=pytest.mark.browser_context_args(has_touch=True),
-            id="mobile-crowded",
-        ),
-        pytest.param(
-            375,
-            18,
-            1234,
-            None,
-            marks=pytest.mark.browser_context_args(has_touch=True),
-            id="mobile-narrow-crowded",
-        ),
-        pytest.param(
-            375,
-            18,
-            1234567,
-            None,
-            marks=pytest.mark.browser_context_args(has_touch=True),
-            id="mobile-long-pr",
-        ),
-        pytest.param(
-            375,
-            18,
-            1234,
-            "Verdana",
-            marks=pytest.mark.browser_context_args(has_touch=True),
-            id="mobile-wide-font",
-        ),
-    ],
-)
-def test_pr_context_and_background_tasks_share_workspace_bar(
-    page: Page,
-    chat_session_contract: ChatSessionContract,
-    tmp_path: Path,
-    theme: str,
-    viewport_width: int,
-    font_size: int,
-    pr_number: int,
-    font_family: str | None,
-) -> None:
-    chat = chat_session_contract
+def _stub_session_bar(page: Page, chat: ChatSessionContract, pr_number: int) -> None:
+    """Workspace, worktree branch, open PR, busy child, full context and one background task."""
     session_id = chat.session_id
-    page.add_init_script("localStorage.setItem('omnigent:default-workspace-panel', 'open')")
-    is_mobile = viewport_width < 768
     chat.contract.json("/v1/sessions/acceptance-child/child_sessions", {"data": []})
     chat.contract.json(
         f"/v1/sessions/{session_id}/resources/environments/default",
         {
-            "metadata": {"root": "/work/repo", "home": "/home/browser"},
+            "metadata": {"root": "/work/repo", "home": "/opt/work/home"},
         },
     )
 
@@ -159,6 +110,119 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
         re.compile(rf"/v1/sessions/{re.escape(session_id)}/child_sessions(?:\?.*)?$"),
         child_sessions,
     )
+
+
+_BAR_HIT_REPORT = """(bar) => {
+  const controls = [...bar.querySelectorAll("button, a")].filter((control) => {
+    const box = control.getBoundingClientRect();
+    return box.width > 0 && box.height > 0;
+  });
+  const owner = (x, y) => {
+    const hit = document.elementFromPoint(x, y);
+    return hit ? (controls.find((control) => control.contains(hit)) ?? null) : null;
+  };
+  const barBox = bar.getBoundingClientRect();
+  return controls.map((control) => {
+    const box = control.getBoundingClientRect();
+    const midY = box.top + box.height / 2;
+    const midX = box.left + box.width / 2;
+    let ownedWidth = 0;
+    let ownedHeight = 0;
+    let stolen = 0;
+    for (let x = Math.floor(barBox.left); x < barBox.right; x += 1) {
+      const hit = owner(x + 0.5, midY);
+      if (hit === control) ownedWidth += 1;
+      else if (hit && x >= box.left && x < box.right) stolen += 1;
+    }
+    for (let y = Math.floor(barBox.top) - 12; y < barBox.bottom + 12; y += 1) {
+      if (owner(midX, y + 0.5) === control) ownedHeight += 1;
+    }
+    const name = control.getAttribute("aria-label") || control.textContent.trim();
+    return { name, ownedWidth, ownedHeight, stolen };
+  });
+}"""
+
+
+def _assert_phone_bar_hit_boxes(page: Page, bar: Locator) -> None:
+    """Every phone bar control owns a 44x36 tap area that no neighbour covers."""
+    report = bar.evaluate(_BAR_HIT_REPORT)
+    assert len(report) >= 4, report
+    for control in report:
+        assert control["stolen"] == 0, report
+        assert control["ownedWidth"] >= 44, report
+        assert control["ownedHeight"] >= 36, report
+    # A tap one pixel inside each edge of the ring / approval boundary opens
+    # only the control that edge belongs to.
+    ring = bar.get_by_test_id("composer-context-ring").bounding_box()
+    approval_button = bar.get_by_role("button", name=re.compile(r"^Standing approval:"))
+    approval = approval_button.bounding_box()
+    assert ring is not None and approval is not None
+    page.touchscreen.tap(ring["x"] + ring["width"] - 1, ring["y"] + ring["height"] / 2)
+    expect(page.get_by_test_id("composer-context-float")).to_be_visible()
+    expect(page.get_by_role("heading", name="Standing approval")).to_have_count(0)
+    page.keyboard.press("Escape")
+    expect(page.get_by_test_id("composer-context-float")).to_be_hidden()
+    page.touchscreen.tap(approval["x"] + 1, approval["y"] + approval["height"] / 2)
+    expect(page.get_by_role("heading", name="Standing approval")).to_be_visible()
+    expect(page.get_by_test_id("composer-context-float")).to_be_hidden()
+    page.keyboard.press("Escape")
+    expect(page.get_by_role("heading", name="Standing approval")).to_have_count(0)
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+@pytest.mark.parametrize(
+    ("viewport_width", "font_size", "pr_number", "font_family"),
+    [
+        pytest.param(1280, 13, 1234, None, id="desktop-default"),
+        pytest.param(
+            390,
+            18,
+            1234,
+            None,
+            marks=pytest.mark.browser_context_args(has_touch=True),
+            id="mobile-crowded",
+        ),
+        pytest.param(
+            375,
+            18,
+            1234,
+            None,
+            marks=pytest.mark.browser_context_args(has_touch=True),
+            id="mobile-narrow-crowded",
+        ),
+        pytest.param(
+            375,
+            18,
+            1234567,
+            None,
+            marks=pytest.mark.browser_context_args(has_touch=True),
+            id="mobile-long-pr",
+        ),
+        pytest.param(
+            375,
+            18,
+            1234,
+            "Verdana",
+            marks=pytest.mark.browser_context_args(has_touch=True),
+            id="mobile-wide-font",
+        ),
+    ],
+)
+def test_pr_context_and_background_tasks_share_workspace_bar(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    tmp_path: Path,
+    theme: str,
+    viewport_width: int,
+    font_size: int,
+    pr_number: int,
+    font_family: str | None,
+) -> None:
+    chat = chat_session_contract
+    session_id = chat.session_id
+    page.add_init_script("localStorage.setItem('omnigent:default-workspace-panel', 'open')")
+    is_mobile = viewport_width < 768
+    _stub_session_bar(page, chat, pr_number)
     page.emulate_media(color_scheme=theme)
     page.add_init_script(f"localStorage.setItem('web-theme', '{theme}')")
     page.add_init_script(f"localStorage.setItem('omnigent:ui-font-size', '{font_size}')")
@@ -171,7 +235,14 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     chat.wait_for_stream()
     bar = page.get_by_test_id("composer-workspace-controls")
     if is_mobile:
-        expect(bar).to_have_count(0)
+        # Phone keeps the session bar above the composer; background tasks stay in the header.
+        expect(bar.get_by_test_id("composer-pr-link")).to_have_accessible_name(
+            f"#{pr_number}", timeout=30_000
+        )
+        expect(bar.get_by_test_id("background-task-pill")).to_have_count(0)
+        expect(bar.get_by_test_id("subagent-task-pill")).to_be_visible()
+        expect(bar.get_by_role("button", name=re.compile(r"^Standing approval:"))).to_be_visible()
+        _assert_phone_bar_hit_boxes(page, bar)
         pill = page.get_by_test_id("mobile-header-controls-slot").get_by_test_id(
             "background-task-pill"
         )
@@ -519,3 +590,222 @@ def test_prompt_history_preserves_drafts_during_real_arrow_navigation(
     composer.press("ArrowUp")
     expect(composer).to_have_value(edited)
     assert chat.event_posts == []
+
+
+_ELIGIBLE_ROTATION = {
+    "eligible": True,
+    "ineligible_reason": None,
+    "harness": "claude-native",
+    "enabled": True,
+    "compactions_setting": 4,
+    "remaining_pct_setting": 25,
+    "sources": {"enabled": "session", "compactions": "default", "remaining_pct": "default"},
+    "compactions": 2,
+    "remaining_pct": 40,
+    "approximate": [],
+    "due": False,
+    "rotation_pending": False,
+}
+
+_SCROLLER_REPORT = """(scroller) => {
+  const view = scroller.getBoundingClientRect();
+  return [...scroller.querySelectorAll("button, a")]
+    .filter((control) => control.getBoundingClientRect().width > 0)
+    .map((control) => {
+      const box = control.getBoundingClientRect();
+      return {
+        name: control.getAttribute("aria-label") || control.textContent.trim(),
+        left: box.left - view.left + scroller.scrollLeft,
+        right: box.right - view.left + scroller.scrollLeft,
+        width: box.width,
+        height: box.height,
+      };
+    });
+}"""
+
+_REVEAL_AND_PROBE = """(scroller, index) => {
+  const controls = [...scroller.querySelectorAll("button, a")].filter(
+    (control) => control.getBoundingClientRect().width > 0,
+  );
+  const control = controls[index];
+  control.scrollIntoView({ block: "nearest", inline: "nearest" });
+  const view = scroller.getBoundingClientRect();
+  const box = control.getBoundingClientRect();
+  const owns = (x) => {
+    const hit = document.elementFromPoint(x, box.top + box.height / 2);
+    return hit !== null && control.contains(hit);
+  };
+  return {
+    name: control.getAttribute("aria-label") || control.textContent.trim(),
+    inside: box.left >= view.left - 0.5 && box.right <= view.right + 0.5,
+    ownsEdges: owns(box.left + 1) && owns(box.right - 1),
+  };
+}"""
+
+
+def _open_full_phone_bar(page: Page, chat: ChatSessionContract) -> tuple[Locator, Locator]:
+    """A 360px phone session with every session-bar control present; returns bar and scroller."""
+    _stub_session_bar(page, chat, 1234)
+    chat.update_session(
+        labels={
+            "omnigent.runner_log_runaway": "2026-09-23T09:25:00+00:00",
+            "omnigent.runner_log_runaway_mb": "5",
+            "omnigent.runner_log_runaway_seen": datetime.now(UTC).isoformat(timespec="seconds"),
+        }
+    )
+    chat.contract.json(f"/v1/sessions/{chat.session_id}/auto-rotation", _ELIGIBLE_ROTATION)
+    page.set_viewport_size({"width": 360, "height": 780})
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    page.get_by_test_id("runner-log-runaway-dismiss").click()
+
+    bar = page.get_by_test_id("composer-workspace-controls")
+    scroller = bar.get_by_test_id("composer-workspace-scroller")
+    for test_id in (
+        "composer-pr-link",
+        "subagent-task-pill",
+        "runner-log-runaway-indicator",
+        "composer-context-ring",
+        "auto-rotation-chip-trigger",
+    ):
+        expect(bar.get_by_test_id(test_id)).to_be_attached(timeout=30_000)
+    expect(bar.get_by_role("button", name=re.compile(r"^Standing approval:"))).to_be_attached()
+    expect(bar).to_have_attribute("data-labels", "collapsed")
+    return bar, scroller
+
+
+@pytest.mark.browser_context_args(has_touch=True, is_mobile=True)
+def test_phone_bar_keeps_every_control_reachable_at_360(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    """At 360px every session-bar control keeps its own 44x36 box in one scrolling row."""
+    bar, scroller = _open_full_phone_bar(page, chat_session_contract)
+
+    # One 40px row that scrolls: the far edge fades, the near edge does not.
+    assert bar.bounding_box()["height"] == pytest.approx(40, abs=1)
+    assert scroller.evaluate("(el) => el.scrollWidth > el.clientWidth")
+    expect(scroller).to_have_attribute("data-hidden-end", "true")
+    expect(scroller).not_to_have_attribute("data-hidden-start", "true")
+
+    controls = scroller.evaluate(_SCROLLER_REPORT)
+    assert len(controls) >= 6, json.dumps(controls)
+    for control in controls:
+        assert control["width"] >= 44 and control["height"] >= 36, controls
+    for first, second in pairwise(sorted(controls, key=lambda control: control["left"])):
+        assert first["right"] <= second["left"] + 0.5, controls
+
+    for index in range(len(controls)):
+        probe = scroller.evaluate(_REVEAL_AND_PROBE, index)
+        assert probe["inside"] and probe["ownsEdges"], probe
+    expect(scroller).to_have_attribute("data-hidden-start", "true")
+    expect(scroller).not_to_have_attribute("data-hidden-end", "true")
+
+    # The last control, revealed by scrolling, opens its own popover from a touch.
+    rotation = bar.get_by_test_id("auto-rotation-chip-trigger").bounding_box()
+    assert rotation is not None
+    page.touchscreen.tap(
+        rotation["x"] + rotation["width"] - 2, rotation["y"] + rotation["height"] / 2
+    )
+    expect(page.get_by_text("Auto-rotation", exact=True).first).to_be_visible()
+
+
+_FOCUS_SETTLED = """(scroller) =>
+  (scroller.scrollLeft > 1) === scroller.hasAttribute("data-hidden-start") &&
+  (scroller.scrollLeft + scroller.clientWidth < scroller.scrollWidth - 1) ===
+    scroller.hasAttribute("data-hidden-end")"""
+
+_FOCUS_RING_REPORT = """(scroller) => {
+  const controls = [...scroller.querySelectorAll("button, a")].filter(
+    (control) => control.getBoundingClientRect().width > 0,
+  );
+  const control = document.activeElement;
+  // Painted ring: the border box plus any outer box-shadow or outline.
+  const style = getComputedStyle(control);
+  const shadows = style.boxShadow === "none" ? [] : style.boxShadow.split(/,(?![^(]*\\))/);
+  let painted = false;
+  let outset = 0;
+  for (const shadow of shadows) {
+    const [x = 0, y = 0, blur = 0, spread = 0] = (shadow.match(/-?[\\d.]+px/g) ?? []).map(
+      parseFloat,
+    );
+    if (blur === 0 && spread === 0) continue;
+    painted = true;
+    if (!/\\binset\\b/.test(shadow)) {
+      outset = Math.max(outset, spread + blur + Math.max(Math.abs(x), Math.abs(y)));
+    }
+  }
+  if (style.outlineStyle !== "none" && parseFloat(style.outlineWidth) > 0) {
+    painted = true;
+    outset = Math.max(outset, parseFloat(style.outlineWidth) + parseFloat(style.outlineOffset));
+  }
+  const box = control.getBoundingClientRect();
+  const ring = {
+    left: box.left - outset,
+    right: box.right + outset,
+    top: box.top - outset,
+    bottom: box.bottom + outset,
+  };
+  // Visible area: every clipping ancestor, minus the scroller's faded edges.
+  const clip = { left: 0, right: innerWidth, top: 0, bottom: innerHeight };
+  for (let node = control.parentElement; node !== document.body; node = node.parentElement) {
+    const nodeStyle = getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    const fade = (side) =>
+      node === scroller ? parseFloat(nodeStyle.getPropertyValue(`--bar-fade-${side}`)) : 0;
+    if (nodeStyle.overflowX !== "visible") {
+      clip.left = Math.max(clip.left, rect.left + node.clientLeft + fade("start"));
+      clip.right = Math.min(
+        clip.right,
+        rect.left + node.clientLeft + node.clientWidth - fade("end"),
+      );
+    }
+    if (nodeStyle.overflowY !== "visible") {
+      clip.top = Math.max(clip.top, rect.top + node.clientTop);
+      clip.bottom = Math.min(clip.bottom, rect.top + node.clientTop + node.clientHeight);
+    }
+  }
+  return {
+    index: controls.indexOf(control),
+    name: control.getAttribute("aria-label") || control.textContent.trim(),
+    focusVisible: control.matches(":focus-visible"),
+    painted,
+    visible:
+      ring.left >= clip.left - 0.5 &&
+      ring.right <= clip.right + 0.5 &&
+      ring.top >= clip.top - 0.5 &&
+      ring.bottom <= clip.bottom + 0.5,
+    ring,
+    clip,
+    boxShadow: style.boxShadow,
+  };
+}"""
+
+
+@pytest.mark.browser_context_args(has_touch=True, is_mobile=True)
+def test_phone_bar_focus_rings_stay_visible_at_360(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    """Tabbing along the scrolling 360px bar shows each control's whole focus ring."""
+    _, scroller = _open_full_phone_bar(page, chat_session_contract)
+    count = len(scroller.evaluate(_SCROLLER_REPORT))
+    scroller.evaluate(
+        """(scroller) => [...scroller.querySelectorAll("button, a")]
+          .find((control) => control.getBoundingClientRect().width > 0)
+          .focus()"""
+    )
+    # Arrive by keyboard so the browser shows its focus-visible ring.
+    page.keyboard.press("Shift+Tab")
+    page.keyboard.press("Tab")
+
+    visited = []
+    for _ in range(count + 1):
+        page.wait_for_function(_FOCUS_SETTLED, arg=scroller.element_handle())
+        report = scroller.evaluate(_FOCUS_RING_REPORT)
+        if report["index"] < 0:
+            break
+        assert report["focusVisible"] and report["painted"] and report["visible"], report
+        visited.append(report["index"])
+        page.keyboard.press("Tab")
+    # Tab reached the first, at least one middle and the last control, in order.
+    assert visited[0] == 0 and visited[-1] == count - 1 and len(visited) >= 3, visited
+    assert visited == sorted(set(visited)), visited

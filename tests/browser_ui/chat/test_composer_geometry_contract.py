@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from itertools import pairwise
 
@@ -173,7 +174,8 @@ def test_landing_and_live_cards_share_the_geometry_contract(
         assert document_width(page) <= viewport["width"]
         submit = box(_submit(page, surface))
         if touch or viewport["width"] < 768:
-            assert submit["width"] >= 44 and submit["height"] >= 44
+            # Touch targets: 44px wide, 36px tall (compact rows, reliable taps).
+            assert submit["width"] >= 44 and submit["height"] >= 36, submit
         else:
             assert submit["height"] < 44
         attach = page.get_by_test_id(
@@ -188,11 +190,79 @@ def test_landing_and_live_cards_share_the_geometry_contract(
         if touch:
             for row in menu.get_by_role("menuitem").all():
                 bounds = box(row)
-                assert bounds["width"] >= 44 and bounds["height"] >= 44
+                assert bounds["width"] >= 44 and bounds["height"] >= 36, bounds
         page.keyboard.press("Escape")
         widths.append(card["width"])
     if viewport == DESKTOP:
         assert widths[0] == pytest.approx(widths[1], abs=TOLERANCE)
+
+
+@pytest.mark.parametrize(
+    "viewport",
+    [{"width": 402, "height": 874}, {"width": 360, "height": 780}],
+    ids=["iphone-402", "android-360"],
+)
+@pytest.mark.browser_context_args(has_touch=True, is_mobile=True)
+def test_phone_landing_header_pills_stay_on_screen(
+    page: Page, chat_session_contract: ChatSessionContract, viewport: dict[str, int]
+) -> None:
+    """The new-session header keeps host and model controls inside their pill and the screen."""
+    chat = chat_session_contract
+    chat.set_catalog(
+        harness="pi",
+        models=[
+            {
+                **model_option("pi-default", display_name="Pi default", is_default=True),
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": effort} for effort in ("low", "medium", "high", "xhigh")
+                ],
+                "defaultReasoningEffort": "high",
+            }
+        ],
+        selected_model="pi-default",
+    )
+    # A user badge on the agent widens the model trigger (badge + harness mark + effort).
+    badges = {
+        "version": 1,
+        "enabled": True,
+        "entries": {
+            chat.agent_id: {"label": "PI", "borderColor": "#db2777", "textColor": "#db2777"}
+        },
+    }
+    page.add_init_script(
+        f"localStorage.setItem('omnigent:agent-badge-preferences', '{json.dumps(badges)}')"
+    )
+    open_landing(page, chat, viewport)
+    groups = page.locator("[data-mobile-header-group]:visible")
+    expect(groups.first).to_be_visible()
+    # Measure once the badge and the effort glyph have joined the model trigger.
+    expect(groups.get_by_test_id("agent-badge").first).to_be_visible()
+    expect(page.locator("[data-testid$='-agent-effort-glyph']:visible").first).to_be_visible()
+    boxes = [box(groups.nth(index)) for index in range(groups.count())]
+    for group in boxes:
+        assert_within_viewport(group, viewport["width"])
+    for first, second in pairwise(sorted(boxes, key=lambda bounds: bounds["x"])):
+        assert_no_overlap(first, second)
+    # Every icon, badge and effort glyph stays inside its own button (no spill past the pill).
+    spill = """(group) => [...group.querySelectorAll("button")].flatMap((button) => {
+      const edge = button.getBoundingClientRect();
+      return [...button.querySelectorAll("svg, img, span")]
+        .map((part) => part.getBoundingClientRect())
+        .filter((part) => part.width > 0)
+        .filter((part) => part.left < edge.left - 1 || part.right > edge.right + 1)
+        .map((part) => [button.getAttribute("aria-label"), part.left, part.right, edge.right]);
+    })"""
+    for index in range(groups.count()):
+        group = boxes[index]
+        assert groups.nth(index).evaluate(spill) == [], (index, group)
+        for button in groups.nth(index).locator("button:visible").all():
+            bounds = box(button)
+            assert bounds["x"] >= group["x"] - TOLERANCE, (bounds, group)
+            assert bounds["x"] + bounds["width"] <= group["x"] + group["width"] + TOLERANCE, (
+                bounds,
+                group,
+            )
+    assert document_width(page) <= viewport["width"]
 
 
 def document_width(page: Page) -> int:

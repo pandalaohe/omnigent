@@ -22,6 +22,9 @@ def browser_context_args(browser_context_args):
 
 def _configure_buttons(page: Page) -> None:
     page.add_init_script("""
+        localStorage.getItem('omnigent:mobile-assistant-device-state') ||
+            localStorage.setItem('omnigent:mobile-assistant-device-state',
+                JSON.stringify({position: {x: 0.86, y: 0.2}}));
         localStorage.setItem('omnigent:mobile-assistant-preferences', JSON.stringify({
             version: 2, enabled: true,
             terminalButtons: [['Esc', 'Escape'], ['Tab', 'Tab'], ['Up', 'ArrowUp'],

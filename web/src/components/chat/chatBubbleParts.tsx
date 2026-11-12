@@ -1000,7 +1000,8 @@ function useMessageActionVisibility(persistentOnMobile = false, persistentOnDesk
     visibilityClassName: actionsVisible
       ? "opacity-100"
       : isMobile
-        ? "invisible opacity-0"
+        ? // Hidden actions take no room on phones; a tap on the message reveals them.
+          "hidden"
         : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40",
   };
 }
@@ -1248,10 +1249,7 @@ function UserBubble({
         {visibilityToggle}
         <div
           id={actionsId}
-          className={cn(
-            "flex max-w-full items-center justify-end gap-3 pt-1 mobile-app:py-0",
-            visibilityClassName,
-          )}
+          className={cn("flex max-w-full items-center justify-end gap-3 pt-1", visibilityClassName)}
         >
           {awaitingAgent && (
             <span
@@ -1515,10 +1513,7 @@ function AssistantBubble({
             {visibilityToggle}
             <div
               id={actionsId}
-              className={cn(
-                "flex mobile-app:flex-wrap items-center gap-3 mobile-app:py-0",
-                visibilityClassName,
-              )}
+              className={cn("flex mobile-app:flex-wrap items-center gap-3", visibilityClassName)}
             >
               <MessageActions>
                 {markdownText && (

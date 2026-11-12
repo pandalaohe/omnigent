@@ -726,7 +726,7 @@ export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
       {body}
       {/* Match Streamdown's action-pill height and reserve its rightmost slot
           for download. All controls stay anchored to the header. */}
-      <div className="absolute top-2 right-12 z-10 -mr-1.5 flex items-center gap-0.5 border-y border-transparent py-1">
+      <div className="chat-code-actions absolute top-2 right-12 z-10 -mr-1.5 flex items-center gap-0.5 border-y border-transparent py-1">
         {send && <ChatCodeBlockSendButton getCode={getCode} send={send} />}
         <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
         <ChatCodeBlockCopyButton getCode={getCode} />

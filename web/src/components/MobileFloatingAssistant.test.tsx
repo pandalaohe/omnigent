@@ -33,11 +33,37 @@ vi.mock("@/hooks/useIsPhone", () => ({
 const navigate = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/routing", () => ({ useNavigate: () => navigate }));
 
+// Floating-button cases keep a stored spot; a new device starts docked at the edge.
+const FLOATING = { position: { x: 0.86, y: 0.2 } };
+
 describe("MobileFloatingAssistant", () => {
   beforeEach(() => {
     localStorage.clear();
+    // Most cases drive the floating button; a new device starts docked (own case below).
+    localStorage.setItem(MOBILE_ASSISTANT_DEVICE_STORAGE_KEY, JSON.stringify(FLOATING));
     vi.stubGlobal("innerWidth", 390);
     vi.stubGlobal("innerHeight", 844);
+  });
+
+  it("starts docked on the right edge for a new device and restores on tap", () => {
+    localStorage.clear();
+    render(<MobileFloatingAssistant />);
+
+    const handle = screen.getByRole("button", { name: "Expand floating assistant" });
+    expect(handle).toHaveAttribute("data-dock-edge", "right");
+    expect(handle.style.left).toBe(`${390 - 7}px`);
+    expect(screen.queryByRole("button", { name: "Open floating assistant" })).toBeNull();
+
+    fireEvent.click(handle);
+    const button = screen.getByRole("button", { name: "Open floating assistant" });
+    expect(button.style.left).toBe(`${390 - 26 - 12}px`);
+    expect(readMobileAssistantPreferences().dock).toBeUndefined();
+
+    fireEvent.pointerDown(button, { pointerId: 3, clientX: 352, clientY: 354 });
+    fireEvent.pointerMove(button, { pointerId: 3, clientX: 388, clientY: 354 });
+    fireEvent.pointerUp(button, { pointerId: 3, clientX: 388, clientY: 354 });
+    expect(readMobileAssistantPreferences().dock).toMatchObject({ edge: "right" });
+    expect(screen.getByRole("button", { name: "Expand floating assistant" })).toBeTruthy();
   });
 
   afterEach(() => vi.useRealTimers());
@@ -270,6 +296,7 @@ describe("MobileFloatingAssistant", () => {
 
   it("renders a configured icon without action-specific branching", () => {
     writeMobileAssistantPreferences({
+      ...FLOATING,
       version: 2,
       enabled: true,
       buttons: [
@@ -295,6 +322,7 @@ describe("MobileFloatingAssistant", () => {
   it("repeats an enabled arrow while held and stops on release", () => {
     vi.useFakeTimers();
     writeMobileAssistantPreferences({
+      ...FLOATING,
       version: 2,
       enabled: true,
       buttons: [
@@ -335,6 +363,7 @@ describe("MobileFloatingAssistant", () => {
       repeat: true,
     };
     writeMobileAssistantPreferences({
+      ...FLOATING,
       version: 2,
       enabled: true,
       buttons: [],
@@ -377,6 +406,7 @@ describe("MobileFloatingAssistant", () => {
 
   it("dispatches a soft key to the control focused before the palette click", () => {
     writeMobileAssistantPreferences({
+      ...FLOATING,
       version: 2,
       enabled: true,
       buttons: [
@@ -406,6 +436,7 @@ describe("MobileFloatingAssistant", () => {
 
   it("inserts a phrase into a controlled composer input", () => {
     writeMobileAssistantPreferences({
+      ...FLOATING,
       version: 2,
       enabled: true,
       buttons: [
@@ -449,6 +480,7 @@ describe("MobileFloatingAssistant", () => {
 
   it("keeps the last terminal as the key target after chrome focus with two terminals", () => {
     writeMobileAssistantPreferences({
+      ...FLOATING,
       version: 2,
       enabled: true,
       buttons: [
@@ -505,6 +537,7 @@ describe("MobileFloatingAssistant", () => {
 
   it("routes soft keys, phrases, custom chords, and global shortcuts in CLI terminal view", () => {
     writeMobileAssistantPreferences({
+      ...FLOATING,
       version: 2,
       enabled: true,
       buttons: [

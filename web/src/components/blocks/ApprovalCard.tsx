@@ -911,7 +911,7 @@ export function ApprovalCard({
         data-state={nativeDelivery.state}
         className={cn("flex flex-col gap-2", className)}
       >
-        <AlertTitle className="flex items-center gap-2 text-ui">
+        <AlertTitle className="flex items-center gap-2 text-ui max-md:flex-wrap max-md:gap-y-0.5">
           <ClockIcon className="size-4 text-muted-foreground" />
           {unconfirmed ? "Approval delivery unconfirmed" : "Waiting for Kiro to confirm"}
         </AlertTitle>
@@ -1086,7 +1086,7 @@ export function ApprovalCard({
         data-state="responded"
         className={cn("flex flex-col gap-1 border-muted", className)}
       >
-        <AlertTitle className="flex items-center gap-2 text-ui">
+        <AlertTitle className="flex items-center gap-2 text-ui max-md:flex-wrap max-md:gap-y-0.5">
           {icon}
           {label}
           {policyLabel && <span className="text-muted-foreground text-sm">· {policyLabel}</span>}
@@ -1178,7 +1178,7 @@ export function ApprovalCard({
           )}
         </div>
       )}
-      <AlertTitle className="flex items-center gap-2 text-ui">
+      <AlertTitle className="flex items-center gap-2 text-ui max-md:flex-wrap max-md:gap-y-0.5">
         {isCodexCommandApproval ? (
           <TerminalIcon className="size-4 text-yellow-600 dark:text-yellow-400" />
         ) : isExitPlanMode ? (

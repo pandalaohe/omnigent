@@ -32,8 +32,15 @@ export function MobileHeaderButtonGroup({
 /** Keep the native button as the Radix trigger and layer glass behind its icon. */
 export const MobileHeaderButton = forwardRef<
   HTMLButtonElement,
-  Omit<ComponentPropsWithoutRef<typeof Button>, "asChild"> & { glass?: boolean }
->(function MobileHeaderButton({ children, className, size, variant, glass = true, ...props }, ref) {
+  Omit<ComponentPropsWithoutRef<typeof Button>, "asChild"> & {
+    glass?: boolean;
+    /** Size to the content (at least 44px) for triggers that hold more than one icon. */
+    fit?: boolean;
+  }
+>(function MobileHeaderButton(
+  { children, className, size, variant, glass = true, fit = false, ...props },
+  ref,
+) {
   const isMobile = useIsMobileViewport();
   const grouped = useContext(MobileHeaderButtonGroupContext);
   return (
@@ -46,11 +53,14 @@ export const MobileHeaderButton = forwardRef<
         className,
         isMobile &&
           "size-11 rounded-full border-none bg-transparent p-0 shadow-none [--icon-container-default:20px] hover:bg-transparent active:transform-none! aria-expanded:bg-transparent dark:hover:bg-transparent",
+        isMobile && fit && "w-auto min-w-11 max-w-none shrink-0 gap-1 px-2",
       )}
     >
       {isMobile ? (
         <>
-          <span className="relative z-10 flex items-center justify-center">{children}</span>
+          <span className={cn("relative z-10 flex items-center justify-center", fit && "gap-1")}>
+            {children}
+          </span>
           {glass && !grouped && <OmniGlassSurface width={44} height={44} borderRadius={22} />}
         </>
       ) : (

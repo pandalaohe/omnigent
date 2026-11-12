@@ -50,6 +50,13 @@ vi.mock("@/hooks/useSessionMentionEntries", () => ({
 // ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
 // (default: no PR) so these tests don't need a QueryClientProvider, matching
 // the workspace-files stub above.
+// The session chips read react-query; their own suites cover them.
+vi.mock("@/components/StandingApprovalChip", () => ({
+  StandingApprovalChip: () => <span data-testid="standing-approval-chip-stub" />,
+}));
+vi.mock("@/components/AutoRotationChip", () => ({
+  AutoRotationChip: () => <span data-testid="auto-rotation-chip-stub" />,
+}));
 vi.mock("@/hooks/usePullRequests", () => ({
   usePullRequestInfo: () => usePullRequestInfoMock(),
 }));
@@ -785,7 +792,12 @@ describe("Composer status line (branch + context ring)", () => {
         expect(actions).not.toContainElement(host);
         expect(group).toContainElement(harness);
         expect(actions).not.toContainElement(harness);
-        expect(screen.queryByTestId("composer-workspace-controls")).toBeNull();
+        // Phone keeps the session status bar above the composer, without host/model.
+        const bar = screen.getByTestId("composer-workspace-controls");
+        expect(bar).not.toContainElement(host);
+        expect(bar).toContainElement(screen.getByTestId("standing-approval-chip-stub"));
+        expect(bar).toContainElement(screen.getByTestId("auto-rotation-chip-stub"));
+        expect(group).not.toContainElement(screen.getByTestId("standing-approval-chip-stub"));
         expect(group.querySelectorAll(".glass-surface")).toHaveLength(1);
         expect(group).toHaveClass("rounded-[20px]");
         expect(screen.getByTestId("composer-host-icon")).toHaveClass("size-5");

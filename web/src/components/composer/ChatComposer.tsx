@@ -288,8 +288,10 @@ export function useCollapsedWorkspaceLabels(barRef: RefObject<HTMLElement | null
       // Not laid out yet (hidden, or jsdom): keep the current verdict.
       if (!(bar.clientWidth > 0)) return;
       const labels = bar.querySelectorAll<HTMLElement>("[data-workspace-collapse-label]");
+      // A phone bar scrolls its inner row instead of overflowing itself.
+      const row = bar.querySelector<HTMLElement>("[data-workspace-scroller]") ?? bar;
       const cramped =
-        bar.scrollWidth > bar.clientWidth + 1 ||
+        row.scrollWidth > row.clientWidth + 1 ||
         Array.from(labels).some((label) => label.scrollWidth > label.clientWidth + 1);
       if (cramped) bar.dataset.labels = "collapsed";
     };
