@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import Awaitable, Callable
 
@@ -143,10 +144,11 @@ class StartupAdmission:
         if not self._queue_mode or session_id in self._unrequired:
             return False
         try:
-            response = await self._server_client.post(
-                f"/v1/sessions/{session_id}/startup/recreate-exemption",
-                timeout=5.0,
-            )
+            async with asyncio.timeout(60.0):
+                response = await self._server_client.post(
+                    f"/v1/sessions/{session_id}/startup/recreate-exemption",
+                    timeout=60.0,
+                )
             if (
                 response.status_code == 200
                 and response.json() == {"exempt": True}
@@ -154,7 +156,7 @@ class StartupAdmission:
             ):
                 self._recreate_exempt.add(session_id)
                 return True
-        except (httpx.HTTPError, ValueError, RuntimeError):
+        except (httpx.HTTPError, ValueError, RuntimeError, TimeoutError):
             pass
         return False
 
@@ -213,13 +215,14 @@ class StartupAdmission:
         if not self.record_observation(session_id, observation):
             return False
         try:
-            response = await self._server_client.post(
-                f"/v1/sessions/{session_id}/startup/receipts",
-                json=observation.model_dump(),
-                timeout=5.0,
-            )
+            async with asyncio.timeout(60.0):
+                response = await self._server_client.post(
+                    f"/v1/sessions/{session_id}/startup/receipts",
+                    json=observation.model_dump(),
+                    timeout=60.0,
+                )
             return response.status_code == 200 and response.json() == {"accepted": True}
-        except (httpx.HTTPError, ValueError):
+        except (httpx.HTTPError, ValueError, TimeoutError):
             return False
 
     def empty_settler(self, session_id: str) -> Callable[[], Awaitable[None]]:
@@ -237,17 +240,18 @@ class StartupAdmission:
         if attempt is None:
             raise RuntimeError("Startup permission unavailable")
         try:
-            response = await self._server_client.post(
-                f"/v1/sessions/{session_id}/startup/claims",
-                json={
-                    "attempt": attempt.model_dump(),
-                    "boundary": boundary,
-                    "claim_id": uuid.uuid4().hex,
-                },
-                timeout=5.0,
-            )
+            async with asyncio.timeout(60.0):
+                response = await self._server_client.post(
+                    f"/v1/sessions/{session_id}/startup/claims",
+                    json={
+                        "attempt": attempt.model_dump(),
+                        "boundary": boundary,
+                        "claim_id": uuid.uuid4().hex,
+                    },
+                    timeout=60.0,
+                )
             if response.status_code == 200 and response.json() == {"granted": True}:
                 return
-        except (httpx.HTTPError, ValueError, RuntimeError):
+        except (httpx.HTTPError, ValueError, RuntimeError, TimeoutError):
             pass
         raise RuntimeError("Startup permission unavailable")

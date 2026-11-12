@@ -278,7 +278,7 @@ async def post_external_session_status(
 # The server keeps one receipt per (old, new) pair, making retries safe.
 _SUCCESSION_MAX_ATTEMPTS = 3
 _SUCCESSION_RETRY_DELAYS_S = (1.0, 2.0)
-_SUCCESSION_REQUEST_TIMEOUT_S = 60.0
+_SUCCESSION_REQUEST_TIMEOUT_S = 180.0
 
 
 async def post_session_succession(
@@ -308,14 +308,16 @@ async def post_session_succession(
     payload: dict[str, object] = {"target_session_id": new_session_id}
     if allow_empty:
         payload["allow_empty"] = True
+    deadline = asyncio.get_running_loop().time() + _SUCCESSION_REQUEST_TIMEOUT_S
     for attempt in range(1, _SUCCESSION_MAX_ATTEMPTS + 1):
         try:
-            response = await client.post(
-                url,
-                json=payload,
-                timeout=_SUCCESSION_REQUEST_TIMEOUT_S,
-            )
-        except httpx.TransportError as exc:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                _logger.warning("session succession deadline expired; result unconfirmed")
+                return
+            async with asyncio.timeout_at(deadline):
+                response = await client.post(url, json=payload, timeout=max(0.001, remaining))
+        except (httpx.TransportError, TimeoutError) as exc:
             _logger.warning(
                 "session succession attempt %d/%d failed; old=%s new=%s error=%r",
                 attempt,
@@ -324,9 +326,17 @@ async def post_session_succession(
                 new_session_id,
                 exc,
             )
-            if attempt >= _SUCCESSION_MAX_ATTEMPTS:
+            if (
+                attempt >= _SUCCESSION_MAX_ATTEMPTS
+                or asyncio.get_running_loop().time() >= deadline
+            ):
                 return
-            await asyncio.sleep(_SUCCESSION_RETRY_DELAYS_S[attempt - 1])
+            await asyncio.sleep(
+                min(
+                    _SUCCESSION_RETRY_DELAYS_S[attempt - 1],
+                    max(0, deadline - asyncio.get_running_loop().time()),
+                )
+            )
             continue
         if response.status_code < 400:
             return
@@ -341,7 +351,12 @@ async def post_session_succession(
         )
         if response.status_code < 500 or attempt >= _SUCCESSION_MAX_ATTEMPTS:
             return
-        await asyncio.sleep(_SUCCESSION_RETRY_DELAYS_S[attempt - 1])
+        await asyncio.sleep(
+            min(
+                _SUCCESSION_RETRY_DELAYS_S[attempt - 1],
+                max(0, deadline - asyncio.get_running_loop().time()),
+            )
+        )
 
 
 async def post_session_event_with_retry(

@@ -41,11 +41,11 @@ CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CODEX_NATIVE_REQUEST_SESSION_
 
 # Maximum time for a fresh TUI to emit ``thread/started``. Deliberately
 # generous because a host-spawned TUI cold-starts over the runner.
-CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS = 30.0
+CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS = 180.0
 # A configured command (for example ``codex-wrapper``) may do bounded setup
 # before it execs Codex. Direct launches retain the watchdog above; this
 # allowance is advertised only for an explicit command override.
-CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS = 120.0
+CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS = 180.0
 # Give the runner time to publish bridge state or its startup error at the end
 # of the configured-command watchdog before the executor reports a generic miss.
 CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS = 5.0

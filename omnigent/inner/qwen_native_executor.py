@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 #: bridge's 30 s default because a timeout now fails the turn; the harness
 #: watchdog defaults (``HARNESS_TURN_TIMEOUT_S`` 3600 s,
 #: ``HARNESS_TURN_ABSOLUTE_TIMEOUT_S`` 10800 s) sit far above this bound.
-_READY_TIMEOUT_S = 90.0
+_READY_TIMEOUT_S = 180.0
 
 
 class QwenNativeExecutor(Executor):

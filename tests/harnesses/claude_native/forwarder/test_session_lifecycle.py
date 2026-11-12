@@ -722,7 +722,7 @@ async def test_post_session_succession_posts_old_and_new_ids() -> None:
     Succession is one POST to the old session naming the replacement target.
 
     The server acts on the old id, so the loop must not substitute the
-    already-rotated-to session for it. The 60 s per-request timeout is the
+    already-rotated-to session for it. The shared 180 s timeout is the
     helper's own: the forwarder's shared client timeout is far too short for
     a phased move.
     """
@@ -747,7 +747,7 @@ async def test_post_session_succession_posts_old_and_new_ids() -> None:
     assert calls == [
         ("POST", "/v1/sessions/conv_old/succession", {"target_session_id": "conv_new"})
     ]
-    assert timeouts[0]["read"] == 60.0
+    assert 179.0 < timeouts[0]["read"] <= 180.0
 
 
 @pytest.mark.asyncio

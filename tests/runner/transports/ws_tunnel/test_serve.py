@@ -3882,11 +3882,12 @@ async def test_application_progress_bounds_connection_owned_requests(
     finishes: bool,
     quick_request: bool,
 ) -> None:
-    """Work outlives the silence budget only while the application peer makes progress."""
+    """Silent work is bounded by the busy recovery budget; cancellation still cleans up."""
     import websockets
     from websockets.asyncio.client import ClientConnection
 
     monkeypatch.setattr(serve_module, "RUNNER_TUNNEL_SILENCE_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(serve_module, "RUNNER_TUNNEL_BUSY_SILENCE_TIMEOUT_S", 0.75)
     finishes = finishes and not blocked_pong
     started = asyncio.Event()
     cancelled = asyncio.Event()
@@ -3949,6 +3950,12 @@ async def test_application_progress_bounds_connection_owned_requests(
             checked.set()
             return
         if finishes:
+            # A live request can stay silent past the idle cutoff and still finish.
+            # custom-lint: disable-next=sleep-then-assert -- exercise silence past idle expiry
+            await asyncio.sleep(0.6)
+            assert not cancelled.is_set()
+            await ws.send(encode_frame(PingFrame(ts=99)))
+            assert json.loads(await ws.recv()) == {"kind": "pong", "ts": 99}
             for ts in range(3):
                 await asyncio.sleep(0.2)
                 assert not cancelled.is_set()
@@ -3998,6 +4005,7 @@ async def test_server_silence_deadline_survives_delayed_loop(
     monkeypatch: pytest.MonkeyPatch, with_shutdown: bool, late_frame: bool, work: str
 ) -> None:
     """A stalled loop cannot extend a silent socket past the reconnect budget."""
+    monkeypatch.setattr(serve_module, "RUNNER_TUNNEL_BUSY_SILENCE_TIMEOUT_S", 0.1)
     import websockets
 
     loop = asyncio.get_running_loop()

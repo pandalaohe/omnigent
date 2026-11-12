@@ -165,7 +165,7 @@ async def test_ensure_ready_does_not_latch_on_timeout(
     assert submitted == []
     # The executor waits under its own widened bound, not the bridge default.
     assert ready_timeouts == [qne._READY_TIMEOUT_S, qne._READY_TIMEOUT_S]
-    assert qne._READY_TIMEOUT_S > 30.0
+    assert qne._READY_TIMEOUT_S > 90.0
 
 
 class _FakeClock:

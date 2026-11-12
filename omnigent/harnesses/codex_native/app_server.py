@@ -186,6 +186,7 @@ _MODEL_PROVIDER_READ_TIMEOUT_SECONDS = 2.0
 # Model discovery is a best-effort side process whose callers fall back to a
 # cached or bundled catalog, so it keeps a short readiness budget.
 _CONNECT_TIMEOUT_SECONDS = 10.0
+_SESSION_CONNECT_TIMEOUT_SECONDS = 120.0
 # Initialization and model/list can stall after the listener becomes ready.
 _MODEL_CATALOG_PROBE_TIMEOUT_SECONDS = 30.0
 _PICKER_CATALOG_WAIT_SECONDS = 2.0
@@ -1417,12 +1418,14 @@ class CodexAppServerClient:
         if self._ws_url is not None:
             self._ws = await websockets.connect(
                 self._ws_url,
+                open_timeout=_SESSION_CONNECT_TIMEOUT_SECONDS,
                 max_size=_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
                 compression=None,
             )
         else:
             self._ws = await websockets.unix_connect(
                 path=str(self._socket_path),
+                open_timeout=_SESSION_CONNECT_TIMEOUT_SECONDS,
                 uri=_UDS_WEBSOCKET_HANDSHAKE_URI,
                 max_size=_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
                 compression=None,
@@ -3028,6 +3031,7 @@ class CodexNativeAppServer:
     exit_confirmed: bool = field(default=False, init=False)
     process_exit_confirmed: bool = field(default=False, init=False)
     _resident_spawned: bool = field(default=False, init=False, repr=False)
+    _startup_ready_deadline: float | None = field(default=None, init=False, repr=False)
     _lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     _start_generation: int = field(default=0, init=False, repr=False)
     _context_inventory: CodexContextInventory | None = field(default=None, init=False, repr=False)
@@ -3436,6 +3440,9 @@ class CodexNativeAppServer:
         # session to "no enforcement" with a surfaced reason rather than
         # blocking session creation (fail-open). ``BaseException`` on the
         # outer guard so a cancellation mid-trust still tears down.
+        self._startup_ready_deadline = (
+            asyncio.get_running_loop().time() + _APP_SERVER_READY_TIMEOUT_SECONDS
+        )
         try:
             try:
                 try:
@@ -3462,6 +3469,8 @@ class CodexNativeAppServer:
                     await self._spawn_app_server_process(resolved_listen)
                     startup_client = await self._wait_until_ready()
             except CodexAppServerSilentStartTimeout as silent:
+                if asyncio.get_running_loop().time() >= self._startup_ready_deadline:
+                    raise RuntimeError(str(silent)) from silent
                 # A fresh app-server can stall before initialization; a second spawn
                 # can recover. Reuse the transport: callers captured the listen
                 # URL before start() and hand it to the TUI, forwarder and bridge.
@@ -3496,8 +3505,7 @@ class CodexNativeAppServer:
                     with contextlib.suppress(FileNotFoundError):
                         self.socket_path.unlink()
                 await self._spawn_app_server_process(resolved_listen)
-                # The second spawn gets its own full readiness budget; a second
-                # silent timeout is final.
+                # Recovery shares the first attempt's final readiness deadline.
                 try:
                     startup_client = await self._wait_until_ready()
                 except CodexAppServerSilentStartTimeout as second:
@@ -3944,6 +3952,12 @@ class CodexNativeAppServer:
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _APP_SERVER_READY_TIMEOUT_SECONDS
+        if self._startup_ready_deadline is not None:
+            deadline = min(
+                deadline,
+                self._startup_ready_deadline,
+                loop.time() + _APP_SERVER_READY_TIMEOUT_SECONDS * 2 / 3,
+            )
         last_error: Exception | None = None
         while loop.time() < deadline:
             if self.proc is not None and self.proc.returncode is not None:

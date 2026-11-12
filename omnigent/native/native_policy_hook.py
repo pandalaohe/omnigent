@@ -42,16 +42,9 @@ _logger = logging.getLogger(__name__)
 # transient 429 / 5xx / connect errors on the policy evaluate POST before
 # failing closed. Keeps those gates from blocking long on a sick server
 # while still absorbing brief DB hiccups on a hosted deployment. The
-# budget must also land the fail-closed block inside the tightest
-# retrying caller's prompt hook timeout: Claude Code kills a
-# UserPromptSubmit hook at 30s and a killed hook does not block, so a
-# budget that outlasted it would turn the block into a fail-open. Sized
-# 30 - (5 TCP + 5 TLS) - 2 (hook start-up and the failed relay curl) -
-# 3 (margin) = 15: an attempt started just under it can still spend 5s
-# in TCP connect plus 5s in the TLS handshake (httpcore times connect_tcp
-# and start_tls separately) before it fails. A gateway-severed held poll
-# resets it — see :func:`post_evaluate_with_retry`.
-_EVALUATE_POLICY_RETRY_BUDGET_S = 15.0
+# budget must fit inside the caller's enforcement hook deadline. Native
+# enforcement hooks provide a longer outer wait, including parked human ASK.
+_EVALUATE_POLICY_RETRY_BUDGET_S = 120.0
 _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S = 1.0
 _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S = 10.0
 # The tool-call phase gets its own, much longer budget: every harness

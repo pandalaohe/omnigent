@@ -102,10 +102,10 @@ async def test_restart_deadlines_and_notice_retry(monkeypatch, reconnect):
             "cut_sessions": ["requester"],
         }
     else:
-        now[0] = 329
+        now[0] = 509
         restarts.advance(record)
         assert record.status()["phase"] == "waiting_reconnect"
-        now[0] = 330
+        now[0] = 510
         restarts.advance(record)
         assert record.status()["phase"] == "failed"
         assert record.reason == "host did not reconnect"
@@ -165,10 +165,10 @@ async def test_preview_expiry_options_and_stopping_timeout(monkeypatch):
         drain_timeout_s=120,
         notify=AsyncMock(),
     )
-    now[0] = 269
+    now[0] = 304
     restarts.advance(record)
     assert record.phase == "draining"
-    now[0] = 270
+    now[0] = 305
     restarts.advance(record)
     assert record.status()["phase"] == "failed"
     assert record.reason == "host did not restart"

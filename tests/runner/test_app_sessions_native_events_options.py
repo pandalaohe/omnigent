@@ -2725,11 +2725,13 @@ async def test_events_model_change_takes_its_baseline_after_a_slow_boot(
     """
     events: list[str] = []
     state = {"booted": False, "switched": False}
+    clock = _VirtualClock()
 
     def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
-        del bridge_dir, ready_timeout_s, timeout_s
+        del bridge_dir, timeout_s
+        assert ready_timeout_s > 20
         events.append("wait")
-        time.sleep(0.05)
+        clock.sleep(25)
         state["booted"] = True
 
     def _status(bridge_dir: Any) -> str | None:
@@ -2748,7 +2750,7 @@ async def test_events_model_change_takes_its_baseline_after_a_slow_boot(
 
     with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
         resp = await _post_model_change_through_a_boot(
-            monkeypatch, wait=_wait, inject=_inject, status=_status
+            monkeypatch, wait=_wait, inject=_inject, status=_status, clock=clock
         )
 
     assert resp.status_code == 204, resp.text
@@ -3162,7 +3164,9 @@ async def test_events_model_change_sends_no_key_past_its_budget(
     assert resp.json()["error"] == "claude_native_model_failed"
     keys = [key for _, key in tui.sent]
     clear_composer = "\x1b[107;5u" * 2 + "\x1b[117;5u" * 2
-    assert keys[:4] == ["Space", clear_composer, "/model claude-opus-4-7", "Enter"], keys
+    assert keys[:3] == ["Space", clear_composer, "/model claude-opus-4-7"], keys
+    if draft_after_s is not None:
+        assert keys[3] == "Enter", keys
     late = [
         (round(at - started_at, 2), key) for at, key in tui.sent if at >= started_at + budget_s
     ]

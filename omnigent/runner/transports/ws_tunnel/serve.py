@@ -91,6 +91,8 @@ from omnigent.util.tunnel_limits import (
 
 _logger = logging.getLogger(__name__)
 
+RUNNER_TUNNEL_BUSY_SILENCE_TIMEOUT_S = 300.0
+
 _ASGIApp: TypeAlias = ASGIApp
 
 # Reconnect backoff: 0.5 s initial, 10 s cap, ±50% jitter. The
@@ -1201,12 +1203,17 @@ async def _serve_tunnel_once(
 
         loop = asyncio.get_running_loop()
 
+        def silence_timeout() -> float:
+            if dispatch_tasks or ws_channels:
+                return RUNNER_TUNNEL_BUSY_SILENCE_TIMEOUT_S
+            return RUNNER_TUNNEL_SILENCE_TIMEOUT_S
+
         async def receive_and_handle_frame() -> None:
             raw = await ws.recv()
             if shutdown_event is not None and shutdown_event.is_set():
                 return
             # Buffered frames after a loop stall cannot renew an expired tunnel.
-            if loop.time() - last_progress >= RUNNER_TUNNEL_SILENCE_TIMEOUT_S:
+            if loop.time() - last_progress >= silence_timeout():
                 return
             await _handle_tunnel_frame(
                 app,
@@ -1227,12 +1234,10 @@ async def _serve_tunnel_once(
             try:
                 done, _pending = await asyncio.wait(
                     {operation},
-                    timeout=max(
-                        0.0, last_progress + RUNNER_TUNNEL_SILENCE_TIMEOUT_S - loop.time()
-                    ),
+                    timeout=max(0.0, last_progress + silence_timeout() - loop.time()),
                 )
                 now = loop.time()
-                if done and now - last_progress < RUNNER_TUNNEL_SILENCE_TIMEOUT_S:
+                if done and now - last_progress < silence_timeout():
                     operation.result()
                     last_progress = now
                     return
@@ -1246,7 +1251,7 @@ async def _serve_tunnel_once(
                             session_id=runner_primary_session_id(),
                             runner_id=runner_id,
                             connection_id=connection_id,
-                            silence_timeout_s=RUNNER_TUNNEL_SILENCE_TIMEOUT_S,
+                            silence_timeout_s=silence_timeout(),
                             **diagnostics.snapshot(),
                         ),
                     )

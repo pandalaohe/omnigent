@@ -2595,10 +2595,10 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     assert discover_calls[0]["bridge_dir"] == bridge_dir
     # A failed marker write falls the forwarder back to the legacy timeout
     # too, keeping it aligned with the executor's unextended legacy wait.
-    expected_timeout = None if marker_write_fails or login_required else 120.0
+    expected_timeout = None if marker_write_fails or login_required else 180.0
     assert discover_calls[0]["thread_start_timeout_seconds"] == expected_timeout
     assert codex_native_bridge.read_bridge_startup_timeout(bridge_dir) == (
-        None if marker_write_fails or login_required else 120.0
+        None if marker_write_fails or login_required else 180.0
     )
     if rotated:
         # The rotated session's own id never gets a bridge directory.
@@ -2607,7 +2607,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
         assert "requires interactive login" in caplog.text
         assert "preserving the unbounded sign-in wait" in caplog.text
     else:
-        assert "configured command 'codex-wrapper' gets a 120s thread-start budget" in caplog.text
+        assert "configured command 'codex-wrapper' gets a 180s thread-start budget" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -4779,7 +4779,7 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
 @pytest.mark.parametrize(
     ("exc", "thread_start_timeout_seconds", "expected_cause"),
     [
-        (TimeoutError("no thread/started observed"), None, "startup timed out after 30s"),
+        (TimeoutError("no thread/started observed"), None, "startup timed out after 180s"),
         (TimeoutError("no thread/started observed"), 120.0, "startup timed out after 120s"),
         (
             RuntimeError("event stream ended"),

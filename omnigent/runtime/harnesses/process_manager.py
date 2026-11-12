@@ -208,7 +208,7 @@ _RELEASE_GRACE_S = 5.0
 # (Claude Code, Codex, etc.) plus uvicorn is typically 1–3s; the
 # generous cap catches genuinely-stuck spawns without waiting
 # forever.
-_SPAWN_READY_TIMEOUT_S = 30.0
+_SPAWN_READY_TIMEOUT_S = 180.0
 
 # Polling interval while waiting for the socket to appear. Short
 # enough that fast spawns return quickly; not so short that we

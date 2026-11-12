@@ -93,7 +93,7 @@ if TYPE_CHECKING:
 _logger = logging.getLogger("omnigent.runner.app")
 
 # Budget for re-creating a reaped native pane before a turn forwards into it.
-_NATIVE_TERMINAL_RECOVERY_TIMEOUT_S = 60.0
+_NATIVE_TERMINAL_RECOVERY_TIMEOUT_S = 240.0
 
 
 async def _read_file_in_root(root: str, relative_path: str) -> str:
