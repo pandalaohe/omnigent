@@ -7,7 +7,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Locator, Page, Route, expect
 
 from tests._helpers.workspace_geometry import workspace_bar_needs_collapse
 from tests.browser_ui.chat.session_contract import ChatSessionContract
@@ -19,6 +19,63 @@ _MONITOR_TASK = {
     "description": "Watch PR checks and review comments",
     "command": "gh pr checks 123 --watch",
 }
+
+
+_BAR_HIT_REPORT = """(bar) => {
+  const controls = [...bar.querySelectorAll("button, a")].filter((control) => {
+    const box = control.getBoundingClientRect();
+    return box.width > 0 && box.height > 0;
+  });
+  const owner = (x, y) => {
+    const hit = document.elementFromPoint(x, y);
+    return hit ? (controls.find((control) => control.contains(hit)) ?? null) : null;
+  };
+  const barBox = bar.getBoundingClientRect();
+  return controls.map((control) => {
+    const box = control.getBoundingClientRect();
+    const midY = box.top + box.height / 2;
+    const midX = box.left + box.width / 2;
+    let ownedWidth = 0;
+    let ownedHeight = 0;
+    let stolen = 0;
+    for (let x = Math.floor(barBox.left); x < barBox.right; x += 1) {
+      const hit = owner(x + 0.5, midY);
+      if (hit === control) ownedWidth += 1;
+      else if (hit && x >= box.left && x < box.right) stolen += 1;
+    }
+    for (let y = Math.floor(barBox.top) - 12; y < barBox.bottom + 12; y += 1) {
+      if (owner(midX, y + 0.5) === control) ownedHeight += 1;
+    }
+    const name = control.getAttribute("aria-label") || control.textContent.trim();
+    return { name, ownedWidth, ownedHeight, stolen };
+  });
+}"""
+
+
+def _assert_phone_bar_hit_boxes(page: Page, bar: Locator) -> None:
+    """Every phone bar control owns a 44x36 tap area that no neighbour covers."""
+    report = bar.evaluate(_BAR_HIT_REPORT)
+    assert len(report) >= 4, report
+    for control in report:
+        assert control["stolen"] == 0, report
+        assert control["ownedWidth"] >= 44, report
+        assert control["ownedHeight"] >= 36, report
+    # A tap one pixel inside each edge of the ring / approval boundary opens
+    # only the control that edge belongs to.
+    ring = bar.get_by_test_id("composer-context-ring").bounding_box()
+    approval_button = bar.get_by_role("button", name=re.compile(r"^Standing approval:"))
+    approval = approval_button.bounding_box()
+    assert ring is not None and approval is not None
+    page.touchscreen.tap(ring["x"] + ring["width"] - 1, ring["y"] + ring["height"] / 2)
+    expect(page.get_by_test_id("composer-context-float")).to_be_visible()
+    expect(page.get_by_role("heading", name="Standing approval")).to_have_count(0)
+    page.keyboard.press("Escape")
+    expect(page.get_by_test_id("composer-context-float")).to_be_hidden()
+    page.touchscreen.tap(approval["x"] + 1, approval["y"] + approval["height"] / 2)
+    expect(page.get_by_role("heading", name="Standing approval")).to_be_visible()
+    expect(page.get_by_test_id("composer-context-float")).to_be_hidden()
+    page.keyboard.press("Escape")
+    expect(page.get_by_role("heading", name="Standing approval")).to_have_count(0)
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])
@@ -176,6 +233,9 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
             f"#{pr_number}", timeout=30_000
         )
         expect(bar.get_by_test_id("background-task-pill")).to_have_count(0)
+        expect(bar.get_by_test_id("subagent-task-pill")).to_be_visible()
+        expect(bar.get_by_role("button", name=re.compile(r"^Standing approval:"))).to_be_visible()
+        _assert_phone_bar_hit_boxes(page, bar)
         pill = page.get_by_test_id("mobile-header-controls-slot").get_by_test_id(
             "background-task-pill"
         )

@@ -59,6 +59,18 @@
   }
 }
 
+/* Phone session bar: each control owns a real 44x36 box instead of overflow slop,
+ * so a tap near one control's edge never lands on its neighbour. */
+.phone-session-bar :is(button, a) {
+  min-width: 44px;
+  min-height: 36px;
+  justify-content: center;
+}
+
+.phone-session-bar :is(button, a)::after {
+  display: none;
+}
+
 /* Native popup menus use the browser's color scheme, including on Windows. */
 select {
   color-scheme: light;
@@ -1190,13 +1202,16 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
 
 @media (width < 48rem) {
   .session-chat-transcript > [role="log"] {
-    /* The floating header sits below the safe area: fade content out under it. */
+    /* Fade content out under the floating header (below the safe area) and before
+     * it reaches the composer stack (session bar, card, quota line). */
+    --chat-composer-fade-start: calc(100% - max(64px, var(--session-composer-height, 0px)) - 8px);
+    --chat-composer-fade-end: calc(100% - max(64px, var(--session-composer-height, 0px)) + 24px);
     --chat-edge-fade: linear-gradient(
       to bottom,
       transparent calc(var(--omnigent-safe-top) + 44px),
       black calc(var(--omnigent-safe-top) + 84px),
-      black calc(100% - max(64px, var(--omnigent-safe-bottom))),
-      transparent 100%
+      black var(--chat-composer-fade-start),
+      transparent var(--chat-composer-fade-end)
     );
     -webkit-mask-image: var(--chat-edge-fade);
     mask-image: var(--chat-edge-fade);
@@ -1340,6 +1355,11 @@ aside[aria-label="Workspace"][data-maximized] {
 
   .mobile-menu-glass [data-slot="command"] {
     background: transparent;
+  }
+
+  /* Chromium can drop the blur inside a popper wrapper; the tint keeps menus readable. */
+  .mobile-menu-glass-layer {
+    --omni-glass-background: color-mix(in oklab, var(--background) 84%, transparent);
   }
 }
 
@@ -1716,15 +1736,15 @@ html[data-electron-mac] .breadcrumb-folder {
       to bottom,
       transparent calc(48px + var(--omnigent-inset-top)),
       black calc(80px + var(--omnigent-inset-top)),
-      black calc(100% - 32px),
-      transparent 100%
+      black var(--chat-composer-fade-start, calc(100% - 32px)),
+      transparent var(--chat-composer-fade-end, 100%)
     );
     -webkit-mask-image: linear-gradient(
       to bottom,
       transparent calc(48px + var(--omnigent-inset-top)),
       black calc(80px + var(--omnigent-inset-top)),
-      black calc(100% - 32px),
-      transparent 100%
+      black var(--chat-composer-fade-start, calc(100% - 32px)),
+      transparent var(--chat-composer-fade-end, 100%)
     );
   }
 
@@ -1744,15 +1764,15 @@ html[data-electron-mac] .breadcrumb-folder {
       to bottom,
       transparent var(--fade-start),
       black calc(var(--fade-start) + 32px),
-      black calc(100% - 32px),
-      transparent 100%
+      black var(--chat-composer-fade-start, calc(100% - 32px)),
+      transparent var(--chat-composer-fade-end, 100%)
     );
     -webkit-mask-image: linear-gradient(
       to bottom,
       transparent var(--fade-start),
       black calc(var(--fade-start) + 32px),
-      black calc(100% - 32px),
-      transparent 100%
+      black var(--chat-composer-fade-start, calc(100% - 32px)),
+      transparent var(--chat-composer-fade-end, 100%)
     );
   }
 

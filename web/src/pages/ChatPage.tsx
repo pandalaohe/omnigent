@@ -5226,7 +5226,7 @@ function ComposerImpl(
                 !isMobile &&
                 "rounded-t-none border-t-0 border-border/50 before:pointer-events-none before:absolute before:inset-x-4 before:top-0 before:h-px before:bg-border/50 before:content-['']",
               isMobile &&
-                "isolate mx-0! mb-4 h-10! w-full! max-w-none! flex-nowrap! gap-1 rounded-[20px] border-0 px-2! py-0!",
+                "phone-session-bar isolate mx-0! mb-4 h-10! w-full! max-w-none! flex-nowrap! gap-1 rounded-[20px] border-0 px-2! py-0!",
             )}
           >
             {isMobile && <OmniGlassSurface borderRadius={20} className="-z-10" />}

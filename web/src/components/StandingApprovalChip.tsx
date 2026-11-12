@@ -72,7 +72,7 @@ export function StandingApprovalChip({
               className={cn(
                 "flex h-7 shrink-0 items-center gap-1 rounded-full px-2 text-xs text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                 appearance === "bar"
-                  ? "phone-hit-area relative px-1.5"
+                  ? "min-h-9 min-w-11 justify-center px-1.5"
                   : "border border-border bg-background",
               )}
             >

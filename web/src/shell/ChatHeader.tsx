@@ -649,14 +649,15 @@ export function ChatHeader({
           (!canvas || canvas.compact || canvas.focused) &&
           (mobileTitle ? (
             // Phone: menu button and session title share one glass surface.
-            <MobileHeaderButtonGroup className="flex min-w-0 items-center gap-0.5 pl-0! pr-4!">
+            <MobileHeaderButtonGroup className="flex min-w-0 items-center gap-0.5 pl-0! pr-3!">
               <SidebarOpenButton
                 onOpenSidebar={onOpenSidebar}
                 settingsMode={settingsMode}
                 componentId="chat.header.open_sidebar"
               />
+              {/* Two short lines fit the 44px pill and show twice the title of one. */}
               <span
-                className="min-w-0 truncate text-ui font-medium text-foreground"
+                className="line-clamp-2 min-w-0 break-words text-[13px] leading-4 font-medium text-foreground"
                 title={mobileTitle}
                 data-testid="mobile-header-title"
               >
@@ -729,7 +730,7 @@ export function ChatHeader({
         )}
       </div>
 
-      <MobileHeaderButtonGroup className="flex shrink-0 items-center gap-2 max-md:empty:hidden max-md:ml-2">
+      <MobileHeaderButtonGroup className="flex shrink-0 items-center gap-2 max-md:empty:hidden max-md:ml-2 max-md:gap-0">
         {isMobile && !settingsMode && (
           <MobileHeaderControlsSlot sessionId={conversationId ?? null} />
         )}

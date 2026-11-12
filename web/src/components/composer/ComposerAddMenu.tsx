@@ -8,6 +8,7 @@ import {
   TargetIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { PickerShell } from "@/components/PickerShell";
 import { SelectionList } from "@/components/SelectionList";
 import {
@@ -71,6 +72,7 @@ export function ComposerAddMenu({
   projects?: readonly { name: string }[];
   onProjectSelect?: (name: string) => void;
 }) {
+  const isMobile = useIsMobileViewport();
   const [open, setOpen] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const pendingActionRef = useRef<(() => void) | null>(null);
@@ -82,12 +84,15 @@ export function ComposerAddMenu({
     if (!trigger || !composer) return;
     const triggerRect = trigger.getBoundingClientRect();
     const composerRect = composer.getBoundingClientRect();
+    // Phone: the session bar floats above the card; open above it, not over it.
+    const bar = isMobile ? composer.parentElement?.querySelector(".composer-context-bar") : null;
+    const top = Math.min(composerRect.top, bar?.getBoundingClientRect().top ?? Infinity);
     setGeometry({
       width: composerRect.width,
       alignOffset: composerRect.left - triggerRect.left,
-      sideOffset: triggerRect.top - composerRect.top + 6,
+      sideOffset: triggerRect.top - top + 6,
     });
-  }, []);
+  }, [isMobile]);
   useEffect(() => {
     if (!open) return;
     const composer = triggerRef.current?.closest("[data-composer-card]");
