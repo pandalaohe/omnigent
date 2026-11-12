@@ -11,6 +11,9 @@ import { usageRangeQuery } from "@/pages/usageBoard/UsageRangeControl";
 import { readBoardJson } from "./taskBoardData";
 
 export interface BoardSession {
+  agent_id?: string | null;
+  reported_model?: string | null;
+  last_message_preview?: string | null;
   running_since?: number;
   running_seconds?: number;
   idle_seconds?: number;

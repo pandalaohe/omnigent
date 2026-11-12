@@ -84,6 +84,7 @@ def test_task_board_display_switch_and_source_list(
             "title": "Document recovery",
             "status": "idle",
             "archived": True,
+            "archived_at": time.time(),
             "host_id": "workstation",
             "updated_at": time.time(),
         },
@@ -272,12 +273,26 @@ def test_task_board_display_switch_and_source_list(
     page.get_by_role("link", name="Task board", exact=True).click()
     native = page.get_by_role("region", name="Sessions", exact=True)
     expect(native.get_by_text("Transfer reliability", exact=True)).to_be_visible()
-    expect(native.locator('a[href="/c/child"]')).to_have_count(0)
-    native.get_by_role(
-        "button", name="Expand child sessions: Transfer reliability", exact=True
-    ).click()
     expect(native.locator('a[href="/c/child"]')).to_be_visible()
+    if width >= 621:
+        native.get_by_role(
+            "button", name="Collapse child sessions: Transfer reliability", exact=True
+        ).click()
+        expect(native.locator('a[href="/c/child"]')).to_have_count(0)
+        native.get_by_role(
+            "button", name="Expand child sessions: Transfer reliability", exact=True
+        ).click()
+        expect(native.locator('a[href="/c/child"]')).to_be_visible()
+    native.get_by_role("button", name="1 archived today", exact=True).click()
     expect(native.locator('a[href="/c/archived"]')).to_be_visible()
+    native.get_by_role("button", name="Session details: Transfer reliability", exact=True).click()
+    session_detail = native.get_by_role(
+        "region", name="Session details: Transfer reliability", exact=True
+    )
+    expect(
+        session_detail.get_by_text("No linked task was supplied for this session.")
+    ).to_be_visible()
+    session_detail.get_by_role("button", name="Close", exact=True).click()
     expect(native.get_by_text("Verify resumed chunks").first).to_be_visible()
     page.get_by_role("button", name="2 Waiting on me", exact=True).click()
     waiting = page.get_by_role("region", name="Waiting on me", exact=True)

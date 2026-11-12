@@ -4,8 +4,6 @@ import { boardExitProps } from "@/lib/boardFrame";
 import { useState } from "react";
 import {
   ActivityIcon,
-  ChevronDownIcon,
-  ChevronRightIcon,
   CircleAlertIcon,
   HandIcon,
   ListTreeIcon,
@@ -20,15 +18,12 @@ import { Link } from "@/lib/routing";
 import { Spinner } from "@/components/ui/spinner";
 import { taskIdentity, useTaskBoardData, type BoardTask } from "./taskBoardData";
 import {
-  sessionTree,
   useBoardQuota,
   useBoardQuotaCosts,
   useBoardSchedule,
-  useBoardSessionDetails,
   useBoardSessions,
   useBoardSilentSessions,
   useBoardSystem,
-  type BoardSession,
 } from "./taskBoardNative";
 import { BoardRefreshContext, useBoardPreferences } from "./taskBoardPreferences";
 import {
@@ -40,9 +35,9 @@ import {
 import { TaskBoardQuotaBand, TaskBoardQuotaPanel } from "./TaskBoardQuota";
 import { TaskBoardHostsBand, TaskBoardHostsPanel } from "./TaskBoardHosts";
 import { TaskBoardDetail, BoardDate, taskTitle } from "./TaskBoardDetail";
-import { TaskBoardRoutes, BoardPager } from "./TaskBoardRoutes";
+import { TaskBoardRoutes } from "./TaskBoardRoutes";
 import { TaskBoardSearch } from "./TaskBoardSearch";
-import { TaskProgressIcon } from "./TaskProgressIcon";
+import { TaskBoardSessions } from "./TaskBoardSessions";
 import { formatNumber, t } from "./taskBoardText";
 
 import { TaskBoardActivity } from "./TaskBoardActivity";
@@ -57,169 +52,6 @@ function ReadFailure({ label, retry }: { label: string; retry: () => void }) {
     </div>
   );
 }
-function SessionsView({
-  sessions,
-  selected,
-  onSelect,
-  silent,
-}: {
-  sessions: BoardSession[];
-  selected: string[];
-  onSelect: (ids: string[]) => void;
-  silent: Set<string>;
-}) {
-  const [page, setPage] = useState(0);
-  const [expanded, setExpanded] = useState<string[]>([]);
-  const parents = new Set(
-    sessions.flatMap((session) => (session.parent_session_id ? [session.parent_session_id] : [])),
-  );
-  let foldedDepth = Infinity;
-  const tree = sessionTree(
-    sessions.filter((session) => !selected.length || selected.includes(session.id)),
-  ).filter((row) => {
-    if (row.depth > foldedDepth) return false;
-    foldedDepth =
-      parents.has(row.session.id) && !expanded.includes(row.session.id) ? row.depth : Infinity;
-    return true;
-  });
-  const pages = Math.max(1, Math.ceil(tree.length / 20)),
-    currentPage = Math.min(page, pages - 1);
-  const visible = tree.slice(currentPage * 20, (currentPage + 1) * 20);
-  const details = useBoardSessionDetails(
-    visible.filter((row) => !row.session.archived).map((row) => row.session.id),
-  );
-  const byId = new Map(
-    details.flatMap((detail) => (detail.data ? [[detail.data.id, detail.data] as const] : [])),
-  );
-  return (
-    <section className="tb-sessions" aria-label={t("view.sessions")}>
-      <div className="tb-section-toolbar">
-        <h2>{t("sessions.title", { count: sessions.length })}</h2>
-        <TaskBoardSearch
-          options={sessions.map((session) => ({
-            id: session.id,
-            label: session.title || session.id,
-            hint: session.workspace ?? session.host_id ?? undefined,
-          }))}
-          selected={selected}
-          onChange={(ids) => {
-            onSelect(ids);
-            setPage(0);
-          }}
-        />
-      </div>
-      {!tree.length && <p className="tb-empty">{t("sessions.empty")}</p>}
-      <ul>
-        {visible.map(({ session: row, depth }) => {
-          const detail = byId.get(row.id);
-          const session = {
-            ...row,
-            ...detail,
-            pending_elicitations_count:
-              detail?.pending_elicitations_count ?? row.pending_elicitations_count,
-          };
-          return (
-            <li
-              key={session.id}
-              className="tb-session-row"
-              style={{ paddingLeft: 12 + Math.min(depth, 3) * 18 }}
-            >
-              <div className="flex items-center gap-1">
-                {parents.has(session.id) && (
-                  <Button
-                    size="icon-sm"
-                    variant="ghost"
-                    aria-expanded={expanded.includes(session.id)}
-                    aria-label={t(
-                      expanded.includes(session.id) ? "sessions.collapse" : "sessions.expand",
-                      { title: session.title || session.id },
-                    )}
-                    onClick={() =>
-                      setExpanded((current) =>
-                        current.includes(session.id)
-                          ? current.filter((id) => id !== session.id)
-                          : [...current, session.id],
-                      )
-                    }
-                  >
-                    <ChevronDownIcon
-                      className={`size-4 ${expanded.includes(session.id) ? "" : "-rotate-90"}`}
-                    />
-                  </Button>
-                )}
-                <Link
-                  {...boardExitProps()}
-                  to={`/c/${encodeURIComponent(session.id)}`}
-                  className="tb-session-link min-w-0 flex-1"
-                >
-                  <span className="tb-session-status">
-                    <TaskProgressIcon
-                      progress={
-                        session.status === "running"
-                          ? "in-process"
-                          : session.status === "failed"
-                            ? "failed"
-                            : "needs-action"
-                      }
-                      waiting={(session.pending_elicitations_count ?? 0) > 0}
-                    />
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <h3 className="truncate">{session.title || session.id}</h3>
-                    <p className="truncate text-xs text-muted-foreground">
-                      {[session.host_id, session.workspace, session.git_branch]
-                        .filter(Boolean)
-                        .join(" · ")}
-                    </p>
-                  </div>
-                  <span className="tb-session-state">
-                    {session.archived
-                      ? t("sessions.archived")
-                      : silent.has(session.id)
-                        ? t("sessions.silent")
-                        : t(`session.${session.status}`)}
-                  </span>
-                  <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" />
-                </Link>
-              </div>
-              {session.todos?.length ? (
-                <ol className="tb-todos">
-                  {session.todos.map((todo, i) => (
-                    // Native todo snapshots carry no stable item id.
-                    // eslint-disable-next-line react/no-array-index-key
-                    <li key={i}>
-                      <TaskProgressIcon
-                        progress={
-                          todo.status === "completed"
-                            ? "completed"
-                            : todo.status === "in_progress"
-                              ? "in-process"
-                              : "needs-action"
-                        }
-                      />
-                      <span>
-                        {todo.status === "in_progress" && todo.activeForm
-                          ? todo.activeForm
-                          : todo.content}
-                      </span>
-                    </li>
-                  ))}
-                </ol>
-              ) : null}
-            </li>
-          );
-        })}
-      </ul>
-      {details.some((detail) => detail.isError) && (
-        <p role="status" className="mt-3 text-xs text-muted-foreground">
-          {t("sessions.detailsFailed")}
-        </p>
-      )}
-      <BoardPager page={currentPage} pages={pages} onChange={setPage} />
-    </section>
-  );
-}
-
 export function TaskBoardPage() {
   const [preferences, updatePreferences, storage] = useBoardPreferences();
   return (
@@ -248,7 +80,6 @@ function TaskBoardContent({
     schedule = useBoardSchedule();
   const appearance = useBoardAppearance(preferences);
   const [selectedTask, setSelectedTask] = useState<BoardTask | null>(null);
-  const [sessionSelection, setSessionSelection] = useState<string[]>([]);
   const [taskSelection, setTaskSelection] = useState<string[]>([]);
   const [panel, setPanel] = useState<
     "waiting" | "exceptions" | "running" | "quota" | "hosts" | null
@@ -471,11 +302,12 @@ function TaskBoardContent({
           sessionsQuery.isPending ? (
             <Spinner aria-label={t("board.loading")} className="mx-auto my-12 size-5" />
           ) : (
-            <SessionsView
+            <TaskBoardSessions
               sessions={sessions}
-              selected={sessionSelection}
-              onSelect={setSessionSelection}
-              silent={silentIds}
+              tasks={tasks}
+              sourceCaches={tasksQuery.data?.sourceCaches}
+              onSelect={select}
+              onView={(view) => updatePreferences({ view })}
             />
           )
         ) : tasksQuery.isPending ||

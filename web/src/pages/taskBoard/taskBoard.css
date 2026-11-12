@@ -1230,6 +1230,12 @@
 .tb-brand-antigravity {
   background: #1a73e8;
 }
+.tb-brand-pi {
+  background: #7c2d92;
+}
+.tb-page.dark .tb-brand-pi {
+  background: #9b46b3;
+}
 .tb-project-bullet {
   display: inline-grid;
   place-items: center;

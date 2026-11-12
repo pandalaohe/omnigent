@@ -154,6 +154,9 @@ it("defaults to native parent/child sessions and watches without device activity
   renderBoard();
   const region = await screen.findByRole("region", { name: "Sessions" });
   expect(await within(region).findByText("Verifying resumed chunks")).toBeTruthy();
+  fireEvent.click(
+    within(region).getByRole("button", { name: "Collapse child sessions: Transfer reliability" }),
+  );
   expect(within(region).queryByRole("link", { name: /Check retry behaviour/ })).toBeNull();
   fireEvent.click(
     within(region).getByRole("button", { name: "Expand child sessions: Transfer reliability" }),
@@ -163,6 +166,7 @@ it("defaults to native parent/child sessions and watches without device activity
       .getByRole("link", { name: /Check retry behaviour/ })
       .getAttribute("href"),
   ).toBe("/c/child");
+  fireEvent.click(within(region).getByRole("button", { name: "1 archived today" }));
   expect(
     within(region)
       .getByRole("link", { name: /Document the recovery path/ })
