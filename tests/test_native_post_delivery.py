@@ -65,6 +65,39 @@ async def test_succession_backstop_and_explicit_cancellation(monkeypatch, outcom
 
 
 @pytest.mark.asyncio
+async def test_succession_retries_only_use_the_original_remaining_budget(monkeypatch, caplog):
+    from omnigent.native import _native_post_delivery as delivery
+
+    monkeypatch.setattr(delivery, "_SUCCESSION_REQUEST_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(delivery, "_SUCCESSION_RETRY_DELAYS_S", (0.01, 0.01))
+    budgets = []
+    interrupted = asyncio.Event()
+
+    async def handle(request):
+        budgets.append(request.extensions["timeout"]["read"])
+        if len(budgets) < 3:
+            await asyncio.sleep(0.1)
+            return httpx.Response(503)
+        try:
+            await asyncio.Future()
+        finally:
+            interrupted.set()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://ap"
+    ) as client:
+        await asyncio.wait_for(
+            delivery.post_session_succession(client, old_session_id="old", new_session_id="new"),
+            timeout=1,
+        )
+    assert len(budgets) == 3
+    assert budgets[0] > budgets[1] > budgets[2]
+    assert budgets[2] < 0.1
+    assert interrupted.is_set()
+    assert "succession attempt" in caplog.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("source_id", [None, "agy:turn:tool-output"])
 async def test_only_keyed_conversation_items_retry_an_ambiguous_response(source_id) -> None:
     calls = 0

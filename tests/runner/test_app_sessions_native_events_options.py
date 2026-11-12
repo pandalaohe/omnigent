@@ -2723,6 +2723,9 @@ async def test_events_model_change_takes_its_baseline_after_a_slow_boot(
     spelling outside the expected set (a gateway's own id for the model), which
     only reads as a change against the booted pane's model.
     """
+    from omnigent.server.routes._sessions import helpers
+
+    assert helpers._TUI_INJECT_FORWARD_TIMEOUT_S > native_controls._CLAUDE_CONTROL_BUDGET_S
     events: list[str] = []
     state = {"booted": False, "switched": False}
     clock = _VirtualClock()
@@ -5454,6 +5457,8 @@ async def test_unregistered_elicitation_interrupt_validates_native_thread_owner(
         "slow-report",
         "replacement-report",
         "spawn-during-report",
+        "slow-stop",
+        "hung-stop",
     ],
 )
 async def test_codex_helper_stop_ownership_and_finalization(tmp_path, monkeypatch, case):
@@ -5482,10 +5487,15 @@ async def test_codex_helper_stop_ownership_and_finalization(tmp_path, monkeypatc
     monkeypatch.setattr(
         native_controls,
         "_CODEX_HELPER_STOP_TIMEOUT_S",
-        1.0 if case in {"slow-report", "replacement-report", "spawn-during-report"} else 0.02,
+        native_controls._CODEX_HELPER_STOP_TIMEOUT_S / 100
+        if case in {"slow-stop", "hung-stop"}
+        else 1.0
+        if case in {"slow-report", "replacement-report", "spawn-during-report"}
+        else 0.02,
     )
     monkeypatch.setattr(native_controls, "_CODEX_HELPER_PROCESS_GRACE_S", 0.001)
     closed, signals, reports, child_posts = [], [], [], []
+    stop_cancelled = asyncio.Event()
     backend = SimpleNamespace(
         proc=SimpleNamespace(pid=4242, returncode=0 if case == "exited" else None),
         process_start_stamp=100.0,
@@ -5549,6 +5559,14 @@ async def test_codex_helper_stop_ownership_and_finalization(tmp_path, monkeypatc
 
         async def request(self, method, params):
             assert method == "turn/interrupt"
+            if case == "slow-stop":
+                await asyncio.sleep(0.03)  # Beyond the old scaled stop backstop.
+                bridge.clear_active_child_turn(tmp_path, "child_thread")
+            if case == "hung-stop":
+                try:
+                    await asyncio.Future()
+                finally:
+                    stop_cancelled.set()
             if case == "late":
                 bridge.update_active_child_turn(
                     tmp_path, "late_thread", session_id="late_child", turn_id="late_turn"
@@ -5623,6 +5641,9 @@ async def test_codex_helper_stop_ownership_and_finalization(tmp_path, monkeypatc
         elif case == "late":
             assert subagent_work.get_subagent_work("late_child").status == "failed"
             assert any("late_child" in path for path in child_posts)
+        elif case == "hung-stop":
+            assert stop_cancelled.is_set()
+            assert closed, "a hung stop must proceed to bounded owned-backend cleanup"
         else:
             assert closed == [], "reporting must not destroy a responsive backend"
             if case in {"replacement-report", "spawn-during-report"}:
