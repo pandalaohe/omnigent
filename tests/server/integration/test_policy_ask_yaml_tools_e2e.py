@@ -179,6 +179,7 @@ async def test_input_ask_yaml_approve(
                     "type": "message",
                     "data": {
                         "role": "user",
+                        "_input_request_id": "request-approval-test",
                         "content": [{"type": "input_text", "text": "hello approve test"}],
                     },
                 },
@@ -195,6 +196,10 @@ async def test_input_ask_yaml_approve(
         assert any(p["elicitation_id"] == elicitation_id for p in pending), (
             f"elicitation {elicitation_id} not in session snapshot: {pending}"
         )
+
+        own = next(p for p in pending if p["elicitation_id"] == elicitation_id)
+        assert own["params"]["input_request_id"] == "request-approval-test"
+        assert own["params"]["input_approval_deadline"] > 0
 
         # Approve the elicitation.
         verdict = await client.post(

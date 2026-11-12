@@ -17761,23 +17761,49 @@ async def test_readiness_does_not_reset_expired_chain(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
-async def test_child_request_approval_outlives_machine_and_relay_deadlines(monkeypatch):
+@pytest.mark.parametrize("stall_after_approval", [False, True])
+async def test_child_request_approval_outlives_machine_and_relay_deadlines(
+    monkeypatch, stall_after_approval
+):
     from omnigent.harnesses.claude_native import bridge
     from omnigent.runner import tool_dispatch
 
     monkeypatch.setattr(tool_dispatch, "_REMOTE_CHILD_READY_TIMEOUT_S", 0.15)
+    monkeypatch.setattr(tool_dispatch, "_CHILD_APPROVAL_POLL_S", 0.01)
     monkeypatch.setattr(bridge, "_TOOL_CALL_TIMEOUT_S", 0.1)
     waiting, approve = asyncio.Event(), asyncio.Event()
     deadlines = []
+    request_id = [None]
+    import time
 
     async def handler(request):
         if request.method == "GET":
-            return httpx.Response(200, json={"runner_online": True})
-        deadlines.append(json.loads(request.content)["data"]["_input_admission_deadline"])
+            return httpx.Response(
+                200,
+                json={
+                    "runner_online": True,
+                    "pending_elicitations": [
+                        {
+                            "params": {
+                                "phase": "request",
+                                "input_request_id": request_id[0],
+                                "input_approval_deadline": time.time() + 5,
+                            }
+                        }
+                    ]
+                    if waiting.is_set() and not approve.is_set()
+                    else [],
+                },
+            )
+        data = json.loads(request.content)["data"]
+        request_id[0] = data["_input_request_id"]
+        deadlines.append(data["_input_admission_deadline"])
         if len(deadlines) == 1:
             started = asyncio.get_running_loop().time()
             waiting.set()
             await approve.wait()
+            if stall_after_approval:
+                await asyncio.Future()
             waited = asyncio.get_running_loop().time() - started
             return httpx.Response(
                 202,
@@ -17811,13 +17837,18 @@ async def test_child_request_approval_outlives_machine_and_relay_deadlines(monke
                 await asyncio.wait_for(asyncio.shield(call), 0.3)
             approve.set()
             result = await asyncio.wait_for(call, 2)
-            assert not result.get("isError")
-            assert json.loads(result["content"][0]["text"]) == {
-                "conversation_id": "child",
-                "accepted": True,
-            }
-            assert len(deadlines) == 2
-            assert deadlines[1] - deadlines[0] >= 0.3
+            if stall_after_approval:
+                assert result.get("isError")
+                assert "deadline" in result["content"][0]["text"]
+                assert len(deadlines) == 1
+            else:
+                assert not result.get("isError")
+                assert json.loads(result["content"][0]["text"]) == {
+                    "conversation_id": "child",
+                    "accepted": True,
+                }
+                assert len(deadlines) == 2
+                assert deadlines[1] - deadlines[0] >= 0.3
         finally:
             approve.set()
             await asyncio.wait_for(call, 2)
@@ -17844,3 +17875,67 @@ async def test_child_machine_recovery_expiry_does_not_repost(monkeypatch):
                 client, "child", content=[{"type": "input_text", "text": "work"}], created_by=None
             )
     assert len(posts) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("other_ask", [False, True])
+async def test_child_message_without_matching_ask_still_hits_machine_backstop(
+    monkeypatch, other_ask
+):
+    import time
+
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.runner import tool_dispatch
+
+    monkeypatch.setattr(tool_dispatch, "_REMOTE_CHILD_READY_TIMEOUT_S", 0.08)
+    monkeypatch.setattr(tool_dispatch, "_CHILD_APPROVAL_POLL_S", 0.01)
+    monkeypatch.setattr(bridge, "_TOOL_CALL_TIMEOUT_S", 0.2)
+    cancelled = asyncio.Event()
+    posts = []
+
+    async def handler(request):
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "pending_elicitations": [
+                        {
+                            "params": {
+                                "phase": "request",
+                                "input_request_id": "another-request",
+                                "input_approval_deadline": time.time() + 86400,
+                            }
+                        }
+                    ]
+                    if other_ask
+                    else []
+                },
+            )
+        posts.append(request)
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+
+        async def executor(_name, _arguments):
+            await tool_dispatch._post_child_message_recovering(
+                client, "child", content=[{"type": "input_text", "text": "work"}], created_by=None
+            )
+
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                bridge._run_relay_tool,
+                executor,
+                asyncio.get_running_loop(),
+                "sys_session_send",
+                {},
+            ),
+            1,
+        )
+        assert result.get("isError")
+        assert "machine admission deadline" in result["content"][0]["text"]
+        assert cancelled.is_set() and len(posts) == 1

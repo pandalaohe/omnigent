@@ -356,6 +356,7 @@ _SESSION_START_DEADLINE: ContextVar[float | None] = ContextVar(
 _INITIAL_MESSAGE_LABEL = "omnigent.initial_message"
 _INITIAL_MESSAGE_LABEL_RETRY_DELAY_S = 0.5
 _SESSION_CREATE_DELIVERIES: set[asyncio.Task[str]] = set()
+_CHILD_APPROVAL_POLL_S = 1.0
 
 
 @dataclass
@@ -2000,15 +2001,86 @@ async def _post_child_message_event(
         }
 
     async def post(actor: str | None) -> httpx.Response:
-        # REQUEST policy can park on the server. Its own policy bounds that wait;
-        # the server separately enforces and adjusts the machine admission deadline.
-        with pause_tool_call_deadline(_ASK_GATE_DELIVERY_READ_TIMEOUT_S):
-            response = await server_client.post(
+        request_id = uuid.uuid4().hex
+        payload = _payload(actor)
+        cast(_JsonObject, payload["data"])["_input_request_id"] = request_id
+        deadline = _SESSION_START_DEADLINE.get()
+        budget = _REMOTE_CHILD_READY_TIMEOUT_S if deadline is None else deadline - time.time()
+        machine_deadline = time.monotonic() + max(0.0, budget)
+        paused_at: float | None = None
+        approval_deadline = 0.0
+        pause = contextlib.ExitStack()
+        request_task = asyncio.create_task(
+            server_client.post(
                 f"{_session_url(session_id)}/events",
-                json=_payload(actor),
+                json=payload,
                 headers={AGENT_SESSION_HEADER: "agent"},
                 timeout=_ASK_GATE_DELIVERY_TIMEOUT,
             )
+        )
+
+        def resume() -> None:
+            nonlocal paused_at, machine_deadline
+            if paused_at is not None:
+                machine_deadline += time.monotonic() - paused_at
+                paused_at = None
+            pause.close()
+
+        try:
+            while not request_task.done():
+                if paused_at is not None and time.time() >= approval_deadline:
+                    resume()
+                remaining = machine_deadline - (
+                    paused_at if paused_at is not None else time.monotonic()
+                )
+                if remaining <= 0:
+                    raise httpx.ReadTimeout("Child message machine admission deadline expired")
+                interval = min(_CHILD_APPROVAL_POLL_S, remaining)
+                if paused_at is not None:
+                    interval = min(interval, max(0.0, approval_deadline - time.time()))
+                done, _ = await asyncio.wait({request_task}, timeout=interval)
+                if done:
+                    break
+                # Only a server-owned, request-correlated REQUEST card is proof
+                # of a human wait. Missing/unreadable proof resumes machine time.
+                pending_until = 0.0
+                try:
+                    async with asyncio.timeout(min(1.0, remaining)):
+                        snapshot = await server_client.get(
+                            f"{_session_url(session_id)}",
+                            params={**_SESSION_METADATA_PARAMS, "include_live_status": "false"},
+                            timeout=min(1.0, remaining),
+                        )
+                    if snapshot.status_code == 200:
+                        entries = snapshot.json().get("pending_elicitations", [])
+                        for entry in entries:
+                            params = entry.get("params", {}) if isinstance(entry, dict) else {}
+                            expires = params.get("input_approval_deadline")
+                            if (
+                                params.get("phase") == "request"
+                                and params.get("input_request_id") == request_id
+                                and isinstance(expires, (int, float))
+                                and math.isfinite(expires)
+                                and expires > time.time()
+                            ):
+                                pending_until = expires
+                                break
+                except (httpx.HTTPError, TimeoutError, ValueError, AttributeError):
+                    pending_until = 0.0
+                if pending_until:
+                    if paused_at is None:
+                        paused_at = time.monotonic()
+                        approval_deadline = pending_until
+                        pause.enter_context(pause_tool_call_deadline(pending_until - time.time()))
+                else:
+                    resume()
+            response = request_task.result()
+        finally:
+            resume()
+            if not request_task.done():
+                request_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await request_task
         waited = getattr(response, "headers", {}).get("X-Omnigent-Approval-Wait-Seconds")
         if waited is not None:
             try:
