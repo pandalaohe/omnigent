@@ -146,6 +146,7 @@ it("filters before rollups and expands source, group, task and nodes", () => {
       />
     </MemoryRouter>,
   );
+  expect(document.querySelector(".r-head text")).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Priced" }));
   expect(screen.getByText("1 sources")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: /engineering.*1 groups/ }));

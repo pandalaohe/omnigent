@@ -133,20 +133,6 @@ export function TaskBoardHistoryChart({
             </span>
           ))}
         </span>
-        {mapAxisTicks({ from: start, to: now }, W, 66).ticks.map((time) =>
-          x(+time) > 20 && x(+time) < W - 20 ? (
-            <text
-              key={+time}
-              x={x(+time)}
-              y={H - 6}
-              fill="var(--fg2)"
-              fontSize={12}
-              textAnchor="middle"
-            >
-              {localDay(+time).slice(5)}
-            </text>
-          ) : null,
-        )}
         {costs.some((c) => c !== null) && (
           <span className="r-key">
             <i className="line" />
