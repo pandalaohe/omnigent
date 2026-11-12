@@ -39,7 +39,7 @@ const chipTone: Record<UsageTone, string> = {
   mute: "text-muted-foreground",
 };
 
-/** The card body. Fixed width so nothing wraps out of the frame. */
+/** Full titles and values remain readable on narrow touch surfaces. */
 export function UsageTipCard({ model }: { model: UsageTipModel }) {
   return (
     <div
@@ -47,10 +47,15 @@ export function UsageTipCard({ model }: { model: UsageTipModel }) {
       data-testid="usage-tip-card"
     >
       {model.note ? (
-        <UsageName className="mb-0.5 text-[11px] text-muted-foreground">{model.note}</UsageName>
+        <span className="mb-0.5 block text-sm text-muted-foreground wrap-anywhere">
+          {model.note}
+        </span>
       ) : null}
       <div className="mb-1 flex items-center justify-between gap-2">
-        <span className="min-w-0 flex-1 font-semibold text-foreground wrap-anywhere">
+        <span
+          title={model.title}
+          className="min-w-0 flex-1 font-semibold text-foreground wrap-anywhere"
+        >
           {model.title}
         </span>
         {model.chip ? (
@@ -75,7 +80,7 @@ export function UsageTipCard({ model }: { model: UsageTipModel }) {
               </span>
             </div>
           ) : (
-            <div className="grid grid-cols-[42px_minmax(0,1fr)_44px] items-center gap-2">
+            <div className="grid grid-cols-[42px_minmax(0,1fr)_max-content] items-center gap-2">
               <UsageName className="text-muted-foreground">{row.label}</UsageName>
               <span className="h-1 overflow-hidden rounded-full bg-foreground/10">
                 <span
@@ -86,14 +91,14 @@ export function UsageTipCard({ model }: { model: UsageTipModel }) {
                   }}
                 />
               </span>
-              <UsageName
+              <span
                 className={cn(
                   "text-right font-semibold",
                   row.tone ? TONE_TEXT[row.tone] : "text-foreground",
                 )}
               >
                 {row.value}
-              </UsageName>
+              </span>
             </div>
           )}
         </div>

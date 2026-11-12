@@ -177,7 +177,7 @@ const COMPACT_STEPS: [number, string][] = [
 
 /**
  * A money figure for a tile: two decimals, and from six integer digits a
- * scaled two-decimal form (`$123.46K`); the full value stays in its title.
+ * truncated two-decimal form (`$123.45K`); detail keeps the full value.
  */
 export function formatTileAmount(value: number, unit: string | null): string {
   const symbol = unit ? CURRENCY_SYMBOLS[unit] : undefined;

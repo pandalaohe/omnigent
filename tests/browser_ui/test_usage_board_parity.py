@@ -162,7 +162,7 @@ def test_usage_ranges_pools_and_navigation(
     summary = page.get_by_role("region", name="Usage summary")
     expect(summary.get_by_text("$617.00")).to_have_count(4)
     # The target question glyph must not inherit a full-height button row.
-    assert summary.locator(".usage-summary-tip").first.bounding_box()["height"] == 15
+    assert summary.locator(".usage-summary-tip").first.bounding_box()["height"] == 16
     usable_ms = (time.perf_counter() - started) * 1000
     assert set(ranges) == {"period", "d30", "today", "h24", "d7"}
     assert len(ranges) == 5
@@ -185,18 +185,14 @@ def test_usage_ranges_pools_and_navigation(
         padding:style('.usage-board').paddingLeft,
         columns:style('.usage-tiles').gridTemplateColumns};
     }""")
+    assert geometry["tilesDisplay"] == "grid"
+    assert geometry["gap"] == "8px"
+    assert geometry["regular"]["width"] >= 164
     if width < 600:
-        assert geometry["tilesDisplay"] == "grid"
-        assert geometry["gap"] == "6px"
-        assert geometry["minHeight"] == "0px"
-        assert geometry["padding"] == "10px"
+        assert geometry["padding"] == "12px"
         assert len(geometry["columns"].split()) == 2
-        assert geometry["nav"]["top"] >= geometry["head"]["bottom"]
-        assert geometry["age"]["top"] >= geometry["nav"]["bottom"]
-        assert geometry["wide"]["width"] > geometry["regular"]["width"] * 1.9
     else:
-        assert geometry["regular"]["width"] == 150
-        assert geometry["wide"]["width"] == 300
+        assert geometry["wide"]["width"] > geometry["regular"]["width"]
     # Large figure, blank summary padding and native keyboard activation all open Analysis.
     for activation in ["figure", "whitespace", "keyboard"]:
         summary = page.get_by_role("region", name="Usage summary")

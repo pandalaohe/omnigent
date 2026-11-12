@@ -96,7 +96,7 @@ export function UsageRing({
   }
   const elapsed = window ? elapsedFraction(window) : 0;
   const reading = percent !== null && size > 20 ? formatPercentReading(percent) : "";
-  const named = showName && Boolean(window) && size > 40;
+  const named = showName && Boolean(window) && size >= 64;
   // A small ring (the compact list) drops the % mark and keeps a 10 px floor.
   const small = size < 64;
   const figure = reading

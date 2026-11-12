@@ -163,15 +163,15 @@ describe("board", () => {
     const ring = within(tile).getByTestId("usage-ring");
     expect(ring.getAttribute("data-tone")).toBe("mute");
     // The arcs are dimmed, not recoloured: the reading still shows its figure.
-    expect((ring.querySelector("svg") as SVGElement).style.opacity).toBe("0.45");
+    expect(ring.querySelector('circle[stroke="var(--muted-foreground)"]')).toBeTruthy();
     expect(within(tile).getByTestId("usage-ring").textContent).toContain("13");
   });
 
-  it("renders a value-only window as a dashed ring with the figure, not a percent", async () => {
+  it("renders a value-only window as a plain figure, not a percent", async () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
     renderRoute();
     const tile = (await screen.findByText("LiteLLM")).closest("[data-account]") as HTMLElement;
-    expect(within(tile).getByText("$41.00")).toBeTruthy();
+    expect(within(tile).getByTestId("usage-figure").textContent).toContain("$41.00");
     expect(within(tile).queryByText("%")).toBeNull();
   });
 

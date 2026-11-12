@@ -661,6 +661,9 @@
   background: color-mix(in srgb, var(--foreground) 14%, transparent);
   color: var(--foreground);
 }
+.usage-detail-cells button[aria-pressed="true"] .usage-unit-mark {
+  color: var(--foreground);
+}
 .usage-detail-cells button > span {
   font-size: var(--text-sm);
   line-height: 18px;

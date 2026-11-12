@@ -305,9 +305,8 @@ def test_account_detail_keyboard_ranges_and_return(
 
     def names_in_view(view, names):
         for name in names:
-            own = page.locator("[data-usage-name]:visible").filter(has_text=name)
+            own = page.get_by_text(name, exact=False).filter(visible=True)
             expect(own.first).to_be_visible()
-            assert name in own.first.get_attribute("title")
         name_views.append({"view": view, "width": width, "names": list(names)})
 
     page.goto(appearance_url + "/frame/usage/board")
@@ -319,7 +318,7 @@ def test_account_detail_keyboard_ranges_and_return(
         page,
         {
             '[data-testid="usage-ring"]': 4,
-            ".usage-balance-ring": 2,
+            '[data-testid="usage-figure"]': 2,
             "[data-usage-amount]": 2,
             "[data-usage-label]": 6,
         },
@@ -341,8 +340,8 @@ def test_account_detail_keyboard_ranges_and_return(
         page,
         {
             '[data-testid="usage-tile"]': 3,
-            '[data-testid="usage-ring"]': 8,
-            ".usage-balance-ring": 3,
+            '[data-testid="usage-ring"]': 7,
+            '[data-testid="usage-figure"]': 4,
             "[data-usage-amount]": 4,
             "[data-usage-label]": 7,
         },
@@ -362,7 +361,7 @@ def test_account_detail_keyboard_ranges_and_return(
         {
             '[data-testid="usage-tile"]': 3,
             '[data-testid="usage-ring"]': 3,
-            ".usage-balance-ring": 0,
+            '[data-testid="usage-figure"]': 0,
             "[data-usage-amount]": 3,
             "[data-usage-label]": 3,
         },
@@ -389,8 +388,8 @@ def test_account_detail_keyboard_ranges_and_return(
         balances = len(item.get("balances", []))
         amount_windows = sum(window["percent_used"] is None for window in item["windows"])
         expected = {
-            '[data-testid="usage-ring"]': max(1, len(item["windows"])),
-            ".usage-balance-ring": balances,
+            '[data-testid="usage-ring"]': max(1, len(item["windows"]) - amount_windows),
+            '[data-testid="usage-figure"]': balances + amount_windows,
             "[data-usage-amount]": balances + amount_windows,
             "[data-usage-label]": len(item["windows"]) + balances,
         }
@@ -400,10 +399,10 @@ def test_account_detail_keyboard_ranges_and_return(
         if item["id"] == "plan-0":
             names_in_view("detail-card", [LONG_NAMES["card"]])
         if item["id"] == "plan-1":
-            expect(page.locator("[data-usage-percent]").filter(has_text="100.00%")).to_be_visible()
+            expect(page.locator("[data-usage-percent]").filter(has_text="100%")).to_be_visible()
             expect(
                 page.locator("[data-usage-amount]").filter(has_text="$1,234,567,890,123.45")
-            ).to_have_count(balances + amount_windows)
+            ).to_have_count(balances)
             page.get_by_text("Hosts", exact=True).click()
             page.get_by_text("Usage tools", exact=True).click()
             page.get_by_text("By model", exact=True).click()
@@ -461,10 +460,18 @@ def test_account_detail_keyboard_ranges_and_return(
             groups = {}
             for window in item["windows"]:
                 groups.setdefault(window.get("group") or "", []).append(window)
+            expected['[data-testid="usage-figure"]'] = balances + amount_windows
             expected['[data-testid="usage-ring"]'] = max(
                 1,
                 sum(
-                    1 if any(window["id"] == selected_id for window in windows) else len(windows)
+                    int(
+                        next(window for window in windows if window["id"] == selected_id)[
+                            "percent_used"
+                        ]
+                        is not None
+                    )
+                    if any(window["id"] == selected_id for window in windows)
+                    else sum(window["percent_used"] is not None for window in windows)
                     for windows in groups.values()
                 ),
             )
@@ -503,7 +510,7 @@ def test_account_detail_keyboard_ranges_and_return(
     settings_geometry = {
         '[data-testid="usage-tile"]': 1,
         '[data-testid="usage-ring"]': 4,
-        ".usage-balance-ring": 2,
+        '[data-testid="usage-figure"]': 2,
         "[data-usage-amount]": 2,
         "[data-usage-label]": 4,
     }

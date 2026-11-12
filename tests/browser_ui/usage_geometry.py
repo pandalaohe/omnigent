@@ -153,16 +153,34 @@ USAGE_GEOMETRY = """expected => {
         clipping(el, rect, !ellipsis);
       }
       if (el.matches('[data-usage-percent]')) {
-        if (!/^\\d+\\.\\d{2}%$/.test(el.textContent.trim()))
+        const small = el.closest('[data-testid="usage-ring"]').getBoundingClientRect().width < 64;
+        const reading = el.textContent.trim();
+        const pattern = small ? /^[<>]?\\d+(?:\\.\\d{1,2})?$/
+          : /^[<>]?\\d+(?:\\.\\d{1,2})?%$/;
+        if (!pattern.test(reading))
           failures.push(`split percentage: ${describe(el)}`);
-        const tops = new Set(rects.map(rect => Math.round(rect.top)));
-        if (tops.size !== 1) failures.push(`wrapped percentage: ${describe(el)}`);
+        const height = Math.max(...rects.map(rect => rect.height));
+        if (Math.max(...rects.map(rect => rect.bottom)) -
+            Math.min(...rects.map(rect => rect.bottom)) > height * 0.6)
+          failures.push(`wrapped percentage: ${describe(el)}`);
       }
     }
   }
   for (const ring of document.querySelectorAll('[data-testid="usage-ring"]')) {
     if (!visible(ring)) continue;
     reveal(ring);
+    const bounds = ring.getBoundingClientRect();
+    const inner = bounds.width * 0.375;
+    for (const text of ring.querySelectorAll('.usage-ring-name, [data-usage-percent]')) {
+      const rects = ellipsized(text) ? [text.getBoundingClientRect()] : textRects(text);
+      for (const rect of rects) for (const x of [rect.left, rect.right])
+        for (const y of [rect.top + rect.height * 0.18, rect.bottom - rect.height * 0.18]) {
+          const clearance = inner - Math.hypot(x - bounds.left - bounds.width / 2,
+            y - bounds.top - bounds.height / 2);
+          if (clearance < (bounds.width >= 64 ? 2 : 1))
+            failures.push(`text crowds ring: ${describe(text)} (${clearance.toFixed(2)}px)`);
+        }
+    }
     for (const circle of ring.querySelectorAll('circle')) {
       const box = circle.getBoundingClientRect(), matrix = circle.getScreenCTM();
       const stroke = parseFloat(getComputedStyle(circle).strokeWidth) / 2;

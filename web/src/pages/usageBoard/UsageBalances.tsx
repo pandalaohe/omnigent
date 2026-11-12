@@ -59,9 +59,11 @@ export function UsageBalances({
             />
           )}
           {balance.group && balance.group !== balance.label ? (
-            <UsageName className="usage-caption">{balance.group}</UsageName>
+            <span className="usage-caption wrap-anywhere">{balance.group}</span>
           ) : null}
-          {balance.note ? <UsageName className="usage-caption">{balance.note}</UsageName> : null}
+          {balance.note ? (
+            <span className="usage-caption wrap-anywhere">{balance.note}</span>
+          ) : null}
           <span className="usage-caption">
             {account.balance_read_at == null
               ? t("balanceNone")

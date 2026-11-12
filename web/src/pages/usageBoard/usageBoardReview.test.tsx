@@ -409,7 +409,7 @@ describe("Account detail composition", () => {
     account.balance_freshness = "fresh";
     mocks.overview.current = { ...LOADED, data };
     renderBoard(`/usage/board/${encodeURIComponent(account.id)}`);
-    const balance = screen.getByText("¥298.24");
+    const balance = screen.getByTitle("¥298.24");
     const quota = screen.getByText("Quota", { exact: true }).closest("section")!;
     expect(quota.contains(balance)).toBe(true);
     const rings = within(quota).getAllByTestId("usage-ring");
@@ -586,8 +586,14 @@ describe("Proven pool usage", () => {
     try {
       renderBoard(`/usage/board/${encodeURIComponent(account)}?focus=Pool%20A`);
       const cells = screen.getByRole("group", { name: "Cost time range" });
-      await waitFor(() => expect(within(cells).getAllByText("$3.20")).toHaveLength(3));
-      await within(cells.closest("section")!).findByText("Previous $1.20", { exact: true });
+      await waitFor(() =>
+        expect(
+          [...cells.querySelectorAll("b")].filter((el) => el.textContent === "$3.20"),
+        ).toHaveLength(3),
+      );
+      await waitFor(() =>
+        expect(cells.closest("section")!.textContent).toContain("Previous $1.20"),
+      );
       fireEvent.click(screen.getByText("Cost breakdown", { exact: true }));
       expect(
         within(screen.getByText("Cost breakdown", { exact: true }).closest("details")!).getByText(
@@ -602,8 +608,11 @@ describe("Proven pool usage", () => {
       fireEvent.click(within(tools).getByText("By model", { exact: true }));
       expect(within(tools).getByText("selected-model", { exact: true })).toBeTruthy();
       expect(
-        within(tools).getAllByText(unit === "tokens" ? "1K" : "$3.20", { exact: true }),
-      ).toHaveLength(2);
+        within(tools).getByText("selected-model", { exact: true }).parentElement?.textContent,
+      ).toContain(unit === "tokens" ? "1K" : "$3.20");
+      expect(tools.querySelector(".text-3xl")?.textContent).toContain(
+        unit === "tokens" ? "1K" : "$3.20",
+      );
       expect(tools.textContent).not.toContain("99,999");
       expect(tools.textContent).not.toContain("parent-model");
       expect(tools.textContent).not.toContain("other-model");

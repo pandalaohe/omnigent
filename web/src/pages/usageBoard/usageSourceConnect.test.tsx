@@ -54,7 +54,7 @@ describe("source connection", () => {
           </TooltipProvider>
         </MemoryRouter>,
       );
-      expect(screen.getByText("$0.00")).toBeTruthy();
+      expect(document.querySelector("[data-usage-amount]")?.textContent).toBe("$0.00");
       expect(screen.getByText("Incomplete coverage")).toBeTruthy();
       expect(screen.getByText("Balance reading is old")).toBeTruthy();
       expect(screen.queryByTestId("usage-ring")).toBeNull();
