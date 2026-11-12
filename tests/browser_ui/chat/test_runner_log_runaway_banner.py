@@ -194,9 +194,8 @@ def test_dismissed_warning_collapses_into_the_workspace_bar(
     pill = page.get_by_test_id("background-task-pill")
     expect(pill).to_be_visible(timeout=10_000)
 
-    bar = page.get_by_test_id(
-        "mobile-header-controls-slot" if viewport["width"] < 768 else "composer-workspace-controls"
-    )
+    # Phone keeps the session bar above the composer, so the indicator lands there too.
+    bar = page.get_by_test_id("composer-workspace-controls")
     before = box(bar)
     page.get_by_test_id("runner-log-runaway-dismiss").click()
     expect(page.get_by_test_id("runner-log-runaway-banner")).to_have_count(0)

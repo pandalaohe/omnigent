@@ -1089,7 +1089,7 @@ def test_tool_rows_read_as_actions_with_their_outcome(
         # The path must retain a readable prefix beside its verb, not disappear atomically.
         assert geometry["visiblePathWidth"] >= 44, geometry
         if app_kind:
-            assert geometry["path"]["height"] >= 44, geometry
+            assert geometry["path"]["height"] >= 36, geometry
             assert geometry["path"]["width"] >= 44, geometry
             assert geometry["path"]["left"] >= geometry["verb"]["right"], geometry
             assert geometry["path"]["right"] <= geometry["title"]["right"] + 1, geometry

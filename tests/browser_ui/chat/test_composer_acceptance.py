@@ -171,7 +171,11 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     chat.wait_for_stream()
     bar = page.get_by_test_id("composer-workspace-controls")
     if is_mobile:
-        expect(bar).to_have_count(0)
+        # Phone keeps the session bar above the composer; background tasks stay in the header.
+        expect(bar.get_by_test_id("composer-pr-link")).to_have_accessible_name(
+            f"#{pr_number}", timeout=30_000
+        )
+        expect(bar.get_by_test_id("background-task-pill")).to_have_count(0)
         pill = page.get_by_test_id("mobile-header-controls-slot").get_by_test_id(
             "background-task-pill"
         )

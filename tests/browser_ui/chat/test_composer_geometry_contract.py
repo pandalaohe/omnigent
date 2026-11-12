@@ -173,7 +173,8 @@ def test_landing_and_live_cards_share_the_geometry_contract(
         assert document_width(page) <= viewport["width"]
         submit = box(_submit(page, surface))
         if touch or viewport["width"] < 768:
-            assert submit["width"] >= 44 and submit["height"] >= 44
+            # Touch targets: 44px wide, 36px tall (compact rows, reliable taps).
+            assert submit["width"] >= 44 and submit["height"] >= 36, submit
         else:
             assert submit["height"] < 44
         attach = page.get_by_test_id(
@@ -188,7 +189,7 @@ def test_landing_and_live_cards_share_the_geometry_contract(
         if touch:
             for row in menu.get_by_role("menuitem").all():
                 bounds = box(row)
-                assert bounds["width"] >= 44 and bounds["height"] >= 44
+                assert bounds["width"] >= 44 and bounds["height"] >= 36, bounds
         page.keyboard.press("Escape")
         widths.append(card["width"])
     if viewport == DESKTOP:

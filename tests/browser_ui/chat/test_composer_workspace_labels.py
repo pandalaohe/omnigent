@@ -72,7 +72,8 @@ def test_composer_details_wrap_without_clipping(
     page.goto(f"{base_url}/c/{session_id}")
     controls = page.get_by_test_id("composer-workspace-controls")
     if viewport_width < 768:
-        expect(controls).to_have_count(0)
+        # Phone keeps the session bar above the composer; the menu still names the directory.
+        expect(controls).to_be_visible(timeout=30_000)
         page.get_by_role("button", name=re.compile(r"^(?:Conversation|Session) actions$")).click()
         if has_binding:
             directory = page.get_by_role("menu").get_by_label(
@@ -81,7 +82,8 @@ def test_composer_details_wrap_without_clipping(
             expect(directory).to_have_text("checkout")
             expect(directory).to_have_attribute("title", _WORKSPACE)
         else:
-            expect(page.locator('[aria-label^="Working directory:"]')).to_have_count(0)
+            menu = page.get_by_role("menu")
+            expect(menu.locator('[aria-label^="Working directory:"]')).to_have_count(0)
         return
     expect(controls).to_be_visible(timeout=30_000)
     expect(controls.get_by_role("button")).to_have_count(0)
