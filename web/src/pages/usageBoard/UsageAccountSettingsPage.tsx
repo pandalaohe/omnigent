@@ -1,3 +1,4 @@
+import { boardPath } from "@/lib/boardFrame";
 // One account's settings. Reached only from its tile: the windows it shows, the
 // renewal countdown, and removing a reported source. Every change applies at
 // once — no save button — and the tile beside the rows is the preview.
@@ -70,7 +71,7 @@ export function UsageAccountSettingsPage() {
               renewal={renewalOf(account, board.renewals[account.id])}
               density={board.density}
               shownModel={preferences.shownModels?.[account.id]}
-              onOpen={() => navigate(`/usage/board/${encodeURIComponent(account.id)}`)}
+              onOpen={() => navigate(boardPath(`/usage/board/${encodeURIComponent(account.id)}`))}
             />
           </div>
           <div className="rounded-[11px] border border-border bg-card px-3.5 py-1">
@@ -101,7 +102,7 @@ export function UsageAccountSettingsPage() {
               </details>
             </div>
             <Link
-              to={`/usage/board/${encodeURIComponent(account.id)}/models`}
+              to={boardPath(`/usage/board/${encodeURIComponent(account.id)}/models`)}
               className="flex min-h-12 items-center justify-between border-b border-border py-2 text-sm"
             >
               Models <span aria-hidden="true">›</span>
@@ -189,7 +190,7 @@ export function UsageAccountSettingsPage() {
                       try {
                         await deleteUsageAccount(account.id);
                         await overview.refetch();
-                        navigate("/usage/board");
+                        navigate(boardPath("/usage/board"));
                       } catch (error) {
                         setRemoveError(
                           error instanceof Error ? error.message : "Could not remove the account.",

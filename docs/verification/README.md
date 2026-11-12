@@ -28,6 +28,6 @@ temporary directories the run created.
 
 - [Browser extensions](features/browser-extensions.md): user packages, native consent, agent fill and local data removal.
 - [Agent file opening](features/open-in-panel.md): deferred workspace requests and unconfirmed delivery reporting.
-
 - [Task source snapshots](features/task-source-snapshots.md): staged publication, pinned reads,
   source details and warm/cold client behavior.
+- [Board frames](features/board-frames.md): mount URLs, same-site authentication and ancestor policy.

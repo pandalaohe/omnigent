@@ -1,4 +1,5 @@
 import { sourceHistory, type SourceCache } from "./taskBoardSnapshotData";
+import { boardExitProps, boardPath } from "@/lib/boardFrame";
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { timeMonday } from "d3-time";
@@ -273,7 +274,7 @@ export function TaskBoardActivity({
                 ))}
                 {active.map((session) => (
                   <li key={session.id}>
-                    <Link to={`/c/${encodeURIComponent(session.id)}`}>
+                    <Link {...boardExitProps()} to={`/c/${encodeURIComponent(session.id)}`}>
                       {session.title || session.id}
                     </Link>
                   </li>
@@ -287,7 +288,7 @@ export function TaskBoardActivity({
               <ul className="tb-activity-list">
                 {usage.data.accounts.map((account) => (
                   <li key={account.account}>
-                    <Link to={`/usage/board/${encodeURIComponent(account.account)}`}>
+                    <Link to={boardPath(`/usage/board/${encodeURIComponent(account.account)}`)}>
                       {account.account}
                     </Link>
                     <span>

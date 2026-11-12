@@ -1,3 +1,4 @@
+import { boardExitProps, boardPath } from "@/lib/boardFrame";
 import { useState } from "react";
 import {
   ActivityIcon,
@@ -138,6 +139,7 @@ function SessionsView({
                   </Button>
                 )}
                 <Link
+                  {...boardExitProps()}
                   to={`/c/${encodeURIComponent(session.id)}`}
                   className="tb-session-link min-w-0 flex-1"
                 >
@@ -357,7 +359,7 @@ export function TaskBoardPage() {
                   const usageWindow = quotaReading(account);
                   return (
                     <li key={account.id}>
-                      <Link to={`/usage/board/${encodeURIComponent(account.id)}`}>
+                      <Link to={boardPath(`/usage/board/${encodeURIComponent(account.id)}`)}>
                         <b>
                           {account.display_name}
                           {preferences.pinnedQuota.includes(account.id) && (
@@ -399,7 +401,7 @@ export function TaskBoardPage() {
                     <div className="flex items-center gap-2" key={account.id}>
                       <Link
                         className="min-w-0 flex-1 truncate"
-                        to={`/usage/board/${encodeURIComponent(account.id)}`}
+                        to={boardPath(`/usage/board/${encodeURIComponent(account.id)}`)}
                       >
                         {account.display_name}
                       </Link>
@@ -440,7 +442,9 @@ export function TaskBoardPage() {
             <ul>
               {(system.data?.hosts ?? []).slice(0, 4).map((host) => (
                 <li key={host.host_id}>
-                  <Link to="/settings/hosts">{host.name}</Link>
+                  <Link {...boardExitProps()} to="/settings/hosts">
+                    {host.name}
+                  </Link>
                   <span>
                     {host.state !== "online"
                       ? t("hosts.offline")
@@ -484,7 +488,7 @@ export function TaskBoardPage() {
             ))}
             {selectedPanelSessions.map((session) => (
               <li key={session.id}>
-                <Link to={`/c/${encodeURIComponent(session.id)}`}>
+                <Link {...boardExitProps()} to={`/c/${encodeURIComponent(session.id)}`}>
                   <TaskProgressIcon
                     progress={
                       session.status === "failed"
@@ -591,7 +595,9 @@ export function TaskBoardPage() {
                 .filter((task) => task.state === "active" && task.next_run_at)
                 .map((task) => (
                   <li key={task.id}>
-                    <Link to={`/tasks/${encodeURIComponent(task.id)}`}>{task.name}</Link>
+                    <Link {...boardExitProps()} to={`/tasks/${encodeURIComponent(task.id)}`}>
+                      {task.name}
+                    </Link>
                     <BoardDate value={task.next_run_at ?? undefined} />
                   </li>
                 ))}

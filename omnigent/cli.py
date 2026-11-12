@@ -4930,8 +4930,9 @@ def server(
             else {}
         )
         key_config = global_cfg if resolve_config_path() is None else load_server_config()
-        if "api_keys" in key_config:
-            title_server_config["api_keys"] = key_config["api_keys"]
+        for key in ("api_keys", "frame_ancestors"):
+            if key in key_config:
+                title_server_config[key] = key_config[key]
 
     # Let the server-config reader (branding) see the same ``-c`` file.
     if config_path:
