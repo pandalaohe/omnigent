@@ -194,7 +194,7 @@ export function TaskBoardHistory({
   now: number;
 }) {
   const [showMonths, setShowMonths] = useState(false);
-  const archiveGeneration = useRef<string | null>(null);
+  const [archiveGeneration, setArchiveGeneration] = useState<string | null>(null);
   const hasOldMonths = counts.some((c) => Date.parse(c.day + "T00:00:00") < now - 365 * DAY);
   const [range, setRange] = useState<[number, number]>([now - 84 * DAY, now + 3600000]),
     [sets, setSets] = useState<Record<string, string[]>>({ source: [], agent: [], outcome: [] }),
@@ -225,7 +225,7 @@ export function TaskBoardHistory({
     setExtra([]);
     setLoading(false);
     setError(false);
-    archiveGeneration.current = null;
+    setArchiveGeneration(null);
     const requestState = request;
     return () => {
       requestState.current++;
@@ -247,11 +247,11 @@ export function TaskBoardHistory({
     merged = new Map(tasks.map((task) => [taskIdentity(task), task]));
   extra.forEach((task) => merged.set(taskIdentity(task), task));
   const archiveTask =
-    detailSelection?.task && archiveGeneration.current === generationKey
+    detailSelection?.task && archiveGeneration === generationKey
       ? merged.get(taskIdentity(detailSelection.task))
       : undefined;
   const selectTask = (task: BoardTask) => {
-    archiveGeneration.current = generationKey;
+    setArchiveGeneration(generationKey);
     onSelect(task);
   };
   const historyStart = Math.min(
@@ -300,7 +300,7 @@ export function TaskBoardHistory({
     request.current++;
     setLoading(false);
     setError(false);
-    archiveGeneration.current = null;
+    setArchiveGeneration(null);
     setRange([a, b]);
     reset();
   };

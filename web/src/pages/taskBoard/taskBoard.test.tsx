@@ -205,6 +205,22 @@ it.each(["none", "recent", "archive"])(
     fireEvent.click(within(detail).getByRole("button", { name: "Close" }));
     expect(view.container.querySelectorAll(".tb-dc")).toHaveLength(0);
     expect(document.activeElement).toBe(trigger);
+    if (relation === "none") {
+      fireEvent.click(trigger);
+      fireEvent.keyDown(screen.getByRole("slider", { name: "Range start" }), { key: "ArrowRight" });
+      expect(view.container.querySelectorAll(".tb-dc")).toHaveLength(0);
+      fireEvent.click(view.container.querySelector(".h-p")!);
+      fireEvent.click(view.container.querySelector(".h-srow")!);
+      fireEvent.click(screen.getByRole("button", { name: /Archive recovery.*Completed/ }));
+      const sameTask = screen.getByRole("button", { name: "Open task details" });
+      sameTask.focus();
+      fireEvent.click(sameTask);
+      const reopened = await screen.findByRole("region", { name: "Details: Archive recovery" });
+      expect(view.container.querySelectorAll(".tb-dc")).toHaveLength(1);
+      fireEvent.click(within(reopened).getByRole("button", { name: "Close" }));
+      expect(view.container.querySelectorAll(".tb-dc")).toHaveLength(0);
+      expect(document.activeElement).toBe(sameTask);
+    }
     if (relation !== "none") {
       fireEvent.click(trigger);
       const reopened = await screen.findByRole("region", { name: "Details: Archive recovery" });
