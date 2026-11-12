@@ -220,32 +220,25 @@ function AppRoutes({ basename }: AppProps) {
         <Route path={`${prefix}/approve/:sessionId/:elicitationId`} element={<ApprovePage />} />
         <Route element={<BoardFrameLayout />}>
           <Route path={`${prefix}/frame/task-board`} element={<TaskBoardPage />} />
-          {usageBoardAvailable(info) && (
-            <>
-              <Route path={`${prefix}/frame/usage/board`} element={<UsageBoardPage />} />
-              <Route path={`${prefix}/frame/usage/board/cost`} element={<UsageBoardCostPage />} />
-              <Route
-                path={`${prefix}/frame/usage/board/issues`}
-                element={<UsageBoardIssuesPage />}
-              />
-              <Route
-                path={`${prefix}/frame/usage/board/:accountId/issues`}
-                element={<UsageBoardIssuesPage />}
-              />
-              <Route
-                path={`${prefix}/frame/usage/board/:accountId/models`}
-                element={<UsageBoardModelsPage />}
-              />
-              <Route
-                path={`${prefix}/frame/usage/board/:accountId`}
-                element={<UsageBoardAccountPage />}
-              />
-              <Route
-                path={`${prefix}/frame/usage/board/:accountId/settings`}
-                element={<UsageBoardAccountSettingsPage />}
-              />
-            </>
-          )}
+          <Route path={`${prefix}/frame/usage/board`} element={<UsageBoardPage />} />
+          <Route path={`${prefix}/frame/usage/board/cost`} element={<UsageBoardCostPage />} />
+          <Route path={`${prefix}/frame/usage/board/issues`} element={<UsageBoardIssuesPage />} />
+          <Route
+            path={`${prefix}/frame/usage/board/:accountId/issues`}
+            element={<UsageBoardIssuesPage />}
+          />
+          <Route
+            path={`${prefix}/frame/usage/board/:accountId/models`}
+            element={<UsageBoardModelsPage />}
+          />
+          <Route
+            path={`${prefix}/frame/usage/board/:accountId`}
+            element={<UsageBoardAccountPage />}
+          />
+          <Route
+            path={`${prefix}/frame/usage/board/:accountId/settings`}
+            element={<UsageBoardAccountSettingsPage />}
+          />
         </Route>
         <Route element={<AppShell />}>
           <Route path={prefix || "/"} element={<ChatPage />} />
