@@ -17,6 +17,74 @@ from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 from tests.server.helpers import create_test_session, start_session_stream_collector
 
 
+@pytest.mark.parametrize("recovery", ["running", "idle"])
+async def test_observation_warning_reaches_live_status_and_snapshot(client, monkeypatch, recovery):
+    from omnigent.harnesses.antigravity_native import reader
+
+    session = await create_test_session(client, "agy-observation")
+    session_id = session["id"]
+    clock = [0.0]
+    monkeypatch.setattr(reader, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", lambda *args, **kwargs: {})
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda *args, **kwargs: [])
+    state = reader._ReaderState(seen=set(), interacted=set(), turn_active=True, turn_generation=1)
+    collector = await start_session_stream_collector(session_id)
+
+    async def status_event():
+        async with asyncio.timeout(5):
+            while True:
+                event = await collector.next_event()
+                assert event["type"] not in {"response.completed", "response.failed"}
+                if event["type"] == "session.status":
+                    return event
+
+    try:
+        await reader._post_event(client, session_id, reader._status_event("running"))
+        await status_event()
+        clock[0] = 601
+        await reader._reconcile_idle_turn(
+            port=1,
+            cascade_id="cascade",
+            client=client,
+            session_id=session_id,
+            state=state,
+            on_pending_interaction=None,
+        )
+        notice = await status_event()
+        assert notice["status"] == "running"
+        assert notice["blocked_on"] == "completion observation unavailable"
+        snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
+        assert snapshot["blocked_on"] == notice["blocked_on"]
+        assert state.turn_active
+
+        monkeypatch.setattr(
+            reader,
+            "get_all_cascade_trajectories",
+            lambda *args, **kwargs: {
+                "trajectorySummaries": {
+                    "cascade": {"status": "CASCADE_RUN_STATUS_" + recovery.upper()}
+                }
+            },
+        )
+        for _ in range(1 if recovery == "running" else 2):
+            await reader._reconcile_idle_turn(
+                port=1,
+                cascade_id="cascade",
+                client=client,
+                session_id=session_id,
+                state=state,
+                on_pending_interaction=None,
+            )
+        recovered = await status_event()
+        assert recovered["status"] == recovery
+        assert not recovered.get("blocked_on")
+        assert state.turn_active == (recovery == "running")
+        snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
+        assert not snapshot.get("blocked_on")
+    finally:
+        await collector.stop()
+
+
 @pytest.mark.parametrize("persist, digit", [("session", "2"), ("always", "3")])
 @pytest.mark.parametrize("changed_command", [False, True])
 async def test_permission_consent_through_reader_and_server(

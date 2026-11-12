@@ -550,6 +550,12 @@ export function workingIndicatorLabel(
   { answerableInChat = false, terminalView = false } = {},
 ): string {
   if (blockedOn) {
+    if (blockedOn === "completion observation unavailable") {
+      return "Antigravity completion is unconfirmed. Still watching for completion.";
+    }
+    if (blockedOn === "completion observer stopped") {
+      return "Antigravity observation stopped before completion was confirmed. Check the terminal.";
+    }
     // A "dialog open" block lives only in the terminal tab, so point the user
     // there to respond rather than leaving the session looking hung.
     if (blockedOn === "dialog open") {

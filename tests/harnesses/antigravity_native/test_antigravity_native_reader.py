@@ -5777,23 +5777,31 @@ async def test_helper_waits_through_empty_snapshots_before_native_work(
 
 
 @pytest.mark.parametrize("status", ["CASCADE_RUN_STATUS_IDLE", "CASCADE_RUN_STATUS_RUNNING"])
-async def test_helper_without_native_work_fails_at_the_silence_deadline(
+async def test_helper_without_native_work_keeps_watching_after_silence_deadline(
     monkeypatch: pytest.MonkeyPatch,
     status: str,
 ) -> None:
     clock = [0.0]
     monkeypatch.setattr(reader, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(reader, "get_trajectory_steps", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        reader,
+        "get_trajectory_steps",
+        lambda *_args, **_kwargs: _child_transcript() if clock[0] >= 660 else [],
+    )
     monkeypatch.setattr(
         reader,
         "get_all_cascade_trajectories",
-        lambda *_args, **_kwargs: {"trajectorySummaries": {"child-aaa": {"status": status}}},
+        lambda *_args, **_kwargs: {
+            "trajectorySummaries": {
+                "child-aaa": {"status": "CASCADE_RUN_STATUS_IDLE" if clock[0] >= 660 else status}
+            }
+        },
     )
     sink = _PostSink()
     monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
 
     async def tick(_seconds: float) -> None:
-        assert sink.statuses() == []
+        assert "failed" not in sink.statuses()
         clock[0] += 30
 
     monkeypatch.setattr(reader, "_sleep", tick)
@@ -5808,9 +5816,11 @@ async def test_helper_without_native_work_fails_at_the_silence_deadline(
             ),
             timeout=_MIRROR_HANG_GUARD_S,
         )
-    assert clock[0] == reader._UNCONFIRMED_TURN_TIMEOUT_S
-    assert sink.statuses() == ["failed"]
-    assert "120 seconds without evidence of work" in sink.posts[-1][1]["output"]
+    assert clock[0] >= 660
+    assert sink.statuses() == ["running", "running", "idle"]
+    assert any(
+        data.get("observation_status") == "observation_unconfirmed" for _, data in sink.posts
+    )
 
 
 async def test_running_helper_retains_evidence_of_an_unfinished_native_step(
@@ -6009,7 +6019,9 @@ async def test_running_child_reads_status_once_per_tick_without_closing(
 
     assert polls >= 30, f"the mirror should have kept polling a vetoed child; got {polls}"
     assert idle_checks == polls
-    assert sink.statuses() == ["failed"]
+    assert sink.statuses() == ["running"]
+    assert sink.posts[-1][1]["observation_status"] == "observation_unconfirmed"
+    assert sink.posts[-1][1]["blocked_on"] == "completion observer stopped"
     assert "completion could be confirmed" in sink.posts[-1][1]["output"]
 
 
@@ -6102,12 +6114,14 @@ async def test_stream_frame_refreshes_silence_deadline(monkeypatch: pytest.Monke
     }
     clock[0] = 119
     await reader._stream_loop(**params, stop=_stop_after(1))
-    for clock[0] in (120, 121, 122, 238):
+    for clock[0] in (120, 121, 122, 238, 718):
         await reader._reconcile_idle_turn(**params)
         assert sink.statuses() == []
-    for clock[0] in (239, 240):
+    for clock[0] in (719, 720):
         await reader._reconcile_idle_turn(**params)
-    assert sink.statuses() == ["failed"]
+    assert sink.statuses() == ["running"]
+    assert state.turn_active
+    assert sink.posts[-1][1]["observation_status"] == "observation_unconfirmed"
 
 
 async def test_slow_completion_reads_are_sequential_with_transport_timeouts(

@@ -1547,6 +1547,37 @@ describe("chatStore — switchTo", () => {
     expect(useChatStore.getState().backgroundTasks).toEqual([{ description: "Wait for CI" }]);
   });
 
+  it("restores an observation warning on open and clears it on recovery", async () => {
+    seedSession("conv_observation", []);
+    const routed = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (
+        String(input).split("?")[0] === "/v1/sessions/conv_observation" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        return mockResponse({
+          id: "conv_observation",
+          agent_id: "agent_xyz",
+          status: "running",
+          blocked_on: "completion observation unavailable",
+          created_at: 0,
+          items: [],
+        });
+      }
+      return routed(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_observation");
+    expect(useChatStore.getState().sessionStatus).toBe("running");
+    expect(useChatStore.getState().blockedOn).toBe("completion observation unavailable");
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_observation",
+      status: "running",
+    });
+    expect(useChatStore.getState().blockedOn).toBeNull();
+  });
+
   it("restores the background agents a waiting snapshot names", async () => {
     seedSession("conv_waiting_agent", []);
     const routed = fetchMock.getMockImplementation()!;

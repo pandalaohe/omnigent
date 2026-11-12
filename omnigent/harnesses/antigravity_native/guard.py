@@ -11,6 +11,7 @@ import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
+from time import monotonic, sleep
 
 from omnigent import permission_tiers
 from omnigent.permission_tiers import (
@@ -36,7 +37,20 @@ def _object(value: object) -> dict[str, object]:
     return value
 
 
+class PermissionStateUnavailable(RuntimeError):
+    """The current revision could not be observed; no tool lease was granted."""
+
+
 def _error(exc: Exception) -> dict[str, str]:
+    if isinstance(exc, PermissionStateUnavailable):
+        return {
+            "decision": "deny",
+            "status": "unavailable",
+            "reason": (
+                "Permission state unavailable; retry the permission check "
+                "before running this tool."
+            ),
+        }
     return {"decision": "deny", "reason": f"Permission check unavailable: {type(exc).__name__}"}
 
 
@@ -73,22 +87,28 @@ def _confirmed_relay(bridge_dir: Path, state: HostPermissionState) -> dict[str, 
     if state.status != "ready":
         raise ValueError("Permission state is blocked or switching")
     relay = _relay_config(bridge_dir, state)
-    attempt = 0
+    deadline = monotonic() + 60.0
     while True:
         try:
-            confirmed = _relay_post(relay, "/permission-tiers/state", {})
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise PermissionStateUnavailable("State observation deadline expired")
+            confirmed = _relay_post(
+                relay, "/permission-tiers/state", {}, timeout_s=min(55.0, remaining)
+            )
             break
         except urllib.error.HTTPError as exc:
-            if exc.code not in (503, 504) or attempt == 2:
+            if exc.code not in (503, 504):
                 raise
             exc.close()
         except urllib.error.URLError as exc:
-            if not isinstance(exc.reason, TimeoutError) or attempt == 2:
+            if not isinstance(exc.reason, TimeoutError):
                 raise
         except TimeoutError:
-            if attempt == 2:
-                raise
-        attempt += 1
+            pass
+        if monotonic() >= deadline:
+            raise PermissionStateUnavailable("State observation deadline expired")
+        sleep(min(0.2, max(0.0, deadline - monotonic())))
     if (
         confirmed.get("permission_tiers_capability") is not True
         or confirmed.get("permission_tier") != state.tier
@@ -111,7 +131,11 @@ def _relay_config(bridge_dir: Path, state: HostPermissionState) -> dict[str, obj
 
 
 def _relay_post(
-    relay: Mapping[str, object], path: str, payload: dict[str, object]
+    relay: Mapping[str, object],
+    path: str,
+    payload: dict[str, object],
+    *,
+    timeout_s: float | None = None,
 ) -> dict[str, object]:
     url, token = relay.get("url"), relay.get("token")
     if not isinstance(url, str) or not isinstance(token, str) or not token:
@@ -126,10 +150,12 @@ def _relay_post(
     if path == "/policies/evaluate":
         timeout = 86400
     elif path == "/permission-tiers/state":
-        timeout = 10
+        timeout = 55
     else:
         timeout = 5
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(
+        request, timeout=timeout if timeout_s is None else timeout_s
+    ) as response:
         return _object(json.load(response))
 
 

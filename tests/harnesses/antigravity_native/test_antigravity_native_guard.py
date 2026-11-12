@@ -390,13 +390,28 @@ def test_recovered_state_mismatch_denies_without_retry(native_transport, field, 
     assert [path for path, _ in calls] == ["/permission-tiers/state"] * 2
 
 
-def test_persistent_state_timeout_denies_after_three_attempts(native_transport):
+def test_persistent_state_timeout_is_recoverable_at_shared_deadline(native_transport, monkeypatch):
     _, run = native_transport
+    clock = [0.0]
+    monkeypatch.setattr(guard, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(guard, "sleep", lambda _: clock.__setitem__(0, clock[0] + 20))
     result, calls = run([TimeoutError(), TimeoutError(), TimeoutError()])
     assert result["decision"] == "deny"
-    assert "TimeoutError" in result["reason"]
+    assert result["status"] == "unavailable"
+    assert "unavailable" in result["reason"]
     assert [path for path, _ in calls] == ["/permission-tiers/state"] * 3
     assert all(timeout > 5 for _, timeout in calls)
+
+
+@pytest.mark.parametrize("policy", ["POLICY_ACTION_ALLOW", "POLICY_ACTION_DENY"])
+def test_state_recovers_after_old_total_budget(native_transport, monkeypatch, policy):
+    matching, run = native_transport
+    clock = [0.0]
+    monkeypatch.setattr(guard, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(guard, "sleep", lambda _: clock.__setitem__(0, 35.0))
+    result, calls = run([http_error(503), matching, {"result": policy}])
+    assert result["decision"] == ("allow" if policy == "POLICY_ACTION_ALLOW" else "deny")
+    assert calls[1] == ("/permission-tiers/state", 25.0)
 
 
 @pytest.mark.parametrize("failure", ["401", "malformed", "url-other"])

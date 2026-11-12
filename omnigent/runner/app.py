@@ -13066,14 +13066,21 @@ def create_runner_app(
                         status_code=409 if body_type == "permission_tier_prepare" else 503,
                         content={"error": "session_busy"},
                     )
+                agy_switch_deadline = None
                 if harness == "antigravity-native":
-                    from omnigent.harnesses.antigravity_native.bridge import _require_agy_idle
+                    from omnigent.harnesses.antigravity_native.bridge import (
+                        AGY_SWITCH_STEP_TIMEOUT_S,
+                        _require_agy_idle,
+                        agy_control_deadline,
+                    )
 
+                    agy_switch_deadline = time.monotonic() + AGY_SWITCH_STEP_TIMEOUT_S
                     try:
-                        await asyncio.to_thread(
-                            _require_agy_idle,
-                            permission_tiers.path(conversation_id).parent,
-                        )
+                        with agy_control_deadline(agy_switch_deadline):
+                            await asyncio.to_thread(
+                                _require_agy_idle,
+                                permission_tiers.path(conversation_id).parent,
+                            )
                     except (OSError, RuntimeError, ValueError):
                         return JSONResponse(
                             status_code=409 if body_type == "permission_tier_prepare" else 503,
@@ -13109,6 +13116,7 @@ def create_runner_app(
                                 tier=target,
                                 previous=state.tier,
                                 timeout_s=AGY_SWITCH_STEP_TIMEOUT_S,
+                                deadline=agy_switch_deadline,
                             )
                         else:
                             from omnigent.harnesses.pi_native.bridge import (
@@ -13161,9 +13169,20 @@ def create_runner_app(
                     return JSONResponse(
                         status_code=409, content={"error": "permission_tier_stale"}
                     )
-                snapshot = await _session_payload_for_host_spawn_check(
-                    server_client, conversation_id
-                )
+                try:
+                    remaining = (
+                        max(0.0, agy_switch_deadline - time.monotonic())
+                        if agy_switch_deadline is not None
+                        else None
+                    )
+                    async with asyncio.timeout(remaining):
+                        snapshot = await _session_payload_for_host_spawn_check(
+                            server_client, conversation_id
+                        )
+                except TimeoutError:
+                    return JSONResponse(
+                        status_code=503, content={"error": "server_state_unavailable"}
+                    )
                 labels = snapshot.get("labels") if isinstance(snapshot, dict) else None
                 if not isinstance(labels, dict):
                     return JSONResponse(
@@ -13201,6 +13220,7 @@ def create_runner_app(
                                 tier=target,
                                 previous=prepared[1],
                                 timeout_s=AGY_SWITCH_STEP_TIMEOUT_S,
+                                deadline=agy_switch_deadline,
                             )
                         else:
                             from omnigent.harnesses.pi_native.bridge import (

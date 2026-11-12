@@ -238,6 +238,7 @@ interface SessionResponseWire {
    */
   archived?: boolean;
   status: SessionStatus;
+  blocked_on?: string | null;
   /**
    * Background shells (claude-native) still running as of the last status
    * edge, so a reload re-shows "N background tasks still running" after the session
@@ -498,6 +499,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     hostResumable: wire.host_resumable ?? false,
     archived: wire.archived ?? false,
     status: snapshotStatus(wire),
+    ...(wire.blocked_on ? { blockedOn: wire.blocked_on } : {}),
     backgroundTaskCount: wire.background_task_count ?? undefined,
     backgroundTasks: parseBackgroundTasks(wire.background_tasks),
     backgroundAgents: parseBackgroundTasks(wire.background_agents),

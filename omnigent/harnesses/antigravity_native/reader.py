@@ -176,7 +176,7 @@ _CASCADE_RUN_STATUS_IDLE = "CASCADE_RUN_STATUS_IDLE"
 _QUIESCENT_TICKS_TO_CLOSE = 2
 # Bound unavailable completion observations without blocking the stream's error path.
 _IDLE_READ_TIMEOUT_S = 2.0
-_UNCONFIRMED_TURN_TIMEOUT_S = 120.0
+_UNCONFIRMED_TURN_TIMEOUT_S = 600.0
 # Terminal-failure session status (a valid ``external_session_status``; see the
 # ``Literal["idle", "running", "failed"]`` schema). Emitted when an agy turn
 # closes on a model/turn ERROR so the web UI shows the turn FAILED instead of a
@@ -1300,6 +1300,7 @@ class _ReaderState:
     turn_error: str | None = None
     idle_ticks: int = 0
     last_work_at: float = field(default_factory=lambda: monotonic())
+    observation_notice_at: float = float("-inf")
     last_text: str = ""
     posted_model_enum: str | None = None
     model_catalog: dict[str, object] | None = None
@@ -1446,7 +1447,7 @@ async def _stream_loop(
     """
     while not stop():
         async for frame in stream_agent_state_updates(port, cascade_id):
-            state.last_work_at = monotonic()
+            await _note_observed_work(client, session_id, state)
             context = frame.get("contextWindowUsage")
             if isinstance(context, dict):
                 payload: dict[str, object] = {}
@@ -1606,7 +1607,7 @@ async def _commit_step(
             state.last_text = text
         if _is_settled(step):
             state.seen.add(key)
-            state.last_work_at = monotonic()
+            await _note_observed_work(client, session_id, state)
         # Close any live block for this step BEFORE its committed item. Done
         # here rather than in the stream handler because the poll loop commits
         # through this same function: closing in only one path leaves every
@@ -1761,6 +1762,16 @@ async def _register_subagent_child(
     return child_session_id
 
 
+async def _note_observed_work(
+    client: httpx.AsyncClient, session_id: str, state: _ReaderState
+) -> None:
+    state.last_work_at = monotonic()
+    if state.observation_notice_at != float("-inf"):
+        if state.turn_active:
+            await _post_event(client, session_id, _status_event(_STATUS_RUNNING))
+        state.observation_notice_at = float("-inf")
+
+
 async def _reconcile_idle_turn(
     *,
     port: int,
@@ -1786,7 +1797,7 @@ async def _reconcile_idle_turn(
     status = summary.get("status") if isinstance(summary, dict) else None
     if generation == state.turn_generation and status == "CASCADE_RUN_STATUS_RUNNING":
         if state.usage_thread_kind != "subagent" or state.native_work_observed:
-            state.last_work_at = monotonic()
+            await _note_observed_work(client, session_id, state)
         state.idle_ticks = 0
     if not poll_steps and (not state.turn_active or status == "CASCADE_RUN_STATUS_RUNNING"):
         return body
@@ -1815,7 +1826,7 @@ async def _reconcile_idle_turn(
         if not state.turn_active or generation != state.turn_generation:
             return body
         if steps and isinstance(steps[-1], dict) and not _is_settled(steps[-1]):
-            state.last_work_at = monotonic()
+            await _note_observed_work(client, session_id, state)
         # A helper may omit USER_INPUT, but registration alone is not native work.
         turn_observed = state.turn_generation > 0 or (
             state.usage_thread_kind == "subagent" and bool(state.seen)
@@ -1841,11 +1852,16 @@ async def _reconcile_idle_turn(
             if state.turn_error:
                 event.data["output"] = state.turn_error
         elif monotonic() - state.last_work_at >= _UNCONFIRMED_TURN_TIMEOUT_S:
-            event = _status_event(_STATUS_FAILED)
-            event.data["output"] = (
-                state.last_text + "\n\nAntigravity completion could not be confirmed after "
-                "120 seconds without evidence of work; the last received text is shown above."
-            ).strip()
+            if state.observation_notice_at < state.last_work_at:
+                event = _status_event(_STATUS_RUNNING)
+                event.data["output"] = (
+                    "Antigravity observation unconfirmed; still watching for completion."
+                )
+                event.data["observation_status"] = "observation_unconfirmed"
+                event.data["blocked_on"] = "completion observation unavailable"
+                await _post_event(client, session_id, event)
+                state.observation_notice_at = monotonic()
+            return body
         else:
             return body
         state.turn_active = False
@@ -1896,7 +1912,9 @@ async def _mirror_subagent_cascade(
             await _sleep(_SUBAGENT_POLL_INTERVAL_S)
     finally:
         if child_state.turn_active:
-            event = _status_event(_STATUS_FAILED)
+            event = _status_event(_STATUS_RUNNING)
+            event.data["observation_status"] = "observation_unconfirmed"
+            event.data["blocked_on"] = "completion observer stopped"
             event.data["output"] = (
                 "Helper mirroring ended before native completion could be confirmed."
             )
