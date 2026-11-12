@@ -206,7 +206,7 @@ def create_agent_quota_router(
                 body_limit=evidence_max_body_bytes,
             )
         )
-    otlp_receiver = OtlpReceiver(service)
+    otlp_receiver = OtlpReceiver(service, evidence_service)
 
     @router.get("/me/usage/lines")
     async def usage_lines(request: Request, running: bool = False) -> dict[str, Any]:

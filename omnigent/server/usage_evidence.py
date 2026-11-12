@@ -7,13 +7,17 @@ import base64
 import json
 import logging
 from collections.abc import Sequence
+from datetime import date
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
 from omnigent.db.utils import now_epoch
 from omnigent.stores.usage_evidence_store import EVIDENCE_TABLES, UsageEvidenceStore
 from omnigent.usage.evidence import EvidenceBody, Rejected, SourceEvent, SourceStatus
+from omnigent.usage.ranges import RangeKey, range_spans
+from omnigent.usage.speed import aggregate_speed
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +70,40 @@ class UsageEvidenceService:
             self.store.insert_events(owner, events) if events else {"accepted": 0, "duplicates": 0}
         )
         return dict(result, rejected=rejected)
+
+    def read_speed(
+        self,
+        owner: str,
+        range_key: RangeKey = "h24",
+        tz: str = "UTC",
+        account: str | None = None,
+        model: str | None = None,
+        by: str = "model",
+        from_date: date | None = None,
+        to_date: date | None = None,
+    ) -> dict[str, Any]:
+        if range_key == "period" or by not in {"model", "account"}:
+            raise ValueError("Invalid speed range or grouping")
+        now = now_epoch()
+        try:
+            span, _ = range_spans(
+                range_key, now, ZoneInfo(tz), from_date=from_date, to_date=to_date
+            )
+        except KeyError:
+            raise ValueError("Invalid timezone") from None
+        points = self.store.read_speed(owner, span.counted_from, span.until, account, model)
+        return {
+            "generated_at": now,
+            "range": range_key,
+            "span": {
+                "requested_from": span.requested_from,
+                "counted_from": span.counted_from,
+                "until": span.until,
+                "approx": span.approx,
+            },
+            "rows": aggregate_speed(points, by),
+            "last_received_at": max((p["updated_at"] for p in points), default=None),
+        }
 
     def read_sources(self, owner: str, account: str | None = None) -> dict[str, Any]:
         now = now_epoch()

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Annotated, Any
+from datetime import date
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -14,6 +15,7 @@ from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.usage_evidence import UsageEvidenceService
 from omnigent.usage.evidence import Account, EvidenceBody, Severity, parse_cloudevents
+from omnigent.usage.ranges import RangeKey
 
 
 def create_usage_evidence_router(
@@ -76,6 +78,29 @@ def create_usage_evidence_router(
         except (ValueError, RecursionError):
             raise HTTPException(422, "Invalid CloudEvents envelope") from None
         return await call(service.report_events, user, parsed)
+
+    @router.get("/me/usage/speed")
+    async def speed(
+        request: Request,
+        range_key: Annotated[RangeKey, Query(alias="range")] = "h24",
+        tz: str = "UTC",
+        account: Account | None = None,
+        model: Annotated[str | None, Query(max_length=128)] = None,
+        by: Literal["model", "account"] = "model",
+        from_date: Annotated[date | None, Query(alias="from")] = None,
+        to_date: Annotated[date | None, Query(alias="to")] = None,
+    ) -> JSONResponse:
+        return await call(
+            service.read_speed,
+            owner(request),
+            range_key,
+            tz,
+            account,
+            model,
+            by,
+            from_date,
+            to_date,
+        )
 
     @router.get("/me/usage/sources")
     async def sources(request: Request, account: Account | None = None) -> JSONResponse:

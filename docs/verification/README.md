@@ -11,6 +11,7 @@ app; component checks use their own isolated test environment.
   receipts, user controls, permission initialization and context usage.
 - [OTLP usage ingestion](features/usage-otlp.md): HTTP signals, accounting and managed-session exclusion.
 - [Source evidence](features/usage-source-evidence.md): CloudEvents replay, status freshness, retention and scoped reads.
+- [Speed evidence](features/usage-speed.md): OTLP histograms, replay corrections, scoped reads and account isolation.
 - [Automatic rotation](features/auto-rotation.md): context notices, handover deferral,
   durable request recovery and runner concurrency.
 - [Host upgrades](features/host-upgrade.md): legacy channel pins, Windows file users,

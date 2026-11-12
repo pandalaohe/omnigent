@@ -187,6 +187,46 @@ between accounts requires a removal and replacement; it is complete only when
 neither response holds or skips an entry. There is no cross-account transaction.
 See **Usage → Issues** for attributable rejected or failed source reports.
 
+## Speed histograms
+
+Send speed through the existing OTLP metrics door,
+`POST /v1/me/usage/otlp/v1/metrics`, using delta temporality:
+
+- `gen_ai.server.time_to_first_token`: explicit-bucket Histogram, unit `s`.
+- `gen_ai.server.time_per_output_token`: explicit-bucket Histogram, unit `s`.
+- `omnigent.usage.speed.requests`: optional monotonic Sum, unit `{request}`,
+  counting requests before the producer's sample filter.
+
+Set `startTimeUnixNano` and `timeUnixNano` for each interval. The interval must
+end in a closed UTC hour and within `usage.evidence.retention_days` (default
+400). Histogram counts must match the buckets; bounds must be finite,
+nonnegative, strictly increasing, with at most 256 bounds. Histogram sums are
+not required. Use `gen_ai.response.model` (fallback `gen_ai.request.model`),
+`omnigent.usage.account` as for activity, and optional point attribute
+`omnigent.usage.coverage` (`complete` or `partial`). `Metric.description`
+(up to 256 characters) states the producer's sample filter.
+
+Speed is accepted from any resource, including managed resources and services
+whose activity counters are excluded. It creates no activity account or writer
+claim. Replay replaces the same account/model/metric/interval, independently of
+the activity receiver's two-hour deduplication. A complete row holds a partial
+replay or lower count; the OTLP partial-success message warns with no added
+rejection count. An intentional correction sets the boolean point attribute
+`omnigent.usage.correction` to true. Invalid points increase the rejection count.
+
+Read `GET /v1/me/usage/speed?range=h24&tz=UTC` with optional `account`, `model`
+and `by=model|account` (default `model`, combining accounts). Range and custom
+`from`/`to` dates follow activity; `period` is rejected. The reply includes
+`generated_at`, `range`, `span`, `last_received_at`, and rows with `hours`,
+`complete_hours`, `partial_hours`, nullable `requests`, `ttft`, `tpot`,
+`description` and `excluded_hours`. Histograms contain `unit`,
+`explicit_bounds`, `bucket_counts` and `count`; identical bounds are summed.
+The earliest interval chooses each metric's bounds; incompatible intervals are
+excluded with reason `bounds-changed`. Requests stay null if any included
+interval lacks them. Quantiles and tokens/second conversion belong to consumers.
+Read and write require usage scope and use the authenticated owner and current
+workspace. Account/user removal and daily retention also clear speed evidence.
+
 ## Source status and events
 
 External collectors can push status snapshots and notifications independently of

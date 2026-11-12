@@ -160,7 +160,14 @@ async def test_indexed_event_rejections_and_single_mode(request, db_uri):
 
 
 @pytest.mark.parametrize(
-    "method,path", [("GET", "events"), ("GET", "sources"), ("POST", "events"), ("PUT", "evidence")]
+    "method,path",
+    [
+        ("GET", "events"),
+        ("GET", "sources"),
+        ("GET", "speed"),
+        ("POST", "events"),
+        ("PUT", "evidence"),
+    ],
 )
 def test_usage_scope_only(method, path):
     path = "/v1/me/usage/" + path
@@ -256,6 +263,7 @@ async def test_real_key_scope_and_disabled_gate(db_uri):
             for method, suffix, kwargs in [
                 ("GET", "events", {}),
                 ("GET", "sources", {}),
+                ("GET", "speed", {}),
                 ("PUT", "evidence", {"json": {"schema_version": 1}}),
                 (
                     "POST",

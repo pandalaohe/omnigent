@@ -12,12 +12,18 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
-from omnigent.db.db_models import SqlUsageSourceEvent, SqlUsageSourceStatus, current_workspace_id
+from omnigent.db.db_models import (
+    SqlUsageSourceEvent,
+    SqlUsageSourceStatus,
+    SqlUsageSpeedPoint,
+    current_workspace_id,
+)
 from omnigent.db.utils import now_epoch, run_write_transaction
 from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
 from omnigent.usage.evidence import SourceEvent, SourceStatus
+from omnigent.usage.speed import SpeedPoint
 
-EVIDENCE_TABLES = (SqlUsageSourceStatus, SqlUsageSourceEvent)
+EVIDENCE_TABLES = (SqlUsageSourceStatus, SqlUsageSourceEvent, SqlUsageSpeedPoint)
 
 
 class UsageEvidenceStore:
@@ -71,6 +77,56 @@ class UsageEvidenceStore:
         UsageSnapshotStore.write_in_session(
             session, owner, "usage.evidence.lock", {"schema_version": 1}
         )
+
+    def upsert_speed(self, owner: str, rows: Sequence[SpeedPoint]) -> int:
+        def write(session: Session) -> int:
+            self._lock(session, owner)
+            held = 0
+            table = SqlUsageSpeedPoint
+            for row in rows:
+                values = dict(
+                    row.values(),
+                    workspace_id=current_workspace_id(),
+                    owner_id=owner,
+                    updated_at=now_epoch(),
+                )
+                existing = session.get(
+                    table, tuple(values[column.name] for column in table.__table__.primary_key)
+                )
+                if (
+                    existing is not None
+                    and existing.coverage == "complete"
+                    and not row.correction
+                    and (row.coverage == "partial" or row.count < existing.count)
+                ):
+                    held += 1
+                    continue
+                self._write(session, table, values)
+                session.expire_all()
+            return held
+
+        return run_write_transaction(self.sessions._write_session(), "report_speed_points", write)
+
+    def read_speed(
+        self,
+        owner: str,
+        start: int,
+        end: float,
+        account: str | None = None,
+        model: str | None = None,
+    ) -> list[dict[str, Any]]:
+        table = SqlUsageSpeedPoint
+        query = select(table).where(
+            *self.scope(table, owner), table.start_utc >= start, table.end_utc <= end
+        )
+        for column, value in ((table.account_id, account), (table.model, model)):
+            if value is not None:
+                query = query.where(column == value)
+        with self.sessions._read_session()("read_speed_points") as session:
+            return [
+                {column.name: getattr(row, column.name) for column in table.__table__.columns}
+                for row in session.scalars(query)
+            ]
 
     def upsert_status(self, owner: str, rows: Sequence[SourceStatus]) -> int:
         def write(session: Session) -> int:
@@ -230,6 +286,7 @@ class UsageEvidenceStore:
             for table, column in (
                 (SqlUsageSourceEvent, SqlUsageSourceEvent.time_utc),
                 (SqlUsageSourceStatus, SqlUsageSourceStatus.updated_at),
+                (SqlUsageSpeedPoint, SqlUsageSpeedPoint.end_utc),
             ):
                 if table.__tablename__ in before:
                     result[table.__tablename__] = cast(

@@ -3402,6 +3402,25 @@ def _usage_evidence_key(length: int) -> String:
     )
 
 
+class SqlUsageSpeedPoint(OmnigentBase):
+    __tablename__ = "usage_speed_points"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, default=0)
+    owner_id: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    account_id: Mapped[str] = mapped_column(_usage_evidence_key(64), primary_key=True, default="")
+    model: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    metric: Mapped[str] = mapped_column(String(16), primary_key=True)
+    start_utc: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    end_utc: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    unit: Mapped[str] = mapped_column(String(16))
+    bounds: Mapped[list[float] | None] = mapped_column(JSON)
+    bucket_counts: Mapped[list[int] | None] = mapped_column(JSON)
+    count: Mapped[int] = mapped_column(BigInteger)
+    coverage: Mapped[str | None] = mapped_column(String(16))
+    description: Mapped[str | None] = mapped_column(String(256))
+    updated_at: Mapped[int] = mapped_column(BigInteger)
+
+
 class SqlUsageSourceStatus(OmnigentBase):
     __tablename__ = "usage_source_status"
 
