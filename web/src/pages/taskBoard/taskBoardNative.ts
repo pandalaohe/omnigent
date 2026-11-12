@@ -1,3 +1,4 @@
+import type { DisplayTool } from "./taskBoardDisplay";
 import { useEffect } from "react";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { resolveWebSocketUrl } from "@/lib/host";
@@ -7,6 +8,13 @@ import type { UsageOverview } from "@/pages/usageBoard/usageBoardData";
 import { readBoardJson } from "./taskBoardData";
 
 export interface BoardSession {
+  running_since?: number;
+  running_seconds?: number;
+  idle_seconds?: number;
+  ended_at?: number;
+  current_tool?: DisplayTool;
+  questions?: { id: string; text: string }[];
+  need?: string;
   id: string;
   title?: string | null;
   status: string;

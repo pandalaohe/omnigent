@@ -3,6 +3,7 @@
     "locale": "en"
   },
   "board.title": "Task board",
+  "board.sourceUpdating": "Source data is updating. Showing the last complete reading where available.",
   "board.loading": "Loading tasks",
   "board.serverOff": "Task board is off on this server",
   "board.userOff": "Task board is off",
@@ -66,6 +67,7 @@
   "waiting.dependency": "Waiting on a dependency",
   "waiting.external": "Waiting on an external reply",
   "waiting.empty": "Nothing needs attention here.",
+  "detail.sourceDetails": "Source details",
   "detail.title": "Details: {{title}}",
   "detail.close": "Close",
   "detail.observed": "seen closed",

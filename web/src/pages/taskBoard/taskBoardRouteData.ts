@@ -124,6 +124,18 @@ export function taskRelations(tasks: BoardTask[]): TaskRelation[] {
   return [...edges.values()];
 }
 
+/** Parent membership is indexed once for every stop in the graph. */
+export function parentRelationCounts(
+  tasks: BoardTask[],
+  relations = taskRelations(tasks),
+): Map<BoardTask, number> {
+  const counts = new Map<BoardTask, number>();
+  for (const edge of relations) {
+    if (edge.kind === "parent" && edge.to) counts.set(edge.from, (counts.get(edge.from) ?? 0) + 1);
+  }
+  return counts;
+}
+
 function score(ids: string[], links: [string, string][]): number {
   const positions = new Map(ids.map((id, index) => [id, index]));
   return links.reduce(

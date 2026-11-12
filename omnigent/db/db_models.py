@@ -3066,6 +3066,11 @@ class SqlTaskBoardSource(OmnigentBase):
     complete_updated: Mapped[float | None] = mapped_column(Double)
     complete_version: Mapped[str | None] = mapped_column(Text)
     issues: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    source_generation: Mapped[str | None] = mapped_column(
+        String(32), default=lambda: uuid.uuid4().hex
+    )
+    source_display: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    snapshot_state: Mapped[dict[str, Any] | None] = mapped_column(JSON)
 
 
 class SqlTaskBoardItem(OmnigentBase):

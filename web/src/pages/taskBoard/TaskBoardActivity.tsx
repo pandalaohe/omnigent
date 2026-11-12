@@ -1,3 +1,4 @@
+import { sourceHistory, type SourceCache } from "./taskBoardSnapshotData";
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { timeMonday } from "d3-time";
@@ -23,7 +24,9 @@ export function TaskBoardActivity({
   tasks,
   sessions,
   onSelect,
+  sourceCaches,
 }: {
+  sourceCaches?: Record<string, SourceCache>;
   view: "log" | "history" | "today";
   tasks: BoardTask[];
   sessions: BoardSession[];
@@ -36,13 +39,15 @@ export function TaskBoardActivity({
   const history = useQuery({
     queryKey: ["taskBoard", "history"],
     queryFn: () => readBoardHistory(),
+    enabled: !sourceCaches,
     retry: false,
     refetchInterval: () => (document.visibilityState === "visible" ? 60_000 : false),
   });
   const offset = -new Date().getTimezoneOffset();
   const counts = useQuery({
     queryKey: ["taskBoard", "closedCounts", offset],
-    queryFn: readLocalClosedCounts,
+    queryFn: () => readLocalClosedCounts(),
+    enabled: !sourceCaches,
     retry: false,
     refetchInterval: () => (document.visibilityState === "visible" ? 60_000 : false),
   });
@@ -57,12 +62,16 @@ export function TaskBoardActivity({
     refetchInterval: () => (document.visibilityState === "visible" ? 60_000 : false),
   });
   const byId = new Map(tasks.map((task) => [taskIdentity(task), task]));
-  const events = (history.data ?? []).filter(
+  const cachedHistory = sourceCaches ? sourceHistory(sourceCaches) : undefined;
+  const cachedCounts = sourceCaches
+    ? Object.values(sourceCaches).flatMap((cache) => cache.counts)
+    : undefined;
+  const events = (cachedHistory ?? history.data ?? []).filter(
     (event) => view !== "today" || localDay(event.time) === today,
   );
   const weeks = new Map<string, number>(),
     months = new Map<string, number>();
-  for (const day of counts.data?.days ?? []) {
+  for (const day of cachedCounts ?? counts.data?.days ?? []) {
     const week = localDay(timeMonday.floor(new Date(`${day.day}T12:00:00`)));
     weeks.set(week, (weeks.get(week) ?? 0) + day.closed);
     months.set(day.day.slice(0, 7), (months.get(day.day.slice(0, 7)) ?? 0) + day.closed);
@@ -172,7 +181,7 @@ export function TaskBoardActivity({
                   title={t("history.week", { date: week, count })}
                   onClick={() => {
                     setMonth(
-                      (counts.data?.days ?? [])
+                      (cachedCounts ?? counts.data?.days ?? [])
                         .find(
                           (day) =>
                             localDay(timeMonday.floor(new Date(`${day.day}T12:00:00`))) === week,

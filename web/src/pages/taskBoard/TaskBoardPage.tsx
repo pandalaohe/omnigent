@@ -527,11 +527,17 @@ export function TaskBoardPage() {
           />
         </div>
       )}
+      {Object.keys(tasksQuery.data?.sourceStates ?? {}).length > 0 && (
+        <p role="status" className="tb-band-empty">
+          {t("board.sourceUpdating")}
+        </p>
+      )}
       {(["log", "history", "today"] as const).map((view) =>
         preferences.view === view ? (
           <TaskBoardActivity
             key={view}
             view={view}
+            sourceCaches={tasksQuery.data?.sourceCaches}
             tasks={tasks}
             sessions={sessions}
             onSelect={select}
@@ -553,7 +559,8 @@ export function TaskBoardPage() {
               silent={silentIds}
             />
           )
-        ) : tasksQuery.isPending ? (
+        ) : tasksQuery.isPending ||
+          (!tasks.length && Object.keys(tasksQuery.data?.sourceStates ?? {}).length > 0) ? (
           <Spinner aria-label={t("board.loading")} className="mx-auto my-12 size-5" />
         ) : (
           <TaskBoardRoutes
@@ -595,6 +602,7 @@ export function TaskBoardPage() {
         <TaskBoardDetail
           key={taskIdentity(selected)}
           task={selected}
+          sourceCache={tasksQuery.data?.sourceCaches?.[selected["omnigent.ai:source"]]}
           tasks={tasks}
           sessions={sessions}
           onSelect={select}

@@ -1,0 +1,211 @@
+{
+  "envelopes": {
+    "begin": {
+      "@type": "Group",
+      "uid": "example-feed",
+      "updated": "2026-11-12T04:00:00Z",
+      "sequence": 1,
+      "omnigent.ai:sourceDisplay": {
+        "version": 1,
+        "asOf": "2026-11-12T04:00:00Z",
+        "timeZone": "UTC",
+        "snapshot": {
+          "id": "snapshot-1",
+          "baseId": null,
+          "chunkCount": 1,
+          "expectedTaskCount": 1,
+          "contentHash": "d96aa25b640dbe60c1a62273de56116013f79607ec4020d93b8731bffeb8c0ef",
+          "coverageFrom": "2025-11-12",
+          "coverageTo": "2026-11-13",
+          "operation": "begin"
+        }
+      },
+      "entries": []
+    },
+    "append": {
+      "@type": "Group",
+      "uid": "example-feed",
+      "updated": "2026-11-12T04:00:00Z",
+      "sequence": 1,
+      "omnigent.ai:sourceDisplay": {
+        "version": 1,
+        "asOf": "2026-11-12T04:00:00Z",
+        "timeZone": "UTC",
+        "snapshot": {
+          "id": "snapshot-1",
+          "baseId": null,
+          "chunkCount": 1,
+          "expectedTaskCount": 1,
+          "contentHash": "d96aa25b640dbe60c1a62273de56116013f79607ec4020d93b8731bffeb8c0ef",
+          "coverageFrom": "2025-11-12",
+          "coverageTo": "2026-11-13",
+          "operation": "append",
+          "sourceGeneration": "server-generation-from-begin",
+          "chunkIndex": 0
+        }
+      },
+      "entries": [
+        {
+          "@type": "Task",
+          "uid": "example-1",
+          "updated": "2026-11-12T04:00:00Z",
+          "sequence": 0,
+          "title": "Example",
+          "omnigent.ai:sourceDisplay": {
+            "version": 1,
+            "sessions": [],
+            "intervals": [
+              {
+                "id": "work",
+                "from": "2026-11-12T04:00:00Z",
+                "to": null,
+                "agentId": "agent",
+                "origin": "event",
+                "cost": {
+                  "amount": null,
+                  "kind": "estimate",
+                  "tokens": 0
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "publish": {
+      "@type": "Group",
+      "uid": "example-feed",
+      "updated": "2026-11-12T04:00:00Z",
+      "sequence": 1,
+      "omnigent.ai:sourceDisplay": {
+        "version": 1,
+        "asOf": "2026-11-12T04:00:00Z",
+        "timeZone": "UTC",
+        "snapshot": {
+          "id": "snapshot-1",
+          "baseId": null,
+          "chunkCount": 1,
+          "expectedTaskCount": 1,
+          "contentHash": "d96aa25b640dbe60c1a62273de56116013f79607ec4020d93b8731bffeb8c0ef",
+          "coverageFrom": "2025-11-12",
+          "coverageTo": "2026-11-13",
+          "operation": "publish",
+          "sourceGeneration": "server-generation-from-begin"
+        }
+      },
+      "entries": []
+    }
+  },
+  "vectors": [
+    {
+      "input": {
+        "count": 42,
+        "amount": 1.25,
+        "zero": -0.0,
+        "cost": null
+      },
+      "canonical": "{\"amount\":1.25,\"cost\":null,\"count\":42,\"zero\":0}",
+      "sha256": "27f9285444b09e92e384cd84d980b86d7ac1e79da71b71791e54a1701b189d78"
+    },
+    {
+      "input": {
+        "decimal": 1e-07,
+        "whole": 1.0
+      },
+      "canonical": "{\"decimal\":1e-7,\"whole\":1}",
+      "sha256": "fdac39e88ea54f795d15670c70bbacf4200f32c19bff36d7670b81c5f95e7045"
+    },
+    {
+      "input": {
+        "group": {
+          "@type": "Group",
+          "uid": "example-feed",
+          "updated": "2026-11-12T04:00:00Z",
+          "sequence": 1,
+          "omnigent.ai:sourceDisplay": {
+            "version": 1,
+            "asOf": "2026-11-12T04:00:00Z",
+            "timeZone": "UTC"
+          }
+        },
+        "tasks": [
+          {
+            "@type": "Task",
+            "uid": "example-1",
+            "updated": "2026-11-12T04:00:00Z",
+            "sequence": 0,
+            "title": "Example",
+            "omnigent.ai:sourceDisplay": {
+              "version": 1,
+              "sessions": [],
+              "intervals": [
+                {
+                  "id": "work",
+                  "from": "2026-11-12T04:00:00Z",
+                  "to": null,
+                  "agentId": "agent",
+                  "origin": "event",
+                  "cost": {
+                    "amount": null,
+                    "kind": "estimate",
+                    "tokens": 0
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "removedUids": []
+      },
+      "canonical": "{\"group\":{\"@type\":\"Group\",\"omnigent.ai:sourceDisplay\":{\"asOf\":\"2026-11-12T04:00:00Z\",\"timeZone\":\"UTC\",\"version\":1},\"sequence\":1,\"uid\":\"example-feed\",\"updated\":\"2026-11-12T04:00:00Z\"},\"removedUids\":[],\"tasks\":[{\"@type\":\"Task\",\"omnigent.ai:sourceDisplay\":{\"intervals\":[{\"agentId\":\"agent\",\"cost\":{\"amount\":null,\"kind\":\"estimate\",\"tokens\":0},\"from\":\"2026-11-12T04:00:00Z\",\"id\":\"work\",\"origin\":\"event\",\"to\":null}],\"sessions\":[],\"version\":1},\"sequence\":0,\"title\":\"Example\",\"uid\":\"example-1\",\"updated\":\"2026-11-12T04:00:00Z\"}]}",
+      "sha256": "d96aa25b640dbe60c1a62273de56116013f79607ec4020d93b8731bffeb8c0ef"
+    },
+    {
+      "input": {
+        "group": {
+          "@type": "Group",
+          "uid": "example-feed",
+          "updated": "2026-11-12T04:00:00Z",
+          "sequence": 1,
+          "omnigent.ai:sourceDisplay": {
+            "version": 1,
+            "asOf": "2026-11-12T04:00:00Z",
+            "timeZone": "UTC"
+          }
+        },
+        "tasks": [
+          {
+            "@type": "Task",
+            "uid": "example-1",
+            "updated": "2026-11-12T04:00:00Z",
+            "sequence": 0,
+            "title": "Example",
+            "omnigent.ai:sourceDisplay": {
+              "version": 1,
+              "sessions": [],
+              "intervals": [
+                {
+                  "id": "work",
+                  "from": "2026-11-12T04:00:00Z",
+                  "to": null,
+                  "agentId": "agent",
+                  "origin": "event",
+                  "cost": {
+                    "amount": null,
+                    "kind": "estimate",
+                    "tokens": 0
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "removedUids": [
+          "example-1"
+        ]
+      },
+      "canonical": "{\"group\":{\"@type\":\"Group\",\"omnigent.ai:sourceDisplay\":{\"asOf\":\"2026-11-12T04:00:00Z\",\"timeZone\":\"UTC\",\"version\":1},\"sequence\":1,\"uid\":\"example-feed\",\"updated\":\"2026-11-12T04:00:00Z\"},\"removedUids\":[\"example-1\"],\"tasks\":[{\"@type\":\"Task\",\"omnigent.ai:sourceDisplay\":{\"intervals\":[{\"agentId\":\"agent\",\"cost\":{\"amount\":null,\"kind\":\"estimate\",\"tokens\":0},\"from\":\"2026-11-12T04:00:00Z\",\"id\":\"work\",\"origin\":\"event\",\"to\":null}],\"sessions\":[],\"version\":1},\"sequence\":0,\"title\":\"Example\",\"uid\":\"example-1\",\"updated\":\"2026-11-12T04:00:00Z\"}]}",
+      "sha256": "3f83d5d3566cc100983ccd4edf55c382ae6a29204d11b7450f7531d4828320cd"
+    }
+  ]
+}

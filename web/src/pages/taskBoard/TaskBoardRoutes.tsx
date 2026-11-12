@@ -22,6 +22,7 @@ import {
   routeLayout,
   routeRows,
   routeTicks,
+  parentRelationCounts,
   taskRelations,
   taskTime,
   type RouteEdge,
@@ -135,14 +136,10 @@ export function TaskBoardRoutes({
       )
       .join("; ");
   const ticks = mode === "time" ? routeTicks(window, width - (width < 600 ? 28 : 210)) : [];
-  const relations = taskRelations(tasks);
-  const children = (node: RouteNode) =>
-    relations.filter(
-      (edge) =>
-        edge.kind === "parent" &&
-        edge.to &&
-        node.tasks.some((task) => taskIdentity(task) === taskIdentity(edge.from)),
-    );
+  const relations = useMemo(() => taskRelations(tasks), [tasks]);
+  const parentCounts = useMemo(() => parentRelationCounts(tasks, relations), [tasks, relations]);
+  const childCount = (node: RouteNode) =>
+    node.tasks.reduce((count, task) => count + (parentCounts.get(task) ?? 0), 0);
   const nodeActive = (node: RouteNode) => hub === node.id || hover === node.id;
   const showEdge = (edge: (typeof layout.edges)[number]) => !edge.hub || nodeActive(edge.from);
   const litChildren = new Set([
@@ -156,7 +153,7 @@ export function TaskBoardRoutes({
   const openNode = (node: RouteNode) => {
     if (node.tasks.length === 1) {
       onSelect(node.tasks[0]);
-      if (children(node).length >= 8) setHub((current) => (current === node.id ? null : node.id));
+      if (childCount(node) >= 8) setHub((current) => (current === node.id ? null : node.id));
       return;
     }
     if (mode === "time" && window.to - window.from > MIN_SPAN + 1) {
@@ -610,7 +607,7 @@ export function TaskBoardRoutes({
                             />
                           </foreignObject>
                         )}
-                        {children(node).length >= 8 && (
+                        {childCount(node) >= 8 && (
                           <g>
                             <rect
                               x={node.x + 12}
@@ -627,7 +624,7 @@ export function TaskBoardRoutes({
                               fontSize="11"
                               fill="var(--foreground)"
                             >
-                              {children(node).length}
+                              {childCount(node)}
                             </text>
                           </g>
                         )}

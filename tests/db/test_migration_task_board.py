@@ -17,6 +17,9 @@ def test_task_board_sqlite_migration_round_trip():
     precision = importlib.import_module(
         "omnigent.db.migrations.versions.a55c20261106_task_board_complete_version"
     )
+    snapshots = importlib.import_module(
+        "omnigent.db.migrations.versions.a64c20261112_task_source_snapshots"
+    )
     engine = sa.create_engine("sqlite://")
     try:
         with engine.begin() as connection:
@@ -24,6 +27,7 @@ def test_task_board_sqlite_migration_round_trip():
             with Operations.context(MigrationContext.configure(connection)):
                 migration.upgrade()
                 precision.upgrade()
+                snapshots.upgrade()
         with Session(engine) as session:
             session.add(
                 SqlTaskBoardSource(
@@ -74,6 +78,7 @@ def test_task_board_sqlite_migration_round_trip():
             with Operations.context(MigrationContext.configure(connection)):
                 migration.upgrade()
                 precision.upgrade()
+                snapshots.upgrade()
             assert {"task_board_sources", "task_board_items", "task_board_history"} <= set(
                 sa.inspect(connection).get_table_names()
             )

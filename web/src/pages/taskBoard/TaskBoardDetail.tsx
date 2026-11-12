@@ -1,3 +1,4 @@
+import type { SourceCache } from "./taskBoardSnapshotData";
 import { useQuery } from "@tanstack/react-query";
 import { ExternalLinkIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -14,6 +15,7 @@ import { useBoardSessionDetails, type BoardSession } from "./taskBoardNative";
 import { taskRelations, taskLocalTime } from "./taskBoardRouteData";
 import { formatDate, formatNumber, t } from "./taskBoardText";
 import { TaskProgressIcon } from "./TaskProgressIcon";
+import { TaskSourceDetails } from "./TaskSourceDetails";
 import { TaskBoardActions, taskActions } from "./TaskBoardActions";
 
 export const taskTitle = (task: BoardTask) =>
@@ -43,7 +45,9 @@ export function TaskBoardDetail({
   sessions,
   onSelect,
   onClose,
+  sourceCache,
 }: {
+  sourceCache?: SourceCache;
   task: BoardTask;
   tasks: BoardTask[];
   sessions: BoardSession[];
@@ -56,11 +60,12 @@ export function TaskBoardDetail({
       readBoardJson<BoardTask>(
         `/v1/me/tasks/item?${new URLSearchParams({ source: task["omnigent.ai:source"], uid: task.uid })}`,
       ),
+    enabled: !sourceCache,
     retry: false,
     staleTime: 30_000,
     refetchInterval: () => (document.visibilityState === "visible" ? 60_000 : false),
   });
-  const current = query.data ?? task;
+  const current = sourceCache ? task : (query.data ?? task);
   const actions = taskActions(current["omnigent.ai:actions"]);
   const spans = current["omnigent.ai:workedBy"] ?? [];
   const ids = [...new Set(spans.map((span) => span.session))];
@@ -364,6 +369,7 @@ export function TaskBoardDetail({
           </ol>
         </details>
       )}
+      <TaskSourceDetails display={current["omnigent.ai:sourceDisplay"]} />
     </section>
   );
 }

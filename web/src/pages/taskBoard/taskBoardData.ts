@@ -1,8 +1,11 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { authenticatedFetch } from "@/lib/identity";
+import { readPinnedSources, type SourceCache, type SourcePin } from "./taskBoardSnapshotData";
+import { readBoardJson } from "./taskBoardRead";
+import type { TaskDisplay } from "./taskBoardDisplay";
 
 export type TaskProgress = "needs-action" | "in-process" | "completed" | "failed" | "cancelled";
 export interface BoardTask {
+  "omnigent.ai:sourceDisplay"?: TaskDisplay;
   uid: string;
   title?: string;
   progress?: TaskProgress;
@@ -54,6 +57,7 @@ export interface TaskHistory {
   to?: string;
 }
 export interface TaskSource {
+  snapshot?: SourcePin;
   id: string;
   name: string | null;
   source: string | null;
@@ -66,7 +70,7 @@ export interface TaskSource {
     gone?: number;
     history_added?: number;
   } | null;
-  counts?: { open: number; closed: number; gone: number };
+  counts?: { open: number; closed: number; gone: number } | null;
   issues?: {
     code: string;
     path?: string;
@@ -75,11 +79,7 @@ export interface TaskSource {
   }[];
 }
 
-export async function readBoardJson<T>(path: string): Promise<T> {
-  const response = await authenticatedFetch(path);
-  if (!response.ok) throw new Error(`Task board read failed (${response.status})`);
-  return response.json() as Promise<T>;
-}
+export { readBoardJson } from "./taskBoardRead";
 
 interface TaskPage {
   entries: BoardTask[];
@@ -88,6 +88,8 @@ interface TaskPage {
   "omnigent.ai:changedThrough"?: string;
 }
 export interface BoardData {
+  sourceCaches?: Record<string, SourceCache>;
+  sourceStates?: Record<string, string>;
   tasks: BoardTask[];
   sources: TaskSource[];
   changedThrough?: string;
@@ -124,6 +126,9 @@ async function readTasks(
 /** Publish one atomic cache update only after every page and recreated source was read. */
 export async function readTaskBoard(previous?: BoardData, now = Date.now()): Promise<BoardData> {
   const { sources } = await readBoardJson<{ sources: TaskSource[] }>("/v1/me/tasks/sources");
+  if (sources.some((source) => source.snapshot && source.snapshot.phase !== "legacy")) {
+    return readPinnedSources(sources, previous, now);
+  }
   const cutoff = new Date(now - 365 * 86_400_000).toISOString();
   const sourceIds = new Set(sources.map((source) => source.id));
   const oldSources = new Map(previous?.sources.map((source) => [source.id, source]));
@@ -198,10 +203,21 @@ export function useTaskBoardData() {
 }
 
 export function safeSourceLink(href: string | undefined | null): string | undefined {
-  if (!href) return undefined;
+  if (
+    !href ||
+    [...href].some(
+      (char) => char.trim() === "" || char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127,
+    )
+  )
+    return undefined;
   try {
     const url = new URL(href);
-    return ["https:", "http:"].includes(url.protocol) ? url.href : undefined;
+    return ["https:", "http:"].includes(url.protocol) &&
+      url.hostname &&
+      !url.username &&
+      !url.password
+      ? url.href
+      : undefined;
   } catch {
     return undefined;
   }
