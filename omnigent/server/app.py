@@ -2165,9 +2165,16 @@ def create_app(
     from omnigent.server.admin_list import resolve_data_dir
     from omnigent.server.agent_quota import AgentQuotaService
     from omnigent.server.routes.agent_quota import create_agent_quota_router
-    from omnigent.server.server_config import task_board_enabled, usage_import_body_limit
+    from omnigent.server.server_config import (
+        task_board_enabled,
+        usage_evidence_body_limit,
+        usage_evidence_retention_days,
+        usage_import_body_limit,
+    )
     from omnigent.server.server_config import usage_enabled as usage_module_enabled
+    from omnigent.server.usage_evidence import UsageEvidenceService
     from omnigent.server.usage_price_source import UsagePriceSource
+    from omnigent.stores.usage_evidence_store import UsageEvidenceStore
     from omnigent.stores.usage_hours_store import (
         UsageHoursRecorder,
         UsageHoursStore,
@@ -2187,6 +2194,10 @@ def create_app(
         _logger.warning("Invalid usage.mark configuration; using defaults")
         usage_mark = MarkSettings()
     usage_hours_store = UsageHoursStore(conversation_store.storage_location)
+    usage_evidence_service = UsageEvidenceService(
+        UsageEvidenceStore(conversation_store.storage_location),
+        usage_evidence_retention_days(resolved_server_config),
+    )
     usage_price_source = UsagePriceSource(
         UsageSnapshotStore(conversation_store.storage_location),
         usage_hours_store,
@@ -2492,7 +2503,11 @@ def create_app(
         )
 
         usage_price_task: asyncio.Task[None] | None = None
+        usage_evidence_task: asyncio.Task[None] | None = None
         if agent_quota_service.usage_enabled:
+            usage_evidence_task = asyncio.create_task(
+                usage_evidence_service.run_retention(), name="usage-evidence-retention"
+            )
             await asyncio.to_thread(usage_price_source.load)
             usage_price_task = asyncio.create_task(
                 usage_price_source.run(), name="usage-price-source"
@@ -2786,6 +2801,10 @@ def create_app(
                 usage_price_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await usage_price_task
+            if usage_evidence_task is not None:
+                usage_evidence_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await usage_evidence_task
             if usage_flush_task is not None:
                 usage_flush_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -2991,6 +3010,8 @@ def create_app(
             price_source=usage_price_source,
             model_catalogs=host_model_catalog_cache_store,
             import_max_body_bytes=usage_import_body_limit(resolved_server_config),
+            evidence_service=usage_evidence_service,
+            evidence_max_body_bytes=usage_evidence_body_limit(resolved_server_config),
         ),
         prefix="/v1",
     )

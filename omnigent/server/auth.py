@@ -93,13 +93,19 @@ def scope_allows(scope: str, method: str, path: str) -> bool:
         return path in {
             "/v1/me/usage",
             "/v1/me/usage/activity",
+            "/v1/me/usage/speed",
+            "/v1/me/usage/prices",
             "/v1/me/usage/analysis",
             "/v1/me/usage/issues",
             "/v1/me/usage/models",
+            "/v1/me/usage/events",
+            "/v1/me/usage/sources",
         }
     account = r"/v1/me/usage/accounts/[A-Za-z0-9][A-Za-z0-9_-]{0,31}"
     return (
         (method == "PUT" and re.fullmatch(account, path) is not None)
+        or (method == "PUT" and path == "/v1/me/usage/evidence")
+        or (method == "POST" and path == "/v1/me/usage/events")
         or (method == "POST" and re.fullmatch(account + "/import", path) is not None)
         or (
             method == "POST"
@@ -862,16 +868,18 @@ class UnifiedAuthProvider(AuthProvider):
                         continue
                     if (
                         re.fullmatch(r"[A-Za-z0-9_-]{32,256}", token) is None
-                        or not any(
-                            scope_allows(scope, request.scope.get("method", ""), request.url.path)
-                            for scope in key.scopes
-                        )
                         or self._usage_read_account_lookup is None
                     ):
                         return None
                     account = key.user
                     generation = self._usage_read_account_lookup(account)
                     if generation is None:
+                        return None
+                    if not any(
+                        scope_allows(scope, request.scope.get("method", ""), request.url.path)
+                        for scope in key.scopes
+                    ):
+                        request.state.api_key_scope_denied = True
                         return None
                     from omnigent.db.account_authority import bind_account_authority
 
@@ -901,6 +909,7 @@ class UnifiedAuthProvider(AuthProvider):
                     managed, generation = found
                     method = request.scope.get("method", "")
                     if not api_key_scope_allows(managed.scopes, method, request.url.path):
+                        request.state.api_key_scope_denied = True
                         return None
                     from omnigent.db.account_authority import bind_account_authority
 

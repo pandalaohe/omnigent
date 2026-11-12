@@ -16,6 +16,7 @@ import time
 from collections import defaultdict
 from contextlib import suppress
 from dataclasses import dataclass, field
+from itertools import pairwise
 from typing import TYPE_CHECKING, Any, Literal
 
 from google.protobuf.json_format import MessageToDict, ParseDict
@@ -32,9 +33,11 @@ from opentelemetry.proto.metrics.v1.metrics_pb2 import ResourceMetrics
 
 from omnigent.db.db_models import current_workspace_id
 from omnigent.stores.usage_hours_store import UsageBuckets
+from omnigent.usage.speed import SpeedPoint
 
 if TYPE_CHECKING:
     from omnigent.server.agent_quota import AgentQuotaService
+    from omnigent.server.usage_evidence import UsageEvidenceService
 
 Signal = Literal["metrics", "traces", "logs"]
 Export = ExportMetricsServiceRequest | ExportTraceServiceRequest
@@ -142,7 +145,7 @@ def export_response(
         "traces": ExportTraceServiceResponse,
         "logs": ExportLogsServiceResponse,
     }[signal]()
-    if rejected:
+    if rejected or reasons:
         field_name = "rejected_data_points" if signal == "metrics" else "rejected_spans"
         setattr(response.partial_success, field_name, rejected)
         response.partial_success.error_message = "; ".join(sorted(reasons or set()))
@@ -270,6 +273,7 @@ class _Group:
 @dataclass
 class NormalizedExport:
     deltas: list[UsageDelta] = field(default_factory=list)
+    speed: list[SpeedPoint] = field(default_factory=list)
     rejected: int = 0
     reasons: set[str] = field(default_factory=set)
     unmapped: set[tuple[str, str]] = field(default_factory=set)
@@ -282,6 +286,98 @@ class NormalizedExport:
             self.rejected_accounts.add(account)
 
 
+_SPEED_METRICS = {
+    "gen_ai.server.time_to_first_token": "ttft",
+    "gen_ai.server.time_per_output_token": "tpot",
+    "omnigent.usage.speed.requests": "requests",
+}
+
+
+def _normalize_speed(message: ExportMetricsServiceRequest, result: NormalizedExport) -> None:
+    for resource in message.resource_metrics:
+        attrs = _attributes(resource.resource.attributes)
+        emitter = _emitter(str(attrs.get("service.name", "")))
+        for metric in (m for scope in resource.scope_metrics for m in scope.metrics):
+            name = _SPEED_METRICS.get(metric.name)
+            if name is None:
+                continue
+            kind = metric.WhichOneof("data")
+            if kind not in {"sum", "histogram"}:
+                count = len(getattr(metric, kind).data_points) if kind else 0
+                result.reject(count, "Invalid speed metric type")
+                continue
+            data = getattr(metric, kind)
+            for point in data.data_points:
+                attributes = _attributes(point.attributes)
+                try:
+                    if data.aggregation_temporality != 1:
+                        raise ValueError("Speed requires delta temporality")
+                    if point.flags & 1:
+                        raise ValueError("Speed point has no recorded value")
+                    start, end = point.start_time_unix_nano // 10**9, point.time_unix_nano // 10**9
+                    if not 0 < start < end <= 253402300799:
+                        raise ValueError("Invalid speed interval")
+                    model = attributes.get(
+                        "gen_ai.response.model", attributes.get("gen_ai.request.model", "")
+                    )
+                    coverage = attributes.get("omnigent.usage.coverage")
+                    correction = attributes.get("omnigent.usage.correction", False)
+                    if (
+                        not isinstance(model, str)
+                        or len(model) > 128
+                        or coverage not in {None, "complete", "partial"}
+                        or type(correction) is not bool
+                        or len(metric.description) > 256
+                    ):
+                        raise ValueError("Invalid speed dimensions")
+                    bounds = counts = None
+                    if name == "requests":
+                        if (
+                            kind != "sum"
+                            or not data.is_monotonic
+                            or metric.unit != "{request}"
+                            or point.WhichOneof("value") is None
+                        ):
+                            raise ValueError("Invalid speed request sum")
+                        count = int(
+                            _number(getattr(point, point.WhichOneof("value")), integer=True)
+                        )
+                    else:
+                        if kind != "histogram" or metric.unit != "s":
+                            raise ValueError("Speed requires a histogram in seconds")
+                        bounds = list(point.explicit_bounds)
+                        counts = list(point.bucket_counts)
+                        count = int(_number(point.count, integer=True))
+                        if (
+                            len(bounds) > 256
+                            or any(not math.isfinite(n) or n < 0 for n in bounds)
+                            or any(a >= b for a, b in pairwise(bounds))
+                            or len(counts) != len(bounds) + 1
+                            or sum(counts) != count
+                            or any(n > 2**63 - 1 for n in counts)
+                        ):
+                            raise ValueError("Invalid speed histogram")
+                    result.speed.append(
+                        SpeedPoint(
+                            _account(attributes, attrs, emitter),
+                            model,
+                            name,
+                            start,
+                            end,
+                            metric.unit,
+                            bounds,
+                            counts,
+                            count,
+                            coverage,
+                            metric.description or None,
+                            correction,
+                        )
+                    )
+                except ValueError as exc:
+                    # Sidecar failures must not create activity accounts or issues.
+                    result.reject(1, str(exc))
+
+
 def normalize_export(
     message: Export, seen: set[bytes], managed_sessions: set[str]
 ) -> NormalizedExport:
@@ -291,6 +387,7 @@ def normalize_export(
     if isinstance(message, ExportTraceServiceRequest):
         _normalize_traces(message, pending, result)
         return result
+    _normalize_speed(message, result)
     resources: dict[bytes, list[ResourceMetrics]] = defaultdict(list)
     for resource in message.resource_metrics:
         identity = b"".join(
@@ -316,6 +413,8 @@ def normalize_export(
         )
         groups: dict[tuple[str, str, int, str], _Group] = {}
         for metric in metrics:
+            if metric.name in _SPEED_METRICS:
+                continue
             if emitter is _GENERIC and metric.name.startswith(
                 "gen_ai.client.inference.operation."
             ):
@@ -502,8 +601,11 @@ def _normalize_traces(
 class OtlpReceiver:
     """Serialize retries and retain identities only after their group is written."""
 
-    def __init__(self, service: AgentQuotaService) -> None:
+    def __init__(
+        self, service: AgentQuotaService, evidence: UsageEvidenceService | None = None
+    ) -> None:
         self.service = service
+        self.evidence = evidence
         self._lock = threading.Lock()
         self._seen: dict[tuple[int, str, bytes], float] = {}
         self._sessions: dict[tuple[int, str, str], tuple[float, bool]] = {}
@@ -549,6 +651,21 @@ class OtlpReceiver:
             result = normalize_export(
                 message, {key[2] for key in self._seen if key[:2] == scope}, managed
             )
+            if result.speed and self.evidence is not None:
+                from omnigent.db.utils import now_epoch
+
+                now_utc = now_epoch()
+                valid = []
+                for point in result.speed:
+                    if (
+                        point.end_utc < now_utc - self.evidence.retention_days * 86400
+                        or point.end_utc > now_utc // 3600 * 3600
+                    ):
+                        result.reject(1, "Speed interval out of range")
+                    else:
+                        valid.append(point)
+                if valid and self.evidence.store.upsert_speed(owner, valid):
+                    result.reasons.add("Speed correction held; explicit correction required")
             for account, metric in result.unmapped:
                 with suppress(UsageAccountLimitError):
                     self.service.note_otlp_issue(owner, account, "unmapped_metric", metric=metric)

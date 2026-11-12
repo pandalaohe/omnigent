@@ -408,6 +408,9 @@ class UsageHoursStore:
         """Remove one account's hours."""
 
         def write(session: Session) -> None:
+            from omnigent.stores.usage_evidence_store import UsageEvidenceStore
+
+            UsageEvidenceStore.delete_in_session(session, owner, account_id)
             session.execute(
                 delete(SqlUsageHour).where(
                     SqlUsageHour.workspace_id == current_workspace_id(),

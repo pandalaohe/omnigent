@@ -32,6 +32,7 @@ from omnigent.server.agent_quota import (
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.server_config import load_server_config
+from omnigent.server.usage_evidence import UsageEvidenceService
 from omnigent.server.usage_price_source import PriceSourceSelection, UsagePriceSource
 from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 from omnigent.stores.host_store import HostStore
@@ -200,12 +201,25 @@ def create_agent_quota_router(
     price_source: UsagePriceSource | None = None,
     model_catalogs: HostModelCatalogCacheStore | None = None,
     import_max_body_bytes: int = 5 * 1024 * 1024,
+    evidence_service: UsageEvidenceService | None = None,
+    evidence_max_body_bytes: int = 1024 * 1024,
 ) -> APIRouter:
     router = APIRouter()
     from omnigent.server.routes.usage_pricing import create_usage_pricing_router
 
     router.include_router(create_usage_pricing_router(service, auth_provider))
-    otlp_receiver = OtlpReceiver(service)
+    if evidence_service is not None:
+        from omnigent.server.routes.usage_evidence import create_usage_evidence_router
+
+        router.include_router(
+            create_usage_evidence_router(
+                evidence_service,
+                auth_provider,
+                enabled=service.usage_enabled,
+                body_limit=evidence_max_body_bytes,
+            )
+        )
+    otlp_receiver = OtlpReceiver(service, evidence_service)
 
     @router.get("/me/usage/lines")
     async def usage_lines(request: Request, running: bool = False) -> dict[str, Any]:

@@ -187,6 +187,198 @@ between accounts requires a removal and replacement; it is complete only when
 neither response holds or skips an entry. There is no cross-account transaction.
 See **Usage → Issues** for attributable rejected or failed source reports.
 
+## Speed histograms
+
+Send speed through the existing OTLP metrics door,
+`POST /v1/me/usage/otlp/v1/metrics`, using delta temporality:
+
+- `gen_ai.server.time_to_first_token`: explicit-bucket Histogram, unit `s`.
+- `gen_ai.server.time_per_output_token`: explicit-bucket Histogram, unit `s`.
+- `omnigent.usage.speed.requests`: optional monotonic Sum, unit `{request}`,
+  counting requests before the producer's sample filter.
+
+Set `startTimeUnixNano` and `timeUnixNano` for each interval. The interval must
+end in a closed UTC hour and within `usage.evidence.retention_days` (default
+400). Histogram counts must match the buckets; bounds must be finite,
+nonnegative, strictly increasing, with at most 256 bounds. Histogram sums are
+not required. Use `gen_ai.response.model` (fallback `gen_ai.request.model`),
+`omnigent.usage.account` as for activity, and optional point attribute
+`omnigent.usage.coverage` (`complete` or `partial`). `Metric.description`
+(up to 256 characters) states the producer's sample filter.
+
+Speed is accepted from any resource, including managed resources and services
+whose activity counters are excluded. It creates no activity account or writer
+claim. Replay replaces the same account/model/metric/interval, independently of
+the activity receiver's two-hour deduplication. A complete row holds a partial
+replay or lower count; the OTLP partial-success message warns with no added
+rejection count. An intentional correction sets the boolean point attribute
+`omnigent.usage.correction` to true. Invalid points increase the rejection count.
+
+Read `GET /v1/me/usage/speed?range=h24&tz=UTC` with optional `account`, `model`
+and `by=model|account` (default `model`, combining accounts). Range and custom
+`from`/`to` dates follow activity; `period` is rejected. The reply includes
+`generated_at`, `range`, `span`, `last_received_at`, and rows with `hours`,
+`complete_hours`, `partial_hours`, nullable `requests`, `ttft`, `tpot`,
+`description` and `excluded_hours`. Histograms contain `unit`,
+`explicit_bounds`, `bucket_counts` and `count`; identical bounds are summed.
+The earliest interval chooses each metric's bounds; incompatible intervals are
+excluded with reason `bounds-changed`. Requests stay null if any included
+interval lacks them. Quantiles and tokens/second conversion belong to consumers.
+Read and write require usage scope and use the authenticated owner and current
+workspace. Account/user removal and daily retention also clear speed evidence.
+
+## Source status and events
+
+External collectors can push status snapshots and notifications independently of
+account report v2. Both doors require the authenticated owner's `usage` scope
+and store evidence in the current workspace. They create no accounts, activity
+or activity-writer claims. A v2 receipt does not confirm either evidence channel.
+
+Send `PUT /v1/me/usage/evidence` with `Content-Type: application/json`:
+
+```json
+{
+  "schema_version": 1,
+  "sources": [{"account": null, "source": "collector", "state": "ok"}]
+}
+```
+
+`sources` accepts up to 128 rows. Omit `account` or use null for source-wide
+status; otherwise use the same account id pattern as report v2. Optional
+`last_ok`, `last_error_at`, `observed_at` and `fresh_until` are Unix seconds.
+States are `ok`, `auth_failed`, `credential_missing`, `not_configured`,
+`format_changed`, `unreachable`, `paused`, `never_read`, `session_expired`,
+`access_denied`, `expiring` and `unknown`. Repeating `(account, source)` replaces
+the snapshot; omitting `sources` changes nothing. The 200 reply contains
+`applied: {prices, price_aliases, sources}` and indexed `skipped` entries with
+`invalid_value` or `out_of_range`. The same door also accepts the price sections below.
+
+### Price evidence
+
+Send prices and aliases through the same `PUT /v1/me/usage/evidence` door.
+This example uses a closed UTC hour; replace `hour`, `as_of` and `fetched_at`
+with retained timestamps from your producer before sending:
+
+```json
+{
+  "schema_version": 1,
+  "prices": [{
+    "account": "a",
+    "hour": 1794304800,
+    "model": "model-a",
+    "estimate": {
+      "state": "exact",
+      "low_usd": "0.10",
+      "high_usd": "0.10",
+      "price_source": "public",
+      "price_version": "v1",
+      "fetched_at": 1794308400,
+      "as_of": 1794308400,
+      "rates": [{"token_kind": "uncached_input", "per_token": "0.00001"}],
+      "priced_as": ["public-model"]
+    },
+    "partitions": []
+  }],
+  "price_aliases": [{"account": "a", "mappings": {}, "observed_at": 1794308400}]
+}
+```
+
+`prices` accepts up to 500 rows; identity is `(account, hour, model)`.
+`hour` is an aligned, closed UTC hour in Unix seconds, within the evidence
+retention horizon. Each row supplies `estimate`, `partitions`, or both.
+A present part replaces that part in full; an absent part preserves it.
+When both stored and incoming estimates have `as_of`, a strictly older incoming
+estimate is preserved as the stored newer statement; its partitions can still
+replace independently. Equal timestamps or a missing timestamp on either side
+use arrival order. `price_version` is opaque and is never sorted.
+
+Money and per-token rates are nonnegative fixed-point decimal **strings**, at
+most 40 characters; exponents, signs, NaN and infinity are rejected. They are
+stored and summed with Decimal without binary-float conversion. The API returns
+exact decimal strings; a display should format monetary amounts to two decimals.
+Unknown endpoints stay null. `state` is `exact`, `range`, `partial` or `unknown`;
+`missing` holds up to 16 codes of at most 64 characters. Optional `priced_units`
+and `usage_units` are nonnegative integers, with priced <= usage when both exist.
+Optional `cache_savings_low_usd` and `cache_savings_high_usd` are producer bounds,
+not reconstructed from rates. Low bounds must not exceed known high bounds.
+
+`rates` holds at most 32 `{token_kind, per_token}` entries. Token kinds are
+`uncached_input`, `output`, `cache_read`, `cache_write`, `cache_write_5m` and
+`cache_write_1h`. `priced_as` holds at most 8 model names of at most 128 characters.
+`price_source` (256 chars), `price_version` (128), `fetched_at` and `as_of` are
+optional per-hour provenance. Timestamps are nonnegative Unix seconds.
+
+`partitions` holds at most 64 complete groups. Each entry has `context_class`
+(0–5), `upstream_host` (256 chars), and nonnegative `calls`, `prompt_tokens`,
+`completion_tokens`, `cache_read_tokens`, `cache_write_tokens`, plus boolean
+`prompt_present`, `completion_present`, `cache_read_present`, `cache_write_present`.
+Send the whole hourly partition group together; an empty array clears that part.
+
+`price_aliases` accepts up to 64 accounts. Each `mappings` object has at most 128
+observed-model keys mapped to a priced-model name or null (names <=128 chars).
+It replaces the whole account map; `{}` means successfully reported empty,
+distinct from never reported. `observed_at` is optional. An absent section changes
+nothing. The evidence body cap is 1 MiB. Schema/envelope errors return 422;
+row errors return 200 with indexed `skipped` entries (`invalid_value` or
+`out_of_range`) and applied counts for prices, price_aliases and sources.
+
+Read `GET /v1/me/usage/prices?range=h24&tz=UTC[&account=a][&model=model-a]`.
+Ranges are `today`, `h24`, `d7`, `d30`, `d90`, `custom`; custom requires `from`
+and `to` dates. `period` is rejected. The response contains `generated_at`,
+`range`, `span` (requested_from, counted_from, until, approx), `rows` and `aliases`.
+Each account/model row includes `hours`, an `estimate` aggregate, rate ranges,
+`priced_as` and partitions summed by context_class/upstream_host.
+
+The aggregate includes exact known-endpoint sums (`low_usd`, `high_usd`),
+`rows_with_low`, `rows_with_high`, state counts, missing codes, latest `as_of`,
+and `price_sources: [{source, version, fetched_at}]`. Unit sums are null when any
+hour lacks them. `cache_savings` contains low/high sums and `rows_with_bounds`.
+Each rate has token_kind, low_per_token, high_per_token. Rates are display evidence.
+`aliases` includes account, mappings, observed_at and updated_at.
+
+Add `detail=hours` to include `hourly` entries with hour, estimate and partitions.
+Every hourly estimate retains its own `price_source`, `price_version`, `fetched_at`
+and `as_of`; labels must use that evidence rather than today's price table.
+No rows means not reported. Reads are private/no-store and scoped to the owner
+and workspace; account/user removal and daily retention also remove price evidence.
+
+Send events to `POST /v1/me/usage/events` in CloudEvents 1.0 structured mode
+(`application/cloudevents+json`, one object) or batch mode
+(`application/cloudevents-batch+json`, up to 500 objects). Required attributes:
+`specversion: "1.0"`, `id`, `source` (a URI-reference), `type`, and RFC 3339 `time`.
+The three identity/type strings are limited to 128 characters. Optional `subject`
+is an account id; omit it for a source-wide event. Optional `severity` is `error`,
+`warn`, `info` (default) or `recover`. `data` is a JSON object up to 4 KiB and 16
+levels deep; `datacontenttype`, when supplied, must be `application/json`.
+
+The first event with `(source, id)` wins. Replays return duplicates without
+changing the stored event. A 200 reply contains `accepted`, `duplicates` and
+indexed `rejected` entries: `invalid_attribute`, `data_too_large`, `out_of_range`
+or `future_time` (over 300 seconds ahead). An invalid envelope, more than 500
+events or a body over 1 MiB returns 422 with nothing stored. Both doors cap
+bodies at 1 MiB; `usage.ingest.max_body_bytes.evidence` may lower this limit.
+Retry an unknown-outcome body before newer writes on that channel. Duplicates
+are successful receipts; skipped/rejected rows require producer corrections.
+
+Read `GET /v1/me/usage/sources[?account=...]` for snapshots with
+`current: true|false|null`: freshness is unknown without `fresh_until`, and an
+old `ok` has `current: false`. Read `GET /v1/me/usage/events` with optional
+`account`, `source`, `severity`, `before` and `limit` (1–200, default 50).
+Events are newest first, with descending `(source, id)` ties. Return
+`next_before` unchanged as `before` to fetch another page with the same filters.
+Event `time`, `generated_at` and `earliest_time` are Unix seconds; `stored` counts
+all stored events matching the filters before cursor pagination.
+`history_complete` remains false: the oldest stored event proves no continuity.
+Omitting the account filter includes source-wide rows.
+
+Evidence remains in the server database for `usage.evidence.retention_days`
+(default 400). A daily task deletes old events by their event time and status
+by `updated_at`, the last time a producer confirmed the row. Intake skips older
+observations, so replay cannot recreate pruned history. Account removal deletes
+that account's evidence; user removal also deletes source-wide evidence. A code
+rollback leaves the archive tables in place; an explicit schema downgrade drops
+their rows and requires a database backup and deliberate removal procedure.
+
 ## State, changes and removal
 
 The server database stores account readings, report outcomes and hourly activity

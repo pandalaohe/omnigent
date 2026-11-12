@@ -3396,6 +3396,105 @@ class SqlUsageProducer(OmnigentBase):
     binding: Mapped[str] = mapped_column(Text, nullable=False)
 
 
+def _usage_evidence_key(length: int) -> String:
+    return String(length).with_variant(
+        MySQLVarchar(length, charset="utf8mb4", collation="utf8mb4_0900_bin"), "mysql"
+    )
+
+
+class SqlUsagePriceEvidence(OmnigentBase):
+    __tablename__ = "usage_price_evidence"
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, default=0)
+    owner_id: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    account_id: Mapped[str] = mapped_column(_usage_evidence_key(64), primary_key=True, default="")
+    hour_utc: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    model: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    low_usd: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    high_usd: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    missing: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    priced_units: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    usage_units: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    cache_savings_low_usd: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    cache_savings_high_usd: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    rates: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    priced_as: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    price_source: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    price_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    fetched_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    as_of: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    partitions: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[int] = mapped_column(BigInteger)
+
+
+class SqlUsagePriceAliases(OmnigentBase):
+    __tablename__ = "usage_price_aliases"
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, default=0)
+    owner_id: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    account_id: Mapped[str] = mapped_column(_usage_evidence_key(64), primary_key=True, default="")
+    mappings: Mapped[dict[str, str | None]] = mapped_column(JSON)
+    observed_at: Mapped[int | None] = mapped_column(BigInteger)
+    updated_at: Mapped[int] = mapped_column(BigInteger)
+
+
+class SqlUsageSpeedPoint(OmnigentBase):
+    __tablename__ = "usage_speed_points"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, default=0)
+    owner_id: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    account_id: Mapped[str] = mapped_column(_usage_evidence_key(64), primary_key=True, default="")
+    model: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    metric: Mapped[str] = mapped_column(String(16), primary_key=True)
+    start_utc: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    end_utc: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    unit: Mapped[str] = mapped_column(String(16))
+    bounds: Mapped[list[float] | None] = mapped_column(JSON)
+    bucket_counts: Mapped[list[int] | None] = mapped_column(JSON)
+    count: Mapped[int] = mapped_column(BigInteger)
+    coverage: Mapped[str | None] = mapped_column(String(16))
+    description: Mapped[str | None] = mapped_column(String(256))
+    updated_at: Mapped[int] = mapped_column(BigInteger)
+
+
+class SqlUsageSourceStatus(OmnigentBase):
+    __tablename__ = "usage_source_status"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, default=0)
+    owner_id: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    account_id: Mapped[str] = mapped_column(_usage_evidence_key(64), primary_key=True, default="")
+    source: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    state: Mapped[str] = mapped_column(String(24))
+    last_ok: Mapped[int | None] = mapped_column(BigInteger)
+    last_error_at: Mapped[int | None] = mapped_column(BigInteger)
+    observed_at: Mapped[int | None] = mapped_column(BigInteger)
+    fresh_until: Mapped[int | None] = mapped_column(BigInteger)
+    updated_at: Mapped[int] = mapped_column(BigInteger)
+
+
+class SqlUsageSourceEvent(OmnigentBase):
+    __tablename__ = "usage_source_events"
+    __table_args__ = (
+        Index(
+            "ix_usage_source_events_account_time",
+            "workspace_id",
+            "owner_id",
+            "account_id",
+            "time_utc",
+        ),
+    )
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, default=0)
+    owner_id: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    source: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    event_id: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True, default="")
+    account_id: Mapped[str] = mapped_column(_usage_evidence_key(64), default="")
+    type: Mapped[str] = mapped_column(String(128))
+    time_utc: Mapped[int] = mapped_column(BigInteger)
+    severity: Mapped[str] = mapped_column(String(8))
+    data: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    received_at: Mapped[int] = mapped_column(BigInteger)
+
+
 class SqlUsagePricingDefaults(OmnigentBase):
     """Revision authority and defaults, outside the preferences envelope."""
 
