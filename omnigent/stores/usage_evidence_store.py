@@ -102,10 +102,26 @@ class UsageEvidenceStore:
                     "updated_at": now_epoch(),
                 }
                 if row.estimate is not None:
-                    values.update(row.estimate.model_dump())
+                    table = SqlUsagePriceEvidence
+                    existing = session.get(
+                        table,
+                        tuple(values[column.name] for column in table.__table__.primary_key),
+                    )
+                    # Unknown or equal ordering keeps arrival-order replacement.
+                    older = (
+                        existing is not None
+                        and existing.as_of is not None
+                        and row.estimate.as_of is not None
+                        and row.estimate.as_of < existing.as_of
+                    )
+                    if not older:
+                        values.update(row.estimate.model_dump())
+                    elif row.partitions is None:
+                        continue
                 if row.partitions is not None:
                     values["partitions"] = [part.model_dump() for part in row.partitions]
                 self._write(session, SqlUsagePriceEvidence, values)
+                session.expire_all()
             for row in aliases:
                 self._write(
                     session,

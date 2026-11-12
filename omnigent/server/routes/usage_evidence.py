@@ -82,7 +82,9 @@ def create_usage_evidence_router(
     @router.get("/me/usage/prices")
     async def prices(
         request: Request,
-        range_key: Annotated[RangeKey, Query(alias="range")] = "h24",
+        range_key: Annotated[
+            Literal["today", "h24", "d7", "d30", "d90", "custom"], Query(alias="range")
+        ] = "h24",
         tz: str = "UTC",
         account: Account | None = None,
         model: Annotated[str | None, Query(max_length=128)] = None,

@@ -125,3 +125,47 @@ def test_price_validation_ranges_unknown_and_prune(db_uri):
     )
     assert service.read_prices(OWNER)["rows"] == []
     assert service.read_prices(OWNER)["aliases"] == []
+
+
+def test_price_statement_order_and_independent_partitions(db_uri):
+    service = UsageEvidenceService(UsageEvidenceStore(db_uri))
+
+    def statement(as_of, amount, version, **parts):
+        return price(
+            estimate={
+                "state": "exact",
+                "low_usd": amount,
+                "high_usd": amount,
+                "as_of": as_of,
+                "price_source": "public",
+                "price_version": version,
+                "fetched_at": as_of,
+            },
+            **parts,
+        )
+
+    # Same-key entries within one batch must also see the preceding update.
+    report(
+        service,
+        prices=[
+            statement(100, "0.30", "z"),
+            statement(200, "0.20", "a"),
+            statement(150, "0.10", "zz", partitions=[]),
+        ],
+    )
+    row = service.read_prices(OWNER, detail="hours")["rows"][0]["hourly"][0]
+    assert row["estimate"]["as_of"] == 200
+    assert row["estimate"]["low_usd"] == "0.20"
+    assert row["estimate"]["price_version"] == "a"
+    assert row["partitions"] == []
+    report(service, prices=[statement(100, "0.40", "later-arrival")])
+    assert service.read_prices(OWNER)["rows"][0]["estimate"]["low_usd"] == "0.20"
+    report(service, prices=[price(partitions=[])])
+    assert service.read_prices(OWNER)["rows"][0]["estimate"]["low_usd"] == "0.20"
+    # Equal or unknown ordering keeps arrival-order replacement, not version sorting.
+    for stamp in (200, None, 50):
+        report(service, prices=[statement(stamp, "0.05", "not-ordered")])
+        assert (
+            service.read_prices(OWNER, detail="hours")["rows"][0]["hourly"][0]["estimate"]["as_of"]
+            == stamp
+        )

@@ -330,3 +330,21 @@ async def test_price_door_read_labels_and_owner_isolation(request, db_uri):
             await client.get("/v1/me/usage/prices", headers=_headers("other@example.test"))
         ).json()["rows"] == []
         assert (await client.get("/v1/me/usage/prices?tz=bad", headers=headers)).status_code == 422
+
+
+def test_documented_price_payload_matches_intake_and_provenance():
+    from pathlib import Path
+
+    from omnigent.usage.evidence import EvidenceBody
+    from omnigent.usage.prices import PriceAliases, PriceEvidence
+
+    guide = (Path(__file__).resolve().parents[3] / "docs/usage-reports.md").read_text()
+    assert "### Price evidence" in guide
+    section = guide.split("### Price evidence", 1)[1]
+    payload = json.loads(section.split("```json\n", 1)[1].split("```", 1)[0])
+    body = EvidenceBody.model_validate(payload)
+    row = PriceEvidence.model_validate(body.prices[0])
+    assert row.estimate is not None
+    assert row.estimate.price_source and row.estimate.price_version
+    assert row.estimate.fetched_at is not None
+    assert PriceAliases.model_validate(body.price_aliases[0]).mappings == {}
