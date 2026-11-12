@@ -1375,17 +1375,51 @@ async def test_continuity_wait_reads_completion_after_timeout(validation_error):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ending", ["deadline", "peer_exit", "loop_stop", "relay_close"])
+async def test_continuity_wait_survives_two_minutes_of_scheduling_delay(monkeypatch):
+    elapsed = 0.0
+    frame = {"live": True, "incarnation": "fixture"}
+
+    class DelayedFuture(Future):
+        def result(self, timeout=None):
+            nonlocal elapsed
+            if timeout is not None and elapsed < 120:
+                elapsed += 60
+                raise TimeoutError("wait elapsed")
+            self.set_result(frame)
+            return super().result(timeout)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.time",
+        SimpleNamespace(monotonic=lambda: elapsed),
+    )
+    future = DelayedFuture()
+    connection, peer = socket.socketpair()
+    try:
+        assert (
+            _wait_for_pi_bootstrap_frame(future, asyncio.get_running_loop(), connection, None)
+            == frame
+        )
+        assert elapsed == 120
+        assert not future.cancelled()
+    finally:
+        connection.close()
+        peer.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["peer_exit", "loop_stop", "relay_close", "validation_error"])
 async def test_pending_continuity_releases_validation(ending, monkeypatch):
     loop = asyncio.new_event_loop()
     thread = threading.Thread(target=loop.run_forever)
     entered, released, closed = threading.Event(), threading.Event(), threading.Event()
     connection, peer = socket.socketpair()
+    finish = asyncio.Event()
 
     async def validate():
         try:
             entered.set()
-            await asyncio.Event().wait()
+            await finish.wait()
+            raise ValueError("validation failed")
         finally:
             released.set()
 
@@ -1403,9 +1437,7 @@ async def test_pending_continuity_releases_validation(ending, monkeypatch):
     try:
         await poll_until_async(entered.is_set)
         waiter = asyncio.create_task(
-            asyncio.to_thread(
-                _wait_for_pi_bootstrap_frame, future, loop, connection, closed, timeout=0.5
-            )
+            asyncio.to_thread(_wait_for_pi_bootstrap_frame, future, loop, connection, closed)
         )
         await poll_until_async(waiting.is_set)
         if ending == "peer_exit":
@@ -1416,10 +1448,17 @@ async def test_pending_continuity_releases_validation(ending, monkeypatch):
             loop.call_soon_threadsafe(loop.stop)
             await asyncio.to_thread(thread.join, 2)
             assert not thread.is_alive()
-        failure = TimeoutError if ending == "deadline" else ConnectionAbortedError
-        with pytest.raises(failure, match="Pi bootstrap"):
+        elif ending == "validation_error":
+            loop.call_soon_threadsafe(finish.set)
+        failure = ValueError if ending == "validation_error" else ConnectionAbortedError
+        message = "validation failed" if ending == "validation_error" else "Pi bootstrap"
+        with pytest.raises(failure, match=message):
             await asyncio.wait_for(waiter, 2)
-        assert future.cancelled()
+        if ending == "validation_error":
+            assert future.done()
+            assert isinstance(future.exception(), ValueError)
+        else:
+            assert future.cancelled()
     finally:
         future.cancel()
         closed.set()
@@ -1474,8 +1513,9 @@ async def test_process_identity_loss_revokes_all_hosted_scopes(attestor_relay, m
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("handoff", [False, True])
+@pytest.mark.parametrize("ending", ["broker_loss", "backstop"])
 async def test_real_node_client_seals_before_local_evaluation_on_broker_loss(
-    attestor_relay, handoff
+    attestor_relay, handoff, ending, monkeypatch, caplog
 ):
     node = shutil.which("node")
     if node is None:
@@ -1536,7 +1576,29 @@ lines.once('line', async line => {
         process.stdin.write(json.dumps(descriptor).encode() + b"\n")
         await process.stdin.drain()
         assert await asyncio.wait_for(process.stdout.readline(), 5) == b"connected\n"
-        runtime.pi_scopes.invalidate("session-a")
+        if ending == "broker_loss":
+            runtime.pi_scopes.invalidate("session-a")
+        else:
+            from omnigent.harnesses.claude_native import bridge
+
+            def expire_stalled_validation(future, loop, connection, closed):
+                stalled = Future()
+                clock = iter([0.0, bridge._PI_CONTINUITY_STUCK_BACKSTOP_S + 1])
+                try:
+                    with monkeypatch.context() as patch:
+                        patch.setattr(
+                            bridge,
+                            "time",
+                            SimpleNamespace(
+                                **{**vars(bridge.time), "monotonic": lambda: next(clock)}
+                            ),
+                        )
+                        return _wait_for_pi_bootstrap_frame(stalled, loop, connection, closed)
+                finally:
+                    future.cancel()
+                    assert stalled.cancelled()
+
+            monkeypatch.setattr(bridge, "_wait_for_pi_bootstrap_frame", expire_stalled_validation)
         process.stdin.write(b"evaluate\n")
         await process.stdin.drain()
         output, error = await asyncio.wait_for(process.communicate(), 5)
@@ -1551,6 +1613,10 @@ lines.once('line', async line => {
             assert result["posts"] == 0
         assert actor.token.encode() not in output + error
         assert admission.credential.encode() not in output + error
+        if ending == "backstop":
+            assert (
+                "Pi bootstrap watch ended: stage=continuity exception=TimeoutError" in caplog.text
+            )
     finally:
         if process.returncode is None:
             process.kill()

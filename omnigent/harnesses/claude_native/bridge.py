@@ -9640,17 +9640,18 @@ _POLICY_PROXY_ERROR_DETAIL_MAX = 400
 # waiting never stalls other relay traffic.
 _FILE_CHANGE_OBSERVER_TIMEOUT_S = 10.0
 
+# Five minutes is when a user watching an unresponsive Pi child would consider it stuck.
+_PI_CONTINUITY_STUCK_BACKSTOP_S = 5 * 60.0
+
 
 def _wait_for_pi_bootstrap_frame(
     future: Future[_JsonObject],
     loop: asyncio.AbstractEventLoop,
     connection: socket.socket,
     closed: threading.Event | None,
-    *,
-    timeout: float = 30.0,
 ) -> _JsonObject:
-    """Wait for fresh validation within a bounded window, cancelling abandoned work."""
-    deadline = time.monotonic() + timeout
+    """Wait for fresh validation, stopping on lost liveness or a stuck runner."""
+    deadline = time.monotonic() + _PI_CONTINUITY_STUCK_BACKSTOP_S
     try:
         while True:
             if closed is not None and closed.is_set():
@@ -9661,7 +9662,7 @@ def _wait_for_pi_bootstrap_frame(
                 raise ConnectionAbortedError("Pi bootstrap watch peer disconnected")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError("Pi bootstrap continuity deadline exceeded")
+                raise TimeoutError("Pi bootstrap continuity stuck beyond user-wait backstop")
             try:
                 return future.result(timeout=min(0.1, remaining))
             except TimeoutError:
