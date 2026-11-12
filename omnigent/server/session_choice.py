@@ -21,6 +21,29 @@ CHOICE_LABEL = "omnigent.session_choice"
 SLOT_LABEL = "omnigent.startup.session_choice"
 CounterKey = tuple[str, str, str, int, int]
 
+_QUOTA_RESET = re.compile(
+    r"^\s*(?:Error:\s*)?(?:Individual\s+)?quota\s+(?:reached|exceeded)\b"
+    r".{0,2048}?\bresets\s+in\s+"
+    r"(?:(\d{1,3})d)?\s*(?:(\d{1,4})h)?\s*(?:(\d{1,4})m)?\s*(?:(\d{1,4})s)?"
+    r"(?!\w)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def quota_reset_at(message: str, now: float) -> float | None:
+    """Recognize an explicit provider quota rejection with a bounded relative reset."""
+    if message.startswith("[antigravity: ") and message.endswith("]"):
+        message = message[len("[antigravity: ") : -1]
+    match = _QUOTA_RESET.match(message)
+    if match is None:
+        return None
+    seconds = sum(
+        int(value or 0) * unit
+        for value, unit in zip(match.groups(), (86400, 3600, 60, 1), strict=True)
+    )
+    return now + seconds if 0 < seconds <= 366 * 86400 else None
+
+
 PositiveInt = Annotated[int, Field(strict=True, ge=1)]
 Identifier = Annotated[StrictStr, Field(min_length=1, max_length=32)]
 
@@ -510,12 +533,14 @@ def _filter_link(
 ) -> Skipped | None:
     product = request.products.get(link.agent_id, link.agent_id)
     pool = pool_of(link, product)
-    if link.agent_id in request.unavailable or (
+    if link.agent_id in request.unavailable:
+        return Skipped(link, "unavailable")
+    if (
         link.model
         and request.models.get(link.agent_id)
         and link.model not in request.models[link.agent_id]
     ):
-        return Skipped(link, "unavailable")
+        return Skipped(link, "model_not_in_catalog")
     caller_level = _ability(settings, request.caller_product, request.caller_model, request)
     level = _ability(settings, product, link.model, request)
     if caller_level is not None and level is not None and level < caller_level:
@@ -576,6 +601,11 @@ def choose(
                     break
         if survivors and settings.strategy == "drain":
             break
+    warnings = tuple(
+        f"{item.link.agent_id}: {item.link.model} is not in this host's model catalog"
+        for item in skipped
+        if item.why == "model_not_in_catalog"
+    )
     if survivors and settings.strategy == "balance":
 
         def rank(item):
@@ -613,7 +643,7 @@ def choose(
         link = picked[3]
         pool = pool_of(link, request.products.get(link.agent_id, link.agent_id))
         reading = readings.get(pool)
-        warnings = (
+        warnings += (
             (f"{pool} may not last until its reset",) if reading and reading.state == "low" else ()
         )
         return Choice(
@@ -651,6 +681,7 @@ def choose(
             first.why,
             tuple(skipped),
             flags,
+            warnings,
             clears_at=first.until,
             work_types=tuple(w.id for w in settings.work_types),
         )
@@ -663,6 +694,7 @@ def choose(
         "No eligible link",
         tuple(skipped),
         flags,
+        warnings,
         work_types=tuple(w.id for w in settings.work_types),
     )
 
@@ -673,7 +705,37 @@ class ChoiceState:
     def __init__(self) -> None:
         self.counters: dict[CounterKey, float] = {}
         self.cooldowns: dict[tuple[str, str], float] = {}
+        self.exhausted: dict[tuple[str, str], float] = {}
+        self.quota_rejections: set[tuple[str, str]] = set()
         self.tiers: dict[tuple[str, str, str, int], tuple[Row, ...]] = {}
+
+    def quota_readings(
+        self, owner: str, readings: Mapping[str, UsageAccountView], now: float
+    ) -> dict[str, UsageAccountView]:
+        """Provider rejection wins over a polled balance until its explicit reset."""
+        from omnigent.usage.contract import UsageAccountView, UsageWindowView
+
+        result = dict(readings)
+        for (user, pool), until in tuple(self.exhausted.items()):
+            if user == owner and until > now:
+                result[pool] = UsageAccountView(
+                    id=pool,
+                    kind="account",
+                    display_name=readings[pool].display_name if pool in readings else pool,
+                    state="exhausted",
+                    reason="provider_quota_reached",
+                    freshness="fresh",
+                    windows=[
+                        UsageWindowView(
+                            id="provider-quota",
+                            kind="other",
+                            remaining_pct=0,
+                            resets_at=until,
+                            state="exhausted",
+                        )
+                    ],
+                )
+        return result
 
     def saved(self, owner: str, settings: SessionChoice) -> None:
         current = {
@@ -702,6 +764,7 @@ class ChoiceState:
         *,
         now: float,
     ) -> Choice:
+        readings = self.quota_readings(request.owner, readings, now)
         counters = self.counters
         if request.preview:
             preview_state = ChoiceState()
@@ -712,6 +775,7 @@ class ChoiceState:
         if not request.preview:
             self.saved(request.owner, settings)
             self.cooldowns = {key: until for key, until in self.cooldowns.items() if until > now}
+            self.exhausted = {key: until for key, until in self.exhausted.items() if until > now}
             for pool in request.exclude:
                 self.cooldowns[(request.owner, pool)] = now + 600
         cooldowns = {

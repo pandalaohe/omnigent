@@ -244,7 +244,7 @@ def create_session_choice_router(
         )
         now = time.time()
         readings, _, floors = await asyncio.to_thread(inputs, request.app, settings, context, now)
-        reading = readings.get(pool)
+        reading = readings.get(pool) if pool is not None else None
         if reading is None or reading.freshness != "fresh":
             return {"notice": None}
         limits = settings.limits.get(pool) if pool is not None else None

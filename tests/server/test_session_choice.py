@@ -22,6 +22,7 @@ from omnigent.server.session_choice import (
     model_family,
     parse_session_choice,
     pool_of_session,
+    quota_reset_at,
 )
 from omnigent.server.user_preferences_store import (
     SqlAlchemyUserPreferencesStore,
@@ -420,6 +421,74 @@ def test_exhausted_without_reset_is_skipped_without_an_invented_until():
     assert result.pool == "pool-1"
     assert result.skipped[0].why == "exhausted"
     assert result.skipped[0].until is None
+
+
+@pytest.mark.parametrize(
+    "message,seconds",
+    [
+        ("Individual quota reached. Resets in 132h0m26s", 475226),
+        ("Error: Quota exceeded. Resets in 1d 2h 3m 4s.", 93784),
+        ("Individual quota reached. Resets in 20m", 1200),
+        ("Individual quota reached. Resets in 0s", None),
+        ("Individual quota reached. Resets in -1h", None),
+        ("Individual quota reached. Resets in 1.5h", None),
+        ("Individual quota reached. Resets in 9999h", None),
+        ("Individual quota reached. Resets in 12hours", None),
+        ("Individual quota reached. Resets in unknown", None),
+        ("HTTP 429: too many requests", None),
+        ("The docs say: Individual quota reached. Resets in 1h", None),
+    ],
+)
+def test_explicit_provider_quota_reset(message, seconds):
+    assert quota_reset_at(message, NOW) == (NOW + seconds if seconds else None)
+
+
+def test_provider_rejection_overrides_balance_for_only_its_owner_until_reset():
+    from omnigent.server.session_choice import TileLimits, tile_line
+    from omnigent.usage.contract import UsageBalance
+
+    state = ChoiceState()
+    state.exhausted[(OWNER, "pool-0")] = NOW + 60
+    quota = reading()
+    quota.balances = [UsageBalance(id="credit", remaining=20, unit="USD")]
+    quota.balance_freshness = "fresh"
+    readings = {"pool-0": quota}
+    for preview in (True, False):
+        result = state.select(
+            table((1,)),
+            "work",
+            ChoiceRequest(OWNER, "host-a", preview=preview),
+            readings,
+            {},
+            {"pool-0": FloorOff(until="manual")},
+            now=NOW,
+        )
+        assert result.outcome == "hold"
+        assert result.reason == "exhausted"
+        assert result.clears_at == NOW + 60
+    assert tile_line(TileLimits(), quota, None, NOW).state == "ok"
+    other = state.select(
+        table((1,)),
+        "work",
+        ChoiceRequest("other@example.test", "host-a"),
+        readings,
+        {},
+        {},
+        now=NOW,
+    )
+    assert other.outcome == "pick"
+    assert (
+        state.select(
+            table((1,)),
+            "work",
+            ChoiceRequest(OWNER, "host-a"),
+            readings,
+            {},
+            {},
+            now=NOW + 60,
+        ).outcome
+        == "pick"
+    )
 
 
 @pytest.mark.parametrize("strategy", ["drain", "balance"])

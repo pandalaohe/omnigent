@@ -31,6 +31,7 @@ from omnigent.server.session_choice import (
     ordered_links,
     pool_of,
     pool_of_session,
+    quota_reset_at,
     resolve_work_type,
     state_for,
     tile_line,
@@ -301,6 +302,40 @@ def choice_record(session: Conversation) -> dict[str, Any] | None:
         return None
 
 
+async def record_quota_exhaustion(
+    app: Any,
+    session: Conversation,
+    message: str,
+    *,
+    actor: str | None,
+    from_runner: bool,
+    response_id: str | None,
+) -> None:
+    """Record a provider error for the session's server-selected owner and pool."""
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.session_collab import collab_owner_for
+
+    now = time.time()
+    until = quota_reset_at(message, now)
+    record = choice_record(session)
+    pool = record.get("pool") if record else None
+    if until is None or not isinstance(pool, str) or not pool:
+        return
+    owner = await asyncio.to_thread(
+        collab_owner_for, session, app.state.conversation_store, app.state.permission_store
+    )
+    if not from_runner and (actor or RESERVED_USER_LOCAL) != owner:
+        return
+    state = state_for(app)
+    # Older forwarders omit turn ids; deduplicate their exact rejection instead.
+    identity = (session.id, response_id or hashlib.sha256(message.encode()).hexdigest())
+    if identity in state.quota_rejections:
+        return
+    state.quota_rejections.add(identity)
+    key = (owner, pool)
+    state.exhausted[key] = max(state.exhausted.get(key, 0), until)
+
+
 def _read(app: Any, owner: str, name: str, operation: Any, default: Any):
     """External reads fail open; the first failure of each read is logged once."""
     try:
@@ -360,7 +395,7 @@ async def context_request(
             agent_cache=getattr(app.state, "agent_cache", None),
         )
         record = records.get(harness)
-        if harness in {"codex", "codex-native"} and (
+        if harness in {"codex", "codex-native", "pi", "pi-native"} and (
             record is None or time.time() - (record["fetched_at"] or 0) > 300
         ):
             harnesses.add(harness)
@@ -582,7 +617,7 @@ def inputs(app: Any, settings: SessionChoice, request: ChoiceRequest, now: float
         if prefs
         else {}
     )
-    return readings, running, floors
+    return state_for(app).quota_readings(request.owner, readings, now), running, floors
 
 
 @dataclass
