@@ -198,6 +198,9 @@ export function TaskBoardDetail({
   });
   const last = display?.lastActivity ?? current.updated;
   const checks = display?.checks ?? [];
+  const checkHosts = sourceCache?.display.checkHosts ?? [
+    ...new Set(checks.map((check) => check.host)),
+  ];
   const verdict = checks.some((c) => c.verdict === "failed")
     ? "failed"
     : checks.some((c) => c.verdict === "flaky")
@@ -298,6 +301,14 @@ export function TaskBoardDetail({
         </b>
         <code>{display?.identity?.key ?? current["omnigent.ai:key"] ?? current.uid}</code>
         <span className="tb-dc-group">
+          {display?.identity?.groupBadge && (
+            <span
+              className="tb-dc-group-badge"
+              style={{ background: rows[0]?.color ?? "var(--primary)" }}
+            >
+              {display.identity.groupBadge}
+            </span>
+          )}
           {display?.identity?.groupLabel ?? current["omnigent.ai:group"]?.name}
         </span>
         <button type="button" aria-label={t("detail.close")} onClick={onClose}>
@@ -357,13 +368,26 @@ export function TaskBoardDetail({
             <Tile
               label={t("detail.tests")}
               verdict={verdict}
-              sub={checks.map((c) => (
-                <span key={c.id}>
-                  {c.host} {t(`sessions.check.${c.verdict}`)}{" "}
-                  {t("detail.checkCount", { count: c.count })}
-                  <br />
-                </span>
-              ))}
+              sub={
+                checks.length > 0 &&
+                checkHosts.map((host) => {
+                  const check = checks.find((item) => item.host === host);
+                  return (
+                    <span key={host}>
+                      {host}{" "}
+                      {check ? (
+                        <>
+                          {t(`sessions.check.${check.verdict}`)}{" "}
+                          {t("detail.checkCount", { count: check.count })}
+                        </>
+                      ) : (
+                        t("detail.noCheckRecord")
+                      )}
+                      <br />
+                    </span>
+                  );
+                })
+              }
             >
               {verdict ? t(`sessions.check.${verdict}`) : t("detail.notTested")}
             </Tile>

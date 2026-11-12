@@ -348,5 +348,6 @@
   "detail.state.failed": "Failed",
   "detail.state.blocked": "Blocked",
   "detail.state.queued": "Queued",
-  "detail.state.held": "Open, no session running"
+  "detail.state.held": "Open, no session running",
+  "detail.noCheckRecord": "No record"
 }

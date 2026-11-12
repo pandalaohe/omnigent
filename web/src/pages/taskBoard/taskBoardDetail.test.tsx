@@ -34,6 +34,13 @@ const task: BoardTask = {
   "omnigent.ai:sourceDisplay": {
     version: 1,
     state: "running",
+    identity: {
+      key: "ENG-1",
+      label: "Example task",
+      groupId: "work",
+      groupLabel: "Example group",
+      groupBadge: "ENG",
+    },
     current: "Current fallback",
     next: "Next fallback",
     sessions,
@@ -73,7 +80,9 @@ const other: BoardTask = {
   "omnigent.ai:source": "example",
 };
 function mount(current = task, selectedSessionId?: string, native = false) {
-  const cache = { display: { version: 1, asOf, timeZone: "UTC" } } as SourceCache;
+  const cache = {
+    display: { version: 1, asOf, timeZone: "UTC", checkHosts: ["workstation", "other-host"] },
+  } as SourceCache;
   const onSelect = vi.fn(),
     onClose = vi.fn();
   const view = render(
@@ -98,11 +107,15 @@ function mount(current = task, selectedSessionId?: string, native = false) {
 it("renders distinct current, need and next, estimated sessions-first cost, checks, literal quote and recent three commits", () => {
   const { container } = mount();
   expect(screen.getByText("Current work")).toBeTruthy();
+  expect(container.querySelector(".tb-dc-group-badge")?.textContent).toBe("ENG");
   expect(screen.getByText("Decision required")).toBeTruthy();
   expect(screen.getByText("Next work")).toBeTruthy();
   expect(screen.getByText("$0.06")).toBeTruthy();
   expect(screen.queryByText("$999.00")).toBeNull();
   expect(container.querySelector(".tb-dc-tile.failed")?.textContent).toContain("0 items");
+  expect(container.querySelector(".tb-dc-tile.failed")?.textContent).toContain(
+    "other-host No record",
+  );
   expect(container.querySelector(".tb-dc-segment")?.getAttribute("title")).toContain("pi");
   expect(container.querySelectorAll(".tb-dc-commits li")).toHaveLength(3);
   expect(container.querySelector(".tb-dc-commits li")?.textContent).toContain("abcdef4");

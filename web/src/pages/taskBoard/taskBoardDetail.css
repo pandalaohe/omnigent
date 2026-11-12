@@ -461,3 +461,16 @@
 .tb-dc.state-held {
   --tb-dc: var(--muted-foreground);
 }
+
+.tb-dc-group-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 4.5px;
+  padding: 0 4px;
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+}
