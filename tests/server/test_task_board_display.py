@@ -113,7 +113,7 @@ def test_source_and_declared_accounts():
         {"version": 1, "state": "running"},
         {
             "version": 1,
-            "links": [{"id": "x", "label": "X", "href": "https://user:pass@example.org/"}],
+            "links": [{"id": "x", "label": "X", "href": "https://user:pass@example.com/"}],
         },
         {
             "version": 1,
@@ -162,7 +162,7 @@ def test_group_display_requires_snapshot():
         {"version": 1, "omitted": {"events": True}},
         {
             "version": 1,
-            "links": [{"id": "x", "label": "X", "href": "https://user:pass@example.org/"}],
+            "links": [{"id": "x", "label": "X", "href": "https://user:pass@example.com/"}],
         },
     ],
 )

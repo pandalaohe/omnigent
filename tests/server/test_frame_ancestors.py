@@ -42,7 +42,7 @@ def test_valid_policy(entries):
         ["*"],
         ["https:"],
         ["https://example.org/"],
-        ["https://user@example.org"],
+        ["https://user@example.com"],
         ["https://example.org?q=1"],
         ["https://example.org#x"],
         ["https://example.org;"],
