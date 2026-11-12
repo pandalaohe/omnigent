@@ -118,13 +118,22 @@ interface UsageTipProps {
    * because there is nowhere else for that tap to go.
    */
   tapOpens?: boolean;
+  /** Name a semantic button when the disclosure has no child control. */
+  triggerLabel?: string;
 }
 
 /**
  * Hover/focus wrapper for a data card. The trigger never swallows a click, so
  * on a tile the tap that opens the tip on desktop still navigates on a phone.
  */
-export function UsageTip({ model, children, className, tapOpens = false }: UsageTipProps) {
+export function UsageTip({
+  model,
+  children,
+  className,
+  tapOpens = false,
+  triggerLabel,
+}: UsageTipProps) {
+  const Trigger = triggerLabel ? "button" : "span";
   const [open, setOpen] = useState(false);
   const closeTimer = useRef<number | null>(null);
 
@@ -161,7 +170,9 @@ export function UsageTip({ model, children, className, tapOpens = false }: Usage
       }}
     >
       <PopoverTrigger asChild>
-        <span
+        <Trigger
+          type={triggerLabel ? "button" : undefined}
+          aria-label={triggerLabel}
           className={className}
           tabIndex={tapOpens ? undefined : 0}
           onPointerEnter={(event) => {
@@ -180,7 +191,7 @@ export function UsageTip({ model, children, className, tapOpens = false }: Usage
           onBlur={scheduleClose}
         >
           {children}
-        </span>
+        </Trigger>
       </PopoverTrigger>
       <PopoverContent
         side="top"

@@ -402,6 +402,28 @@ it("keeps imperative account navigation and back/settings links inside a frame",
 });
 
 describe("Account detail composition", () => {
+  it("gives long window disclosures a named keyboard button and the same tap tip", async () => {
+    const data = usageBoardData();
+    const account = data.accounts[0];
+    const name = "Monthly quota window with a meaningful full-name suffix";
+    account.windows = [{ ...account.windows[0], label: name }];
+    mocks.overview.current = { ...LOADED, data };
+    renderBoard(`/usage/board/${encodeURIComponent(account.id)}`);
+    const trigger = screen.getByRole("button", { name: `${name} details` });
+    expect(trigger.tabIndex).toBe(0);
+    expect(trigger.querySelector("button")).toBeNull();
+    const matches = vi
+      .spyOn(trigger, "matches")
+      .mockImplementation((selector) => selector === ":focus-visible");
+    fireEvent.focus(trigger);
+    expect(await within(screen.getByTestId("usage-tip-card")).findByText(name)).toBeTruthy();
+    fireEvent.keyDown(trigger, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("usage-tip-card")).toBeNull());
+    matches.mockRestore();
+    fireEvent.click(trigger);
+    expect(await within(screen.getByTestId("usage-tip-card")).findByText(name)).toBeTruthy();
+  });
+
   it("shows each balance once in Quota after the card windows", () => {
     const data = usageBoardData();
     const account = data.accounts[0];

@@ -171,6 +171,7 @@ export function UsageAccountPage() {
                               <div key={window.id} data-usage-window className="usage-window">
                                 <UsageTip
                                   className="usage-ring-trigger"
+                                  triggerLabel={`${windowName(window)} details`}
                                   model={windowTip(account, window, group.tag, {
                                     pinned: picked.pinned,
                                     stale: stale || empty,
