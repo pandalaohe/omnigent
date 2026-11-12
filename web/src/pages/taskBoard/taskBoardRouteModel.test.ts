@@ -117,6 +117,38 @@ describe("route source projection", () => {
     expect(mapHubMembers(a, [a, b, c])).toEqual([b]);
     expect(mapHubMembers(b, [a, b, c])).toEqual([]);
   });
+  it("allocates historical colours in row order without reserving old closed board groups first", () => {
+    const live = task("live", "running", "a"),
+      old = task("old", "done", "m"),
+      historical = task("historical", "done", "y");
+    old.progressUpdated = new Date(now - 100 * DAY).toISOString();
+    old["omnigent.ai:sourceDisplay"]!.historyState = {
+      first: old.progressUpdated,
+      last: old.progressUpdated,
+      end: old.progressUpdated,
+      outcome: "completed",
+      active: true,
+      pinned: false,
+      future: false,
+    };
+    historical["omnigent.ai:sourceDisplay"]!.historyState = {
+      ...old["omnigent.ai:sourceDisplay"]!.historyState!,
+      last: new Date(now - HOUR).toISOString(),
+      end: new Date(now - HOUR).toISOString(),
+      active: false,
+    };
+    const source = [{ id: "example", name: "Example", source: null }],
+      snapshot = cache([]);
+    snapshot.display.groups = [
+      { id: "a", label: "Current", badge: "A", rank: 0 },
+      { id: "m", label: "Old", badge: "M", rank: 1 },
+    ];
+    const before = mapGroups([live, historical], source, { example: snapshot }, now),
+      after = mapGroups([live, old, historical], source, { example: snapshot }, now);
+    expect(after.find((group) => group.tasks.includes(historical))!.color).toBe(
+      before.find((group) => group.tasks.includes(historical))!.color,
+    );
+  });
   it("uses supplied history time ahead of the snapshot delivery timestamp", () => {
     const old = task("old");
     old["omnigent.ai:sourceDisplay"]!.lastActivity = undefined;

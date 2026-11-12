@@ -69,6 +69,8 @@ export function mapGroups(
   tasks: BoardTask[],
   sources: TaskSource[],
   caches: Record<string, SourceCache>,
+  now = Date.now(),
+  boardHours = 24,
 ): MapGroup[] {
   const keyed = new Map<string, MapGroup>();
   for (const task of tasks) {
@@ -99,20 +101,36 @@ export function mapGroups(
     }
     keyed.get(id)!.tasks.push(task);
   }
-  const groups = [...keyed.values()],
-    used = new Map<string, Set<number>>();
+  const groups = orderMapGroups([...keyed.values()], tasks, sources),
+    used = new Map<string, Set<number>>(),
+    positions = new Map(groups.map((group, index) => [group.id, index]));
   const colorOrder = [...groups].sort((a, b) => {
-    const rank = (group: MapGroup) =>
-      caches[group.source]?.display.groups?.find(
-        (item) => JSON.stringify([group.source, item.id]) === group.id,
-      )?.rank ?? Number.MAX_SAFE_INTEGER;
+    const rank = (group: MapGroup) => {
+      const onBoard = group.tasks.some((task) => {
+        const closed = task.progressUpdated ?? task["omnigent.ai:closedSeen"];
+        return (
+          (task["omnigent.ai:sourceDisplay"]?.historyState?.active !== false ||
+            routeAttention(task)) &&
+          (routeState(task) !== "done" || !closed || Date.parse(closed) >= now - boardHours * HOUR)
+        );
+      });
+      return onBoard
+        ? (caches[group.source]?.display.groups?.find(
+            (item) => JSON.stringify([group.source, item.id]) === group.id,
+          )?.rank ?? Number.MAX_SAFE_INTEGER)
+        : Number.MAX_SAFE_INTEGER;
+    };
     const liveSession = (group: MapGroup) =>
       group.tasks.some((task) =>
         task["omnigent.ai:sourceDisplay"]?.sessions?.some(
           (session) => session.status === "running",
         ),
       );
-    return Number(liveSession(b)) - Number(liveSession(a)) || rank(a) - rank(b);
+    return (
+      Number(liveSession(b)) - Number(liveSession(a)) ||
+      rank(a) - rank(b) ||
+      positions.get(a.id)! - positions.get(b.id)!
+    );
   });
   for (const group of colorOrder) {
     const id = JSON.parse(group.id)[1] as string,
@@ -138,7 +156,7 @@ export function mapGroups(
         (a.created ?? "").localeCompare(b.created ?? ""),
     );
   }
-  return orderMapGroups(groups, tasks, sources);
+  return groups;
 }
 function orderMapGroups(
   groups: MapGroup[],

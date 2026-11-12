@@ -305,7 +305,10 @@ export function TaskBoardRoutes({
       void tasks;
       return Date.now();
     }, [tasks]),
-    groups = useMemo(() => mapGroups(tasks, sources, caches), [tasks, sources, caches]),
+    groups = useMemo(
+      () => mapGroups(tasks, sources, caches, now, boardHours),
+      [tasks, sources, caches, now, boardHours],
+    ),
     relations = useMemo(() => mapRelations(tasks), [tasks]);
   const relationCounts = useMemo(() => {
     const counts = new Map<string, { outgoing: number; incoming: number }>();
