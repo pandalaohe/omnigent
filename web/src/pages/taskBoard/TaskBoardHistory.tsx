@@ -197,8 +197,15 @@ export function TaskBoardHistory({
     [extra, setExtra] = useState<BoardTask[]>([]),
     [loading, setLoading] = useState(false),
     [error, setError] = useState(false);
+  const monthSources = [
+    ...new Set([
+      ...Object.keys(caches),
+      ...tasks.map((task) => task["omnigent.ai:source"]),
+      ...counts.map((count) => count.source),
+    ]),
+  ].sort();
   const generationKey = JSON.stringify(
-    Object.entries(caches).map(([id, cache]) => [id, cache.pin.sourceGeneration, cache.pin.id]),
+    monthSources.map((id) => [id, caches[id]?.pin.sourceGeneration, caches[id]?.pin.id]),
   );
   const currentGeneration = useRef(generationKey);
   currentGeneration.current = generationKey;
@@ -309,7 +316,8 @@ export function TaskBoardHistory({
     setError(false);
     try {
       const batches = await Promise.all(
-        Object.entries(caches).map(async ([source, cache]) => {
+        monthSources.map(async (source) => {
+          const cache = caches[source];
           const loaded: BoardTask[] = [];
           const query = new URLSearchParams({
             source,
@@ -322,7 +330,7 @@ export function TaskBoardHistory({
               1,
             ).toISOString(),
           });
-          if (cache.pin.id) {
+          if (cache?.pin.id) {
             query.set("snapshot", cache.pin.id);
             query.set("source_generation", cache.pin.sourceGeneration);
           }
@@ -341,7 +349,7 @@ export function TaskBoardHistory({
             seen.add(cursor);
             query.set("cursor", cursor);
           }
-          if (cache.pin.id) {
+          if (cache?.pin.id) {
             const verify = new URLSearchParams({
               snapshot: cache.pin.id,
               source_generation: cache.pin.sourceGeneration,

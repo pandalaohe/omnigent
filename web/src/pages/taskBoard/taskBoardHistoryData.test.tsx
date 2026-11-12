@@ -283,6 +283,54 @@ it("loads pinned old-month cursor pages and discards a cancelled response", asyn
   expect(screen.queryByText("Old B")).toBeNull();
 });
 
+it("loads old-month cursor pages for a cacheless source without recent tasks", async () => {
+  fetcher.mockReset();
+  const older = [task("Old A"), task("Old B")];
+  older.forEach((old) => {
+    const history = old["omnigent.ai:sourceDisplay"]!.historyState!;
+    history.first = "2020-01-01T00:00:00Z";
+    history.last = "2020-01-20T00:00:00Z";
+    history.end = history.last;
+  });
+  fetcher
+    .mockResolvedValueOnce(Response.json({ entries: [older[0]], "omnigent.ai:cursor": "later" }))
+    .mockResolvedValueOnce(Response.json({ entries: [older[1]] }));
+  const { container } = render(
+    <MemoryRouter>
+      <TaskBoardHistory
+        tasks={[]}
+        sessions={[]}
+        caches={{}}
+        counts={[{ day: "2020-01-20", source: "engineering", closed: 2 }]}
+        now={now}
+        onSelect={vi.fn()}
+      />
+    </MemoryRouter>,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Find by month" }));
+  fireEvent.change(container.querySelector("input[type=month]")!, { target: { value: "2020-01" } });
+  fireEvent.click(screen.getByRole("button", { name: "Load month" }));
+  await waitFor(() => expect(container.querySelector(".h-stat>b")?.textContent).toBe("2"));
+  expect(fetcher).toHaveBeenCalledTimes(2);
+  const queries = fetcher.mock.calls.map(
+    ([url]) => new URL(url, "https://example.test").searchParams,
+  );
+  expect(queries.map((query) => query.get("source"))).toEqual(["engineering", "engineering"]);
+  expect(queries[1].get("cursor")).toBe("later");
+  for (const query of queries) {
+    expect(query.get("include_history")).toBe("1");
+    expect(query.get("state")).toBe("closed");
+    expect(query.has("snapshot")).toBe(false);
+    expect(query.has("source_generation")).toBe(false);
+  }
+  fireEvent.click(screen.getByRole("button", { name: /engineering.*1 groups/ }));
+  fireEvent.click(screen.getByRole("button", { name: /A group/ }));
+  expect(screen.getByRole("button", { name: /Old A.*Completed/ })).toBeTruthy();
+  expect(screen.getByRole("button", { name: /Old B.*Completed/ })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Back to recent" }));
+  await waitFor(() => expect(container.querySelector(".h-stat>b")?.textContent).toBe("0"));
+});
+
 it("keeps native sessions without a supplied task in the Today worker totals", () => {
   render(
     <TaskBoardToday

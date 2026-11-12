@@ -504,7 +504,9 @@ def test_task_board_display_switch_and_source_list(
             }
         )
 
-    browser_contract.route("/v1/me/tasks", archived_page)
+    browser_contract.route(
+        re.compile(rf"^{re.escape(appearance_url)}/v1/me/tasks(?:\?.*)?$"), archived_page
+    )
     history.get_by_role("button", name="Find by month", exact=True).click()
     history.get_by_label("Find month", exact=True).fill("2020-01")
     history.get_by_role("button", name="Load month", exact=True).click()
@@ -794,6 +796,58 @@ def test_task_board_display_switch_and_source_list(
         expect(trigger).to_be_focused()
         navigation_checks.append(boundary)
     print("ROUTE_RELATED_NAVIGATION", width, theme, navigation_checks, flush=True)
+    assert not errors
+
+
+@pytest.mark.parametrize(
+    "width,theme", [(1440, "dark"), (1440, "light"), (390, "dark"), (390, "light")]
+)
+def test_task_board_history_source_names_and_scroll(
+    page: Page,
+    appearance_url: str,
+    browser_contract: BrowserContract,
+    width: int,
+    theme: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    browser_contract.json(
+        "/v1/info",
+        {
+            "single_user": True,
+            "accounts_enabled": False,
+            "features": {},
+            "task_board_enabled": True,
+        },
+    )
+    preferences = {
+        "user_id": "local",
+        "is_admin": True,
+        "preferences": {
+            "version": 1,
+            "settings": {"session_navigation": {"showTaskBoard": True}},
+        },
+    }
+    browser_contract.json("/v1/me", preferences)
+    browser_contract.json("/v1/me/preferences", preferences)
+    browser_contract.json(
+        "/v1/agents/with-sessions", {"agent_ids": [], "template_by_agent_id": {}}
+    )
+    browser_contract.json(
+        "/v1/me/preferences/keep_warm/convert", {"layers": {}, "already": True}, method="POST"
+    )
+    browser_contract.json(
+        "/v1/system/settings",
+        {"health_check": {"project_id": None, "host_id": None, "prompt": None}},
+    )
+    browser_contract.json("/v1/me/usage", {"accounts": []})
+    browser_contract.json("/v1/scheduled-tasks", {"scheduled_tasks": []})
+    browser_contract.json("/v1/me/tasks/history", {"entries": []})
+    observed = datetime.now(UTC).isoformat()
+    errors: list[str] = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.set_viewport_size({"width": width, "height": 900})
+    output = Path(request.config.getoption("--output"))
+    output.mkdir(parents=True, exist_ok=True)
     source_ids = [f"project-{index:02d}" for index in range(1, 11)]
     browser_contract.json(
         "/v1/me/tasks/sources",
@@ -824,9 +878,10 @@ def test_task_board_display_switch_and_source_list(
         },
     )
     browser_contract.json("/v1/me/tasks/closed-counts", {"days": []})
-    page.evaluate(
-        "value => localStorage.setItem('omnigent.taskBoard.display', JSON.stringify(value))",
-        {"theme": theme, "defaultView": "history", "refresh": 0},
+    page.add_init_script(
+        "localStorage.setItem('omnigent.taskBoard.display', "
+        + json.dumps(json.dumps({"theme": theme, "defaultView": "history", "refresh": 0}))
+        + ")"
     )
     page.goto(appearance_url + "/task-board")
     names = page.locator(".h-p .h-name b")
