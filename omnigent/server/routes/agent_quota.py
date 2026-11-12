@@ -558,6 +558,7 @@ def create_agent_quota_router(
         pool: str | None = None,
         model: str | None = None,
         card: str | None = None,
+        include_previous: bool = False,
     ) -> Response:
         require_usage()
         from fastapi.responses import JSONResponse
@@ -573,6 +574,21 @@ def create_agent_quota_router(
                 tz=tz,
                 account=account,
             )
+            prior = None
+            if range_key != "d90" and (include_previous or service.pricing_store is not None):
+                prior = await asyncio.to_thread(
+                    service.analysis,
+                    owner,
+                    range_key=range_key,
+                    from_date=from_date,
+                    to_date=to_date,
+                    tz=tz,
+                    account=account,
+                    now=view.generated_at,
+                    previous=True,
+                )
+            if include_previous:
+                view.previous = prior
             if service.pricing_store is not None:
                 from fastapi.encoders import jsonable_encoder
 
@@ -582,18 +598,7 @@ def create_agent_quota_router(
                 projection = await asyncio.to_thread(
                     value_usage, view, baseline, pool=pool, model=model, card_id=card
                 )
-                if range_key != "d90":
-                    prior = await asyncio.to_thread(
-                        service.analysis,
-                        owner,
-                        range_key=range_key,
-                        from_date=from_date,
-                        to_date=to_date,
-                        tz=tz,
-                        account=account,
-                        now=view.generated_at,
-                        previous=True,
-                    )
+                if prior is not None:
                     previous_values = await asyncio.to_thread(
                         value_usage, prior, baseline, pool=pool, model=model, card_id=card
                     )

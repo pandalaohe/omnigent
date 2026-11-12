@@ -127,6 +127,43 @@ def test_account_detail_keyboard_ranges_and_return(
     browser_contract.json(
         "/v1/me/usage/analysis", {"generated_at": now, "pool_catalog": [], "pools": [], "rows": []}
     )
+    pricing = {
+        "revision": 1,
+        "defaults": {
+            "schema_version": 1,
+            "default_discount": "0.8",
+            "display_currency": "USD",
+            "fx_to_display": {"USD": "1", "HKD": "0.128205128205128205"},
+        },
+        "cards": [
+            {
+                "id": "card-a",
+                "name": "Used card",
+                "retail_amount": "100.000000000000000001",
+                "purchase_currency": "HKD",
+                "allowance_usd": "100",
+                "period_kind": "week",
+                "starts_on": "2026-11-02",
+                "timezone": "UTC",
+                "target_kind": "account",
+                "target_id": "plan-0",
+                "parent_account_id": None,
+                "discount_override": None,
+                "rates_usd_per_million": {
+                    "read": "2",
+                    "write": "4",
+                    "cache_read": "0.2",
+                    "cache_write": "2.5",
+                },
+            }
+        ],
+    }
+    browser_contract.json("/v1/me/usage/pricing-baseline", pricing)
+    browser_contract.json(
+        "/v1/me/usage/pricing-baseline",
+        lambda request: {**request.post_data_json, "revision": 2},
+        method="PUT",
+    )
     browser_contract.json("/v1/me/usage/lines", {"schema": 1, "tiles": {}})
     browser_contract.json("/v1/me/session-choice", {"settings": None, "revision": "sample"})
     browser_contract.json(
@@ -156,4 +193,21 @@ def test_account_detail_keyboard_ranges_and_return(
     expect(page.get_by_role("link", name="Models", exact=True)).to_be_visible()
     expect(page.get_by_role("link", name="Issues", exact=True)).to_be_visible()
     expect(page.get_by_text("Connect a source", exact=True)).to_be_visible()
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+
+    page.get_by_text("Pricing", exact=True).click()
+    expect(page.get_by_label("Card payment preview")).to_contain_text("HKD 80.00 · USD 10.26")
+    field = page.get_by_label("Card discount", exact=True)
+    field.fill("0.6")
+    field.blur()
+    expect(page.get_by_label("Card payment preview")).to_contain_text("HKD 60.00 · USD 7.69")
+    with page.expect_request(
+        lambda req: req.method == "PUT" and req.url.endswith("/usage/pricing-baseline")
+    ) as saved_request:
+        page.get_by_role("button", name="Save pricing", exact=True).click()
+    assert saved_request.value.post_data_json["cards"][0]["discount_override"] == "0.6"
+    assert (
+        saved_request.value.post_data_json["cards"][0]["retail_amount"] == "100.000000000000000001"
+    )
+    expect(page.get_by_text("Pricing saved. History recalculated.")).to_be_visible()
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")

@@ -354,5 +354,13 @@ async def test_analysis_route_range_validation_and_usage_scope(pools):
         response = await client.get("/v1/me/usage/analysis")
         assert response.status_code == 200
         assert response.headers["cache-control"] == "private, no-store"
+        assert response.json()["previous"] is None
+        comparison = await client.get("/v1/me/usage/analysis?include_previous=true")
+        assert comparison.status_code == 200
+        previous = comparison.json()["previous"]
+        assert previous["span"]["until"] <= comparison.json()["span"]["counted_from"]
+        assert previous["previous"] is None
+        no_previous = await client.get("/v1/me/usage/analysis?range=d90&include_previous=true")
+        assert no_previous.json()["previous"] is None
     assert scope_allows("usage", "GET", "/v1/me/usage/analysis")
     assert not scope_allows("usage:read", "GET", "/v1/me/usage/analysis")

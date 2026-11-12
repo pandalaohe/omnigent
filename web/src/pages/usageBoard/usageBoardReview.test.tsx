@@ -467,6 +467,45 @@ describe("Proven pool usage", () => {
           JSON.stringify({
             generated_at: now,
             accounts: [],
+            previous: {
+              generated_at: now,
+              span: {
+                requested_from: now - 172800,
+                counted_from: now - 172800,
+                until: now - 86400,
+                approx: false,
+              },
+              account_spans: {},
+              pool_catalog: [
+                {
+                  parent_account_id: account,
+                  pool_id: "pool-a",
+                  display_name: "Pool A",
+                  usage_available: true,
+                },
+              ],
+              pools: [
+                {
+                  parent_account_id: account,
+                  pool_id: "pool-a",
+                  channel: "usage",
+                  totals: sampleTotals(1.2, 400),
+                },
+              ],
+              rows: [
+                {
+                  parent_account_id: account,
+                  pool_id: "pool-a",
+                  channel: "usage",
+                  hour: now - 90000,
+                  model: "selected-model",
+                  cost_usd: 1.2,
+                  tokens: 400,
+                  contributes_money: true,
+                  contributes_usage: true,
+                },
+              ],
+            },
             span: {
               requested_from: now - 86400,
               counted_from: now - 86400,
@@ -523,6 +562,7 @@ describe("Proven pool usage", () => {
       renderBoard(`/usage/board/${encodeURIComponent(account)}?focus=Pool%20A`);
       const cells = screen.getByRole("group", { name: "Cost time range" });
       await waitFor(() => expect(within(cells).getAllByText("$3.20")).toHaveLength(3));
+      await screen.findByText("Previous $1.20", { exact: true });
       fireEvent.click(screen.getByText("Cost breakdown", { exact: true }));
       expect(
         screen.getByText("selected-model", { exact: true }).parentElement?.textContent,

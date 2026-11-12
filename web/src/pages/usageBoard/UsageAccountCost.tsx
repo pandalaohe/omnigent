@@ -27,11 +27,12 @@ export function UsageAccountCost({ account }: { account: UsageAccountView }) {
   // relation first; ambiguous labels never fall back to the whole account.
   const pools = useQueries({
     queries: (["today", "d7", "period"] as const).map((key) => ({
-      queryKey: ["usageBoard", "accountPool", account.id, key],
+      queryKey: ["usageBoard", "accountPoolComparison", account.id, key],
       enabled: !!focus,
       queryFn: async () => {
         const params = usageRangeQuery({ key });
         params.set("account", account.id);
+        params.set("include_previous", "true");
         return usageJson<DetailAnalysis>(`analysis?${params}`);
       },
       retry: false,
@@ -125,6 +126,7 @@ export function UsageAccountCost({ account }: { account: UsageAccountView }) {
 }
 
 interface DetailAnalysis {
+  previous?: DetailAnalysis | null;
   partial?: boolean;
   truncated?: boolean;
   generated_at: number;
@@ -165,12 +167,17 @@ function poolAmount(
   const totals = data.pools
     .filter(
       (pool) =>
-        pool.parent_account_id === account && pool.pool_id === poolId && pool.channel === "usage",
+        pool.parent_account_id === account &&
+        pool.pool_id === poolId &&
+        ["usage", "metered_cost"].includes(pool.channel),
     )
     .map((pool) => pool.totals);
   if (!totals.length) return;
   const rows = data.rows.filter(
-    (row) => row.parent_account_id === account && row.pool_id === poolId && row.channel === "usage",
+    (row) =>
+      row.parent_account_id === account &&
+      row.pool_id === poolId &&
+      (row.contributes_money || row.contributes_usage),
   );
   const base = sumUsage(totals);
   const project = (items: DetailAnalysis["rows"]): UsageTotals => ({
@@ -196,7 +203,7 @@ function poolAmount(
     account,
     span: data.account_spans[account] ?? data.span,
     totals: base,
-    previous: null,
+    previous: data.previous ? (poolAmount(data.previous, account, focus) ?? null) : null,
     mark: base.unpriced || data.partial || data.truncated ? "≥" : null,
     series: [...byHour].sort(([a], [b]) => a - b).map(([at, items]) => ({ at, ...project(items) })),
     models: [...byModel].map(([model, items]) => ({ model, ...project(items) })),

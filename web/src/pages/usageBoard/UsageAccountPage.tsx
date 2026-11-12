@@ -18,6 +18,7 @@ import { cn } from "@/lib/utils";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { UsageCostCard, UsageByModel } from "./UsageAmounts";
 import { UsageAccountCost } from "./UsageAccountCost";
+import { UsagePricingSummary } from "./UsagePricingPanel";
 import { UsageModelPoolsLink } from "./UsageModelPoolsLink";
 
 import { UsageBoardFrame } from "./UsageBoardFrame";
@@ -85,7 +86,11 @@ export function UsageAccountPage() {
       error={overview.error ?? activity.error}
       actions={
         <Button variant="ghost" size="icon" asChild aria-label="Account settings">
-          <Link to={boardPath(`/usage/board/${encodeURIComponent(accountId)}/settings`)}>
+          <Link
+            to={boardPath(
+              `/usage/board/${encodeURIComponent(accountId)}/settings${focus ? `?focus=${encodeURIComponent(focus)}` : ""}`,
+            )}
+          >
             <SettingsIcon className="size-4" aria-hidden="true" />
           </Link>
         </Button>
@@ -257,6 +262,7 @@ export function UsageAccountPage() {
 
               <div className="grid gap-2">
                 <UsageAccountCost account={account} />
+                <UsagePricingSummary accountId={account.id} />
                 <section className="rounded-[11px] border border-border bg-card px-3.5 py-3">
                   <h2 className="text-sm font-semibold">Used in</h2>
                   <UsageModelPoolsLink />
