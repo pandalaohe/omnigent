@@ -5,6 +5,8 @@ import { afterEach, expect, it, vi } from "vitest";
 import { TaskBoardDetail } from "./TaskBoardDetail";
 import type { BoardTask } from "./taskBoardData";
 import type { DisplaySession } from "./taskBoardDisplay";
+import { boardGroupColors, boardSessionRows } from "./taskBoardSessionData";
+import type { BoardSession } from "./taskBoardNative";
 import type { SourceCache } from "./taskBoardSnapshotData";
 
 vi.mock("./taskBoardNative", () => ({ useBoardSessionDetails: () => [] }));
@@ -79,7 +81,12 @@ const other: BoardTask = {
   title: "Upstream task",
   "omnigent.ai:source": "example",
 };
-function mount(current = task, selectedSessionId?: string, native = false) {
+function mount(
+  current = task,
+  selectedSessionId?: string,
+  native: boolean | BoardSession[] = false,
+  allTasks = [current, other],
+) {
   const cache = {
     display: { version: 1, asOf, timeZone: "UTC", checkHosts: ["workstation", "other-host"] },
   } as SourceCache;
@@ -90,9 +97,13 @@ function mount(current = task, selectedSessionId?: string, native = false) {
       <MemoryRouter>
         <TaskBoardDetail
           task={current}
-          tasks={[current, other]}
+          tasks={allTasks}
           sessions={
-            native ? [{ id: "session-1", title: "Session 1", status: "idle", archived: true }] : []
+            Array.isArray(native)
+              ? native
+              : native
+                ? [{ id: "session-1", title: "Session 1", status: "idle", archived: true }]
+                : []
           }
           sourceCache={cache}
           onSelect={onSelect}
@@ -162,6 +173,7 @@ it("keeps missing cost absent and known zero visible without empty footer scaffo
     },
   });
   expect(screen.getByText("$0.00")).toBeTruthy();
+  expect(document.querySelector(".tb-dc-segment.live")).toBeNull();
 });
 
 it("opens a real session outside the board frame in a new tab", () => {
@@ -183,4 +195,173 @@ it("does not charge a session whose explicit task reference belongs to another s
   mount({ ...task, "omnigent.ai:sourceDisplay": { version: 1, sessions: [foreign] } });
   expect(screen.queryByText("$500.00")).toBeNull();
   expect(screen.queryByText("Cost")).toBeNull();
+});
+
+it.each(["next", "first"])(
+  "retains %s ordering and a dependency on both ends in frame mode",
+  (relation) => {
+    window.history.replaceState({}, "", "/frame/task-board");
+    const left: BoardTask = {
+      uid: "left",
+      title: "Left",
+      "omnigent.ai:source": "example",
+      relatedTo: { right: { relation: { [relation]: true, "omnigent.ai:depends-on": true } } },
+    };
+    const right: BoardTask = { uid: "right", title: "Right", "omnigent.ai:source": "example" };
+    const view = mount(left, undefined, false, [left, right]);
+    const forward = relation === "next";
+    expect(screen.getByText(forward ? "Successor" : "Predecessor")).toBeTruthy();
+    expect(screen.getByText("Depends on")).toBeTruthy();
+    expect(view.container.querySelectorAll(".tb-dc-relation")).toHaveLength(2);
+    view.unmount();
+    mount(right, undefined, false, [left, right]);
+    expect(screen.getByText(forward ? "Predecessor" : "Successor")).toBeTruthy();
+    expect(screen.getByText("Blocking")).toBeTruthy();
+    window.history.replaceState({}, "", "/");
+  },
+);
+it.each([0, 1.25])("always marks actual cost %s and explains pricing", (amount) => {
+  const { container } = mount({
+    ...task,
+    "omnigent.ai:sourceDisplay": {
+      version: 1,
+      sessions: [
+        { ...sessions[0], cost: { amount, kind: "actual", sourceLabel: "Source pricing" } },
+      ],
+    },
+  });
+  expect(container.querySelector(".tb-dc-money.actual i")?.textContent).toBe("Actual");
+  expect(container.querySelector(".tb-dc-money")?.getAttribute("title")).toContain(
+    "Source pricing",
+  );
+  expect(container.querySelector(".tb-dc-money")?.textContent).toContain(`$${amount.toFixed(2)}`);
+});
+it("marks mixed known and unknown estimated nodes and retains missing-price information", () => {
+  const { container } = mount();
+  expect(container.querySelector(".tb-dc-money.estimate i")?.textContent).toBe("Est.");
+  expect(container.querySelector(".tb-dc-money")?.getAttribute("title")).toContain("4 unpriced");
+  expect(container.querySelector(".tb-dc-money")?.getAttribute("title")).toContain("token");
+});
+it("shares full-board collision colours even without sessions, and separates logo treatments", () => {
+  const make = (uid: string, group: string): BoardTask => ({
+    ...task,
+    uid,
+    "omnigent.ai:sourceDisplay": {
+      ...task["omnigent.ai:sourceDisplay"]!,
+      identity: { key: uid, label: uid, groupId: group, groupBadge: "G" },
+      sessions: sessions.map((item) => ({
+        ...item,
+        id: uid + item.id,
+        task: { source: "example", uid },
+      })),
+    },
+  });
+  const first = make("first", "a"),
+    second = make("second", "m");
+  // These group hashes collide in the twelve-colour palette.
+  const all = [first, second];
+  const colors = boardGroupColors(all);
+  expect(colors.get(JSON.stringify(["example", "first"]))).not.toBe(
+    colors.get(JSON.stringify(["example", "second"])),
+  );
+  const { container, unmount } = mount(second, undefined, false, all);
+  expect(container.querySelector<HTMLElement>(".tb-dc-group-badge")?.style.background).toBe(
+    "rgb(0, 145, 200)",
+  );
+  expect(boardSessionRows(all, []).find((row) => row.task?.uid === "second")?.color).toBe(
+    colors.get(JSON.stringify(["example", "second"])),
+  );
+  expect(
+    container.querySelector(".tb-dc-who .tb-agent-logo:not(.compact) svg")?.getAttribute("width"),
+  ).toBe("18");
+  expect(
+    container.querySelector(".tb-dc-axis .tb-agent-logo.compact svg")?.getAttribute("width"),
+  ).toBe("11");
+  expect(container.querySelector(".tb-dc-sessions .tb-identity-mark")).toBeTruthy();
+  unmount();
+  const empty = {
+    ...second,
+    "omnigent.ai:sourceDisplay": { ...second["omnigent.ai:sourceDisplay"]!, sessions: [] },
+  };
+  const view = mount(empty, undefined, false, [first, empty]);
+  expect(view.container.querySelector<HTMLElement>(".tb-dc-group-badge")?.style.background).toBe(
+    "rgb(0, 145, 200)",
+  );
+});
+it.each([undefined, "session-0"])(
+  "shows tool name, elapsed and cap at source asOf in context %s",
+  (selected) => {
+    const tool = {
+      id: "tool",
+      name: "shell",
+      label: "Run checks",
+      startedAt: "2026-11-12T03:50:00Z",
+      limitSeconds: 1200,
+    };
+    const current = {
+      ...task,
+      "omnigent.ai:sourceDisplay": { version: 1 as const, sessions: [{ ...sessions[0], tool }] },
+    };
+    const { container, unmount } = mount(current, selected);
+    expect(container.querySelector(".tb-dc-tool")?.textContent).toBe(
+      "Run checks (shell) running 10 min, limit 20 min",
+    );
+    unmount();
+    const noCap = {
+      ...current,
+      "omnigent.ai:sourceDisplay": {
+        version: 1 as const,
+        sessions: [{ ...sessions[0], tool: { ...tool, limitSeconds: undefined } }],
+      },
+    };
+    const next = mount(noCap, selected);
+    expect(next.container.querySelector(".tb-dc-tool")?.textContent).toBe(
+      "Run checks (shell) running 10 min",
+    );
+    next.unmount();
+    mount(
+      {
+        ...current,
+        "omnigent.ai:sourceDisplay": {
+          version: 1,
+          sessions: [{ ...sessions[0], tool: { ...tool, limitSeconds: 300 } }],
+        },
+      },
+      selected,
+    );
+    expect(document.querySelector(".tb-dc-tool")).toBeNull();
+  },
+);
+
+it("uses the native tool tuple and live clock instead of the older source tool", () => {
+  vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-11-12T05:00:00Z"));
+  const tool = {
+    id: "old",
+    name: "old-tool",
+    label: "Source work",
+    startedAt: "2026-11-12T03:50:00Z",
+  };
+  const current = {
+    ...task,
+    "omnigent.ai:sourceDisplay": { version: 1 as const, sessions: [{ ...sessions[0], tool }] },
+  };
+  const { container } = mount(current, "session-0", [
+    {
+      id: "session-0",
+      status: "running",
+      updated_at: Date.now() / 1000,
+      current_tool: {
+        id: "native",
+        name: "native-shell",
+        label: "Native work",
+        startedAt: "2026-11-12T04:50:00Z",
+        limitSeconds: 1200,
+      },
+    },
+  ]);
+  expect(container.querySelector(".tb-dc-tool")?.textContent).toBe(
+    "Native work (native-shell) running 10 min, limit 20 min",
+  );
+  expect(screen.queryByText(/Source work/)).toBeNull();
+  vi.restoreAllMocks();
 });

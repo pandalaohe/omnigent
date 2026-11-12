@@ -11,6 +11,7 @@ import {
   BanIcon,
   ClockIcon,
   CircleDotIcon,
+  SquareTerminalIcon,
 } from "lucide-react";
 import { Link } from "@/lib/routing";
 import { useBoardCadence } from "./taskBoardPreferences";
@@ -24,10 +25,10 @@ import {
 } from "./taskBoardData";
 import { useBoardSessionDetails, type BoardSession } from "./taskBoardNative";
 import { taskLocalTime, taskRelations } from "./taskBoardRouteData";
-import { displayCost, sessionObservation } from "./taskBoardDisplay";
-import { boardSessionRows } from "./taskBoardSessionData";
+import { displayCost, sessionObservation, type TaskDisplay } from "./taskBoardDisplay";
+import { boardSessionRows, boardGroupColors } from "./taskBoardSessionData";
 import { formatDate, formatNumber, t } from "./taskBoardText";
-import { BoardIdentityMark } from "./BoardIdentityMark";
+import { BoardIdentityMark, BoardAgentLogo } from "./BoardIdentityMark";
 import { TaskSourceDetails } from "./TaskSourceDetails";
 import { TaskBoardActions, taskActions } from "./TaskBoardActions";
 import "./taskBoardDetail.css";
@@ -91,6 +92,19 @@ const duration = (seconds: number) => {
       ? `${Math.floor(hours / 24)}d ${hours % 24}h`
       : `${hours}h${Math.round((seconds % 3600) / 60) ? ` ${Math.round((seconds % 3600) / 60)}m` : ""}`;
 };
+const toolDuration = (seconds: number) => {
+  const rounded = Math.round(seconds);
+  if (rounded < 60) return t("detail.toolSeconds", { count: rounded });
+  if (rounded < 3600) return t("detail.toolMinutes", { count: Math.round(rounded / 60) });
+  const hours = Math.floor(rounded / 3600),
+    minutes = Math.round((rounded % 3600) / 60);
+  return hours >= 24
+    ? t("detail.toolDays", { days: Math.floor(hours / 24), hours: hours % 24 })
+    : t("detail.toolHours", {
+        hours,
+        minutes: minutes ? ` ${t("detail.toolMinutes", { count: minutes })}` : "",
+      });
+};
 const Mark = ({ id, label = id }: { id: string; label?: string }) => (
   <BoardIdentityMark id={id} product={id} label={label} neutral size={18} />
 );
@@ -139,6 +153,7 @@ export function TaskBoardDetail({
     if (detail.data && (detail.data.updated_at ?? 0) >= (byId.get(detail.data.id)?.updated_at ?? 0))
       byId.set(detail.data.id, detail.data);
   });
+  const groupColor = boardGroupColors(tasks).get(taskIdentity(current));
   const rows = boardSessionRows([current], [...byId.values()]).filter(
     (row) =>
       ids.includes(row.session.id) &&
@@ -182,6 +197,11 @@ export function TaskBoardDetail({
     (live?.questions?.length ? live.questions.map((q) => q.text).join("；") : undefined) ??
     display?.need ??
     current["omnigent.ai:waiting"]?.note;
+  const tool = live?.tool;
+  const toolClock = live && byId.has(live.id) ? new Date(Date.now()).toISOString() : asOf;
+  const toolElapsed = tool
+    ? (Date.parse(toolClock) - Date.parse(tool.startedAt)) / 1000
+    : undefined;
   const next = live?.next ?? display?.next ?? current["omnigent.ai:next"];
   const actors = new Map((display?.actors ?? []).map((a) => [a.agentId, a.label]));
   linked.forEach((s) => {
@@ -232,7 +252,10 @@ export function TaskBoardDetail({
   const end = Date.parse(asOf),
     span = Math.max(1, end - start);
   const id = taskIdentity(current);
-  const relationMap = new Map(
+  type DetailRelation = Omit<NonNullable<TaskDisplay["relations"]>[number], "kind"> & {
+    kind: "parent" | "dependency" | "include" | "next";
+  };
+  const relationMap = new Map<string, DetailRelation>(
     tasks.flatMap((item) =>
       (item["omnigent.ai:sourceDisplay"]?.relations ?? []).map(
         (edge) =>
@@ -260,14 +283,15 @@ export function TaskBoardDetail({
       ![...relationMap.values()].some(
         (item) =>
           JSON.stringify(item.from) === JSON.stringify(from) &&
-          JSON.stringify(item.to) === JSON.stringify(to),
+          JSON.stringify(item.to) === JSON.stringify(to) &&
+          item.kind === edge.kind,
       )
     )
       relationMap.set(key, {
         id: key,
         from,
         to,
-        kind: edge.kind === "parent" ? "parent" : "dependency",
+        kind: edge.kind,
         origin: "observed",
         provenance: t("detail.observedEdge"),
       });
@@ -304,7 +328,7 @@ export function TaskBoardDetail({
           {display?.identity?.groupBadge && (
             <span
               className="tb-dc-group-badge"
-              style={{ background: rows[0]?.color ?? "var(--primary)" }}
+              style={{ background: groupColor ?? "var(--primary)" }}
             >
               {display.identity.groupBadge}
             </span>
@@ -322,12 +346,34 @@ export function TaskBoardDetail({
               {now || t(state === "done" ? "detail.closedLead" : "detail.quietLead")}
             </p>
           )}
-          {live?.tool &&
-            (live.tool.limitSeconds == null ||
-              (Date.parse(byId.has(live.id) ? new Date(Date.now()).toISOString() : asOf) -
-                Date.parse(live.tool.startedAt)) /
-                1000 <
-                live.tool.limitSeconds) && <p className="tb-dc-tool">{live.tool.label}</p>}
+          {tool &&
+            toolElapsed !== undefined &&
+            toolElapsed >= 0 &&
+            (tool.limitSeconds == null || toolElapsed < tool.limitSeconds) && (
+              <p
+                className="tb-dc-tool"
+                title={
+                  t("detail.toolLine", {
+                    label: tool.label,
+                    name: tool.name,
+                    elapsed: toolDuration(toolElapsed),
+                  }) +
+                  (tool.limitSeconds == null
+                    ? ""
+                    : t("detail.toolLimit", { limit: toolDuration(tool.limitSeconds) }))
+                }
+              >
+                <SquareTerminalIcon size={14} />
+                {t("detail.toolLine", {
+                  label: tool.label,
+                  name: tool.name,
+                  elapsed: toolDuration(toolElapsed),
+                })}
+                {tool.limitSeconds == null
+                  ? ""
+                  : t("detail.toolLimit", { limit: toolDuration(tool.limitSeconds) })}
+              </p>
+            )}
           {need && (
             <div className="tb-dc-need">
               <HandIcon size={16} />
@@ -348,8 +394,8 @@ export function TaskBoardDetail({
               {actors.size ? (
                 <>
                   <span className="tb-dc-who">
-                    {[...actors].map(([agent, label]) => (
-                      <Mark key={agent} id={agent} label={label} />
+                    {[...actors].map(([agent]) => (
+                      <BoardAgentLogo key={agent} id={agent} />
                     ))}
                   </span>
                   {actors.size === 1
@@ -402,17 +448,28 @@ export function TaskBoardDetail({
                 sub={<>{t("detail.segmentCount", { count: nodes.length })}</>}
               >
                 <span
-                  title={roll.unpriced ? t("detail.unpriced", { count: roll.unpriced }) : undefined}
+                  className={`tb-dc-money ${roll.kind}`}
+                  title={[
+                    t(`sessions.cost.${roll.kind}.hint`),
+                    ...new Set(
+                      nodes.flatMap((node) =>
+                        node.cost?.sourceLabel ? [node.cost.sourceLabel] : [],
+                      ),
+                    ),
+                    roll.unpriced ? t("detail.unpriced", { count: roll.unpriced }) : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
                 >
-                  $
-                  {formatNumber(roll.amount, {
-                    minimumFractionDigits: 2,
-                    maximumFractionDigits: 2,
-                  })}
+                  <span>
+                    $
+                    {formatNumber(roll.amount, {
+                      minimumFractionDigits: 2,
+                      maximumFractionDigits: 2,
+                    })}
+                  </span>
+                  <i>{t(`sessions.cost.${roll.kind}`)}</i>
                 </span>
-                {roll.kind === "estimate" && (
-                  <em className="tb-dc-estimate">{t("sessions.cost.estimate")}</em>
-                )}
               </Tile>
             )}
           </div>
@@ -443,7 +500,7 @@ export function TaskBoardDetail({
                   <span>{stamp(new Date(start).toISOString())}</span>
                   <span>
                     {[...new Set(validIntervals.map((s) => s.agentId))].map((agent) => (
-                      <Mark key={agent} id={agent} />
+                      <BoardAgentLogo key={agent} id={agent} size={16} compact />
                     ))}
                     {t("detail.segmentCount", { count: validIntervals.length })}
                   </span>
@@ -465,13 +522,17 @@ export function TaskBoardDetail({
                       ? fromHere
                         ? "childTask"
                         : "parentTask"
-                      : edge.kind === "include"
+                      : edge.kind === "next"
                         ? fromHere
-                          ? "includes"
-                          : "includedBy"
-                        : fromHere
-                          ? "blocking"
-                          : "dependsOn";
+                          ? "successor"
+                          : "predecessor"
+                        : edge.kind === "include"
+                          ? fromHere
+                            ? "includes"
+                            : "includedBy"
+                          : fromHere
+                            ? "blocking"
+                            : "dependsOn";
                   const targetState =
                     target?.["omnigent.ai:sourceDisplay"]?.state ??
                     (target && ["completed", "cancelled"].includes(taskProgress(target))

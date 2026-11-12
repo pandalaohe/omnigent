@@ -360,3 +360,39 @@ describe("translation catalogue", () => {
     );
   });
 });
+
+it("reveals a related task at the expanded session anchor and restores its row on close", async () => {
+  enableBoard();
+  const fixture = taskBoardFixture();
+  const origin = fixture.tasks[1];
+  origin["omnigent.ai:sourceDisplay"] = {
+    version: 1,
+    sessions: [
+      {
+        id: "source-session",
+        task: { source: origin["omnigent.ai:source"], uid: origin.uid },
+        role: "root",
+        agentId: "pi",
+        label: "Example worker",
+        title: "Example worker",
+        status: "running",
+        createdAt: new Date().toISOString(),
+        lastActivityAt: new Date().toISOString(),
+      },
+    ],
+  };
+  report(fixture.tasks, fixture.sources);
+  renderBoard();
+  const row = await screen.findByRole("button", { name: "Session details: Example worker" });
+  fireEvent.click(row);
+  const original = await screen.findByRole("region", { name: "Details: Choose the retry budget" });
+  fireEvent.click(within(original).getByRole("button", { name: /ENG-123/ }));
+  const target = await screen.findByRole("region", {
+    name: "Details: Recover interrupted uploads",
+  });
+  expect(target.closest(".tb-session-group")).toBeTruthy();
+  expect(screen.queryByRole("region", { name: "Details: Choose the retry budget" })).toBeNull();
+  fireEvent.click(within(target).getByRole("button", { name: "Close" }));
+  expect(screen.queryByRole("region", { name: "Details: Recover interrupted uploads" })).toBeNull();
+  expect(document.activeElement).toBe(row);
+});

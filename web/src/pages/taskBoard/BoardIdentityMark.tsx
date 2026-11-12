@@ -17,6 +17,39 @@ const colours = [
   "#6cbe45",
   "#996633",
 ];
+function agentIcon(product?: string | null) {
+  return product === "claude"
+    ? Claude
+    : product === "codex"
+      ? Codex
+      : product === "antigravity"
+        ? Antigravity
+        : product === "pi"
+          ? Pi
+          : null;
+}
+
+export function BoardAgentLogo({
+  id,
+  size = 18,
+  compact = false,
+}: {
+  id: string;
+  size?: number;
+  compact?: boolean;
+}) {
+  const Icon = agentIcon(id);
+  return (
+    <span
+      className={`tb-agent-logo${compact ? " compact" : ""} ag-${Icon ? id : "unknown"}`}
+      aria-hidden="true"
+      style={{ width: size, height: size }}
+    >
+      {Icon ? <Icon size={compact ? Math.round(size * 0.69) : size} /> : <span>?</span>}
+    </span>
+  );
+}
+
 export function BoardIdentityMark({
   id,
   label,
@@ -32,16 +65,7 @@ export function BoardIdentityMark({
 }) {
   let hash = 0;
   for (let index = 0; index < id.length; index++) hash = (hash * 31 + id.charCodeAt(index)) >>> 0;
-  const Icon =
-    product === "claude"
-      ? Claude
-      : product === "codex"
-        ? Codex
-        : product === "antigravity"
-          ? Antigravity
-          : product === "pi"
-            ? Pi
-            : null;
+  const Icon = agentIcon(product);
   return (
     <span
       className={`tb-identity-mark${Icon ? ` tb-brand-${product}` : ""}`}

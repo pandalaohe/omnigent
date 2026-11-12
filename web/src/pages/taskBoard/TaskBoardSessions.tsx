@@ -432,6 +432,7 @@ export function TaskBoardSessions({
   const [archiveOpen, setArchiveOpen] = useState(false),
     [archivePage, setArchivePage] = useState(0),
     [selected, setSelected] = useState<string | null>(null);
+  const [relatedTask, setRelatedTask] = useState<BoardTask | null>(null);
   const [hover, setHover] = useState<ReactNode>(null),
     [pointer, setPointer] = useState({ x: 0, y: 0 });
   const [hoverEvent, setHoverEvent] = useState<string | null>(null);
@@ -485,6 +486,7 @@ export function TaskBoardSessions({
   const restore = () => {
     const id = selected;
     setSelected(null);
+    setRelatedTask(null);
     if (id) rowElements.current.get(id)?.querySelector<HTMLElement>('[role="button"]')?.focus();
   };
   const renderRow = (row: SessionRow, kind: "root" | "child" | "archived", children?: number) => {
@@ -513,6 +515,7 @@ export function TaskBoardSessions({
             open={open}
             onOpen={() => {
               setSelected(open ? null : id);
+              setRelatedTask(null);
               setHover(null);
             }}
             asOf={row.asOf ?? asOf}
@@ -527,12 +530,13 @@ export function TaskBoardSessions({
         {open &&
           (row.task ? (
             <TaskBoardDetail
-              task={row.task}
-              selectedSessionId={row.session.id}
+              key={taskIdentity(relatedTask ?? row.task)}
+              task={relatedTask ?? row.task}
+              selectedSessionId={relatedTask ? undefined : row.session.id}
               tasks={tasks}
               sessions={hydrated}
-              sourceCache={sourceCaches?.[row.task["omnigent.ai:source"]]}
-              onSelect={onSelect}
+              sourceCache={sourceCaches?.[(relatedTask ?? row.task)["omnigent.ai:source"]]}
+              onSelect={setRelatedTask}
               onClose={restore}
             />
           ) : (

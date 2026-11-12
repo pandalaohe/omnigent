@@ -304,15 +304,7 @@
 .tb-dc-tile small > span br {
   display: none;
 }
-.tb-dc-estimate {
-  font-size: 10px;
-  font-style: normal;
-  font-weight: 500;
-  color: var(--muted-foreground);
-  border: 1px solid var(--tb-dc-line);
-  border-radius: 4px;
-  padding: 0 3px;
-}
+
 .tb-dc-track {
   height: 16px;
   border-radius: 4.5px;
@@ -473,4 +465,71 @@
   color: #fff;
   font-size: 9px;
   font-weight: 700;
+}
+
+.tb-dc-money {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.tb-dc-money i {
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 0 3.5px;
+  border-radius: 3.5px;
+  line-height: 13.5px;
+  vertical-align: 1px;
+}
+.tb-dc-money.actual i {
+  background: color-mix(in srgb, #2ea65c 14%, transparent);
+  color: color-mix(in srgb, #2ea65c 80%, var(--foreground));
+}
+.tb-dc-money.estimate i {
+  background: color-mix(in srgb, #d4972a 16%, transparent);
+  color: color-mix(in srgb, #d4972a 72%, var(--foreground));
+}
+.tb-agent-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  color: var(--foreground);
+}
+.tb-agent-logo.compact {
+  background: var(--secondary);
+  border-radius: 4.5px;
+}
+.tb-agent-logo.compact.ag-codex {
+  color: #3b4bdb;
+}
+.tb-agent-logo.compact.ag-pi {
+  color: #7c2d92;
+}
+.tb-agent-logo.compact.ag-claude {
+  color: #d97757;
+}
+.tb-agent-logo.compact.ag-antigravity {
+  color: #1a73e8;
+}
+.dark .tb-agent-logo.compact.ag-codex {
+  color: #8391ff;
+}
+.dark .tb-agent-logo.compact.ag-pi {
+  color: #ce7be5;
+}
+.tb-agent-logo.ag-unknown {
+  color: var(--muted-foreground);
+}
+
+/* Agent fills outrank the shared live texture. */
+.tb-dc-segment:where(.live) {
+  background-image: repeating-linear-gradient(
+    45deg,
+    rgb(255 255 255 / 0.3) 0 3.5px,
+    transparent 3.5px 7px
+  );
 }

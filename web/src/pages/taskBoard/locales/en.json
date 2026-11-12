@@ -349,5 +349,11 @@
   "detail.state.blocked": "Blocked",
   "detail.state.queued": "Queued",
   "detail.state.held": "Open, no session running",
-  "detail.noCheckRecord": "No record"
+  "detail.noCheckRecord": "No record",
+  "detail.toolLine": "{{label}} ({{name}}) running {{elapsed}}",
+  "detail.toolLimit": ", limit {{limit}}",
+  "detail.toolSeconds": "{{count}} sec",
+  "detail.toolMinutes": "{{count}} min",
+  "detail.toolHours": "{{hours}} hr{{minutes}}",
+  "detail.toolDays": "{{days}} days {{hours}} hr"
 }
