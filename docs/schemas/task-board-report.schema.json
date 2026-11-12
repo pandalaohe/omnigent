@@ -1,6 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://omnigent.ai/schemas/task-board-report.schema.json",
+  "$comment": "Report schema revision 2",
   "title": "Omnigent Task Board Report",
   "description": "JSCalendar Group of Tasks or single Task report accepted by PUT /v1/me/tasks/sources/{source_id} (RFC 8984 plus omnigent.ai: vendor properties).",
   "oneOf": [
@@ -30,11 +31,20 @@
     },
     "Progress": {
       "type": "string",
-      "enum": ["needs-action", "in-process", "completed", "failed", "cancelled"]
+      "enum": [
+        "needs-action",
+        "in-process",
+        "completed",
+        "failed",
+        "cancelled"
+      ]
     },
     "Participant": {
       "type": "object",
-      "required": ["@type", "roles"],
+      "required": [
+        "@type",
+        "roles"
+      ],
       "properties": {
         "@type": {
           "type": "string",
@@ -64,7 +74,10 @@
     },
     "Relation": {
       "type": "object",
-      "required": ["@type", "relation"],
+      "required": [
+        "@type",
+        "relation"
+      ],
       "properties": {
         "@type": {
           "type": "string",
@@ -84,7 +97,10 @@
     },
     "Link": {
       "type": "object",
-      "required": ["@type", "href"],
+      "required": [
+        "@type",
+        "href"
+      ],
       "properties": {
         "@type": {
           "type": "string",
@@ -104,11 +120,19 @@
     "Waiting": {
       "type": "object",
       "description": "Omnigent-defined structured block reason when the task is waiting.",
-      "required": ["on"],
+      "required": [
+        "on"
+      ],
       "properties": {
         "on": {
           "type": "string",
-          "enum": ["user", "input", "auth", "dependency", "external"]
+          "enum": [
+            "user",
+            "input",
+            "auth",
+            "dependency",
+            "external"
+          ]
         },
         "since": {
           "$ref": "#/$defs/UTCDateTime"
@@ -122,7 +146,9 @@
     "TaskGroup": {
       "type": "object",
       "description": "Omnigent-defined route, project, milestone or sprint grouping.",
-      "required": ["id"],
+      "required": [
+        "id"
+      ],
       "properties": {
         "id": {
           "type": "string",
@@ -138,7 +164,10 @@
     "WorkedBy": {
       "type": "object",
       "description": "Omnigent-defined session work interval linking a task to an Omnigent session.",
-      "required": ["session", "from"],
+      "required": [
+        "session",
+        "from"
+      ],
       "properties": {
         "session": {
           "type": "string",
@@ -164,7 +193,10 @@
     "SourceField": {
       "type": "object",
       "description": "Omnigent-defined source-specific display field shown in the task detail drawer.",
-      "required": ["label", "value"],
+      "required": [
+        "label",
+        "value"
+      ],
       "properties": {
         "label": {
           "type": "string",
@@ -180,7 +212,11 @@
     "HistoryEvent": {
       "type": "object",
       "description": "Omnigent-defined append-only timeline event for a task.",
-      "required": ["id", "time", "kind"],
+      "required": [
+        "id",
+        "time",
+        "kind"
+      ],
       "properties": {
         "id": {
           "type": "string",
@@ -235,7 +271,11 @@
     },
     "Task": {
       "type": "object",
-      "required": ["@type", "uid", "updated"],
+      "required": [
+        "@type",
+        "uid",
+        "updated"
+      ],
       "propertyNames": {
         "not": {
           "pattern": "^omnigent\\.ai:(?:source|gone|closedSeen|unresolved)$"
@@ -337,6 +377,9 @@
             "const": true
           }
         },
+        "omnigent.ai:sourceDisplay": {
+          "$ref": "#/$defs/TaskDisplayV1"
+        },
         "omnigent.ai:key": {
           "type": "string",
           "maxLength": 64,
@@ -404,7 +447,12 @@
     },
     "Group": {
       "type": "object",
-      "required": ["@type", "uid", "updated", "entries"],
+      "required": [
+        "@type",
+        "uid",
+        "updated",
+        "entries"
+      ],
       "properties": {
         "@type": {
           "type": "string",
@@ -425,9 +473,15 @@
         "source": {
           "$ref": "#/$defs/AbsoluteURI"
         },
+        "omnigent.ai:sourceDisplay": {
+          "$ref": "#/$defs/SourceDisplayV1"
+        },
         "omnigent.ai:complete": {
           "type": "string",
-          "enum": ["open", "all"],
+          "enum": [
+            "open",
+            "all"
+          ],
           "description": "Omnigent-defined completeness mode for the Group report."
         },
         "entries": {
@@ -436,7 +490,9 @@
           "items": {
             "if": {
               "type": "object",
-              "required": ["@type"],
+              "required": [
+                "@type"
+              ],
               "properties": {
                 "@type": {
                   "type": "string",
@@ -453,12 +509,21 @@
               "$ref": "#/$defs/Task"
             }
           }
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
         }
       }
     },
     "TaskAction": {
       "type": "object",
-      "required": ["kind", "label", "prompt"],
+      "required": [
+        "kind",
+        "label",
+        "prompt"
+      ],
       "properties": {
         "kind": {
           "const": "new-session"
@@ -479,6 +544,1788 @@
         }
       },
       "additionalProperties": true
+    },
+    "DisplayActor": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "agentId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Agentid",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "label": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "host": {
+          "title": "Host",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        }
+      },
+      "required": [
+        "id",
+        "agentId",
+        "label"
+      ],
+      "title": "Actor",
+      "type": "object"
+    },
+    "DisplayBadge": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "label": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "tone": {
+          "title": "Tone",
+          "enum": [
+            "neutral",
+            "info",
+            "success",
+            "warning",
+            "danger"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ],
+      "title": "Badge",
+      "type": "object"
+    },
+    "DisplayCheck": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "host": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Host",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "verdict": {
+          "enum": [
+            "passed",
+            "failed",
+            "flaky"
+          ],
+          "title": "Verdict",
+          "type": "string"
+        },
+        "count": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Count",
+          "type": "integer"
+        },
+        "at": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "seconds": {
+          "title": "Seconds",
+          "minimum": 0,
+          "type": "number"
+        },
+        "head": {
+          "title": "Head",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "sourceLabel": {
+          "title": "Sourcelabel",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "link": {
+          "$ref": "#/$defs/DisplayLink"
+        }
+      },
+      "required": [
+        "id",
+        "host",
+        "verdict",
+        "count",
+        "at"
+      ],
+      "title": "Check",
+      "type": "object"
+    },
+    "DisplayCommit": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "sha": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Sha",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "subject": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Subject",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "at": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "link": {
+          "$ref": "#/$defs/DisplayLink"
+        }
+      },
+      "required": [
+        "id",
+        "sha",
+        "subject",
+        "at"
+      ],
+      "title": "Commit",
+      "type": "object"
+    },
+    "DisplayCost": {
+      "additionalProperties": false,
+      "properties": {
+        "amount": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Amount"
+        },
+        "kind": {
+          "enum": [
+            "actual",
+            "estimate"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "tokens": {
+          "anyOf": [
+            {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tokens"
+        },
+        "sourceLabel": {
+          "title": "Sourcelabel",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        }
+      },
+      "required": [
+        "amount",
+        "kind"
+      ],
+      "title": "Cost",
+      "type": "object"
+    },
+    "DisplayDetailRow": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "label": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "value": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "title": "Value",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "value"
+      ],
+      "title": "DetailRow",
+      "type": "object"
+    },
+    "DisplayEvent": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "at": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "kind": {
+          "enum": [
+            "open",
+            "start",
+            "transfer",
+            "stop",
+            "outcome",
+            "check",
+            "commit",
+            "other"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "task": {
+          "$ref": "#/$defs/DisplayTaskRef"
+        },
+        "agentId": {
+          "title": "Agentid",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "host": {
+          "title": "Host",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "rootSessionId": {
+          "title": "Rootsessionid",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "label": {
+          "title": "Label",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "from": {
+          "title": "From",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "workSeconds": {
+          "title": "Workseconds",
+          "minimum": 0,
+          "type": "number"
+        },
+        "checkId": {
+          "title": "Checkid",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "commitIds": {
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string",
+            "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+          },
+          "maxItems": 1000,
+          "title": "Commitids",
+          "type": "array"
+        },
+        "outcome": {
+          "title": "Outcome",
+          "maxLength": 500,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "sourceLabel": {
+          "title": "Sourcelabel",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "rank": {
+          "title": "Rank",
+          "maximum": 9007199254740991,
+          "minimum": -9007199254740991,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "at",
+        "kind",
+        "task"
+      ],
+      "title": "Event",
+      "type": "object"
+    },
+    "DisplayHistoryState": {
+      "additionalProperties": false,
+      "properties": {
+        "first": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "last": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "end": {
+          "title": "End",
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "outcome": {
+          "enum": [
+            "completed",
+            "merged",
+            "dropped",
+            "split",
+            "unknown"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "active": {
+          "title": "Active",
+          "type": "boolean"
+        },
+        "pinned": {
+          "title": "Pinned",
+          "type": "boolean"
+        },
+        "future": {
+          "title": "Future",
+          "type": "boolean"
+        },
+        "commitCount": {
+          "title": "Commitcount",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "first",
+        "last",
+        "outcome",
+        "active",
+        "pinned",
+        "future"
+      ],
+      "title": "HistoryState",
+      "type": "object"
+    },
+    "DisplayHub": {
+      "additionalProperties": false,
+      "properties": {
+        "scope": {
+          "const": "explicit",
+          "title": "Scope",
+          "type": "string"
+        },
+        "members": {
+          "items": {
+            "$ref": "#/$defs/DisplayTaskRef"
+          },
+          "maxItems": 2000,
+          "title": "Members",
+          "type": "array"
+        }
+      },
+      "required": [
+        "scope",
+        "members"
+      ],
+      "title": "Hub",
+      "type": "object"
+    },
+    "DisplayInterval": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "from": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "to": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UTCDateTime"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "To"
+        },
+        "agentId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Agentid",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "host": {
+          "title": "Host",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "sessionId": {
+          "title": "Sessionid",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "label": {
+          "title": "Label",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "origin": {
+          "enum": [
+            "event",
+            "session"
+          ],
+          "title": "Origin",
+          "type": "string"
+        },
+        "tokens": {
+          "anyOf": [
+            {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tokens"
+        },
+        "cost": {
+          "$ref": "#/$defs/DisplayCost"
+        }
+      },
+      "required": [
+        "id",
+        "from",
+        "to",
+        "agentId",
+        "origin"
+      ],
+      "title": "Interval",
+      "type": "object"
+    },
+    "DisplayLink": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "label": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "href": {
+          "maxLength": 2048,
+          "title": "Href",
+          "type": "string",
+          "pattern": "^https?://[^/@\\s\\x00-\\x1f\\x7f-\\x9f]+(?:[/?#][^\\s\\x00-\\x1f\\x7f-\\x9f]*)?$"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "href"
+      ],
+      "title": "Link",
+      "type": "object"
+    },
+    "DisplayQuestion": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "text": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Text",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        }
+      },
+      "required": [
+        "id",
+        "text"
+      ],
+      "title": "Question",
+      "type": "object"
+    },
+    "DisplayQuote": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "text": {
+          "maxLength": 4000,
+          "minLength": 1,
+          "title": "Text",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x08\\x0b-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "date": {
+          "title": "Date",
+          "pattern": "^(?![\\s\\S]*[\\r\\n])(?!0000)(?:(?:\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|02-(?:0[1-9]|1\\d|2[0-8])))|(?:(?:\\d{2}(?:0[48]|[2468][048]|[13579][26])|(?:0[48]|[2468][048]|[13579][26])00)-02-29))$",
+          "type": "string"
+        },
+        "at": {
+          "title": "At",
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "task": {
+          "$ref": "#/$defs/DisplayTaskRef"
+        },
+        "sourceLabel": {
+          "title": "Sourcelabel",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "sourceLink": {
+          "$ref": "#/$defs/DisplayLink"
+        },
+        "rank": {
+          "title": "Rank",
+          "maximum": 9007199254740991,
+          "minimum": -9007199254740991,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "text",
+        "task"
+      ],
+      "title": "Quote",
+      "type": "object"
+    },
+    "DisplayRelation": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "from": {
+          "$ref": "#/$defs/DisplayTaskRef"
+        },
+        "to": {
+          "$ref": "#/$defs/DisplayTaskRef"
+        },
+        "kind": {
+          "enum": [
+            "parent",
+            "dependency",
+            "include"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "label": {
+          "title": "Label",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "origin": {
+          "enum": [
+            "observed",
+            "manual"
+          ],
+          "title": "Origin",
+          "type": "string"
+        },
+        "provenance": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Provenance",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "since": {
+          "title": "Since",
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "rank": {
+          "title": "Rank",
+          "maximum": 9007199254740991,
+          "minimum": -9007199254740991,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "from",
+        "to",
+        "kind",
+        "origin",
+        "provenance"
+      ],
+      "title": "Relation",
+      "type": "object"
+    },
+    "DisplaySession": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "task": {
+          "$ref": "#/$defs/DisplayTaskRef"
+        },
+        "parentId": {
+          "title": "Parentid",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "role": {
+          "enum": [
+            "root",
+            "child",
+            "peer"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "agentId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Agentid",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "label": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "title": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "Title",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "host": {
+          "title": "Host",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "model": {
+          "title": "Model",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "effort": {
+          "title": "Effort",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "status": {
+          "enum": [
+            "running",
+            "idle",
+            "archived"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "createdAt": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "lastActivityAt": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "runningSince": {
+          "title": "Runningsince",
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "runningSeconds": {
+          "title": "Runningseconds",
+          "minimum": 0,
+          "type": "number"
+        },
+        "idleSeconds": {
+          "title": "Idleseconds",
+          "minimum": 0,
+          "type": "number"
+        },
+        "archivedAt": {
+          "title": "Archivedat",
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "endedAt": {
+          "title": "Endedat",
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "now": {
+          "title": "Now",
+          "maxLength": 500,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "next": {
+          "title": "Next",
+          "maxLength": 500,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "need": {
+          "title": "Need",
+          "maxLength": 500,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "last": {
+          "title": "Last",
+          "maxLength": 500,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "context": {
+          "title": "Context",
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        "compactAt": {
+          "title": "Compactat",
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        "tool": {
+          "$ref": "#/$defs/DisplayTool"
+        },
+        "questions": {
+          "items": {
+            "$ref": "#/$defs/DisplayQuestion"
+          },
+          "maxItems": 32,
+          "title": "Questions",
+          "type": "array"
+        },
+        "steps": {
+          "items": {
+            "$ref": "#/$defs/DisplayStep"
+          },
+          "maxItems": 64,
+          "title": "Steps",
+          "type": "array"
+        },
+        "cost": {
+          "$ref": "#/$defs/DisplayCost"
+        }
+      },
+      "required": [
+        "id",
+        "task",
+        "role",
+        "agentId",
+        "label",
+        "title",
+        "status",
+        "createdAt",
+        "lastActivityAt"
+      ],
+      "title": "Session",
+      "type": "object",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "running"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "anyOf": [
+              {
+                "required": [
+                  "runningSince"
+                ]
+              },
+              {
+                "required": [
+                  "runningSeconds"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "archived"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "required": [
+              "archivedAt"
+            ]
+          }
+        }
+      ]
+    },
+    "DisplayStep": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "kind": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Kind",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "label": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "state": {
+          "enum": [
+            "done",
+            "current",
+            "future"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "label",
+        "state"
+      ],
+      "title": "Step",
+      "type": "object"
+    },
+    "DisplayTaskIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Key",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "label": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "groupId": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "title": "Groupid",
+          "type": "string"
+        },
+        "groupLabel": {
+          "title": "Grouplabel",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "groupBadge": {
+          "title": "Groupbadge",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "rank": {
+          "title": "Rank",
+          "maximum": 9007199254740991,
+          "minimum": -9007199254740991,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "key",
+        "label",
+        "groupId"
+      ],
+      "title": "TaskIdentity",
+      "type": "object"
+    },
+    "DisplayTaskRef": {
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "title": "Source",
+          "type": "string"
+        },
+        "uid": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Uid",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        }
+      },
+      "required": [
+        "source",
+        "uid"
+      ],
+      "title": "TaskRef",
+      "type": "object"
+    },
+    "DisplayTool": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "name": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "label": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "startedAt": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "limitSeconds": {
+          "title": "Limitseconds",
+          "minimum": 0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "label",
+        "startedAt"
+      ],
+      "title": "Tool",
+      "type": "object"
+    },
+    "TaskDisplayV1": {
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "const": 1,
+          "title": "Version",
+          "type": "integer"
+        },
+        "identity": {
+          "$ref": "#/$defs/DisplayTaskIdentity"
+        },
+        "badges": {
+          "items": {
+            "$ref": "#/$defs/DisplayBadge"
+          },
+          "maxItems": 8,
+          "title": "Badges",
+          "type": "array"
+        },
+        "rows": {
+          "items": {
+            "$ref": "#/$defs/DisplayDetailRow"
+          },
+          "maxItems": 16,
+          "title": "Rows",
+          "type": "array"
+        },
+        "links": {
+          "items": {
+            "$ref": "#/$defs/DisplayLink"
+          },
+          "maxItems": 8,
+          "title": "Links",
+          "type": "array"
+        },
+        "current": {
+          "title": "Current",
+          "maxLength": 500,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "need": {
+          "title": "Need",
+          "maxLength": 500,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "next": {
+          "title": "Next",
+          "maxLength": 500,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "state": {
+          "title": "State",
+          "enum": [
+            "done",
+            "ready",
+            "running",
+            "user",
+            "failed",
+            "blocked",
+            "queued",
+            "held"
+          ],
+          "type": "string"
+        },
+        "lastActivity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UTCDateTime"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Lastactivity"
+        },
+        "actors": {
+          "items": {
+            "$ref": "#/$defs/DisplayActor"
+          },
+          "maxItems": 32,
+          "title": "Actors",
+          "type": "array"
+        },
+        "sessions": {
+          "items": {
+            "$ref": "#/$defs/DisplaySession"
+          },
+          "maxItems": 500,
+          "title": "Sessions",
+          "type": "array"
+        },
+        "intervals": {
+          "items": {
+            "$ref": "#/$defs/DisplayInterval"
+          },
+          "maxItems": 200,
+          "title": "Intervals",
+          "type": "array"
+        },
+        "nodeSelection": {
+          "title": "Nodeselection",
+          "enum": [
+            "sessions-first",
+            "intervals"
+          ],
+          "type": "string"
+        },
+        "checks": {
+          "items": {
+            "$ref": "#/$defs/DisplayCheck"
+          },
+          "maxItems": 32,
+          "title": "Checks",
+          "type": "array"
+        },
+        "quotes": {
+          "items": {
+            "$ref": "#/$defs/DisplayQuote"
+          },
+          "maxItems": 1000,
+          "title": "Quotes",
+          "type": "array"
+        },
+        "commits": {
+          "items": {
+            "$ref": "#/$defs/DisplayCommit"
+          },
+          "maxItems": 1000,
+          "title": "Commits",
+          "type": "array"
+        },
+        "events": {
+          "items": {
+            "$ref": "#/$defs/DisplayEvent"
+          },
+          "maxItems": 5000,
+          "title": "Events",
+          "type": "array"
+        },
+        "relations": {
+          "items": {
+            "$ref": "#/$defs/DisplayRelation"
+          },
+          "maxItems": 200,
+          "title": "Relations",
+          "type": "array"
+        },
+        "hub": {
+          "$ref": "#/$defs/DisplayHub"
+        },
+        "historyState": {
+          "$ref": "#/$defs/DisplayHistoryState"
+        },
+        "omitted": {
+          "additionalProperties": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "propertyNames": {
+            "enum": [
+              "badges",
+              "rows",
+              "links",
+              "actors",
+              "sessions",
+              "intervals",
+              "checks",
+              "quotes",
+              "commits",
+              "events",
+              "relations",
+              "members"
+            ]
+          },
+          "title": "Omitted",
+          "type": "object"
+        }
+      },
+      "required": [
+        "version"
+      ],
+      "title": "TaskDisplayV1",
+      "type": "object"
+    },
+    "DisplayAccount": {
+      "additionalProperties": false,
+      "properties": {
+        "ref": {
+          "$ref": "#/$defs/DisplayAccountRef"
+        },
+        "label": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "authoritySource": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "title": "Authoritysource",
+          "type": "string"
+        },
+        "timeZone": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Timezone",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        }
+      },
+      "required": [
+        "ref",
+        "label",
+        "authoritySource",
+        "timeZone"
+      ],
+      "title": "Account",
+      "type": "object"
+    },
+    "DisplayAccountDay": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "account": {
+          "$ref": "#/$defs/DisplayAccountRef"
+        },
+        "date": {
+          "pattern": "^(?![\\s\\S]*[\\r\\n])(?!0000)(?:(?:\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|02-(?:0[1-9]|1\\d|2[0-8])))|(?:(?:\\d{2}(?:0[48]|[2468][048]|[13579][26])|(?:0[48]|[2468][048]|[13579][26])00)-02-29))$",
+          "title": "Date",
+          "type": "string"
+        },
+        "amount": {
+          "minimum": 0,
+          "title": "Amount",
+          "type": "number"
+        },
+        "kind": {
+          "const": "estimate",
+          "title": "Kind",
+          "type": "string"
+        },
+        "sourceLabel": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Sourcelabel",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        }
+      },
+      "required": [
+        "id",
+        "account",
+        "date",
+        "amount",
+        "kind",
+        "sourceLabel"
+      ],
+      "title": "AccountDay",
+      "type": "object"
+    },
+    "DisplayAccountRef": {
+      "additionalProperties": false,
+      "properties": {
+        "namespace": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Namespace",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        }
+      },
+      "required": [
+        "namespace",
+        "id"
+      ],
+      "title": "AccountRef",
+      "type": "object"
+    },
+    "DisplayClosedDay": {
+      "additionalProperties": false,
+      "properties": {
+        "date": {
+          "pattern": "^(?![\\s\\S]*[\\r\\n])(?!0000)(?:(?:\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|02-(?:0[1-9]|1\\d|2[0-8])))|(?:(?:\\d{2}(?:0[48]|[2468][048]|[13579][26])|(?:0[48]|[2468][048]|[13579][26])00)-02-29))$",
+          "title": "Date",
+          "type": "string"
+        },
+        "count": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "date",
+        "count"
+      ],
+      "title": "ClosedDay",
+      "type": "object"
+    },
+    "DisplayFuture": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "label": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "at": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "sourceLabel": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Sourcelabel",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "link": {
+          "$ref": "#/$defs/DisplayLink"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "at",
+        "sourceLabel"
+      ],
+      "title": "Future",
+      "type": "object"
+    },
+    "DisplayGroupIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "badge": {
+          "title": "Badge",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "rank": {
+          "title": "Rank",
+          "maximum": 9007199254740991,
+          "minimum": -9007199254740991,
+          "type": "integer"
+        },
+        "id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "title": "Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "id"
+      ],
+      "title": "GroupIdentity",
+      "type": "object"
+    },
+    "DisplayRelease": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "name": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "publishedAt": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "source": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "title": "Source",
+          "type": "string"
+        },
+        "link": {
+          "$ref": "#/$defs/DisplayLink"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "publishedAt",
+        "source"
+      ],
+      "title": "Release",
+      "type": "object"
+    },
+    "DisplaySnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "baseId": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string",
+              "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Baseid"
+        },
+        "operation": {
+          "enum": [
+            "begin",
+            "append",
+            "publish"
+          ],
+          "title": "Operation",
+          "type": "string"
+        },
+        "chunkIndex": {
+          "title": "Chunkindex",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "chunkCount": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Chunkcount",
+          "type": "integer"
+        },
+        "expectedTaskCount": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Expectedtaskcount",
+          "type": "integer"
+        },
+        "contentHash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Contenthash",
+          "type": "string"
+        },
+        "coverageFrom": {
+          "pattern": "^(?![\\s\\S]*[\\r\\n])(?!0000)(?:(?:\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|02-(?:0[1-9]|1\\d|2[0-8])))|(?:(?:\\d{2}(?:0[48]|[2468][048]|[13579][26])|(?:0[48]|[2468][048]|[13579][26])00)-02-29))$",
+          "title": "Coveragefrom",
+          "type": "string"
+        },
+        "coverageTo": {
+          "pattern": "^(?![\\s\\S]*[\\r\\n])(?!0000)(?:(?:\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|02-(?:0[1-9]|1\\d|2[0-8])))|(?:(?:\\d{2}(?:0[48]|[2468][048]|[13579][26])|(?:0[48]|[2468][048]|[13579][26])00)-02-29))$",
+          "title": "Coverageto",
+          "type": "string"
+        },
+        "removedUids": {
+          "items": {
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string",
+            "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+          },
+          "maxItems": 10000,
+          "title": "Removeduids",
+          "type": "array"
+        },
+        "sourceGeneration": {
+          "title": "Sourcegeneration",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "abandons": {
+          "title": "Abandons",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        }
+      },
+      "required": [
+        "id",
+        "baseId",
+        "operation",
+        "chunkCount",
+        "expectedTaskCount",
+        "contentHash",
+        "coverageFrom",
+        "coverageTo"
+      ],
+      "title": "Snapshot",
+      "type": "object"
+    },
+    "DisplaySourceIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "badge": {
+          "title": "Badge",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "rank": {
+          "title": "Rank",
+          "maximum": 9007199254740991,
+          "minimum": -9007199254740991,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "label"
+      ],
+      "title": "SourceIdentity",
+      "type": "object"
+    },
+    "SourceDisplayV1": {
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "const": 1,
+          "title": "Version",
+          "type": "integer"
+        },
+        "asOf": {
+          "$ref": "#/$defs/UTCDateTime"
+        },
+        "timeZone": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Timezone",
+          "type": "string",
+          "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/DisplaySnapshot"
+        },
+        "identity": {
+          "$ref": "#/$defs/DisplaySourceIdentity"
+        },
+        "groups": {
+          "items": {
+            "$ref": "#/$defs/DisplayGroupIdentity"
+          },
+          "maxItems": 1000,
+          "title": "Groups",
+          "type": "array"
+        },
+        "checkHosts": {
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string",
+            "pattern": "^(?![\\s\\S]*[\\x00-\\x1f\\x7f-\\x9f])(?=[\\s\\S]*\\S)[\\s\\S]+$"
+          },
+          "maxItems": 2,
+          "title": "Checkhosts",
+          "type": "array"
+        },
+        "future": {
+          "items": {
+            "$ref": "#/$defs/DisplayFuture"
+          },
+          "maxItems": 1000,
+          "title": "Future",
+          "type": "array"
+        },
+        "closedDays": {
+          "items": {
+            "$ref": "#/$defs/DisplayClosedDay"
+          },
+          "maxItems": 36600,
+          "title": "Closeddays",
+          "type": "array"
+        },
+        "accounts": {
+          "items": {
+            "$ref": "#/$defs/DisplayAccount"
+          },
+          "maxItems": 1000,
+          "title": "Accounts",
+          "type": "array"
+        },
+        "accountDays": {
+          "items": {
+            "$ref": "#/$defs/DisplayAccountDay"
+          },
+          "maxItems": 36600,
+          "title": "Accountdays",
+          "type": "array"
+        },
+        "releases": {
+          "items": {
+            "$ref": "#/$defs/DisplayRelease"
+          },
+          "maxItems": 200,
+          "title": "Releases",
+          "type": "array"
+        }
+      },
+      "required": [
+        "version",
+        "asOf",
+        "timeZone",
+        "snapshot"
+      ],
+      "title": "SourceDisplayV1",
+      "type": "object"
     }
   }
 }

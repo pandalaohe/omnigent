@@ -1,3 +1,4 @@
+import { boardPath } from "@/lib/boardFrame";
 // Page chrome shared by every Usage board route: the title row, the actions on
 // its right, and the loading / failed / off states, so no route renders a
 // half-filled page while the reading is still arriving.
@@ -31,7 +32,7 @@ export function UsageBoardFrame({
       <div className="mb-2.5 flex min-h-9 flex-wrap items-center gap-2">
         {back ? (
           <Button variant="ghost" size="sm" asChild className="-ml-2 gap-1">
-            <Link to={back.to}>
+            <Link to={boardPath(back.to)}>
               <span aria-hidden="true">‹</span>
               {back.label}
             </Link>

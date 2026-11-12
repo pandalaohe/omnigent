@@ -1,3 +1,4 @@
+import { boardPath } from "@/lib/boardFrame";
 import { Link, useParams } from "@/lib/routing";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { UsageBoardFrame } from "./UsageBoardFrame";
@@ -29,7 +30,7 @@ export function UsageIssuesPage() {
     return (
       <Link
         className="font-medium underline underline-offset-2"
-        to={`/usage/board/${encodeURIComponent(id)}`}
+        to={boardPath(`/usage/board/${encodeURIComponent(id)}`)}
       >
         {names.get(id) ?? id}
       </Link>

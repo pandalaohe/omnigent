@@ -1,3 +1,4 @@
+import { MemoryRouter } from "react-router-dom";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { TaskBoardActions, taskActions } from "./TaskBoardActions";
@@ -97,3 +98,22 @@ it.each([
     expect(screen.getByRole("button", { name: "Continue" })).toBeTruthy();
   },
 );
+
+it("opens the app instead of a composer inside a frame", () => {
+  window.history.replaceState({}, "", "/frame/task-board");
+  try {
+    render(
+      <MemoryRouter>
+        <TaskBoardActions
+          actions={taskActions([{ kind: "new-session", label: "Continue", prompt: "Review" }])}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole("link", { name: "Open in Omnigent" }).getAttribute("target")).toBe(
+      "_blank",
+    );
+    expect(screen.queryByRole("button", { name: "Continue" })).toBeNull();
+  } finally {
+    window.history.replaceState({}, "", "/");
+  }
+});

@@ -1,3 +1,5 @@
+import * as identity from "@/lib/identity";
+import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { Link, Outlet, MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -29,6 +31,13 @@ vi.mock("@/pages/ChatPage", () => ({
 }));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
+vi.mock("@/pages/usageBoard/UsageBoardPage", () => ({
+  UsageBoardPage: () => <h1>Usage board</h1>,
+}));
+vi.mock("@/pages/usageBoard/UsageAccountPage", () => ({
+  UsageAccountPage: () => <h1>Account reading</h1>,
+}));
+
 vi.mock("@/pages/TaskDetailPage", () => ({ TaskDetailPage: () => <div>task detail page</div> }));
 vi.mock("@/pages/SettingsPage", async () => {
   const { useLocation, useNavigationType } = await import("react-router-dom");
@@ -444,5 +453,85 @@ describe("Settings routes", () => {
     expect(await screen.findByTestId("settings-location")).toHaveTextContent(
       "/settings/appearance",
     );
+  });
+});
+
+describe("board frame routes", () => {
+  beforeEach(() => patchUsageBoardPreferences({ enabled: false }));
+  afterEach(() => {
+    cleanup();
+    patchUsageBoardPreferences({ enabled: true });
+  });
+  it.each(["/frame/task-board", "/frame/usage/board"])(
+    "mounts %s without app chrome",
+    async (path) => {
+      renderRoute(path, {}, { ...FALLBACK_SERVER_INFO, usage_board_enabled: true });
+      await screen.findByRole("heading", {
+        name: path.includes("usage") ? "Usage board is off" : "Task board is off on this server",
+      });
+      expect(screen.queryByText("app shell")).toBeNull();
+      expect(screen.queryByText("not found")).toBeNull();
+    },
+  );
+  it("keeps first-run setup outside the frame", () => {
+    renderRoute(
+      "/frame/task-board",
+      {},
+      { ...FALLBACK_SERVER_INFO, accounts_enabled: true, needs_setup: true },
+    );
+    expect(screen.getByRole("heading", { name: "Omnigent is not set up yet" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Open Omnigent" }).getAttribute("target")).toBe(
+      "_blank",
+    );
+  });
+});
+
+describe("Usage frame capability transitions", () => {
+  beforeEach(() => patchUsageBoardPreferences({ enabled: true }));
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["/frame/usage/board", "Usage board"],
+    ["/frame/usage/board/account", "Account reading"],
+  ])("keeps %s shell-free as capabilities resolve", async (path, heading) => {
+    function route(info: typeof FALLBACK_SERVER_INFO | "loading") {
+      return (
+        <CapabilitiesProvider info={info}>
+          <MemoryRouter initialEntries={[path]}>
+            <App />
+          </MemoryRouter>
+        </CapabilitiesProvider>
+      );
+    }
+    const view = render(route("loading"));
+    expect(await screen.findByRole("status", { name: "Loading" })).toBeInTheDocument();
+    expect(screen.queryByText("app shell")).toBeNull();
+    expect(screen.queryByText("not found")).toBeNull();
+    view.rerender(route({ ...FALLBACK_SERVER_INFO, usage_board_enabled: true }));
+    expect(await screen.findByRole("heading", { name: heading })).toBeInTheDocument();
+    expect(screen.queryByText("app shell")).toBeNull();
+    expect(screen.queryByText("not found")).toBeNull();
+    view.rerender(route("loading"));
+    expect(await screen.findByRole("status", { name: "Loading" })).toBeInTheDocument();
+    view.rerender(route({ ...FALLBACK_SERVER_INFO, usage_board_enabled: false }));
+    expect(
+      await screen.findByRole("heading", { name: "Usage board is off on this server" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("app shell")).toBeNull();
+    expect(screen.queryByText("not found")).toBeNull();
+  });
+
+  it("shows an already-required sign-in while capabilities are still loading", () => {
+    vi.spyOn(identity, "getFrameLoginUrl").mockReturnValue("/login?return_to=%2Fusage%2Fboard");
+    renderRoute("/frame/usage/board/account", {}, "loading");
+    expect(screen.getByRole("link", { name: "Sign in to Omnigent" })).toHaveAttribute(
+      "target",
+      "_blank",
+    );
+    expect(screen.queryByText("app shell")).toBeNull();
+    expect(screen.queryByText("not found")).toBeNull();
   });
 });

@@ -1,3 +1,4 @@
+import { boardExitProps, boardPath } from "@/lib/boardFrame";
 // The Usage board's own group in Settings. One place for the module's switch,
 // the ring colour line, which accounts are on the board, and how to connect an
 // outside source. Display routes never render any of it.
@@ -93,6 +94,7 @@ export function UsageBoardSettings() {
     <div className="flex flex-col">
       <p className="text-xs text-muted-foreground">{t("preferencesHelp")}</p>
       <Link
+        {...boardExitProps()}
         to="/settings/general#session-choice"
         className="py-2 text-sm text-primary underline underline-offset-2"
       >
@@ -119,7 +121,7 @@ export function UsageBoardSettings() {
       {available ? (
         <>
           <Link
-            to="/usage/board/issues"
+            to={boardPath("/usage/board/issues")}
             className="inline-flex min-h-11 items-center border-t border-border py-2 text-sm"
           >
             Issues{" "}

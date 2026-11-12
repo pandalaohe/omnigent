@@ -1,3 +1,4 @@
+import { boardDefaults } from "./taskBoardPreferences";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
@@ -109,6 +110,16 @@ it("renders full-past counts without inventing old task bodies", async () => {
   expect((screen.getByLabelText("Find month") as HTMLSelectElement).value).toBe("2020-01");
   expect(screen.getByText(/outside the retained task window/)).toBeTruthy();
 });
+it("translates the Today closed-count tile", async () => {
+  fetcher.mockImplementation(async (url: string) =>
+    Response.json(url.includes("closed-counts") ? { days: [] } : { entries: [] }),
+  );
+  const { container } = wrap(
+    <TaskBoardActivity view="today" tasks={[]} sessions={[]} onSelect={vi.fn()} />,
+  );
+  expect(await screen.findByText("Closed today", { selector: "dt" })).toBeTruthy();
+  expect(container.textContent).not.toContain("toclosedDay.closed");
+});
 it("keeps aliases local and requires a named counted confirmation before deletion", async () => {
   const source = { ...taskBoardFixture().sources[0], counts: { open: 2, closed: 3, gone: 1 } };
   const update = vi.fn();
@@ -117,7 +128,8 @@ it("keeps aliases local and requires a named counted confirmation before deletio
     <TaskBoardSources
       sources={[source]}
       preferences={{
-        view: "sources",
+        ...boardDefaults,
+        view: "settings",
         mode: "order",
         focus: [],
         aliases: {},
@@ -181,6 +193,31 @@ it("queries historical counts with the date's offset, splitting a daylight trans
     offset.mockRestore();
   }
 });
+it("loads History counts through the query boundary across a daylight transition", async () => {
+  const boundary = Date.parse("2026-03-08T10:00:00Z");
+  const offset = vi.spyOn(Date.prototype, "getTimezoneOffset").mockImplementation(function (
+    this: Date,
+  ) {
+    return this.getTime() < boundary ? 480 : 420;
+  });
+  const segments: URLSearchParams[] = [];
+  fetcher.mockImplementation(async (path: string) => {
+    const url = new URL(path, "https://example.test");
+    if (!url.pathname.endsWith("closed-counts")) return Response.json({ entries: [] });
+    if (!url.searchParams.has("from"))
+      return Response.json({ days: [{ day: "2026-03-09", source: "a", closed: 2 }] });
+    segments.push(url.searchParams);
+    return Response.json({ days: [{ day: "2026-03-09", source: "a", closed: 1 }] });
+  });
+  try {
+    wrap(<TaskBoardActivity view="history" tasks={[]} sessions={[]} onSelect={vi.fn()} />);
+    await screen.findByTitle("Week of 2026-03-09: 2 closed");
+    expect(segments.map((query) => query.get("offset"))).toEqual(["-480", "-420"]);
+    expect(segments.every((query) => !query.has("client"))).toBe(true);
+  } finally {
+    offset.mockRestore();
+  }
+});
 it("reports browser storage failures and interpolates issue paths", () => {
   const source = {
     ...taskBoardFixture().sources[0],
@@ -190,7 +227,8 @@ it("reports browser storage failures and interpolates issue paths", () => {
     <TaskBoardSources
       sources={[source]}
       preferences={{
-        view: "sources",
+        ...boardDefaults,
+        view: "settings",
         mode: "order",
         focus: [],
         aliases: {},
@@ -212,7 +250,8 @@ it("offers an available standards reference before a source is connected", () =>
     <TaskBoardSources
       sources={[]}
       preferences={{
-        view: "sources",
+        ...boardDefaults,
+        view: "settings",
         mode: "order",
         focus: [],
         aliases: {},

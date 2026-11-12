@@ -1,3 +1,4 @@
+import { boardExitProps } from "@/lib/boardFrame";
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   ChevronDownIcon,
@@ -22,6 +23,7 @@ import {
   routeLayout,
   routeRows,
   routeTicks,
+  parentRelationCounts,
   taskRelations,
   taskTime,
   type RouteEdge,
@@ -44,7 +46,13 @@ export function TaskBoardRoutes({
   onFocus,
   onSelect,
   scheduled,
+  boardHours = 24,
+  lodStation = 2,
+  lodPhase = 14,
 }: {
+  boardHours?: number;
+  lodStation?: number;
+  lodPhase?: number;
   tasks: BoardTask[];
   sources: TaskSource[];
   aliases: Record<string, string>;
@@ -72,7 +80,29 @@ export function TaskBoardRoutes({
   const touches = useRef(new Map<number, { x: number; y: number }>());
   const pinch = useRef<{ distance: number; window: TimeWindow } | null>(null);
   const now = Date.now();
-  const allRows = useMemo(() => routeRows(tasks, sources), [tasks, sources]);
+  const allRows = useMemo(() => {
+    const cutoff = now - boardHours * HOUR;
+    const rows = routeRows(tasks, sources);
+    if (mode !== "order") return rows;
+    return rows
+      .map((row) => ({
+        ...row,
+        tasks: row.tasks.filter((task) => {
+          if (taskProgress(task) !== "completed") return true;
+          const ended = task.progressUpdated ?? task["omnigent.ai:closedSeen"];
+          return !ended || Date.parse(ended) >= cutoff;
+        }),
+      }))
+      .filter((row) =>
+        row.tasks.some(
+          (task) =>
+            !!task["omnigent.ai:waiting"] ||
+            taskProgress(task) === "in-process" ||
+            taskProgress(task) === "failed" ||
+            (taskTime(task, now) >= cutoff && taskTime(task, now) <= now),
+        ),
+      );
+  }, [tasks, sources, mode, boardHours, now]);
   const sourceName = (id: string) =>
     aliases[id] || sources.find((source) => source.id === id)?.name || id;
   const shown = allRows.filter((row) => !focus.length || focus.includes(row.id));
@@ -107,7 +137,10 @@ export function TaskBoardRoutes({
     node.tasks.length > 1
       ? t("routes.stops", { count: node.tasks.length })
       : taskTitle(node.tasks[0]).slice(0, 23) + (taskTitle(node.tasks[0]).length > 23 ? "…" : "");
-  const layout = routeLayout(mapped, mode, window, width, now, label);
+  const layout = routeLayout(mapped, mode, window, width, now, label, {
+    station: lodStation,
+    phase: lodPhase,
+  });
   const clusterTasks = tasks.filter((task) => clusterIds?.includes(taskIdentity(task)));
   const currentClusterPage = Math.min(
     clusterPage,
@@ -135,14 +168,10 @@ export function TaskBoardRoutes({
       )
       .join("; ");
   const ticks = mode === "time" ? routeTicks(window, width - (width < 600 ? 28 : 210)) : [];
-  const relations = taskRelations(tasks);
-  const children = (node: RouteNode) =>
-    relations.filter(
-      (edge) =>
-        edge.kind === "parent" &&
-        edge.to &&
-        node.tasks.some((task) => taskIdentity(task) === taskIdentity(edge.from)),
-    );
+  const relations = useMemo(() => taskRelations(tasks), [tasks]);
+  const parentCounts = useMemo(() => parentRelationCounts(tasks, relations), [tasks, relations]);
+  const childCount = (node: RouteNode) =>
+    node.tasks.reduce((count, task) => count + (parentCounts.get(task) ?? 0), 0);
   const nodeActive = (node: RouteNode) => hub === node.id || hover === node.id;
   const showEdge = (edge: (typeof layout.edges)[number]) => !edge.hub || nodeActive(edge.from);
   const litChildren = new Set([
@@ -156,7 +185,7 @@ export function TaskBoardRoutes({
   const openNode = (node: RouteNode) => {
     if (node.tasks.length === 1) {
       onSelect(node.tasks[0]);
-      if (children(node).length >= 8) setHub((current) => (current === node.id ? null : node.id));
+      if (childCount(node) >= 8) setHub((current) => (current === node.id ? null : node.id));
       return;
     }
     if (mode === "time" && window.to - window.from > MIN_SPAN + 1) {
@@ -300,18 +329,16 @@ export function TaskBoardRoutes({
             {t("routes.now")}
           </Button>
           <span className="ml-auto text-xs text-muted-foreground">
-            {t(`routes.${detailLevel(window.to - window.from)}`)}
+            {t(`routes.${detailLevel(window.to - window.from, lodStation, lodPhase)}`)}
           </span>
         </div>
       )}
       {!tasks.length ? (
         <div className="tb-empty">
           <h2>{t("board.empty")}</h2>
-          <p>{t("board.connect")}</p>
-          <code className="mt-3 block break-all text-xs">{t("board.endpoint")}</code>
-          <a href="https://www.rfc-editor.org/rfc/rfc8984.html" target="_blank" rel="noreferrer">
-            {t("sources.docs")}
-          </a>
+          <Link {...boardExitProps()} to="/settings/general#task-board-settings">
+            {t("sources.openSettings")}
+          </Link>
         </div>
       ) : !mapped.length ? (
         <p className="tb-empty">{t("search.empty")}</p>
@@ -470,7 +497,8 @@ export function TaskBoardRoutes({
                       strokeWidth="7"
                       strokeLinecap="round"
                       opacity={
-                        detailLevel(window.to - window.from) === "segment" && mode === "time"
+                        detailLevel(window.to - window.from, lodStation, lodPhase) === "segment" &&
+                        mode === "time"
                           ? 0.4
                           : 1
                       }
@@ -610,7 +638,7 @@ export function TaskBoardRoutes({
                             />
                           </foreignObject>
                         )}
-                        {children(node).length >= 8 && (
+                        {childCount(node) >= 8 && (
                           <g>
                             <rect
                               x={node.x + 12}
@@ -627,7 +655,7 @@ export function TaskBoardRoutes({
                               fontSize="11"
                               fill="var(--foreground)"
                             >
-                              {children(node).length}
+                              {childCount(node)}
                             </text>
                           </g>
                         )}
@@ -653,6 +681,7 @@ export function TaskBoardRoutes({
                       height="30"
                     >
                       <Link
+                        {...boardExitProps()}
                         to={`/tasks/${encodeURIComponent(task.id)}`}
                         className="block truncate text-xs underline"
                         title={task.name}

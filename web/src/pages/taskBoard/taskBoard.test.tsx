@@ -42,7 +42,7 @@ function renderBoard() {
 }
 function enableBoard(view = "sessions") {
   localStorage.setItem(SESSION_NAVIGATION_STORAGE_KEY, JSON.stringify({ showTaskBoard: true }));
-  localStorage.setItem(BOARD_PREFERENCES_KEY, JSON.stringify({ view }));
+  localStorage.setItem(BOARD_PREFERENCES_KEY, JSON.stringify({ defaultView: view }));
 }
 function report(
   tasks: BoardTask[],
@@ -110,6 +110,8 @@ beforeEach(() => {
     if (url.pathname === "/v1/system/status")
       return Response.json({ hosts: [], findings: [], level: "ok" });
     if (url.pathname === "/v1/me/usage") return Response.json(mocks.quota ?? { accounts: [] });
+    if (url.pathname === "/v1/me/usage/activity")
+      return Response.json({ accounts: [{ account: "account-0", totals: { cost_usd: 123.456 } }] });
     if (url.pathname === "/v1/scheduled-tasks") return Response.json({ scheduled_tasks: [] });
     throw new Error(`Unexpected board read: ${path}`);
   });
@@ -136,15 +138,14 @@ it("keeps deployment and user gates ahead of every read", () => {
   );
   expect(mocks.fetch).not.toHaveBeenCalled();
 });
-it("opens by default and tells an empty board how to send tasks", async () => {
-  localStorage.setItem(BOARD_PREFERENCES_KEY, JSON.stringify({ view: "routes" }));
+it("opens an empty board with source management in Settings", async () => {
+  localStorage.setItem(BOARD_PREFERENCES_KEY, JSON.stringify({ defaultView: "routes" }));
   renderBoard();
   expect(await screen.findByRole("heading", { name: "No tasks yet" })).toBeTruthy();
-  expect(screen.getByText("Send a source's tasks as JSCalendar with PUT to:")).toBeTruthy();
-  expect(screen.getByText("/v1/me/tasks/sources/{source_id}")).toBeTruthy();
-  expect(screen.getByRole("link", { name: "JSCalendar reference" }).getAttribute("href")).toBe(
-    "https://www.rfc-editor.org/rfc/rfc8984.html",
-  );
+  expect(
+    screen.getByRole("link", { name: "Manage task sources in Settings" }).getAttribute("href"),
+  ).toBe("/settings/general#task-board-settings");
+  expect(screen.queryByText("/v1/me/tasks/sources/{source_id}")).toBeNull();
 });
 it("defaults to native parent/child sessions and watches without device activity", async () => {
   enableBoard();
@@ -226,13 +227,14 @@ it("prioritizes quota attention, exposes every account and saves pins locally", 
   };
   renderBoard();
   const quota = await screen.findByRole("region", { name: "Quota" });
-  expect(await within(quota).findByRole("link", { name: /Account 5\s*93%/ })).toBeTruthy();
-  fireEvent.click(within(quota).getByText("Show all 5 accounts"));
-  fireEvent.click(within(quota).getByRole("button", { name: "Pin Account 1" }));
+  expect(await within(quota).findByRole("button", { name: /Account 5\s*93%/ })).toBeTruthy();
+  fireEvent.click(within(quota).getByRole("button", { name: "Show all 5 accounts" }));
+  expect(await screen.findByText(/Today’s estimate \$123.46/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Pin Account 1" }));
   expect(JSON.parse(localStorage.getItem(BOARD_PREFERENCES_KEY)!).pinnedQuota).toEqual([
     "account-0",
   ]);
-  expect(within(quota).getAllByRole("link")[0].getAttribute("href")).toBe("/usage/board/account-0");
+  expect(within(quota).getAllByRole("button")[1].textContent).toContain("Account 1");
 });
 it("maps source tasks to routes and keeps unsafe source URLs as text", async () => {
   enableBoard("routes");
@@ -275,7 +277,7 @@ it("joins task waits with native prompts and opens real session links", async ()
   mocks.sessions = fixture.sessions;
   report(fixture.tasks, fixture.sources);
   renderBoard();
-  await screen.findByText("13 tasks");
+  await screen.findByRole("button", { name: /2 Waiting on me/ });
   fireEvent.click(screen.getByRole("button", { name: /2 Waiting on me/ }));
   const waiting = screen.getByRole("region", { name: "Waiting on me" });
   expect(within(waiting).getByRole("button", { name: /Choose the retry budget/ })).toBeTruthy();
@@ -306,7 +308,7 @@ it("keeps native sessions usable with no source and retries a failed source read
   await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
   fireEvent.click(screen.getByRole("button", { name: "Routes" }));
   expect(await screen.findByRole("heading", { name: "No tasks yet" })).toBeTruthy();
-  expect(screen.getByText("/v1/me/tasks/sources/{source_id}")).toBeTruthy();
+  expect(screen.getByRole("link", { name: "Manage task sources in Settings" })).toBeTruthy();
 });
 it("stores the display switch in the existing navigation namespace", async () => {
   render(<TaskBoardSettings />);

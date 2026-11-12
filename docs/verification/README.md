@@ -22,9 +22,13 @@ app; component checks use their own isolated test environment.
   Stop through chat interrupt, and window-owned action claims.
 
 Record the checkout revision, command, result and evidence location for each run.
+- [Purchase baseline API](features/usage-pricing.md): saved cards, FX, payment allocation and quota observations.
 An HTML preview with fake data proves the shown component interactions, rather
 than a deployed host or a live provider. Clean up only the test processes and
 temporary directories the run created.
 
 - [Browser extensions](features/browser-extensions.md): user packages, native consent, agent fill and local data removal.
 - [Agent file opening](features/open-in-panel.md): deferred workspace requests and unconfirmed delivery reporting.
+- [Task source snapshots](features/task-source-snapshots.md): staged publication, pinned reads,
+  source details and warm/cold client behavior.
+- [Board frames](features/board-frames.md): mount URLs, same-site authentication and ancestor policy.

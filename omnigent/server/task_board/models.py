@@ -262,6 +262,7 @@ class _Task(_CalendarObject):
 
 class _Group(_CalendarObject):
     object_type: Literal["Group"] = Field(alias="@type")
+    sequence: int = Field(default=0, ge=0, le=9_007_199_254_740_991)
     entries: list[dict[str, Any]]
     title: str | None = Field(default=None, max_length=128)
     source: URI | None = None
@@ -362,6 +363,9 @@ def parse_report(body: bytes, content_type: str, limits: TaskBoardLimits) -> Rep
                     code, (prefix + "." if prefix else "") + key, "Too many entries", status=413
                 )
         tasks.append(task)
+    from omnigent.server.task_board.display import validate_displays
+
+    validate_displays(tasks, group)
     return Report(tasks, group)
 
 

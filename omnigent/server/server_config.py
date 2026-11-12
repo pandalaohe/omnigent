@@ -61,6 +61,52 @@ DEFAULT_AGENT_NAME_KEY = "default_agent_name"
 SESSION_TITLE_INSTRUCTIONS_MAX_CHARS = 4_000
 
 
+def frame_ancestors_policy(config: Mapping[str, Any]) -> str | None:
+    """Validate the opt-in SPA framing policy without coercing YAML values."""
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    entries = config.get("frame_ancestors", [])
+    if not isinstance(entries, list):
+        raise ValueError("frame_ancestors must be a list of strings")
+    for entry in entries:
+        error = f"Invalid frame_ancestors entry: {entry!r}"
+        if not isinstance(entry, str):
+            raise ValueError(error)
+        if entry == "'self'":
+            continue
+        if entry == "'none'":
+            if len(entries) != 1:
+                raise ValueError(error + " ('none' must be alone)")
+            continue
+        if re.search(r"[\s\x00-\x20\x7f,;]", entry):
+            raise ValueError(error)
+        match = re.fullmatch(
+            r"(https?)://(\*\.)?(\[[0-9a-fA-F:.]+\]|[A-Za-z0-9.-]+)(?::([0-9]+))?", entry
+        )
+        if not match or (match[2] and match[1] != "https"):
+            raise ValueError(error)
+        try:
+            parsed = urlsplit(entry)
+            if parsed.port is not None and not 1 <= parsed.port <= 65535:
+                raise ValueError(error)
+            host = match[3]
+            try:
+                address = ipaddress.ip_address(host.strip("[]"))
+            except ValueError:
+                if host.startswith("[") or not all(
+                    re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                    for label in host.split(".")
+                ):
+                    raise ValueError(error) from None
+            else:
+                if match[2] or (address.version == 6 and not host.startswith("[")):
+                    raise ValueError(error)
+        except ValueError:
+            raise ValueError(error) from None
+    return "frame-ancestors " + " ".join(entries) if entries else None
+
+
 @dataclass(frozen=True)
 class ApiKey:
     name: str

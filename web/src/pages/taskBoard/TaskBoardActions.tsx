@@ -1,3 +1,6 @@
+import { t } from "./taskBoardText";
+import { isFramePath } from "@/lib/boardFrame";
+import { Link } from "@/lib/routing";
 import { lazy, Suspense, useState } from "react";
 import { useProjects } from "@/hooks/useConversations";
 import { Button } from "@/components/ui/button";
@@ -38,8 +41,14 @@ export function TaskBoardActions({ actions }: { actions: SessionAction[] }) {
     null,
   );
   const { data: projects, isLoading } = useProjects({
-    enabled: actions.length > 0 || draft !== null,
+    enabled: !isFramePath() && (actions.length > 0 || draft !== null),
   });
+  if (isFramePath())
+    return actions.length ? (
+      <Link to="/" target="_blank" rel="noopener">
+        {t("actions.openInApp")}
+      </Link>
+    ) : null;
   return (
     <>
       {actions.map((action, index) => (

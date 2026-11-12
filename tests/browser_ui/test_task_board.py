@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -170,7 +171,7 @@ def test_task_board_display_switch_and_source_list(
                 {
                     "@type": "Task",
                     "uid": "drop",
-                    "updated": "2026-11-06T06:30:00Z",
+                    "updated": datetime.now(UTC).isoformat(),
                     "title": "Drop the legacy endpoint",
                     "progress": "cancelled",
                     "omnigent.ai:source": "example",
@@ -283,7 +284,9 @@ def test_task_board_display_switch_and_source_list(
     expect(waiting.get_by_text("Approve the retry budget")).to_be_visible()
     expect(waiting.locator('a[href="/c/child"]')).to_be_visible()
     waiting.get_by_role("button", name="Close", exact=True).click()
-    page.get_by_role("button", name="Routes", exact=True).click()
+    page.get_by_role("navigation", name="Board views").get_by_role(
+        "button", name="Routes", exact=True
+    ).click()
     region = page.get_by_role("region", name="Routes", exact=True)
     expect(region.get_by_role("heading", name="Version two")).to_be_visible()
     region.get_by_role(
@@ -308,7 +311,7 @@ def test_task_board_display_switch_and_source_list(
     assert page.locator("main").last.evaluate(
         "element => element.scrollWidth <= element.clientWidth"
     )
-    title = page.get_by_role("heading", name="Task board", exact=True).bounding_box()
+    title = page.locator(".tb-page-header").bounding_box()
     header = page.get_by_role("banner").bounding_box()
     assert title and header and title["y"] >= header["y"] + header["height"]
     assert board_session_queries and all(
@@ -331,17 +334,32 @@ def test_task_board_display_switch_and_source_list(
     ).to_be_visible()
     page.get_by_role("button", name="Today", exact=True).click()
     expect(page.get_by_text("Active sessions today", exact=True)).to_be_visible()
-    page.get_by_role("button", name="Sources", exact=True).click()
-    page.get_by_label(f"Display name for {source_name}").fill("Local display name")
-    expect(page.get_by_text("Display settings saved in this browser.")).to_be_visible()
-    page.get_by_label("Show on map", exact=True).uncheck()
-    page.get_by_role("button", name="Delete source", exact=True).click()
-    expect(
-        page.get_by_text(
-            "Delete Local display name and its 2 stored tasks, including their history?"
-        )
-    ).to_be_visible()
-    page.get_by_role("button", name="Cancel", exact=True).click()
+    expect(page.locator(".tb-number-tiles dt").filter(has_text="Closed today")).to_be_visible()
+    expect(page.get_by_text("toclosedDay.closed", exact=True)).to_have_count(0)
+    page.get_by_role("button", name="Settings", exact=True).click()
+    display = page.get_by_role("region", name="Settings", exact=True)
+    display.get_by_role("button", name="Dark" if theme == "dark" else "Light", exact=True).click()
+    display.get_by_role("button", name="Off", exact=True).click()
+    expect(display.get_by_role("button", name="Off", exact=True)).to_have_attribute(
+        "aria-pressed", "true"
+    )
+    assert display.get_by_role("button", name="Off", exact=True).evaluate(
+        "el => getComputedStyle(el).backgroundColor"
+    ) == ("rgb(24, 31, 37)" if theme == "dark" else "rgb(255, 255, 255)")
+    assert display.locator(".tb-project-bullet").evaluate(
+        "el => getComputedStyle(el).borderRadius === '50%' && "
+        "getComputedStyle(el).backgroundColor === 'rgb(238, 53, 46)'"
+    )
+    display.get_by_label("Station level up to", exact=True).select_option("3")
+    display.get_by_label("Board window", exact=True).select_option("72")
+    display.get_by_role("button", name=source_name, exact=True).click()
+    page.get_by_role("navigation", name="Board views").get_by_role(
+        "button", name="Routes", exact=True
+    ).click()
+    expect(page.get_by_role("heading", name="Version two")).to_have_count(0)
+    page.get_by_role("button", name="Settings", exact=True).click()
+    display.get_by_role("button", name="Restore defaults", exact=True).click()
+    expect(display.get_by_role("status")).to_contain_text("Saved in this browser")
     expect(page.locator("main").last).to_be_visible()
     assert page.locator("main").last.evaluate(
         "element => element.scrollWidth <= element.clientWidth"

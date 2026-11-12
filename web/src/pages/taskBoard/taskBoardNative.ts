@@ -1,12 +1,23 @@
+import type { DisplayTool } from "./taskBoardDisplay";
+import { useBoardCadence } from "./taskBoardPreferences";
 import { useEffect } from "react";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { resolveWebSocketUrl } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
 import type { SystemStatusView } from "@/hooks/useSystemStatus";
 import type { UsageOverview } from "@/pages/usageBoard/usageBoardData";
+import type { UsageActivity } from "@/pages/usageBoard/usageActivityData";
+import { usageRangeQuery } from "@/pages/usageBoard/UsageRangeControl";
 import { readBoardJson } from "./taskBoardData";
 
 export interface BoardSession {
+  running_since?: number;
+  running_seconds?: number;
+  idle_seconds?: number;
+  ended_at?: number;
+  current_tool?: DisplayTool;
+  questions?: { id: string; text: string }[];
+  need?: string;
   id: string;
   title?: string | null;
   status: string;
@@ -28,7 +39,6 @@ export interface BoardSchedule {
   next_run_at?: string | null;
   state: string;
 }
-const cadence = () => (document.visibilityState === "visible" ? 60_000 : false);
 
 async function readSessions(archived: boolean): Promise<BoardSession[]> {
   const rows: BoardSession[] = [];
@@ -55,6 +65,7 @@ async function readSessions(archived: boolean): Promise<BoardSession[]> {
 }
 
 export function useBoardSessions() {
+  const cadence = useBoardCadence();
   const client = useQueryClient();
   const query = useQuery({
     queryKey: ["taskBoard", "sessions"],
@@ -111,6 +122,7 @@ export function useBoardSessions() {
 }
 
 export function useBoardSessionDetails(ids: string[]) {
+  const cadence = useBoardCadence();
   return useQueries({
     queries: [...new Set(ids)].map((id) => ({
       queryKey: ["taskBoard", "session", id],
@@ -126,10 +138,17 @@ export function useBoardSessionDetails(ids: string[]) {
 }
 
 export function useBoardSilentSessions(sessions: BoardSession[]) {
+  const cadence = useBoardCadence();
   const candidates = sessions.filter(
     (session) =>
       session.status === "running" &&
       !session.archived &&
+      !(
+        session.current_tool &&
+        (session.current_tool.limitSeconds == null ||
+          Date.now() / 1000 - Date.parse(session.current_tool.startedAt) / 1000 <
+            session.current_tool.limitSeconds)
+      ) &&
       session.updated_at &&
       Date.now() / 1000 - session.updated_at >= 1200,
   );
@@ -152,6 +171,7 @@ export function useBoardSilentSessions(sessions: BoardSession[]) {
 }
 
 export function useBoardSystem() {
+  const cadence = useBoardCadence();
   return useQuery({
     queryKey: ["taskBoard", "system"],
     queryFn: () => readBoardJson<SystemStatusView>("/v1/system/status"),
@@ -160,6 +180,7 @@ export function useBoardSystem() {
   });
 }
 export function useBoardQuota() {
+  const cadence = useBoardCadence();
   return useQuery({
     queryKey: ["taskBoard", "quota"],
     queryFn: async () => {
@@ -173,9 +194,22 @@ export function useBoardQuota() {
   });
 }
 export function useBoardSchedule() {
+  const cadence = useBoardCadence();
   return useQuery({
     queryKey: ["taskBoard", "schedule"],
     queryFn: () => readBoardJson<{ scheduled_tasks: BoardSchedule[] }>("/v1/scheduled-tasks"),
+    refetchInterval: cadence,
+    retry: false,
+  });
+}
+
+export function useBoardQuotaCosts(enabled: boolean) {
+  const cadence = useBoardCadence();
+  return useQuery({
+    queryKey: ["taskBoard", "quotaCosts", new Date().toDateString()],
+    queryFn: () =>
+      readBoardJson<UsageActivity>(`/v1/me/usage/activity?${usageRangeQuery({ key: "today" })}`),
+    enabled,
     refetchInterval: cadence,
     retry: false,
   });
