@@ -37,14 +37,18 @@
       pointer-events: inherit;
     }
 
-    /* Edge handles keep the entire target inside the viewport. */
+    /* Edge handles keep the entire target inside the viewport. A side handle's
+     * target stays in the 16px content gutter (the screen edge extends it), so it
+     * never takes a tap meant for a message or a code block. */
     &[data-dock-edge="left"]::after {
       left: 0;
+      width: 16px;
       transform: translateY(-50%);
     }
     &[data-dock-edge="right"]::after {
       left: auto;
       right: 0;
+      width: 16px;
       transform: translateY(-50%);
     }
     &[data-dock-edge="top"]::after {
@@ -69,6 +73,44 @@
 
 .phone-session-bar :is(button, a)::after {
   display: none;
+}
+
+/* Phone session bar row: when its controls outgrow a narrow phone it scrolls
+ * sideways (no scrollbar) and fades the edge that hides more controls. */
+.phone-session-bar-scroll {
+  --bar-fade-start: 0px;
+  --bar-fade-end: 0px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+  scroll-padding-inline: 20px;
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent,
+    black var(--bar-fade-start),
+    black calc(100% - var(--bar-fade-end)),
+    transparent
+  );
+  mask-image: linear-gradient(
+    to right,
+    transparent,
+    black var(--bar-fade-start),
+    black calc(100% - var(--bar-fade-end)),
+    transparent
+  );
+}
+
+.phone-session-bar-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.phone-session-bar-scroll[data-hidden-start] {
+  --bar-fade-start: 20px;
+}
+
+.phone-session-bar-scroll[data-hidden-end] {
+  --bar-fade-end: 20px;
 }
 
 /* Native popup menus use the browser's color scheme, including on Windows. */

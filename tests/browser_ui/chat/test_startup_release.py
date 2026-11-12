@@ -15,6 +15,12 @@ def test_startup_release_keeps_unknown_work_and_advances_the_queue(
     chat = chat_session_contract
     artifacts = Path(output_path)
     page.set_viewport_size({"width": width, "height": 900})
+    # Start from a floating spot; a new phone docks the assistant at the edge instead.
+    page.add_init_script(
+        "localStorage.getItem('omnigent:mobile-assistant-device-state') ||"
+        " localStorage.setItem('omnigent:mobile-assistant-device-state',"
+        " JSON.stringify({position: {x: 0.86, y: 0.2}}))"
+    )
     startup = {
         "id": "a" * 32,
         "host_id": chat.host_id,

@@ -312,6 +312,7 @@ import {
 import { HostBadge } from "@/components/HostBadge";
 import { MobileHeaderControlPortal } from "@/shell/MobileHeaderControlsSlot";
 import { OmniGlassSurface } from "@/components/OmniGlassSurface";
+import { PhoneBarScroller } from "@/components/composer/PhoneBarScroller";
 import { StandingApprovalChip } from "@/components/StandingApprovalChip";
 import { AutoRotationChip } from "@/components/AutoRotationChip";
 import {
@@ -5230,76 +5231,79 @@ function ComposerImpl(
             )}
           >
             {isMobile && <OmniGlassSurface borderRadius={20} className="-z-10" />}
-            <ComposerWorkspaceStatus
-              workspacePath={composerWorkspace ?? null}
-              worktreePath={composerGit.worktreePath}
-              isWorktree={composerGit.isWorktree}
-              branch={composerGit.branch}
-              branchState={composerGit.branchState}
-              creationBranch={composerGit.creationBranch}
-              showWorktree={composerGit.isWorktree === true}
-            />
-            <ComposerPrLink
-              state={composerGit.githubState}
-              prCount={composerGit.prCount}
-              prNumber={composerGit.prNumber}
-              prNumberPrefix={composerGit.prNumberPrefix}
-              prs={composerGit.prs}
-              prStatus={composerGit.prStatus}
-              onOpen={openComposerGithubTab}
-              conversationId={composerSessionId ?? undefined}
-            />
-            <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
-              <div
-                data-testid="composer-task-indicators"
-                className="flex items-center gap-0 empty:hidden"
-              >
-                {/* Phone shows background tasks in the header pill. */}
-                {!isMobile && <BackgroundTaskIndicator />}
-                <SubagentTaskIndicator conversationId={conversationId} />
-                {goal && <GoalStatusPill goal={goal} onOpen={() => setGoalDialogOpen(true)} />}
-                <RunnerLogRunawayIndicator
-                  key={conversationId}
-                  labels={runnerLogLabels}
-                  fallbackLabels={runnerLogFallbackLabels}
-                />
+            <PhoneBarScroller enabled={isMobile}>
+              <ComposerWorkspaceStatus
+                workspacePath={composerWorkspace ?? null}
+                worktreePath={composerGit.worktreePath}
+                isWorktree={composerGit.isWorktree}
+                branch={composerGit.branch}
+                branchState={composerGit.branchState}
+                creationBranch={composerGit.creationBranch}
+                showWorktree={composerGit.isWorktree === true}
+              />
+              <ComposerPrLink
+                state={composerGit.githubState}
+                prCount={composerGit.prCount}
+                prNumber={composerGit.prNumber}
+                prNumberPrefix={composerGit.prNumberPrefix}
+                prs={composerGit.prs}
+                prStatus={composerGit.prStatus}
+                onOpen={openComposerGithubTab}
+                conversationId={composerSessionId ?? undefined}
+              />
+              <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
+                <div
+                  data-testid="composer-task-indicators"
+                  className="flex items-center gap-0 empty:hidden"
+                >
+                  {/* Phone shows background tasks in the header pill. */}
+                  {!isMobile && <BackgroundTaskIndicator />}
+                  <SubagentTaskIndicator conversationId={conversationId} />
+                  {goal && <GoalStatusPill goal={goal} onOpen={() => setGoalDialogOpen(true)} />}
+                  <RunnerLogRunawayIndicator
+                    key={conversationId}
+                    labels={runnerLogLabels}
+                    fallbackLabels={runnerLogFallbackLabels}
+                  />
+                </div>
+                {conversationId && (
+                  <ComposerContextRing
+                    contextWindow={composerContextWindow}
+                    tokensUsed={composerTokensUsed}
+                    autoCompactTokenLimit={composerCompactLimit}
+                    sourceKey={usageContextSourceKey({
+                      hostId: composerSession?.hostId,
+                      agentName: composerBoundAgentName,
+                      harness: sessionHarness,
+                      model: sessionDefaultModel,
+                    })}
+                  />
+                )}
+                {isMobile && composerSessionId && (
+                  <>
+                    <StandingApprovalChip
+                      key={`approval:${composerSessionId}`}
+                      sessionId={composerSessionId}
+                      appearance="bar"
+                      readOnly={
+                        composerSession?.parentSessionId != null ||
+                        composerSession?.archived === true ||
+                        !isEditorLevel(permissionLevel ?? null)
+                      }
+                    />
+                    <AutoRotationChip
+                      key={`auto-rotation:${composerSessionId}`}
+                      sessionId={composerSessionId}
+                      appearance="bar"
+                      readOnly={
+                        composerSession?.archived === true ||
+                        !isEditorLevel(permissionLevel ?? null)
+                      }
+                    />
+                  </>
+                )}
               </div>
-              {conversationId && (
-                <ComposerContextRing
-                  contextWindow={composerContextWindow}
-                  tokensUsed={composerTokensUsed}
-                  autoCompactTokenLimit={composerCompactLimit}
-                  sourceKey={usageContextSourceKey({
-                    hostId: composerSession?.hostId,
-                    agentName: composerBoundAgentName,
-                    harness: sessionHarness,
-                    model: sessionDefaultModel,
-                  })}
-                />
-              )}
-              {isMobile && composerSessionId && (
-                <>
-                  <StandingApprovalChip
-                    key={`approval:${composerSessionId}`}
-                    sessionId={composerSessionId}
-                    appearance="bar"
-                    readOnly={
-                      composerSession?.parentSessionId != null ||
-                      composerSession?.archived === true ||
-                      !isEditorLevel(permissionLevel ?? null)
-                    }
-                  />
-                  <AutoRotationChip
-                    key={`auto-rotation:${composerSessionId}`}
-                    sessionId={composerSessionId}
-                    appearance="bar"
-                    readOnly={
-                      composerSession?.archived === true || !isEditorLevel(permissionLevel ?? null)
-                    }
-                  />
-                </>
-              )}
-            </div>
+            </PhoneBarScroller>
           </ComposerWorkspaceBar>
         )}
       </div>
