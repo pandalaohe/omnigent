@@ -225,7 +225,9 @@ it.each([365, 1825])("propagates an unknown account day inside a %s-day chart bu
       now={now}
       historyStart={from}
       capped={false}
-      sourceOrder={[]}
+      sourceColors={new Map()}
+      selectedSources={[]}
+      onSource={() => {}}
       onRange={vi.fn()}
     />,
   );

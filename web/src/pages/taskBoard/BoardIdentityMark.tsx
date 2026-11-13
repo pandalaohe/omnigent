@@ -56,12 +56,14 @@ export function BoardIdentityMark({
   product,
   size = 16,
   neutral = false,
+  color,
 }: {
   id: string;
   label: string;
   product?: string | null;
   size?: number;
   neutral?: boolean;
+  color?: string;
 }) {
   let hash = 0;
   for (let index = 0; index < id.length; index++) hash = (hash * 31 + id.charCodeAt(index)) >>> 0;
@@ -78,7 +80,7 @@ export function BoardIdentityMark({
           ? undefined
           : neutral
             ? "var(--secondary)"
-            : colours[hash % colours.length],
+            : (color ?? colours[hash % colours.length]),
         color: !Icon && neutral ? "var(--muted-foreground)" : undefined,
         fontSize: Math.round(size * 0.58),
       }}

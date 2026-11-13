@@ -38,6 +38,7 @@ export const activityNumber = (amount: number | undefined) =>
     : formatNumber(amount, {
         notation: "compact",
         maximumSignificantDigits: 3,
+        maximumFractionDigits: 2,
       });
 export const activityMoney = (amount: number) =>
   "$" +

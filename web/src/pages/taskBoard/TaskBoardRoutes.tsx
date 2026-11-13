@@ -1,3 +1,4 @@
+import { boardSourceColors } from "./taskBoardVisual";
 import {
   Fragment,
   useCallback,
@@ -58,7 +59,6 @@ import {
   mapRelations,
   mapScene,
   routeAttention,
-  routeColors,
   routeMoment,
   routeQueued,
   routeState,
@@ -519,15 +519,10 @@ export function TaskBoardRoutes({
     (id: string) => caches[id]?.display.identity?.badge ?? sourceName(id).slice(0, 1).toUpperCase(),
     [caches, sourceName],
   );
+  const sourceColors = useMemo(() => boardSourceColors(tasks), [tasks]);
   const sourceColor = useCallback(
-    (id: string) =>
-      routeColors[
-        Math.max(
-          0,
-          sources.findIndex((source) => source.id === id),
-        ) % routeColors.length
-      ],
-    [sources],
+    (id: string) => sourceColors.get(id) ?? "var(--muted-foreground)",
+    [sourceColors],
   );
   const nowOn = view.from <= now && view.to >= now;
   // Discrete window jumps ease from the previous window; drags and wheel pans follow the pointer.
@@ -1596,6 +1591,7 @@ export function TaskBoardRoutes({
             }}
           >
             {compact ? <Rows3Icon size={16} /> : <Rows4Icon size={16} />}
+            {t("routes.rowsCompact")}
           </button>
           <button
             type="button"
@@ -1617,6 +1613,7 @@ export function TaskBoardRoutes({
             }}
           >
             {allExpanded ? <ChevronsDownUpIcon size={16} /> : <ChevronsUpDownIcon size={16} />}
+            {t(allExpanded ? "routes.collapseAll" : "routes.expandAll")}
           </button>
           <button
             type="button"
@@ -1628,6 +1625,29 @@ export function TaskBoardRoutes({
             <CircleHelpIcon size={16} />
           </button>
         </div>
+      </div>
+      <div className="rt-legend rt-legend-always" aria-label={t("routes.legend")}>
+        {["running", "user", "failed", "ready", "held", "queued"].map((state) => {
+          const count = tasks.filter((task) => routeState(task) === state).length;
+          return (
+            <span key={state} className={count ? "" : "zero"}>
+              <i className={`rt-symbol rt-${state}`} />
+              {t(`sessions.taskState.${state}`)} <b>{count}</b>
+            </span>
+          );
+        })}
+        <span>
+          <i className="rt-line-key done" />
+          {t("visual.donePath")}
+        </span>
+        <span>
+          <i className="rt-line-key queued" />
+          {t("sessions.taskState.queued")}
+        </span>
+        <span>
+          <i className="rt-line-key running" />
+          {t("visual.runningPath")}
+        </span>
       </div>
       {help && (
         <section className="rt-help" aria-label={t("routes.help")}>
@@ -1643,14 +1663,6 @@ export function TaskBoardRoutes({
               phase: lodPhase,
             })}
           </p>
-          <div className="rt-legend">
-            {["running", "user", "failed", "ready", "held", "queued"].map((state) => (
-              <span key={state}>
-                <i className={`rt-symbol rt-${state}`} />
-                {t(`sessions.taskState.${state}`)}
-              </span>
-            ))}
-          </div>
           <p>{t("routes.attentionHelp")}</p>
           <p>{t("routes.gestureHelp")}</p>
         </section>
@@ -2250,7 +2262,25 @@ export function TaskBoardRoutes({
                             <span>
                               {t("board.tasks", { count: lane.count ?? lane.tasks.length })}
                             </span>
-                            {` · ${lane.summary}`}
+                            <span className="rt-summary">
+                              {lane.tasks.filter((task) => routeState(task) === "running").length >
+                                0 && (
+                                <em className="running">
+                                  {t("sessions.taskState.running")}{" "}
+                                  {
+                                    lane.tasks.filter((task) => routeState(task) === "running")
+                                      .length
+                                  }
+                                </em>
+                              )}
+                              {lane.tasks.filter((task) => routeState(task) === "user").length >
+                                0 && (
+                                <em className="user">
+                                  {t("sessions.taskState.user")}{" "}
+                                  {lane.tasks.filter((task) => routeState(task) === "user").length}
+                                </em>
+                              )}
+                            </span>
                           </small>
                         </span>
                       </button>

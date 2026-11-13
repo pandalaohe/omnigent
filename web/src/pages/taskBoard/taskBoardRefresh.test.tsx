@@ -198,7 +198,7 @@ it("selects an entire source inline and supports filtered keyboard selection", (
   }));
   const onFocus = vi.fn();
   const view = render(board(tasks, "order", { onFocus }));
-  fireEvent.click(screen.getByRole("button", { name: "Focus" }));
+  fireEvent.click(screen.getByRole("button", { name: "Groups" }));
   const panel = screen.getByRole("region", { name: "Show only these" });
   expect(panel.parentElement).toBe(view.container.querySelector(".rt-routes"));
   fireEvent.click(within(panel).getByRole("checkbox", { name: /Source/ }));

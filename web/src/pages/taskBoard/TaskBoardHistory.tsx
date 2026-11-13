@@ -1,3 +1,4 @@
+import { boardSourceColors } from "./taskBoardVisual";
 import { useEffect, useRef, useState } from "react";
 import { ChevronDown, X, ArrowUpRight } from "lucide-react";
 import { type BoardTask, readBoardJson, taskIdentity } from "./taskBoardData";
@@ -8,7 +9,6 @@ import { localDay } from "./taskBoardActivityData";
 import {
   accountTotals,
   DAY,
-  activityColors,
   historyCards,
   historyRoll,
   historySort,
@@ -274,8 +274,8 @@ export function TaskBoardHistory({
       .filter(Number.isFinite),
   );
   const displayFrom = Math.max(from, historyStart);
-  const sourceColor = (source: string) =>
-    activityColors[Math.max(0, Object.keys(caches).indexOf(source)) % activityColors.length];
+  const sourceColors = boardSourceColors(tasks);
+  const sourceColor = (source: string) => sourceColors.get(source) ?? "var(--muted-foreground)";
   const all = historyCards([...merged.values()], sessions, now, caches),
     inRange = all.filter((c) => c.end >= from && c.end <= to);
   const matches = (c: HistoryCard) =>
@@ -465,29 +465,33 @@ export function TaskBoardHistory({
           note={t("g6.nodes", { count: activityNumber(total.nodes) })}
         />
         <ActivityTile
-          value={total.usd ? activityMoney(total.usd) : "—"}
+          value={total.usd !== null ? activityMoney(total.usd) : "—"}
           label={
             <>
               {t("g6.attributedCost")} <i className="est">{t("sessions.cost.estimate")}</i>
             </>
           }
-          note={t("g6.pricedNodes", {
-            priced: activityNumber(total.nodes - total.unpriced),
-            unpriced: activityNumber(total.unpriced),
-          })}
+          note={
+            total.usd === null
+              ? t("visual.noPriced")
+              : t("g6.pricedNodes", {
+                  priced: activityNumber(total.nodes - total.unpriced),
+                  unpriced: activityNumber(total.unpriced),
+                })
+          }
         />
         <ActivityTile
-          value={accountSum ? activityMoney(accountSum) : "—"}
+          value={accountSum !== null ? activityMoney(accountSum) : "—"}
           label={
             <>
               {t("g6.allAccounts")} <i className="est">{t("sessions.cost.estimate")}</i>
             </>
           }
-          note={t("g6.unattributed")}
+          note={accountSum !== null ? t("g6.unattributed") : t("visual.noAccountData")}
         />
       </div>
       <TaskBoardHistoryChart
-        cards={all.filter(matches)}
+        cards={all}
         counts={counts.filter((c) => !sets.source.length || sets.source.includes(c.source))}
         accounts={daily}
         from={from}
@@ -495,7 +499,11 @@ export function TaskBoardHistory({
         now={now}
         historyStart={historyStart}
         capped={hasOldMonths}
-        sourceOrder={Object.keys(caches)}
+        sourceColors={sourceColors}
+        selectedSources={sets.source}
+        onSource={(source) =>
+          changeSet("source", sets.source.length === 1 && sets.source[0] === source ? [] : [source])
+        }
         sourceLabels={names}
         onRange={setTime}
       />

@@ -1,3 +1,4 @@
+import { routeState } from "./taskBoardRouteModel";
 import { useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -183,17 +184,7 @@ export function TaskBoardDetail({
   const selected = linked.find((s) => s.id === selectedSessionId);
   const live = selected ?? linked.find((s) => s.status !== "archived");
   const asOf = sourceCache?.display.asOf ?? new Date(Date.now()).toISOString();
-  const state =
-    display?.state ??
-    (["completed", "cancelled"].includes(taskProgress(current))
-      ? "done"
-      : taskProgress(current) === "in-process"
-        ? "running"
-        : taskProgress(current) === "failed"
-          ? "failed"
-          : current["omnigent.ai:waiting"]
-            ? "user"
-            : "queued");
+  const state = routeState(current);
   const StateIcon = detailStateIcons[state];
   const stamp = (value: string) =>
     formatDate(Date.parse(value), {
@@ -344,9 +335,16 @@ export function TaskBoardDetail({
       </header>
       <div className="tb-dc-body">
         <div className="tb-dc-main">
-          {!selectedSessionId && (
+          {!selectedSessionId && (!!now || !need) && (
             <p className={`tb-dc-now ${!now ? "quiet" : ""}`}>
-              {now || t(state === "done" ? "detail.closedLead" : "detail.quietLead")}
+              {now ||
+                t(
+                  state === "done"
+                    ? "detail.closedLead"
+                    : state === "running"
+                      ? "visual.runningLead"
+                      : "detail.quietLead",
+                )}
             </p>
           )}
           {tool &&
@@ -668,7 +666,10 @@ export function TaskBoardDetail({
           )}
         </footer>
       )}
-      <TaskSourceDetails display={display} />
+      <TaskSourceDetails
+        display={display}
+        hasParent={relations.some((edge) => edge.kind === "parent")}
+      />
       {(sourceLink || taskActions(current["omnigent.ai:actions"]).length > 0) && (
         <div className="tb-dc-actions">
           <TaskBoardActions actions={taskActions(current["omnigent.ai:actions"])} />
