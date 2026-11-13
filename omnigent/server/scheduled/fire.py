@@ -1661,6 +1661,7 @@ async def _create_library_agent_session(deps: FireDeps, task: ScheduledTask) -> 
     custom_agents_store = deps.custom_agents_store
     assert custom_agents_store is not None  # gated by _is_library_agent_task
     project = await _task_project(deps, task)
+    warnings: list[str] = []
     result = await launch_library_agent(
         custom_agents_store=custom_agents_store,
         artifact_store=deps.artifact_store,
@@ -1678,7 +1679,7 @@ async def _create_library_agent_session(deps: FireDeps, task: ScheduledTask) -> 
             permission_mode=task.permission_mode,
         ),
         project_config=project.config if project is not None else None,
-        master=await load_master(task.user_id, deps.preferences_store),
+        master=await load_master(task.user_id, deps.preferences_store, warnings=warnings),
     )
     conv: Conversation | None = await asyncio.to_thread(
         deps.conversation_store.get_conversation, result.session_id
@@ -1687,6 +1688,25 @@ async def _create_library_agent_session(deps: FireDeps, task: ScheduledTask) -> 
         raise OmnigentError(
             f"created session {result.session_id!r} not found",
             code=ErrorCode.INTERNAL_ERROR,
+        )
+    if warnings:
+        from omnigent.entities import MessageData, NewConversationItem
+
+        await asyncio.to_thread(
+            deps.conversation_store.append,
+            conv.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=f"scheduled-defaults-{conv.id}",
+                    data=MessageData(
+                        role="assistant",
+                        agent="system",
+                        content=[{"type": "output_text", "text": warning}],
+                    ),
+                )
+                for warning in warnings
+            ],
         )
     labels = _session_labels(task)
     await asyncio.to_thread(deps.conversation_store.set_labels, conv.id, labels)

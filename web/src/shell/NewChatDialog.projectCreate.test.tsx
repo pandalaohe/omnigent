@@ -474,7 +474,8 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
     );
 
-    const body = await submitAndReadBody();
+    const body = await submitAndReadBody({ id: "conv_new", warnings: ["defaults unavailable"] });
+    expect(showToast).toHaveBeenCalledWith("defaults unavailable");
     expect(body.project_id).toBe("proj_alpha");
     // The dialog sends the agent it shows; the untouched workspace seed is
     // omitted for server default-fill.
@@ -704,7 +705,11 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
   it("carries project_id and the omission rules through the multipart (bundled) path", async () => {
     const config = { host_id: "host_1", workspace: REPO, agent_id: "ag_other" };
     setProjectConfig(config);
-    vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new", agentId: "ag_pending" });
+    vi.mocked(createBundledSession).mockResolvedValue({
+      id: "conv_new",
+      agentId: "ag_pending",
+      warnings: ["defaults unavailable"],
+    });
     renderLanding({ session_bundle_workspaces: true });
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
@@ -734,6 +739,8 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     await waitFor(() => expect(vi.mocked(createBundledSession)).toHaveBeenCalled());
     await waitFor(() => expect(navigateMock).toHaveBeenCalled());
+
+    expect(showToast).toHaveBeenCalledWith("defaults unavailable");
 
     // Atomic filing rides in the metadata part; the config-seeded workspace
     // is omitted from the launch fields but preserved in composer context, and

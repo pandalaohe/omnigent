@@ -300,6 +300,21 @@ async def test_catalogs_returns_only_the_callers_hosts(
     assert rows[0]["stale"] is False
 
 
+async def test_resolve_exposes_unavailable_defaults(client, stores, monkeypatch):
+    stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
+    _seed_agent(stores, AGENT_ID, harness="codex")
+
+    def unavailable(owner):
+        raise OSError("preferences unavailable")
+
+    monkeypatch.setattr(stores.prefs, "get", unavailable)
+    response = await client.get(
+        "/v1/calling-defaults/resolve", params={"host_id": HOST_A, "agent_id": AGENT_ID}
+    )
+    assert response.status_code == 200, response.text
+    assert "storage_unavailable" in response.json()["warnings"][0]
+
+
 @pytest.mark.parametrize("harness", ["codex", "claude-native", "claude-sdk"])
 async def test_resolve_reads_the_master_table_through_the_agents_harness(
     client: httpx.AsyncClient, stores: _Stores, harness: str

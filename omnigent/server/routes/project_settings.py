@@ -302,12 +302,14 @@ def create_project_settings_router(
 
     async def context(
         project: Any,
+        *,
+        warnings: list[str],
     ) -> tuple[dict[str, Any], dict[tuple[str, str], dict[str, Any]], list[Any], dict]:
         owner = project.user_id or RESERVED_USER_LOCAL
         hosts = await asyncio.to_thread(host_store.list_hosts, owner)
         host_map = {host.host_id: host for host in hosts}
         catalogs = await asyncio.to_thread(catalog_store.list, list(host_map))
-        master = await load_master(owner, user_preferences_store)
+        master = await load_master(owner, user_preferences_store, warnings=warnings)
         return host_map, {(row["host_id"], row["harness"]): row for row in catalogs}, hosts, master
 
     def agent_lookup(
@@ -345,7 +347,8 @@ def create_project_settings_router(
         host_filter: str | None = None,
         harness_filter: str | None = None,
     ) -> dict[str, Any]:
-        host_map, catalog_map, hosts, master = await context(project)
+        warnings: list[str] = []
+        host_map, catalog_map, hosts, master = await context(project, warnings=warnings)
         owner = project.user_id or RESERVED_USER_LOCAL
         agent_choices: list[dict[str, Any]] = []
         if agent_store is not None:
@@ -477,6 +480,7 @@ def create_project_settings_router(
             "agents": agent_choices,
             "rows": rows,
             "applies_to": "future sessions",
+            "warnings": warnings,
         }
 
     @router.get("/projects/{project_id}/settings")
@@ -503,7 +507,8 @@ def create_project_settings_router(
                 "Project settings changed. Read again before updating.", code=ErrorCode.CONFLICT
             )
         next_config, named = _apply_patch(project.config, body)
-        host_map, catalog_map, _hosts, master = await context(project)
+        warnings: list[str] = []
+        host_map, catalog_map, _hosts, master = await context(project, warnings=warnings)
         owner = project.user_id or RESERVED_USER_LOCAL
         entry_change = body.host is not None and "workspace" in body.host.model_fields_set
         entry_host_id = body.host.host_id if body.host else None
@@ -745,6 +750,7 @@ def create_project_settings_router(
             initial_agent_id=initial_agent_id,
         )
         response = await render(request, updated, updated_entries, new_revision)
+        response["warnings"] = list(dict.fromkeys([*warnings, *response["warnings"]]))
         response["changed_fields"] = [
             field
             for field in named

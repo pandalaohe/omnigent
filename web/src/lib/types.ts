@@ -327,6 +327,7 @@ export interface SessionFamily {
 }
 
 export interface Session {
+  warnings?: string[];
   family?: SessionFamily | null;
   sandboxProfile?: SandboxProfile | null;
   /**

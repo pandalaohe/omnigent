@@ -44,6 +44,7 @@
 
 import type { InfiniteData, QueryClient } from "@tanstack/react-query";
 import { create } from "zustand";
+import { showToast } from "@/components/ui/toast";
 import type {
   AnyBlock,
   ElicitationBlock,
@@ -4988,6 +4989,7 @@ async function ensureBoundSession(
     // before we can subscribe to /stream, so early events can be
     // missed). Bind the stream FIRST, then post the first message.
     const session = await createSession(agentId, []);
+    for (const warning of session.warnings ?? []) showToast(warning);
     sessionId = session.id;
     // Register the create_session span (see interactionTelemetry). This path
     // sends no host params, so the server always makes an external ("computer")

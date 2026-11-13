@@ -69,6 +69,21 @@ def shared_settings_app(runtime_init: None, db_uri: str, tmp_path: Path) -> Fast
 
 
 @pytest.mark.asyncio
+async def test_project_preview_exposes_unavailable_defaults(settings_app, monkeypatch):
+    def unavailable(owner):
+        raise OSError("preferences unavailable")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=settings_app), base_url="http://test"
+    ) as client:
+        project_id = await _make_project(client)
+        monkeypatch.setattr(settings_app.state.user_preferences_store, "get", unavailable)
+        response = await client.get(f"/v1/projects/{project_id}/settings")
+    assert response.status_code == 200, response.text
+    assert "storage_unavailable" in response.json()["warnings"][0]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("approval_key", ["standing_approval", "standing_pass"])
 async def test_orchestration_tool_to_store_requires_approval(
     settings_app, db_uri, caplog, approval_key

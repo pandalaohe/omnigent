@@ -352,7 +352,8 @@ def create_calling_defaults_router(
                 return None
             return _create_resolved_harness(agent, None, agent_cache)
 
-        master = await load_master(owner, user_preferences_store)
+        warnings: list[str] = []
+        master = await load_master(owner, user_preferences_store, warnings=warnings)
         resolved_host_id = host.host_id if host is not None else None
         records = (
             await asyncio.to_thread(catalog_store.list, [resolved_host_id])
@@ -414,6 +415,7 @@ def create_calling_defaults_router(
             sources=resolution.sources,
             level=resolution.level,
             problems=problems,
+            warnings=warnings,
         )
 
     return router
