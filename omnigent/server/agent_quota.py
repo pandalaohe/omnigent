@@ -1139,14 +1139,23 @@ class AgentQuotaService:
 
         choice = read_collab_settings(self.preferences, context.owner_id).session_choice
         pools = []
+        products: dict[str, str | None] = {}
         for link in ordered_links(choice):
-            probe = Conversation(
-                id="", created_at=0, updated_at=0, root_conversation_id="", agent_id=link.agent_id
-            )
-            product = agent_key_for_harness(
-                _resolve_harness_impl(probe, agent_store=agent_store, agent_cache=agent_cache)
-            )
-            pools.append(pool_of(link, product))
+            if link.meter:
+                pools.append(link.meter)
+                continue
+            if link.agent_id not in products:
+                probe = Conversation(
+                    id="",
+                    created_at=0,
+                    updated_at=0,
+                    root_conversation_id="",
+                    agent_id=link.agent_id,
+                )
+                products[link.agent_id] = agent_key_for_harness(
+                    _resolve_harness_impl(probe, agent_store=agent_store, agent_cache=agent_cache)
+                )
+            pools.append(pool_of(link, products[link.agent_id]))
         payload: dict[str, Any] = {
             "tiers": asdict(tiers),
             "agents": {
@@ -1236,20 +1245,27 @@ class AgentQuotaService:
 
         settings = read_collab_settings(self.preferences, owner).session_choice
         meters: dict[tuple[str, str], set[str | None]] = defaultdict(set)
+        products: dict[str, str | None] = {}
+        default_models: dict[str, str | None] = {}
         for link in ordered_links(settings):
             probe = Conversation(
                 id="", created_at=0, updated_at=0, root_conversation_id="", agent_id=link.agent_id
             )
-            product = agent_key_for_harness(
-                _resolve_harness_impl(
+            if link.agent_id not in products:
+                products[link.agent_id] = agent_key_for_harness(
+                    _resolve_harness_impl(
+                        probe, agent_store=self.agent_store, agent_cache=self.agent_cache
+                    )
+                )
+            product = products[link.agent_id]
+            if product is None:
+                continue
+            if not link.model and link.agent_id not in default_models:
+                default_models[link.agent_id] = _resolve_llm_model(
                     probe, agent_store=self.agent_store, agent_cache=self.agent_cache
                 )
-            )
-            model = link.model or _resolve_llm_model(
-                probe, agent_store=self.agent_store, agent_cache=self.agent_cache
-            )
-            if product is not None:
-                meters[(product, model or "")].add(link.meter)
+            model = link.model or default_models.get(link.agent_id)
+            meters[(product, model or "")].add(link.meter)
         return dict(meters)
 
     def activity(
