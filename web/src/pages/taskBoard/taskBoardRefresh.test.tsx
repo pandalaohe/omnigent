@@ -116,11 +116,11 @@ it("retains the originating phone row when a related task is on another eight-st
   act(() => trigger.focus());
   fireEvent.click(trigger);
   const first = screen.getByRole("region", { name: "Details: Task 13" });
-  fireEvent.click(within(first).getByRole("button", { name: /task-0/ }));
+  fireEvent.click(within(first).getByRole("button", { name: "Task 1" }));
   const destination = screen.getByRole("region", { name: "Details: Task 1" });
   expect(destination.closest("li")).toBe(trigger.closest("li"));
   expect(screen.queryByRole("button", { name: "Task 1" })).toBeNull();
-  fireEvent.click(within(destination).getByRole("button", { name: /task-12/ }));
+  fireEvent.click(within(destination).getByRole("button", { name: "Task 13" }));
   const returned = screen.getByRole("region", { name: "Details: Task 13" });
   expect(returned.closest("li")).toBe(trigger.closest("li"));
   fireEvent.click(within(returned).getByRole("button", { name: "Close" }));
@@ -180,7 +180,7 @@ it.each(["source", "group", "focus"] as const)(
     fireEvent.click(trigger);
     const first = screen.getByRole("region", { name: `Details: ${origin.title}` });
     const anchorTop = first.closest<HTMLElement>(".rt-panel")!.style.top;
-    fireEvent.click(within(first).getByRole("button", { name: new RegExp(target.uid) }));
+    fireEvent.click(within(first).getByRole("button", { name: target.title }));
     const destination = screen.getByRole("region", { name: `Details: ${target.title}` });
     expect(destination.closest<HTMLElement>(".rt-panel")!.style.top).toBe(anchorTop);
     expect(anchorTop).not.toBe("0px");
