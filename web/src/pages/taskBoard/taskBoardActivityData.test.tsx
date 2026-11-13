@@ -11,6 +11,7 @@ import {
   localDay,
   readBoardHistory,
   readLocalClosedCounts,
+  useBoardHistory,
 } from "./taskBoardActivityData";
 
 const fetcher = vi.hoisted(() => vi.fn());
@@ -31,6 +32,62 @@ function wrap(ui: React.ReactNode) {
     </QueryClientProvider>,
   );
 }
+it("loads one history page, pages on demand, and recovers after a failed incremental refresh", async () => {
+  let failed = true;
+  fetcher.mockImplementation(async (path: string) => {
+    const params = new URL(path, "https://example.test").searchParams;
+    const row = (id: string) => ({
+      id,
+      source: "example",
+      uid: "one",
+      time: new Date().toISOString(),
+      kind: "comment",
+    });
+    if (params.has("changed_after")) {
+      if (failed) {
+        failed = false;
+        return Response.json({}, { status: 422 });
+      }
+      return Response.json({ entries: [row("new")] });
+    }
+    return Response.json(
+      params.has("cursor")
+        ? { entries: [row("older")] }
+        : { entries: [row("first")], cursor: "next" },
+    );
+  });
+  function Reader() {
+    const history = useBoardHistory();
+    return (
+      <>
+        <output>{history.events.length}</output>
+        <button type="button" onClick={() => void history.loadEarlier()}>
+          Earlier
+        </button>
+        <button type="button" onClick={() => void history.refetch()}>
+          Refresh
+        </button>
+        {history.isError && <span>Failed</span>}
+      </>
+    );
+  }
+  wrap(<Reader />);
+  await screen.findByText("1", { selector: "output" });
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  const first = new URL(fetcher.mock.calls[0][0], "https://example.test");
+  expect(first.searchParams.has("after")).toBe(true);
+  expect(first.searchParams.get("limit")).toBe("500");
+  fireEvent.click(screen.getByText("Earlier"));
+  await screen.findByText("2", { selector: "output" });
+  fireEvent.click(screen.getByText("Refresh"));
+  await screen.findByText("Failed");
+  expect(screen.getByText("2", { selector: "output" })).toBeTruthy();
+  fireEvent.click(screen.getByText("Refresh"));
+  await screen.findByText("3", { selector: "output" });
+  await waitFor(() => expect(screen.queryByText("Failed")).toBeNull());
+  for (const [path] of fetcher.mock.calls.slice(2))
+    expect(new URL(path, "https://example.test").searchParams.has("changed_after")).toBe(true);
+});
 it("drains history cursors and rejects repeated cursors", async () => {
   fetcher
     .mockResolvedValueOnce(Response.json({ entries: [{ id: "a" }], cursor: "next" }))

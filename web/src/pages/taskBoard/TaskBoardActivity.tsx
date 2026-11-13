@@ -7,7 +7,7 @@ import { useBoardCadence } from "./taskBoardPreferences";
 import { sourceHistory, type SourceCache } from "./taskBoardSnapshotData";
 import { readBoardJson, type BoardTask } from "./taskBoardData";
 import type { BoardSession } from "./taskBoardNative";
-import { localDay, readBoardHistory, readLocalClosedCounts } from "./taskBoardActivityData";
+import { localDay, useBoardHistory, readLocalClosedCounts } from "./taskBoardActivityData";
 import { TaskBoardLog } from "./TaskBoardLog";
 import { TaskBoardHistory, type HistoryDetailSelection } from "./TaskBoardHistory";
 import { TaskBoardToday } from "./TaskBoardToday";
@@ -46,17 +46,11 @@ export function TaskBoardActivity({
   const now = Date.now(),
     today = localDay(now),
     offset = -new Date(now).getTimezoneOffset();
-  const history = useQuery({
-    queryKey: ["taskBoard", "history"],
-    queryFn: () => readBoardHistory(),
-    enabled: !sourceCaches,
-    retry: false,
-    refetchInterval: cadence,
-  });
+  const history = useBoardHistory(view === "log");
   const counts = useQuery({
     queryKey: ["taskBoard", "closedCounts", offset],
     queryFn: () => readLocalClosedCounts(),
-    enabled: !sourceCaches,
+    enabled: !sourceCaches && view === "history",
     retry: false,
     refetchInterval: cadence,
   });
@@ -72,9 +66,9 @@ export function TaskBoardActivity({
     setDetail(true);
     onSelect(task);
   };
-  const events = (sourceCaches ? sourceHistory(caches) : (history.data ?? [])).filter(
-    (e) => !excluded.includes(e.source),
-  );
+  const events = (
+    sourceCaches ? sourceHistory(caches).concat(history.events) : history.events
+  ).filter((e) => !excluded.includes(e.source));
   const closedCounts = (
     sourceCaches ? Object.values(caches).flatMap((c) => c.counts) : (counts.data?.days ?? [])
   ).filter((c) => !excluded.includes(c.source));
@@ -126,6 +120,16 @@ export function TaskBoardActivity({
           onSelect={select}
         />
       )}{" "}
+      {view === "log" && history.hasEarlier && (
+        <button
+          type="button"
+          disabled={history.loadingEarlier}
+          onClick={() => void history.loadEarlier()}
+        >
+          {t("activity.loadEarlier")}
+        </button>
+      )}
+      {view === "log" && history.earlierError && <p role="alert">{t("activity.failed")}</p>}
       {detail && inlineDetail}
     </section>
   );

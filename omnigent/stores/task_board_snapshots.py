@@ -80,7 +80,7 @@ def guard_sources(
     )
     if source_id is not None:
         statement = statement.where(SqlTaskBoardSource.source_id == source_id)
-    rows = session.scalars(statement.order_by(SqlTaskBoardSource.source_id).with_for_update())
+    rows = session.scalars(statement.order_by(SqlTaskBoardSource.source_id))
     pins = {}
     for row in rows:
         pin = source_pin(row)

@@ -30,6 +30,14 @@ def _query_time(value: str | None, path: str) -> str | None:
     if value is None:
         return None
     try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            raise ValueError
+        if value.endswith("Z"):
+            text = value[:-1]
+            value = (text.rstrip("0").rstrip(".") if "." in text else text) + "Z"
+        else:
+            value = utc_text(parsed.timestamp())
         utc_timestamp(value)
         return value
     except ValueError:
@@ -153,7 +161,7 @@ def create_task_board_router(
         }
         if next_cursor is not None:
             payload["omnigent.ai:cursor"] = next_cursor
-        if changed_after is not None and cursor is None:
+        if cursor is None:
             payload["omnigent.ai:changedThrough"] = utc_text(started)
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
@@ -186,17 +194,23 @@ def create_task_board_router(
         after: str | None = None,
         before: str | None = None,
         source: str | None = None,
+        uid: str | None = None,
+        changed_after: str | None = None,
         cursor: str | None = Query(default=None, max_length=4096),
         limit: int = Query(default=500, ge=1, le=5000),
     ) -> JSONResponse:
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
-        _query_time(after, "after")
-        _query_time(before, "before")
+        after = _query_time(after, "after")
+        before = _query_time(before, "before")
+        changed_after = _query_time(changed_after, "changed_after")
+        started = utc_text(datetime.now(UTC).timestamp())
         entries, next_cursor = await asyncio.to_thread(
             store.list_history,
             owner,
             HistoryQuery(
                 source=source,
+                uid=uid,
+                changed_after=changed_after,
                 snapshot=snapshot,
                 source_generation=source_generation,
                 after=after,
@@ -205,7 +219,7 @@ def create_task_board_router(
                 limit=limit,
             ),
         )
-        payload: dict[str, Any] = {"entries": entries}
+        payload: dict[str, Any] = {"entries": entries, "changedThrough": started}
         if next_cursor is not None:
             payload["cursor"] = next_cursor
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})

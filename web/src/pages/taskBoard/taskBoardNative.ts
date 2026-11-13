@@ -43,7 +43,10 @@ export interface BoardSchedule {
   state: string;
 }
 
-async function readSessions(archived: boolean): Promise<BoardSession[]> {
+async function readSessions(
+  archived: boolean,
+  publish?: (rows: BoardSession[]) => void,
+): Promise<BoardSession[]> {
   const rows: BoardSession[] = [];
   const params = new URLSearchParams({ kind: "any", limit: "200" });
   if (archived) {
@@ -59,6 +62,7 @@ async function readSessions(archived: boolean): Promise<BoardSession[]> {
       last_id: string | null;
     }>(`/v1/sessions?${params}`);
     rows.push(...page.data);
+    publish?.([...rows]);
     if (!page.has_more) break;
     if (!page.last_id || seen.has(page.last_id)) throw new Error("Repeated session cursor");
     seen.add(page.last_id);
@@ -73,7 +77,13 @@ export function useBoardSessions() {
   const query = useQuery({
     queryKey: ["taskBoard", "sessions"],
     queryFn: async () => {
-      const [active, archived] = await Promise.all([readSessions(false), readSessions(true)]);
+      const [active, archived] = await Promise.all([
+        readSessions(false, (rows) => {
+          if (!client.getQueryData(["taskBoard", "sessions"]))
+            client.setQueryData(["taskBoard", "sessions"], rows);
+        }),
+        readSessions(true),
+      ]);
       return [...new Map([...active, ...archived].map((row) => [row.id, row])).values()];
     },
     refetchInterval: cadence,

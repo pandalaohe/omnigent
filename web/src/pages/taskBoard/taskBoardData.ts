@@ -89,6 +89,7 @@ interface TaskPage {
   "omnigent.ai:changedThrough"?: string;
 }
 export interface BoardData {
+  partial?: boolean;
   sourceCaches?: Record<string, SourceCache>;
   sourceStates?: Record<string, string>;
   tasks: BoardTask[];
@@ -105,6 +106,7 @@ export const isOpenTask = (task: BoardTask) =>
 
 async function readTasks(
   params: URLSearchParams,
+  publish?: (tasks: BoardTask[]) => void,
 ): Promise<{ tasks: BoardTask[]; changedThrough?: string }> {
   const tasks: BoardTask[] = [];
   let cursor: string | undefined;
@@ -117,6 +119,7 @@ async function readTasks(
     const page = await readBoardJson<TaskPage>(`/v1/me/tasks?${query}`);
     if (!cursor) changedThrough = page["omnigent.ai:changedThrough"] ?? page.updated;
     tasks.push(...page.entries);
+    publish?.([...tasks]);
     cursor = page["omnigent.ai:cursor"];
     if (cursor && seen.has(cursor)) throw new Error("Repeated task cursor");
     if (cursor) seen.add(cursor);
@@ -124,11 +127,16 @@ async function readTasks(
   return { tasks, changedThrough };
 }
 
-/** Publish one atomic cache update only after every page and recreated source was read. */
-export async function readTaskBoard(previous?: BoardData, now = Date.now()): Promise<BoardData> {
+/** Keep refreshes atomic; initial reads can publish usable pages while the rest load. */
+export async function readTaskBoard(
+  previousData?: BoardData,
+  now = Date.now(),
+  publish?: (data: BoardData) => void,
+): Promise<BoardData> {
+  const previous = previousData?.partial ? undefined : previousData;
   const { sources } = await readBoardJson<{ sources: TaskSource[] }>("/v1/me/tasks/sources");
   if (sources.some((source) => source.snapshot && source.snapshot.phase !== "legacy")) {
-    return readPinnedSources(sources, previous, now);
+    return readPinnedSources(sources, previous, now, previous ? undefined : publish);
   }
   const cutoff = new Date(now - 365 * 86_400_000).toISOString();
   const sourceIds = new Set(sources.map((source) => source.id));
@@ -170,7 +178,10 @@ export async function readTaskBoard(previous?: BoardData, now = Date.now()): Pro
     const params = new URLSearchParams({ state: "open" });
     if (source) params.set("source", source);
     // eslint-disable-next-line no-await-in-loop
-    const open = await readTasks(params);
+    const open = await readTasks(
+      params,
+      !previous && publish ? (tasks) => publish({ tasks, sources, partial: true }) : undefined,
+    );
     params.set("state", "closed");
     params.set("closed_after", cutoff);
     // eslint-disable-next-line no-await-in-loop
@@ -197,7 +208,10 @@ export function useTaskBoardData() {
   const client = useQueryClient();
   return useQuery({
     queryKey: ["taskBoard", "list"],
-    queryFn: () => readTaskBoard(client.getQueryData<BoardData>(["taskBoard", "list"])),
+    queryFn: () =>
+      readTaskBoard(client.getQueryData<BoardData>(["taskBoard", "list"]), Date.now(), (data) =>
+        client.setQueryData(["taskBoard", "list"], data),
+      ),
     refetchInterval: cadence,
     refetchOnWindowFocus: true,
     retry: false,

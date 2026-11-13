@@ -5,11 +5,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -66,6 +68,8 @@ class HistoryQuery:
     limit: int = 500
     snapshot: str | None = None
     source_generation: str | None = None
+    uid: str | None = None
+    changed_after: str | None = None
 
 
 def _read_cursor(owner: str, kind: str, query: Any) -> tuple[str, dict[str, Any]]:
@@ -95,6 +99,8 @@ def _read_cursor(owner: str, kind: str, query: Any) -> tuple[str, dict[str, Any]
             raise ValueError
         if kind in {"items", "changes"}:
             utc_timestamp(cursor["through"])
+        if kind in {"history", "changes"}:
+            utc_timestamp(position[0] + "Z")
         return fingerprint, cursor
     except (ValueError, KeyError, TypeError, UnicodeDecodeError, RecursionError):
         raise ReportError("bad_value", "cursor", "Invalid cursor for this query") from None
@@ -104,6 +110,18 @@ def _next_cursor(fingerprint: str, position: tuple[str, ...], **metadata: Any) -
     return base64.urlsafe_b64encode(
         json.dumps({"query": fingerprint, "position": position, **metadata}).encode()
     ).decode()
+
+
+def _keyset(keys: Any, values: Any, *, descending: bool = False) -> Any:
+    return or_(
+        *(
+            and_(
+                *(keys[j] == values[j] for j in range(i)),
+                keys[i] < values[i] if descending else keys[i] > values[i],
+            )
+            for i in range(len(keys))
+        )
+    )
 
 
 def _in_time_window(value: str | None, after: str | None, before: str | None) -> bool:
@@ -126,6 +144,19 @@ class TaskBoardStore:
             query_name_prefix="omnigent.task_board",
             immediate=True,
         )
+
+    @contextmanager
+    def _read(self, name: str) -> Iterator[Session]:
+        with self._reads(name) as session:
+            # Pins and rows must describe the same publication without blocking its writer.
+            dialect = session.get_bind().dialect.name
+            if dialect in {"postgresql", "mysql"}:
+                session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+            elif dialect == "sqlite":
+                connection = session.connection()
+                if not getattr(connection.connection.driver_connection, "in_transaction", False):
+                    connection.exec_driver_sql("BEGIN")
+            yield session
 
     @staticmethod
     def _scope(model: Any, owner: str) -> tuple[Any, ...]:
@@ -361,8 +392,7 @@ class TaskBoardStore:
                 query.read_at if query.read_at is not None else datetime.now(UTC).timestamp()
             ),
         )
-        with self._writes("read_tasks") as session:
-            self._lock_owner(session, owner)
+        with self._read("read_tasks") as session:
             pins = guard_sources(
                 session,
                 owner,
@@ -377,8 +407,6 @@ class TaskBoardStore:
             )
             legacy_ids = [key for key, pin in pins.items() if pin["phase"] == "legacy"]
             if legacy_ids:
-                from sqlalchemy import or_
-
                 statement = statement.where(
                     or_(
                         SqlTaskBoardItem.source_id.not_in(legacy_ids),
@@ -392,27 +420,58 @@ class TaskBoardStore:
             if not query.include_gone and not changes:
                 statement = statement.where(SqlTaskBoardItem.gone_at.is_(None))
             if query.changed_after is not None:
+                bound = utc_timestamp(query.changed_after)
+                # A float timestamp cannot represent fractions finer than microseconds.
+                inclusive = utc_sort_key(utc_text(bound)) >= utc_sort_key(query.changed_after)
                 statement = statement.where(
-                    SqlTaskBoardItem.changed_at >= utc_timestamp(query.changed_after)
+                    SqlTaskBoardItem.changed_at >= bound
+                    if inclusive
+                    else SqlTaskBoardItem.changed_at > bound
                 )
             if query.state != "all":
                 is_open = SqlTaskBoardItem.progress.in_(OPEN_PROGRESS)
                 statement = statement.where(is_open if query.state == "open" else ~is_open)
-            rows = list(session.scalars(statement))
-            if query.changed_after is not None:
-                rows = [
-                    row
-                    for row in rows
-                    if utc_sort_key(utc_text(row.changed_at)) >= utc_sort_key(query.changed_after)
-                ]
-            if query.closed_after is not None or query.closed_before is not None:
-                rows = [
-                    row
-                    for row in rows
-                    if _in_time_window(
-                        self._closed_time(row), query.closed_after, query.closed_before
+            closed = func.coalesce(SqlTaskBoardItem.closed_at, SqlTaskBoardItem.closed_seen_at)
+            precise_closed = func.replace(
+                SqlTaskBoardItem.body["progressUpdated"].as_string(), "Z", ""
+            )
+            for bound, lower in ((query.closed_after, True), (query.closed_before, False)):
+                if bound is not None:
+                    numeric = (
+                        closed >= utc_timestamp(bound) if lower else closed < utc_timestamp(bound)
                     )
-                ]
+                    exact = (
+                        precise_closed >= utc_sort_key(bound)
+                        if lower
+                        else precise_closed < utc_sort_key(bound)
+                    )
+                    statement = statement.where(
+                        ~SqlTaskBoardItem.progress.in_(OPEN_PROGRESS),
+                        or_(
+                            and_(precise_closed.is_not(None), exact),
+                            and_(precise_closed.is_(None), numeric),
+                        ),
+                    )
+            created = func.coalesce(
+                func.replace(SqlTaskBoardItem.body["created"].as_string(), "Z", ""), ""
+            )
+            keys = (
+                (SqlTaskBoardItem.changed_at, SqlTaskBoardItem.source_id, SqlTaskBoardItem.uid)
+                if changes
+                else (
+                    SqlTaskBoardItem.source_id,
+                    SqlTaskBoardItem.group_id,
+                    created,
+                    SqlTaskBoardItem.uid,
+                )
+            )
+            if cursor:
+                values = list(cursor["position"])
+                if changes:
+                    values[0] = utc_timestamp(values[0] + "Z")
+                statement = statement.where(_keyset(keys, values))
+            rows = list(session.scalars(statement.order_by(*keys).limit(query.limit + 1)))
+            page = rows[: query.limit]
 
             def position(row: SqlTaskBoardItem) -> tuple[str, ...]:
                 if changes:
@@ -424,10 +483,6 @@ class TaskBoardStore:
                     row.uid,
                 )
 
-            rows.sort(key=position)
-            if cursor:
-                rows = [row for row in rows if position(row) > tuple(cursor["position"])]
-            page = rows[: query.limit]
             entries = self._entries(session, owner, page, history=query.include_history)
             next_cursor = None
             if len(rows) > query.limit:
@@ -450,10 +505,22 @@ class TaskBoardStore:
         histories: dict[tuple[str, str], list[dict[str, Any]]] = {}
         identities = {(row.source_id, row.uid) for row in rows}
         if history and identities:
-            for entry in session.scalars(
-                select(SqlTaskBoardHistory).where(*self._scope(SqlTaskBoardHistory, owner))
-            ):
-                if (entry.source_id, entry.uid) in identities:
+            identity_list = sorted(identities)
+            for offset in range(0, len(identity_list), 250):
+                for entry in session.scalars(
+                    select(SqlTaskBoardHistory).where(
+                        *self._scope(SqlTaskBoardHistory, owner),
+                        or_(
+                            *(
+                                and_(
+                                    SqlTaskBoardHistory.source_id == source,
+                                    SqlTaskBoardHistory.uid == uid,
+                                )
+                                for source, uid in identity_list[offset : offset + 250]
+                            )
+                        ),
+                    )
+                ):
                     histories.setdefault((entry.source_id, entry.uid), []).append(entry.entry)
             for entries in histories.values():
                 entries.sort(key=lambda entry: (utc_sort_key(entry["time"]), entry["id"]))
@@ -494,8 +561,7 @@ class TaskBoardStore:
         snapshot: str | None = None,
         source_generation: str | None = None,
     ) -> dict[str, Any] | None:
-        with self._writes("read_task") as session:
-            self._lock_owner(session, owner)
+        with self._read("read_task") as session:
             guard_sources(
                 session, owner, source, snapshot=snapshot, source_generation=source_generation
             )
@@ -512,8 +578,7 @@ class TaskBoardStore:
         self, owner: str, query: HistoryQuery
     ) -> tuple[list[dict[str, Any]], str | None]:
         fingerprint, cursor = _read_cursor(owner, "history", query)
-        with self._writes("read_task_history") as session:
-            self._lock_owner(session, owner)
+        with self._read("read_task_history") as session:
             pins = guard_sources(
                 session,
                 owner,
@@ -525,18 +590,50 @@ class TaskBoardStore:
             statement = select(SqlTaskBoardHistory).where(*self._scope(SqlTaskBoardHistory, owner))
             if query.source is not None:
                 statement = statement.where(SqlTaskBoardHistory.source_id == query.source)
+            if query.uid is not None:
+                statement = statement.where(SqlTaskBoardHistory.uid == query.uid)
+            if query.changed_after is not None:
+                statement = statement.where(
+                    select(SqlTaskBoardItem.uid)
+                    .where(
+                        *self._scope(SqlTaskBoardItem, owner),
+                        SqlTaskBoardItem.source_id == SqlTaskBoardHistory.source_id,
+                        SqlTaskBoardItem.uid == SqlTaskBoardHistory.uid,
+                        SqlTaskBoardItem.changed_at >= utc_timestamp(query.changed_after),
+                    )
+                    .exists()
+                )
 
             def position(row: SqlTaskBoardHistory) -> tuple[str, ...]:
                 return utc_sort_key(row.entry["time"]), row.source_id, row.uid, row.entry_id
 
-            rows = sorted(session.scalars(statement), key=position, reverse=True)
-            rows = [
-                row
-                for row in rows
-                if _in_time_window(row.entry["time"], query.after, query.before)
-            ]
+            time_key = func.replace(SqlTaskBoardHistory.entry["time"].as_string(), "Z", "")
+            for bound, lower in ((query.after, True), (query.before, False)):
+                if bound is not None:
+                    # Use the timestamp index; the text predicate keeps full precision.
+                    statement = statement.where(
+                        SqlTaskBoardHistory.time >= utc_timestamp(bound)
+                        if lower
+                        else SqlTaskBoardHistory.time <= utc_timestamp(bound),
+                        time_key >= utc_sort_key(bound)
+                        if lower
+                        else time_key < utc_sort_key(bound),
+                    )
+            keys = (
+                time_key,
+                SqlTaskBoardHistory.source_id,
+                SqlTaskBoardHistory.uid,
+                SqlTaskBoardHistory.entry_id,
+            )
             if cursor:
-                rows = [row for row in rows if position(row) < tuple(cursor["position"])]
+                statement = statement.where(_keyset(keys, cursor["position"], descending=True))
+            rows = list(
+                session.scalars(
+                    statement.order_by(
+                        SqlTaskBoardHistory.time.desc(), *(key.desc() for key in keys)
+                    ).limit(query.limit + 1)
+                )
+            )
             page = rows[: query.limit]
             return [
                 {**row.entry, "source": row.source_id, "uid": row.uid} for row in page
@@ -555,12 +652,14 @@ class TaskBoardStore:
         snapshot: str | None = None,
         source_generation: str | None = None,
     ) -> list[dict[str, Any]]:
-        with self._writes("count_closed_tasks") as session:
-            self._lock_owner(session, owner)
+        with self._read("count_closed_tasks") as session:
             guard_sources(
                 session, owner, source, snapshot=snapshot, source_generation=source_generation
             )
-            statement = select(SqlTaskBoardItem).where(
+            closed_text = SqlTaskBoardItem.body["progressUpdated"].as_string()
+            statement = select(
+                SqlTaskBoardItem.source_id, closed_text, SqlTaskBoardItem.closed_seen_at
+            ).where(
                 *self._scope(SqlTaskBoardItem, owner),
                 SqlTaskBoardItem.gone_at.is_(None),
                 ~SqlTaskBoardItem.progress.in_(OPEN_PROGRESS),
@@ -568,11 +667,17 @@ class TaskBoardStore:
             if source is not None:
                 statement = statement.where(SqlTaskBoardItem.source_id == source)
             counts: dict[tuple[str, str], int] = {}
-            for row in session.scalars(statement):
-                closed = self._closed_time(row)
+            for source_id, supplied, seen_at in session.execute(statement):
+                closed = (
+                    supplied
+                    if supplied is not None
+                    else utc_text(seen_at)
+                    if seen_at is not None
+                    else None
+                )
                 if closed is not None and _in_time_window(closed, after, before):
                     day = (datetime.fromisoformat(closed) + timedelta(minutes=offset)).date()
-                    key = day.isoformat(), row.source_id
+                    key = day.isoformat(), source_id
                     counts[key] = counts.get(key, 0) + 1
             return [
                 {"day": day, "source": source_id, "closed": count}
@@ -604,8 +709,7 @@ class TaskBoardStore:
         return run_write_transaction(self._writes, "delete_task_source", remove)
 
     def list_sources(self, owner: str) -> list[dict[str, Any]]:
-        with self._writes("read_task_sources") as session:
-            self._lock_owner(session, owner)
+        with self._read("read_task_sources") as session:
             counts: dict[str, dict[str, int]] = {}
             for source_id, progress, gone_at, count in session.execute(
                 select(
@@ -666,8 +770,7 @@ class TaskBoardStore:
         limit: int = 1000,
         cursor: str | None = None,
     ) -> dict[str, Any]:
-        with self._writes("read_source_display") as session:
-            self._lock_owner(session, owner)
+        with self._read("read_source_display") as session:
             pins = guard_sources(
                 session, owner, source_id, snapshot=snapshot, source_generation=source_generation
             )
