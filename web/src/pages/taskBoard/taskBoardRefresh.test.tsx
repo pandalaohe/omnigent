@@ -142,6 +142,7 @@ it.each(["source", "group", "focus"] as const)(
         state: "running",
         lastActivity: new Date(now).toISOString(),
       },
+      "omnigent.ai:workedBy": [{ session: `session-${index}`, from: "2026-11-06T00:00:00Z" }],
     }));
     tasks[0]["omnigent.ai:sourceDisplay"]!.relations = [
       {
@@ -389,6 +390,9 @@ it("opens explicit hub membership grouped by source and refreshes its task count
       version: 1 as const,
       state: index === 0 ? ("running" as const) : ("held" as const),
     },
+    ...(index === 0 && {
+      "omnigent.ai:workedBy": [{ session: "session-root", from: "2026-11-06T00:00:00Z" }],
+    }),
   }));
   tasks[0]["omnigent.ai:sourceDisplay"] = {
     ...tasks[0]["omnigent.ai:sourceDisplay"],

@@ -199,6 +199,7 @@
 .rt-scene {
   position: relative;
   isolation: isolate;
+  contain: layout style;
   min-height: 1px;
 }
 .rt-svg {
@@ -216,7 +217,8 @@
   stroke-width: 1.5;
   opacity: 0.34;
 }
-.rt-edge-focus .rt-connection {
+.rt-edge-focus .rt-connection,
+.rt-edge-hover .rt-connection {
   opacity: 0.18;
 }
 .rt-connection.active {
@@ -611,6 +613,7 @@
 .rt-tooltip {
   position: fixed;
   z-index: 100;
+  contain: layout style;
   max-width: min(380px, calc(100vw - 16px));
   pointer-events: none;
 }
@@ -973,10 +976,12 @@
 .rt-label-blocked b {
   font-weight: 500;
 }
-.rt-edge-focus .rt-rail {
+.rt-edge-focus .rt-rail,
+.rt-edge-hover .rt-rail {
   opacity: 0.18;
 }
-.rt-edge-focus .rt-long:not(.active) {
+.rt-edge-focus .rt-long:not(.active),
+.rt-edge-hover .rt-long:not(.active) {
   opacity: 0.12;
 }
 .rt-long.active {

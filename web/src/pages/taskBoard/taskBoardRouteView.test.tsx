@@ -123,9 +123,37 @@ it("dims the map for a connector only once the pointer rests on it", () => {
   fireEvent.mouseEnter(edge);
   fireEvent.mouseLeave(edge);
   act(() => vi.advanceTimersByTime(200));
-  expect(view.container.querySelector(".rt-edge-focus")).toBeNull();
+  expect(view.container.querySelector(".rt-edge-hover")).toBeNull();
   fireEvent.mouseEnter(edge);
   act(() => vi.advanceTimersByTime(200));
-  expect(view.container.querySelector(".rt-edge-focus")).toBeTruthy();
+  expect(view.container.querySelector(".rt-edge-hover")).toBeTruthy();
   vi.useRealTimers();
+});
+
+it("keeps recent and pinned cards that the board window would drop", () => {
+  const old = new Date(now - 10 * DAY).toISOString();
+  const cards = [
+    card("1", "busy", live),
+    card("late", "closed-late", {
+      progress: "completed",
+      progressUpdated: new Date(now - 2 * DAY).toISOString(),
+      updated: new Date(now - DAY).toISOString(),
+    }),
+    card("archived", "archive-task", { progress: "completed", progressUpdated: old, updated: old }),
+    card("gone", "archive-group", { progress: "completed", progressUpdated: old, updated: old }),
+  ];
+  localStorage.setItem(
+    ROUTE_VIEW_KEY,
+    JSON.stringify({
+      pins: {
+        tasks: [JSON.stringify(["work", "archived"])],
+        groups: [JSON.stringify(["work", "archive-group"])],
+      },
+    }),
+  );
+  const view = render(board(cards));
+  for (const name of ["Group closed-late", "Group archive-task", "Group archive-group"])
+    expect(screen.getByRole("heading", { name })).toBeTruthy();
+  for (const uid of ["late", "archived", "gone"])
+    expect(view.container.querySelector(`.rt-stop[data-route-task="${uid}"]`)).toBeTruthy();
 });

@@ -32,21 +32,17 @@ export type RouteState = NonNullable<TaskDisplay["state"]>;
 export const routeLive = (task: BoardTask) =>
   !!task["omnigent.ai:sourceDisplay"]?.sessions?.some((session) => session.status === "running") ||
   !!task["omnigent.ai:workedBy"]?.some((span) => !span.to);
-export const routeState = (task: BoardTask): RouteState =>
-  task["omnigent.ai:sourceDisplay"]?.state ??
-  (task["omnigent.ai:waiting"]
-    ? task["omnigent.ai:waiting"].on === "user"
-      ? "user"
-      : "blocked"
-    : taskProgress(task) === "in-process"
-      ? routeLive(task)
-        ? "running"
-        : "held"
-      : ["completed", "cancelled"].includes(taskProgress(task))
-        ? "done"
-        : taskProgress(task) === "failed"
-          ? "failed"
-          : "queued");
+export function routeState(task: BoardTask): RouteState {
+  const supplied = task["omnigent.ai:sourceDisplay"]?.state;
+  // A source may call a card running; without live work behind it the card is open and idle.
+  if (supplied) return supplied === "running" && !routeLive(task) ? "held" : supplied;
+  if (task["omnigent.ai:waiting"])
+    return task["omnigent.ai:waiting"].on === "user" ? "user" : "blocked";
+  const progress = taskProgress(task);
+  if (progress === "in-process") return routeLive(task) ? "running" : "held";
+  if (progress === "completed" || progress === "cancelled") return "done";
+  return progress === "failed" ? "failed" : "queued";
+}
 export const routeAttention = (task: BoardTask) =>
   ["running", "user", "failed"].includes(routeState(task));
 export const routeQueued = (task: BoardTask) => ["queued", "blocked"].includes(routeState(task));
@@ -438,8 +434,9 @@ export interface MapFold {
   tasks: BoardTask[];
   queued: boolean;
 }
-const urgency: Partial<Record<RouteState, number>> = { running: 0, user: 1, failed: 2, blocked: 3 };
-/** Important cards first: running, waiting on you, failed, blocked, then the most recent. */
+const urgency: Partial<Record<RouteState, number>> = { user: 0, running: 1, failed: 2, blocked: 3 };
+const needsUser = (task: BoardTask) => routeState(task) === "user";
+/** Important cards first: waiting on you, running, failed, blocked, then the most recent. */
 const byUrgency = (tasks: BoardTask[]) =>
   tasks
     .map((task, index) => ({ task, index }))
@@ -450,8 +447,9 @@ const byUrgency = (tasks: BoardTask[]) =>
     )
     .map((item) => item.task);
 /**
- * Fit a row into `room` stops. Important cards stay stations; the rest keep the newest finished and
- * the next queued in turn, and whatever does not fit folds in place into counted capsules.
+ * Fit a row into `room` stops. Cards waiting on the user always stay stations; other important cards
+ * come next, then the newest finished and the next queued in turn, and whatever does not fit folds
+ * in place into counted capsules.
  */
 export function orderStops(
   tasks: BoardTask[],
@@ -463,7 +461,14 @@ export function orderStops(
   const past = tasks.filter((task) => !routeQueued(task)),
     queued = tasks.filter(routeQueued);
   if (collapsed) {
-    const shown = new Set(byUrgency(past.filter(important)).slice(0, Math.max(0, room - 2)));
+    const waiting = past.filter(needsUser),
+      shown = new Set([
+        ...waiting,
+        ...byUrgency(past.filter((task) => important(task) && !needsUser(task))).slice(
+          0,
+          Math.max(0, room - 2 - waiting.length),
+        ),
+      ]);
     return [
       past.filter((task) => !shown.has(task)),
       ...past.filter((task) => shown.has(task)).map((task) => [task]),
@@ -482,15 +487,17 @@ export function orderStops(
   const index = new Map(tasks.map((task, position) => [task, position])),
     kept = new Array<boolean>(tasks.length).fill(false);
   let entries = 1;
-  for (const task of candidates) {
+  const keep = (task: BoardTask, forced: boolean) => {
     const at = index.get(task)!,
       left = at > 0 && !kept[at - 1],
       right = at + 1 < tasks.length && !kept[at + 1],
       change = left && right ? 2 : left || right ? 1 : 0;
-    if (entries + change > room) continue;
+    if (kept[at] || (!forced && entries + change > room)) return;
     kept[at] = true;
     entries += change;
-  }
+  };
+  tasks.filter(needsUser).forEach((task) => keep(task, true));
+  candidates.forEach((task) => keep(task, false));
   const out: MapFold[] = [];
   let run: BoardTask[] = [];
   tasks.forEach((task, at) => {
@@ -1002,12 +1009,21 @@ export function mapScene(
     const minimum = lane.collapsed ? 34 : level === "station" ? 60 : 84;
     const pinnedX = Math.min(right - 8, x(now)),
       pinnedGap = lane.collapsed ? 38 : 50,
-      // Live stops stack left of now; those that would run past the row start share one capsule.
+      // Live stops stack left of now; running ones that would run past the row start share one
+      // capsule, while cards waiting on the user always keep their own stop.
       liveRoom = Math.max(1, Math.floor((pinnedX - gutter - minimum) / pinnedGap) + 1),
-      pinned: BoardTask[][] =
-        live.length > liveRoom
-          ? [live.slice(liveRoom - 1), ...live.slice(0, liveRoom - 1).map((task) => [task])]
-          : live.map((task) => [task]),
+      waiting = live.filter(needsUser),
+      working = live.filter((task) => !needsUser(task)),
+      workingRoom = Math.max(1, liveRoom - waiting.length),
+      pinned: BoardTask[][] = [
+        ...(working.length > workingRoom
+          ? [
+              working.slice(workingRoom - 1),
+              ...working.slice(0, workingRoom - 1).map((task) => [task]),
+            ]
+          : working.map((task) => [task])),
+        ...waiting.map((task) => [task]),
+      ],
       limit = pinned.length ? pinnedX - (pinned.length - 1) * pinnedGap - minimum : Infinity;
     const clusters: { x: number; end: number; tasks: BoardTask[] }[] = [];
     for (const task of rest) {

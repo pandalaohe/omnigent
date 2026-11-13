@@ -32,6 +32,9 @@ const task = (
     state,
     lastActivity: new Date(now - HOUR).toISOString(),
   },
+  ...(state === "running" && {
+    "omnigent.ai:workedBy": [{ session: "s", from: new Date(now - HOUR).toISOString() }],
+  }),
 });
 const cache = (days: SourceCache["display"]["closedDays"]): SourceCache => ({
   pin: {
@@ -373,6 +376,69 @@ describe("route view on real-sized rows", () => {
     expect(stops.length).toBeLessThanOrEqual(9);
     expect(singles).toEqual(expect.arrayContaining(["run-a", "user-a", "next-0", "done-29"]));
     expect(stops.flatMap((stop) => stop.tasks)).toEqual(tasks);
+  });
+  it("runs a card the source calls running only while live work backs it", () => {
+    const shown = (extra: Partial<BoardTask>) =>
+      routeState(
+        open("supplied", {
+          "omnigent.ai:sourceDisplay": { version: 1, state: "running", sessions: [] },
+          ...extra,
+        }),
+      );
+    expect(shown({})).toBe("held");
+    expect(
+      shown({ "omnigent.ai:workedBy": [{ session: "s1", from: "2026-11-05", to: "2026-11-06" }] }),
+    ).toBe("held");
+    expect(shown({ "omnigent.ai:workedBy": [{ session: "s1", from: "2026-11-06" }] })).toBe(
+      "running",
+    );
+    expect(routeState(task("waiting", "user"))).toBe("user");
+    expect(routeState(task("broken", "failed"))).toBe("failed");
+  });
+  it("never folds a card that needs the user into a capsule", () => {
+    const live = { "omnigent.ai:workedBy": [{ session: "s1", from: "2026-11-06" }] },
+      waiting = { "omnigent.ai:waiting": { on: "user" } };
+    const row = [
+      open("held0"),
+      open("running1", live),
+      open("held2"),
+      open("user3", waiting),
+      open("held4"),
+      open("held5"),
+      open("held6"),
+    ];
+    const single = (stops: ReturnType<typeof orderStops>, uid: string) =>
+      stops.some((stop) => stop.tasks.length === 1 && stop.tasks[0].uid === uid);
+    expect(single(orderStops(row, 3), "user3")).toBe(true);
+    const crowded = [
+      ...Array.from({ length: 4 }, (_, index) => open(`run${index}`, live)),
+      open("user", waiting),
+      open("held"),
+    ];
+    expect(single(orderStops(crowded, 5, true), "user")).toBe(true);
+    const busy = [
+      ...Array.from({ length: 12 }, (_, index) => open(`run${index}`, live)),
+      open("user-a", waiting),
+      open("user-b", waiting),
+    ].map((item) => ({ ...item, "omnigent.ai:group": { id: "alpha" } }));
+    const group = mapGroups(busy, [{ id: "example", name: "Example", source: null }], {}, now)[0];
+    const scene = mapScene(
+      [{ ...group, top: 0, height: 136, nodes: [] }],
+      "time",
+      initialWindow(now),
+      700,
+      now,
+      "station",
+      [],
+      new Map(),
+      {},
+      () => "",
+    );
+    for (const uid of ["user-a", "user-b"])
+      expect(scene.nodes.some((node) => node.tasks.length === 1 && node.tasks[0].uid === uid)).toBe(
+        true,
+      );
+    expect(scene.nodes.some((node) => node.tasks.length > 1)).toBe(true);
   });
   it("folds urgent cards that do not fit instead of overlapping them", () => {
     const tasks = Array.from({ length: 20 }, (_, index) => task(`run-${index}`, "running"));
