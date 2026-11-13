@@ -1707,7 +1707,7 @@ class ClaudeNativeToolRelay:
             "tools": _normalize_relay_tool_specs(tools),
             "updated_at": time.time(),
         }
-        _write_json_file(self._bridge_dir / _TOOL_RELAY_FILE, relay_info)
+        _publish_tool_relay(self._bridge_dir, relay_info)
         self._relay_info = relay_info
         self._advertised_tool_names = _relay_info_tool_names(relay_info)
         self._tool_executor = tool_executor
@@ -1738,6 +1738,10 @@ class ClaudeNativeToolRelay:
         if _read_json_file(relay_file).get("url") == self._advertised_url:
             with contextlib.suppress(FileNotFoundError):
                 relay_file.unlink()
+        candidate = _session_tool_relay_file(self._bridge_dir, self._relay_info.get("session_id"))
+        if candidate is not None and _read_json_file(candidate).get("url") == self._advertised_url:
+            with contextlib.suppress(FileNotFoundError):
+                candidate.unlink()
         self._closed.set()
         self._httpd.shutdown()
         self._httpd.server_close()
@@ -2650,6 +2654,9 @@ def write_active_session_id(bridge_dir: Path, session_id: str) -> None:
         config["conversation_id"] = session_id
         config["updated_at"] = time.time()
         _write_json_file(bridge_dir / _CONFIG_FILE, config)
+        candidate = _session_tool_relay_file(bridge_dir, session_id)
+        if candidate is not None and (relay_info := _read_json_file(candidate)):
+            _activate_tool_relay(bridge_dir, relay_info)
     # The new session's policies were never checked.
     policy_allow_cache.invalidate(bridge_dir)
 
@@ -9258,6 +9265,35 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
     )
 
 
+def _session_tool_relay_file(bridge_dir: Path, session_id: object) -> Path | None:
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    digest = hashlib.sha256(session_id.encode()).hexdigest()
+    return bridge_dir / f"tool_relay.{digest}.json"
+
+
+def _activate_tool_relay(bridge_dir: Path, relay_info: _JsonObject) -> None:
+    _write_json_file(bridge_dir / _TOOL_RELAY_FILE, relay_info)
+    _write_private_file(
+        bridge_dir / _TOOL_RELAY_ENV_FILE,
+        f"OMNIGENT_RELAY_URL='{relay_info['url']}'\nOMNIGENT_RELAY_TOKEN='{relay_info['token']}'\n",
+    )
+
+
+def _publish_tool_relay(bridge_dir: Path, relay_info: _JsonObject) -> None:
+    with _bridge_metadata_write_lock(bridge_dir):
+        config = _read_json_file(bridge_dir / _CONFIG_FILE)
+        active = config.get("active_session_id") or config.get("conversation_id")
+        candidate = _session_tool_relay_file(bridge_dir, relay_info.get("session_id"))
+        # Claude successors initialize before their terminal transfer is confirmed.
+        # Other native harnesses do not have an active-session bridge binding.
+        if isinstance(active, str) and active and candidate is not None:
+            _write_json_file(candidate, relay_info)
+            if active != relay_info["session_id"]:
+                return
+        _activate_tool_relay(bridge_dir, relay_info)
+
+
 def start_tool_relay(
     *,
     bridge_dir: Path,
@@ -9360,13 +9396,7 @@ def start_tool_relay(
             relay_info["permission_tiers_v1"] = True
     if pi_scope_relay is not None:
         relay_info["pi_scopes_v2"] = True
-    _write_json_file(bridge_dir / _TOOL_RELAY_FILE, relay_info)
-    # token_urlsafe's alphabet is [A-Za-z0-9_-], safe inside single quotes.
-    # Hooks source this file whenever they run, so it is replaced whole.
-    _write_private_file(
-        bridge_dir / _TOOL_RELAY_ENV_FILE,
-        f"OMNIGENT_RELAY_URL='{advertised_url}'\nOMNIGENT_RELAY_TOKEN='{token}'\n",
-    )
+    _publish_tool_relay(bridge_dir, relay_info)
     relay = ClaudeNativeToolRelay(
         bridge_dir=bridge_dir,
         httpd=httpd,
@@ -11145,6 +11175,12 @@ def _read_relay_tool_specs(bridge_dir: Path) -> list[_JsonObject]:
         relay files return an empty list.
     """
     relay = _read_json_file(bridge_dir / _TOOL_RELAY_FILE)
+    active = read_active_session_id(bridge_dir)
+    candidate = _session_tool_relay_file(bridge_dir, active)
+    if candidate is not None and (current := _read_json_file(candidate)):
+        relay = current
+    if active and relay.get("session_id") not in (None, active):
+        return []
     raw_tools = relay.get("tools") if isinstance(relay, dict) else None
     if not isinstance(raw_tools, list):
         return []
@@ -11166,6 +11202,15 @@ def _call_relay_tool(
     :returns: MCP tool-call result.
     """
     relay = _read_json_file(bridge_dir / _TOOL_RELAY_FILE)
+    active = read_active_session_id(bridge_dir)
+    candidate = _session_tool_relay_file(bridge_dir, active)
+    if candidate is not None and (current := _read_json_file(candidate)):
+        relay = current
+    if active and relay.get("session_id") not in (None, active):
+        return _mcp_error(
+            "Omnigent session rotation is still pending. Retry this tool after the "
+            "rotation finishes; if it persists, send a message in the original session."
+        )
     token = relay.get("token")
     url = relay.get("url")
     if not isinstance(token, str) or not isinstance(url, str):

@@ -218,6 +218,7 @@ _PROVIDER_USAGE_LIMITS_REFRESH_INTERVAL_S = 300
 # progress rather than that a healthy backlog drain simply took a long time.
 _FORWARD_LOOP_STALL_DEADLINE_S = 300.0
 _POST_TIMEOUT_S = 10.0
+_CLEAR_SUCCESSOR_BIND_TIMEOUT_S = 180.0
 # A child-history POST carries up to 100 items and can outlast the live lane's
 # budget; that lane runs off the latency-sensitive path, so it gets more room.
 _SUBAGENT_POST_TIMEOUT_S = 30.0
@@ -581,6 +582,8 @@ class HookForwardState:
     pending_clear_old_id: str | None = None
     pending_clear_new_id: str | None = None
     pending_clear_transferred: bool = False
+    clear_rotation_attempt: str | None = None
+    clear_recovery_notice_attempt: str | None = None
     posted_compaction_status_key: str | None = None
 
 
@@ -5179,6 +5182,63 @@ async def supervise_forwarder(
         backoff_s = min(backoff_s * 2.0, _SUPERVISOR_MAX_BACKOFF_S)
 
 
+class _ClearSuccessorRefused(RuntimeError):
+    """The clear landed, but the server refused to prepare its successor."""
+
+
+_CLEAR_REFUSAL_REASONS = {
+    "not_top_level": "Only a top-level session can rotate.",
+    "source_changed": "Source session changed.",
+    "archived": "Source session is archived.",
+    "target_archived": "Successor is archived.",
+    "conflict": "Session state conflicts with successor creation.",
+}
+
+
+async def _post_clear_recovery_notice(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    source_id: str,
+    detail: str,
+    bridge_dir: Path,
+) -> None:
+    checkpoint = _read_hook_state(bridge_dir) or HookForwardState(event_cursor=0)
+    attempt = checkpoint.clear_rotation_attempt or uuid.uuid4().hex
+    if checkpoint.clear_recovery_notice_attempt == attempt:
+        return
+    # Best-effort means one send attempt, including when its reply is lost.
+    await _write_hook_state_async(
+        bridge_dir,
+        replace(checkpoint, clear_rotation_attempt=attempt, clear_recovery_notice_attempt=attempt),
+    )
+    text = (
+        f"[System: Clear accepted. {detail} "
+        f"Read the handover note before continuing. If it is missing, "
+        f"call sys_session_get_history for session "
+        f"'{source_id}' and read its latest handover note before continuing work.]"
+    )
+    try:
+        response = await client.post(
+            f"/v1/sessions/{url_component(session_id)}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "stable_id": hashlib.sha256(
+                        f"clear-recovery:{source_id}:{attempt}".encode()
+                    ).hexdigest()[:32],
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            },
+        )
+        response.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Could not post clear recovery notice for session=%s", session_id, exc_info=True
+        )
+
+
 async def _maybe_rotate_session_on_clear(
     *,
     client: httpx.AsyncClient,
@@ -5233,8 +5293,20 @@ async def _maybe_rotate_session_on_clear(
             )
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as exc:
         pending = _read_hook_state(bridge_dir)
+        detail = (
+            str(exc)
+            if isinstance(exc, _ClearSuccessorRefused)
+            else f"Session handover did not complete ({type(exc).__name__})."
+        )
+        await _post_clear_recovery_notice(
+            client,
+            session_id=read_active_session_id(bridge_dir) or session_id,
+            source_id=session_id,
+            detail=detail + " This session continues here.",
+            bridge_dir=bridge_dir,
+        )
         if pending is not None and pending.pending_clear_new_id:
             # Retry the same candidate; unknown ownership is not rejection.
             raise
@@ -5310,6 +5382,9 @@ async def _create_clear_replacement_session(
     """
     checkpoint = _read_hook_state(bridge_dir) or HookForwardState(event_cursor=0)
     old_session_id = checkpoint.pending_clear_old_id or old_session_id
+    if checkpoint.clear_rotation_attempt is None:
+        checkpoint = replace(checkpoint, clear_rotation_attempt=uuid.uuid4().hex)
+        await _write_hook_state_async(bridge_dir, checkpoint)
     old = await _fetch_session_snapshot(client, old_session_id)
     agent_id = old.get("agent_id")
     if not isinstance(agent_id, str) or not agent_id:
@@ -5332,6 +5407,18 @@ async def _create_clear_replacement_session(
             raise RuntimeError("clear replacement was already rejected and archived")
     if new_session_id is None:
         create_resp = await client.post(f"/v1/sessions/{url_component(old_session_id)}/successor")
+        if create_resp.is_error:
+            try:
+                error = create_resp.json().get("error", {})
+                reason_code = error.get("code") if isinstance(error, dict) else None
+            except (ValueError, AttributeError):
+                reason_code = None
+            reason = (
+                _CLEAR_REFUSAL_REASONS.get(reason_code) if isinstance(reason_code, str) else None
+            ) or "Successor rejection reason unavailable."
+            detail = f"successor creation was refused (HTTP {create_resp.status_code}: {reason})."
+            _logger.warning("Clear accepted but %s source=%s", detail, old_session_id)
+            raise _ClearSuccessorRefused(detail)
         create_resp.raise_for_status()
         created = _parse_json_response(create_resp, context="clear-replacement session create")
         new_session_id = created.get("id")
@@ -5370,11 +5457,27 @@ async def _create_clear_replacement_session(
             source_present, target_present = await owners()
             transferred = target_present and not source_present
         if isinstance(runner_id, str) and runner_id:
-            bind_resp = await client.patch(
-                f"/v1/sessions/{url_component(new_session_id)}",
-                json={"runner_id": runner_id},
-            )
-            bind_resp.raise_for_status()
+            try:
+                bind_resp = await client.patch(
+                    f"/v1/sessions/{url_component(new_session_id)}",
+                    json={"runner_id": runner_id},
+                    timeout=_CLEAR_SUCCESSOR_BIND_TIMEOUT_S,
+                )
+                bind_resp.raise_for_status()
+            except httpx.TimeoutException:
+                try:
+                    candidate = await _fetch_session_snapshot(client, new_session_id)
+                except (httpx.HTTPError, RuntimeError) as exc:
+                    # Keep the durable candidate: a missing read is not a failed bind.
+                    raise RuntimeError(
+                        "Successor binding is unconfirmed; retry reconciliation"
+                    ) from exc
+                if candidate.get("archived") or candidate.get("runner_id") != runner_id:
+                    raise
+                _logger.info(
+                    "Successor bind timed out but server confirms runner; session=%s",
+                    new_session_id,
+                )
         if not transferred:
             transfer_resp = await client.post(
                 (
@@ -5382,6 +5485,7 @@ async def _create_clear_replacement_session(
                     f"/resources/terminals/{url_component(terminal_id)}/transfer"
                 ),
                 json={"target_session_id": new_session_id},
+                timeout=_CLEAR_SUCCESSOR_BIND_TIMEOUT_S,
             )
             transfer_resp.raise_for_status()
     except httpx.HTTPError:
@@ -5450,6 +5554,13 @@ async def _create_clear_replacement_session(
             new_session_id=new_session_id,
             allow_empty=True,
         )
+    await _post_clear_recovery_notice(
+        client,
+        session_id=new_session_id,
+        source_id=old_session_id,
+        detail="Session handover is continuing in this session.",
+        bridge_dir=bridge_dir,
+    )
     return new_session_id
 
 
@@ -8155,6 +8266,8 @@ def _validated_hook_state(
         pending_clear_old_id=state.pending_clear_old_id,
         pending_clear_new_id=state.pending_clear_new_id,
         pending_clear_transferred=state.pending_clear_transferred,
+        clear_rotation_attempt=state.clear_rotation_attempt,
+        clear_recovery_notice_attempt=state.clear_recovery_notice_attempt,
     )
 
 
@@ -9981,6 +10094,12 @@ def _read_hook_state(bridge_dir: Path) -> HookForwardState | None:
         if isinstance(raw.get("pending_clear_new_id"), str)
         else None,
         pending_clear_transferred=raw.get("pending_clear_transferred") is True,
+        clear_rotation_attempt=raw.get("clear_rotation_attempt")
+        if isinstance(raw.get("clear_rotation_attempt"), str)
+        else None,
+        clear_recovery_notice_attempt=raw.get("clear_recovery_notice_attempt")
+        if isinstance(raw.get("clear_recovery_notice_attempt"), str)
+        else None,
         posted_compaction_status_key=posted_compaction_status_key,
     )
 
@@ -10008,6 +10127,10 @@ def _write_hook_state(bridge_dir: Path, state: HookForwardState) -> None:
         payload["pending_clear_transferred"] = state.pending_clear_transferred
     if state.posted_compaction_status_key is not None:
         payload["posted_compaction_status_key"] = state.posted_compaction_status_key
+    if state.clear_rotation_attempt is not None:
+        payload["clear_rotation_attempt"] = state.clear_rotation_attempt
+    if state.clear_recovery_notice_attempt is not None:
+        payload["clear_recovery_notice_attempt"] = state.clear_recovery_notice_attempt
     _write_json_atomic(bridge_dir / _HOOK_STATE_FILE, payload)
 
 
