@@ -20,7 +20,8 @@ import { eventMother, localDay, type BoardEvent } from "./taskBoardActivityData"
 import { boardGroupColors } from "./taskBoardSessionData";
 import { BoardIdentityMark } from "./BoardIdentityMark";
 import { TaskBoardFoldText } from "./TaskBoardFoldText";
-import { activityHistoryValue } from "./taskBoardPresentation";
+import { activityHistoryValue, activityName } from "./taskBoardPresentation";
+import type { TaskDisplay } from "./taskBoardDisplay";
 import { t } from "./taskBoardText";
 import {
   activityNumber,
@@ -55,11 +56,15 @@ const icons = {
   commit: GitBranch,
 };
 type LogCategory = "created" | "done" | "relation" | "changes" | "activity";
+type RichEvent = NonNullable<TaskDisplay["events"]>[number];
+interface LogEvent extends BoardEvent {
+  rich?: { task: BoardTask; event: RichEvent };
+}
 interface LogRow {
-  event: BoardEvent;
+  event: LogEvent;
   category: LogCategory;
   changeBreakdown?: string[];
-  changes?: BoardEvent[];
+  changes?: LogEvent[];
 }
 const logCategory = (kind: string): LogCategory => {
   if (["field", "assignee", "other"].includes(kind)) return "changes";
@@ -68,6 +73,62 @@ const logCategory = (kind: string): LogCategory => {
   if (["relation", "parent"].includes(kind)) return "relation";
   return "activity";
 };
+const eventCommits = (
+  display: TaskDisplay | undefined,
+  rich: RichEvent | undefined,
+  time: string,
+) =>
+  (display?.commits ?? []).filter(
+    (commit) =>
+      rich?.commitIds?.includes(commit.id) ||
+      (rich?.from &&
+        Date.parse(commit.at) >= Date.parse(rich.from) &&
+        Date.parse(commit.at) <= Date.parse(time)),
+  );
+
+function RichEventDetail({
+  display,
+  event,
+  time,
+}: {
+  display?: TaskDisplay;
+  event?: RichEvent;
+  time: string;
+}) {
+  const commits = eventCommits(display, event, time);
+  return (
+    <>
+      {event && (
+        <p>
+          {activityAgentName(
+            event.agentId,
+            display?.actors?.find((a) => a.agentId === event.agentId)?.label,
+          )}
+          {event.host && ` · ${activityName(event.host) ?? t("g6.otherHost")}`}
+          {event.workSeconds !== undefined && ` · ${activityDuration(event.workSeconds)}`}
+        </p>
+      )}
+      {event?.from && (
+        <div className="dc-tiles">
+          <div>{activityStamp(Date.parse(event.from))}</div>
+          <div>{activityStamp(Date.parse(time))}</div>
+          <div>
+            {activityNumber(commits.length)} {t("g6.commits")}
+          </div>
+        </div>
+      )}
+      <ul className="lgd-c">
+        {commits.slice(0, 4).map((commit) => (
+          <li key={commit.id}>
+            <code>{commit.sha}</code>
+            <em>{activityStamp(Date.parse(commit.at), true)}</em>
+            <span>{commit.subject}</span>
+          </li>
+        ))}
+      </ul>
+    </>
+  );
+}
 export function TaskBoardLog({
   tasks,
   sessions,
@@ -104,24 +165,19 @@ export function TaskBoardLog({
     })),
   );
   const richMap = new Map(rich.map((r) => [r.key, r]));
-  const supplied = new Set(
-    tasks
-      .filter((task) => task["omnigent.ai:sourceDisplay"]?.events !== undefined)
-      .map(taskIdentity),
+  const combined = new Map<string, LogEvent>(
+    events.map((e) => [JSON.stringify([e.source, e.uid, e.id]), e]),
   );
-  const combined = new Map(
-    events
-      .filter((event) => !supplied.has(JSON.stringify([event.source, event.uid])))
-      .map((e) => [JSON.stringify([e.source, e.uid, e.id]), e]),
-  );
-  rich.forEach(({ event, key }) =>
+  rich.forEach(({ task, event, key }) =>
     combined.set(key, {
+      ...combined.get(key),
       id: event.id,
       time: event.at,
       source: event.task.source,
       uid: event.task.uid,
       kind: kinds[event.kind] ?? event.kind,
-      label: event.label,
+      label: event.label ?? combined.get(key)?.label,
+      rich: { task, event },
     }),
   );
   const rawLive = [...combined.values()].sort(
@@ -132,7 +188,7 @@ export function TaskBoardLog({
   );
   const changeGroups = new Map<
     string,
-    { event: BoardEvent; kinds: Map<string, number>; changes: BoardEvent[] }
+    { event: LogEvent; kinds: Map<string, number>; changes: LogEvent[] }
   >();
   const live: LogRow[] = [];
   for (const event of rawLive) {
@@ -209,17 +265,17 @@ export function TaskBoardLog({
             ? t("routes.yesterday")
             : day.slice(5)
         : by === "mother"
-          ? (rootSession?.label ??
-            sessions.find((s) => s.id === root)?.title ??
-            (mother?.label !== mother?.id ? mother?.label : undefined) ??
-            t("activity.unassigned"))
-          : (identity?.groupLabel ??
-            task?.["omnigent.ai:group"]?.name ??
+          ? (activityName(
+              rootSession?.label,
+              sessions.find((s) => s.id === root)?.title,
+              mother?.label !== mother?.id ? mother?.label : undefined,
+            ) ?? t("activity.unassigned"))
+          : (activityName(identity?.groupLabel, task?.["omnigent.ai:group"]?.name) ??
             activitySourceName(event.source, task, sourceLabels));
     if (!groups.has(key))
       groups.set(key, {
         label,
-        subtitle: by === "time" ? day.slice(5) : rootSession?.title,
+        subtitle: by === "time" ? day.slice(5) : activityName(rootSession?.title),
         agent: by === "mother" ? rootSession?.agentId : undefined,
         rows: [],
       });
@@ -263,7 +319,7 @@ export function TaskBoardLog({
         <button
           type="button"
           className={`l-play ${paused ? "on" : ""}`}
-          disabled={by !== "time"}
+          disabled={by !== "time" && !paused}
           onClick={() => setPaused(paused ? null : live)}
         >
           {paused ? <Play size={14} /> : <Pause size={14} />}
@@ -301,13 +357,7 @@ export function TaskBoardLog({
                   k = kinds[row.kind] ?? row.kind,
                   Icon = icons[k as keyof typeof icons] ?? Clock,
                   check = d?.checks?.find((c) => c.id === r?.checkId),
-                  commits = (d?.commits ?? []).filter(
-                    (c) =>
-                      r?.commitIds?.includes(c.id) ||
-                      (r?.from &&
-                        Date.parse(c.at) >= Date.parse(r.from) &&
-                        Date.parse(c.at) <= Date.parse(row.time)),
-                  );
+                  commits = eventCommits(d, r, row.time);
                 const other = d?.checks
                   ?.filter((c) => c.host !== check?.host)
                   .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0];
@@ -409,7 +459,8 @@ export function TaskBoardLog({
                               fontWeight: 700,
                             }}
                           >
-                            {d.identity.groupBadge ?? d.identity.groupId}
+                            {activityName(d.identity.groupBadge, d.identity.groupId) ??
+                              t("g6.other")}
                           </span>
                         )}
                         <span>{activitySourceName(row.source, task, sourceLabels)}</span>
@@ -424,45 +475,60 @@ export function TaskBoardLog({
                             <ol>
                               {item.changes
                                 ?.slice((pages[id] ?? 0) * 25, (pages[id] ?? 0) * 25 + 25)
-                                .map((event) => (
-                                  <li key={event.id}>
-                                    <time>{activityStamp(Date.parse(event.time), true)}</time>
-                                    {" · "}
-                                    <b>{activityFieldName(event.field ?? event.kind, task)}</b>
-                                    {event.label && (
-                                      <span>
-                                        {" · "}
-                                        {activityHistoryValue(event.label)}
-                                      </span>
-                                    )}
-                                    {event.actor && (
-                                      <span>
-                                        {" · "}
-                                        {activityAgentName(event.actor)}
-                                      </span>
-                                    )}
-                                    {event.from !== undefined && (
-                                      <div>
-                                        <small>{t("g6.changedFrom")}</small>
-                                        <TaskBoardFoldText
-                                          value={activityHistoryValue(event.from)}
+                                .map((event) => {
+                                  const original = event.rich;
+                                  return (
+                                    <li key={event.id}>
+                                      <time>{activityStamp(Date.parse(event.time), true)}</time>
+                                      {" · "}
+                                      <b>{activityFieldName(event.field ?? event.kind, task)}</b>
+                                      {event.label && (
+                                        <span>
+                                          {" · "}
+                                          {activityHistoryValue(event.label)}
+                                        </span>
+                                      )}
+                                      {original ? (
+                                        <RichEventDetail
+                                          display={original.task["omnigent.ai:sourceDisplay"]}
+                                          event={original.event}
+                                          time={event.time}
                                         />
-                                      </div>
-                                    )}
-                                    {event.to !== undefined && (
-                                      <div>
-                                        <small>{t("g6.changedTo")}</small>
-                                        <TaskBoardFoldText value={activityHistoryValue(event.to)} />
-                                      </div>
-                                    )}
-                                    {event.note && (
-                                      <span>
-                                        {" · "}
-                                        {activityHistoryValue(event.note)}
-                                      </span>
-                                    )}
-                                  </li>
-                                ))}
+                                      ) : (
+                                        <>
+                                          {event.actor && (
+                                            <span>
+                                              {" · "}
+                                              {activityAgentName(event.actor)}
+                                            </span>
+                                          )}
+                                          {event.from !== undefined && (
+                                            <div>
+                                              <small>{t("g6.changedFrom")}</small>
+                                              <TaskBoardFoldText
+                                                value={activityHistoryValue(event.from)}
+                                              />
+                                            </div>
+                                          )}
+                                          {event.to !== undefined && (
+                                            <div>
+                                              <small>{t("g6.changedTo")}</small>
+                                              <TaskBoardFoldText
+                                                value={activityHistoryValue(event.to)}
+                                              />
+                                            </div>
+                                          )}
+                                        </>
+                                      )}
+                                      {event.note && (
+                                        <span>
+                                          {" · "}
+                                          {activityHistoryValue(event.note)}
+                                        </span>
+                                      )}
+                                    </li>
+                                  );
+                                })}
                             </ol>
                             <ActivityPages
                               page={pages[id] ?? 0}
@@ -492,26 +558,7 @@ export function TaskBoardLog({
                             </div>
                           </div>
                         ) : (
-                          <>
-                            {r?.from && (
-                              <div className="dc-tiles">
-                                <div>{activityStamp(Date.parse(r.from))}</div>
-                                <div>{activityStamp(Date.parse(row.time))}</div>
-                                <div>
-                                  {activityNumber(commits.length)} {t("g6.commits")}
-                                </div>
-                              </div>
-                            )}
-                            <ul className="lgd-c">
-                              {commits.slice(0, 4).map((c) => (
-                                <li key={c.id}>
-                                  <code>{c.sha}</code>
-                                  <em>{activityStamp(Date.parse(c.at), true)}</em>
-                                  <span>{c.subject}</span>
-                                </li>
-                              ))}
-                            </ul>
-                          </>
+                          <RichEventDetail display={d} event={r} time={row.time} />
                         )}
                       </div>
                     )}

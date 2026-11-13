@@ -8,6 +8,9 @@ import { TaskBoardActivity } from "./TaskBoardActivity";
 import { TaskBoardSources } from "./TaskBoardSources";
 import { TaskBoardLog } from "./TaskBoardLog";
 import { TaskSourceDetails } from "./TaskSourceDetails";
+import { activityStamp } from "./TaskBoardActivityParts";
+import type { BoardTask } from "./taskBoardData";
+import { activityTaskName } from "./taskBoardPresentation";
 import {
   eventMother,
   localDay,
@@ -23,6 +26,185 @@ vi.mock("@/lib/identity", () => ({ authenticatedFetch: fetcher }));
 afterEach(() => {
   cleanup();
   fetcher.mockReset();
+});
+it("retains rich work details inside a folded other event without treating its work start as an old field value", () => {
+  const task: BoardTask = {
+    uid: "review",
+    title: "Review task",
+    "omnigent.ai:source": "engineering",
+    "omnigent.ai:sourceDisplay": {
+      version: 1,
+      events: [
+        {
+          id: "work-1",
+          kind: "other",
+          at: "2026-11-13T12:00:00Z",
+          task: { source: "engineering", uid: "review" },
+          label: "Review completed",
+          from: "2026-11-13T11:00:00Z",
+          workSeconds: 3600,
+          agentId: "codex",
+          host: "workstation",
+          commitIds: ["commit-1"],
+        },
+      ],
+      commits: [
+        {
+          id: "commit-1",
+          sha: "abcdef1",
+          subject: "Preserve review details",
+          at: "2026-11-13T11:30:00Z",
+        },
+      ],
+    },
+  };
+  const { container } = wrap(
+    <TaskBoardLog tasks={[task]} events={[]} sessions={[]} onSelect={vi.fn()} />,
+  );
+  fireEvent.click(container.querySelector(".lr")!);
+  const detail = container.querySelector(".lgd-changes")!;
+  expect(detail.textContent).toContain("Codex");
+  expect(detail.textContent).toContain("workstation");
+  expect(detail.textContent).toContain("1h");
+  expect(detail.textContent).toContain(activityStamp(Date.parse("2026-11-13T11:00:00Z")));
+  expect(detail.textContent).toContain(activityStamp(Date.parse("2026-11-13T12:00:00Z")));
+  expect(detail.textContent).toContain("abcdef1");
+  expect(detail.textContent).toContain("Preserve review details");
+  expect(within(detail as HTMLElement).queryByText("From")).toBeNull();
+});
+it.each([false, true])(
+  "retains canonical events with rich events present=%s and deduplicates only matching event identities",
+  (rich) => {
+    const event = {
+      source: "engineering",
+      uid: "review",
+      id: "change-1",
+      time: "2026-11-13T12:00:00Z",
+      kind: "field",
+      field: "progress",
+      from: "in-process",
+      to: "completed",
+    };
+    const task: BoardTask = {
+      uid: "review",
+      title: "Review task",
+      "omnigent.ai:source": "engineering",
+      "omnigent.ai:sourceDisplay": {
+        version: 1,
+        events: rich
+          ? [
+              {
+                id: "match",
+                kind: "open",
+                at: event.time,
+                task: { source: "engineering", uid: "review" },
+                label: "Rich created",
+              },
+            ]
+          : [],
+      },
+    };
+    const { container } = wrap(
+      <TaskBoardLog
+        tasks={[task]}
+        events={[
+          event,
+          ...(rich ? [{ ...event, id: "match", kind: "created", label: "Canonical created" }] : []),
+        ]}
+        sessions={[]}
+        onSelect={vi.fn()}
+      />,
+    );
+    expect(container.querySelectorAll(".lr")).toHaveLength(rich ? 2 : 1);
+    expect(container.textContent).toContain("1 field changes");
+    if (rich) {
+      expect(container.textContent).toContain("Rich created");
+      expect(container.textContent).not.toContain("Canonical created");
+    }
+    fireEvent.click(container.querySelector(".lr-other")!);
+    expect(screen.getByText("in-process")).toBeTruthy();
+    expect(screen.getByText("completed")).toBeTruthy();
+  },
+);
+it.each(["By time", "By root session"])(
+  "buffers another history page while expanded in %s and resumes without losing either event",
+  (grouping) => {
+    const task = taskBoardFixture().tasks[0];
+    const event = {
+      source: "engineering",
+      uid: task.uid,
+      id: "first",
+      time: "2026-11-13T12:00:00Z",
+      kind: "field",
+      field: "progress",
+      note: "Initial change",
+    };
+    const props = { tasks: [task], sessions: [], onSelect: vi.fn() };
+    const { container, rerender } = render(<TaskBoardLog {...props} events={[event]} />);
+    fireEvent.click(screen.getByRole("button", { name: grouping }));
+    fireEvent.click(container.querySelector(".lr")!);
+    rerender(
+      <TaskBoardLog
+        {...props}
+        events={[
+          event,
+          { ...event, id: "second", time: "2026-11-13T11:00:00Z", note: "Earlier page change" },
+        ]}
+      />,
+    );
+    expect(container.querySelector(".lr")?.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText(/Initial change/)).toBeTruthy();
+    expect(screen.queryByText(/Earlier page change/)).toBeNull();
+    const resume = screen.getByRole("button", { name: /Resume/ });
+    expect(resume.hasAttribute("disabled")).toBe(false);
+    expect(container.querySelector(".l-n")?.textContent).toBe("1");
+    fireEvent.click(resume);
+    expect(container.textContent).toContain("2 field changes");
+    expect(screen.getByText(/Initial change/)).toBeTruthy();
+    expect(screen.getByText(/Earlier page change/)).toBeTruthy();
+  },
+);
+it("checks identity names and group badges without rewriting ordinary prose", () => {
+  const internal = "abcdef0123456789abcdef0123456789";
+  const task: BoardTask = {
+    uid: internal,
+    title: "Readable title",
+    "omnigent.ai:source": "engineering",
+    "omnigent.ai:sourceDisplay": {
+      version: 1,
+      identity: { label: `ENG-123@${internal}`, key: "ENG-123", groupId: internal },
+    },
+  };
+  expect(activityTaskName(task)).toBe("Readable title");
+  expect(
+    activityTaskName({
+      ...task,
+      title: internal,
+      "omnigent.ai:key": undefined,
+      "omnigent.ai:sourceDisplay": { version: 1 },
+    }),
+  ).toBe("Untitled task");
+  const prose = `Investigate ENG-123@${internal} when reported`;
+  expect(
+    activityTaskName({ ...task, title: prose, "omnigent.ai:sourceDisplay": { version: 1 } }),
+  ).toBe(prose);
+  const { container } = render(
+    <TaskBoardLog
+      tasks={[task]}
+      events={[
+        {
+          source: "engineering",
+          uid: internal,
+          id: "created",
+          time: "2026-11-13T12:00:00Z",
+          kind: "created",
+        },
+      ]}
+      sessions={[]}
+      onSelect={vi.fn()}
+    />,
+  );
+  expect(container.textContent).not.toContain(internal);
 });
 it("folds only loaded changes by source, task and day, preserving every event on expansion", () => {
   const task = {

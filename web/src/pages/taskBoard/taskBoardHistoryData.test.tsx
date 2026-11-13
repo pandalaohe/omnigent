@@ -575,7 +575,7 @@ it("keeps native sessions without a supplied task in the Today worker totals", (
   expect(screen.getByText(/1 sessions, 1 open/)).toBeTruthy();
   expect(screen.getByText(/\$3\.00/)).toBeTruthy();
 });
-it("uses supplied activity instead of duplicating task-body update history", () => {
+it("retains distinct canonical activity alongside supplied activity", () => {
   const a = task("A");
   a["omnigent.ai:sourceDisplay"]!.events = [
     {
@@ -602,7 +602,7 @@ it("uses supplied activity instead of duplicating task-body update history", () 
       ]}
     />,
   );
-  expect(container.querySelectorAll(".lr")).toHaveLength(1);
+  expect(container.querySelectorAll(".lr")).toHaveLength(2);
   expect(screen.getByText("Source commit")).toBeTruthy();
 });
 

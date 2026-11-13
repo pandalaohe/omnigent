@@ -28,7 +28,12 @@ import { taskLocalTime, taskRelations } from "./taskBoardRouteData";
 import { displayCost, sessionObservation, type TaskDisplay } from "./taskBoardDisplay";
 import { boardSessionRows, boardGroupColors } from "./taskBoardSessionData";
 import { formatDate, formatNumber, t } from "./taskBoardText";
-import { activityAgentName, activityTaskName, activityTaskKey } from "./taskBoardPresentation";
+import {
+  activityAgentName,
+  activityName,
+  activityTaskName,
+  activityTaskKey,
+} from "./taskBoardPresentation";
 import { BoardIdentityMark, BoardAgentLogo } from "./BoardIdentityMark";
 import { TaskSourceDetails } from "./TaskSourceDetails";
 import { TaskBoardFoldText } from "./TaskBoardFoldText";
@@ -312,11 +317,7 @@ export function TaskBoardDetail({
           <StateIcon size={14} />
           {t(`detail.state.${state}`)}
         </span>
-        <b>
-          {selectedSessionId
-            ? (display?.identity?.label ?? taskTitle(current))
-            : taskTitle(current)}
-        </b>
+        <b>{taskTitle(current)}</b>
         {activityTaskKey(current) && <code>{activityTaskKey(current)}</code>}
         <span className="tb-dc-group">
           {display?.identity?.groupBadge && (
@@ -324,10 +325,10 @@ export function TaskBoardDetail({
               className="tb-dc-group-badge"
               style={{ background: groupColor ?? "var(--primary)" }}
             >
-              {display.identity.groupBadge}
+              {activityName(display.identity.groupBadge) ?? t("g6.other")}
             </span>
           )}
-          {display?.identity?.groupLabel ?? current["omnigent.ai:group"]?.name}
+          {activityName(display?.identity?.groupLabel, current["omnigent.ai:group"]?.name)}
         </span>
         <button type="button" aria-label={t("detail.close")} onClick={onClose}>
           <XIcon size={15} />
@@ -484,7 +485,7 @@ export function TaskBoardDetail({
                           left: `${((Date.parse(s.from) - start) / span) * 100}%`,
                           width: `${Math.max(0.8, ((Date.parse(to) - Date.parse(s.from)) / span) * 100)}%`,
                         }}
-                        title={`${s.agentId} ${stamp(s.from)} → ${liveSegment ? t("detail.now") : stamp(to)} (${duration(Math.max(0, (Date.parse(to) - Date.parse(s.from)) / 1000))})`}
+                        title={`${activityAgentName(s.agentId, actors.get(s.agentId))} ${stamp(s.from)} → ${liveSegment ? t("detail.now") : stamp(to)} (${duration(Math.max(0, (Date.parse(to) - Date.parse(s.from)) / 1000))})`}
                       />
                     );
                   })}

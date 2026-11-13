@@ -1,23 +1,31 @@
 import type { BoardTask } from "./taskBoardData";
 import { t } from "./taskBoardText";
 
+const looksInternal = (value: string) =>
+  /^kit[-_]\S+$/i.test(value) ||
+  /^\S+@[0-9a-f]{8,}$/i.test(value) ||
+  /^[0-9a-f-]{16,}$/i.test(value);
+
+export const activityName = (...values: (string | null | undefined)[]) =>
+  values.find(
+    (value): value is string =>
+      typeof value === "string" && Boolean(value.trim()) && !looksInternal(value.trim()),
+  );
+
 export const activityTaskName = (task: BoardTask) =>
-  task["omnigent.ai:sourceDisplay"]?.identity?.label ||
-  task.title ||
-  (task["omnigent.ai:key"] && !looksInternal(task["omnigent.ai:key"])
-    ? task["omnigent.ai:key"]
-    : t("g6.untitledTask"));
+  activityName(
+    task["omnigent.ai:sourceDisplay"]?.identity?.label,
+    task.title,
+    task["omnigent.ai:key"],
+  ) ?? t("g6.untitledTask");
 
 export const activityTaskKey = (task: BoardTask) => {
-  const key = task["omnigent.ai:sourceDisplay"]?.identity?.key ?? task["omnigent.ai:key"];
-  return key && !looksInternal(key) ? key : undefined;
+  return activityName(task["omnigent.ai:sourceDisplay"]?.identity?.key, task["omnigent.ai:key"]);
 };
 
-const looksInternal = (value: string) =>
-  /^kit[-_]/i.test(value) || /@[0-9a-f]{8,}/i.test(value) || /^[0-9a-f-]{16,}$/i.test(value);
-
 export const activityAgentName = (id?: string | null, label?: string | null) => {
-  if (label?.trim() && !looksInternal(label)) return label;
+  const name = activityName(label);
+  if (name) return name;
   if (!id) return t("g6.unassigned");
   const known: Record<string, string> = {
     pi: t("g6.agent.pi"),
@@ -33,8 +41,7 @@ export const activitySourceName = (
   _task?: BoardTask,
   sourceLabels?: Record<string, string>,
 ) => {
-  const label = sourceLabels?.[source];
-  return label && !looksInternal(label) ? label : t("g6.taskSource");
+  return activityName(sourceLabels?.[source]) ?? t("g6.taskSource");
 };
 
 export const activityFieldName = (field: string, task?: BoardTask) =>

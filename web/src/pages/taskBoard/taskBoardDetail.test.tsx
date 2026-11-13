@@ -11,6 +11,31 @@ import type { SourceCache } from "./taskBoardSnapshotData";
 
 vi.mock("./taskBoardNative", () => ({ useBoardSessionDetails: () => [] }));
 afterEach(cleanup);
+it("uses readable task names and agent names in selected-session headings and timeline tooltips", () => {
+  const internal = "abcdef0123456789abcdef0123456789";
+  const current: BoardTask = {
+    ...task,
+    title: "Readable task",
+    "omnigent.ai:sourceDisplay": {
+      version: 1,
+      identity: { key: "ENG-1", label: `ENG-1@${internal}`, groupId: internal },
+      intervals: [
+        {
+          id: "span",
+          from: "2026-11-12T01:00:00Z",
+          to: "2026-11-12T02:00:00Z",
+          agentId: internal,
+          origin: "event",
+        },
+      ],
+    },
+  };
+  const { container } = mount(current, "source-session");
+  expect(container.querySelector(".tb-dc-header > b")?.textContent).toBe("Readable task");
+  const title = container.querySelector(".tb-dc-segment")?.getAttribute("title");
+  expect(title).toContain("Agent");
+  expect(title).not.toContain(internal);
+});
 const asOf = "2026-11-12T04:00:00Z";
 const ref = { source: "example", uid: "task" };
 const sessions: DisplaySession[] = Array.from({ length: 5 }, (_, index) => ({
@@ -127,7 +152,7 @@ it("renders distinct current, need and next, estimated sessions-first cost, chec
   expect(container.querySelector(".tb-dc-tile.failed")?.textContent).toContain(
     "other-host No record",
   );
-  expect(container.querySelector(".tb-dc-segment")?.getAttribute("title")).toContain("pi");
+  expect(container.querySelector(".tb-dc-segment")?.getAttribute("title")).toContain("Pi");
   expect(container.querySelectorAll(".tb-dc-commits li")).toHaveLength(3);
   expect(container.querySelector(".tb-dc-commits li")?.textContent).toContain("abcdef4");
   expect(container.querySelector("blockquote")?.textContent).toContain("<script>example</script>");
