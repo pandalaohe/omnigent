@@ -7,6 +7,7 @@ import { usageBoardData } from "./usageBoardFixtures";
 import {
   decimalDisplay,
   multiplyDecimal,
+  reapplyPricing,
   validatePricing,
   type PricingBaseline,
 } from "./usagePricingData";
@@ -89,12 +90,16 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
 });
-function panel(focus?: string) {
+function panel(focus?: string, visibleAccount = account) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={["/account/settings#usage-pricing"]}>
-        <UsagePricingPanel accounts={[account]} accountId={account.id} focus={focus} />
+        <UsagePricingPanel
+          accounts={[visibleAccount]}
+          accountId={visibleAccount.id}
+          focus={focus}
+        />
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -110,6 +115,35 @@ function change(label: string, value: string) {
 }
 
 describe("Pricing settings", () => {
+  it("edits and clears one saved model price when reported ids have different casing", async () => {
+    saved.price_overrides = [
+      {
+        account_id: account.id,
+        model: "Model-A",
+        read: "3",
+        write: null,
+        cache_read: null,
+        cache_write: null,
+      },
+    ];
+    panel(undefined, { ...account, models: [{ id: "model-a" }, { id: "MODEL-A" }] });
+    await ready();
+    expect(screen.getAllByLabelText(/^model-a · Read$/i)).toHaveLength(1);
+    expect(screen.getByLabelText("Model-A · Read")).toHaveValue("3.00");
+    change("Model id", "mOdEl-A");
+    expect(screen.getByRole("button", { name: "Add model price" })).toBeDisabled();
+    change("Model-A · Read", "4");
+    fireEvent.click(screen.getByRole("button", { name: "Save pricing" }));
+    await screen.findByText("Pricing saved. History recalculated.");
+    expect(writes[0].price_overrides).toHaveLength(1);
+    expect(writes[0].price_overrides?.[0]).toMatchObject({ model: "Model-A", read: "4" });
+    change("Model-A · Read", "");
+    fireEvent.click(screen.getByRole("button", { name: "Save pricing" }));
+    await waitFor(() => expect(writes).toHaveLength(2));
+    expect(writes[1].price_overrides).toHaveLength(1);
+    expect(writes[1].price_overrides?.[0].read).toBeNull();
+    expect(screen.getAllByLabelText(/^model-a · Read$/i)).toHaveLength(1);
+  });
   it("saves nullable account and card fields, shows grey current prices and preserves explicit zero", async () => {
     panel();
     await ready();
@@ -298,6 +332,38 @@ describe("Pricing settings", () => {
 });
 
 describe("Decimal inputs", () => {
+  it("reapplies model prices by account and lowercase model without weakening duplicate validation", () => {
+    const original = baseline();
+    const row = {
+      account_id: account.id,
+      model: "Model-A",
+      read: "3",
+      write: null,
+      cache_read: null,
+      cache_write: null,
+    };
+    original.price_overrides = [row];
+    const draft = { ...original, price_overrides: [{ ...row, read: null }] };
+    const other = { ...row, account_id: "other-account", read: "8" };
+    const latest = {
+      ...original,
+      revision: 2,
+      price_overrides: [{ ...row, model: "model-a", read: "5" }, other],
+    };
+    const reapplied = reapplyPricing(original, draft, latest);
+    expect(reapplied.price_overrides).toHaveLength(2);
+    expect(reapplied.price_overrides?.find((item) => item.account_id === account.id)).toMatchObject(
+      { read: null },
+    );
+    expect(reapplied.price_overrides?.find((item) => item.account_id === other.account_id)).toEqual(
+      other,
+    );
+    expect(validatePricing(reapplied)).toEqual({});
+    const invalid = { ...original, price_overrides: [row, { ...row, model: "model-a" }] };
+    expect(validatePricing(invalid)[`price_overrides.${account.id}.model-a.model`]).toContain(
+      "unique model id",
+    );
+  });
   it("rounds only at display, keeps half-even and calculates huge decimal products exactly", () => {
     expect(decimalDisplay("1.005")).toBe("1.00");
     expect(decimalDisplay("1.015")).toBe("1.02");
