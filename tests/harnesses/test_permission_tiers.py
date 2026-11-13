@@ -1557,6 +1557,32 @@ def test_windows_live_data_and_environment(shell, command):
     assert decision("auto", "sys_os_shell", {"command": command}, host).action == Verdict.ALLOW
 
 
+@pytest.mark.parametrize("shell", ["bash", "pwsh", "cmd"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        'ls C:/work/project | grep -i "omnigent.*dist-info"',
+        'rg -e "omnigent.*dist-info" C:/work/project',
+    ],
+)
+def test_windows_search_pattern_never_reaches_resolver(shell, command):
+    resolved = []
+    host = windows_host(shell=shell)
+
+    def resolve(path):
+        if "omnigent.*dist-info" in path:
+            raise OSError(123, "The filename, directory name, or volume label syntax is incorrect")
+        resolved.append(path)
+        return host.resolver(path)
+
+    result = decision(
+        "auto", "sys_os_shell", {"command": command}, replace(host, resolver=resolve)
+    )
+    assert result.action == Verdict.ALLOW
+    assert resolved
+    assert all("omnigent.*dist-info" not in path for path in resolved)
+
+
 @pytest.mark.parametrize(
     "shell,variable", [("bash", "$MISSING"), ("cmd", "%MISSING%"), ("pwsh", "$env:MISSING")]
 )

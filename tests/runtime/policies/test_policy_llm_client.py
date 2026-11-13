@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from omnigent.policies.function import FunctionPolicy, _build_event
+from omnigent.policies.function import FunctionPolicy, _build_event, resolve_function_policy
 from omnigent.policies.types import EvaluationContext, PolicyLLMClient
 from omnigent.runtime.caps import RuntimeCaps
 from omnigent.runtime.policies.builder import (
@@ -30,6 +30,7 @@ from omnigent.runtime.policies.builder import (
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.spec import parse_server_llm
+from omnigent.spec.parser import parse_default_policies
 from omnigent.spec.types import (
     AgentSpec,
     FunctionPolicySpec,
@@ -598,6 +599,39 @@ def test_build_policy_llm_client_constructs_from_config() -> None:
     assert result._model == "openai/gpt-4o-mini"
     assert result._connection == {"api_key": "test-key", "base_url": "https://example.com"}
     assert result._request_timeout == 60
+
+
+@pytest.mark.parametrize("configured_timeout,expected", [(None, 300), (45, 45), (60, 60)])
+async def test_loaded_prompt_classifier_uses_effective_timeout(
+    monkeypatch, configured_timeout, expected
+):
+    from omnigent.llms import client as client_module
+
+    response = type("Response", (), {"output_text": '{"action":"allow","reason":""}'})()
+    fake = _FakeClient(response=response)
+    monkeypatch.setattr(client_module, "Client", lambda: fake)
+    raw = {"model": _make_server_llm().model}
+    if configured_timeout is not None:
+        raw["request_timeout"] = configured_timeout
+    config = parse_server_llm(raw, expand_env=False)
+    client = _build_policy_llm_client(config, None)
+    specs = parse_default_policies(
+        {
+            "classifier": {
+                "type": "function",
+                "handler": "omnigent.policies.builtins.prompt.prompt_policy",
+                "factory_params": {"prompt": "Allow the input."},
+            },
+        }
+    )
+    assert isinstance(specs[0], FunctionPolicySpec)
+    policy = resolve_function_policy(specs[0])
+    result = await policy.evaluate(
+        EvaluationContext(phase=Phase.REQUEST, content="hello", llm_client=client), {}
+    )
+    assert result.action.value == "allow"
+    fake.responses.create.assert_awaited_once()
+    assert fake.responses.create.call_args.kwargs["timeout"] == expected
 
 
 def test_build_policy_llm_client_normalizes_databricks_prefix() -> None:

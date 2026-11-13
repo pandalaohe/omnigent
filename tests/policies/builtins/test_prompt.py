@@ -10,11 +10,6 @@ from unittest.mock import AsyncMock
 import pytest
 
 from omnigent.policies.builtins.prompt import _CLASSIFIER_SCHEMA, prompt_policy
-from omnigent.spec.types import DEFAULT_POLICY_CLASSIFIER_TIMEOUT
-
-
-def test_classifier_default_allows_slow_response() -> None:
-    assert DEFAULT_POLICY_CLASSIFIER_TIMEOUT == 60
 
 
 def _make_event(

@@ -17,14 +17,14 @@ if TYPE_CHECKING:
     # behind TYPE_CHECKING to avoid an import cycle.
     from omnigent.policies.types import EvaluationContext
 
-# Default classifier timeout for PromptPolicy evaluations. 60 s
+# Default classifier timeout for PromptPolicy evaluations. 30 s
 # balances classifier latency against the cost of blocking the
 # agent loop for every evaluated phase. The agent-level LLM
 # default (300 s) is tuned for generation; using it for a
 # blocking classifier stalls the loop for minutes on each tool
 # call — see POLICIES.md §9.2. Overrideable via
 # ``policy.llm.request_timeout`` on individual policies.
-DEFAULT_POLICY_CLASSIFIER_TIMEOUT = 60
+DEFAULT_POLICY_CLASSIFIER_TIMEOUT = 30
 
 # Default timeout (seconds) for user approval on an ASK policy.
 # One day — an ASK is a human-in-the-loop gate and should outlive a
