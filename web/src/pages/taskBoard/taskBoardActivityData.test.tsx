@@ -72,6 +72,56 @@ it("retains rich work details inside a folded other event without treating its w
   expect(detail.textContent).toContain("Preserve review details");
   expect(within(detail as HTMLElement).queryByText("From")).toBeNull();
 });
+it("retains canonical change values and actor alongside matching rich work details", () => {
+  const event = {
+    source: "engineering",
+    uid: "review",
+    id: "change-1",
+    time: "2026-11-13T12:00:00Z",
+    kind: "field",
+    field: "progress",
+    actor: "claude",
+    from: "in-process",
+    to: "completed",
+  };
+  const task: BoardTask = {
+    uid: "review",
+    title: "Review task",
+    "omnigent.ai:source": "engineering",
+    "omnigent.ai:sourceDisplay": {
+      version: 1,
+      events: [
+        {
+          id: event.id,
+          at: event.time,
+          kind: "other",
+          task: { source: event.source, uid: event.uid },
+          label: "Status changed",
+          agentId: "codex",
+          host: "workstation",
+          from: "2026-11-13T11:00:00Z",
+          workSeconds: 3600,
+        },
+      ],
+    },
+  };
+  const { container } = wrap(
+    <TaskBoardLog tasks={[task]} events={[event]} sessions={[]} onSelect={vi.fn()} />,
+  );
+  expect(container.querySelectorAll(".lr")).toHaveLength(1);
+  expect(container.textContent).toContain("1 field changes");
+  fireEvent.click(container.querySelector(".lr")!);
+  const detail = container.querySelector(".lgd-changes")!;
+  const members = within(detail as HTMLElement).getAllByRole("listitem");
+  expect(members).toHaveLength(1);
+  const member = within(members[0]);
+  expect(member.getByText("in-process")).toBeTruthy();
+  expect(member.getByText("completed")).toBeTruthy();
+  expect(member.getByText(/Claude/)).toBeTruthy();
+  expect(member.getByText(/Status changed/)).toBeTruthy();
+  expect(member.getByText(/Codex.*workstation.*1h/)).toBeTruthy();
+  expect(member.getByText(activityStamp(Date.parse("2026-11-13T11:00:00Z")))).toBeTruthy();
+});
 it.each([false, true])(
   "retains canonical events with rich events present=%s and deduplicates only matching event identities",
   (rich) => {

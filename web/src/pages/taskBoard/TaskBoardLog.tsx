@@ -488,37 +488,34 @@ export function TaskBoardLog({
                                           {activityHistoryValue(event.label)}
                                         </span>
                                       )}
-                                      {original ? (
+                                      {event.actor && (
+                                        <span>
+                                          {" · "}
+                                          {activityAgentName(event.actor)}
+                                        </span>
+                                      )}
+                                      {event.from !== undefined && (
+                                        <div>
+                                          <small>{t("g6.changedFrom")}</small>
+                                          <TaskBoardFoldText
+                                            value={activityHistoryValue(event.from)}
+                                          />
+                                        </div>
+                                      )}
+                                      {event.to !== undefined && (
+                                        <div>
+                                          <small>{t("g6.changedTo")}</small>
+                                          <TaskBoardFoldText
+                                            value={activityHistoryValue(event.to)}
+                                          />
+                                        </div>
+                                      )}
+                                      {original && (
                                         <RichEventDetail
                                           display={original.task["omnigent.ai:sourceDisplay"]}
                                           event={original.event}
                                           time={event.time}
                                         />
-                                      ) : (
-                                        <>
-                                          {event.actor && (
-                                            <span>
-                                              {" · "}
-                                              {activityAgentName(event.actor)}
-                                            </span>
-                                          )}
-                                          {event.from !== undefined && (
-                                            <div>
-                                              <small>{t("g6.changedFrom")}</small>
-                                              <TaskBoardFoldText
-                                                value={activityHistoryValue(event.from)}
-                                              />
-                                            </div>
-                                          )}
-                                          {event.to !== undefined && (
-                                            <div>
-                                              <small>{t("g6.changedTo")}</small>
-                                              <TaskBoardFoldText
-                                                value={activityHistoryValue(event.to)}
-                                              />
-                                            </div>
-                                          )}
-                                        </>
                                       )}
                                       {event.note && (
                                         <span>
