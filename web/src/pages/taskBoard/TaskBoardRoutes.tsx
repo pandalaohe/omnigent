@@ -28,6 +28,9 @@ import {
   BanIcon,
   PackageCheckIcon,
   ActivityIcon,
+  PinIcon,
+  Rows3Icon,
+  Rows4Icon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Link } from "@/lib/routing";
@@ -71,6 +74,13 @@ import {
 import { TaskBoardDetail, taskTitle } from "./TaskBoardDetail";
 import { TaskBoardTaskHover } from "./TaskBoardTaskHover";
 import { TaskBoardRouteFocus } from "./TaskBoardRouteFocus";
+import { TaskBoardRoutePins } from "./TaskBoardRoutePins";
+import {
+  routeWorthShowing,
+  useRouteViewSettings,
+  useStableList,
+  type RoutePins,
+} from "./taskBoardRouteView";
 import { BoardIdentityMark } from "./BoardIdentityMark";
 import { formatDate, formatNumber, t } from "./taskBoardText";
 import "./taskBoardRoutes.css";
@@ -227,6 +237,51 @@ const measureLabel = (() => {
     return width;
   };
 })();
+const maxFlows = 12;
+/** Pause looping motion while the tab is hidden. */
+function usePageHidden() {
+  const [hidden, setHidden] = useState(() => typeof document !== "undefined" && document.hidden);
+  useEffect(() => {
+    const update = () => setHidden(document.hidden);
+    document.addEventListener("visibilitychange", update);
+    return () => document.removeEventListener("visibilitychange", update);
+  }, []);
+  return hidden;
+}
+const noMarks = { changed: new Set<string>(), added: new Set<string>() };
+/** Cards whose state changed or that appeared since the previous refresh, marked for a moment. */
+function useStateMarks(tasks: BoardTask[]) {
+  const [marks, setMarks] = useState(noMarks),
+    seen = useRef<Map<string, string> | null>(null);
+  useEffect(() => {
+    const before = seen.current,
+      next = new Map(tasks.map((task) => [taskIdentity(task), routeState(task)]));
+    seen.current = next;
+    if (!before) return;
+    const changed = new Set<string>(),
+      added = new Set<string>();
+    for (const [id, state] of next)
+      if (!before.has(id)) added.add(id);
+      else if (before.get(id) !== state) changed.add(id);
+    if (!changed.size && !added.size) return;
+    setMarks({ changed, added });
+    const timer = setTimeout(() => setMarks(noMarks), 2400);
+    return () => clearTimeout(timer);
+  }, [tasks]);
+  return marks;
+}
+/** One compact label line, cut with an ellipsis at `max` pixels. */
+function clipLabel(text: string, max: number) {
+  if (measureLabel(text, 12, 700) <= max) return text;
+  let low = 1,
+    high = text.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (measureLabel(text.slice(0, middle) + "…", 12, 700) <= max) low = middle;
+    else high = middle - 1;
+  }
+  return text.slice(0, low) + "…";
+}
 function RelationFacts({
   relations,
   onSelect,
@@ -284,8 +339,8 @@ function RelationFacts({
 }
 export function TaskBoardRoutes({
   sessions = emptySessions,
-  tasks,
-  sources,
+  tasks: suppliedTasks,
+  sources: suppliedSources,
   aliases,
   mode,
   onMode,
@@ -313,6 +368,12 @@ export function TaskBoardRoutes({
   lodStation?: number;
   lodPhase?: number;
 }) {
+  // The page filters on every render; equal contents keep one identity so layouts stay cached.
+  const tasks = useStableList(suppliedTasks),
+    sources = useStableList(suppliedSources);
+  const [settings, updateSettings] = useRouteViewSettings(),
+    compact = settings.rows === "compact",
+    pins = settings.pins;
   const caches = useMemo(
     () =>
       Object.fromEntries(
@@ -367,7 +428,8 @@ export function TaskBoardRoutes({
     [help, setHelp] = useState(false),
     [hover, setHover] = useState<Hover | null>(null),
     [hoverHub, setHoverHub] = useState<string | null>(null);
-  const [focusOpen, setFocusOpen] = useState(false);
+  const [focusOpen, setFocusOpen] = useState(false),
+    [pinsOpen, setPinsOpen] = useState(false);
   const open = useMemo<OpenPanel | null>(() => {
     if (!selection) return null;
     const byId = new Map(tasks.map((task) => [taskIdentity(task), task]));
@@ -397,7 +459,9 @@ export function TaskBoardRoutes({
     overviewRef = useRef<HTMLDivElement>(null),
     axisRef = useRef<HTMLDivElement>(null),
     panelRef = useRef<HTMLDivElement>(null),
-    tooltipRef = useRef<HTMLDivElement>(null);
+    tooltipRef = useRef<HTMLDivElement>(null),
+    svgRef = useRef<SVGSVGElement>(null),
+    plotRef = useRef<HTMLDivElement>(null);
   const [tooltipSize, setTooltipSize] = useState({ width: 340, height: 240 });
   const pointer = useRef<{
       kind: "map" | "overview";
@@ -454,26 +518,25 @@ export function TaskBoardRoutes({
     [sources],
   );
   const nowOn = view.from <= now && view.to >= now;
-  const moveWindow = (next: TimeWindow) => {
+  // Discrete window jumps ease from the previous window; drags and wheel pans follow the pointer.
+  const easeFrom = useRef<TimeWindow | null>(null);
+  const moveWindow = (next: TimeWindow, ease = false) => {
+    if (ease) easeFrom.current = view;
     setView(clampMapWindow(next, oldest, now));
     setOpen(null);
     setHover(null);
   };
   const zoom = useCallback(
     (direction: number) => {
-      setView((current) => stepMapWindow(current, direction, oldest, now));
+      setView((current) => {
+        const next = stepMapWindow(current, direction, oldest, now);
+        if (next !== current) easeFrom.current = current;
+        return next;
+      });
       setOpen(null);
       setHover(null);
     },
     [oldest, now],
-  );
-  const isExpanded = useCallback(
-    (source: string) =>
-      expanded[source] ??
-      allExpanded ??
-      ((mode === "order" || level === "station") &&
-        groups.some((group) => group.source === source && group.tasks.some(routeAttention))),
-    [expanded, allExpanded, mode, level, groups],
   );
   const future = useMemo(() => {
     const items = new Map<
@@ -551,6 +614,31 @@ export function TaskBoardRoutes({
         .filter((group) => group.tasks.length > 0),
     [groups, focus, mode, now, boardHours, level, nowOn, view],
   );
+  // The attention view keeps rows with something to look at; long time windows stay a history view.
+  const attentionView = settings.scope === "attention" && !(mode === "time" && level === "segment");
+  const worth = useMemo(
+    () => new Set(tasks.filter((task) => routeWorthShowing(task, now, pins)).map(taskIdentity)),
+    [tasks, now, pins],
+  );
+  const important = useCallback(
+    (task: BoardTask) => routeAttention(task) || (attentionView && worth.has(taskIdentity(task))),
+    [worth, attentionView],
+  );
+  const groupWorth = useCallback(
+    (group: MapGroup) =>
+      pins.groups.includes(group.id) || group.tasks.some((task) => worth.has(taskIdentity(task))),
+    [pins.groups, worth],
+  );
+  const isExpanded = useCallback(
+    (source: string) =>
+      expanded[source] ??
+      allExpanded ??
+      ((mode === "order" || level === "station") &&
+        (attentionView
+          ? selectedGroups.some((group) => group.source === source && groupWorth(group))
+          : groups.some((group) => group.source === source && group.tasks.some(routeAttention)))),
+    [expanded, allExpanded, mode, level, groups, attentionView, selectedGroups, groupWorth],
+  );
   const sourceIds = [
     ...new Set([
       ...selectedGroups.map((group) => group.source),
@@ -567,7 +655,8 @@ export function TaskBoardRoutes({
   const sourceSlice = useMemo<string[]>(() => JSON.parse(sourceSliceKey), [sourceSliceKey]);
   const model = useMemo(() => {
     const lanes: MapLane[] = [];
-    let top = 0;
+    let top = 0,
+      folded = 0;
     const countTasks = (items: BoardTask[], source?: string) =>
       mode === "order"
         ? items.length
@@ -598,28 +687,34 @@ export function TaskBoardRoutes({
     for (const source of sourceSlice) {
       const candidates = selectedGroups.filter((group) => group.source === source);
       const live = (group: MapGroup) =>
-        mode === "order"
-          ? group.tasks.some(
-              (task) =>
-                routeAttention(task) ||
-                (!routeQueued(task) &&
-                  (routeMoment(task, now) === undefined ||
-                    routeMoment(task, now)! >= now - boardHours * HOUR)),
-            )
-          : level === "segment"
-            ? mapDensity(group.tasks, view, width, now).some((bucket) => bucket.count > 0)
-            : group.tasks.some(
+        attentionView
+          ? groupWorth(group)
+          : mode === "order"
+            ? group.tasks.some(
                 (task) =>
-                  !routeQueued(task) &&
-                  (routeMoment(task, now) ?? 0) >= view.from &&
-                  (routeMoment(task, now) ?? 0) <= view.to,
-              );
+                  routeAttention(task) ||
+                  (!routeQueued(task) &&
+                    (routeMoment(task, now) === undefined ||
+                      routeMoment(task, now)! >= now - boardHours * HOUR)),
+              )
+            : level === "segment"
+              ? mapDensity(group.tasks, view, width, now).some((bucket) => bucket.count > 0)
+              : group.tasks.some(
+                  (task) =>
+                    !routeQueued(task) &&
+                    (routeMoment(task, now) ?? 0) >= view.from &&
+                    (routeMoment(task, now) ?? 0) <= view.to,
+                );
       const active = candidates.filter(live),
         inactive = candidates.filter((group) => !live(group)),
         list = quiet[source] ? [...active, ...inactive] : active;
       const sourceTasks = candidates.flatMap((group) => group.tasks),
         opened = isExpanded(source);
       if (!sourceTasks.length && !caches[source]?.display.closedDays?.length) continue;
+      if (attentionView && !active.length) {
+        folded++;
+        continue;
+      }
       if (
         mode === "time" &&
         level !== "segment" &&
@@ -648,14 +743,18 @@ export function TaskBoardRoutes({
         header: true,
         collapsed: !opened,
         height: opened
-          ? phone
+          ? phone || compact
             ? 34
             : 40
           : phone
             ? 74
             : level === "segment" && mode === "time"
-              ? 54
-              : 58,
+              ? compact
+                ? 44
+                : 54
+              : compact
+                ? 46
+                : 58,
       });
       if (!opened) continue;
       const page = Math.min(groupPages[source] ?? 0, Math.max(0, Math.ceil(list.length / 10) - 1));
@@ -664,18 +763,26 @@ export function TaskBoardRoutes({
           ...group,
           height:
             mode === "order"
-              ? 136
+              ? compact
+                ? 80
+                : 136
               : level === "station"
                 ? phone
                   ? 150
-                  : 136
+                  : compact
+                    ? 80
+                    : 136
                 : level === "phase"
                   ? phone
                     ? 96
-                    : 84
+                    : compact
+                      ? 60
+                      : 84
                   : phone
                     ? 66
-                    : 46,
+                    : compact
+                      ? 36
+                      : 46,
         });
       if (inactive.length)
         append({
@@ -722,6 +829,8 @@ export function TaskBoardRoutes({
               hm = (time: number) =>
                 formatDate(time, { hour: "2-digit", minute: "2-digit", hour12: false });
             const day = (time: number) => formatDate(time, { month: "2-digit", day: "2-digit" });
+            if (compact)
+              return { lines: [t("routes.stops", { count: node.tasks.length })], sub: "" };
             return {
               lines: [t("routes.stops", { count: node.tasks.length })],
               sub:
@@ -733,6 +842,17 @@ export function TaskBoardRoutes({
             };
           }
           const task = node.tasks[0];
+          if (compact)
+            return {
+              lines: [
+                node.tasks.length > 1
+                  ? mode === "time" && node.queued
+                    ? t("routes.queuedMore")
+                    : nodeLabel(node)
+                  : clipLabel(nodeLabel(node), 150),
+              ],
+              sub: "",
+            };
           return {
             lines:
               node.tasks.length > 1
@@ -751,10 +871,16 @@ export function TaskBoardRoutes({
           };
         },
         measureLabel,
+        { compact, important },
       ),
       height: top,
+      folded,
     };
   }, [
+    attentionView,
+    groupWorth,
+    important,
+    compact,
     selectedGroups,
     groups,
     sourceSlice,
@@ -778,6 +904,25 @@ export function TaskBoardRoutes({
     relations,
     hubs,
   ]);
+  // Flow dashes mark the segment a live session is on, capped like the final's busiest screen.
+  const flows = useMemo(() => {
+    const out: { id: string; lane: string; x1: number; x2: number; y: number }[] = [];
+    for (const lane of model.lanes)
+      lane.nodes.slice(1).forEach((node, index) => {
+        const previous = lane.nodes[index],
+          live = mode === "order" ? previous : node;
+        if (
+          out.length < maxFlows &&
+          !node.density &&
+          live.tasks.length === 1 &&
+          routeState(live.tasks[0]) === "running"
+        )
+          out.push({ id: "flow" + node.id, lane: lane.id, x1: previous.x1, x2: node.x, y: node.y });
+      });
+    return out;
+  }, [model, mode]);
+  const hidden = usePageHidden(),
+    marks = useStateMarks(tasks);
   const x = (time: number) =>
       gutter + ((time - view.from) / (view.to - view.from)) * (right - gutter),
     axis = mapAxisTicks(view, right - gutter),
@@ -932,7 +1077,7 @@ export function TaskBoardRoutes({
   const openNode = (node: MapNode) => {
     if (node.density) {
       const span = Math.max(MIN_SPAN, (node.density.to - node.density.from) * 2);
-      moveWindow({ from: node.density.from - span / 4, to: node.density.from + span * 0.75 });
+      moveWindow({ from: node.density.from - span / 4, to: node.density.from + span * 0.75 }, true);
       return;
     }
     if (node.tasks.length === 1) {
@@ -943,13 +1088,15 @@ export function TaskBoardRoutes({
       const times = node.tasks.flatMap((task) => routeMoment(task, now) ?? []);
       const from = Math.min(...times) - 40 * 60_000,
         to = Math.max(...times) + 40 * 60_000;
-      moveWindow({ from, to: Math.max(to, from + MIN_SPAN) });
+      moveWindow({ from, to: Math.max(to, from + MIN_SPAN) }, true);
     } else {
       setOpen({ kind: "cluster", lane: node.lane, tasks: node.tasks });
       setPanelPage(0);
     }
     setHover(null);
   };
+  const edgeIntent = useRef<ReturnType<typeof setTimeout>>(undefined);
+  useEffect(() => () => clearTimeout(edgeIntent.current), []);
   const showHover = (value: Omit<Hover, "x" | "y">, element: Element) => {
     const rect = element.getBoundingClientRect();
     setHover({ ...value, x: rect.left + rect.width / 2, y: rect.bottom + 8 });
@@ -974,6 +1121,28 @@ export function TaskBoardRoutes({
     observer.observe(element);
     return () => observer.disconnect();
   }, [selection]);
+  useLayoutEffect(() => {
+    const from = easeFrom.current;
+    easeFrom.current = null;
+    if (
+      !from ||
+      mode !== "time" ||
+      globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+    )
+      return;
+    // Draw the new window where the old one stood, then let it settle (compositor-only transform).
+    const scale = (view.to - view.from) / (from.to - from.from),
+      shift =
+        gutter +
+        ((view.from - from.from) / (from.to - from.from)) * (right - gutter) -
+        scale * gutter;
+    if (scale < 1 / 8 || scale > 8 || Math.abs(shift) > 2 * width) return;
+    for (const element of [svgRef.current, plotRef.current, axisRef.current])
+      element?.animate?.(
+        [{ transform: `translateX(${shift}px) scaleX(${scale})` }, { transform: "none" }],
+        { duration: 260, easing: "cubic-bezier(.2, .7, .2, 1)" },
+      );
+  }, [view, mode, gutter, right, width]);
   useLayoutEffect(() => {
     const element = tooltipRef.current;
     if (element) {
@@ -1092,6 +1261,7 @@ export function TaskBoardRoutes({
   };
   const mapKey = (key: string) => {
     if (key === "0") {
+      easeFrom.current = view;
       setView(initialWindow(now));
       setOpen(null);
       return;
@@ -1099,7 +1269,7 @@ export function TaskBoardRoutes({
     if (key === "+" || key === "-") zoom(key === "+" ? -1 : 1);
     else {
       const delta = (key === "ArrowLeft" ? -1 : 1) * (view.to - view.from) * 0.1;
-      moveWindow({ from: view.from + delta, to: view.to + delta });
+      moveWindow({ from: view.from + delta, to: view.to + delta }, true);
     }
   };
   const changeSource = (lane: MapLane) => {
@@ -1113,7 +1283,16 @@ export function TaskBoardRoutes({
       onClick={() => setQuiet((current) => ({ ...current, [lane.source]: !current[lane.source] }))}
     >
       <ChevronDownIcon size={14} />
-      {t(quiet[lane.source] ? "routes.hideQuiet" : "routes.showQuiet", { count: lane.quiet ?? 0 })}
+      {t(
+        quiet[lane.source]
+          ? attentionView
+            ? "routes.hideCalm"
+            : "routes.hideQuiet"
+          : attentionView
+            ? "routes.showCalm"
+            : "routes.showQuiet",
+        { count: lane.quiet ?? 0 },
+      )}
     </button>
   );
   const groupPager = (lane: MapLane) => (
@@ -1275,7 +1454,10 @@ export function TaskBoardRoutes({
       </div>
     ) : null;
   return (
-    <div className="tb-routes rt-routes" data-route-level={mode === "order" ? "order" : level}>
+    <div
+      className={`tb-routes rt-routes${compact ? " rt-compact" : ""}${hidden ? " rt-paused" : ""}`}
+      data-route-level={mode === "order" ? "order" : level}
+    >
       <div className="rt-toolbar">
         <div className="tb-segment" role="group" aria-label={t("routes.mode")}>
           {(["order", "time"] as const).map((value) => (
@@ -1321,6 +1503,7 @@ export function TaskBoardRoutes({
                             : hours === 24
                               ? initialWindow(now)
                               : { from: hours ? now - hours * HOUR : oldest, to: now + DAY },
+                          true,
                         )
                       }
                     >
@@ -1354,6 +1537,48 @@ export function TaskBoardRoutes({
               </div>
             </>
           )}
+          <div className="tb-segment rt-scope" role="group" aria-label={t("routes.scope")}>
+            {(["attention", "all"] as const).map((value) => (
+              <Button
+                key={value}
+                size="sm"
+                variant={settings.scope === value ? "secondary" : "ghost"}
+                aria-pressed={settings.scope === value}
+                onClick={() => {
+                  updateSettings({ scope: value });
+                  setOpen(null);
+                }}
+              >
+                {t(`routes.scope.${value}`)}
+              </Button>
+            ))}
+          </div>
+          <button
+            type="button"
+            className="rt-focus-toggle rt-pins-toggle"
+            aria-pressed={pinsOpen}
+            aria-label={t("routes.pinsTitle")}
+            onClick={() => setPinsOpen(!pinsOpen)}
+          >
+            <PinIcon size={14} />
+            {t("routes.add")}
+            {pins.groups.length + pins.tasks.length > 0 && (
+              <em>{pins.groups.length + pins.tasks.length}</em>
+            )}
+          </button>
+          <button
+            type="button"
+            className="rt-icon"
+            aria-pressed={compact}
+            aria-label={t(compact ? "routes.rowsFinal" : "routes.rowsCompact")}
+            title={t(compact ? "routes.rowsFinal" : "routes.rowsCompact")}
+            onClick={() => {
+              updateSettings({ rows: compact ? "final" : "compact" });
+              setOpen(null);
+            }}
+          >
+            {compact ? <Rows3Icon size={16} /> : <Rows4Icon size={16} />}
+          </button>
           <button
             type="button"
             className="rt-focus-toggle"
@@ -1408,6 +1633,7 @@ export function TaskBoardRoutes({
               </span>
             ))}
           </div>
+          <p>{t("routes.attentionHelp")}</p>
           <p>{t("routes.gestureHelp")}</p>
         </section>
       )}
@@ -1421,6 +1647,18 @@ export function TaskBoardRoutes({
           onChange={(ids) => {
             onFocus(ids);
             setSourcePage(0);
+            setOpen(null);
+          }}
+        />
+      )}
+      {pinsOpen && (
+        <TaskBoardRoutePins
+          groups={groups}
+          pins={pins}
+          sourceName={sourceName}
+          onClose={() => setPinsOpen(false)}
+          onChange={(next: RoutePins) => {
+            updateSettings({ pins: next });
             setOpen(null);
           }}
         />
@@ -1592,6 +1830,7 @@ export function TaskBoardRoutes({
                 className="rt-back-now"
                 type="button"
                 onClick={() => {
+                  easeFrom.current = view;
                   setView(initialWindow(now));
                   setOpen(null);
                 }}
@@ -1721,6 +1960,7 @@ export function TaskBoardRoutes({
             style={{ height: model.height + (scheduledVisible.length ? (phone ? 96 : 88) : 0) }}
           >
             <svg
+              ref={svgRef}
               className={`rt-svg${activeEdge ? " rt-edge-focus" : ""}`}
               width={width}
               height={model.height + (scheduledVisible.length ? (phone ? 96 : 88) : 0)}
@@ -1853,28 +2093,22 @@ export function TaskBoardRoutes({
                       opacity={0.4}
                     />
                   )}
-                  {lane.nodes.slice(1).map((node, index) => {
-                    const previous = lane.nodes[index],
-                      running =
-                        mode === "order"
-                          ? previous.tasks.length === 1 &&
-                            routeState(previous.tasks[0]) === "running"
-                          : node.tasks.length === 1 && routeState(node.tasks[0]) === "running";
-                    return running ? (
+                  {flows
+                    .filter((flow) => flow.lane === lane.id)
+                    .map((flow) => (
                       <line
-                        key={"flow" + node.id}
+                        key={flow.id}
                         className="rt-flow"
-                        x1={previous.x1}
-                        x2={node.x}
-                        y1={node.y}
-                        y2={node.y}
+                        x1={flow.x1}
+                        x2={flow.x2}
+                        y1={flow.y}
+                        y2={flow.y}
                         stroke="var(--card-solid)"
                         strokeWidth={2.5}
                         strokeDasharray="3 9"
                         strokeLinecap="round"
                       />
-                    ) : null;
-                  })}
+                    ))}
                 </g>
               ))}
               {model.edges
@@ -1947,8 +2181,17 @@ export function TaskBoardRoutes({
                         }),
                       )
                       .join("; ")}
-                    onMouseEnter={(event) => showHover({ edge }, event.currentTarget)}
-                    onMouseLeave={() => setHover(null)}
+                    onMouseEnter={(event) => {
+                      // Thin connectors cross the whole map: only a pointer that rests on one
+                      // dims the rest, so sweeping across them does not repaint the map.
+                      const target = event.currentTarget;
+                      clearTimeout(edgeIntent.current);
+                      edgeIntent.current = setTimeout(() => showHover({ edge }, target), 120);
+                    }}
+                    onMouseLeave={() => {
+                      clearTimeout(edgeIntent.current);
+                      setHover(null);
+                    }}
                     onFocus={(event) => showHover({ edge }, event.currentTarget)}
                     onBlur={() => setHover(null)}
                     onClick={() => {
@@ -2021,109 +2264,114 @@ export function TaskBoardRoutes({
                 )}
               </div>
             ))}
-            {model.nodes.map((node) => (
-              <Fragment key={node.id}>
-                {node.density ? (
-                  <button
-                    type="button"
-                    className="rt-density-hit"
-                    style={{
-                      left: node.x,
-                      top: node.y - 22,
-                      width: Math.max(5, node.x1 - node.x),
-                      height: 44,
-                    }}
-                    aria-label={t("routes.densityCount", {
-                      count: node.density.count,
-                      from: momentWord(node.density.from),
-                      to: momentWord(node.density.to),
-                    })}
-                    onMouseEnter={(event) => showHover({ node }, event.currentTarget)}
-                    onMouseLeave={() => setHover(null)}
-                    onClick={() => openNode(node)}
-                  />
-                ) : (
-                  <>
+            <div className="rt-plot" ref={plotRef}>
+              {model.nodes.map((node) => (
+                <Fragment key={node.id}>
+                  {node.density ? (
                     <button
                       type="button"
-                      className="rt-stop"
-                      data-route-task={node.tasks.length === 1 ? node.tasks[0].uid : undefined}
+                      className="rt-density-hit"
                       style={{
-                        left: (node.x + node.x1) / 2,
-                        top: node.y,
-                        ...badgeStyle(node.color),
+                        left: node.x,
+                        top: node.y - 22,
+                        width: Math.max(5, node.x1 - node.x),
+                        height: 44,
                       }}
-                      aria-label={
-                        node.tasks.length > 1
-                          ? t("routes.openCluster", { count: node.tasks.length })
-                          : nodeLabel(node)
-                      }
-                      onMouseEnter={(event) => {
-                        showHover({ node }, event.currentTarget);
-                        if (node.tasks.length === 1 && hubs.get(taskIdentity(node.tasks[0]))?.size)
-                          setHoverHub(taskIdentity(node.tasks[0]));
-                      }}
-                      onMouseLeave={() => {
-                        setHover(null);
-                        setHoverHub(null);
-                      }}
-                      onFocus={(event) => showHover({ node }, event.currentTarget)}
-                      onBlur={() => setHover(null)}
+                      aria-label={t("routes.densityCount", {
+                        count: node.density.count,
+                        from: momentWord(node.density.from),
+                        to: momentWord(node.density.to),
+                      })}
+                      onMouseEnter={(event) => showHover({ node }, event.currentTarget)}
+                      onMouseLeave={() => setHover(null)}
                       onClick={() => openNode(node)}
-                    >
-                      <Station
-                        tasks={node.tasks}
-                        extent={node.x1 - node.x}
-                        time={mode === "time"}
-                      />
-                    </button>
-                    {node.label && (
-                      <span
-                        className={`rt-label${node.hub ? " hub" : ""} rt-label-${node.tasks.length === 1 ? routeState(node.tasks[0]) : "cluster"}`}
-                        style={{ left: node.label.x, top: node.label.y, width: node.label.width }}
+                    />
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        className={`rt-stop${node.tasks.some((task) => marks.changed.has(taskIdentity(task))) ? " rt-changed" : ""}${node.tasks.every((task) => marks.added.has(taskIdentity(task))) ? " rt-new" : ""}`}
+                        data-route-task={node.tasks.length === 1 ? node.tasks[0].uid : undefined}
+                        style={{
+                          left: (node.x + node.x1) / 2,
+                          top: node.y,
+                          ...badgeStyle(node.color),
+                        }}
+                        aria-label={
+                          node.tasks.length > 1
+                            ? t("routes.openCluster", { count: node.tasks.length })
+                            : nodeLabel(node)
+                        }
+                        onMouseEnter={(event) => {
+                          showHover({ node }, event.currentTarget);
+                          if (
+                            node.tasks.length === 1 &&
+                            hubs.get(taskIdentity(node.tasks[0]))?.size
+                          )
+                            setHoverHub(taskIdentity(node.tasks[0]));
+                        }}
+                        onMouseLeave={() => {
+                          setHover(null);
+                          setHoverHub(null);
+                        }}
+                        onFocus={(event) => showHover({ node }, event.currentTarget)}
+                        onBlur={() => setHover(null)}
+                        onClick={() => openNode(node)}
                       >
-                        <b>
-                          {node.lines?.map((line, index) => (
-                            <Fragment key={line}>
-                              {index > 0 && <br />}
-                              {line}
-                            </Fragment>
-                          ))}
-                        </b>
-                        {node.sub && <small>{node.sub}</small>}
-                      </span>
-                    )}
-                    {node.tasks.length === 1 &&
-                      (hubs.get(taskIdentity(node.tasks[0]))?.size ?? 0) > 0 && (
-                        <button
-                          type="button"
-                          className="rt-hub-badge"
-                          style={{ left: node.x + 16, top: node.y - 25 }}
-                          aria-label={t("routes.hubCount", {
-                            count: hubs.get(taskIdentity(node.tasks[0]))!.size,
-                          })}
-                          onMouseEnter={() => setHoverHub(taskIdentity(node.tasks[0]))}
-                          onMouseLeave={() => setHoverHub(null)}
-                          onFocus={() => setHoverHub(taskIdentity(node.tasks[0]))}
-                          onBlur={() => setHoverHub(null)}
-                          onClick={() => {
-                            setOpen((current) =>
-                              current?.kind === "hub" &&
-                              taskIdentity(current.task) === taskIdentity(node.tasks[0])
-                                ? null
-                                : { kind: "hub", lane: node.lane, task: node.tasks[0] },
-                            );
-                            setHover(null);
-                            setPanelPage(0);
-                          }}
+                        <Station
+                          tasks={node.tasks}
+                          extent={node.x1 - node.x}
+                          time={mode === "time"}
+                        />
+                      </button>
+                      {node.label && (
+                        <span
+                          className={`rt-label${node.hub ? " hub" : ""} rt-label-${node.tasks.length === 1 ? routeState(node.tasks[0]) : "cluster"}`}
+                          style={{ left: node.label.x, top: node.label.y, width: node.label.width }}
                         >
-                          {hubs.get(taskIdentity(node.tasks[0]))!.size}
-                        </button>
+                          <b>
+                            {node.lines?.map((line, index) => (
+                              <Fragment key={line}>
+                                {index > 0 && <br />}
+                                {line}
+                              </Fragment>
+                            ))}
+                          </b>
+                          {node.sub && <small>{node.sub}</small>}
+                        </span>
                       )}
-                  </>
-                )}
-              </Fragment>
-            ))}
+                      {node.tasks.length === 1 &&
+                        (hubs.get(taskIdentity(node.tasks[0]))?.size ?? 0) > 0 && (
+                          <button
+                            type="button"
+                            className="rt-hub-badge"
+                            style={{ left: node.x + 16, top: node.y - 25 }}
+                            aria-label={t("routes.hubCount", {
+                              count: hubs.get(taskIdentity(node.tasks[0]))!.size,
+                            })}
+                            onMouseEnter={() => setHoverHub(taskIdentity(node.tasks[0]))}
+                            onMouseLeave={() => setHoverHub(null)}
+                            onFocus={() => setHoverHub(taskIdentity(node.tasks[0]))}
+                            onBlur={() => setHoverHub(null)}
+                            onClick={() => {
+                              setOpen((current) =>
+                                current?.kind === "hub" &&
+                                taskIdentity(current.task) === taskIdentity(node.tasks[0])
+                                  ? null
+                                  : { kind: "hub", lane: node.lane, task: node.tasks[0] },
+                              );
+                              setHover(null);
+                              setPanelPage(0);
+                            }}
+                          >
+                            {hubs.get(taskIdentity(node.tasks[0]))!.size}
+                          </button>
+                        )}
+                    </>
+                  )}
+                </Fragment>
+              ))}
+            </div>
             {scheduledVisible.length > 0 && (
               <div className="rt-future" style={{ top: model.height, height: phone ? 96 : 88 }}>
                 <div className="rt-lane-heading">
@@ -2228,10 +2476,23 @@ export function TaskBoardRoutes({
             {renderPanel()}
           </div>
         )}
+        {attentionView && model.folded > 0 && (
+          <button
+            type="button"
+            className="rt-folded"
+            onClick={() => {
+              updateSettings({ scope: "all" });
+              setOpen(null);
+            }}
+          >
+            <ChevronDownIcon size={14} />
+            {t("routes.foldedSources", { count: model.folded })}
+          </button>
+        )}
         {!model.lanes.length && !scheduledVisible.length && (
           <div className="tb-empty">
             {tasks.length ? (
-              <p>{t("search.empty")}</p>
+              <p>{t(attentionView && model.folded ? "routes.attentionEmpty" : "search.empty")}</p>
             ) : (
               <>
                 <h2>{t("board.empty")}</h2>

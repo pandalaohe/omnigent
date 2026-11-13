@@ -11,6 +11,7 @@ import {
   mapScene,
   orderStops,
   routeMoment,
+  routeState,
   stepMapWindow,
   type MapLane,
 } from "./taskBoardRouteModel";
@@ -334,5 +335,48 @@ describe("order folding and viewport", () => {
         (node) => node.id,
       ).edges,
     ).toEqual([]);
+  });
+});
+
+describe("route view on real-sized rows", () => {
+  const open = (uid: string, extra: Partial<BoardTask> = {}): BoardTask => ({
+    uid,
+    title: uid,
+    progress: "in-process",
+    "omnigent.ai:source": "example",
+    ...extra,
+  });
+  it("runs only cards a session works on; other open cards are open and idle", () => {
+    expect(routeState(open("idle"))).toBe("held");
+    expect(
+      routeState(open("span", { "omnigent.ai:workedBy": [{ session: "s1", from: "2026-11-06" }] })),
+    ).toBe("running");
+    expect(
+      routeState(
+        open("ended", {
+          "omnigent.ai:workedBy": [{ session: "s1", from: "2026-11-05", to: "2026-11-06" }],
+        }),
+      ),
+    ).toBe("held");
+  });
+  it("fits a crowded row into its room, keeping urgent stops and the next queued card", () => {
+    const tasks = [
+      ...Array.from({ length: 30 }, (_, index) => task(`done-${index}`)),
+      task("run-a", "running"),
+      task("user-a", "user"),
+      ...Array.from({ length: 10 }, (_, index) => task(`next-${index}`, "queued")),
+    ];
+    const stops = orderStops(tasks, 9);
+    const singles = stops
+      .filter((stop) => stop.tasks.length === 1)
+      .map((stop) => stop.tasks[0].uid);
+    expect(stops.length).toBeLessThanOrEqual(9);
+    expect(singles).toEqual(expect.arrayContaining(["run-a", "user-a", "next-0", "done-29"]));
+    expect(stops.flatMap((stop) => stop.tasks)).toEqual(tasks);
+  });
+  it("folds urgent cards that do not fit instead of overlapping them", () => {
+    const tasks = Array.from({ length: 20 }, (_, index) => task(`run-${index}`, "running"));
+    expect(orderStops(tasks, 6).length).toBeLessThanOrEqual(6);
+    expect(orderStops(tasks, 6, true).length).toBeLessThanOrEqual(6);
   });
 });

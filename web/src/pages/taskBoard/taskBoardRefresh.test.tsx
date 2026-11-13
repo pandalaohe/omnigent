@@ -1,13 +1,18 @@
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { TaskBoardRoutes } from "./TaskBoardRoutes";
 import type { BoardTask } from "./taskBoardData";
 import type { SourceCache } from "./taskBoardSnapshotData";
 import { DAY } from "./taskBoardRouteData";
+import { ROUTE_VIEW_KEY } from "./taskBoardRouteView";
 
 const clients: QueryClient[] = [];
+// These cases pin the final's layout: every row at the final's row height.
+beforeEach(() =>
+  localStorage.setItem(ROUTE_VIEW_KEY, JSON.stringify({ scope: "all", rows: "final" })),
+);
 afterEach(() => {
   cleanup();
   clients.forEach((client) => client.clear());
@@ -164,11 +169,12 @@ it.each(["source", "group", "focus"] as const)(
         onFocus,
       }),
     );
-    const origin = boundary === "source" ? tasks.at(-1)! : tasks[0];
-    const target = boundary === "source" ? tasks[0] : tasks.at(-1)!;
-    const trigger = view.container.querySelector<HTMLButtonElement>(
-      `.rt-stop[data-route-task="${origin.uid}"]`,
-    )!;
+    // Either end of the relation may land on the first source page; start from the visible one.
+    const stop = (task: BoardTask) =>
+      view.container.querySelector<HTMLButtonElement>(`.rt-stop[data-route-task="${task.uid}"]`);
+    const origin = boundary === "source" && stop(tasks.at(-1)!) ? tasks.at(-1)! : tasks[0];
+    const target = origin === tasks[0] ? tasks.at(-1)! : tasks[0];
+    const trigger = stop(origin)!;
     act(() => trigger.focus());
     fireEvent.click(trigger);
     const first = screen.getByRole("region", { name: `Details: ${origin.title}` });
@@ -424,6 +430,7 @@ it("pages the visible phone group set by ten and source bands by twelve", () => 
     ...task,
     progress: "in-process" as const,
     "omnigent.ai:group": { id: `group-${index}`, name: `Group ${index + 1}` },
+    "omnigent.ai:workedBy": [{ session: `session-${index}`, from: "2026-11-06T00:00:00Z" }],
   }));
   const view = render(board(groups));
   expect(view.container.querySelectorAll(".rt-phone-lane")).toHaveLength(10);

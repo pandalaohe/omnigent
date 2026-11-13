@@ -9,6 +9,7 @@ import { TaskBoardSettings } from "./TaskBoardSettings";
 import { createTaskBoardText } from "./taskBoardText";
 import { taskBoardFixture } from "./taskBoardFixtures";
 import { BOARD_PREFERENCES_KEY } from "./taskBoardPreferences";
+import { ROUTE_VIEW_KEY } from "./taskBoardRouteView";
 import { taskProgress, type BoardTask, type TaskSource } from "./taskBoardData";
 import type { BoardSession } from "./taskBoardNative";
 import { usageBoardData } from "@/pages/usageBoard/usageBoardFixtures";
@@ -74,6 +75,7 @@ beforeEach(() => {
   mocks.quota = null;
   sockets.length = 0;
   localStorage.clear();
+  localStorage.setItem(ROUTE_VIEW_KEY, JSON.stringify({ scope: "all", rows: "final" }));
   vi.stubGlobal(
     "WebSocket",
     class {
@@ -364,6 +366,7 @@ it("maps source tasks to routes and keeps unsafe source URLs as text", async () 
       "omnigent.ai:source": "tracker",
       "omnigent.ai:key": "ENG-1",
       "omnigent.ai:group": { id: "v2", name: "Version two" },
+      "omnigent.ai:workedBy": [{ session: "session-1", from: "2026-11-01T00:00:00Z" }],
       links: { page: { rel: "alternate", href: "https://tracker.example.com/one" } },
     },
     {

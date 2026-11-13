@@ -28,6 +28,10 @@ export const routeColors = [
   "#996633",
 ];
 export type RouteState = NonNullable<TaskDisplay["state"]>;
+/** A card runs only while a session works on it: a running source session or an open work span. */
+export const routeLive = (task: BoardTask) =>
+  !!task["omnigent.ai:sourceDisplay"]?.sessions?.some((session) => session.status === "running") ||
+  !!task["omnigent.ai:workedBy"]?.some((span) => !span.to);
 export const routeState = (task: BoardTask): RouteState =>
   task["omnigent.ai:sourceDisplay"]?.state ??
   (task["omnigent.ai:waiting"]
@@ -35,7 +39,9 @@ export const routeState = (task: BoardTask): RouteState =>
       ? "user"
       : "blocked"
     : taskProgress(task) === "in-process"
-      ? "running"
+      ? routeLive(task)
+        ? "running"
+        : "held"
       : ["completed", "cancelled"].includes(taskProgress(task))
         ? "done"
         : taskProgress(task) === "failed"
@@ -158,111 +164,70 @@ export function mapGroups(
   }
   return groups;
 }
-function orderMapGroups(
-  groups: MapGroup[],
-  tasks: BoardTask[],
-  sourceMetadata: TaskSource[],
-): MapGroup[] {
-  const groupByTask = new Map(
-    groups.flatMap((group) => group.tasks.map((task) => [taskIdentity(task), group.id] as const)),
-  );
-  const attention = (group: MapGroup) => group.tasks.filter(routeAttention).length;
-  const recent = (group: MapGroup) =>
-    Math.max(
-      0,
-      ...group.tasks.map((task) => {
-        const display = task["omnigent.ai:sourceDisplay"];
-        return (
-          Date.parse(
-            display
-              ? (display.historyState?.end ?? display.historyState?.last ?? "")
-              : (task.updated ?? task.created ?? ""),
-          ) || 0
-        );
-      }),
-    );
-  const bySource = new Map<string, MapGroup[]>();
-  for (const group of groups)
-    bySource.set(group.source, [...(bySource.get(group.source) ?? []), group]);
-  const priority = (a: MapGroup, b: MapGroup) =>
-    attention(b) - attention(a) || recent(b) - recent(a);
-  const sources = [...bySource]
-    .map(([source, rows]) => ({
-      source,
-      rows: rows.sort(priority),
-      attention: rows.reduce((sum, row) => sum + attention(row), 0),
-      last: Math.max(0, ...rows.map(recent)),
-    }))
-    .sort(
-      (a, b) =>
-        b.attention - a.attention ||
-        b.last - a.last ||
-        sourceMetadata.findIndex((source) => source.id === a.source) -
-          sourceMetadata.findIndex((source) => source.id === b.source),
-    );
-  const relations = mapRelations(tasks).filter(
-    (edge) =>
-      !mapHubMembers(edge.from, tasks).some((task) => taskIdentity(task) === taskIdentity(edge.to)),
-  );
-  const links = relations.flatMap((edge) => {
-    const a = groupByTask.get(taskIdentity(edge.from)),
-      b = groupByTask.get(taskIdentity(edge.to));
-    return a && b && a !== b ? [[a, b] as [string, string]] : [];
-  });
-  const linked = new Set(links.flat()),
-    input = sources.flatMap((source) => source.rows),
-    positions = new Map<string, number>();
-  if (linked.size > 0 && linked.size <= 150) {
+const compareText = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+let linkedOrder: { structure: string; order: [string, string[]][] } | undefined;
+/** Order linked groups by source block: dagre seeds the order, a bounded swap search refines it. */
+function arrangeLinkedGroups(
+  members: [string, string[]][],
+  links: { pair: [string, string]; weight: number }[],
+): [string, string[]][] {
+  const positions = new Map<string, number>(),
+    count = members.reduce((sum, [, ids]) => sum + ids.length, 0);
+  if (count > 0 && count <= 150) {
+    // Longest-path ranking keeps dagre's ordering phase, at a fifth of network-simplex's cost here.
     const graph = new graphlib.Graph({ compound: true })
-      .setGraph({ rankdir: "LR", nodesep: 10, ranksep: 40 })
+      .setGraph({ rankdir: "LR", nodesep: 10, ranksep: 40, ranker: "longest-path" })
       .setDefaultEdgeLabel(() => ({}));
-    for (const group of input.filter((candidate) => linked.has(candidate.id))) {
-      graph.setNode(`source:${group.source}`, {});
-      graph.setNode(group.id, { width: 100, height: 20 });
-      graph.setParent(group.id, `source:${group.source}`);
+    for (const [source, ids] of members) {
+      graph.setNode(`source:${source}`, {});
+      for (const id of ids) {
+        graph.setNode(id, { width: 100, height: 20 });
+        graph.setParent(id, `source:${source}`);
+      }
     }
-    links.forEach(([a, b], index) => {
+    links.forEach(({ pair: [a, b], weight }, index) => {
       const joint = `joint:${index}`;
       graph.setNode(joint, { width: 4, height: 4 });
-      graph.setEdge(a, joint);
-      graph.setEdge(b, joint);
+      graph.setEdge(a, joint, { weight });
+      graph.setEdge(b, joint, { weight });
     });
     layoutGraph(graph);
-    for (const group of input.filter((candidate) => linked.has(candidate.id)))
-      positions.set(group.id, graph.node(group.id).y as number);
+    for (const [, ids] of members)
+      for (const id of ids) positions.set(id, graph.node(id).y as number);
   }
-  const linkedSources = sources.filter((source) =>
-      source.rows.some((group) => linked.has(group.id)),
-    ),
-    mean = (source: (typeof sources)[number]) => {
-      const values = source.rows.flatMap((group) =>
-        positions.has(group.id) ? [positions.get(group.id)!] : [],
-      );
-      return values.length ? values.reduce((a, b) => a + b, 0) / values.length : 1e12;
-    };
-  const arranged = linkedSources
-    .sort((a, b) => mean(a) - mean(b))
-    .map((source) => ({
-      source: source.source,
-      rows: source.rows
-        .filter((group) => linked.has(group.id))
-        .sort((a, b) => (positions.get(a.id) ?? 1e12) - (positions.get(b.id) ?? 1e12)),
+  const mean = (ids: string[]) =>
+    positions.size ? ids.reduce((sum, id) => sum + positions.get(id)!, 0) / ids.length : 0;
+  const arranged = [...members]
+    .sort((a, b) => mean(a[1]) - mean(b[1]))
+    .map(([source, ids]) => ({
+      source,
+      rows: [...ids].sort((a, b) => (positions.get(a) ?? 0) - (positions.get(b) ?? 0)),
     }));
+  const slot = new Map(members.flatMap(([, ids]) => ids).map((id, index) => [id, index])),
+    ends = links.map(({ pair: [a, b] }) => [slot.get(a)!, slot.get(b)!]),
+    weights = Float64Array.from(links, (link) => link.weight),
+    at = new Int32Array(slot.size),
+    starts = new Int32Array(links.length),
+    stops = new Int32Array(links.length);
   const cost = () => {
-    const at = new Map(
-        arranged.flatMap((source) => source.rows).map((row, index) => [row.id, index]),
-      ),
-      spans = links.map(([a, b]) => {
-        const x = at.get(a)!,
-          y = at.get(b)!;
-        return [Math.min(x, y), Math.max(x, y)];
-      });
-    let score = spans.reduce((sum, [a, b]) => sum + Math.max(0, b - a - 1), 0);
-    for (let i = 0; i < spans.length; i++)
-      for (let j = i + 1; j < spans.length; j++) {
-        const [a, b] = spans[i],
-          [c, d] = spans[j];
-        if ((a < c && c < b && b < d) || (c < a && a < d && d < b)) score += 2;
+    let row = 0;
+    for (const source of arranged) for (const id of source.rows) at[slot.get(id)!] = row++;
+    let score = 0;
+    for (let i = 0; i < ends.length; i++) {
+      const x = at[ends[i][0]],
+        y = at[ends[i][1]];
+      starts[i] = Math.min(x, y);
+      stops[i] = Math.max(x, y);
+      score += weights[i] * Math.max(0, stops[i] - starts[i] - 1);
+    }
+    for (let i = 0; i < ends.length; i++)
+      for (let j = i + 1; j < ends.length; j++) {
+        const a = starts[i],
+          b = stops[i],
+          c = starts[j],
+          d = stops[j];
+        if ((a < c && c < b && b < d) || (c < a && a < d && d < b))
+          score += 2 * weights[i] * weights[j];
       }
     return score;
   };
@@ -290,6 +255,105 @@ function orderMapGroups(
         } else [source.rows[i], source.rows[i + 1]] = [source.rows[i + 1], source.rows[i]];
       }
   }
+  return arranged.map(({ source, rows }) => [source, rows]);
+}
+function orderMapGroups(
+  groups: MapGroup[],
+  tasks: BoardTask[],
+  sourceMetadata: TaskSource[],
+): MapGroup[] {
+  const groupByTask = new Map(
+    groups.flatMap((group) => group.tasks.map((task) => [taskIdentity(task), group.id] as const)),
+  );
+  const attentionCounts = new Map(
+      groups.map((group) => [group.id, group.tasks.filter(routeAttention).length]),
+    ),
+    recentTimes = new Map(
+      groups.map((group) => [
+        group.id,
+        Math.max(
+          0,
+          ...group.tasks.map((task) => {
+            const display = task["omnigent.ai:sourceDisplay"];
+            return (
+              Date.parse(
+                display
+                  ? (display.historyState?.end ?? display.historyState?.last ?? "")
+                  : (task.updated ?? task.created ?? ""),
+              ) || 0
+            );
+          }),
+        ),
+      ]),
+    );
+  const attention = (group: MapGroup) => attentionCounts.get(group.id)!;
+  const recent = (group: MapGroup) => recentTimes.get(group.id)!;
+  const bySource = new Map<string, MapGroup[]>();
+  for (const group of groups)
+    bySource.set(group.source, [...(bySource.get(group.source) ?? []), group]);
+  const priority = (a: MapGroup, b: MapGroup) =>
+    attention(b) - attention(a) || recent(b) - recent(a);
+  const sources = [...bySource]
+    .map(([source, rows]) => ({
+      source,
+      rows: rows.sort(priority),
+      attention: rows.reduce((sum, row) => sum + attention(row), 0),
+      last: Math.max(0, ...rows.map(recent)),
+    }))
+    .sort(
+      (a, b) =>
+        b.attention - a.attention ||
+        b.last - a.last ||
+        sourceMetadata.findIndex((source) => source.id === a.source) -
+          sourceMetadata.findIndex((source) => source.id === b.source),
+    );
+  const hubMembers = new Map(
+    tasks.flatMap((task) => {
+      const members = task["omnigent.ai:sourceDisplay"]?.hub?.members;
+      return members
+        ? [
+            [
+              taskIdentity(task),
+              new Set(members.map((ref) => JSON.stringify([ref.source, ref.uid]))),
+            ] as const,
+          ]
+        : [];
+    }),
+  );
+  // Many relations join the same two groups: lay out and score each group pair once, weighted.
+  const pairs = new Map<string, { pair: [string, string]; weight: number }>();
+  for (const edge of mapRelations(tasks)) {
+    const from = taskIdentity(edge.from),
+      to = taskIdentity(edge.to);
+    if (hubMembers.get(from)?.has(to)) continue;
+    const a = groupByTask.get(from),
+      b = groupByTask.get(to);
+    if (!a || !b || a === b) continue;
+    const pair: [string, string] = a < b ? [a, b] : [b, a],
+      key = JSON.stringify(pair),
+      known = pairs.get(key);
+    if (known) known.weight++;
+    else pairs.set(key, { pair, weight: 1 });
+  }
+  const links = [...pairs.values()].sort((a, b) =>
+      compareText(a.pair.join("\n"), b.pair.join("\n")),
+    ),
+    linked = new Set(links.flatMap((link) => link.pair)),
+    members = sources
+      .flatMap((source) => {
+        const ids = source.rows.flatMap((group) => (linked.has(group.id) ? [group.id] : []));
+        return ids.length ? [[source.source, ids.sort(compareText)] as [string, string[]]] : [];
+      })
+      .sort((a, b) => compareText(a[0], b[0]));
+  // The linked order depends on structure only, so refreshes that change no link reuse it.
+  const structure = JSON.stringify([members, links]);
+  if (linkedOrder?.structure !== structure)
+    linkedOrder = { structure, order: arrangeLinkedGroups(members, links) };
+  const byId = new Map(groups.map((group) => [group.id, group]));
+  const arranged = linkedOrder.order.map(([source, ids]) => ({
+    source,
+    rows: ids.map((id) => byId.get(id)!),
+  }));
   const attentionCost = (list: typeof arranged) =>
     list.reduce(
       (sum, source, index) =>
@@ -374,47 +438,71 @@ export interface MapFold {
   tasks: BoardTask[];
   queued: boolean;
 }
-export function orderStops(tasks: BoardTask[], room: number, collapsed = false): MapFold[] {
+const urgency: Partial<Record<RouteState, number>> = { running: 0, user: 1, failed: 2, blocked: 3 };
+/** Important cards first: running, waiting on you, failed, blocked, then the most recent. */
+const byUrgency = (tasks: BoardTask[]) =>
+  tasks
+    .map((task, index) => ({ task, index }))
+    .sort(
+      (a, b) =>
+        (urgency[routeState(a.task)] ?? 9) - (urgency[routeState(b.task)] ?? 9) ||
+        b.index - a.index,
+    )
+    .map((item) => item.task);
+/**
+ * Fit a row into `room` stops. Important cards stay stations; the rest keep the newest finished and
+ * the next queued in turn, and whatever does not fit folds in place into counted capsules.
+ */
+export function orderStops(
+  tasks: BoardTask[],
+  room: number,
+  collapsed = false,
+  important: (task: BoardTask) => boolean = routeAttention,
+): MapFold[] {
+  const fold = (items: BoardTask[]) => ({ tasks: items, queued: items.every(routeQueued) });
   const past = tasks.filter((task) => !routeQueued(task)),
     queued = tasks.filter(routeQueued);
-  if (collapsed)
+  if (collapsed) {
+    const shown = new Set(byUrgency(past.filter(important)).slice(0, Math.max(0, room - 2)));
     return [
-      past.filter((task) => !routeAttention(task)),
-      ...past.filter(routeAttention).map((task) => [task]),
+      past.filter((task) => !shown.has(task)),
+      ...past.filter((task) => shown.has(task)).map((task) => [task]),
       queued,
     ]
       .filter((items) => items.length)
-      .map((items) => ({ tasks: items, queued: items.every(routeQueued) }));
-  const sorted = tasks;
-  if (sorted.length <= room)
-    return sorted.map((task) => ({ tasks: [task], queued: routeQueued(task) }));
-  const keep = new Set(past.filter(routeAttention));
-  let left = room - keep.size - 2;
-  const queuedCount = queued.length
-    ? Math.min(queued.length, Math.max(1, Math.floor(left * 0.3)))
-    : 0;
-  queued.slice(0, queuedCount).forEach((task) => keep.add(task));
-  left -= queuedCount;
-  for (let i = past.length - 1; i >= 0 && left > 0; i--)
-    if (!keep.has(past[i])) {
-      keep.add(past[i]);
-      left--;
-    }
+      .map(fold);
+  }
+  if (tasks.length <= room) return tasks.map((task) => fold([task]));
+  const finished = past.filter((task) => !important(task)).reverse(),
+    next = queued.filter((task) => !important(task)),
+    candidates = byUrgency(tasks.filter(important));
+  for (let i = 0; i < Math.max(finished.length, next.length); i++)
+    candidates.push(...(next[i] ? [next[i]] : []), ...(finished[i] ? [finished[i]] : []));
+  // Entries = kept stations + runs of folded cards; keeping a card changes that by 0, 1 or 2.
+  const index = new Map(tasks.map((task, position) => [task, position])),
+    kept = new Array<boolean>(tasks.length).fill(false);
+  let entries = 1;
+  for (const task of candidates) {
+    const at = index.get(task)!,
+      left = at > 0 && !kept[at - 1],
+      right = at + 1 < tasks.length && !kept[at + 1],
+      change = left && right ? 2 : left || right ? 1 : 0;
+    if (entries + change > room) continue;
+    kept[at] = true;
+    entries += change;
+  }
   const out: MapFold[] = [];
   let run: BoardTask[] = [];
-  const flush = () => {
-    if (run.length) {
-      out.push({ tasks: run, queued: run.every(routeQueued) });
-      run = [];
+  tasks.forEach((task, at) => {
+    if (!kept[at]) {
+      run.push(task);
+      return;
     }
-  };
-  for (const task of sorted) {
-    if (keep.has(task)) {
-      flush();
-      out.push({ tasks: [task], queued: routeQueued(task) });
-    } else run.push(task);
-  }
-  flush();
+    if (run.length) out.push(fold(run));
+    run = [];
+    out.push(fold([task]));
+  });
+  if (run.length) out.push(fold(run));
   return out;
 }
 export const routePresetHours = [12, 48, 96, 192, 744, 2184, 8784] as const;
@@ -713,6 +801,7 @@ export function placeMapLabels(
   width: number,
   gutter: number,
   measure: (text: string, size: number, weight: number) => number,
+  compact = false,
 ) {
   const labelled = nodes.filter((node) => node.lines?.length),
     placed: RouteBox[] = [];
@@ -748,11 +837,13 @@ export function placeMapLabels(
       const w =
         Math.ceil(
           Math.max(
-            ...node.lines!.map((line) => measure(line, node.hub ? 14 : 13, 700)),
+            ...node.lines!.map((line) =>
+              measure(line, (node.hub ? 14 : 13) - (compact ? 1 : 0), 700),
+            ),
             node.sub ? measure(node.sub, 12, 400) : 0,
           ),
         ) + 2;
-      const h = node.lines!.length * 17 + (node.sub ? 15 : 0),
+      const h = node.lines!.length * (compact ? 15 : 17) + (node.sub ? 15 : 0),
         gap = routeNodeRadius(node) + 4,
         cx = (node.x + node.x1) / 2,
         lane = lanes.find((item) => item.id === node.lane)!;
@@ -812,6 +903,7 @@ export function mapScene(
   label: (node: MapNode) => string | { lines: string[]; sub: string },
   measure: (text: string, size: number, weight: number) => number = (text, size) =>
     text.length * size * 0.56,
+  options: { compact?: boolean; important?: (task: BoardTask) => boolean } = {},
 ) {
   const phone = width <= 620;
   if (phone && mode === "order") return { nodes: [] as MapNode[], edges: [] as MapEdge[], lanes };
@@ -823,7 +915,12 @@ export function mapScene(
       .filter((lane) => !lane.quiet && !lane.pager && (!lane.header || lane.collapsed))
       .map((lane) => [
         lane.id,
-        orderStops(lane.tasks, Math.max(3, Math.floor((right - gutter) / 104) + 1), lane.collapsed),
+        orderStops(
+          lane.tasks,
+          Math.max(3, Math.floor((right - gutter) / 104) + 1),
+          lane.collapsed,
+          options.important,
+        ),
       ]),
   );
   const maxStops = Math.max(3, ...[...items.values()].map((stops) => stops.length)),
@@ -898,13 +995,19 @@ export function mapScene(
           routeMoment(task, now)! <= view.to,
       )
       .sort((a, b) => routeMoment(a, now)! - routeMoment(b, now)!);
-    const pinned = timed.filter((task) => ["running", "user"].includes(routeState(task))),
-      rest = timed.filter((task) => !pinned.includes(task));
+    const live = byUrgency(timed.filter((task) => ["running", "user"].includes(routeState(task)))),
+      rest = timed.filter((task) => !live.includes(task));
     const x = (time: number) =>
       gutter + ((time - view.from) / (view.to - view.from)) * (right - gutter);
     const minimum = lane.collapsed ? 34 : level === "station" ? 60 : 84;
     const pinnedX = Math.min(right - 8, x(now)),
       pinnedGap = lane.collapsed ? 38 : 50,
+      // Live stops stack left of now; those that would run past the row start share one capsule.
+      liveRoom = Math.max(1, Math.floor((pinnedX - gutter - minimum) / pinnedGap) + 1),
+      pinned: BoardTask[][] =
+        live.length > liveRoom
+          ? [live.slice(liveRoom - 1), ...live.slice(0, liveRoom - 1).map((task) => [task])]
+          : live.map((task) => [task]),
       limit = pinned.length ? pinnedX - (pinned.length - 1) * pinnedGap - minimum : Infinity;
     const clusters: { x: number; end: number; tasks: BoardTask[] }[] = [];
     for (const task of rest) {
@@ -923,7 +1026,10 @@ export function mapScene(
       );
       node.timeCluster = cluster.tasks.length > 1;
     }
-    pinned.forEach((task, index) => add([task], pinnedX - (pinned.length - 1 - index) * pinnedGap));
+    pinned.forEach((stop, index) => {
+      const at = pinnedX - (pinned.length - 1 - index) * pinnedGap;
+      add(stop, at, stop.length > 1 ? at + 2 : at);
+    });
     if (view.from <= now && view.to >= now && level === "station") {
       const queue = lane.tasks.filter(routeQueued),
         end = Math.max(x(now), ...lane.nodes.map((node) => node.x1)),
@@ -1070,6 +1176,14 @@ export function mapScene(
     )
       node.lines = [];
   }
-  placeMapLabels(nodes, segments, lanes, width, mode === "order" ? 168 : phone ? 4 : 168, measure);
+  placeMapLabels(
+    nodes,
+    segments,
+    lanes,
+    width,
+    mode === "order" ? 168 : phone ? 4 : 168,
+    measure,
+    options.compact,
+  );
   return { nodes, edges, lanes };
 }
