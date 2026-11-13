@@ -1,7 +1,9 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
 import { useBoardCadence } from "./taskBoardPreferences";
 import { readBoardJson, type BoardTask, type TaskHistory } from "./taskBoardData";
 import type { BoardSession } from "./taskBoardNative";
+import type { SourceCache } from "./taskBoardSnapshotData";
 
 export interface BoardEvent extends TaskHistory {
   source: string;
@@ -65,6 +67,8 @@ interface HistoryCache {
   entries: BoardEvent[];
   through: string;
   earlier: string;
+  after?: string;
+  revision: string;
 }
 const eventKey = (event: BoardEvent) => JSON.stringify([event.source, event.uid, event.id]);
 function mergeEvents(a: BoardEvent[], b: BoardEvent[]) {
@@ -74,10 +78,17 @@ function mergeEvents(a: BoardEvent[], b: BoardEvent[]) {
       eventKey(right).localeCompare(eventKey(left)),
   );
 }
-export function useBoardHistory(enabled = true) {
+export function useBoardHistory(enabled = true, sources?: Record<string, SourceCache>) {
   const client = useQueryClient(),
     cadence = useBoardCadence();
-  const key = ["taskBoard", "windowedHistory"];
+  const identities = Object.entries(sources ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  const generation = JSON.stringify(
+    identities.map(([id, source]) => [id, source.pin.sourceGeneration]),
+  );
+  const revision = JSON.stringify(
+    identities.map(([id, source]) => [id, source.pin.id, source.display.asOf]),
+  );
+  const key = ["taskBoard", "windowedHistory", generation];
   const query = useQuery({
     queryKey: key,
     enabled,
@@ -88,18 +99,25 @@ export function useBoardHistory(enabled = true) {
       const previous = client.getQueryData<HistoryCache>(key);
       let through = new Date().toISOString();
       if (previous) {
-        const updates = await readBoardHistory(
-          new URLSearchParams({
-            changed_after: new Date(Date.parse(previous.through) - 60_000).toISOString(),
-            after:
-              previous.entries.at(-1)?.time ?? new Date(Date.now() - 3 * 86_400_000).toISOString(),
-          }),
-          (value) => {
-            through = value;
-          },
-        );
+        // Source revisions also catch commits delayed beyond the timestamp overlap.
+        const reconcile = !sources || previous.revision !== revision;
+        const params = new URLSearchParams();
+        if (!reconcile)
+          params.set(
+            "changed_after",
+            new Date(Date.parse(previous.through) - 60_000).toISOString(),
+          );
+        if (previous.after) params.set("after", previous.after);
+        const updates = await readBoardHistory(params, (value) => {
+          through = value;
+        });
         const latest = client.getQueryData<HistoryCache>(key) ?? previous;
-        return { ...latest, entries: mergeEvents(latest.entries, updates), through };
+        const retained = reconcile
+          ? latest.entries.filter(
+              (entry) => previous.after && Date.parse(entry.time) < Date.parse(previous.after),
+            )
+          : latest.entries;
+        return { ...latest, entries: mergeEvents(retained, updates), through, revision };
       }
       const after = new Date(Date.now() - 3 * 86_400_000).toISOString();
       const params = new URLSearchParams({ after, limit: "500" });
@@ -117,9 +135,16 @@ export function useBoardHistory(enabled = true) {
         entries: page.entries,
         through: page.changedThrough ?? through,
         earlier: params.toString(),
+        after,
+        revision,
       };
     },
   });
+  const cachedRevision = query.data?.revision;
+  const refetch = query.refetch;
+  useEffect(() => {
+    if (enabled && cachedRevision !== undefined && cachedRevision !== revision) void refetch();
+  }, [enabled, revision, cachedRevision, refetch]);
   const earlier = useQuery({
     queryKey: [...key, "earlier", query.data?.earlier],
     enabled: false,
@@ -130,17 +155,23 @@ export function useBoardHistory(enabled = true) {
       const page = await readBoardJson<{ entries: BoardEvent[]; cursor?: string }>(
         `/v1/me/tasks/history?${params}`,
       );
+      const after = params.has("after")
+        ? previous.after
+        : page.cursor
+          ? (page.entries.at(-1)?.time ?? previous.after)
+          : undefined;
       if (page.cursor) params.set("cursor", page.cursor);
       else if (params.has("after")) {
         params.set("before", params.get("after")!);
         params.delete("after");
         params.delete("cursor");
       } else params.set("done", "1");
-      client.setQueryData<HistoryCache>(key, {
-        ...previous,
-        entries: mergeEvents(previous.entries, page.entries),
+      client.setQueryData<HistoryCache>(key, (latest = previous) => ({
+        ...latest,
+        entries: mergeEvents(latest.entries, page.entries),
         earlier: params.toString(),
-      });
+        after,
+      }));
       return true;
     },
   });

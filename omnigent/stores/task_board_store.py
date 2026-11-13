@@ -5,11 +5,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, TypeVar
 
 from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
@@ -40,6 +39,8 @@ from omnigent.server.task_board.models import (
     utc_timestamp,
 )
 from omnigent.stores.task_board_snapshots import apply_snapshot, digest, guard_sources, source_pin
+
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -145,18 +146,23 @@ class TaskBoardStore:
             immediate=True,
         )
 
-    @contextmanager
-    def _read(self, name: str) -> Iterator[Session]:
-        with self._reads(name) as session:
+    def _read(self, name: str, callback: Callable[[Session], _T]) -> _T:
+        def read(session: Session) -> _T:
             # Pins and rows must describe the same publication without blocking its writer.
             dialect = session.get_bind().dialect.name
             if dialect in {"postgresql", "mysql"}:
                 session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+            elif dialect == "cockroachdb":
+                session.connection(
+                    execution_options={"isolation_level": "SERIALIZABLE"}
+                ).exec_driver_sql("SET TRANSACTION READ ONLY")
             elif dialect == "sqlite":
                 connection = session.connection()
                 if not getattr(connection.connection.driver_connection, "in_transaction", False):
                     connection.exec_driver_sql("BEGIN")
-            yield session
+            return callback(session)
+
+        return run_write_transaction(self._reads, name, read)
 
     @staticmethod
     def _scope(model: Any, owner: str) -> tuple[Any, ...]:
@@ -392,7 +398,8 @@ class TaskBoardStore:
                 query.read_at if query.read_at is not None else datetime.now(UTC).timestamp()
             ),
         )
-        with self._read("read_tasks") as session:
+
+        def read(session: Session) -> tuple[list[dict[str, Any]], str | None]:
             pins = guard_sources(
                 session,
                 owner,
@@ -491,6 +498,8 @@ class TaskBoardStore:
                 )
             return entries, next_cursor
 
+        return self._read("read_tasks", read)
+
     @staticmethod
     def _closed_time(row: SqlTaskBoardItem) -> str | None:
         if row.progress in OPEN_PROGRESS:
@@ -561,7 +570,7 @@ class TaskBoardStore:
         snapshot: str | None = None,
         source_generation: str | None = None,
     ) -> dict[str, Any] | None:
-        with self._read("read_task") as session:
+        def read(session: Session) -> dict[str, Any] | None:
             guard_sources(
                 session, owner, source, snapshot=snapshot, source_generation=source_generation
             )
@@ -574,11 +583,14 @@ class TaskBoardStore:
             )
             return self._entries(session, owner, [row], history=True)[0] if row else None
 
+        return self._read("read_task", read)
+
     def list_history(
         self, owner: str, query: HistoryQuery
     ) -> tuple[list[dict[str, Any]], str | None]:
         fingerprint, cursor = _read_cursor(owner, "history", query)
-        with self._read("read_task_history") as session:
+
+        def read(session: Session) -> tuple[list[dict[str, Any]], str | None]:
             pins = guard_sources(
                 session,
                 owner,
@@ -641,6 +653,8 @@ class TaskBoardStore:
                 rows
             ) > query.limit else None
 
+        return self._read("read_task_history", read)
+
     def closed_counts(
         self,
         owner: str,
@@ -652,7 +666,7 @@ class TaskBoardStore:
         snapshot: str | None = None,
         source_generation: str | None = None,
     ) -> list[dict[str, Any]]:
-        with self._read("count_closed_tasks") as session:
+        def read(session: Session) -> list[dict[str, Any]]:
             guard_sources(
                 session, owner, source, snapshot=snapshot, source_generation=source_generation
             )
@@ -684,6 +698,8 @@ class TaskBoardStore:
                 for (day, source_id), count in sorted(counts.items())
             ]
 
+        return self._read("count_closed_tasks", read)
+
     def delete_source(self, owner: str, source_id: str) -> bool:
         if not source_id:
             return False
@@ -709,7 +725,7 @@ class TaskBoardStore:
         return run_write_transaction(self._writes, "delete_task_source", remove)
 
     def list_sources(self, owner: str) -> list[dict[str, Any]]:
-        with self._read("read_task_sources") as session:
+        def read(session: Session) -> list[dict[str, Any]]:
             counts: dict[str, dict[str, int]] = {}
             for source_id, progress, gone_at, count in session.execute(
                 select(
@@ -756,6 +772,8 @@ class TaskBoardStore:
                 )
             ]
 
+        return self._read("read_task_sources", read)
+
     def read_display(
         self,
         owner: str,
@@ -770,7 +788,8 @@ class TaskBoardStore:
         limit: int = 1000,
         cursor: str | None = None,
     ) -> dict[str, Any]:
-        with self._read("read_source_display") as session:
+        def read(session: Session) -> dict[str, Any]:
+            page_offset = offset
             pins = guard_sources(
                 session, owner, source_id, snapshot=snapshot, source_generation=source_generation
             )
@@ -805,7 +824,7 @@ class TaskBoardStore:
                         or decoded["offset"] < 0
                     ):
                         raise ValueError
-                    offset = decoded["offset"]
+                    page_offset = decoded["offset"]
                 except (ValueError, KeyError, TypeError, UnicodeError):
                     raise ReportError(
                         "bad_value", "cursor", "Invalid cursor for this display query"
@@ -839,13 +858,15 @@ class TaskBoardStore:
             ]
             return {
                 "snapshot": pins[source_id],
-                "entries": rows[offset : offset + limit],
+                "entries": rows[page_offset : page_offset + limit],
                 "cursor": base64.urlsafe_b64encode(
-                    json.dumps({"query": query_key, "offset": offset + limit}).encode()
+                    json.dumps({"query": query_key, "offset": page_offset + limit}).encode()
                 ).decode()
-                if offset + limit < len(rows)
+                if page_offset + limit < len(rows)
                 else None,
             }
+
+        return self._read("read_source_display", read)
 
     def record_issue(self, owner: str, source_id: str, error: ReportError, now: datetime) -> None:
         def record(session: Session) -> None:

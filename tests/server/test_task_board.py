@@ -135,6 +135,7 @@ async def test_history_incremental_refresh_includes_backdated_append(board_clien
         "/v1/me/tasks/history",
         params={
             "changed_after": utc_text((NOW + timedelta(minutes=1)).timestamp()),
+            "after": utc_text((NOW - timedelta(days=3)).timestamp()),
             "uid": "eng-1",
             "source": "example",
         },

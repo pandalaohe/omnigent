@@ -56,6 +56,68 @@ def publish(store, tasks):
     return metadata, header, result
 
 
+def test_guard_and_rows_share_a_snapshot_during_replacement(db_uri, monkeypatch):
+    from omnigent.stores import task_board_store
+
+    store = TaskBoardStore(db_uri)
+    _, original, _ = publish(store, [task("a")])
+    guard = task_board_store.guard_sources
+    interleaved = False
+
+    def replace_after_guard(*args, **kwargs):
+        nonlocal interleaved
+        pins = guard(*args, **kwargs)
+        if not interleaved:
+            interleaved = True
+            metadata, header = envelope(
+                [task("a", 1, "Staging")], snapshot_id="second", base_id="first", sequence=2
+            )
+            header["sourceGeneration"] = original["sourceGeneration"]
+            store.write("owner", "example", operation(metadata, header, "begin"))
+            store.write(
+                "owner",
+                "example",
+                operation(metadata, header, "append", [task("a", 1, "Staging")], chunkIndex=0),
+            )
+        return pins
+
+    monkeypatch.setattr(task_board_store, "guard_sources", replace_after_guard)
+    try:
+        result = store.get_item("owner", "example", "a")
+    except ReportError as error:
+        assert error.code == "snapshot_updating"
+    else:
+        assert result["title"] == "Original"
+    assert interleaved
+
+
+def test_cockroach_read_retries_the_whole_serializable_snapshot(db_uri, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from sqlalchemy.exc import DBAPIError
+
+    from omnigent.stores import task_board_store
+
+    store = TaskBoardStore(db_uri)
+    maker = MagicMock()
+    maker.engine.dialect.name = "cockroachdb"
+    maker.query_name_prefix = "omnigent.task_board"
+    session = maker.return_value.__enter__.return_value
+    session.get_bind.return_value = maker.engine
+    session.scalar.return_value = None
+    store._reads = maker
+    guard = MagicMock(
+        side_effect=[DBAPIError("SELECT", {}, SimpleNamespace(sqlstate="40001")), {}]
+    )
+    monkeypatch.setattr(task_board_store, "guard_sources", guard)
+    assert store.get_item("owner", "example", "a") is None
+    assert guard.call_count == 2
+    assert maker.call_count == 2
+    session.connection.assert_called_with(execution_options={"isolation_level": "SERIALIZABLE"})
+    session.connection.return_value.exec_driver_sql.assert_called_with("SET TRANSACTION READ ONLY")
+
+
 def test_staging_guards_all_reads_and_writers_and_publish_retry(db_uri):
     store = TaskBoardStore(db_uri)
     metadata, header = envelope([task("a"), task("b")], chunks=2)

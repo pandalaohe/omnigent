@@ -46,7 +46,7 @@ export function TaskBoardActivity({
   const now = Date.now(),
     today = localDay(now),
     offset = -new Date(now).getTimezoneOffset();
-  const history = useBoardHistory(view === "log");
+  const history = useBoardHistory(view === "log", sourceCaches);
   const counts = useQuery({
     queryKey: ["taskBoard", "closedCounts", offset],
     queryFn: () => readLocalClosedCounts(),
@@ -74,7 +74,7 @@ export function TaskBoardActivity({
   ).filter((c) => !excluded.includes(c.source));
   return (
     <section className="tb-activity-final" aria-label={t("view." + view)}>
-      {!sourceCaches && history.isError && (
+      {view === "log" && history.isError && (
         <p role="alert">
           {t("activity.failed")}{" "}
           <button type="button" onClick={() => void history.refetch()}>
