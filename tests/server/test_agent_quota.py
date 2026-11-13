@@ -223,6 +223,79 @@ def test_discovery_repeated_choice_links_bound_agent_database_reads(
     assert 1 <= len(agent_reads) <= 2, f"repeated links caused {len(agent_reads)} agent reads"
 
 
+@pytest.mark.parametrize("default_model", [None, "test-default"])
+def test_activity_meters_reuse_default_model_and_refresh_next_call(
+    service, db_uri, tmp_path, default_model
+):
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from tests._helpers.session import bundle_files
+
+    agents = SqlAlchemyAgentStore(db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    service.agent_store = agents
+    service.agent_cache = AgentCache(artifacts, tmp_path / "cache")
+    agent_id = "c" * 32
+
+    def bundle(model):
+        config = (
+            "spec_version: 1\nname: test-agent\nexecutor:\n"
+            "  type: omnigent\n  config:\n    harness: codex\n"
+        )
+        if model is not None:
+            config += f"llm:\n  model: {model}\n"
+        return bundle_files({"config.yaml": config.encode()})
+
+    artifacts.put("original", bundle(default_model))
+    agents.create(agent_id, "test-agent", "original")
+    settings = {
+        "workTypes": [{"id": "work", "label": "Work"}],
+        "hosts": {
+            f"host-{index}": {
+                "work": [
+                    [
+                        {
+                            "links": [
+                                {"agent": agent_id, "meter": "plan-a"},
+                                {"agent": agent_id, "meter": "plan-b"},
+                                {"agent": agent_id, "model": "explicit", "meter": "plan-c"},
+                            ]
+                        }
+                    ]
+                ]
+            }
+            for index in range(40)
+        },
+    }
+    service.preferences.replace_session_choice(
+        OWNER, settings, service.preferences.session_choice(OWNER)["revision"]
+    )
+    agent_reads = []
+
+    def record_read(conn, cursor, statement, parameters, context, executemany):
+        if "FROM agents" in statement:
+            agent_reads.append(statement)
+
+    event.listen(agents._engine, "before_cursor_execute", record_read)
+    try:
+        assert service._activity_meters(OWNER) == {
+            ("codex", default_model or ""): {"plan-a", "plan-b"},
+            ("codex", "explicit"): {"plan-c"},
+        }
+        assert len(agent_reads) <= 2, f"default model caused {len(agent_reads)} agent reads"
+        artifacts.put("updated", bundle("test-updated"))
+        agents.update(agent_id, "updated")
+        agent_reads.clear()
+        assert service._activity_meters(OWNER) == {
+            ("codex", "test-updated"): {"plan-a", "plan-b"},
+            ("codex", "explicit"): {"plan-c"},
+        }
+        assert len(agent_reads) <= 2, f"updated model caused {len(agent_reads)} agent reads"
+    finally:
+        event.remove(agents._engine, "before_cursor_execute", record_read)
+
+
 @pytest.fixture
 def service(db_uri):
     return AgentQuotaService(
