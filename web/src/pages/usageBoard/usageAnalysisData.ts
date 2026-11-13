@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { usageJson } from "./usagePriceSourceData";
 import { usageRangeQuery, type UsageRange } from "./UsageRangeControl";
 import { USAGE_BOARD_POLL_MS } from "./usageBoardData";
+import { formatRingPercent } from "./usageBoardFormat";
 
 export type AnalysisDimension = "account" | "pool" | "model";
 export interface AnalysisRow {
@@ -108,11 +109,27 @@ export function analysisTotals(rows: AnalysisRow[], incomplete = false) {
 }
 
 export interface AnalysisProjection {
+  api_value?: AnalysisValue;
+  spend?: AnalysisValue;
+  spend_estimated?: boolean;
+  show_money?: boolean;
+  show_payback?: boolean;
+  account_money?: Record<string, AccountMoney>;
   paid: AnalysisValue;
   payback: AnalysisValue;
   tokens: AnalysisValue;
   coverage?: { known_paid: number; total_items: number };
   cards?: AnalysisCard[];
+}
+export interface AccountMoney {
+  cost_class: "subscription" | "prepaid" | "metered" | "free" | null;
+  show_money: boolean;
+  show_payback: boolean;
+  estimated: boolean;
+  spend: AnalysisValue;
+  api_value: AnalysisValue;
+  paid: AnalysisValue;
+  payback: AnalysisValue;
 }
 export interface AnalysisCard {
   id: string;
@@ -165,11 +182,12 @@ export function analysisValueText(
         ? ({ USD: "$", CNY: "¥", HKD: "HK$" }[value.currency ?? "USD"] ?? "")
         : "";
   const text = (raw: string) => {
-    const [whole, decimal] = raw.split(".");
+    const [whole, decimal] = (unit === "percent" ? formatRingPercent(raw) : raw).split(".");
     const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    if (unit === "percent") return `${grouped}.${decimal}%`;
     return unit === "money" || unit === "quota"
       ? `${grouped.startsWith("-") ? "-" : ""}${symbol}${grouped.replace(/^-/, "")}.${decimal ?? "00"}`
-      : `${grouped}${decimal && Number(decimal) ? `.${decimal.replace(/0+$/, "")}` : ""}${unit === "ratio" ? "×" : unit === "percent" ? "%" : ""}`;
+      : `${grouped}${decimal && Number(decimal) ? `.${decimal.replace(/0+$/, "")}` : ""}${unit === "ratio" ? "×" : ""}`;
   };
   const low = text(value.formatted.low),
     high = value.formatted.high === null ? null : text(value.formatted.high);

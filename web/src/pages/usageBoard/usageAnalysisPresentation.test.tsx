@@ -1,5 +1,11 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { useState } from "react";
+import {
+  UsageAnalysisFailures,
+  UsageAnalysisShares,
+  UsageAnalysisTable,
+} from "./UsageAnalysisAmounts";
+import { moneyText } from "./UsageAccountMoney";
 import { afterEach, expect, it } from "vitest";
 import {
   AnalysisCards,
@@ -15,6 +21,126 @@ import {
 } from "./usageAnalysisData";
 
 afterEach(cleanup);
+it("keeps two decimals in Analysis table, failure bars and token shares", () => {
+  const row: AnalysisRow = {
+    account_id: "a",
+    parent_account_id: "a",
+    pool_id: null,
+    hour: 1794265200,
+    model: "claude-a",
+    basis: "metered",
+    tokens: 31,
+    requests: 100,
+    failed: 31,
+    cost_usd: null,
+    contributes_usage: true,
+    contributes_money: false,
+    attributed: false,
+    coverage: "complete",
+    reason: null,
+  };
+  const rows = [row, { ...row, model: "gpt-a", tokens: 69, requests: 0, failed: 0 }];
+  const items = [{ key: "a", name: "Alpha", rows, projection: fixture().projection }];
+  render(
+    <>
+      <UsageAnalysisTable
+        items={items}
+        incomplete={false}
+        sort={{ key: "paid", direction: 1 }}
+        onSort={() => {}}
+      />
+      <UsageAnalysisFailures items={items} incomplete={false} />
+      <UsageAnalysisShares rows={rows} incomplete={false} />
+    </>,
+  );
+  const table = screen.getByRole("table", { name: "Each item" });
+  expect(within(table).getByText("31.00%", { exact: true })).toHaveAttribute(
+    "data-label",
+    "Failure rate",
+  );
+  expect(screen.getByRole("button", { name: "Alpha failure rate 31.00%" })).toHaveTextContent(
+    "31.00%",
+  );
+  expect(screen.getByRole("button", { name: "Claude token share 31.00%" })).toBeVisible();
+  expect(screen.getByText("31.00% / —", { exact: true })).toBeVisible();
+});
+it("keeps two decimals and signed bounds in server-rounded Analysis percentages", () => {
+  expect(analysisValueText(value("31", "31.00", null), "percent")).toBe("31.00%");
+  expect(analysisValueText(value("-31", "-31.00", null), "percent")).toBe("-31.00%");
+  expect(analysisValueText(value("1234", "1234.00", null), "percent")).toBe("1,234.00%");
+  expect(
+    analysisValueText(
+      {
+        ...value("-31.001", "-31.01", null),
+        state: "range",
+        high: "-30.999",
+        formatted: { low: "-31.01", high: "-30.99" },
+      },
+      "percent",
+    ),
+  ).toBe("-31.01%–-30.99%");
+  const data = fixture();
+  data.quota_closings[0].remaining.high = "31";
+  data.quota_closings[0].remaining.formatted!.high = "31.00";
+  render(<AnalysisClosings data={data} names={new Map([["a", "Alpha"]])} model={false} />);
+  expect(screen.getByText("≤31.00%", { exact: true })).toBeVisible();
+});
+it.each([
+  ["USD", "$10.00"],
+  ["CNY", "¥10.00"],
+  ["HKD", "HK$10.00"],
+])("retains the accepted %s symbol in class-specific Analysis amounts", (currency, expected) => {
+  const paid = value("10", "10.00", currency);
+  render(
+    <UsageAnalysisTable
+      items={[{ key: "a", name: "Alpha", rows: [], projection: { ...fixture().projection, paid } }]}
+      incomplete={false}
+      sort={{ key: "paid", direction: 1 }}
+      onSort={() => {}}
+    />,
+  );
+  const table = screen.getByRole("table", { name: "Each item" });
+  expect(within(table).getByText(expected, { exact: true })).toHaveAttribute(
+    "data-label",
+    "Paid / spend",
+  );
+});
+it("uses the accepted formatter for raw money, ranges, lower bounds and payback", () => {
+  const raw = { ...value("10", "10.00"), formatted: undefined };
+  expect(moneyText(raw)).toBe("$10.00");
+  expect(moneyText({ ...raw, state: "partial", high: null })).toBe("≥$10.00");
+  expect(moneyText({ ...raw, state: "range", high: "12" })).toBe("$10.00–$12.00");
+  expect(moneyText(value("9007199254740993.01", "9007199254740993.01"))).toBe(
+    "$9,007,199,254,740,993.01",
+  );
+  expect(moneyText(value("2", "2.00", null), true)).toBe("2×");
+  expect(moneyText({ ...raw, state: "unknown", low: null, high: null })).toBe("Unknown");
+});
+it.each([
+  ["subscription", true, true, 7],
+  ["prepaid", true, true, 7],
+  ["metered", true, false, 6],
+  ["free", false, false, 4],
+] as const)(
+  "keeps %s table tracks aligned with visible cells and lets CSS own responsive columns",
+  (_kind, money, payback, count) => {
+    const projection = { ...fixture().projection, show_money: money, show_payback: payback };
+    render(
+      <UsageAnalysisTable
+        items={[{ key: "a", name: "Alpha", rows: [], projection }]}
+        incomplete={false}
+        sort={{ key: "paid", direction: 1 }}
+        onSort={() => {}}
+      />,
+    );
+    const table = screen.getByRole("table", { name: "Each item" });
+    const rows = within(table).getAllByRole("row");
+    expect(within(rows[0]).getAllByRole("columnheader")).toHaveLength(count);
+    expect(within(rows[1]).getAllByRole("cell")).toHaveLength(count);
+    expect(rows[1].style.gridTemplateColumns).toBe("");
+    expect(table.style.getPropertyValue("--ua-metric-columns")).toBe(String(count - 2));
+  },
+);
 function value(raw: string, formatted: string, currency: string | null = "USD"): AnalysisValue {
   return {
     state: "exact",
@@ -126,13 +252,13 @@ it("keeps card sorting usable in both directions", () => {
 it("shows directional same-usage and same-spend comparisons and suppresses 90 day comparisons", () => {
   const result = render(<AnalysisComparisons data={fixture()} ninety={false} />);
   expect(screen.getByText("More spent $1.00")).toBeVisible();
-  expect(screen.getByText("More used 20%")).toBeVisible();
+  expect(screen.getByText("More used 20.00%")).toBeVisible();
   expect(screen.getByText("Token difference: 200")).toBeVisible();
   const lower = fixture();
   lower.comparison.same_spend_percent = value("-20", "-20.00", null);
   lower.comparison.same_spend_difference = value("-200", "-200.00", null);
   result.rerender(<AnalysisComparisons data={lower} ninety={false} />);
-  expect(screen.getByText("Less used 20%")).toBeVisible();
+  expect(screen.getByText("Less used 20.00%")).toBeVisible();
   expect(screen.getByText("Token difference: -200")).toBeVisible();
   result.rerender(<AnalysisComparisons data={fixture()} ninety />);
   expect(screen.getAllByText("90 days has no previous period")).toHaveLength(2);

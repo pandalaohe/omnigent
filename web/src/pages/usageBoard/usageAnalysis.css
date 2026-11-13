@@ -150,7 +150,10 @@
 .ua-table-head,
 .ua-table-row {
   display: grid;
-  grid-template-columns: minmax(100px, 1.4fr) 88px repeat(5, minmax(65px, 1fr));
+  grid-template-columns: minmax(100px, 1.4fr) 88px repeat(
+      var(--ua-metric-columns, 5),
+      minmax(65px, 1fr)
+    );
   gap: 8px;
   align-items: center;
   font-size: var(--usage-fs-xs);
@@ -315,7 +318,10 @@
 }
 .ua-table-head,
 .ua-table-row {
-  grid-template-columns: minmax(84px, 1.2fr) 88px repeat(5, minmax(0, 1fr));
+  grid-template-columns: minmax(84px, 1.2fr) 88px repeat(
+      var(--ua-metric-columns, 5),
+      minmax(0, 1fr)
+    );
   padding: 2px 4px;
 }
 .ua-table-row {

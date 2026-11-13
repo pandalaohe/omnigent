@@ -185,12 +185,23 @@ def present_analysis(
             for reset in card["resets"]
             if max(reset["start"], scope.span.counted_from) < min(reset["until"], scope.span.until)
         ]
-        allowance = sum((Fraction(reset["allowance"].low) for reset in resets), Fraction(0))
-        quota = exact(
-            allowance,
-            unit="USD_allowance",
-            cohort_id=projection["paid"].cohort_id,
-            as_of=int(view.generated_at),
+        quota = (
+            combine(
+                [
+                    reset["allowance"].model_copy(
+                        update={"cohort_id": projection["paid"].cohort_id}
+                    )
+                    for reset in resets
+                ],
+                unit="USD_allowance",
+            )
+            if resets
+            else Value(
+                unit="USD_allowance",
+                cohort_id=projection["paid"].cohort_id,
+                as_of=int(view.generated_at),
+                reason="no_allowance",
+            )
         )
         quota_values.append(quota)
         paid = card["paid"].model_copy(update={"cohort_id": quota.cohort_id})

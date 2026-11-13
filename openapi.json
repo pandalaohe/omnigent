@@ -8665,6 +8665,33 @@
       "PricingBaseline": {
         "additionalProperties": false,
         "properties": {
+          "account_classes": {
+            "maxProperties": 2048,
+            "patternProperties": {
+              "^[A-Za-z0-9][A-Za-z0-9:_.-]*$": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "subscription",
+                      "prepaid",
+                      "metered",
+                      "free"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "propertyNames": {
+              "maxLength": 128,
+              "minLength": 1
+            },
+            "title": "Account Classes",
+            "type": "object"
+          },
           "cards": {
             "items": {
               "$ref": "#/components/schemas/PurchasedCard"
@@ -8803,8 +8830,15 @@
         "additionalProperties": false,
         "properties": {
           "allowance_usd": {
-            "title": "Allowance Usd",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Allowance Usd"
           },
           "discount_override": {
             "anyOf": [
@@ -8816,6 +8850,18 @@
               }
             ],
             "title": "Discount Override"
+          },
+          "ends_on": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ends On"
           },
           "id": {
             "maxLength": 128,
@@ -8873,6 +8919,11 @@
               }
             ]
           },
+          "repeats": {
+            "default": false,
+            "title": "Repeats",
+            "type": "boolean"
+          },
           "retail_amount": {
             "title": "Retail Amount",
             "type": "string"
@@ -8907,7 +8958,6 @@
           "id",
           "name",
           "retail_amount",
-          "allowance_usd",
           "period_kind",
           "starts_on",
           "target_kind",
@@ -18980,6 +19030,26 @@
       },
       "UsageAnalysisView": {
         "properties": {
+          "account_cost_classes": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "subscription",
+                    "prepaid",
+                    "metered",
+                    "free"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": "Account Cost Classes",
+            "type": "object"
+          },
           "account_spans": {
             "additionalProperties": {
               "$ref": "#/components/schemas/AnalysisSpan"
@@ -30490,6 +30560,42 @@
           }
         },
         "summary": "Read Model Price"
+      }
+    },
+    "/v1/me/usage/pricing-baseline/preview": {
+      "post": {
+        "operationId": "preview_baseline_v1_me_usage_pricing_baseline_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PricingBaseline"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Baseline"
       }
     },
     "/v1/me/usage/sources": {

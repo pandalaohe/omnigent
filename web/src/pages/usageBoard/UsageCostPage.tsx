@@ -30,6 +30,7 @@ import {
 } from "./UsageAnalysisDetails";
 import "./usageAnalysis.css";
 import { UsageName } from "./UsageName";
+import { moneyText } from "./UsageAccountMoney";
 
 const compact = (value: number | null) =>
   value === null
@@ -224,22 +225,39 @@ export function UsageCostPage() {
           {!items.length ? <p role="status">No usage in this range.</p> : null}
           <div className="ua-kpis">
             {[
-              ["At API price", "Unknown", "Not available yet · price evidence"],
-              [
-                "Paid",
-                analysisValueText(presentation?.projection.paid),
-                "Configured FX · selected payments",
-              ],
+              ...(presentation?.projection.show_money === false
+                ? []
+                : [
+                    [
+                      "At API price",
+                      moneyText(presentation?.projection.api_value),
+                      "Subscription and prepaid usage",
+                    ],
+                    [
+                      presentation?.projection.spend_estimated ? "Spend · estimated" : "Spend",
+                      moneyText(presentation?.projection.spend),
+                      "Pay as you go",
+                    ],
+                    [
+                      "Paid",
+                      analysisValueText(presentation?.projection.paid),
+                      "Configured FX · selected payments",
+                    ],
+                  ]),
               [
                 "Token",
                 compact(totals.tokens),
                 partial ? "Partial source coverage" : "Reported tokens",
               ],
-              [
-                "Payback",
-                analysisValueText(presentation?.projection.payback, "ratio"),
-                `Known-paid ${presentation?.projection.payback.coverage?.known_paid ?? 0}/${presentation?.projection.payback.coverage?.total_items ?? 0}`,
-              ],
+              ...(presentation?.projection.show_payback === false
+                ? []
+                : [
+                    [
+                      "Payback",
+                      analysisValueText(presentation?.projection.payback, "ratio"),
+                      `Known-paid ${presentation?.projection.payback.coverage?.known_paid ?? 0}/${presentation?.projection.payback.coverage?.total_items ?? 0}`,
+                    ],
+                  ]),
             ].map(([label, value, caption]) => (
               <div className="ua-kpi" key={label}>
                 <span>{label}</span>
@@ -268,7 +286,11 @@ export function UsageCostPage() {
             onSort={(key) => setSort({ key, direction: sort.key === key ? -sort.direction : -1 })}
           />
           <div className="ua-cards">
-            <AnalysisPayback items={selectedItems} />
+            {presentation?.projection.show_payback !== false ? (
+              <AnalysisPayback
+                items={selectedItems.filter((item) => item.projection?.show_payback !== false)}
+              />
+            ) : null}
             <AnalysisClosings data={presentation} names={names} model={dimension === "model"} />
             <UsageAnalysisShares rows={selectedRows} incomplete={!!partial} />
             <UsageAnalysisFailures items={selectedItems} incomplete={!!partial} />

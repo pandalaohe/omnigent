@@ -84,12 +84,30 @@ async def test_settings_auth_save_read_stale_and_invalid_target(request, db_uri,
         assert analysis.status_code == 200
         assert analysis.json()["pricing"]["revision"] == 1
         assert "quota_closings" in analysis.json()
+        payload = saved.json()
+        preview_payload = {
+            "revision": 1,
+            "cards": [card(repeats=True, allowance_usd=None).model_dump(mode="json")],
+            "account_classes": {"account-a": "subscription"},
+        }
+        preview = await client.post(path + "/preview", headers=headers, json=preview_payload)
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["history"][0]["periods"] >= 1
+        assert preview.json()["history"][0]["payment"]["low"] == "80"
+        assert (await client.get(path, headers=headers)).json()["revision"] == 1
+        saved_repeat = await client.put(path, headers=headers, json=preview_payload)
+        assert saved_repeat.status_code == 200, saved_repeat.text
+        assert saved_repeat.json()["cards"][0]["repeats"]
+        preview_payload["revision"] = 2
+        preview_payload["account_classes"] = {"account-a": "free"}
+        assert (await client.put(path, headers=headers, json=preview_payload)).status_code == 422
 
 
 def test_usage_keys_cannot_edit_or_read_pricing_settings():
     for scope in ("usage", "usage:read", "tasks"):
         for method in ("GET", "PUT"):
             assert not scope_allows(scope, method, "/v1/me/usage/pricing-baseline")
+        assert not scope_allows(scope, "POST", "/v1/me/usage/pricing-baseline/preview")
 
 
 @pytest.mark.asyncio
@@ -110,7 +128,7 @@ async def test_analysis_multi_pick_is_authenticated_bounded_and_never_all_owner_
             response = await client.put(
                 f"/v1/me/usage/accounts/account-{key}",
                 headers=headers,
-                json={"schema_version": 2, "observed_at": time.time()},
+                json={"schema_version": 2, "observed_at": time.time(), "source_type": "relay"},
             )
             assert response.status_code == 200
         purchases = [

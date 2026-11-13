@@ -1,8 +1,16 @@
 import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import { usageJson } from "./usagePriceSourceData";
+import type { AnalysisValue } from "./usageAnalysisData";
 
 export type Currency = "CNY" | "USD" | "HKD";
+export type CostClass = "subscription" | "prepaid" | "metered" | "free";
+export const COST_CLASSES: Record<CostClass, string> = {
+  subscription: "Subscription",
+  prepaid: "Prepaid card",
+  metered: "Pay as you go",
+  free: "Free",
+};
 export const CURRENCIES: Currency[] = ["CNY", "USD", "HKD"];
 export const RATE_KEYS = ["read", "write", "cache_read", "cache_write"] as const;
 export type Rates = Record<(typeof RATE_KEYS)[number], string | null>;
@@ -22,7 +30,9 @@ export interface PricingCard {
   name: string;
   retail_amount: string;
   purchase_currency: Currency;
-  allowance_usd: string;
+  allowance_usd: string | null;
+  repeats?: boolean;
+  ends_on?: string | null;
   period_kind: "week" | "month" | "month_weekly_reset";
   starts_on: string;
   timezone: string;
@@ -41,8 +51,21 @@ export interface PricingBaseline {
     fx_to_display: Partial<Record<Currency, string>>;
   };
   cards: PricingCard[];
+  account_classes?: Record<string, CostClass | null>;
+  account_class_defaults?: Record<string, CostClass | null>;
+  renewals?: Record<string, number | null>;
+  history?: {
+    card_id: string;
+    periods: number;
+    starts_on: string;
+    payment: AnalysisValue;
+    total: AnalysisValue;
+  }[];
   price_overrides?: AccountPriceOverride[];
   current_prices?: Record<string, CurrentModelPrice>;
+}
+export function accountCostClass(value: PricingBaseline, account: string): CostClass | null {
+  return value.account_classes?.[account] ?? value.account_class_defaults?.[account] ?? null;
 }
 export const PRICING_QUERY_KEY = ["usageBoard", "pricingBaseline"];
 export function usePricingBaseline() {
@@ -66,17 +89,24 @@ export class PricingSaveError extends Error {
     this.fields = fields;
   }
 }
-export async function savePricingBaseline(value: PricingBaseline): Promise<PricingBaseline> {
-  const response = await authenticatedFetch("/v1/me/usage/pricing-baseline", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      revision: value.revision,
-      defaults: value.defaults,
-      cards: value.cards,
-      price_overrides: value.price_overrides ?? [],
-    }),
-  });
+export async function savePricingBaseline(
+  value: PricingBaseline,
+  preview = false,
+): Promise<PricingBaseline> {
+  const response = await authenticatedFetch(
+    `/v1/me/usage/pricing-baseline${preview ? "/preview" : ""}`,
+    {
+      method: preview ? "POST" : "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        revision: value.revision,
+        defaults: value.defaults,
+        cards: value.cards,
+        price_overrides: value.price_overrides ?? [],
+        account_classes: value.account_classes ?? {},
+      }),
+    },
+  );
   const body = await response.json().catch(() => null);
   if (!response.ok) {
     const fields: Record<string, string> = {};
@@ -170,7 +200,17 @@ export function validatePricing(value: PricingBaseline): Record<string, string> 
       errors[prefix + "timezone"] = "Use an IANA timezone.";
     }
     decimal(prefix + "retail_amount", card.retail_amount);
-    decimal(prefix + "allowance_usd", card.allowance_usd, true);
+    if (card.allowance_usd !== null && card.allowance_usd !== "")
+      decimal(prefix + "allowance_usd", card.allowance_usd, true);
+    else if (!card.repeats)
+      errors[prefix + "allowance_usd"] = "One-off cards require an allowance.";
+    if (
+      card.repeats &&
+      accountCostClass(value, card.parent_account_id ?? card.target_id) !== "subscription"
+    )
+      errors[prefix + "repeats"] = "Automatic renewal requires subscription class.";
+    if (card.ends_on && (!card.repeats || card.ends_on <= card.starts_on))
+      errors[prefix + "ends_on"] = "End date must follow the subscription start.";
     if (card.discount_override !== null && card.discount_override !== "")
       decimal(prefix + "discount_override", card.discount_override, false, true);
     if (card.rates_usd_per_million)
@@ -203,6 +243,9 @@ export function reapplyPricing(
   );
   const cards = new Map(latest.cards.map((card) => [card.id, card]));
   for (const card of changed) cards.set(card.id, card);
+  const classes = { ...latest.account_classes };
+  for (const [account, kind] of Object.entries(edit.account_classes ?? {}))
+    if (kind !== original.account_classes?.[account]) classes[account] = kind;
   const prices = new Map(
     (latest.price_overrides ?? []).map((row) => [accountPriceKey(row.account_id, row.model), row]),
   );
@@ -217,12 +260,14 @@ export function reapplyPricing(
       prices.set(key, row);
   }
   return {
+    ...latest,
     revision: latest.revision,
     defaults:
       JSON.stringify(edit.defaults) === JSON.stringify(original.defaults)
         ? latest.defaults
         : edit.defaults,
     cards: [...cards.values()],
+    account_classes: classes,
     price_overrides: [...prices.values()],
     current_prices: latest.current_prices,
   };

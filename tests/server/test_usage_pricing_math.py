@@ -1,5 +1,6 @@
 """User pricing arithmetic: exact allocations and conservative absence/intervals."""
 
+from datetime import datetime
 from decimal import Decimal
 from fractions import Fraction
 
@@ -7,7 +8,12 @@ import pytest
 from pydantic import ValidationError
 
 from omnigent.usage.contract import AnalysisRowView, AnalysisSpan, UsageAnalysisView
-from omnigent.usage.pricing import PricingBaseline, PricingDefaults, PurchasedCard
+from omnigent.usage.pricing import (
+    PricingBaseline,
+    PricingDefaults,
+    PurchasedCard,
+    default_cost_class,
+)
 from omnigent.usage.pricing_projection import allocation, compare_periods, value_usage
 from omnigent.usage.value import Value, combine, divide, exact, share, subtract
 
@@ -339,6 +345,187 @@ def test_model_selection_does_not_establish_unmapped_rate_compatibility():
     result = value_usage(sample, baseline(purchase), model="model-a")
     assert result["api_value"].state == "exact"
     assert result["api_value"].low == "49"
+
+
+def test_renewal_anchors_month_end_and_honors_exclusive_boundary():
+    purchase = card(
+        repeats=True,
+        allowance_usd=None,
+        period_kind="month",
+        starts_on="2026-01-31",
+        ends_on="2026-04-30",
+        timezone="America/New_York",
+    )
+    state = PricingBaseline(cards=[purchase], account_classes={"account-a": "subscription"})
+    assert [purchase.period_start(i).date().isoformat() for i in range(4)] == [
+        "2026-01-31",
+        "2026-02-28",
+        "2026-03-31",
+        "2026-04-30",
+    ]
+    start = purchase.period_start(0).timestamp()
+    now = purchase.period_start(2).timestamp()
+    periods = list(state.card_periods(purchase, start, purchase.period_start(5).timestamp(), now))
+    assert len(periods) == 3
+    assert periods[1][1][1] - periods[1][1][0] == 31 * 86400 - 3600
+    assert state.next_renewal(purchase, now) is None
+    assert (
+        len(
+            list(
+                state.card_periods(purchase, start, purchase.period_start(5).timestamp(), now - 1)
+            )
+        )
+        == 2
+    )
+
+
+def test_replacement_keeps_started_period_and_does_not_double_price_usage():
+    first = card(
+        repeats=True,
+        allowance_usd=None,
+        period_kind="month",
+        starts_on="2026-01-01",
+        purchase_currency="USD",
+    )
+    second = card(
+        id="card-b",
+        repeats=True,
+        allowance_usd=None,
+        period_kind="month",
+        starts_on="2026-01-15",
+        purchase_currency="USD",
+        retail_amount="200",
+    )
+    state = PricingBaseline(cards=[first, second], account_classes={"account-a": "subscription"})
+    sample = view(first)
+    sample.generated_at = datetime.fromisoformat("2026-02-01T00:00:00+00:00").timestamp()
+    sample.account_cost_classes = {"account-a": "subscription"}
+    sample.rows.append(
+        sample.rows[0].model_copy(update={"hour": second.period_start(0).timestamp()})
+    )
+    result = value_usage(sample, state)
+    assert len(result["cards"]) == 2
+    assert result["cards"][0]["ends_at"] == first.period_start(1).timestamp()
+    assert result["api_value"].low == "98"
+    assert result["cards"][0]["resets"][0]["allowance"].state == "unknown"
+    assert state.next_renewal(first, sample.generated_at) is None
+    edited = state.model_copy(update={"defaults": PricingDefaults(default_discount="0.4")})
+    assert result["display"]["paid"]["low"] == "167.74"
+    assert value_usage(sample, edited)["display"]["paid"]["low"] == "83.87"
+
+
+@pytest.mark.parametrize(
+    "source,native,bases,expected",
+    [
+        ("relay", False, None, "prepaid"),
+        ("subscription", False, None, "subscription"),
+        ("metered", False, None, "metered"),
+        ("manual", False, None, None),
+        ("subscription", True, {"unknown"}, None),
+        (None, True, {"subscription"}, "subscription"),
+        (None, True, {"metered"}, "metered"),
+        (None, True, {"metered", "subscription"}, None),
+    ],
+)
+def test_cost_class_defaults_only_known_facts(source, native, bases, expected):
+    assert default_cost_class(source, native=native, bases=bases) == expected
+
+
+@pytest.mark.parametrize("kind", ["free", "metered", None])
+def test_non_purchase_classes_never_show_payback(kind):
+    sample = view(cost_usd=12.5, priced=True, contributes_money=True)
+    sample.account_cost_classes = {"account-a": kind}
+    result = value_usage(sample, baseline())
+    assert result["show_money"] == (kind != "free")
+    assert result["show_payback"] is False
+    assert result["account_money"]["account-a"]["payback"].state == "unknown"
+    if kind == "metered":
+        assert result["spend"].low == "12.5"
+        assert not result["account_money"]["account-a"]["estimated"]
+
+
+def test_cancel_preserves_started_period_pricing_and_other_account_pool_renewals():
+    purchase = card(
+        repeats=True,
+        allowance_usd=None,
+        period_kind="month",
+        starts_on="2026-01-01",
+        ends_on="2026-01-15",
+        target_kind="pool",
+        target_id="shared",
+        parent_account_id="account-a",
+    )
+    other = card(
+        id="other",
+        repeats=True,
+        allowance_usd=None,
+        starts_on="2026-02-01",
+        target_kind="pool",
+        target_id="shared",
+        parent_account_id="account-b",
+    )
+    state = PricingBaseline(cards=[purchase, other])
+    assert state.replacement_boundary(purchase) == float("inf")
+    assert state.past_period_count(purchase, purchase.period_start(3).timestamp()) == 1
+    sample = view(
+        purchase,
+        hour=int(purchase.period_start(0).timestamp()) + 20 * 86400,
+        pool_id="shared",
+        attributed=True,
+    )
+    result = value_usage(sample, state)
+    assert result["api_value"].low == "49"
+    ongoing = purchase.model_copy(update={"ends_on": None})
+    state = PricingBaseline(cards=[ongoing, other])
+    assert state.past_period_count(ongoing, ongoing.period_start(3).timestamp()) == 4
+
+
+def test_metered_token_estimate_retains_its_label_without_a_reported_bill():
+    sample = view()
+    sample.account_cost_classes = {"account-a": "metered"}
+    result = value_usage(sample, baseline())
+    assert result["spend"].low == "49"
+    assert result["spend_estimated"] is True
+    assert result["show_payback"] is False
+
+
+@pytest.mark.parametrize("ref", ["import:v1", "builtin", "provider", "mixed", None])
+def test_native_metered_estimates_use_account_prices_not_recorded_cost(ref):
+    from omnigent.usage.pricing import AccountPriceOverride
+
+    sample = view(
+        account_id="native:codex",
+        parent_account_id="codex",
+        price_ref=ref,
+        priced=True,
+        cost_usd=2,
+        tokens=1_000_000,
+        uncached_input_tokens=1_000_000,
+        output_tokens=0,
+        cache_read_input_tokens=0,
+        cache_creation_input_tokens=0,
+    )
+    sample.account_spans = {"codex": sample.span}
+    sample.account_cost_classes = {"codex": "metered"}
+    state = PricingBaseline(
+        price_overrides=[
+            AccountPriceOverride(
+                account_id="codex",
+                model="model-a",
+                read="3",
+                write="0",
+                cache_read="0",
+                cache_write="0",
+            )
+        ]
+    )
+    result = value_usage(sample, state)
+    assert result["spend"].low == "3"
+    assert result["spend_estimated"] is True
+    sample.rows[0].basis = "billed"
+    billed = value_usage(sample, state)
+    assert billed["spend"].low == "2"
+    assert billed["spend_estimated"] is False
 
 
 def test_field_overrides_clear_restore_and_missing_partitions(monkeypatch):

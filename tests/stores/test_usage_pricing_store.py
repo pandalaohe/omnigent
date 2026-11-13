@@ -78,6 +78,27 @@ def test_concurrent_first_save_has_one_revision_winner(db_uri):
     assert UsagePricingStore(db_uri).read(OWNER).revision == 1
 
 
+def test_subscription_roundtrip_and_non_subscription_rejection(db_uri):
+    store = UsagePricingStore(db_uri)
+    purchase = card(repeats=True, allowance_usd=None, ends_on="2027-01-01")
+    with pytest.raises(ValueError, match="subscription"):
+        save(store, PricingBaseline(cards=[purchase]))
+    saved = save(
+        store, PricingBaseline(cards=[purchase], account_classes={"account-a": "subscription"})
+    )
+    read = store.read(OWNER)
+    assert read.cards[0].allowance_usd is None
+    assert read.cards[0].repeats
+    assert read.cards[0].ends_on.isoformat() == "2027-01-01"
+    assert read.account_classes == {"account-a": "subscription"}
+    with pytest.raises(ValueError, match="subscription"):
+        save(
+            store, PricingBaseline(revision=saved.revision, account_classes={"account-a": "free"})
+        )
+    assert store.read(OWNER).revision == 1
+    assert store.read("other@example.test").account_classes == {}
+
+
 def test_nullable_account_prices_clear_and_ownership(db_uri):
     from omnigent.usage.pricing import AccountPriceOverride, TokenRates
 

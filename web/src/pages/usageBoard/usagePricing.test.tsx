@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { UsagePricingPanel } from "./UsagePricingPanel";
+import { UsageAccountMoney } from "./UsageAccountMoney";
 import { usageBoardData } from "./usageBoardFixtures";
 import {
   decimalDisplay,
@@ -60,6 +61,21 @@ beforeEach(() => {
     if (url.includes("pricing-baseline/model-price"))
       return new Response(JSON.stringify({ imported: null, builtin: null }));
     if (url.includes("pricing-baseline")) {
+      if (init?.method === "POST")
+        return new Response(
+          JSON.stringify({
+            ...JSON.parse(init.body as string),
+            history: [
+              {
+                card_id: "card-a",
+                periods: 3,
+                starts_on: "2026-11-02",
+                payment: { currency: "HKD", low: "80" },
+                total: { currency: "HKD", low: "240" },
+              },
+            ],
+          }),
+        );
       if (init?.method === "PUT") {
         const body = JSON.parse(init.body as string) as PricingBaseline;
         writes.push(body);
@@ -329,6 +345,48 @@ describe("Pricing settings", () => {
     expect(writes[0].defaults.fx_to_display).toEqual({ HKD: "1" });
     expect(screen.getByLabelText("1 USD = HKD")).not.toBeDisabled();
   });
+  it("previews past subscription periods before saving and invalidates preview after editing", async () => {
+    saved.account_classes = { [account.id]: "subscription" };
+    panel();
+    await ready();
+    fireEvent.click(screen.getByLabelText("Automatic renewal"));
+    change("USD allowance per reset", "");
+    fireEvent.click(screen.getByRole("button", { name: "Save pricing" }));
+    await screen.findByLabelText("Recomputed past periods");
+    expect(writes).toHaveLength(0);
+    expect(screen.getByLabelText("Recomputed past periods").textContent).toContain("3 periods");
+    change("Retail price", "120");
+    expect(screen.queryByLabelText("Recomputed past periods")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save pricing" }));
+    await screen.findByLabelText("Recomputed past periods");
+    fireEvent.click(screen.getByRole("button", { name: "Save pricing" }));
+    await screen.findByText("Pricing saved. History recalculated.");
+    expect(writes[0].cards[0].repeats).toBe(true);
+    expect(writes[0].cards[0].allowance_usd).toBeNull();
+  });
+  it("requires a new history preview after refreshing a conflicting subscription draft", async () => {
+    saved.account_classes = { [account.id]: "subscription" };
+    saved.cards[0].repeats = true;
+    panel();
+    await ready();
+    change("Retail price", "120");
+    fireEvent.click(screen.getByRole("button", { name: "Save pricing" }));
+    await screen.findByLabelText("Recomputed past periods");
+    fail = 409;
+    fireEvent.click(screen.getByRole("button", { name: "Save pricing" }));
+    await screen.findByText("stale revision; refresh and reapply draft");
+    saved = { ...saved, revision: 2, defaults: { ...saved.defaults, default_discount: "0.4" } };
+    fireEvent.click(screen.getByRole("button", { name: "Refresh and reapply draft" }));
+    await screen.findByText("Draft reapplied to the latest revision. Review and save.");
+    expect(screen.queryByLabelText("Recomputed past periods")).toBeNull();
+    fail = 0;
+    fireEvent.click(screen.getByRole("button", { name: "Save pricing" }));
+    await screen.findByLabelText("Recomputed past periods");
+    expect(writes).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Save pricing" }));
+    await screen.findByText("Pricing saved. History recalculated.");
+    expect(writes[1].defaults.default_discount).toBe("0.4");
+  });
 });
 
 describe("Decimal inputs", () => {
@@ -373,4 +431,42 @@ describe("Decimal inputs", () => {
     value.cards[0].allowance_usd = "0";
     expect(validatePricing(value)["cards.card-a.allowance_usd"]).toContain("greater than zero");
   });
+});
+
+it.each(["subscription", "metered", "free"])("shows money appropriate to %s", async (kind) => {
+  const amount = { state: "exact", low: "12.5", high: "12.5", currency: "USD" };
+  vi.mocked(globalThis.fetch).mockResolvedValue(
+    new Response(
+      JSON.stringify({
+        pricing: {
+          account_money: {
+            [account.id]: {
+              cost_class: kind,
+              show_money: kind !== "free",
+              show_payback: kind === "subscription",
+              estimated: false,
+              api_value: amount,
+              paid: amount,
+              spend: amount,
+              payback: amount,
+            },
+          },
+        },
+      }),
+    ),
+  );
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <UsageAccountMoney accountId={account.id} />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+  if (kind === "free") await waitFor(() => expect(screen.queryByText("Set pricing")).toBeNull());
+  else {
+    await screen.findAllByRole("definition");
+    expect(screen.getByText(kind === "metered" ? "Spend" : "At API price")).toBeTruthy();
+    if (kind === "metered") expect(screen.queryByText("Payback")).toBeNull();
+  }
 });

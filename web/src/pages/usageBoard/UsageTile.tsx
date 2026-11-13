@@ -44,6 +44,8 @@ import { UsageAmountFigure, UsageErrorMark } from "./UsageAmounts";
 import { UsageBalances } from "./UsageBalances";
 import { t } from "./usageText";
 import { UsageName } from "./UsageName";
+import { UsageAccountMoney } from "./UsageAccountMoney";
+import { usePricingBaseline, accountCostClass } from "./usagePricingData";
 
 /** Renewal urgency, as the footer colours it: late, or within three days. */
 function renewalTone(days: number): "crit" | "warn" | undefined {
@@ -81,6 +83,8 @@ export function UsageTile({
   amount,
   tokens = false,
 }: UsageTileProps) {
+  const pricing = usePricingBaseline();
+  const free = pricing.data ? accountCostClass(pricing.data, account.id) === "free" : false;
   const stale = isStale(account);
   const empty = neverRead(account);
   const tone = accountTone(account, stale);
@@ -132,6 +136,7 @@ export function UsageTile({
         <UsageErrorMark account={account} />
         <div className="flex shrink-0 flex-col items-end leading-tight">
           {amount &&
+          (tokens || !free) &&
           (tokens
             ? amount.totals.tokens !== null
             : amount.totals.cost_usd !== null || amount.totals.unpriced > 0) ? (
@@ -328,6 +333,7 @@ export function UsageTile({
       {(amount?.totals.partial_rows ?? 0) > 0 ? (
         <p className="usage-caption text-center">{t("incomplete")}</p>
       ) : null}
+      {!arrange ? <UsageAccountMoney accountId={account.id} compact /> : null}
       {arrange ? (
         <div className="usage-tile-footer">
           <GripVerticalIcon className="size-3.5" />
@@ -362,16 +368,18 @@ export function UsageTile({
               <CalendarClockIcon className="size-3.5" aria-hidden="true" />—
             </span>
           )}
-          <span className="usage-period" aria-label={t("periodCost")} title={t("periodCost")}>
-            <ReceiptIcon className="size-3.5" aria-hidden="true" />
-            <b>
-              {amount && amount.totals.cost_usd !== null ? (
-                <UsageAmountFigure amount={amount} tokens={false} />
-              ) : (
-                "—"
-              )}
-            </b>
-          </span>
+          {!free ? (
+            <span className="usage-period" aria-label={t("periodCost")} title={t("periodCost")}>
+              <ReceiptIcon className="size-3.5" aria-hidden="true" />
+              <b>
+                {amount && amount.totals.cost_usd !== null ? (
+                  <UsageAmountFigure amount={amount} tokens={false} />
+                ) : (
+                  "—"
+                )}
+              </b>
+            </span>
+          ) : null}
         </div>
       )}
     </article>
