@@ -35,6 +35,7 @@ import secrets
 import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Mapping
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Literal
 
@@ -234,8 +235,6 @@ _HTML_CLOSE_RE = re.compile(r"</html\s*>", re.IGNORECASE)
 _HEAD_CLOSE_RE = re.compile(r"</head\s*>", re.IGNORECASE)
 _SCRIPT_CLOSE_RE = re.compile(r"</script", re.IGNORECASE)
 _SCRIPT_OPEN_RE = re.compile(r"<script\b", re.IGNORECASE)
-_HEAD_OPEN_RE = re.compile(r"<head\b[^>]*>", re.IGNORECASE)
-_HTML_OPEN_RE = re.compile(r"<html\b[^>]*>", re.IGNORECASE)
 _DOCTYPE_RE = re.compile(r"\s*<!doctype\b[^>]*>", re.IGNORECASE)
 _MODULEPRELOAD_LINK_RE = re.compile(
     r"<link\b(?=[^>]*\brel\s*=\s*[\"']modulepreload[\"'])", re.IGNORECASE
@@ -509,35 +508,105 @@ def _read_in_frame_scripts(names: tuple[str, ...], nonce: str) -> str:
     return "".join(scripts)
 
 
-def _head_asset_index(text: str) -> int:
-    """The insertion point for the head assets.
+class _FrameAssetPositions(HTMLParser):
+    """Find insertion points without interpreting embedded HTML as markup."""
 
-    Right after the opening ``<head>`` tag; without one, right after
-    ``<html>``; without either, after a leading doctype; otherwise at the very
-    start (a bare fragment has no doctype or html element to displace).
-    """
-    for pattern in (_HEAD_OPEN_RE, _HTML_OPEN_RE):
-        match = pattern.search(text)
-        if match is not None:
-            return match.end()
-    match = _DOCTYPE_RE.match(text)
-    if match is not None:
-        return match.end()
-    return 0
+    _RAW_TEXT = frozenset(
+        {
+            "script",
+            "style",
+            "textarea",
+            "title",
+            "xmp",
+            "iframe",
+            "noembed",
+            "noframes",
+            "noscript",
+            "plaintext",
+        }
+    )
+    _SCRIPT_TRANSITIONS = re.compile(r"(?=(<!--|-->|<script(?=[\t\n\r\f />])))", re.I | re.ASCII)
+
+    def __init__(self, text: str) -> None:
+        super().__init__(convert_charrefs=False)
+        self._position = 0
+        self._script_state = "normal"
+        self._plaintext = False
+        self.head: int | None = None
+        self.html: int | None = None
+        self.body_close: int | None = None
+        self.html_close: int | None = None
+        self.feed(text)
+
+    def updatepos(self, i: int, j: int) -> int:
+        self._position += max(0, j - i)
+        return super().updatepos(i, j)
+
+    def set_cdata_mode(self, elem: str, *, escapable: bool = False) -> None:
+        del escapable
+        super().set_cdata_mode(elem)
+        self._script_state = "normal"
+        # Older Python accepts whitespace after </; browsers do not.
+        self.interesting = re.compile(
+            r"\Z" if elem == "plaintext" else rf"</{elem}(?=[\t\n\r\f />])",
+            re.I | re.ASCII,
+        )
+
+    def handle_data(self, data: str) -> None:
+        if self.cdata_elem != "script":
+            return
+        for match in self._SCRIPT_TRANSITIONS.finditer(data):
+            token = match.group(1).lower()
+            if token == "<!--" and self._script_state == "normal":
+                self._script_state = "escaped"
+            elif token == "-->":
+                self._script_state = "normal"
+            elif token == "<script" and self._script_state == "escaped":
+                self._script_state = "double"
+
+    def parse_endtag(self, i: int) -> int:
+        if self.cdata_elem == "script" and self._script_state == "double":
+            # In double-escaped script data, </script returns to escaped data.
+            self._script_state = "escaped"
+            return i + len("</script")
+        raw_tag = self.cdata_elem
+        end = super().parse_endtag(i)
+        if end >= 0 and raw_tag is not None and self.cdata_elem is not None:
+            raise ValueError("HTML parser did not consume a raw-text closing tag")
+        return end
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        if self._plaintext:
+            return
+        if tag in {"head", "html"}:
+            end = self._position + len(self.get_starttag_text() or "")
+            if tag == "head" and self.head is None:
+                self.head = end
+            elif tag == "html" and self.html is None:
+                self.html = end
+        if tag in self._RAW_TEXT:
+            self.set_cdata_mode(tag)
+            self._plaintext = tag == "plaintext"
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._plaintext:
+            return
+        if tag == "body":
+            self.body_close = self._position
+        elif tag == "html":
+            self.html_close = self._position
 
 
 def _inject_in_frame_assets(body: bytes, nonce: str) -> bytes | None:
-    """Inline the panel assets as ``<script data-omni-nonce=…>`` blocks.
+    """Inline panel scripts at actual markup boundaries, keeping the source intact.
 
-    The capture script is placed ahead of page scripts by ``_head_asset_index``;
-    the body assets mirror the viewer's own regex approach: before the last
-    ``</body>``, else the last ``</html>``, else appended.
-
-    :param body: The raw HTML bytes.
-    :param nonce: The bridge nonce for the served token.
-    :returns: The injected bytes, or ``None`` when the body is not UTF-8 or
-        no asset could be read from either list (the caller then serves the
-        body unmodified).
+    Capture falls after head, html, or a leading doctype, or at the start.
+    Body assets precede the last body or html closing tag, or are appended.
+    Non-UTF-8 input or a missing asset set returns ``None``.
     """
     try:
         text = body.decode("utf-8")
@@ -547,16 +616,28 @@ def _inject_in_frame_assets(body: bytes, nonce: str) -> bytes | None:
     body_scripts = _read_in_frame_scripts(_IN_FRAME_ASSETS, nonce)
     if not head_scripts and not body_scripts:
         return None
+    try:
+        positions = _FrameAssetPositions(text)
+    except (AssertionError, ValueError):
+        # Parser errors or unsupported closing syntax must not break the page.
+        return None
+    doctype = _DOCTYPE_RE.match(text)
+    head_index = positions.head
+    if head_index is None:
+        head_index = positions.html
+    if head_index is None:
+        head_index = doctype.end() if doctype is not None else 0
+    body_index = positions.body_close
+    if body_index is None:
+        body_index = positions.html_close
+    if body_index is None:
+        body_index = len(text)
     if head_scripts:
-        index = _head_asset_index(text)
-        text = text[:index] + head_scripts + text[index:]
+        text = text[:head_index] + head_scripts + text[head_index:]
+        if body_index >= head_index:
+            body_index += len(head_scripts)
     if body_scripts:
-        index = _last_match_start(_BODY_CLOSE_RE, text)
-        if index == -1:
-            index = _last_match_start(_HTML_CLOSE_RE, text)
-        if index == -1:
-            index = len(text)
-        text = text[:index] + body_scripts + text[index:]
+        text = text[:body_index] + body_scripts + text[body_index:]
     return text.encode("utf-8")
 
 

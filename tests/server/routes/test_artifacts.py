@@ -1521,6 +1521,57 @@ async def test_panel_html_injects_script_with_nonce(
     assert int(resp.headers["content-length"]) == len(resp.content)
 
 
+@pytest.mark.parametrize(
+    "embedded",
+    [
+        '<script>const html = "<head></body></html>";</script>',
+        '<script><!--\nconst html = "<script></script><head></body></html>";\n//--></script>',
+        '<script><!-->\nconst html = "<script>";</script>',
+        '<script>const html = "</ script><head></body></html>";</script>',
+        "<style>/* <head></body></html> */</style>",
+        "<!-- <head></body></html> -->",
+        "<textarea><head></body></html></textarea>",
+        "<title><head></body></html></title>",
+        "<xmp><head></body></html></xmp>",
+        "<iframe><head></body></html></iframe>",
+        "<noembed><head></body></html></noembed>",
+        "<noframes><head></body></html></noframes>",
+        "<noscript><head></body></html></noscript>",
+    ],
+)
+async def test_panel_injection_ignores_embedded_markup(asset_dir: Path, embedded: str) -> None:
+    """Only real markup selects positions; original HTML stays byte-for-byte intact."""
+    (asset_dir / "omni-html-capture.js").write_text("capture();", encoding="utf-8")
+    (asset_dir / "omni-html-bridge.js").write_text("bridge();", encoding="utf-8")
+    prefix = f"<!doctype html>\n{embedded}<html><head data-value='a>b'>"
+    middle = f"</head><body>é</body>{embedded}"
+    suffix = "</html>"
+    original = (prefix + middle + suffix).encode()
+    expected = (
+        prefix
+        + '<script data-omni-nonce="nonce">capture();</script>'
+        + "</head><body>é"
+        + '<script data-omni-nonce="nonce">bridge();</script>'
+        + f"</body>{embedded}"
+        + suffix
+    ).encode()
+
+    assert artifacts_module._inject_in_frame_assets(original, "nonce") == expected
+
+
+async def test_panel_injection_preserves_fallback_with_embedded_markup(asset_dir: Path) -> None:
+    (asset_dir / "omni-html-capture.js").write_text("capture();", encoding="utf-8")
+    (asset_dir / "omni-html-bridge.js").write_text("bridge();", encoding="utf-8")
+    original = b'<!doctype html><script>const html = "<head></body></html>";</script>'
+    expected = (
+        b'<!doctype html><script data-omni-nonce="nonce">capture();</script>'
+        + original[len(b"<!doctype html>") :]
+        + b'<script data-omni-nonce="nonce">bridge();</script>'
+    )
+
+    assert artifacts_module._inject_in_frame_assets(original, "nonce") == expected
+
+
 async def test_panel_html_without_head_places_capture_after_html(
     client: httpx.AsyncClient,
     asset_dir: Path,
@@ -1589,6 +1640,27 @@ async def test_panel_html_without_asset_is_served_unmodified(
     runner = _stub_runner_app(body, content_type="text/html")
     minted = await _mint(client)
 
+    async with _use_runner(runner):
+        resp = await client.get(minted["url"])
+
+    assert resp.status_code == 200
+    assert resp.content == body
+
+
+async def test_panel_html_parser_failure_serves_original(
+    client: httpx.AsyncClient,
+    asset_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (asset_dir / "omni-html-bridge.js").write_text("bridge();", encoding="utf-8")
+    body = b"<![foo]><p>still readable</p>"
+
+    def reject_declaration(_parser: artifacts_module.HTMLParser, _index: int) -> int:
+        raise AssertionError("unknown status keyword 'foo' in marked section")
+
+    monkeypatch.setattr(artifacts_module.HTMLParser, "parse_html_declaration", reject_declaration)
+    runner = _stub_runner_app(body, content_type="text/html")
+    minted = await _mint(client)
     async with _use_runner(runner):
         resp = await client.get(minted["url"])
 
