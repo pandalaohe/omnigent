@@ -33,6 +33,85 @@ from tests.harnesses.claude_native.forwarder._support import (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reject", [True, False])
+async def test_clear_relay_follows_confirmed_terminal_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reject: bool
+) -> None:
+    from omnigent.harnesses.claude_native import bridge
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    directory = prepare_bridge_dir("conv_old", bridge_id="shared", workspace=tmp_path)
+    relays = []
+    archived = False
+    during_binding = []
+
+    def start(session_id: str) -> None:
+        async def execute(name: str, arguments: dict[str, Any]) -> object:
+            if session_id == "conv_new" and archived:
+                return {"error": "No runner bound for session 'conv_new'"}
+            return {"session_id": session_id}
+
+        relays.append(
+            bridge.start_tool_relay(
+                bridge_dir=directory,
+                tools=[{"name": "sys_session_get_info", "parameters": {}}],
+                tool_executor=execute,
+                loop=asyncio.get_running_loop(),
+                session_id=session_id,
+            )
+        )
+
+    async def call() -> str:
+        result: Any = await asyncio.to_thread(
+            bridge._call_relay_tool, directory, "sys_session_get_info", {}
+        )
+        return result["content"][0]["text"]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal archived
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_old":
+            return httpx.Response(
+                200, json={"agent_id": "agent", "runner_id": "runner", "labels": {}}
+            )
+        if path.endswith("/successor"):
+            return httpx.Response(201, json={"id": "conv_new"})
+        if request.method == "PATCH" and path.endswith("/conv_new"):
+            body = json.loads(request.content)
+            if body.get("archived"):
+                archived = True
+            elif body.get("runner_id"):
+                start("conv_new")
+                during_binding.append(json.loads(await call()))
+                if reject:
+                    raise httpx.ReadTimeout("binding reply lost", request=request)
+        if request.method == "GET" and "/terminals/" in path:
+            return httpx.Response(200 if "/conv_old/" in path else 404, json={})
+        return httpx.Response(200, json={})
+
+    start("conv_old")
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://ap"
+        ) as client:
+            if reject:
+                with pytest.raises(httpx.ReadTimeout):
+                    await forwarder._create_clear_replacement_session(
+                        client=client, old_session_id="conv_old", bridge_dir=directory
+                    )
+            else:
+                await forwarder._create_clear_replacement_session(
+                    client=client, old_session_id="conv_old", bridge_dir=directory
+                )
+        assert archived is reject
+        assert json.loads(await call()) == {"session_id": "conv_old" if reject else "conv_new"}
+        assert during_binding == [{"session_id": "conv_old"}]
+    finally:
+        for relay in reversed(relays):
+            await asyncio.to_thread(relay.close)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("lost_reply", [False, "transport", "proxy"])
 @pytest.mark.parametrize("status_reads_first", [False, True])
 async def test_clear_hook_rotates_active_session_without_reprocessing(
