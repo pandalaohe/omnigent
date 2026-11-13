@@ -258,6 +258,9 @@ it.each([
   [99.996, "99.99", "99", ".99"],
   [100, "100.00", "100", ".00"],
   [1234, ">999", ">999", ""],
+  ["31.00", "31.00", "31", ".00"],
+  ["-31.00", "-31.00", "-31", ".00"],
+  ["1234.00", "1234.00", "1234", ".00"],
 ])("writes ring percent %s with two decimals, split for the stack", (value, text, whole, rest) => {
   expect(formatRingPercent(value)).toBe(text);
   expect(splitPercentReading(text)).toEqual([whole, rest]);

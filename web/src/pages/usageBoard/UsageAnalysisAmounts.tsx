@@ -9,6 +9,7 @@ import { UsageTip } from "./UsageTip";
 import { AnalysisTrend, compareAnalysisDecimals } from "./UsageAnalysisDetails";
 import { UsageName } from "./UsageName";
 import { moneyText } from "./UsageAccountMoney";
+import { formatRingPercent } from "./usageBoardFormat";
 import type { CSSProperties } from "react";
 
 interface Item {
@@ -24,7 +25,8 @@ const number = (value: number | null) =>
     : new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 2 }).format(
         value,
       );
-const percent = (value: number | null) => (value === null ? "Unknown" : `${value.toFixed(1)}%`);
+const percent = (value: number | null) =>
+  value === null ? "Unknown" : `${formatRingPercent(value)}%`;
 const colors = [
   "var(--usage-series-1)",
   "var(--usage-series-2)",

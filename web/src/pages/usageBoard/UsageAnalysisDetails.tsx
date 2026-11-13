@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { AnalysisPanel, AnalysisUnknown } from "./UsageAnalysisPanel";
 import { UsageTip } from "./UsageTip";
 import { UsageName } from "./UsageName";
+import { formatRingPercent } from "./usageBoardFormat";
 import {
   analysisTotals,
   analysisValueText,
@@ -299,7 +300,7 @@ export function AnalysisClosings({
                   {reading.remaining.state === "unknown"
                     ? "Unknown"
                     : reading.remaining.formatted?.high
-                      ? `≤${reading.remaining.formatted.high.replace(/\.00$/, "")}%`
+                      ? `≤${formatRingPercent(reading.remaining.formatted.high)}%`
                       : "Unknown"}
                 </b>
                 <small>

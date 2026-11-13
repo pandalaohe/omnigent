@@ -168,8 +168,12 @@ export function formatPercentReading(value: number): string {
   return String(Number(value.toFixed(decimals)));
 }
 
-/** A window's used percent as its ring writes it: always two decimals. */
-export function formatRingPercent(value: number): string {
+/** Two decimals; server-rounded endpoints retain their sign and bounds, numeric readings their guards. */
+export function formatRingPercent(value: number | string): string {
+  if (typeof value === "string") {
+    const [whole, fraction = ""] = value.split(".");
+    return `${whole}.${fraction.padEnd(2, "0")}`;
+  }
   if (!Number.isFinite(value)) return "—";
   if (value >= 999.995) return ">999";
   if (value > 0 && value < 0.005) return "<0.01";

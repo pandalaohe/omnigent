@@ -286,15 +286,17 @@ def test_analysis_selection(
     assert_usage_geometry(page, analysis_geometry)
     table = page.get_by_role("table", name="Each item")
     expect(table.get_by_title(long_account, exact=True)).to_be_visible()
+    expect(table.get_by_text("3.00%", exact=True)).to_be_visible()
     for section in ["Subscription payback", "Failure rate", "Unused last period"]:
         expect(
             page.get_by_role("region", name=section, exact=True).get_by_title(
                 long_account, exact=True
             )
         ).to_be_visible()
-    page.get_by_role("button", name=long_account + " failure rate 3.0%", exact=True).click()
+    page.get_by_role("button", name=long_account + " failure rate 3.00%", exact=True).click()
     tip = page.get_by_test_id("usage-tip-card")
     expect(tip.get_by_title(long_account, exact=True)).to_be_visible()
+    expect(tip.get_by_text("3.00%", exact=True)).to_be_visible()
     assert_usage_geometry(page, analysis_geometry)
     page.keyboard.press("Escape")
     expect(tip).to_have_count(0)
@@ -310,11 +312,13 @@ def test_analysis_selection(
     expect(table).not_to_contain_text(long_account)
     expect(table).to_contain_text("$10.00")
     expect(page.get_by_text("Less spent $30.00", exact=True)).to_be_visible()
-    expect(page.get_by_text("≤30%", exact=True)).to_be_visible()
+    expect(page.get_by_text("≤30.00%", exact=True)).to_be_visible()
+    expect(page.get_by_text("More used 300.00%", exact=True)).to_be_visible()
     expect(page.get_by_role("button", name="Mon 23:00 1000000 tokens", exact=True)).to_be_visible()
     expect(
-        page.get_by_role("button", name="Claude token share 100.0%", exact=True)
+        page.get_by_role("button", name="Claude token share 100.00%", exact=True)
     ).to_be_visible()
+    expect(page.get_by_text("100.00% / —", exact=True)).to_be_visible()
     page.get_by_role("button", name="Model", exact=True).click()
     model = picks.get_by_role("button", name=long_model, exact=True)
     expect(model).to_have_attribute("title", long_model)
@@ -335,7 +339,7 @@ def test_analysis_selection(
     assert_usage_geometry(page, analysis_geometry)
     picks.get_by_role("button", name="Quota only", exact=True).click()
     expect(table).to_contain_text("Unknown")
-    expect(page.get_by_role("button", name="GPT token share 100.0%", exact=True)).to_have_count(0)
+    expect(page.get_by_role("button", name="GPT token share 100.00%", exact=True)).to_have_count(0)
     assert_usage_geometry(page, analysis_geometry)
     page.get_by_role("button", name="90 days", exact=True).click()
     expect(page.get_by_text("90 days has no previous period", exact=True)).to_have_count(2)
