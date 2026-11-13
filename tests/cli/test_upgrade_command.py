@@ -798,7 +798,10 @@ def test_legacy_custom_pin_moves_once_to_configured_branch(
 
 
 @pytest.mark.parametrize("windows", [False, True])
-@pytest.mark.parametrize("source_ref", [None, "channel/custom", "a" * 40, "other-repo"])
+@pytest.mark.parametrize(
+    "source_ref",
+    [None, "channel/custom", "a" * 40, "other-repo", "alias-ip", "default-port", "different-user"],
+)
 def test_configured_sha_pin_recovers_without_receipt(
     tmp_path, monkeypatch, _wheel_install, windows, source_ref
 ):
@@ -811,7 +814,22 @@ def test_configured_sha_pin_recovers_without_receipt(
         if source_ref == "other-repo"
         else source + (f"@{source_ref}" if source_ref else "")
     )
-    expected = source + "@" + (source_ref or "local/host-custom")
+    alternate_repositories = {
+        "alias-ip": "git+ssh://git@192.0.2.1/opt/repo.git",
+        "default-port": "git+ssh://git@example.test:22/opt/repo.git",
+        "different-user": "git+ssh://other@example.test/opt/repo.git",
+    }
+    if source_ref in alternate_repositories:
+        configured = alternate_repositories[source_ref] + "@channel/custom"
+    expected = (
+        source
+        + "@"
+        + (
+            "channel/custom"
+            if source_ref in alternate_repositories
+            else source_ref or "local/host-custom"
+        )
+    )
     monkeypatch.setattr("omnigent.cli.data_dir", lambda: tmp_path)
     monkeypatch.setattr("omnigent.cli.IS_WINDOWS", windows)
     monkeypatch.setattr(

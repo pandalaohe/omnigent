@@ -6228,15 +6228,9 @@ def _custom_channel(info: _InstalledWheelInfo, *, require_receipt: bool) -> tupl
         ):
             return None
 
-    def identity(source: str) -> tuple[str, str | None, int | None, str]:
+    def repository_path(source: str) -> str:
         repo, _ = _split_vcs_url(source)
-        parsed = urlsplit(repo)
-        return (
-            parsed.scheme,
-            parsed.hostname,
-            parsed.port,
-            parsed.path.rstrip("/").removesuffix(".git"),
-        )
+        return urlsplit(repo).path.rstrip("/").removesuffix(".git")
 
     sources = _load_global_config().get("custom_host_sources")
     if (
@@ -6248,7 +6242,7 @@ def _custom_channel(info: _InstalledWheelInfo, *, require_receipt: bool) -> tupl
         )
     ):
         return None
-    installed = identity(installed_repo)
+    installed_path = repository_path(installed_repo)
     if rollback is not None:
         saved_source = rollback.get("source_url")
         if rollback["schema_version"] == 2 and not (
@@ -6256,21 +6250,18 @@ def _custom_channel(info: _InstalledWheelInfo, *, require_receipt: bool) -> tupl
             and (saved_source is None or (isinstance(saved_source, str) and saved_source))
         ):
             return None
-        if isinstance(saved_source, str) and identity(saved_source) != installed:
+        if isinstance(saved_source, str) and repository_path(saved_source) != installed_path:
             return None
-    if not any(identity(source) == installed for source in sources):
-        return None
     moving_sources = []
     for source in sources:
-        if not require_receipt and identity(source) != installed:
+        if repository_path(source) != installed_path:
             continue
-        repo, branch = _split_vcs_url(source)
+        _, branch = _split_vcs_url(source)
         branch = branch or "local/host-custom"
         if re.fullmatch(r"[0-9a-fA-F]{40}", branch):
-            if identity(source) == installed:
-                return None
-        else:
-            moving_sources.append(f"git+{repo}@{branch}")
+            return None
+        # Configuration supplies only the ref; keep the installed endpoint/account.
+        moving_sources.append(f"git+{installed_repo}@{branch}")
     if not moving_sources:
         return None
     for target in moving_sources:
