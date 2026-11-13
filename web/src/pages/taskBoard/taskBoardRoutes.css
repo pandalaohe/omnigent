@@ -199,6 +199,7 @@
 .rt-scene {
   position: relative;
   isolation: isolate;
+  contain: layout style;
   min-height: 1px;
 }
 .rt-svg {
@@ -216,7 +217,8 @@
   stroke-width: 1.5;
   opacity: 0.34;
 }
-.rt-edge-focus .rt-connection {
+.rt-edge-focus .rt-connection,
+.rt-edge-hover .rt-connection {
   opacity: 0.18;
 }
 .rt-connection.active {
@@ -611,6 +613,7 @@
 .rt-tooltip {
   position: fixed;
   z-index: 100;
+  contain: layout style;
   max-width: min(380px, calc(100vw - 16px));
   pointer-events: none;
 }
@@ -973,10 +976,12 @@
 .rt-label-blocked b {
   font-weight: 500;
 }
-.rt-edge-focus .rt-rail {
+.rt-edge-focus .rt-rail,
+.rt-edge-hover .rt-rail {
   opacity: 0.18;
 }
-.rt-edge-focus .rt-long:not(.active) {
+.rt-edge-focus .rt-long:not(.active),
+.rt-edge-hover .rt-long:not(.active) {
   opacity: 0.12;
 }
 .rt-long.active {
@@ -1263,5 +1268,128 @@
   .rt-focus header > input {
     flex: 1;
     min-width: 140px;
+  }
+}
+
+/* Attention view, pins and compact rows. */
+.rt-pins-toggle {
+  width: auto;
+  padding: 0 9px;
+}
+.rt-pins label span small {
+  display: block;
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+}
+.rt-pins .rt-focus-list p {
+  margin: 4px 0;
+  font-size: 12.5px;
+  color: var(--muted-foreground);
+}
+.rt-folded {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--rt-line2);
+  color: var(--muted-foreground);
+  font-size: 12.5px;
+  text-align: left;
+}
+.rt-folded:hover {
+  color: var(--foreground);
+}
+.rt-compact .rt-label {
+  font-size: 12px;
+  line-height: 15px;
+}
+
+/* Motion: transform and opacity only, so it stays on the compositor. */
+.rt-plot {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.rt-plot > .rt-stop,
+.rt-plot > .rt-hub-badge,
+.rt-plot > .rt-density-hit {
+  pointer-events: auto;
+}
+.rt-svg,
+.rt-plot,
+.rt-axis {
+  transform-origin: 0 0;
+}
+.rt-stop .rt-running::before {
+  content: "";
+  position: absolute;
+  inset: -9px;
+  border: 2px solid var(--rt-color);
+  border-radius: 50%;
+  opacity: 0;
+  pointer-events: none;
+  animation: rt-pulse 2.2s ease-out infinite;
+}
+@keyframes rt-pulse {
+  0% {
+    transform: scale(0.8);
+    opacity: 0.5;
+  }
+  70% {
+    transform: scale(1.5);
+    opacity: 0;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+.rt-stop.rt-changed::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border: 3px solid var(--rt-color);
+  border-radius: 50%;
+  opacity: 0;
+  pointer-events: none;
+  animation: rt-ring 1.1s ease-out 2;
+}
+@keyframes rt-ring {
+  from {
+    transform: scale(0.7);
+    opacity: 0.85;
+  }
+  to {
+    transform: scale(1.9);
+    opacity: 0;
+  }
+}
+.rt-stop.rt-new > * {
+  animation: rt-appear 0.45s ease-out backwards;
+}
+@keyframes rt-appear {
+  from {
+    opacity: 0;
+    scale: 0.5;
+  }
+}
+.rt-panel {
+  animation: rt-drop 0.18s ease-out;
+}
+@keyframes rt-drop {
+  from {
+    opacity: 0;
+    translate: 0 -4px;
+  }
+}
+.rt-paused *,
+.rt-paused *::before,
+.rt-paused *::after {
+  animation-play-state: paused !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  .rt-routes *::before,
+  .rt-routes *::after {
+    animation: none !important;
   }
 }

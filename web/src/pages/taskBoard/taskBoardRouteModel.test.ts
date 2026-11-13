@@ -11,6 +11,7 @@ import {
   mapScene,
   orderStops,
   routeMoment,
+  routeState,
   stepMapWindow,
   type MapLane,
 } from "./taskBoardRouteModel";
@@ -31,6 +32,9 @@ const task = (
     state,
     lastActivity: new Date(now - HOUR).toISOString(),
   },
+  ...(state === "running" && {
+    "omnigent.ai:workedBy": [{ session: "s", from: new Date(now - HOUR).toISOString() }],
+  }),
 });
 const cache = (days: SourceCache["display"]["closedDays"]): SourceCache => ({
   pin: {
@@ -334,5 +338,171 @@ describe("order folding and viewport", () => {
         (node) => node.id,
       ).edges,
     ).toEqual([]);
+  });
+});
+
+describe("route view on real-sized rows", () => {
+  const open = (uid: string, extra: Partial<BoardTask> = {}): BoardTask => ({
+    uid,
+    title: uid,
+    progress: "in-process",
+    "omnigent.ai:source": "example",
+    ...extra,
+  });
+  it("runs only cards a session works on; other open cards are open and idle", () => {
+    expect(routeState(open("idle"))).toBe("held");
+    expect(
+      routeState(open("span", { "omnigent.ai:workedBy": [{ session: "s1", from: "2026-11-06" }] })),
+    ).toBe("running");
+    expect(
+      routeState(
+        open("ended", {
+          "omnigent.ai:workedBy": [{ session: "s1", from: "2026-11-05", to: "2026-11-06" }],
+        }),
+      ),
+    ).toBe("held");
+  });
+  it("fits a crowded row into its room, keeping urgent stops and the next queued card", () => {
+    const tasks = [
+      ...Array.from({ length: 30 }, (_, index) => task(`done-${index}`)),
+      task("run-a", "running"),
+      task("user-a", "user"),
+      ...Array.from({ length: 10 }, (_, index) => task(`next-${index}`, "queued")),
+    ];
+    const stops = orderStops(tasks, 9);
+    const singles = stops
+      .filter((stop) => stop.tasks.length === 1)
+      .map((stop) => stop.tasks[0].uid);
+    expect(stops.length).toBeLessThanOrEqual(9);
+    expect(singles).toEqual(expect.arrayContaining(["run-a", "user-a", "next-0", "done-29"]));
+    expect(stops.flatMap((stop) => stop.tasks)).toEqual(tasks);
+  });
+  it("runs a card the source calls running only while live work backs it", () => {
+    const shown = (extra: Partial<BoardTask>) =>
+      routeState(
+        open("supplied", {
+          "omnigent.ai:sourceDisplay": { version: 1, state: "running", sessions: [] },
+          ...extra,
+        }),
+      );
+    expect(shown({})).toBe("held");
+    expect(
+      shown({ "omnigent.ai:workedBy": [{ session: "s1", from: "2026-11-05", to: "2026-11-06" }] }),
+    ).toBe("held");
+    expect(shown({ "omnigent.ai:workedBy": [{ session: "s1", from: "2026-11-06" }] })).toBe(
+      "running",
+    );
+    expect(routeState(task("waiting", "user"))).toBe("user");
+    expect(routeState(task("broken", "failed"))).toBe("failed");
+  });
+  it("never folds a card that needs the user into a capsule", () => {
+    const live = { "omnigent.ai:workedBy": [{ session: "s1", from: "2026-11-06" }] },
+      waiting = { "omnigent.ai:waiting": { on: "user" } };
+    const row = [
+      open("held0"),
+      open("running1", live),
+      open("held2"),
+      open("user3", waiting),
+      open("held4"),
+      open("held5"),
+      open("held6"),
+    ];
+    const single = (stops: ReturnType<typeof orderStops>, uid: string) =>
+      stops.some((stop) => stop.tasks.length === 1 && stop.tasks[0].uid === uid);
+    expect(single(orderStops(row, 3), "user3")).toBe(true);
+    const crowded = [
+      ...Array.from({ length: 4 }, (_, index) => open(`run${index}`, live)),
+      open("user", waiting),
+      open("held"),
+    ];
+    expect(single(orderStops(crowded, 5, true), "user")).toBe(true);
+    const busy = [
+      ...Array.from({ length: 12 }, (_, index) => open(`run${index}`, live)),
+      open("user-a", waiting),
+      open("user-b", waiting),
+    ].map((item) => ({ ...item, "omnigent.ai:group": { id: "alpha" } }));
+    const group = mapGroups(busy, [{ id: "example", name: "Example", source: null }], {}, now)[0];
+    const scene = mapScene(
+      [{ ...group, top: 0, height: 136, nodes: [] }],
+      "time",
+      initialWindow(now),
+      700,
+      now,
+      "station",
+      [],
+      new Map(),
+      {},
+      () => "",
+    );
+    for (const uid of ["user-a", "user-b"])
+      expect(scene.nodes.some((node) => node.tasks.length === 1 && node.tasks[0].uid === uid)).toBe(
+        true,
+      );
+    expect(scene.nodes.some((node) => node.tasks.length > 1)).toBe(true);
+  });
+  it("wraps crowded waiting-on-you stations onto more rows, all on the map and apart", () => {
+    const waiting = { "omnigent.ai:waiting": { on: "user" } };
+    const users = (count: number) =>
+      Array.from({ length: count }, (_, index) => ({
+        ...open(`user-${index}`, waiting),
+        "omnigent.ai:group": { id: "alpha" },
+      }));
+    const below = { ...open("below"), "omnigent.ai:group": { id: "beta" } };
+    const cases: [number, "order" | "time", number, boolean][] = [
+      [6, "time", 390, false],
+      [14, "time", 700, false],
+      [9, "time", 700, true],
+      [40, "order", 700, false],
+      [12, "order", 700, true],
+    ];
+    for (const [count, mode, width, collapsed] of cases) {
+      const groups = mapGroups(
+          [...users(count), below],
+          [{ id: "example", name: "Example", source: null }],
+          {},
+          now,
+        ),
+        alpha = groups.find((group) => group.tasks.some((item) => item.uid === "user-0"))!,
+        beta = groups.find((group) => group !== alpha)!;
+      const lanes: MapLane[] = [
+        { ...alpha, top: 0, height: 80, nodes: [], collapsed },
+        { ...beta, top: 80, height: 80, nodes: [] },
+      ];
+      const scene = mapScene(
+        lanes,
+        mode,
+        { from: now - DAY, to: now + DAY },
+        width,
+        now,
+        "station",
+        [],
+        new Map(),
+        {},
+        () => "",
+      );
+      const shown = scene.nodes.filter((node) => node.lane === alpha.id);
+      const label = `${count} ${mode} ${width}${collapsed ? " collapsed" : ""}`;
+      expect(
+        shown.filter((node) => node.tasks.length === 1),
+        label,
+      ).toHaveLength(count);
+      for (const node of shown) {
+        expect(node.x, label).toBeGreaterThanOrEqual(width <= 620 ? 14 : 208);
+        expect(node.x, label).toBeLessThanOrEqual(width - 14);
+        expect(node.y, label).toBeGreaterThan(lanes[0].top);
+        expect(node.y, label).toBeLessThan(lanes[0].top + lanes[0].height);
+        for (const other of shown)
+          if (other !== node)
+            expect(Math.hypot(node.x - other.x, node.y - other.y), label).toBeGreaterThanOrEqual(
+              36,
+            );
+      }
+      expect(lanes[1].top, label).toBe(lanes[0].top + lanes[0].height);
+    }
+  });
+  it("folds urgent cards that do not fit instead of overlapping them", () => {
+    const tasks = Array.from({ length: 20 }, (_, index) => task(`run-${index}`, "running"));
+    expect(orderStops(tasks, 6).length).toBeLessThanOrEqual(6);
+    expect(orderStops(tasks, 6, true).length).toBeLessThanOrEqual(6);
   });
 });
