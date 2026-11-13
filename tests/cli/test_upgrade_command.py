@@ -871,6 +871,65 @@ def test_configured_sha_pin_recovers_without_receipt(
         assert not (tmp_path / "updates/custom-host-rollback.json").exists()
 
 
+@pytest.mark.parametrize("windows", [False, True])
+@pytest.mark.parametrize(
+    "refs",
+    [
+        ("main", "channel/custom"),
+        (None, "local/host-custom"),
+        ("channel/custom", "channel/custom"),
+    ],
+)
+def test_configured_sha_pin_requires_consistent_refs(
+    tmp_path, monkeypatch, _wheel_install, windows, refs
+):
+    from dataclasses import replace
+
+    source = "git+ssh://tenant-a@example.test/opt/repo.git"
+    configured = [
+        "git+ssh://tenant-b@example.test/opt/repo.git" + (f"@{refs[0]}" if refs[0] else ""),
+        source + f"@{refs[1]}",
+    ]
+    info = replace(_git_install_info(), vcs_url=source + "@" + "a" * 40)
+    monkeypatch.setattr("omnigent.cli.data_dir", lambda: tmp_path)
+    monkeypatch.setattr("omnigent.cli.IS_WINDOWS", windows)
+    monkeypatch.setattr(
+        "omnigent.cli._load_global_config", lambda: {"custom_host_sources": configured}
+    )
+    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", lambda: info)
+    heads = {
+        source + "@main": "c" * 40,
+        source + "@channel/custom": "b" * 40,
+        source + "@local/host-custom": "b" * 40,
+    }
+    monkeypatch.setattr("omnigent.update_check._remote_git_head", heads.get)
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: ("0.1.0", "b" * 40)
+    )
+    ran = []
+    monkeypatch.setattr(
+        "omnigent.update_check._run_upgrade_command", lambda cmd, _: ran.append(cmd) or 0
+    )
+    monkeypatch.setattr(
+        "omnigent.host.windows_upgrade_launch.launch",
+        lambda info, target, **_: ran.append((info.vcs_url, target)),
+    )
+    result = CliRunner().invoke(cli, ["up"])
+    if refs[0] == "main":
+        assert result.exit_code == 1, result.output
+        assert "Conflicting custom Host tracking refs" in result.output
+        assert all(entry in result.output for entry in configured)
+        assert not ran
+    else:
+        assert result.exit_code == 0, result.output
+        assert len(ran) == 1
+        expected = source + f"@{refs[1]}"
+        if windows:
+            assert ran == [(expected, "b" * 40)]
+        else:
+            assert expected in ran[0]
+
+
 def test_upgrade_git_install_noop_does_not_claim_update(
     monkeypatch: pytest.MonkeyPatch, _wheel_install: None
 ) -> None:

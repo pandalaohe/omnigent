@@ -6252,22 +6252,30 @@ def _custom_channel(info: _InstalledWheelInfo, *, require_receipt: bool) -> tupl
             return None
         if isinstance(saved_source, str) and repository_path(saved_source) != installed_path:
             return None
-    moving_sources = []
+    matching_sources = []
+    branches = set()
     for source in sources:
         if repository_path(source) != installed_path:
             continue
         _, branch = _split_vcs_url(source)
-        branch = branch or "local/host-custom"
-        if re.fullmatch(r"[0-9a-fA-F]{40}", branch):
-            return None
-        # Configuration supplies only the ref; keep the installed endpoint/account.
-        moving_sources.append(f"git+{installed_repo}@{branch}")
-    if not moving_sources:
+        matching_sources.append(source)
+        branches.add(branch or "local/host-custom")
+    if not branches:
         return None
-    for target in moving_sources:
-        head = _remote_git_head(target)
-        if head:
-            return target, head
+    if len(branches) > 1:
+        raise click.ClickException(
+            "Conflicting custom Host tracking refs: "
+            + ", ".join(matching_sources)
+            + "; install unchanged."
+        )
+    branch = branches.pop()
+    if re.fullmatch(r"[0-9a-fA-F]{40}", branch):
+        return None
+    # Configuration supplies only the ref; keep the installed endpoint/account.
+    target = f"git+{installed_repo}@{branch}"
+    head = _remote_git_head(target)
+    if head:
+        return target, head
     raise click.ClickException("Cannot reach a configured custom Host channel; install unchanged.")
 
 
