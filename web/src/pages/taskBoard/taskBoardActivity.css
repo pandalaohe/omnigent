@@ -2245,7 +2245,7 @@
     .td {
       grid-template-columns: minmax(0, 1fr);
     }
-    .td > .td-p {
+    .td[class] > .td-p {
       grid-column: 1/-1;
     }
     .td-ship-body {
