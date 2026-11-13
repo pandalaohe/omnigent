@@ -24,19 +24,23 @@ from tests.harnesses.codex_native.session._support import (
 
 @pytest.mark.parametrize("flag", ["--approve-for-me", "--not-so-yolo"])
 @pytest.mark.parametrize(
-    "config_args",
-    [[], ["-c", 'sandbox_mode="danger-full-access"', "-c", 'approval_policy="never"']],
+    ("config_args", "expected"),
+    [
+        ([], {"approval_policy": "on-request", "sandbox_policy": {"type": "workspace-write"}}),
+        (
+            ["-c", 'sandbox_mode="danger-full-access"', "-c", 'approval_policy="never"'],
+            {"approval_policy": "never", "sandbox_policy": {"type": "danger-full-access"}},
+        ),
+    ],
 )
-def test_rollout_policy_records_approve_for_me_workspace(
-    flag: str, config_args: list[str]
+def test_rollout_policy_records_approve_for_me_defaults_and_overrides(
+    flag: str, config_args: list[str], expected: dict[str, Any]
 ) -> None:
-    """Cold-resume policy records retain the shorthand's sandbox selection."""
-    assert codex_native._codex_turn_context_policy_fields_from_launch_args(
-        [flag, *config_args]
-    ) == {
-        "approval_policy": "on-request",
-        "sandbox_policy": {"type": "workspace-write"},
-    }
+    """Cold-resume policy records retain shorthand defaults and explicit overrides."""
+    assert (
+        codex_native._codex_turn_context_policy_fields_from_launch_args([flag, *config_args])
+        == expected
+    )
 
 
 def test_rollout_policy_ignores_permission_flags_in_prompt_tail() -> None:

@@ -57,13 +57,19 @@ def frame_origins(tmp_path, _built_spa):
     policy = {"value": None}
 
     class Handler(_SpaHandler):
+        # Reuse TLS connections so parallel assets do not repeatedly restart
+        # Chromium's certificate-error handling for the synthetic certificate.
+        protocol_version = "HTTP/1.1"
+
         def do_GET(self):
             if urlparse(self.path).path == "/mount":
                 child = parse_qs(urlparse(self.path).query)["url"][0]
+                body = f'<iframe title="Board" src="{child}"></iframe>'.encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(f'<iframe title="Board" src="{child}"></iframe>'.encode())
+                self.wfile.write(body)
                 return
             super().do_GET()
 
@@ -130,7 +136,7 @@ def test_signed_in_boards_and_ancestor_boundaries(browser: Browser, frame_origin
         contract.json("/v1/me/usage/activity", {"accounts": []})
         contract.json("/v1/scheduled-tasks", {"scheduled_tasks": []})
         contract.json("/v1/me/tasks/sources", {"sources": []})
-        contract.json("/v1/me/tasks", {"tasks": []})
+        contract.json("/v1/me/tasks", {"entries": []})
         contract.json("/v1/system/status", {"hosts": []})
         context.add_cookies(
             [
@@ -144,20 +150,26 @@ def test_signed_in_boards_and_ancestor_boundaries(browser: Browser, frame_origin
             ]
         )
         page = context.new_page()
-        for path, heading in [
-            ("/frame/task-board", "Task board"),
-            ("/frame/usage/board", "Usage board"),
+        for path, role, name in [
+            ("/frame/task-board", "navigation", "Board views"),
+            ("/frame/usage/board", "heading", "Usage board"),
         ]:
             page.goto(parent + "/mount?url=" + board + path)
             frame = page.frame_locator("iframe")
-            expect(frame.get_by_role("heading", name=heading, exact=True)).to_be_visible()
+            expect(frame.get_by_role(role, name=name, exact=True)).to_be_visible()
             expect(frame.get_by_role("link", name="Sign in to Omnigent")).to_have_count(0)
+            if path == "/frame/task-board":
+                frame.get_by_role("button", name="Routes", exact=True).click()
+                expect(
+                    frame.get_by_role("heading", name="No tasks yet", exact=True)
+                ).to_be_visible()
+                expect(frame.get_by_role("alert")).to_have_count(0)
         # Same-origin page-mount ancestor, then board, retains the cookie.
         page.goto(board + "/mount?url=" + board + "/mount?url=" + board + "/frame/task-board")
         expect(
             page.frame_locator("iframe")
             .frame_locator("iframe")
-            .get_by_role("heading", name="Task board", exact=True)
+            .get_by_role("navigation", name="Board views", exact=True)
         ).to_be_visible()
         violations = []
         page.on(
