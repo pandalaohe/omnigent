@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from omnigent.server.agent_quota import AgentQuotaService
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.usage_evidence import UsageEvidenceService
 from omnigent.stores.usage_pricing_store import PricingConflict
 from omnigent.usage.contract import UsageAnalysisView
 from omnigent.usage.pricing import PricingBaseline
@@ -18,7 +19,9 @@ from omnigent.usage.pricing_projection import value_usage
 
 
 def create_usage_pricing_router(
-    service: AgentQuotaService, auth_provider: AuthProvider | None
+    service: AgentQuotaService,
+    auth_provider: AuthProvider | None,
+    evidence_service: UsageEvidenceService | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -29,7 +32,9 @@ def create_usage_pricing_router(
             raise HTTPException(503, "Pricing storage unavailable")
         return service.pricing_store
 
-    def response(saved: PricingBaseline, view: UsageAnalysisView) -> JSONResponse:
+    def response(saved: PricingBaseline, view: UsageAnalysisView, owner: str) -> JSONResponse:
+        if evidence_service is not None:
+            evidence_service.attach_prices(owner, view)
         return JSONResponse(
             jsonable_encoder(
                 dict(saved.model_dump(mode="json"), preview=value_usage(view, saved))
@@ -42,7 +47,7 @@ def create_usage_pricing_router(
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         saved = await asyncio.to_thread(store().read, owner)
         view = await asyncio.to_thread(service.analysis, owner)
-        return await asyncio.to_thread(response, saved, view)
+        return await asyncio.to_thread(response, saved, view, owner)
 
     @router.put("/me/usage/pricing-baseline")
     async def save_baseline(request: Request, body: PricingBaseline) -> JSONResponse:
@@ -68,6 +73,6 @@ def create_usage_pricing_router(
             raise HTTPException(409, str(error)) from None
         except ValueError as error:
             raise HTTPException(422, str(error)) from None
-        return await asyncio.to_thread(response, saved, view)
+        return await asyncio.to_thread(response, saved, view, owner)
 
     return router

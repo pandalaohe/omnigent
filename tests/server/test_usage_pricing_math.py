@@ -168,9 +168,10 @@ def test_incompatible_models_partitions_and_card_selection():
     sample = view()
     sample.rows.append(sample.rows[0].model_copy(update={"model": "model-b"}))
     assert value_usage(sample, baseline())["api_value"].state == "unknown"
+    assert value_usage(sample, baseline())["api_value"].reason == "card rates name no model"
     assert (
         value_usage(view(cache_creation_input_tokens=None), baseline())["api_value"].state
-        == "unknown"
+        == "partial"
     )
     result = value_usage(view(), baseline(), card_id="card-a")
     assert result["paid"].low is not None
@@ -288,7 +289,7 @@ def test_known_payment_with_unpriced_usage_stays_in_ratio_denominator():
     state.cards.append(card(id="card-b", target_id="account-b"))
     result = value_usage(sample, state)
     assert result["payback"].state == "partial"
-    assert result["payback"].display(money=False)["low"] == "2.38"
+    assert result["payback"].display(money=False)["low"] == "4.53"
     assert result["payback"].coverage.usage_units == 74_000_000
 
 
@@ -338,3 +339,98 @@ def test_model_selection_does_not_establish_unmapped_rate_compatibility():
     result = value_usage(sample, baseline(purchase), model="model-a")
     assert result["api_value"].state == "exact"
     assert result["api_value"].low == "49"
+
+
+def test_field_overrides_clear_restore_and_missing_partitions(monkeypatch):
+    from omnigent.llms.context_window import ModelPricing
+    from omnigent.usage.price_resolution import row_value
+    from omnigent.usage.pricing import AccountPriceOverride, TokenRates
+
+    monkeypatch.setattr(
+        "omnigent.usage.price_resolution.selected_price",
+        lambda model: ModelPricing(2e-6, 4e-6, 0.2e-6, 2.5e-6),
+    )
+    monkeypatch.setattr(
+        "omnigent.usage.price_resolution.fetch_model_pricing", lambda *a, **k: None
+    )
+    row = view(priced=True, basis="list", cost_usd=7).rows[0]
+    saved = PricingBaseline(
+        price_overrides=[AccountPriceOverride(account_id="account-a", model="model-a", read="3")]
+    )
+    value = row_value(row, saved, recorded=row)
+    assert value.low == "59"
+    assert {source.layer for source in value.price_sources} == {"account", "import"}
+    purchase = card(rates_usd_per_million=TokenRates(write="6", model="model-a"))
+    assert row_value(row, saved, card=purchase, recorded=row).low == "69"
+    saved.price_overrides[0].read = None
+    assert row_value(row, saved, recorded=row).low == "7"
+    assert row_value(row, saved, recorded=row).price_sources[0].version is None
+    saved.price_overrides[0].read = "0"
+    row.output_tokens = None
+    partial = row_value(row, saved, recorded=row)
+    assert partial.state == "partial" and partial.high is None
+    assert partial.low == "9"
+    assert TokenRates(read="").read is None
+
+
+def test_override_model_matching_and_no_model_card_protection(monkeypatch):
+    from omnigent.usage.price_resolution import row_value
+    from omnigent.usage.pricing import AccountPriceOverride, TokenRates
+
+    monkeypatch.setattr("omnigent.usage.price_resolution.selected_price", lambda model: None)
+    monkeypatch.setattr(
+        "omnigent.usage.price_resolution.fetch_model_pricing", lambda *a, **k: None
+    )
+    rates = {"read": "0", "write": "0", "cache_read": "0", "cache_write": "0"}
+    saved = PricingBaseline(
+        price_overrides=[
+            AccountPriceOverride(account_id="account-a", model="vendor/model-a", **rates)
+        ]
+    )
+    row = view().rows[0]
+    assert row_value(row, saved).low == "0"
+    saved.price_overrides.append(
+        AccountPriceOverride(
+            account_id="account-a", model="duplicate/model-a", **{**rates, "read": "0.00"}
+        )
+    )
+    assert row_value(row, saved).low == "0"
+    saved.price_overrides.append(
+        AccountPriceOverride(account_id="account-a", model="other/model-a", read="1")
+    )
+    assert row_value(row, saved).state == "unknown"
+    purchase = card(rates_usd_per_million=TokenRates(read="2"))
+    assert (
+        row_value(row, saved, card=purchase, card_models={"model-a", "model-b"}).reason
+        == "card rates name no model"
+    )
+
+
+def test_recorded_gateway_range_and_native_old_ref_survive_import_changes(monkeypatch):
+    from omnigent.llms.context_window import ModelPricing
+    from omnigent.usage.prices import PriceEstimate
+
+    monkeypatch.setattr(
+        "omnigent.usage.price_resolution.selected_price", lambda model: ModelPricing(9, 9, 9, 9)
+    )
+    sample = view(priced=True, cost_usd=999, basis="list")
+    sample.rows[0].price_estimate = PriceEstimate(
+        low_usd="10",
+        high_usd="12",
+        state="range",
+        priced_units=37_000_000,
+        usage_units=37_000_000,
+        price_source="gateway list",
+        price_version="v1",
+        fetched_at=123,
+    )
+    result = value_usage(sample, PricingBaseline())["api_value"]
+    assert (result.state, result.low, result.high) == ("range", "10", "12")
+    assert result.price_sources[0].version == "v1"
+    sample.rows[0].price_estimate = None
+    sample.rows[0].account_id = "native:codex"
+    sample.rows[0].basis = "subscription"
+    sample.rows[0].coverage = None
+    result = value_usage(sample, PricingBaseline())["api_value"]
+    assert result.low == "999"
+    assert result.price_sources[0].name == "记录时估价，来源未记录"

@@ -37,12 +37,18 @@ async def test_settings_auth_save_read_stale_and_invalid_target(request, db_uri)
             json={"schema_version": 2, "observed_at": time.time()},
         )
         assert push.status_code == 200, push.text
-        payload = {"revision": 0, "cards": [card().model_dump(mode="json")]}
+        payload = {
+            "revision": 0,
+            "cards": [card().model_dump(mode="json")],
+            "price_overrides": [{"account_id": "account-a", "model": "m", "read": "0"}],
+        }
         saved = await client.put(path, headers=headers, json=payload)
         assert saved.status_code == 200, saved.text
         assert saved.json()["revision"] == 1
         assert saved.json()["cards"][0]["purchase_currency"] == "HKD"
         assert "preview" in saved.json()
+        assert saved.json()["price_overrides"][0]["read"] == "0"
+        assert saved.json()["price_overrides"][0]["write"] is None
         assert (await client.put(path, headers=headers, json=payload)).status_code == 409
         payload["revision"] = 1
         payload["cards"][0]["retail_amount"] = 12.3

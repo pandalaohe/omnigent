@@ -8,6 +8,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, StrictFloat, StrictInt, model_validator
 
+from omnigent.usage.prices import PriceEstimate
+
 _Id = Annotated[
     str,
     Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$"),
@@ -411,6 +413,8 @@ class AnalysisRowView(BaseModel):
     model: str = ""
     host_id: str = ""
     basis: str
+    price_ref: str | None = None
+    price_estimate: PriceEstimate | None = None
     priced: bool = False
     coverage: str | None = None
     tokens: int | None = None

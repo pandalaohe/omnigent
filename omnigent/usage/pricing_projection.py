@@ -7,6 +7,7 @@ from typing import Any
 
 from omnigent.usage.analysis import LIST_BASES
 from omnigent.usage.contract import AnalysisRowView, UsageAnalysisView
+from omnigent.usage.price_resolution import row_value
 from omnigent.usage.pricing import Currency, PricingBaseline, PurchasedCard
 from omnigent.usage.value import Coverage, Value, divide, exact, multiply, subtract
 
@@ -89,8 +90,14 @@ def value_usage(
     converted_paid = Fraction(0)
     ratio_paid = Fraction(0)
     paid_missing = False
+    api_high: Fraction | None = Fraction(0)
+    known_api_high: Fraction | None = Fraction(0)
     api_total = Fraction(0)
+    price_sources = []
+    pricing_reasons = []
     known_api = Fraction(0)
+    known_priced_units = 0
+    known_api_partial = False
     priced_units = 0
     usage_units = sum(row.tokens for row in rows if row.tokens is not None)
     units_complete = bool(rows) and all(row.tokens is not None for row in rows)
@@ -168,54 +175,49 @@ def value_usage(
             if card_rows:
                 ratio_items.add(card.id)
                 ratio_paid += paid * Fraction(defaults.fx_to_display[card.purchase_currency])
-        rates = card.rates_usd_per_million
         target_rows = [
             row
             for row in actual_by_parent.get(card.parent, [])
             if _matches(card, row) and billing[0] <= row.hour < billing[1]
         ]
-        compatible = rates is not None and (
-            rates.model is not None or len({row.model for row in target_rows}) <= 1
-        )
         for row in card_rows:
             card_covered.add(id(row))
-            counts = (
-                row.uncached_input_tokens,
-                row.output_tokens,
-                row.cache_read_input_tokens,
-                row.cache_creation_input_tokens,
+            valued = row_value(
+                row,
+                baseline,
+                card=card,
+                card_models={item.model for item in target_rows},
+                recorded=row
+                if row.priced and (row.basis in LIST_BASES or row.account_id.startswith("native:"))
+                else None,
             )
-            # A partial hour cannot be allocated without finer source evidence.
-            if (
-                not compatible
-                or rates is None
-                or (rates.model is not None and row.model != rates.model)
-                or any(count is None for count in counts)
-                or row.hour < selected[0]
-                or row.hour + 3600 > selected[1]
-            ):
+            if valued.low is None or row.hour < selected[0] or row.hour + 3600 > selected[1]:
+                if valued.reason and valued.reason not in pricing_reasons:
+                    pricing_reasons.append(valued.reason)
                 api_partial = True
                 continue
-            amount = (
-                sum(
-                    (
-                        Fraction(count or 0) * Fraction(rate)
-                        for count, rate in zip(
-                            counts,
-                            (rates.read, rates.write, rates.cache_read, rates.cache_write),
-                            strict=True,
-                        )
-                    ),
-                    Fraction(0),
-                )
-                / 1_000_000
-            )
+            amount = Fraction(valued.low)
             api_total += amount
-            priced_units += sum(count or 0 for count in counts)
+            api_high = (
+                None
+                if api_high is None or valued.high is None
+                else api_high + Fraction(valued.high)
+            )
+            for source in valued.price_sources:
+                if source not in price_sources:
+                    price_sources.append(source)
+            priced_units += valued.coverage.priced_units
             if converted.low is not None:
                 known_api += amount
+                known_priced_units += valued.coverage.priced_units
+                known_api_partial = known_api_partial or valued.state == "partial"
+                known_api_high = (
+                    None
+                    if known_api_high is None or valued.high is None
+                    else known_api_high + Fraction(valued.high)
+                )
                 known_paid_rows.append(row)
-            if row.coverage == "partial" or row.reason:
+            if valued.state == "partial" or row.reason:
                 api_partial = True
         cards.append(
             {
@@ -265,7 +267,11 @@ def value_usage(
             continue
         matches = money_by_activity.get(activity_key(row), [])
         listed = max(
-            (item for item in matches if item.basis == "list" and item.coverage == "complete"),
+            (
+                item
+                for item in matches
+                if item.basis in LIST_BASES or item.account_id.startswith("native:")
+            ),
             key=lambda item: item.channel == "list_cost",
             default=None,
         )
@@ -283,17 +289,37 @@ def value_usage(
             ratio_units_complete = ratio_units_complete and row.tokens is not None
         else:
             missing_paid_accounts.add(row.parent_account_id)
-        if listed is not None and listed.cost_usd is not None and row.tokens is not None:
-            legacy_precision = True
-            amount = Fraction(str(listed.cost_usd))
+        valued = row_value(row, baseline, recorded=listed)
+        if valued.low is not None and row.tokens is not None:
+            legacy_precision = legacy_precision or listed is not None
+            amount = Fraction(valued.low)
             api_total += amount
-            priced_units += row.tokens
+            api_high = (
+                None
+                if api_high is None or valued.high is None
+                else api_high + Fraction(valued.high)
+            )
+            for source in valued.price_sources:
+                if source not in price_sources:
+                    price_sources.append(source)
+            priced_units += valued.coverage.priced_units
+            if valued.state == "partial":
+                api_partial = True
             if billed is not None:
+                known_priced_units += valued.coverage.priced_units
+                known_api_partial = known_api_partial or valued.state == "partial"
+                known_api_high = (
+                    None
+                    if known_api_high is None or valued.high is None
+                    else known_api_high + Fraction(valued.high)
+                )
                 legacy_api[row.parent_account_id] = (
                     legacy_api.get(row.parent_account_id, Fraction(0)) + amount
                 )
                 known_paid_rows.append(row)
         else:
+            if valued.reason and valued.reason not in pricing_reasons:
+                pricing_reasons.append(valued.reason)
             api_partial = True
     for account_id, amount in legacy_paid.items():
         items += 1
@@ -317,8 +343,16 @@ def value_usage(
     api = (
         money(api_total, "USD", coverage)
         if covered
-        else unknown("insufficient_priced_unit_coverage")
+        else unknown(
+            pricing_reasons[0]
+            if len(pricing_reasons) == 1
+            else "insufficient_priced_unit_coverage"
+        )
     )
+    if api.low is not None and api_high is not None and api_high != api_total:
+        upper = money(api_high, "USD", coverage)
+        api = api.model_copy(update={"state": "range", "high": upper.high})
+    api = api.model_copy(update={"price_sources": price_sources})
     if api.low is not None and (api_partial or priced_units < usage_units):
         api = api.model_copy(
             update={"state": "partial", "high": None, "reason": "incomplete_usage_or_pricing"}
@@ -336,7 +370,7 @@ def value_usage(
         paid_value = paid_value.model_copy(
             update={"state": "partial", "high": None, "reason": "unknown_paid_items"}
         )
-    known_units = sum(row.tokens or 0 for row in known_paid_rows)
+    known_units = known_priced_units
     known_api_value = (
         money(known_api, "USD", coverage)
         if known_units
@@ -346,8 +380,14 @@ def value_usage(
         else unknown("no_compatible_known_paid_cohort")
     )
     if known_api_value.low is not None:
+        if known_api_high is not None and known_api_high != known_api:
+            upper = money(known_api_high, "USD", coverage)
+            known_api_value = known_api_value.model_copy(
+                update={"state": "range", "high": upper.high}
+            )
         if (
-            known_units < known_paid_cohort_units
+            known_api_partial
+            or known_units < known_paid_cohort_units
             or view.partial
             or any(row.coverage == "partial" or row.reason for row in known_paid_rows)
         ):
@@ -367,7 +407,9 @@ def value_usage(
             total_items=coverage.total_items,
         ),
     }
-    known_api_value = known_api_value.model_copy(update=ratio_metadata)
+    known_api_value = known_api_value.model_copy(
+        update={**ratio_metadata, "price_sources": price_sources}
+    )
     ratio_denominator = ratio_denominator.model_copy(update=ratio_metadata)
     payback = divide(known_api_value, ratio_denominator, unit="ratio")
     tokens = (
@@ -401,6 +443,7 @@ def value_usage(
         revision=baseline.revision,
         cards=cards,
         coverage=coverage,
+        pricing_reasons=pricing_reasons,
         **values,
         display={
             name: value.display(money=name not in {"payback", "tokens"})

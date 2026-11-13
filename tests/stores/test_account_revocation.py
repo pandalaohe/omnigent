@@ -23,7 +23,7 @@ from omnigent.stores.usage_pricing_store import UsagePricingStore
 from omnigent.stores.usage_quota_closings import UsageQuotaClosingStore
 from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
 from omnigent.usage.contract import PoolRelationClaim, UsageWindow
-from omnigent.usage.pricing import PricingBaseline
+from omnigent.usage.pricing import AccountPriceOverride, PricingBaseline
 from tests.server.test_usage_pricing_math import card
 
 
@@ -42,7 +42,10 @@ def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) 
     )
     pools.write("alice", "pool", relation)
     pricing = UsagePricingStore(db_uri)
-    edit = PricingBaseline(cards=[card()])
+    edit = PricingBaseline(
+        cards=[card()],
+        price_overrides=[AccountPriceOverride(account_id="account-a", model="m", read="1")],
+    )
     pricing.save("alice", edit, known_accounts={"account-a"}, pools=set())
     closings = UsageQuotaClosingStore(db_uri)
     closings.record(
@@ -60,6 +63,7 @@ def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) 
     new = accounts.create_user_with_password("alice", "replacement-password-hash")
     assert pools.read("alice") == []
     assert pricing.read("alice").cards == []
+    assert pricing.read("alice").price_overrides == []
     assert closings.read("alice", 0, 1794304801, as_of=1794304801) == []
     assert new.account_generation and new.account_generation != old.account_generation
     with account_authority_scope("alice", old.account_generation):

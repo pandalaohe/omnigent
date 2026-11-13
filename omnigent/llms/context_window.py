@@ -11,7 +11,7 @@ from __future__ import annotations
 import importlib
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, cast
 
 from omnigent.onboarding.providers import ModelInfo, find_catalog_models
@@ -202,6 +202,7 @@ class ModelPricing:
     output_per_token: float
     cache_read_per_token: float | None = None
     cache_write_per_token: float | None = None
+    price_ref: str | None = field(default=None, compare=False)
 
 
 def fetch_model_pricing(model: str, *, cached_only: bool = False) -> ModelPricing | None:
@@ -393,6 +394,7 @@ def fetch_model_pricing_with_provider(
                     if family is not None and family.pricing is not None:
                         # Convert per-million prices to per-token
                         return ModelPricing(
+                            price_ref="provider",
                             input_per_token=family.pricing.input_per_million / 1_000_000,
                             output_per_token=family.pricing.output_per_million / 1_000_000,
                             cache_read_per_token=(
@@ -421,7 +423,7 @@ def fetch_model_pricing_with_provider(
         fetch_model_pricing(model, cached_only=True) if cached_only else fetch_model_pricing(model)
     )
     if catalog_pricing is not None:
-        return catalog_pricing
+        return replace(catalog_pricing, price_ref="builtin")
 
     # Step 3: No pricing available
     return None

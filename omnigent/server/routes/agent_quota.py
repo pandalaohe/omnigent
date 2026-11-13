@@ -207,7 +207,7 @@ def create_agent_quota_router(
     router = APIRouter()
     from omnigent.server.routes.usage_pricing import create_usage_pricing_router
 
-    router.include_router(create_usage_pricing_router(service, auth_provider))
+    router.include_router(create_usage_pricing_router(service, auth_provider, evidence_service))
     if evidence_service is not None:
         from omnigent.server.routes.usage_evidence import create_usage_evidence_router
 
@@ -605,6 +605,8 @@ def create_agent_quota_router(
 
                 from omnigent.usage.pricing_projection import compare_periods, value_usage
 
+                if evidence_service is not None:
+                    await asyncio.to_thread(evidence_service.attach_prices, owner, view)
                 baseline = await asyncio.to_thread(service.pricing_store.read, owner)
                 projection = await asyncio.to_thread(
                     value_usage, view, baseline, pool=pool, model=model, card_id=card
@@ -621,6 +623,8 @@ def create_agent_quota_router(
                         now=view.generated_at,
                         previous=True,
                     )
+                    if evidence_service is not None:
+                        await asyncio.to_thread(evidence_service.attach_prices, owner, prior)
                     previous_values = await asyncio.to_thread(
                         value_usage, prior, baseline, pool=pool, model=model, card_id=card
                     )

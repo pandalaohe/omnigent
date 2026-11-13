@@ -90,6 +90,7 @@ class AnalysedRow:
             host_id=row.host_id,
             basis=row.basis,
             priced=row.priced,
+            price_ref=row.price_ref,
             coverage=row.coverage,
             tokens=row.total_tokens,
             uncached_input_tokens=row.input_tokens,

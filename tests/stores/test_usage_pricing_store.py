@@ -76,3 +76,39 @@ def test_concurrent_first_save_has_one_revision_winner(db_uri):
         results = [pool.submit(attempt) for _ in range(2)]
         assert sorted(result.result(timeout=40) for result in results) == ["conflict", "saved"]
     assert UsagePricingStore(db_uri).read(OWNER).revision == 1
+
+
+def test_nullable_account_prices_clear_and_ownership(db_uri):
+    from omnigent.usage.pricing import AccountPriceOverride, TokenRates
+
+    store = UsagePricingStore(db_uri)
+    row = AccountPriceOverride(
+        account_id="account-a", model="vendor/model-a", read="0", write="1.234567890123456789"
+    )
+    saved = save(
+        store,
+        PricingBaseline(
+            price_overrides=[row], cards=[card(rates_usd_per_million=TokenRates(read="2"))]
+        ),
+    )
+    loaded = store.read(OWNER)
+    assert loaded.price_overrides == [row]
+    assert loaded.cards[0].rates_usd_per_million.write is None
+    assert store.read("other@example.test").price_overrides == []
+    with workspace_scope(7):
+        assert store.read(OWNER).price_overrides == []
+    assert save(store, PricingBaseline(revision=saved.revision)).price_overrides == [row]
+    row.read = row.write = None
+    loaded.revision = 2
+    loaded.price_overrides = [row]
+    save(store, loaded)
+    assert store.read(OWNER).price_overrides == [row]
+    with pytest.raises(ValueError):
+        save(
+            store,
+            PricingBaseline(
+                revision=3,
+                price_overrides=[AccountPriceOverride(account_id="foreign", model="a", read="1")],
+            ),
+        )
+    assert store.read(OWNER).revision == 3

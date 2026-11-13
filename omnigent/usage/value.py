@@ -30,6 +30,13 @@ class Coverage(BaseModel):
     total_items: int = 0
 
 
+class PriceSource(BaseModel):
+    layer: str
+    name: str
+    version: str | None = None
+    fetched_at: int | None = None
+
+
 class Value(BaseModel):
     state: Literal["exact", "range", "partial", "unknown"] = "unknown"
     low: str | None = None
@@ -40,6 +47,7 @@ class Value(BaseModel):
     coverage: Coverage = Field(default_factory=Coverage)
     as_of: int
     reason: str | None = None
+    price_sources: list[PriceSource] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def valid_bounds(self) -> Value:
@@ -84,6 +92,15 @@ def exact(value: Fraction | Decimal | int, **metadata) -> Value:
     return Value(state="exact", low=text, high=text, **metadata)
 
 
+def price_sources(*values: Value) -> list[PriceSource]:
+    sources = []
+    for value in values:
+        for source in value.price_sources:
+            if source not in sources:
+                sources.append(source)
+    return sources
+
+
 def divide(
     numerator: Value, denominator: Value, *, unit: str, currency: str | None = None
 ) -> Value:
@@ -93,6 +110,7 @@ def divide(
         "cohort_id": numerator.cohort_id,
         "coverage": numerator.coverage,
         "as_of": min(numerator.as_of, denominator.as_of),
+        "price_sources": price_sources(numerator, denominator),
     }
     if (
         numerator.cohort_id != denominator.cohort_id
@@ -139,6 +157,7 @@ def combine(values: list[Value], *, unit: str, currency: str | None = None) -> V
         "cohort_id": first.cohort_id,
         "coverage": first.coverage,
         "as_of": min(item.as_of for item in values),
+        "price_sources": price_sources(*values),
     }
     if any(
         item.low is None
@@ -185,6 +204,7 @@ def scale(
 
 def subtract(left: Value, right: Value) -> Value:
     metadata = left.model_dump(exclude={"state", "low", "high", "reason"})
+    metadata["price_sources"] = price_sources(left, right)
     if (
         left.cohort_id != right.cohort_id
         or left.currency != right.currency
@@ -229,6 +249,7 @@ def multiply(left: Value, right: Value, *, unit: str, currency: str | None = Non
         "cohort_id": left.cohort_id,
         "coverage": left.coverage,
         "as_of": min(left.as_of, right.as_of),
+        "price_sources": price_sources(left, right),
     }
     if (
         left.low is None
