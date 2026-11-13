@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import logging
+from collections import Counter
 from collections.abc import Sequence
 from datetime import date
 from typing import Any
@@ -15,8 +16,9 @@ from pydantic import ValidationError
 
 from omnigent.db.utils import now_epoch
 from omnigent.stores.usage_evidence_store import EVIDENCE_TABLES, UsageEvidenceStore
+from omnigent.usage.contract import UsageAnalysisView
 from omnigent.usage.evidence import EvidenceBody, Rejected, SourceEvent, SourceStatus
-from omnigent.usage.prices import PriceAliases, PriceEvidence, aggregate_prices
+from omnigent.usage.prices import PriceAliases, PriceEstimate, PriceEvidence, aggregate_prices
 from omnigent.usage.ranges import RangeKey, range_spans
 from omnigent.usage.speed import aggregate_speed
 
@@ -27,6 +29,26 @@ class UsageEvidenceService:
     def __init__(self, store: UsageEvidenceStore, retention_days: int = 400) -> None:
         self.store = store
         self.retention_days = retention_days
+
+    def attach_prices(self, owner: str, view: UsageAnalysisView) -> None:
+        """Join exact account/hour/model evidence without relabelling native history."""
+        rows, _ = self.store.read_prices(owner, int(view.span.counted_from), view.span.until)
+        prices = {(row["account_id"], row["hour_utc"], row["model"]): row for row in rows}
+        cohorts = Counter(
+            (row.account_id, row.hour, row.model) for row in view.rows if row.contributes_usage
+        )
+        for row in view.rows:
+            evidence = prices.get((row.account_id, row.hour, row.model))
+            if evidence is not None and evidence["state"] is not None:
+                estimate = PriceEstimate.model_validate(
+                    {key: evidence[key] for key in PriceEstimate.model_fields}
+                )
+                if cohorts[(row.account_id, row.hour, row.model)] > 1:
+                    # Hour-wide evidence cannot be split across host/basis buckets.
+                    estimate = estimate.model_copy(
+                        update={"missing": [*estimate.missing, "ambiguous_hour_cohort"]}
+                    )
+                row.price_estimate = estimate
 
     def report_sources(self, owner: str, body: EvidenceBody) -> dict[str, Any]:
         rows = []

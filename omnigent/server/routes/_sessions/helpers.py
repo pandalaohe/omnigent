@@ -3069,6 +3069,7 @@ def _record_usage_hours(
     growth: TokenGrowth,
     cost_usd: float,
     priced: bool,
+    price_ref: str | None = None,
 ) -> None:
     """Add one turn's usage to the hourly table, beside the daily rollup.
 
@@ -3127,6 +3128,7 @@ def _record_usage_hours(
                 growth=growth,
                 cost_usd=cost_usd,
                 priced=priced,
+                price_ref=price_ref,
             )
     except Exception:  # noqa: BLE001 — bookkeeping must never fail the turn
         _logger.warning("usage_hours attribution failed; continuing the turn", exc_info=True)
@@ -3141,6 +3143,7 @@ def _record_native_hours(
     current: Mapping[str, Any],
     cost_growth: float,
     priced: bool,
+    price_ref: str | None = None,
     tokens_by_model_reported: bool,
     token_growth_by_model: Mapping[str, TokenGrowth],
 ) -> None:
@@ -3194,6 +3197,7 @@ def _record_native_hours(
                 growth=growth,
                 cost_usd=cost_growth if carries_cost else 0.0,
                 priced=True,
+                price_ref=price_ref,
             )
         if priced and cost_growth > 0 and not attributed:
             # The active model has no token growth of its own this report, so
@@ -3206,6 +3210,7 @@ def _record_native_hours(
                 growth=TokenGrowth(),
                 cost_usd=cost_growth,
                 priced=True,
+                price_ref=price_ref,
             )
         return
     growth = TokenGrowth(
@@ -3236,6 +3241,7 @@ def _record_native_hours(
         growth=growth,
         cost_usd=cost_growth,
         priced=priced,
+        price_ref=price_ref,
     )
 
 

@@ -488,3 +488,64 @@ def test_recorder_is_inert_without_a_store_and_when_disabled(db_uri):
         priced=True,
     )
     assert store.read("a@example.test", 0, 4_000_000_000) == []
+
+
+@pytest.mark.parametrize(
+    "first,second,expected",
+    [
+        (None, None, None),
+        ("builtin", "builtin", "builtin"),
+        (None, "builtin", "mixed"),
+        ("import:v1", "import:v2", "mixed"),
+        ("mixed", "builtin", "mixed"),
+    ],
+)
+def test_native_price_refs_merge_without_relabelling_history(db_uri, first, second, expected):
+    store = UsageHoursStore(db_uri)
+    args = (
+        "owner@example.test",
+        "native:codex",
+        HOUR,
+        "model-a",
+        "host-a",
+        "subscription",
+        True,
+        1,
+        0,
+        0,
+        1,
+        2,
+        0.5,
+    )
+    store.add_turn(*args, price_ref=first)
+    store.add_turn(*args, price_ref=second)
+    row = store.read("owner@example.test", HOUR, OTHER_HOUR)[0]
+    assert row.price_ref == expected
+    assert row.cost_usd == 1
+
+
+def test_closed_hour_fill_records_its_actual_price_ref(db_uri):
+    store = UsageHoursStore(db_uri)
+    store.add_turn(
+        "owner@example.test",
+        "native:codex",
+        HOUR,
+        "model-a",
+        "host-a",
+        "subscription",
+        False,
+        10,
+        0,
+        0,
+        0,
+        10,
+        0,
+    )
+    assert (
+        store.fill_unpriced(
+            lambda model: ModelPricing(0.1, 0.2, price_ref="import:v1"), OTHER_HOUR
+        )
+        == 1
+    )
+    row = store.read("owner@example.test", HOUR, OTHER_HOUR)[0]
+    assert row.price_ref == "import:v1" and row.priced

@@ -247,9 +247,11 @@ def test_token_priced_bucket_matches_flat_cost(
     # computed from the running token totals. Stub pricing so the test does not
     # depend on the live catalog; assert the per-model cost bucket still tracks
     # the flat token-priced total (the elif-has_tokens branch feeds by_model).
+    from omnigent.llms.context_window import ModelPricing
+
     monkeypatch.setattr(
         "omnigent.llms.context_window.fetch_model_pricing",
-        lambda model: {"stub": True},
+        lambda model: ModelPricing(0, 0),
     )
     monkeypatch.setattr(
         "omnigent.llms.context_window.compute_llm_cost",

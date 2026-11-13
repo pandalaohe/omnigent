@@ -3,22 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
 from omnigent.server.agent_quota import AgentQuotaService
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.usage_evidence import UsageEvidenceService
 from omnigent.stores.usage_pricing_store import PricingConflict
 from omnigent.usage.contract import UsageAnalysisView
+from omnigent.usage.price_resolution import current_model_prices
 from omnigent.usage.pricing import PricingBaseline
 from omnigent.usage.pricing_projection import value_usage
 
 
 def create_usage_pricing_router(
-    service: AgentQuotaService, auth_provider: AuthProvider | None
+    service: AgentQuotaService,
+    auth_provider: AuthProvider | None,
+    evidence_service: UsageEvidenceService | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -29,10 +34,23 @@ def create_usage_pricing_router(
             raise HTTPException(503, "Pricing storage unavailable")
         return service.pricing_store
 
-    def response(saved: PricingBaseline, view: UsageAnalysisView) -> JSONResponse:
+    def response(saved: PricingBaseline, view: UsageAnalysisView, owner: str) -> JSONResponse:
+        if evidence_service is not None:
+            evidence_service.attach_prices(owner, view)
+        models = {row.model for row in view.rows}
+        models.update(row.model for row in saved.price_overrides)
+        models.update(
+            card.rates_usd_per_million.model
+            for card in saved.cards
+            if card.rates_usd_per_million and card.rates_usd_per_million.model
+        )
         return JSONResponse(
             jsonable_encoder(
-                dict(saved.model_dump(mode="json"), preview=value_usage(view, saved))
+                dict(
+                    saved.model_dump(mode="json"),
+                    preview=value_usage(view, saved),
+                    current_prices=current_model_prices(models),
+                )
             ),
             headers={"Cache-Control": "private, no-store"},
         )
@@ -42,7 +60,16 @@ def create_usage_pricing_router(
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         saved = await asyncio.to_thread(store().read, owner)
         view = await asyncio.to_thread(service.analysis, owner)
-        return await asyncio.to_thread(response, saved, view)
+        return await asyncio.to_thread(response, saved, view, owner)
+
+    @router.get("/me/usage/pricing-baseline/model-price")
+    async def read_model_price(
+        request: Request, model: Annotated[str, Query(min_length=1, max_length=128)]
+    ) -> JSONResponse:
+        require_user(request, auth_provider)
+        store()
+        prices = await asyncio.to_thread(current_model_prices, {model})
+        return JSONResponse(prices[model], headers={"Cache-Control": "private, no-store"})
 
     @router.put("/me/usage/pricing-baseline")
     async def save_baseline(request: Request, body: PricingBaseline) -> JSONResponse:
@@ -68,6 +95,6 @@ def create_usage_pricing_router(
             raise HTTPException(409, str(error)) from None
         except ValueError as error:
             raise HTTPException(422, str(error)) from None
-        return await asyncio.to_thread(response, saved, view)
+        return await asyncio.to_thread(response, saved, view, owner)
 
     return router

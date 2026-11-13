@@ -859,3 +859,20 @@ def test_missing_billing_mark_does_not_charge_unpriced_history(
     assert store.get_daily_cost(_OWNER, _today()) == pytest.approx(0.1)
     [row] = hours.read(_OWNER, _this_hour(), _this_hour() + 3600)
     assert (row.input_tokens, row.cost_usd) == (100_000, pytest.approx(0.1))
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_turn_seams_persist_pricing_provenance(db_uri, hours, monkeypatch, native):
+    _patch_price(monkeypatch, ModelPricing(1e-6, 0, price_ref="import:v1"))
+    conv_id = _session(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    if native:
+        _persist_native_cumulative_usage(
+            conv_id, {"cumulative_input_tokens": 100, "model": "m"}, store
+        )
+    else:
+        _accumulate_session_usage(
+            {"usage": {"input_tokens": 100, "total_tokens": 100, "model": "m"}}, conv_id, store
+        )
+    [row] = hours.read(_OWNER, _this_hour(), _this_hour() + 3600)
+    assert row.price_ref == "import:v1"

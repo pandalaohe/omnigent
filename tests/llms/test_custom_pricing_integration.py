@@ -163,7 +163,8 @@ def test_fetch_pricing_fallback_to_catalog(monkeypatch: pytest.MonkeyPatch):
         model="test-model", provider_config=provider_config, harness="claude-sdk"
     )
 
-    assert pricing is catalog_pricing
+    assert pricing == catalog_pricing
+    assert pricing.price_ref == "builtin"
     assert requested_models == ["test-model"]
 
 

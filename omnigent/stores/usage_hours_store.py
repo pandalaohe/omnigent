@@ -21,7 +21,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, case, delete, func, or_, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -81,6 +81,7 @@ class HourRow:
     updated_at: int
     reasoning_tokens: int | None = None
     coverage: str | None = None
+    price_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -154,6 +155,7 @@ def _row_from_orm(row: SqlUsageHour) -> HourRow:
         updated_at=row.updated_at,
         reasoning_tokens=row.reasoning_tokens,
         coverage=row.coverage,
+        price_ref=row.price_ref,
     )
 
 
@@ -239,6 +241,7 @@ class UsageHoursStore:
         output_tokens: int,
         total_tokens: int,
         cost_usd: float,
+        price_ref: str | None = None,
     ) -> None:
         """Add one turn's usage to its hour row, creating the row if needed.
 
@@ -285,6 +288,7 @@ class UsageHoursStore:
             None,
             None,
             cost,
+            price_ref=price_ref,
         )
 
     def replace_activity(self, owner: str, account_id: str, rows: Sequence[ActivityHour]) -> None:
@@ -462,7 +466,7 @@ class UsageHoursStore:
             if pricing is None:
                 continue
             cost = compute_llm_cost(growth.cost_dict(), pricing)
-            if self._move_to_priced(row, cost):
+            if self._move_to_priced(row, cost, getattr(pricing, "price_ref", None)):
                 filled += 1
         return filled
 
@@ -597,7 +601,7 @@ class UsageHoursStore:
 
     # -- internals ------------------------------------------------------
 
-    def _move_to_priced(self, row: HourRow, cost: float) -> bool:
+    def _move_to_priced(self, row: HourRow, cost: float, price_ref: str | None = None) -> bool:
         def write(session: Session) -> bool:
             if row.owner_id:
                 require_active_account(session, row.owner_id)
@@ -638,6 +642,7 @@ class UsageHoursStore:
                 failed=present.failed,
                 reasons=None,
                 cost_usd=cost,
+                price_ref=price_ref,
                 increment=True,
             )
             session.delete(present)
@@ -661,6 +666,7 @@ class UsageHoursStore:
         cost_usd: float,
         *,
         account_record: dict[str, Any] | None = None,
+        price_ref: str | None = None,
     ) -> None:
         def write(session: Session) -> None:
             require_active_account(session, owner)
@@ -678,6 +684,7 @@ class UsageHoursStore:
                 failed=failed,
                 reasons=reasons,
                 cost_usd=cost_usd,
+                price_ref=price_ref,
                 increment=True,
             )
             if account_record is not None:
@@ -704,6 +711,7 @@ class UsageHoursStore:
         reasons: Mapping[str, int] | None,
         cost_usd: float,
         increment: bool,
+        price_ref: str | None = None,
     ) -> None:
         """Insert or merge one row, adding the counters when *increment*."""
         now = now_epoch()
@@ -726,6 +734,7 @@ class UsageHoursStore:
             "reasons": json.dumps(reasons, sort_keys=True) if reasons else None,
             "cost_usd": cost_usd,
             "updated_at": now,
+            "price_ref": price_ref,
         }
         key = [
             "workspace_id",
@@ -795,7 +804,18 @@ class UsageHoursStore:
         for column, value in values.items():
             if column in key:
                 continue
-            if increment and column in counters:
+            if increment and column == "price_ref":
+                merged[column] = case(
+                    (SqlUsageHour.price_ref == getattr(proposed, column), SqlUsageHour.price_ref),
+                    (
+                        and_(
+                            SqlUsageHour.price_ref.is_(None), getattr(proposed, column).is_(None)
+                        ),
+                        None,
+                    ),
+                    else_="mixed",
+                )
+            elif increment and column in counters:
                 if value is not None:
                     zero = 0.0 if column == "cost_usd" else 0
                     merged[column] = func.coalesce(getattr(SqlUsageHour, column), zero) + getattr(
@@ -876,6 +896,7 @@ class UsageHoursRecorder:
         cost_usd: float,
         priced: bool,
         hour: int | None = None,
+        price_ref: str | None = None,
     ) -> None:
         """Record one turn's growth at the current UTC hour.
 
@@ -900,6 +921,7 @@ class UsageHoursRecorder:
                 growth.output_tokens,
                 growth.total_tokens,
                 cost_usd if priced else 0.0,
+                price_ref=price_ref,
             )
         except Exception:
             _logger.warning("usage_hours write failed; continuing the turn", exc_info=True)
@@ -929,6 +951,7 @@ def record_turn_usage(
     growth: TokenGrowth,
     cost_usd: float,
     priced: bool,
+    price_ref: str | None = None,
 ) -> None:
     """Record a turn's usage through the configured recorder, if any."""
     recorder = _recorder
@@ -943,6 +966,7 @@ def record_turn_usage(
         growth=growth,
         cost_usd=cost_usd,
         priced=priced,
+        price_ref=price_ref,
     )
 
 

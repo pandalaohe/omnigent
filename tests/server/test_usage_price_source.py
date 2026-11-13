@@ -170,6 +170,11 @@ async def test_selection_freezes_priced_history_fills_closed_only_and_restarts(
     restored.load()
     assert restored.status()["version"] == price_source.status()["version"]
     assert fetch_model_pricing_with_provider("model") == ModelPricing(2e-6, 6e-6)
+    assert (
+        fetch_model_pricing_with_provider("model").price_ref
+        == "import:" + restored.status()["version"]
+    )
+    assert rows[0].price_ref == "mixed"
     assert route.call_count == 2  # loading the cache needed no request
     await restored.select(PriceSourceSelection())
     assert restored.status()["version"] is None

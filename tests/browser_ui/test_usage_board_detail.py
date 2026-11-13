@@ -205,11 +205,25 @@ def test_account_detail_keyboard_ranges_and_return(
                 },
             }
         ],
+        "price_overrides": [],
+        "current_prices": {
+            "pricing-model": {
+                "imported": {"read": "2", "write": "4", "cache_read": "0.2", "cache_write": "2.5"},
+                "builtin": None,
+            }
+        },
     }
     browser_contract.json("/v1/me/usage/pricing-baseline", pricing)
     browser_contract.json(
+        "/v1/me/usage/pricing-baseline/model-price", {"imported": None, "builtin": None}
+    )
+    browser_contract.json(
         "/v1/me/usage/pricing-baseline",
-        lambda request: {**request.post_data_json, "revision": 2},
+        lambda request: {
+            **request.post_data_json,
+            "revision": 2,
+            "current_prices": pricing["current_prices"],
+        },
         method="PUT",
     )
     browser_contract.json("/v1/me/usage/lines", {"schema": 1, "tiles": {}})
@@ -530,6 +544,25 @@ def test_account_detail_keyboard_ranges_and_return(
         {"view": "pricing", "width": width, "names": [LONG_NAMES["card"]], "native_control": True}
     )
     expect(page.get_by_label("Card payment preview")).to_contain_text("HKD 80.00 · USD 10.26")
+    page.get_by_label("Model id", exact=True).fill("pricing-model")
+    page.get_by_role("button", name="Add model price", exact=True).click()
+    account_read = page.get_by_label("pricing-model · Read", exact=True)
+    expect(account_read).to_have_attribute("placeholder", "2.00")
+    account_read.fill("3.000000000000000001")
+    account_read.blur()
+    expect(account_read).to_have_value("3.00")
+    page.get_by_label("Rate model (optional)", exact=True).fill("pricing-model")
+    card_read = page.get_by_label("Read", exact=True)
+    card_read.focus()
+    expect(card_read).to_have_value("2")
+    card_read.fill("")
+    expect(card_read).to_have_value("")
+    expect(card_read).to_have_attribute("placeholder", "3.00")
+    card_write = page.get_by_label("Write", exact=True)
+    card_write.focus()
+    expect(card_write).to_have_value("4")
+    card_write.fill("0")
+    expect(card_write).to_have_value("0")
     field = page.get_by_label("Card discount", exact=True)
     field.fill("0.6")
     field.blur()
@@ -539,6 +572,11 @@ def test_account_detail_keyboard_ranges_and_return(
     ) as saved_request:
         page.get_by_role("button", name="Save pricing", exact=True).click()
     assert saved_request.value.post_data_json["cards"][0]["discount_override"] == "0.6"
+    assert saved_request.value.post_data_json["cards"][0]["rates_usd_per_million"]["read"] is None
+    assert saved_request.value.post_data_json["cards"][0]["rates_usd_per_million"]["write"] == "0"
+    assert (
+        saved_request.value.post_data_json["price_overrides"][0]["read"] == "3.000000000000000001"
+    )
     assert (
         saved_request.value.post_data_json["cards"][0]["retail_amount"] == "100.000000000000000001"
     )
