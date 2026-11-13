@@ -111,6 +111,8 @@ const currentEdge = (edges: MapEdge[], relation?: string) =>
   relation === undefined
     ? undefined
     : edges.find((edge) => edge.relations.some((item) => item.id === relation));
+const currentHub = (nodes: MapNode[], hub: string | null) =>
+  hub !== null && nodes.some((node) => node.hub && taskIdentity(node.tasks[0]) === hub);
 const badgeStyle = (color: string) => ({ "--rt-color": color }) as CSSProperties;
 const dayKey = (time: number) => {
   const date = new Date(time);
@@ -1098,7 +1100,8 @@ export function TaskBoardRoutes({
     }
     hoverStore.set({ hover: null });
   };
-  const edgeIntent = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const edgeIntent = useRef<ReturnType<typeof setTimeout>>(undefined),
+    shownScene = useRef(model);
   useEffect(() => () => clearTimeout(edgeIntent.current), []);
   const showHover = (value: Omit<Hover, "x" | "y">, element: Element) => {
     const rect = element.getBoundingClientRect();
@@ -1149,13 +1152,14 @@ export function TaskBoardRoutes({
   // Connector hover dims the map through one class; the map itself never re-renders on hover.
   // A refreshed scene drops hover whose station, connector or hub is gone.
   useLayoutEffect(() => {
+    shownScene.current = model;
     const { hover, hub } = hoverStore.get();
     if (
       hover &&
       !(hover.edge ? currentEdge(model.edges, hover.edge) : currentNode(model.nodes, hover.node))
     )
       hoverStore.set({ hover: null });
-    if (hub && !hubs.has(hub)) hoverStore.set({ hub: null });
+    if (hub && !currentHub(model.nodes, hub)) hoverStore.set({ hub: null });
     const sync = () =>
       svgRef.current?.classList.toggle(
         "rt-edge-hover",
@@ -1163,7 +1167,7 @@ export function TaskBoardRoutes({
       );
     sync();
     return hoverStore.subscribe(sync);
-  }, [hoverStore, model, hubs]);
+  }, [hoverStore, model]);
   useEffect(() => {
     if (mode !== "time") return;
     const cleanups: (() => void)[] = [];
@@ -1483,7 +1487,7 @@ export function TaskBoardRoutes({
               onClick={() => {
                 onMode(value);
                 setOpen(null);
-                hoverStore.set({ hover: null });
+                hoverStore.set({ hover: null, hub: null });
               }}
             >
               {value === "order" ? <RouteIcon size={15} /> : <ClockIcon size={15} />}{" "}
@@ -2171,8 +2175,10 @@ export function TaskBoardRoutes({
                       const target = event.currentTarget;
                       clearTimeout(edgeIntent.current);
                       edgeIntent.current = setTimeout(() => {
-                        // A connector removed by a refresh meanwhile no longer shows.
-                        if (target.isConnected) showHover({ edge: edge.relations[0].id }, target);
+                        // A refresh meanwhile may have removed this connector or its relation.
+                        const relation = edge.relations[0].id;
+                        if (target.isConnected && currentEdge(shownScene.current.edges, relation))
+                          showHover({ edge: relation }, target);
                       }, 120);
                     }}
                     onMouseLeave={() => {
@@ -2572,7 +2578,7 @@ function RouteHighlights({
 }) {
   const { hover, hub } = useHover(store);
   const activeEdge = currentEdge(edges, hover?.edge) ?? openEdge,
-    activeHub = hub ?? openHub;
+    activeHub = (currentHub(nodes, hub) ? hub : null) ?? openHub;
   if (!activeEdge && !activeHub) return null;
   const ringed = activeEdge
     ? nodes.filter((node) => node.id === activeEdge.from.id || node.id === activeEdge.to.id)

@@ -187,3 +187,59 @@ it("keeps a focused connector's highlight and tooltip on the current data", () =
   expect(view.container.querySelector(".rt-highlights")).toBeNull();
   expect(view.container.querySelector(".rt-edge-hover")).toBeNull();
 });
+
+it("drops a hub highlight on a mode switch and once its station leaves the map", () => {
+  const hubbed = (extra: Partial<BoardTask> = {}) => [
+    card("h", "busy", {
+      ...live,
+      "omnigent.ai:sourceDisplay": {
+        version: 1,
+        hub: { scope: "explicit", members: [{ source: "work", uid: "m" }] },
+      } as BoardTask["omnigent.ai:sourceDisplay"],
+      ...extra,
+    }),
+    card("m", "recent", { updated: new Date(now - DAY).toISOString() }),
+  ];
+  const view = render(board(hubbed()));
+  const highlight = () => view.container.querySelector(".rt-highlights");
+  fireEvent.focus(view.container.querySelector(".rt-hub-badge")!);
+  expect(highlight()).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "By time" }));
+  expect(highlight()).toBeNull();
+  fireEvent.focus(view.container.querySelector(".rt-hub-badge")!);
+  expect(highlight()).toBeTruthy();
+  // Still a hub in the data, but closed long ago: its station leaves the map.
+  const old = new Date(now - 10 * DAY).toISOString();
+  view.rerender(
+    board(
+      hubbed({
+        progress: "completed",
+        progressUpdated: old,
+        updated: old,
+        "omnigent.ai:workedBy": [],
+      }),
+    ),
+  );
+  expect(view.container.querySelector('.rt-stop[data-route-task="h"]')).toBeNull();
+  expect(highlight()).toBeNull();
+});
+
+it("does not let a delayed connector hover land after a refresh replaced its relation", () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const linked = (relation: Record<string, boolean>) => [
+    card("x", "busy", { ...live, relatedTo: { y: { relation } } }),
+    card("y", "recent", { updated: new Date(now - DAY).toISOString() }),
+  ];
+  const view = render(board(linked({ parent: true })));
+  const edge = view.container.querySelector(".rt-edge-hit")!;
+  fireEvent.mouseEnter(edge);
+  view.rerender(board(linked({ "omnigent.ai:depends-on": true })));
+  expect(view.container.querySelector(".rt-edge-hit")).toBe(edge);
+  act(() => vi.advanceTimersByTime(200));
+  expect(screen.queryByRole("tooltip")).toBeNull();
+  // The old relation coming back must not revive a hover nobody rests on.
+  view.rerender(board(linked({ parent: true })));
+  expect(screen.queryByRole("tooltip")).toBeNull();
+  expect(view.container.querySelector(".rt-edge-hover")).toBeNull();
+  vi.useRealTimers();
+});
