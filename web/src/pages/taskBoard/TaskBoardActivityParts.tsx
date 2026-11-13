@@ -25,6 +25,7 @@ export const activityStamp = (at: number, timeOnly = false) => {
 };
 export const activityDuration = (value: number) => {
   const seconds = Math.round(value);
+  if (seconds === 0) return "0m";
   if (seconds < 3600) return activityNumber(Math.max(1, Math.round(seconds / 60))) + "m";
   const hours = Math.floor(seconds / 3600),
     minutes = Math.round((seconds % 3600) / 60);
@@ -38,6 +39,8 @@ export const activityNumber = (amount: number | undefined) =>
     : formatNumber(amount, {
         notation: "compact",
         maximumSignificantDigits: 3,
+        maximumFractionDigits: 3,
+        roundingPriority: "lessPrecision",
       });
 export const activityMoney = (amount: number) =>
   "$" +

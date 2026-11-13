@@ -1,3 +1,4 @@
+import userEvent from "@testing-library/user-event";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
@@ -392,4 +393,69 @@ it("uses the native tool tuple and live clock instead of the older source tool",
   );
   expect(screen.queryByText(/Source work/)).toBeNull();
   vi.restoreAllMocks();
+});
+
+it("shows file short names, deduplicates paths, folds old versions and reports clipboard success or failure", async () => {
+  const { TaskSourceDetails } = await import("./TaskSourceDetails");
+  const path = "/opt/work/261024_T260101-EX-AG-001_task-placement-trust-separation_design.html";
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+  render(
+    <TaskSourceDetails
+      display={{
+        version: 1,
+        rows: [
+          { id: "path-0", label: "Design", value: path },
+          { id: "path-1", label: "Design", value: path },
+          {
+            id: "path-2",
+            label: "Design",
+            value:
+              "/opt/work/generation-history/v1/261024_T260101-EX-AG-001_task-placement-trust-separation_design.md",
+          },
+          { id: "event_age", label: "Snapshot event age", value: "12345" },
+        ],
+      }}
+    />,
+  );
+  const file = screen.getByTitle(path);
+  expect(file.textContent).toContain("task placement trust separation");
+  expect(screen.getAllByTitle(path)).toHaveLength(1);
+  expect(screen.queryByText("Snapshot event age")).toBeNull();
+  expect(screen.queryByTitle(/generation-history/)).toBeNull();
+  fireEvent.click(file);
+  await screen.findByText("Copied");
+  expect(writeText).toHaveBeenCalledWith(path);
+  writeText.mockRejectedValueOnce(Error("denied"));
+  fireEvent.click(file);
+  await screen.findByText("Copy failed — try again");
+  fireEvent.click(screen.getByRole("button", { name: "Older versions (1)" }));
+  expect(screen.getByTitle(/generation-history/)).toBeTruthy();
+});
+
+it("activates artifact copy by keyboard and hides placeholder path actions", async () => {
+  const { TaskSourceDetails } = await import("./TaskSourceDetails");
+  const user = userEvent.setup();
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+  const path = "/opt/work/omnigent/fork/example/design.html";
+  const { container } = render(
+    <TaskSourceDetails
+      display={{
+        version: 1,
+        rows: [
+          { id: "path-0", label: "Design", value: "—" },
+          { id: "path-1", label: "Design", value: path },
+        ],
+      }}
+    />,
+  );
+  expect(container.querySelectorAll(".tb-file")).toHaveLength(1);
+  await user.tab();
+  expect(document.activeElement).toBe(screen.getByTitle(path));
+  await user.keyboard("{Enter}");
+  await screen.findByText("Copied");
+  expect(writeText).toHaveBeenCalledWith(path);
+  await user.keyboard(" ");
+  expect(writeText).toHaveBeenCalledTimes(2);
 });

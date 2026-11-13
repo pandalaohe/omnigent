@@ -17,7 +17,7 @@ import {
 import { taskIdentity, type BoardTask } from "./taskBoardData";
 import type { BoardSession } from "./taskBoardNative";
 import { eventMother, localDay, type BoardEvent } from "./taskBoardActivityData";
-import { boardGroupColors } from "./taskBoardSessionData";
+import { boardSourceColors } from "./taskBoardVisual";
 import { BoardIdentityMark } from "./BoardIdentityMark";
 import { TaskBoardFoldText } from "./TaskBoardFoldText";
 import { activityHistoryValue, activityName } from "./taskBoardPresentation";
@@ -30,6 +30,7 @@ import {
   activityFieldName,
   activitySourceName,
   activityTaskName,
+  activityTaskKey,
   ActivityPages,
   ActivitySegments,
   activityDuration,
@@ -149,7 +150,7 @@ export function TaskBoardLog({
     [page, setPage] = useState(0),
     [pages, setPages] = useState<Record<string, number>>({});
   const taskMap = new Map(tasks.map((task) => [taskIdentity(task), task])),
-    colors = boardGroupColors(tasks);
+    colors = boardSourceColors(tasks);
   const roots = new Map(
     tasks.flatMap((task) =>
       (task["omnigent.ai:sourceDisplay"]?.sessions ?? []).map(
@@ -354,6 +355,7 @@ export function TaskBoardLog({
                   task = taskMap.get(JSON.stringify([row.source, row.uid])),
                   d = task?.["omnigent.ai:sourceDisplay"],
                   r = richMap.get(id)?.event,
+                  actor = r?.agentId ?? row.actor?.split(/[@/]/)[0],
                   k = kinds[row.kind] ?? row.kind,
                   Icon = icons[k as keyof typeof icons] ?? Clock,
                   check = d?.checks?.find((c) => c.id === r?.checkId),
@@ -370,7 +372,7 @@ export function TaskBoardLog({
                       className={`lr lr-${k} ${open === id ? "is-open" : ""}`}
                       style={
                         {
-                          "--lc": task ? colors.get(taskIdentity(task)) : undefined,
+                          "--lc": task ? colors.get(row.source) : undefined,
                         } as CSSProperties
                       }
                       onClick={() => {
@@ -389,12 +391,12 @@ export function TaskBoardLog({
                       <span className="lr-t">{activityStamp(Date.parse(row.time), true)}</span>
                       <span className="lr-who">
                         <BoardIdentityMark
-                          id={r?.agentId ?? r?.host ?? row.source}
+                          id={actor ?? r?.host ?? row.source}
                           label={
-                            activityAgentName(r?.agentId, r?.host) ??
+                            activityAgentName(actor, r?.host) ??
                             activitySourceName(row.source, task, sourceLabels)
                           }
-                          product={r?.agentId}
+                          product={actor === "ag" ? "antigravity" : actor}
                           size={24}
                         />
                       </span>
@@ -403,6 +405,9 @@ export function TaskBoardLog({
                         title={activityEventLabel(k)}
                       >
                         <Icon size={14} />
+                        <span>
+                          {item.category === "changes" ? row.label : activityEventLabel(k)}
+                        </span>
                       </span>
                       <span className="lr-main">
                         <b>
@@ -442,28 +447,14 @@ export function TaskBoardLog({
                           ` · ${activityNumber(commits.length)} ${t("g6.commits")}`}
                       </span>
                       <span className="lr-line">
-                        {d?.identity && (
-                          <span
-                            style={{
-                              display: "inline-grid",
-                              placeItems: "center",
-                              minWidth: 18,
-                              height: 18,
-                              padding: "0 5px",
-                              borderRadius: 6,
-                              background: task
-                                ? colors.get(taskIdentity(task))
-                                : "var(--secondary)",
-                              color: "white",
-                              fontSize: 10,
-                              fontWeight: 700,
-                            }}
-                          >
-                            {activityName(d.identity.groupBadge, d.identity.groupId) ??
-                              t("g6.other")}
-                          </span>
-                        )}
+                        <BoardIdentityMark
+                          id={row.source}
+                          color={colors.get(row.source)}
+                          label={activitySourceName(row.source, task, sourceLabels)}
+                          size={18}
+                        />
                         <span>{activitySourceName(row.source, task, sourceLabels)}</span>
+                        {task && activityTaskKey(task) && <code>{activityTaskKey(task)}</code>}
                       </span>
                       <ChevronDown size={14} className="lr-chev" />
                     </div>

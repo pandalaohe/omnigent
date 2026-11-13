@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { timeDay, timeMonday, timeMonth, timeYear } from "d3-time";
 import type { HistoryCard } from "./taskBoardHistoryData";
-import { DAY, activityColors } from "./taskBoardHistoryData";
+import { DAY } from "./taskBoardHistoryData";
 import type { ClosedDay } from "./taskBoardActivityData";
 import { localDay } from "./taskBoardActivityData";
 import { activityMoney, activityNumber, activitySourceName } from "./TaskBoardActivityParts";
@@ -17,7 +17,10 @@ export function TaskBoardHistoryChart({
   now,
   historyStart,
   capped,
-  sourceOrder,
+  sourceColors,
+  legendSources,
+  selectedSources,
+  onSource,
   sourceLabels,
   onRange,
 }: {
@@ -29,7 +32,10 @@ export function TaskBoardHistoryChart({
   now: number;
   historyStart: number;
   capped: boolean;
-  sourceOrder: string[];
+  sourceColors: Map<string, string>;
+  legendSources?: string[];
+  selectedSources: string[];
+  onSource: (source: string) => void;
   sourceLabels?: Record<string, string>;
   onRange: (from: number, to: number) => void;
 }) {
@@ -91,10 +97,11 @@ export function TaskBoardHistoryChart({
     ),
     top = sources.slice(0, 6),
     stacks = [...top, ...(sources.length > 6 ? ["other"] : [])],
+    legend = legendSources?.length
+      ? [...legendSources.slice(0, 6), ...(legendSources.length > 6 ? ["other"] : [])]
+      : stacks,
     palette = stacks.map((source) =>
-      source === "other"
-        ? "var(--fg3)"
-        : activityColors[Math.max(0, sourceOrder.indexOf(source)) % activityColors.length],
+      source === "other" ? "var(--fg3)" : (sourceColors.get(source) ?? "var(--muted-foreground)"),
     );
   const x = (time: number) => 2 + ((time - start) / span) * (W - 4),
     clamp = (time: number) => Math.max(2, Math.min(W - 2, x(time)));
@@ -129,11 +136,19 @@ export function TaskBoardHistoryChart({
           )}
         </b>
         <span className="r-names">
-          {stacks.map((s, i) => (
-            <span key={s}>
-              <i style={{ background: palette[i] }} />
-              {s === "other" ? t("g6.other") : s}
-            </span>
+          {legend.map((s) => (
+            <button
+              type="button"
+              key={s}
+              disabled={s === "other"}
+              aria-pressed={!selectedSources.length || selectedSources.includes(s)}
+              onClick={() => onSource(s)}
+            >
+              <i style={{ background: s === "other" ? "var(--fg3)" : sourceColors.get(s) }}>
+                {s === "other" ? "…" : activitySourceName(s, undefined, sourceLabels).slice(0, 1)}
+              </i>
+              {s === "other" ? t("g6.other") : activitySourceName(s, undefined, sourceLabels)}
+            </button>
           ))}
         </span>
         {costs.some((c) => c !== null) && (
@@ -195,6 +210,7 @@ export function TaskBoardHistoryChart({
                     width={w}
                     height={Math.max(1, height - 0.6)}
                     fill={palette[j]}
+                    opacity={!selectedSources.length || selectedSources.includes(s) ? 1 : 0.2}
                   />
                 );
               })}

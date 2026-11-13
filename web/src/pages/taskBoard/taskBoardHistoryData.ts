@@ -110,10 +110,15 @@ export const historySort = (sort: string) => (a: HistoryCard, b: HistoryCard) =>
         : b.end - a.end;
 export function historyRoll(cards: HistoryCard[]) {
   const nodes = cards.flatMap((c) => c.nodes),
-    priced = nodes.filter((n) => n.cost?.amount != null);
+    priced = nodes.filter((n) => n.cost?.amount != null),
+    durationNodes = nodes.filter((n) => Number.isFinite(n.from) && Number.isFinite(n.to));
   return {
     n: cards.length,
-    seconds: cards.reduce((sum, c) => sum + c.seconds, 0),
+    seconds: durationNodes.reduce(
+      (sum, node) => sum + Math.max(0, (node.to - node.from) / 1000),
+      0,
+    ),
+    durationNodes: durationNodes.length,
     nodes: nodes.length,
     unpriced: nodes.length - priced.length,
     usd: priced.length ? priced.reduce((sum, n) => sum + (n.cost?.amount ?? 0), 0) : null,

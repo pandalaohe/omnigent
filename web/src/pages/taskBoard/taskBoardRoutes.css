@@ -1393,3 +1393,57 @@
     animation: none !important;
   }
 }
+
+.rt-icon:has(> svg + *) {
+  width: auto;
+}
+.rt-controls .rt-icon {
+  width: auto;
+  padding: 0 8px;
+  gap: 5px;
+}
+.rt-legend-always {
+  margin: 6px 0 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+.rt-legend-always > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.rt-legend .zero {
+  opacity: 0.5;
+}
+.rt-line-key {
+  width: 26px;
+  border-top: 3px solid var(--link);
+}
+.rt-line-key.queued {
+  border-top-style: dotted;
+}
+.rt-line-key.running {
+  border-top-style: dashed;
+}
+.rt-summary {
+  display: inline-flex;
+  gap: 5px;
+  margin-left: 8px;
+}
+.rt-summary em {
+  padding: 0 6px;
+  border-radius: 4px;
+  font-style: normal;
+}
+.rt-summary .running {
+  color: var(--link);
+  background: color-mix(in srgb, var(--link) 13%, var(--background));
+}
+.rt-summary .user {
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 13%, var(--background));
+}

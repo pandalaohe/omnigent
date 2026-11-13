@@ -1,3 +1,4 @@
+import { boardSourceColors } from "./taskBoardVisual";
 import type { BoardTask } from "./taskBoardData";
 import type { BoardSession } from "./taskBoardNative";
 import { boardSessionRows } from "./taskBoardSessionData";
@@ -5,17 +6,27 @@ import { accountTotals } from "./taskBoardHistoryData";
 import { latestRelease, type SourceCache } from "./taskBoardSnapshotData";
 import { localDay } from "./taskBoardActivityData";
 import { t } from "./taskBoardText";
-import { BoardIdentityMark } from "./BoardIdentityMark";
+import { BoardIdentityMark, boardIdentityColor } from "./BoardIdentityMark";
 import {
   activityNumber,
   activityTaskName,
+  activityTaskKey,
   activityAgentName,
   activitySourceName,
   activityStamp,
   activityMoney,
 } from "./TaskBoardActivityParts";
 import type { UsageActivity } from "@/pages/usageBoard/usageActivityData";
-import { Coins, FlaskConical, Network, PackageCheck, Quote } from "lucide-react";
+import {
+  Coins,
+  FlaskConical,
+  Network,
+  PackageCheck,
+  Quote,
+  CircleCheck,
+  CircleX,
+  TriangleAlert,
+} from "lucide-react";
 
 export function TaskBoardToday({
   tasks,
@@ -63,8 +74,14 @@ export function TaskBoardToday({
         }),
       ),
   );
+  const sourceColors = boardSourceColors(tasks);
   const bySource = new Map<string, number>();
   commits.forEach((c) => bySource.set(c.source, (bySource.get(c.source) ?? 0) + 1));
+  if (!commits.size)
+    closed.forEach((task) => {
+      const source = task["omnigent.ai:source"];
+      bySource.set(source, (bySource.get(source) ?? 0) + 1);
+    });
   const sources = [...bySource].sort((a, b) => b[1] - a[1]);
   const topSources =
     sources.length <= 6
@@ -82,16 +99,30 @@ export function TaskBoardToday({
       2,
     );
   const receipts = tasks
-    .filter(
-      (task) =>
-        task["omnigent.ai:sourceDisplay"]?.historyState?.active !== false &&
-        task["omnigent.ai:sourceDisplay"]?.checks?.some((c) => hosts.includes(c.host)),
-    )
-    .sort(
-      (a, b) =>
-        Date.parse(b["omnigent.ai:sourceDisplay"]?.lastActivity ?? b.updated ?? "") -
-        Date.parse(a["omnigent.ai:sourceDisplay"]?.lastActivity ?? a.updated ?? ""),
-    );
+    .filter((task) => task["omnigent.ai:sourceDisplay"]?.historyState?.active !== false)
+    .map((task) => ({
+      task,
+      checks: hosts.map(
+        (host) =>
+          task["omnigent.ai:sourceDisplay"]?.checks
+            ?.filter((check) => check.host === host)
+            .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0],
+      ),
+    }))
+    .filter((row) => row.checks.some(Boolean))
+    .sort((a, b) => {
+      const priority = (checks: typeof a.checks) =>
+        Math.min(
+          ...checks.map((check) =>
+            check?.verdict === "failed" ? 0 : check?.verdict === "flaky" ? 1 : 2,
+          ),
+        );
+      return (
+        priority(a.checks) - priority(b.checks) ||
+        Date.parse(b.task["omnigent.ai:sourceDisplay"]?.lastActivity ?? b.task.updated ?? "") -
+          Date.parse(a.task["omnigent.ai:sourceDisplay"]?.lastActivity ?? a.task.updated ?? "")
+      );
+    });
   const quotes = tasks
     .flatMap((task) =>
       (task["omnigent.ai:sourceDisplay"]?.quotes ?? [])
@@ -136,142 +167,162 @@ export function TaskBoardToday({
       .slice(0, 6),
     maxCost = Math.max(1, ...rows.map((a) => a.amount ?? 0));
   return (
-    <div className="td">
+    <div
+      className={`td${receipts.length ? " has-receipts" : ""}${quotes.length ? " has-decisions" : ""}`}
+    >
       <section className="td-p td-ship">
         <h3>
           <PackageCheck size={16} />
           {t("g6.landed")}
           <em>{t("g6.reportedGit")}</em>
         </h3>
-        <div className="td-stats">
+        <div className="td-ship-body">
           <div>
-            <b>{activityNumber(closed.length)}</b>
-            <span>{t("today.closed")}</span>
-          </div>
-          <div>
-            <b>{activityNumber(commits.size)}</b>
-            <span title={t("g6.taskCommitsHint")}>{t("g6.taskCommits")}</span>
-          </div>
-          <div>
-            <b>{release?.name ?? "—"}</b>
-            <span>
-              {t("g6.latestRelease")}
-              {release ? `, ${activityStamp(Date.parse(release.publishedAt))}` : ""}
-            </span>
-          </div>
-        </div>
-        <div className="td-roots">
-          {topSources.map(([source, n]) => (
-            <span key={source}>
-              <i style={{ width: `${Math.max(4, (n / Math.max(1, commits.size)) * 100)}%` }} />
-              <b>{sourceName(source)}</b>
-              <em>{activityNumber(n)}</em>
-            </span>
-          ))}
-        </div>
-        <ul className="td-list">
-          {closed.slice(0, 6).map((task) => (
-            <li key={JSON.stringify([task["omnigent.ai:source"], task.uid])}>
-              <span className="td-t">
-                {activityStamp(
-                  Date.parse(
-                    task["omnigent.ai:sourceDisplay"]?.historyState?.end ?? task.progressUpdated!,
-                  ),
-                  true,
-                )}
-              </span>
-              <button type="button" className="td-x" onClick={() => onSelect(task)}>
-                {task.title || activityTaskName(task)}
-              </button>
-            </li>
-          ))}
-        </ul>
-      </section>
-      <section className="td-p td-rcp">
-        <h3>
-          <FlaskConical size={16} />
-          {t("g6.testReceipts")}
-          <em>{t("g6.reportedChecks")}</em>
-        </h3>
-        <table>
-          <thead>
-            <tr>
-              <th>{t("g6.task")}</th>
-              {hosts.map((host) => (
-                <th key={host}>{host}</th>
+            <div className="td-stats">
+              <div>
+                <b>{activityNumber(closed.length)}</b>
+                <span>{t("today.closed")}</span>
+              </div>
+              <div className="td-secondary">
+                <b>{activityNumber(commits.size)}</b>
+                <span title={t("g6.taskCommitsHint")}>{t("g6.taskCommits")}</span>
+              </div>
+              <div className="td-secondary">
+                <b>{release?.name ?? "—"}</b>
+                <span>
+                  {t("g6.latestRelease")}
+                  {release ? `, ${activityStamp(Date.parse(release.publishedAt))}` : ""}
+                </span>
+              </div>
+            </div>
+            <div className="td-roots">
+              {topSources.map(([source, n]) => (
+                <span key={source}>
+                  <i
+                    style={{
+                      background: sourceColors.get(source),
+                      opacity: 0.22,
+                      width: `${Math.max(4, (n / Math.max(1, commits.size || closed.length)) * 100)}%`,
+                    }}
+                  />
+                  <b>{sourceName(source)}</b>
+                  <em>{activityNumber(n)}</em>
+                </span>
               ))}
-              <th>{t("g6.lastCheck")}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {receipts.slice(0, 11).map((task) => (
-              <tr key={JSON.stringify([task["omnigent.ai:source"], task.uid])}>
-                <th>
-                  <button type="button" onClick={() => onSelect(task)}>
-                    <b>{activityTaskName(task)}</b>
-                  </button>
-                </th>
-                {hosts.map((host) => {
-                  const check = task["omnigent.ai:sourceDisplay"]?.checks
-                    ?.filter((c) => c.host === host)
-                    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0];
-                  return (
-                    <td key={host} className={`v-${check?.verdict ?? "none"}`}>
-                      <i />
-                      {check ? t("sessions.check." + check.verdict) : t("g6.noReceipt")}
-                      {check && <small>{activityNumber(check.count)}</small>}
-                    </td>
-                  );
-                })}
-                <td className="td-t">
+            </div>
+          </div>
+          <ul className="td-list">
+            {closed.slice(0, 6).map((task) => (
+              <li key={JSON.stringify([task["omnigent.ai:source"], task.uid])}>
+                <span className="td-t">
                   {activityStamp(
-                    Math.max(
-                      ...task["omnigent.ai:sourceDisplay"]!.checks!.map((c) => Date.parse(c.at)),
+                    Date.parse(
+                      task["omnigent.ai:sourceDisplay"]?.historyState?.end ?? task.progressUpdated!,
                     ),
+                    true,
                   )}
-                </td>
-              </tr>
+                </span>
+                <button type="button" className="td-x" onClick={() => onSelect(task)}>
+                  <span className="td-task-title">{task.title || activityTaskName(task)}</span>
+                  {activityTaskKey(task) && <code>{activityTaskKey(task)}</code>}
+                </button>
+              </li>
             ))}
-          </tbody>
-        </table>
+          </ul>
+        </div>
       </section>
-      <section className="td-p td-dec">
-        <h3>
-          <Quote size={16} />
-          {t("g6.decisions")}
-          <em>{t("g6.reportedQuotes")}</em>
-        </h3>
-        {quotes.slice(0, 5).map(({ task, q }) => (
-          <blockquote key={JSON.stringify([task["omnigent.ai:source"], task.uid, q.id])}>
-            <button
-              type="button"
-              onClick={() => {
-                const target = tasks.find(
-                  (candidate) =>
-                    candidate.uid === q.task.uid &&
-                    candidate["omnigent.ai:source"] === q.task.source,
-                );
-                if (target) onSelect(target);
-              }}
-            >
-              {"「"}
-              {q.text.slice(0, 80)}
-              {q.text.length > 80 ? "…" : ""}
-              {"」"}
-              <cite>
-                {activityTaskName(task)}
-                {q.date ? " · " + q.date : ""}
-              </cite>
-            </button>
-          </blockquote>
-        ))}
-      </section>
+      {receipts.length > 0 && (
+        <section className="td-p td-rcp">
+          <h3>
+            <FlaskConical size={16} />
+            {t("g6.testReceipts")}
+            <em>{t("g6.reportedChecks")}</em>
+          </h3>
+          <table>
+            <thead>
+              <tr>
+                <th>{t("g6.task")}</th>
+                {hosts.map((host) => (
+                  <th key={host}>{host}</th>
+                ))}
+                <th>{t("g6.lastCheck")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {receipts.slice(0, 11).map(({ task, checks }) => (
+                <tr key={JSON.stringify([task["omnigent.ai:source"], task.uid])}>
+                  <th>
+                    <button type="button" onClick={() => onSelect(task)}>
+                      <b>{activityTaskName(task)}</b>
+                    </button>
+                  </th>
+                  {hosts.map((host, index) => {
+                    const check = checks[index];
+                    return (
+                      <td key={host} className={`v-${check?.verdict ?? "none"}`}>
+                        {check?.verdict === "passed" ? (
+                          <CircleCheck size={13} />
+                        ) : check?.verdict === "failed" ? (
+                          <CircleX size={13} />
+                        ) : check ? (
+                          <TriangleAlert size={13} />
+                        ) : null}
+                        {check ? t("sessions.check." + check.verdict) : t("g6.noReceipt")}
+                        {check && <small>{activityNumber(check.count)}</small>}
+                      </td>
+                    );
+                  })}
+                  <td className="td-t">
+                    {activityStamp(
+                      Math.max(...checks.flatMap((check) => (check ? [Date.parse(check.at)] : []))),
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
+      {quotes.length > 0 && (
+        <section className="td-p td-dec">
+          <h3>
+            <Quote size={16} />
+            {t("g6.decisions")}
+            <em>{t("g6.reportedQuotes")}</em>
+          </h3>
+          {quotes.slice(0, 5).map(({ task, q }) => (
+            <blockquote key={JSON.stringify([task["omnigent.ai:source"], task.uid, q.id])}>
+              <button
+                type="button"
+                onClick={() => {
+                  const target = tasks.find(
+                    (candidate) =>
+                      candidate.uid === q.task.uid &&
+                      candidate["omnigent.ai:source"] === q.task.source,
+                  );
+                  if (target) onSelect(target);
+                }}
+              >
+                {"「"}
+                {q.text.slice(0, 80)}
+                {q.text.length > 80 ? "…" : ""}
+                {"」"}
+                <cite>
+                  {activityTaskName(task)}
+                  {q.date ? " · " + q.date : ""}
+                </cite>
+              </button>
+            </blockquote>
+          ))}
+        </section>
+      )}
       <section className="td-p td-who">
         <h3>
           <Network size={16} />
           {t("g6.whoWorked")}
           <em>{t("g6.reportedSessions")}</em>
         </h3>
+        {!agents.size && <p className="td-empty">{t("visual.noSessions")}</p>}
         {[...agents]
           .sort((a, b) => b[1].n - a[1].n)
           .slice(0, 6)
@@ -284,13 +335,14 @@ export function TaskBoardToday({
                 size={26}
               />
               <b>{activityAgentName(agent, agentLabels.get(agent))}</b>
-              <i className="td-bar">
+              <span className="td-agent-count">{activityNumber(a.n)}</span>
+              <i className={`td-bar ag-${agent}`}>
                 <u style={{ width: `${(a.n / maxN) * 100}%` }} />
               </i>
               <em>
                 {t("g6.workerCount", { count: activityNumber(a.n), live: activityNumber(a.live) })}
                 {" · "}
-                {a.cost ? activityMoney(a.cost) : t("g6.unbilled")}
+                {a.cost !== null ? activityMoney(a.cost) : t("g6.unbilled")}
               </em>
             </div>
           ))}
@@ -299,8 +351,9 @@ export function TaskBoardToday({
         <h3>
           <Coins size={18} />
           {t("g6.accountCosts")}
-          <em>{t("g6.estimatedUsage")}</em>
+          <em title={t("g6.costFootnote")}>{t("g6.estimatedUsage")}</em>
         </h3>
+        {!rows.length && <p className="td-empty">{t("visual.noUsage")}</p>}
         {rows.map((a) => (
           <div className="td-h" key={a.id}>
             <BoardIdentityMark id={a.id} label={a.label} size={20} />
@@ -309,15 +362,27 @@ export function TaskBoardToday({
               {a.id.startsWith("native:") ? ` · ${t("g6.nativeUsage")}` : ""}
             </b>
             <i className="td-bar">
-              <u style={{ width: `${((a.amount ?? 0) / maxCost) * 100}%` }} />
+              <u
+                style={{
+                  background: boardIdentityColor(a.id),
+                  width: `${((a.amount ?? 0) / maxCost) * 100}%`,
+                }}
+              />
             </i>
             <span title={t("sessions.cost.estimate.hint")}>
               {a.amount === null ? "—" : activityMoney(a.amount)}
             </span>
           </div>
         ))}
-        <p className="muted td-foot">{t("g6.costFootnote")}</p>
       </section>
+      {(!receipts.length || !quotes.length) && (
+        <p className="td-missing">
+          {t("visual.notReported")}{" "}
+          {[!receipts.length ? t("g6.testReceipts") : "", !quotes.length ? t("g6.decisions") : ""]
+            .filter(Boolean)
+            .join(" · ")}
+        </p>
+      )}
     </div>
   );
 }
