@@ -10,6 +10,7 @@ import {
   formatTimeLeft,
   formatWindowLength,
   formatUsageValue,
+  formatPercentReading,
   paceChip,
   windowName,
 } from "./usageBoardFormat";
@@ -31,7 +32,7 @@ export function windowTip(
   if (window.percent_used !== null) {
     rows.push({
       label: "Used",
-      value: `${window.percent_used.toFixed(2).replace(/\.00$/, "")}%`,
+      value: `${formatPercentReading(window.percent_used)}%`,
       bar: window.percent_used,
       tone: options.stale ? "mute" : undefined,
     });

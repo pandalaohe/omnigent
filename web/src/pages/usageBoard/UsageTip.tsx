@@ -10,6 +10,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { cn } from "@/lib/utils";
 
 import { TONE_TEXT, type UsageTone } from "./usageBoardFormat";
+import { UsageName } from "./UsageName";
 
 const HOVER_CLOSE_DELAY_MS = 150;
 
@@ -38,37 +39,49 @@ const chipTone: Record<UsageTone, string> = {
   mute: "text-muted-foreground",
 };
 
-/** The card body. Fixed width so nothing wraps out of the frame. */
+/** Full titles and values remain readable on narrow touch surfaces. */
 export function UsageTipCard({ model }: { model: UsageTipModel }) {
   return (
-    <div className="w-[216px] text-xs leading-snug" data-testid="usage-tip-card">
+    <div
+      className="w-max min-w-[216px] max-w-[min(320px,calc(100vw-48px))] text-xs leading-snug"
+      data-testid="usage-tip-card"
+    >
       {model.note ? (
-        <div className="mb-0.5 text-[11px] text-muted-foreground">{model.note}</div>
+        <span className="mb-0.5 block text-sm text-muted-foreground wrap-anywhere">
+          {model.note}
+        </span>
       ) : null}
       <div className="mb-1 flex items-center justify-between gap-2">
-        <span className="min-w-0 truncate font-semibold text-foreground">{model.title}</span>
+        <span
+          title={model.title}
+          className="min-w-0 flex-1 font-semibold text-foreground wrap-anywhere"
+        >
+          {model.title}
+        </span>
         {model.chip ? (
-          <span
+          <UsageName
             className={cn(
-              "inline-flex shrink-0 items-center rounded-full bg-current/12 px-1.5 py-px text-[10px] font-medium",
+              "max-w-[50%] shrink-0 rounded-full bg-current/12 px-1.5 py-px text-[10px] font-medium",
               chipTone[model.chip.tone],
             )}
           >
             {model.chip.label}
-          </span>
+          </UsageName>
         ) : null}
       </div>
       {model.rows.map((row, index) => (
         <div key={`${row.label}-${row.value}`}>
           {model.dividerBefore === index ? <div className="my-1 h-px bg-border" /> : null}
           {row.bar === undefined ? (
-            <div className="flex items-center justify-between gap-3 text-muted-foreground">
-              <span className="min-w-0 truncate">{row.label}</span>
-              <span className="shrink-0 font-semibold text-foreground">{row.value}</span>
+            <div className="flex flex-wrap items-baseline justify-between gap-x-3 text-muted-foreground">
+              <span className="min-w-0">{row.label}</span>
+              <span className="ml-auto text-right font-semibold text-foreground tabular-nums wrap-anywhere">
+                {row.value}
+              </span>
             </div>
           ) : (
-            <div className="grid grid-cols-[42px_minmax(0,1fr)_44px] items-center gap-2">
-              <span className="truncate text-muted-foreground">{row.label}</span>
+            <div className="grid grid-cols-[42px_minmax(0,1fr)_max-content] items-center gap-2">
+              <UsageName className="text-muted-foreground">{row.label}</UsageName>
               <span className="h-1 overflow-hidden rounded-full bg-foreground/10">
                 <span
                   className="block h-full rounded-full"
@@ -105,13 +118,22 @@ interface UsageTipProps {
    * because there is nowhere else for that tap to go.
    */
   tapOpens?: boolean;
+  /** Name a semantic button when the disclosure has no child control. */
+  triggerLabel?: string;
 }
 
 /**
  * Hover/focus wrapper for a data card. The trigger never swallows a click, so
  * on a tile the tap that opens the tip on desktop still navigates on a phone.
  */
-export function UsageTip({ model, children, className, tapOpens = false }: UsageTipProps) {
+export function UsageTip({
+  model,
+  children,
+  className,
+  tapOpens = false,
+  triggerLabel,
+}: UsageTipProps) {
+  const Trigger = triggerLabel ? "button" : "span";
   const [open, setOpen] = useState(false);
   const closeTimer = useRef<number | null>(null);
 
@@ -148,7 +170,9 @@ export function UsageTip({ model, children, className, tapOpens = false }: Usage
       }}
     >
       <PopoverTrigger asChild>
-        <span
+        <Trigger
+          type={triggerLabel ? "button" : undefined}
+          aria-label={triggerLabel}
           className={className}
           tabIndex={tapOpens ? undefined : 0}
           onPointerEnter={(event) => {
@@ -167,7 +191,7 @@ export function UsageTip({ model, children, className, tapOpens = false }: Usage
           onBlur={scheduleClose}
         >
           {children}
-        </span>
+        </Trigger>
       </PopoverTrigger>
       <PopoverContent
         side="top"

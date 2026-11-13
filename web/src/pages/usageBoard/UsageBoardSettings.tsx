@@ -20,11 +20,14 @@ import { useSessionCollabPreferences } from "@/hooks/useSessionCollabPreferences
 import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 
+import { UsagePricingPanel } from "./UsagePricingPanel";
+import { UsageModelPoolsLink } from "./UsageModelPoolsLink";
 import { ConnectDialog } from "./UsageSourceConnect";
 import { t } from "./usageText";
 import { UsageRing } from "./UsageRing";
 import { UsagePriceSourceSettings } from "./UsagePriceSourceSettings";
 import { useUsageOverview, type UsageWindowView } from "./usageBoardData";
+import { UsageName } from "./UsageName";
 
 /** A synthetic reading, so the colour line shows what each tier looks like. */
 function sampleWindow(percentUsed: number): UsageWindowView {
@@ -129,6 +132,8 @@ export function UsageBoardSettings() {
               ›
             </span>
           </Link>
+          <UsageModelPoolsLink settings />
+          <UsagePricingPanel accounts={accounts} />
           <UsagePriceSourceSettings />
           {board.enabled ? (
             <>
@@ -176,7 +181,7 @@ export function UsageBoardSettings() {
                     reports through the usage API.
                   </p>
                 ) : (
-                  <div className="grid gap-x-6 sm:grid-cols-2">
+                  <div className="grid grid-cols-1 gap-x-6 sm:grid-cols-2">
                     {accounts.map((account) => {
                       const on = !board.hidden.includes(account.id);
                       return (
@@ -196,7 +201,7 @@ export function UsageBoardSettings() {
                                 aria-hidden="true"
                               />
                             )}
-                            <span className="truncate">{account.display_name}</span>
+                            <UsageName>{account.display_name}</UsageName>
                           </span>
                           <Switch
                             checked={on}
@@ -319,7 +324,7 @@ function ColourLine({
           <span>% left</span>
         </span>
       </div>
-      <div className="flex flex-wrap items-center gap-2.5" aria-hidden="true">
+      <div className="usage-palette flex flex-wrap items-center gap-2.5" aria-hidden="true">
         {samples.map((used) => (
           <UsageRing
             key={used}

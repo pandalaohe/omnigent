@@ -1,28 +1,49 @@
-// The board's one reading mark: a ring whose inner arc is used and whose thin
-// outer arc is time elapsed, in the window's own colour. A window that only
-// carries an amount gets a dashed ring and the figure; a window with no
-// reading at all gets the dashed ring and nothing — never a `0`.
+// The board's one reading mark: a ring whose thick arc is used, in the state's
+// colour, and whose thin outer arc is time elapsed, in the time colour. Inside,
+// the window name, then the whole percent large and its decimals small. A glyph
+// beside a row keeps only the used arc. A window that only carries an amount
+// gets a plain figure; a window with no reading gets a dashed ring and a dash.
 
 import { cn } from "@/lib/utils";
+import type { CSSProperties } from "react";
+import { UsageName } from "./UsageName";
 
 import type { UsageWindowView } from "./usageBoardData";
 import {
-  formatUsageValue,
+  figureEms,
+  formatPercentReading,
+  formatRingPercent,
   isPercentWindow,
+  ringFigureSize,
+  splitPercentReading,
   stateTone,
   TONE_STROKE,
   windowName,
   type UsageTone,
 } from "./usageBoardFormat";
+import { UsageFigure } from "./UsageFigure";
 
-const RADIUS = 40;
-const STROKE = 8.5;
-const OUTER_RADIUS = 47.6;
-const OUTER_STROKE = 3;
-const CIRCUMFERENCE = Math.PI * 2;
+// Geometry in viewBox units (0–100): time arc outside, used arc inside.
+// The time dot (radius 3.4) still paints inside the ring's box.
+const TIME_RADIUS = 46.5;
+const TIME_STROKE = 3;
+const TIME_DOT = 3.4;
+const USAGE_RADIUS = 39;
+const USAGE_STROKE = 8.5;
+// A glyph (row-sized ring) draws one thick used arc and no time arc.
+const GLYPH_RADIUS = 36;
+const GLYPH_STROKE = 24;
+const GLYPH_MAX = 32;
+// Clear radius for text: the used arc's inner edge less a 3-unit margin.
+const CLEAR_RADIUS = USAGE_RADIUS - USAGE_STROKE / 2 - 3;
+// Inner stack, in percent of the ring: name, whole percent, decimals.
+const NAME_SIZE = 11.5;
+const WHOLE_SIZE = 28.5;
+const DECIMAL_SIZE = 12.2;
+const TAU = Math.PI * 2;
 
-function arc(radius: number, fraction: number, color: string, stroke: number) {
-  const length = CIRCUMFERENCE * radius;
+function arc(radius: number, fraction: number, color: string, stroke: number, round: boolean) {
+  const length = TAU * radius;
   const drawn = Math.max(0, Math.min(1, fraction)) * length;
   return (
     <circle
@@ -32,7 +53,7 @@ function arc(radius: number, fraction: number, color: string, stroke: number) {
       fill="none"
       stroke={color}
       strokeWidth={stroke}
-      strokeLinecap="butt"
+      strokeLinecap={round && fraction < 0.995 ? "round" : "butt"}
       strokeDasharray={`${drawn.toFixed(2)} ${(length + 2).toFixed(2)}`}
       transform="rotate(-90 50 50)"
     />
@@ -51,9 +72,9 @@ interface UsageRingProps {
   window: UsageWindowView | null;
   /** The whole account's reading is old: no colour, no pace claim. */
   stale?: boolean;
-  /** Diameter in px. */
+  /** Maximum diameter in px; the containing tile may make it smaller. */
   size?: number;
-  /** Write the window name above the figure, as the board does. */
+  /** Write the window name inside: above the figure, or alone in a small ring. */
   showName?: boolean;
   className?: string;
 }
@@ -65,99 +86,162 @@ export function toneForRing(window: UsageWindowView, stale: boolean): UsageTone 
 export function UsageRing({
   window,
   stale = false,
-  size = 88,
+  size = 96,
   showName = true,
   className,
 }: UsageRingProps) {
   const tone = window ? toneForRing(window, stale) : "mute";
   const color = TONE_STROKE[tone];
-  const dashed = !window || !isPercentWindow(window);
   const percent = window && isPercentWindow(window) ? (window.percent_used ?? 0) : null;
+  // An amount-only window is a figure, not a ring, once there is room to read it.
+  if (window && percent === null && size >= 64) {
+    return (
+      <UsageFigure
+        className={className}
+        label={showName ? windowName(window) : undefined}
+        value={window.used_value ?? null}
+        unit={window.unit}
+        size={size}
+      />
+    );
+  }
+  const glyph = size < GLYPH_MAX;
+  const small = size < 64;
   const elapsed = window ? elapsedFraction(window) : 0;
-  const [whole, decimals] = (percent ?? 0).toFixed(2).split(".");
-  const value =
-    window && !isPercentWindow(window)
-      ? window.used_value !== null && window.used_value !== undefined
-        ? formatUsageValue(window.used_value, window.unit)
-        : ""
-      : "";
+  const reading =
+    percent === null || glyph
+      ? ""
+      : small
+        ? formatPercentReading(percent)
+        : formatRingPercent(percent);
+  // A small ring holds either its name (the compact list) or a bare figure.
+  const named = showName && Boolean(window) && !glyph;
+  const figure = reading && !(small && named);
+  const [whole, decimals] = splitPercentReading(reading);
+  // The whole percent shrinks only when it would leave the clear circle.
+  const wholeSize = small
+    ? ringFigureSize(figureEms(reading), 0, CLEAR_RADIUS, 30, 1000 / size)
+    : Math.min(WHOLE_SIZE, (2 * Math.sqrt(CLEAR_RADIUS ** 2 - 9 ** 2)) / figureEms(whole));
+  const nameTop = small ? 8 : 26;
+  const nameWidth = 2 * Math.sqrt(Math.max(0, CLEAR_RADIUS ** 2 - nameTop ** 2));
+  // The name shrinks to its clear width, down to 10 px; a small ring's name may grow to 24 %.
+  const nameSize = window
+    ? Math.max(
+        1000 / size,
+        Math.min(small ? 24 : NAME_SIZE, nameWidth / figureEms(windowName(window))),
+      )
+    : NAME_SIZE;
 
   return (
     <span
-      className={cn("relative inline-flex shrink-0 items-center justify-center", className)}
-      style={{ width: size, height: size }}
-      data-testid="usage-ring"
-      data-tone={tone}
-      data-state={window?.state ?? "none"}
+      className={cn("usage-reading-figure", className)}
+      style={{ "--usage-ring-size": `${size}px` } as CSSProperties}
     >
-      <svg
-        viewBox="0 0 100 100"
-        aria-hidden="true"
-        className="absolute inset-0 h-full w-full"
-        style={{ opacity: stale ? 0.45 : 1 }}
+      <span
+        className="usage-ring"
+        data-testid="usage-ring"
+        aria-label={reading ? `${reading}% used` : undefined}
+        data-tone={tone}
+        data-state={window?.state ?? "none"}
+        data-stale={stale || undefined}
+        data-glyph={glyph || undefined}
       >
-        {dashed ? (
-          <circle
-            cx={50}
-            cy={50}
-            r={44}
-            fill="none"
-            stroke={window ? color : "var(--foreground)"}
-            strokeWidth={3}
-            strokeDasharray="6 6"
-            opacity={window ? 0.8 : 0.42}
-          />
-        ) : (
-          <>
+        <svg viewBox="0 0 100 100" aria-hidden="true" className="usage-ring-art">
+          {percent === null ? (
             <circle
               cx={50}
               cy={50}
-              r={RADIUS}
+              r={42}
               fill="none"
-              stroke="var(--border)"
-              strokeWidth={STROKE}
+              className="usage-ring-dash"
+              strokeWidth={3}
+              strokeDasharray="3 5"
+              strokeLinecap="round"
             />
-            <circle
-              cx={50}
-              cy={50}
-              r={OUTER_RADIUS}
-              fill="none"
-              stroke="var(--foreground)"
-              strokeOpacity={0.08}
-              strokeWidth={OUTER_STROKE}
-            />
-            {percent !== null ? arc(RADIUS, percent / 100, color, STROKE) : null}
-            {window ? arc(OUTER_RADIUS, elapsed, "var(--info)", OUTER_STROKE) : null}
-            {elapsed > 0 ? (
+          ) : glyph ? (
+            <>
               <circle
-                cx={50 + OUTER_RADIUS * Math.sin(2 * Math.PI * elapsed)}
-                cy={50 - OUTER_RADIUS * Math.cos(2 * Math.PI * elapsed)}
-                r={3.4}
-                fill="var(--info)"
+                cx={50}
+                cy={50}
+                r={GLYPH_RADIUS}
+                fill="none"
+                className="usage-ring-track"
+                strokeWidth={GLYPH_STROKE}
               />
+              {arc(GLYPH_RADIUS, percent / 100, color, GLYPH_STROKE, false)}
+            </>
+          ) : (
+            <>
+              <circle
+                cx={50}
+                cy={50}
+                r={TIME_RADIUS}
+                fill="none"
+                className="usage-ring-track usage-ring-time-track"
+                strokeWidth={TIME_STROKE}
+              />
+              <circle
+                cx={50}
+                cy={50}
+                r={USAGE_RADIUS}
+                fill="none"
+                className="usage-ring-track"
+                strokeWidth={USAGE_STROKE}
+              />
+              {arc(USAGE_RADIUS, percent / 100, color, USAGE_STROKE, false)}
+              {arc(TIME_RADIUS, elapsed, "var(--usage-time)", TIME_STROKE, true)}
+              {elapsed > 0 ? (
+                <circle
+                  cx={50 + TIME_RADIUS * Math.sin(TAU * elapsed)}
+                  cy={50 - TIME_RADIUS * Math.cos(TAU * elapsed)}
+                  r={TIME_DOT}
+                  fill="var(--usage-time)"
+                />
+              ) : null}
+            </>
+          )}
+        </svg>
+        {!glyph ? (
+          <span className="usage-ring-content" data-small={small || undefined}>
+            {named && window ? (
+              <UsageName
+                data-usage-label
+                className="usage-ring-name"
+                style={{ fontSize: `${nameSize}cqi`, maxWidth: `${nameWidth.toFixed(1)}cqi` }}
+              >
+                {windowName(window)}
+              </UsageName>
             ) : null}
-          </>
-        )}
-      </svg>
-      <span className="relative flex flex-col items-center leading-none">
-        {showName && window ? (
-          <span className="mb-0.5 w-full truncate px-1 text-center text-[10.5px] font-bold text-muted-foreground">
-            {windowName(window)}
-          </span>
-        ) : null}
-        {percent !== null && size > 20 ? (
-          <span className="flex flex-col items-center font-bold leading-none">
-            <span style={{ fontSize: size * 0.285 }}>{whole}</span>
-            <span
-              style={{ fontSize: Math.max(10, size * 0.122) }}
-              className="mt-0.5 text-muted-foreground"
-            >
-              .{decimals}%
-            </span>
-          </span>
-        ) : value ? (
-          <span className="max-w-[80%] text-center text-[13px] font-semibold text-foreground">
-            {value}
+            {figure ? (
+              small ? (
+                <span
+                  className="usage-ring-percent"
+                  style={{ fontSize: `${wholeSize.toFixed(1)}cqi` }}
+                  data-usage-percent=""
+                >
+                  {reading}
+                </span>
+              ) : (
+                <span className="usage-ring-percent" data-usage-percent="stack">
+                  <span
+                    className="usage-ring-whole"
+                    style={{ fontSize: `${wholeSize.toFixed(1)}cqi` }}
+                  >
+                    {whole}
+                  </span>
+                  <span
+                    className="usage-ring-decimals"
+                    style={{ fontSize: `max(10px, ${DECIMAL_SIZE}cqi)` }}
+                  >
+                    {decimals}%
+                  </span>
+                </span>
+              )
+            ) : !window ? (
+              <span className="usage-ring-none" aria-label="No reading">
+                —
+              </span>
+            ) : null}
           </span>
         ) : null}
       </span>

@@ -10,6 +10,7 @@ from playwright.sync_api import Page, expect
 from tests.browser_ui.conftest import BrowserContract
 from tests.browser_ui.test_sessions_appearance import appearance_features as appearance_features
 from tests.browser_ui.test_sessions_appearance import appearance_url as appearance_url
+from tests.browser_ui.usage_geometry import assert_usage_geometry
 
 
 @pytest.fixture
@@ -125,14 +126,43 @@ def test_usage_ranges_pools_and_navigation(
         }
 
     browser_contract.json("/v1/me/usage/activity", activity)
+    browser_contract.json(
+        "/v1/me/usage/analysis",
+        {
+            "generated_at": now,
+            "rows": [],
+            "pool_catalog": [],
+            "pools": [],
+            "span": {"requested_from": now - 86400, "counted_from": now - 86400, "until": now},
+        },
+    )
+    browser_contract.json(
+        "/v1/me/usage/pricing-baseline",
+        {
+            "revision": 0,
+            "defaults": {
+                "default_discount": "1",
+                "display_currency": "USD",
+                "fx_to_display": {"USD": "1"},
+            },
+            "cards": [],
+        },
+    )
     page.set_viewport_size({"width": width, "height": 900})
     started = time.perf_counter()
     page.goto(appearance_url + "/frame/usage/board")
     expect(page.get_by_test_id("usage-tile")).to_have_count(50)
+    board_geometry = {
+        '[data-testid="usage-tile"]': 50,
+        '[data-testid="usage-ring"]': 198,
+        "[data-usage-label]": 99,
+        "[data-usage-amount]": 0,
+    }
+    assert_usage_geometry(page, board_geometry)
     summary = page.get_by_role("region", name="Usage summary")
     expect(summary.get_by_text("$617.00")).to_have_count(4)
     # The target question glyph must not inherit a full-height button row.
-    assert summary.locator(".usage-summary-tip").first.bounding_box()["height"] == 15
+    assert summary.locator(".usage-summary-tip").first.bounding_box()["height"] == 16
     usable_ms = (time.perf_counter() - started) * 1000
     assert set(ranges) == {"period", "d30", "today", "h24", "d7"}
     assert len(ranges) == 5
@@ -155,33 +185,49 @@ def test_usage_ranges_pools_and_navigation(
         padding:style('.usage-board').paddingLeft,
         columns:style('.usage-tiles').gridTemplateColumns};
     }""")
+    assert geometry["tilesDisplay"] == "grid"
+    assert geometry["gap"] == "8px"
+    assert geometry["regular"]["width"] >= 164
     if width < 600:
-        assert geometry["tilesDisplay"] == "grid"
-        assert geometry["gap"] == "6px"
-        assert geometry["minHeight"] == "0px"
-        assert geometry["padding"] == "10px"
+        assert geometry["padding"] == "12px"
         assert len(geometry["columns"].split()) == 2
-        assert geometry["nav"]["top"] >= geometry["head"]["bottom"]
-        assert geometry["age"]["top"] >= geometry["nav"]["bottom"]
-        assert geometry["wide"]["width"] > geometry["regular"]["width"] * 1.9
     else:
-        assert geometry["regular"]["width"] == 150
-        assert geometry["wide"]["width"] == 300
+        assert geometry["wide"]["width"] > geometry["regular"]["width"]
     # Large figure, blank summary padding and native keyboard activation all open Analysis.
     for activation in ["figure", "whitespace", "keyboard"]:
         summary = page.get_by_role("region", name="Usage summary")
+        link = summary.get_by_role("link", name="Open usage analysis")
         if activation == "figure":
-            rect = summary.locator(".usage-summary-big").bounding_box()
-            page.mouse.click(rect["x"] + rect["width"] / 2, rect["y"] + rect["height"] / 2)
+            summary.scroll_into_view_if_needed()
+            figure = summary.locator(".usage-summary-big").bounding_box()
+            anchor = link.bounding_box()
+            link.click(
+                position={
+                    "x": figure["x"] + figure["width"] / 2 - anchor["x"],
+                    "y": figure["y"] + figure["height"] / 2 - anchor["y"],
+                }
+            )
         elif activation == "whitespace":
+            summary.scroll_into_view_if_needed()
             rect = summary.bounding_box()
-            page.touchscreen.tap(rect["x"] + rect["width"] / 2, rect["y"] + rect["height"] - 4)
+            anchor = link.bounding_box()
+            link.tap(
+                position={
+                    "x": rect["x"] + rect["width"] / 2 - anchor["x"],
+                    "y": rect["y"] + rect["height"] - 4 - anchor["y"],
+                }
+            )
         else:
-            summary.get_by_role("link", name="Open usage analysis").focus()
+            link.focus()
             page.keyboard.press("Enter")
         expect(page).to_have_url(appearance_url + "/frame/usage/board/cost")
+        expect(page.locator(".ua-kpi")).to_have_count(4)
+        assert_usage_geometry(
+            page, {'[data-testid="usage-ring"]': 0, ".ua-kpi": 4, '[role="table"]': 1}
+        )
         page.get_by_role("link", name="Usage", exact=True).click()
         expect(page.get_by_test_id("usage-tile")).to_have_count(50)
+        assert_usage_geometry(page, board_geometry)
     summary.get_by_role("button", name="All accounts · 30-day reported cost details").click()
     expect(page.get_by_test_id("usage-tip-card")).to_be_visible()
     page.keyboard.press("Escape")

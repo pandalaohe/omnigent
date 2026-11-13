@@ -307,8 +307,11 @@ async def test_analysis_http_auth_and_real_app_pool_intake(request):
         response = await client.get(path, headers=headers)
         assert response.status_code == 200
         assert response.json()["pool_catalog"][0]["pool_id"] == "source:pool-a"
-        other = await client.get(path, headers={"X-Forwarded-Email": "other@example.test"})
+        other = await client.get(
+            path + "?include_previous=true", headers={"X-Forwarded-Email": "other@example.test"}
+        )
         assert other.status_code == 200 and other.json()["pool_catalog"] == []
+        assert other.json()["previous"]["pool_catalog"] == []
 
 
 def test_query_bound_filters_cohort_before_limit_and_reports_partial(pools, monkeypatch):
@@ -354,5 +357,13 @@ async def test_analysis_route_range_validation_and_usage_scope(pools):
         response = await client.get("/v1/me/usage/analysis")
         assert response.status_code == 200
         assert response.headers["cache-control"] == "private, no-store"
+        assert response.json()["previous"] is None
+        comparison = await client.get("/v1/me/usage/analysis?include_previous=true")
+        assert comparison.status_code == 200
+        previous = comparison.json()["previous"]
+        assert previous["span"]["until"] <= comparison.json()["span"]["counted_from"]
+        assert previous["previous"] is None
+        no_previous = await client.get("/v1/me/usage/analysis?range=d90&include_previous=true")
+        assert no_previous.json()["previous"] is None
     assert scope_allows("usage", "GET", "/v1/me/usage/analysis")
     assert not scope_allows("usage:read", "GET", "/v1/me/usage/analysis")

@@ -585,12 +585,53 @@ def create_agent_quota_router(
         pool: str | None = None,
         model: str | None = None,
         card: str | None = None,
+        dimension: Literal["account", "pool", "model", "card"] | None = None,
+        selection: Annotated[str | None, Query(max_length=131072)] = None,
+        exclude: Annotated[list[str] | None, Query(max_length=256)] = None,
+        include_previous: bool = False,
     ) -> Response:
         require_usage()
         from fastapi.responses import JSONResponse
 
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         try:
+            keys = json.loads(selection) if selection is not None else []
+            if dimension is not None and any(
+                item is not None for item in (account, pool, model, card)
+            ):
+                raise ValueError("Use one selection format")
+            if (
+                not isinstance(keys, list)
+                or len(keys) > 256
+                or not all(isinstance(key, str) and len(key) <= 512 for key in keys)
+            ):
+                raise ValueError("Invalid selection")
+            baseline = (
+                await asyncio.to_thread(service.pricing_store.read, owner)
+                if service.pricing_store is not None
+                else None
+            )
+            cohort = None
+            if dimension == "account":
+                cohort = set(keys)
+            elif dimension == "pool":
+                pairs = [json.loads(key) for key in keys]
+                if not all(
+                    isinstance(pair, list)
+                    and len(pair) == 2
+                    and all(isinstance(part, str) for part in pair)
+                    for pair in pairs
+                ):
+                    raise ValueError("Invalid pool selection")
+                cohort = {pair[0] for pair in pairs}
+            elif dimension == "card":
+                cohort = (
+                    {purchase.parent for purchase in baseline.cards if purchase.id in keys}
+                    if baseline is not None
+                    else set()
+                )
+            if cohort is not None:
+                cohort -= set(exclude or [])
             view = await asyncio.to_thread(
                 service.analysis,
                 owner,
@@ -599,30 +640,37 @@ def create_agent_quota_router(
                 to_date=to_date,
                 tz=tz,
                 account=account,
+                account_ids=cohort,
             )
-            if service.pricing_store is not None:
+            prior = None
+            if range_key != "d90" and (
+                include_previous or baseline is not None or dimension is not None
+            ):
+                prior = await asyncio.to_thread(
+                    service.analysis,
+                    owner,
+                    range_key=range_key,
+                    from_date=from_date,
+                    to_date=to_date,
+                    tz=tz,
+                    account=account,
+                    account_ids=cohort,
+                    now=view.generated_at,
+                    previous=True,
+                )
+            if include_previous:
+                view.previous = prior
+            if baseline is not None:
                 from fastapi.encoders import jsonable_encoder
 
                 from omnigent.usage.pricing_projection import compare_periods, value_usage
 
                 if evidence_service is not None:
                     await asyncio.to_thread(evidence_service.attach_prices, owner, view)
-                baseline = await asyncio.to_thread(service.pricing_store.read, owner)
                 projection = await asyncio.to_thread(
                     value_usage, view, baseline, pool=pool, model=model, card_id=card
                 )
-                if range_key != "d90":
-                    prior = await asyncio.to_thread(
-                        service.analysis,
-                        owner,
-                        range_key=range_key,
-                        from_date=from_date,
-                        to_date=to_date,
-                        tz=tz,
-                        account=account,
-                        now=view.generated_at,
-                        previous=True,
-                    )
+                if prior is not None:
                     if evidence_service is not None:
                         await asyncio.to_thread(evidence_service.attach_prices, owner, prior)
                     previous_values = await asyncio.to_thread(
@@ -641,12 +689,40 @@ def create_agent_quota_router(
                     int(view.span.until),
                     as_of=int(view.generated_at),
                 )
+                relations = (
+                    await asyncio.to_thread(service.pool_store.read_map, owner)
+                    if service.pool_store is not None
+                    else {}
+                )
+                for closing in view.quota_closings:
+                    relation = relations.get(closing["account_id"])
+                    closing["parent_account_id"] = (
+                        relation.parent_account_id if relation else closing["account_id"]
+                    )
+                    closing["pool_id"] = relation.pool_id if relation else None
                 if account is not None:
                     view.quota_closings = [
                         item for item in view.quota_closings if item["account_id"] == account
                     ]
+            if dimension is not None:
+                from fastapi.encoders import jsonable_encoder
+
+                from omnigent.usage.analysis_presentation import present_analysis
+                from omnigent.usage.pricing import PricingBaseline
+
+                view.presentation = jsonable_encoder(
+                    await asyncio.to_thread(
+                        present_analysis,
+                        view,
+                        prior,
+                        baseline or PricingBaseline(),
+                        dimension=dimension,
+                        keys=keys,
+                        excluded=set(exclude or []),
+                    )
+                )
         except (ValueError, ZoneInfoNotFoundError):
-            raise HTTPException(422, "Invalid usage range or timezone") from None
+            raise HTTPException(422, "Invalid usage range, timezone or selection") from None
         return JSONResponse(
             view.model_dump(mode="json"), headers={"Cache-Control": "private, no-store"}
         )

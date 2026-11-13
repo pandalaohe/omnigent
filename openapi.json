@@ -19025,6 +19025,28 @@
             "title": "Pools",
             "type": "array"
           },
+          "presentation": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Presentation"
+          },
+          "previous": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UsageAnalysisView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "pricing": {
             "anyOf": [
               {
@@ -29513,6 +29535,75 @@
                 }
               ],
               "title": "Card"
+            }
+          },
+          {
+            "in": "query",
+            "name": "dimension",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "account",
+                    "pool",
+                    "model",
+                    "card"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dimension"
+            }
+          },
+          {
+            "in": "query",
+            "name": "selection",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 131072,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Selection"
+            }
+          },
+          {
+            "in": "query",
+            "name": "exclude",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 256,
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Exclude"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_previous",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Previous",
+              "type": "boolean"
             }
           }
         ],
