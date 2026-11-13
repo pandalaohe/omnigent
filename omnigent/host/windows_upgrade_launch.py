@@ -58,10 +58,11 @@ def launch(
     if not launchers:
         raise RuntimeError("Cannot identify this tool's uv launchers; install unchanged.")
     bin_dir = launchers[0].parent
-    repo, _ = _split_vcs_url(info.vcs_url or "")
+    repo, revision = _split_vcs_url(info.vcs_url or "")
     source = f"git+{repo}@{target}"
+    tracked_source = f"git+{repo}" + (f"@{revision}" if revision else "")
     requested = sorted(set(info.extras) | set(extras))
-    spec = source + "#egg=omnigent" + (f"[{','.join(requested)}]" if requested else "")
+    spec = tracked_source + "#egg=omnigent" + (f"[{','.join(requested)}]" if requested else "")
     snapshot = installed_user_host_service()
     server = snapshot[1] if snapshot else cli._load_global_config().get("server")
     mode = ["--server", str(server)] if server else ["--local"]

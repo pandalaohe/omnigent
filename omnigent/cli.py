@@ -6201,8 +6201,8 @@ def _echo_upgrade_plan(
     )
 
 
-def _legacy_custom_channel(info: _InstalledWheelInfo) -> tuple[str, str] | None:
-    """Recover branch tracking for installs pinned by the retired custom updater."""
+def _custom_channel(info: _InstalledWheelInfo, *, require_receipt: bool) -> tuple[str, str] | None:
+    """Recover branch tracking from legacy state or a matching configured source."""
     from urllib.parse import urlsplit
 
     from omnigent.update_check import _remote_git_head, _split_vcs_url
@@ -6212,19 +6212,21 @@ def _legacy_custom_channel(info: _InstalledWheelInfo) -> tuple[str, str] | None:
     installed_repo, revision = _split_vcs_url(info.vcs_url)
     if not revision or not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
         return None
-    receipt = data_dir() / "updates" / "custom-host-rollback.json"
-    try:
-        rollback = json.loads(receipt.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if (
-        not isinstance(rollback, dict)
-        or rollback.get("schema_version") not in (1, 2)
-        or rollback.get("channel_tracking_migrated")
-        or not isinstance(rollback.get("commit_sha"), str)
-        or not re.fullmatch(r"[0-9a-fA-F]{40}", rollback["commit_sha"])
-    ):
-        return None
+    rollback = None
+    if require_receipt:
+        receipt = data_dir() / "updates" / "custom-host-rollback.json"
+        try:
+            rollback = json.loads(receipt.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if (
+            not isinstance(rollback, dict)
+            or rollback.get("schema_version") not in (1, 2)
+            or rollback.get("channel_tracking_migrated")
+            or not isinstance(rollback.get("commit_sha"), str)
+            or not re.fullmatch(r"[0-9a-fA-F]{40}", rollback["commit_sha"])
+        ):
+            return None
 
     def identity(source: str) -> tuple[str, str | None, int | None, str]:
         repo, _ = _split_vcs_url(source)
@@ -6247,18 +6249,21 @@ def _legacy_custom_channel(info: _InstalledWheelInfo) -> tuple[str, str] | None:
     ):
         return None
     installed = identity(installed_repo)
-    saved_source = rollback.get("source_url")
-    if rollback["schema_version"] == 2 and not (
-        "source_url" in rollback
-        and (saved_source is None or (isinstance(saved_source, str) and saved_source))
-    ):
-        return None
-    if isinstance(saved_source, str) and identity(saved_source) != installed:
-        return None
+    if rollback is not None:
+        saved_source = rollback.get("source_url")
+        if rollback["schema_version"] == 2 and not (
+            "source_url" in rollback
+            and (saved_source is None or (isinstance(saved_source, str) and saved_source))
+        ):
+            return None
+        if isinstance(saved_source, str) and identity(saved_source) != installed:
+            return None
     if not any(identity(source) == installed for source in sources):
         return None
     moving_sources = []
     for source in sources:
+        if not require_receipt and identity(source) != installed:
+            continue
         repo, branch = _split_vcs_url(source)
         branch = branch or "local/host-custom"
         if re.fullmatch(r"[0-9a-fA-F]{40}", branch):
@@ -6310,18 +6315,15 @@ def _upgrade_vcs_install(
         _upgrade_failure_message,
     )
 
-    legacy_channel = _legacy_custom_channel(info)
-    if legacy_channel:
-        info = replace(info, vcs_url=legacy_channel[0])
-        click.echo(f"Restoring branch tracking for the legacy custom Host install: {info.vcs_url}")
+    legacy_channel = _custom_channel(info, require_receipt=True)
+    channel = legacy_channel or _custom_channel(info, require_receipt=False)
+    if channel:
+        info = replace(info, vcs_url=channel[0])
+        click.echo(f"Restoring branch tracking for the custom Host install: {info.vcs_url}")
     current_sha = info.commit_sha or ""
     cur_short = current_sha[:9] if current_sha else "unknown"
     remote_sha = (
-        legacy_channel[1]
-        if legacy_channel
-        else _remote_git_head(info.vcs_url)
-        if info.vcs_url
-        else None
+        channel[1] if channel else _remote_git_head(info.vcs_url) if info.vcs_url else None
     )
     remote_short = remote_sha[:9] if remote_sha else ""
     known_behind = bool(remote_sha and current_sha and remote_sha != current_sha)
@@ -6330,7 +6332,7 @@ def _upgrade_vcs_install(
         remote_sha
         and current_sha
         and remote_sha == current_sha
-        and not legacy_channel
+        and not channel
         and not (IS_WINDOWS and dry_run)
     ):
         click.echo(f"omnigent is up to date (git {cur_short}, tracking {info.vcs_url}).")
@@ -6366,7 +6368,7 @@ def _upgrade_vcs_install(
         info,
         allow_prerelease=pre,
         extra_overrides=extra_overrides,
-        target_vcs_url=legacy_channel[0] if legacy_channel else None,
+        target_vcs_url=channel[0] if channel else None,
     )
     if not suggestion.runnable:
         raise click.ClickException(
@@ -6402,18 +6404,19 @@ def _upgrade_vcs_install(
         # Verify by commit, not exit code: a re-pull of a ref that hasn't moved (or
         # a pinned ref, or a cached reinstall) exits 0 without changing anything.
         _, new_sha = _probe_installed_distribution()
-        if legacy_channel:
+        if channel:
             if not new_sha or new_sha != remote_sha:
                 raise click.ClickException(
                     f"Custom Host channel verification failed: expected {remote_short}, "
                     f"installed {(new_sha or 'unknown')[:9]}."
                 )
-            from omnigent.util.atomic_json import atomic_write_json
+            if legacy_channel:
+                from omnigent.util.atomic_json import atomic_write_json
 
-            receipt = data_dir() / "updates" / "custom-host-rollback.json"
-            rollback = json.loads(receipt.read_text(encoding="utf-8"))
-            rollback["channel_tracking_migrated"] = True
-            atomic_write_json(receipt, rollback)
+                receipt = data_dir() / "updates" / "custom-host-rollback.json"
+                rollback = json.loads(receipt.read_text(encoding="utf-8"))
+                rollback["channel_tracking_migrated"] = True
+                atomic_write_json(receipt, rollback)
             click.echo(f"✓ Updated to git {new_sha[:9]}; custom Host branch tracking restored.")
             return
         if new_sha and current_sha and new_sha != current_sha:

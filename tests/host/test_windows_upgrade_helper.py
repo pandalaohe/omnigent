@@ -329,13 +329,16 @@ def launcher(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
-def test_shim_argv_env_and_detach(launcher, dry_run, monkeypatch):
+@pytest.mark.parametrize("revision", ["local/host-custom", "v1.2.3", None])
+def test_shim_argv_env_and_detach(launcher, dry_run, monkeypatch, revision):
     info, events, root = launcher
-    from types import SimpleNamespace
+    from dataclasses import replace
 
-    monkeypatch.setattr(
-        "omnigent.update_check.sys.version_info", SimpleNamespace(major=3, minor=12)
+    info = replace(
+        info, vcs_url="git+https://example.test/repo.git" + (f"@{revision}" if revision else "")
     )
+
+    monkeypatch.setattr(shim, "_uv_python_minor", lambda: "3.12")
     shim.launch(info, "b" * 40, extras=("slack",), force=False, dry_run=dry_run)
     if not dry_run:
         assert events.pop(0) == "drain"
@@ -343,7 +346,9 @@ def test_shim_argv_env_and_detach(launcher, dry_run, monkeypatch):
     argv, options = events[0]
     source = "git+https://example.test/repo.git@" + "b" * 40
     assert argv[argv.index("--with") + 1] == source
-    assert argv[argv.index("--install-spec") + 1] == source + "#egg=omnigent[all,slack]"
+    tracked = "git+https://example.test/repo.git" + (f"@{revision}" if revision else "")
+    assert argv[argv.index("--install-spec") + 1] == tracked + "#egg=omnigent[all,slack]"
+    assert argv[argv.index("--target") + 1] == "b" * 40
     assert [argv[i + 1] for i, value in enumerate(argv) if value == "--python"] == ["3.12", "3.12"]
     assert options["creationflags"] == 0x09000200
     assert options["cwd"] == root / "updates"
