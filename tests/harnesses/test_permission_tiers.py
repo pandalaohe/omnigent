@@ -1459,6 +1459,11 @@ def test_windows_shell_data_roles_keep_normal_tier_policy(platform, tool, key, c
         "rg -f patterns.txt file.txt:stream",
         "grep -fpatterns.txt file.txt:stream",
         "rg -e pattern file.txt:stream",
+        "rg file.txt:stream -e needle",
+        "rg file.txt:stream --regexp=needle",
+        "rg file.txt:stream -f patterns.txt",
+        "rg NUL -e needle",
+        "grep file.txt:stream -e needle",
         "Get-Content file.txt:stream",
         r"Get-Content %MISSING%\file.txt",
         "Get-Content 100%",
@@ -1557,12 +1562,33 @@ def test_windows_live_data_and_environment(shell, command):
     assert decision("auto", "sys_os_shell", {"command": command}, host).action == Verdict.ALLOW
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rg ordinary.txt -e needle",
+        "rg ordinary.txt --regexp=needle",
+        "rg ordinary.txt -f patterns.txt",
+        "grep ordinary.txt -e needle",
+        "grep ordinary.txt -f patterns.txt",
+        'rg -- "file:stream" ordinary.txt',
+        'rg -e "--regexp" ordinary.txt',
+    ],
+)
+def test_windows_search_late_patterns_keep_normal_tier_policy(command):
+    assert tuple(
+        decision(tier, "sys_os_shell", {"command": command}, windows_host()).action
+        for tier in PERMISSION_TIERS
+    ) == (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
+
+
 @pytest.mark.parametrize("shell", ["bash", "pwsh", "cmd"])
 @pytest.mark.parametrize(
     "command",
     [
         'ls C:/work/project | grep -i "omnigent.*dist-info"',
         'rg -e "omnigent.*dist-info" C:/work/project',
+        'rg C:/work/project -e "omnigent.*dist-info"',
+        'grep C:/work/project --regexp="omnigent.*dist-info"',
     ],
 )
 def test_windows_search_pattern_never_reaches_resolver(shell, command):

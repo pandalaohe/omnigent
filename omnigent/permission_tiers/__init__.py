@@ -1716,7 +1716,8 @@ def _windows_path_operands(tokens: list[str], raw_tokens: list[str], shell: str)
     files = set()
     certain = True
     options = True
-    pattern_seen = False
+    explicit_pattern = False
+    positionals = []
     index = start
     while index < len(tokens):
         value = tokens[index]
@@ -1733,29 +1734,31 @@ def _windows_path_operands(tokens: list[str], raw_tokens: list[str], shell: str)
             if option in file_options:
                 candidates[index] = attached
                 files.add(index)
-                pattern_seen = command in ("grep", "egrep", "fgrep", "rg") or pattern_seen
+                explicit_pattern = command in ("grep", "egrep", "fgrep", "rg") or explicit_pattern
             elif command != "curl" or (
                 urlsplit(attached).scheme in ("http", "https") and urlsplit(attached).hostname
             ):
                 data.add(index)
-                pattern_seen = True
+                explicit_pattern = True
         elif options and any(
             len(option) == 2 and value.startswith(option) and len(value) > 2
             for option in file_options
         ):
             candidates[index] = value[2:]
             files.add(index)
-            pattern_seen = command in ("grep", "egrep", "fgrep", "rg") or pattern_seen
+            explicit_pattern = command in ("grep", "egrep", "fgrep", "rg") or explicit_pattern
         elif options and value.startswith("-"):
             certain &= value in flags
-        elif command in ("grep", "egrep", "fgrep", "rg") and not pattern_seen:
-            data.add(index)
-            pattern_seen = True
+        elif command in ("grep", "egrep", "fgrep", "rg"):
+            positionals.append(index)
         elif command == "curl":
             url = urlsplit(value)
             if url.scheme in ("http", "https") and url.hostname:
                 data.add(index)
         index += 1
+    # Explicit patterns apply to all positionals, even those preceding the option.
+    if positionals and not explicit_pattern:
+        data.add(positionals[0])
     return [
         value
         for index, value in enumerate(candidates)
