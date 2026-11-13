@@ -93,12 +93,24 @@ type OpenPanel =
   | { kind: "cluster"; lane: string; tasks: BoardTask[] }
   | { kind: "edge"; lane: string; edge: MapEdge }
   | { kind: "hub"; lane: string; task: BoardTask };
+/** Hover keeps identities only; each render resolves them against the current scene. */
 interface Hover {
-  node?: MapNode;
-  edge?: MapEdge;
+  node?: string;
+  edge?: string;
   x: number;
   y: number;
 }
+const nodeKey = (node: MapNode) => (node.tasks.length ? taskIdentity(node.tasks[0]) : node.id);
+const currentNode = (nodes: MapNode[], key?: string) =>
+  key === undefined
+    ? undefined
+    : nodes.find((node) =>
+        node.tasks.length ? node.tasks.some((task) => taskIdentity(task) === key) : node.id === key,
+      );
+const currentEdge = (edges: MapEdge[], relation?: string) =>
+  relation === undefined
+    ? undefined
+    : edges.find((edge) => edge.relations.some((item) => item.id === relation));
 const badgeStyle = (color: string) => ({ "--rt-color": color }) as CSSProperties;
 const dayKey = (time: number) => {
   const date = new Date(time);
@@ -815,72 +827,68 @@ export function TaskBoardRoutes({
           height: 40,
         });
     }
-    return {
-      ...mapScene(
-        lanes,
-        mode,
-        view,
-        width,
-        now,
-        level,
-        relations,
-        hubs,
-        caches,
-        (node) => {
-          if (node.timeCluster) {
-            const times = node.tasks.map((task) => routeMoment(task, now)!),
-              first = Math.min(...times),
-              last = Math.max(...times),
-              hm = (time: number) =>
-                formatDate(time, { hour: "2-digit", minute: "2-digit", hour12: false });
-            const day = (time: number) => formatDate(time, { month: "2-digit", day: "2-digit" });
-            if (compact)
-              return { lines: [t("routes.stops", { count: node.tasks.length })], sub: "" };
-            return {
-              lines: [t("routes.stops", { count: node.tasks.length })],
-              sub:
-                level === "station"
-                  ? `${hm(first)}–${hm(last)}`
-                  : day(first) === day(last)
-                    ? day(first)
-                    : `${day(first)}–${day(last)}`,
-            };
-          }
-          const task = node.tasks[0];
-          if (compact)
-            return {
-              lines: [
-                node.tasks.length > 1
-                  ? mode === "time" && node.queued
-                    ? t("routes.queuedMore")
-                    : nodeLabel(node)
-                  : clipLabel(nodeLabel(node), 150),
-              ],
-              sub: "",
-            };
+    const scene = mapScene(
+      lanes,
+      mode,
+      view,
+      width,
+      now,
+      level,
+      relations,
+      hubs,
+      caches,
+      (node) => {
+        if (node.timeCluster) {
+          const times = node.tasks.map((task) => routeMoment(task, now)!),
+            first = Math.min(...times),
+            last = Math.max(...times),
+            hm = (time: number) =>
+              formatDate(time, { hour: "2-digit", minute: "2-digit", hour12: false });
+          const day = (time: number) => formatDate(time, { month: "2-digit", day: "2-digit" });
+          if (compact) return { lines: [t("routes.stops", { count: node.tasks.length })], sub: "" };
           return {
-            lines:
-              node.tasks.length > 1
-                ? [mode === "time" && node.queued ? t("routes.queuedMore") : nodeLabel(node)]
-                : routeLabelLines(nodeLabel(node)),
+            lines: [t("routes.stops", { count: node.tasks.length })],
             sub:
-              node.tasks.length === 1
-                ? mode === "time" && routeState(task) === "user"
-                  ? t("sessions.taskState.user")
-                  : !routeQueued(task) &&
-                      !["running", "user"].includes(routeState(task)) &&
-                      routeMoment(task, now)
-                    ? momentWord(routeMoment(task, now)!)
-                    : ""
-                : "",
+              level === "station"
+                ? `${hm(first)}–${hm(last)}`
+                : day(first) === day(last)
+                  ? day(first)
+                  : `${day(first)}–${day(last)}`,
           };
-        },
-        measureLabel,
-        { compact, important },
-      ),
-      height: top,
-      folded,
-    };
+        }
+        const task = node.tasks[0];
+        if (compact)
+          return {
+            lines: [
+              node.tasks.length > 1
+                ? mode === "time" && node.queued
+                  ? t("routes.queuedMore")
+                  : nodeLabel(node)
+                : clipLabel(nodeLabel(node), 150),
+            ],
+            sub: "",
+          };
+        return {
+          lines:
+            node.tasks.length > 1
+              ? [mode === "time" && node.queued ? t("routes.queuedMore") : nodeLabel(node)]
+              : routeLabelLines(nodeLabel(node)),
+          sub:
+            node.tasks.length === 1
+              ? mode === "time" && routeState(task) === "user"
+                ? t("sessions.taskState.user")
+                : !routeQueued(task) &&
+                    !["running", "user"].includes(routeState(task)) &&
+                    routeMoment(task, now)
+                  ? momentWord(routeMoment(task, now)!)
+                  : ""
+              : "",
+        };
+      },
+      measureLabel,
+      { compact, important },
+    );
+    return { ...scene, height: top + scene.grown, folded };
   }, [
     attentionView,
     groupWorth,
@@ -1139,13 +1147,23 @@ export function TaskBoardRoutes({
       );
   }, [view, mode, gutter, right, width]);
   // Connector hover dims the map through one class; the map itself never re-renders on hover.
-  useEffect(
-    () =>
-      hoverStore.subscribe(() =>
-        svgRef.current?.classList.toggle("rt-edge-hover", !!hoverStore.get().hover?.edge),
-      ),
-    [hoverStore],
-  );
+  // A refreshed scene drops hover whose station, connector or hub is gone.
+  useLayoutEffect(() => {
+    const { hover, hub } = hoverStore.get();
+    if (
+      hover &&
+      !(hover.edge ? currentEdge(model.edges, hover.edge) : currentNode(model.nodes, hover.node))
+    )
+      hoverStore.set({ hover: null });
+    if (hub && !hubs.has(hub)) hoverStore.set({ hub: null });
+    const sync = () =>
+      svgRef.current?.classList.toggle(
+        "rt-edge-hover",
+        !!currentEdge(model.edges, hoverStore.get().hover?.edge),
+      );
+    sync();
+    return hoverStore.subscribe(sync);
+  }, [hoverStore, model, hubs]);
   useEffect(() => {
     if (mode !== "time") return;
     const cleanups: (() => void)[] = [];
@@ -1956,7 +1974,7 @@ export function TaskBoardRoutes({
           >
             <svg
               ref={svgRef}
-              className={`rt-svg${openEdge ? " rt-edge-focus" : ""}${hoverStore.get().hover?.edge ? " rt-edge-hover" : ""}`}
+              className={`rt-svg${openEdge ? " rt-edge-focus" : ""}${currentEdge(model.edges, hoverStore.get().hover?.edge) ? " rt-edge-hover" : ""}`}
               width={width}
               height={model.height + (scheduledVisible.length ? (phone ? 96 : 88) : 0)}
               aria-label={t("routes.map")}
@@ -2033,7 +2051,10 @@ export function TaskBoardRoutes({
                   {mode === "time" &&
                     lane.nodes.some((node) => !node.queued && !node.density) &&
                     (() => {
-                      const past = lane.nodes.filter((node) => !node.queued && !node.density);
+                      // Wrapped rows below carry only waiting stations; the rail runs on the first.
+                      const past = lane.nodes.filter(
+                        (node) => !node.queued && !node.density && node.top === lane.top,
+                      );
                       const earliest = lane.historyStart ?? Infinity;
                       return (
                         <line
@@ -2055,7 +2076,10 @@ export function TaskBoardRoutes({
                       <line
                         key={node.id}
                         className="rt-rail"
-                        x1={lane.nodes[lane.nodes.indexOf(node) - 1]?.x1 ?? gutter}
+                        x1={(() => {
+                          const previous = lane.nodes[lane.nodes.indexOf(node) - 1];
+                          return previous?.top === node.top ? previous.x1 : node.x;
+                        })()}
                         x2={node.x}
                         y1={node.y}
                         y2={node.y}
@@ -2146,13 +2170,18 @@ export function TaskBoardRoutes({
                       // dims the rest, so sweeping across them does not repaint the map.
                       const target = event.currentTarget;
                       clearTimeout(edgeIntent.current);
-                      edgeIntent.current = setTimeout(() => showHover({ edge }, target), 120);
+                      edgeIntent.current = setTimeout(() => {
+                        // A connector removed by a refresh meanwhile no longer shows.
+                        if (target.isConnected) showHover({ edge: edge.relations[0].id }, target);
+                      }, 120);
                     }}
                     onMouseLeave={() => {
                       clearTimeout(edgeIntent.current);
                       hoverStore.set({ hover: null });
                     }}
-                    onFocus={(event) => showHover({ edge }, event.currentTarget)}
+                    onFocus={(event) =>
+                      showHover({ edge: edge.relations[0].id }, event.currentTarget)
+                    }
                     onBlur={() => hoverStore.set({ hover: null })}
                     onClick={() => {
                       setOpen((current) =>
@@ -2177,7 +2206,7 @@ export function TaskBoardRoutes({
               nodes={model.nodes}
               edges={model.edges}
               hubs={hubs}
-              openEdge={openEdge}
+              openEdge={openEdge && (currentEdge(model.edges, openEdge.relations[0]?.id) ?? null)}
               openHub={openHub}
               width={width}
               height={model.height + (scheduledVisible.length ? (phone ? 96 : 88) : 0)}
@@ -2252,7 +2281,9 @@ export function TaskBoardRoutes({
                         from: momentWord(node.density.from),
                         to: momentWord(node.density.to),
                       })}
-                      onMouseEnter={(event) => showHover({ node }, event.currentTarget)}
+                      onMouseEnter={(event) =>
+                        showHover({ node: nodeKey(node) }, event.currentTarget)
+                      }
                       onMouseLeave={() => hoverStore.set({ hover: null })}
                       onClick={() => openNode(node)}
                     />
@@ -2273,7 +2304,7 @@ export function TaskBoardRoutes({
                             : nodeLabel(node)
                         }
                         onMouseEnter={(event) => {
-                          showHover({ node }, event.currentTarget);
+                          showHover({ node: nodeKey(node) }, event.currentTarget);
                           if (
                             node.tasks.length === 1 &&
                             hubs.get(taskIdentity(node.tasks[0]))?.size
@@ -2283,7 +2314,7 @@ export function TaskBoardRoutes({
                         onMouseLeave={() => {
                           hoverStore.set({ hover: null, hub: null });
                         }}
-                        onFocus={(event) => showHover({ node }, event.currentTarget)}
+                        onFocus={(event) => showHover({ node: nodeKey(node) }, event.currentTarget)}
                         onBlur={() => hoverStore.set({ hover: null })}
                         onClick={() => openNode(node)}
                       >
@@ -2484,7 +2515,15 @@ export function TaskBoardRoutes({
           setOpen(null);
         }}
       />
-      {!phone && <RouteTooltip store={hoverStore} tasks={tasks} onSelect={selectTask} />}
+      {!phone && (
+        <RouteTooltip
+          store={hoverStore}
+          nodes={model.nodes}
+          edges={model.edges}
+          tasks={tasks}
+          onSelect={selectTask}
+        />
+      )}
     </div>
   );
 }
@@ -2532,7 +2571,7 @@ function RouteHighlights({
   height: number;
 }) {
   const { hover, hub } = useHover(store);
-  const activeEdge = hover?.edge ?? openEdge,
+  const activeEdge = currentEdge(edges, hover?.edge) ?? openEdge,
     activeHub = hub ?? openHub;
   if (!activeEdge && !activeHub) return null;
   const ringed = activeEdge
@@ -2591,21 +2630,27 @@ function RouteHighlights({
 }
 function RouteTooltip({
   store,
+  nodes,
+  edges,
   tasks,
   onSelect,
 }: {
   store: HoverStore;
+  nodes: MapNode[];
+  edges: MapEdge[];
   tasks: BoardTask[];
   onSelect: (task: BoardTask) => void;
 }) {
   const { hover } = useHover(store);
+  const edge = currentEdge(edges, hover?.edge),
+    node = edge ? undefined : currentNode(nodes, hover?.node);
   const ref = useRef<HTMLDivElement>(null),
     [size, setSize] = useState({ width: 340, height: 240 });
   useLayoutEffect(() => {
     const rect = ref.current?.getBoundingClientRect();
     if (rect) setSize({ width: rect.width, height: rect.height });
-  }, [hover]);
-  if (!hover) return null;
+  }, [hover, edge, node]);
+  if (!hover || !(edge || node)) return null;
   return (
     <div
       ref={ref}
@@ -2616,31 +2661,31 @@ function RouteTooltip({
         top: Math.max(8, Math.min(globalThis.innerHeight - size.height - 8, hover.y)),
       }}
     >
-      {hover.edge ? (
+      {edge ? (
         <>
           <b>
-            {t(hover.edge.relations.length > 1 ? "routes.relationCount" : "routes.relationTitle", {
-              count: hover.edge.relations.length,
+            {t(edge.relations.length > 1 ? "routes.relationCount" : "routes.relationTitle", {
+              count: edge.relations.length,
             })}
           </b>
-          <RelationFacts relations={hover.edge.relations.slice(0, 4)} onSelect={onSelect} />
+          <RelationFacts relations={edge.relations.slice(0, 4)} onSelect={onSelect} />
         </>
-      ) : hover.node?.density ? (
+      ) : node?.density ? (
         <>
-          <b>{t("routes.stops", { count: hover.node.density.count })}</b>
+          <b>{t("routes.stops", { count: node.density.count })}</b>
           <p>
-            {momentWord(hover.node.density.from)}
+            {momentWord(node.density.from)}
             {" — "}
-            {momentWord(hover.node.density.to)}
+            {momentWord(node.density.to)}
           </p>
         </>
-      ) : hover.node?.tasks.length === 1 ? (
-        <TaskBoardTaskHover task={hover.node.tasks[0]} tasks={tasks} />
+      ) : node?.tasks.length === 1 ? (
+        <TaskBoardTaskHover task={node.tasks[0]} tasks={tasks} />
       ) : (
         <>
-          <b>{t("routes.stops", { count: hover.node?.tasks.length ?? 0 })}</b>
+          <b>{t("routes.stops", { count: node?.tasks.length ?? 0 })}</b>
           <ul>
-            {hover.node?.tasks.slice(0, 6).map((task) => (
+            {node?.tasks.slice(0, 6).map((task) => (
               <li key={taskIdentity(task)}>{taskTitle(task)}</li>
             ))}
           </ul>

@@ -157,3 +157,33 @@ it("keeps recent and pinned cards that the board window would drop", () => {
   for (const uid of ["late", "archived", "gone"])
     expect(view.container.querySelector(`.rt-stop[data-route-task="${uid}"]`)).toBeTruthy();
 });
+
+it("keeps a focused connector's highlight and tooltip on the current data", () => {
+  const recent = new Date(now - DAY).toISOString();
+  const linked = (title: string, extra: BoardTask[] = [], related = true) => [
+    card("x", "busy", {
+      ...live,
+      ...(related && { relatedTo: { y: { relation: { parent: true } } } }),
+    }),
+    card("y", "recent", { title, updated: recent }),
+    ...extra,
+  ];
+  const view = render(board(linked("Card y")));
+  fireEvent.focus(view.container.querySelector(".rt-edge-hit")!);
+  expect(screen.getByRole("tooltip").textContent).toContain("Card y");
+  // Same identities; a finished card ahead of x moves its station, so the connector path changes.
+  const earlier = card("w", "busy", {
+    progress: "completed",
+    progressUpdated: new Date(now - 3_600_000).toISOString(),
+  });
+  view.rerender(board(linked("Renamed y", [earlier])));
+  expect(screen.getByRole("tooltip").textContent).toContain("Renamed y");
+  const current = view.container.querySelector(".rt-svg:not(.rt-highlights) .rt-connection")!;
+  expect(view.container.querySelector(".rt-highlights .rt-connection")?.getAttribute("d")).toBe(
+    current.getAttribute("d"),
+  );
+  view.rerender(board(linked("Renamed y", [earlier], false)));
+  expect(screen.queryByRole("tooltip")).toBeNull();
+  expect(view.container.querySelector(".rt-highlights")).toBeNull();
+  expect(view.container.querySelector(".rt-edge-hover")).toBeNull();
+});

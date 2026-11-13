@@ -913,24 +913,18 @@ export function mapScene(
   options: { compact?: boolean; important?: (task: BoardTask) => boolean } = {},
 ) {
   const phone = width <= 620;
-  if (phone && mode === "order") return { nodes: [] as MapNode[], edges: [] as MapEdge[], lanes };
+  if (phone && mode === "order")
+    return { nodes: [] as MapNode[], edges: [] as MapEdge[], lanes, grown: 0 };
   const gutter = phone ? 14 : 208,
     right = width - (mode === "order" ? 58 : 14),
+    room = Math.max(3, Math.floor((right - gutter) / 104) + 1),
     nodes: MapNode[] = [];
   const items = new Map(
     lanes
       .filter((lane) => !lane.quiet && !lane.pager && (!lane.header || lane.collapsed))
-      .map((lane) => [
-        lane.id,
-        orderStops(
-          lane.tasks,
-          Math.max(3, Math.floor((right - gutter) / 104) + 1),
-          lane.collapsed,
-          options.important,
-        ),
-      ]),
+      .map((lane) => [lane.id, orderStops(lane.tasks, room, lane.collapsed, options.important)]),
   );
-  const maxStops = Math.max(3, ...[...items.values()].map((stops) => stops.length)),
+  const maxStops = Math.min(room, Math.max(3, ...[...items.values()].map((stops) => stops.length))),
     gap = Math.min(176, (right - gutter) / Math.max(1, maxStops - 1));
   const maxDensity = Math.max(
     1,
@@ -944,20 +938,29 @@ export function mapScene(
       ).map((bucket) => bucket.count),
     ),
   );
+  // Stations that need the user never fold, so a row they overflow wraps onto extra rows of the
+  // same height; later lanes move down by the added height.
+  let grown = 0;
   for (const lane of lanes) {
     lane.nodes = [];
+    lane.top += grown;
     if (lane.quiet || lane.pager || (lane.header && !lane.collapsed)) continue;
-    const y = lane.top + lane.height / 2 + (phone && mode === "time" ? 12 : 0);
-    const add = (tasks: BoardTask[], x: number, x1 = x, density?: MapDensity) => {
+    const base = lane.height,
+      y = lane.top + base / 2 + (phone && mode === "time" ? 12 : 0);
+    const wrap = (rows: number) => {
+      lane.height = base * rows;
+      grown += base * (rows - 1);
+    };
+    const add = (tasks: BoardTask[], x: number, x1 = x, density?: MapDensity, row = 0) => {
       const node: MapNode = {
         id: `${lane.id}:${nodes.length}`,
         lane: lane.id,
         tasks,
         x,
         x1,
-        y,
-        top: lane.top,
-        height: lane.height,
+        y: y + row * base,
+        top: lane.top + row * base,
+        height: base,
         color: lane.color,
         queued: tasks.length > 0 && tasks.every(routeQueued),
         density,
@@ -968,10 +971,18 @@ export function mapScene(
       return node;
     };
     if (mode === "order") {
-      (items.get(lane.id) ?? []).forEach((item, index) => {
-        const at = gutter + index * gap;
-        add(item.tasks, at, item.tasks.length > 1 ? at + 2 : at);
+      const stops = items.get(lane.id) ?? [];
+      stops.forEach((item, index) => {
+        const at = gutter + (index % room) * gap;
+        add(
+          item.tasks,
+          at,
+          item.tasks.length > 1 ? at + 2 : at,
+          undefined,
+          Math.floor(index / room),
+        );
       });
+      wrap(Math.max(1, Math.ceil(stops.length / room)));
       continue;
     }
     if (level === "segment") {
@@ -1024,7 +1035,9 @@ export function mapScene(
           : working.map((task) => [task])),
         ...waiting.map((task) => [task]),
       ],
-      limit = pinned.length ? pinnedX - (pinned.length - 1) * pinnedGap - minimum : Infinity;
+      limit = pinned.length
+        ? pinnedX - (Math.min(pinned.length, liveRoom) - 1) * pinnedGap - minimum
+        : Infinity;
     const clusters: { x: number; end: number; tasks: BoardTask[] }[] = [];
     for (const task of rest) {
       const px = Math.min(limit, x(routeMoment(task, now)!)),
@@ -1042,10 +1055,13 @@ export function mapScene(
       );
       node.timeCluster = cluster.tasks.length > 1;
     }
+    // The stops nearest now fill the first row; any overflow wraps right-aligned onto rows below.
     pinned.forEach((stop, index) => {
-      const at = pinnedX - (pinned.length - 1 - index) * pinnedGap;
-      add(stop, at, stop.length > 1 ? at + 2 : at);
+      const back = pinned.length - 1 - index,
+        at = pinnedX - (back % liveRoom) * pinnedGap;
+      add(stop, at, stop.length > 1 ? at + 2 : at, undefined, Math.floor(back / liveRoom));
     });
+    wrap(Math.max(1, Math.ceil(pinned.length / liveRoom)));
     if (view.from <= now && view.to >= now && level === "station") {
       const queue = lane.tasks.filter(routeQueued),
         end = Math.max(x(now), ...lane.nodes.map((node) => node.x1)),
@@ -1201,5 +1217,5 @@ export function mapScene(
     measure,
     options.compact,
   );
-  return { nodes, edges, lanes };
+  return { nodes, edges, lanes, grown };
 }

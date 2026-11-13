@@ -440,6 +440,66 @@ describe("route view on real-sized rows", () => {
       );
     expect(scene.nodes.some((node) => node.tasks.length > 1)).toBe(true);
   });
+  it("wraps crowded waiting-on-you stations onto more rows, all on the map and apart", () => {
+    const waiting = { "omnigent.ai:waiting": { on: "user" } };
+    const users = (count: number) =>
+      Array.from({ length: count }, (_, index) => ({
+        ...open(`user-${index}`, waiting),
+        "omnigent.ai:group": { id: "alpha" },
+      }));
+    const below = { ...open("below"), "omnigent.ai:group": { id: "beta" } };
+    const cases: [number, "order" | "time", number, boolean][] = [
+      [6, "time", 390, false],
+      [14, "time", 700, false],
+      [9, "time", 700, true],
+      [40, "order", 700, false],
+      [12, "order", 700, true],
+    ];
+    for (const [count, mode, width, collapsed] of cases) {
+      const groups = mapGroups(
+          [...users(count), below],
+          [{ id: "example", name: "Example", source: null }],
+          {},
+          now,
+        ),
+        alpha = groups.find((group) => group.tasks.some((item) => item.uid === "user-0"))!,
+        beta = groups.find((group) => group !== alpha)!;
+      const lanes: MapLane[] = [
+        { ...alpha, top: 0, height: 80, nodes: [], collapsed },
+        { ...beta, top: 80, height: 80, nodes: [] },
+      ];
+      const scene = mapScene(
+        lanes,
+        mode,
+        { from: now - DAY, to: now + DAY },
+        width,
+        now,
+        "station",
+        [],
+        new Map(),
+        {},
+        () => "",
+      );
+      const shown = scene.nodes.filter((node) => node.lane === alpha.id);
+      const label = `${count} ${mode} ${width}${collapsed ? " collapsed" : ""}`;
+      expect(
+        shown.filter((node) => node.tasks.length === 1),
+        label,
+      ).toHaveLength(count);
+      for (const node of shown) {
+        expect(node.x, label).toBeGreaterThanOrEqual(width <= 620 ? 14 : 208);
+        expect(node.x, label).toBeLessThanOrEqual(width - 14);
+        expect(node.y, label).toBeGreaterThan(lanes[0].top);
+        expect(node.y, label).toBeLessThan(lanes[0].top + lanes[0].height);
+        for (const other of shown)
+          if (other !== node)
+            expect(Math.hypot(node.x - other.x, node.y - other.y), label).toBeGreaterThanOrEqual(
+              36,
+            );
+      }
+      expect(lanes[1].top, label).toBe(lanes[0].top + lanes[0].height);
+    }
+  });
   it("folds urgent cards that do not fit instead of overlapping them", () => {
     const tasks = Array.from({ length: 20 }, (_, index) => task(`run-${index}`, "running"));
     expect(orderStops(tasks, 6).length).toBeLessThanOrEqual(6);
