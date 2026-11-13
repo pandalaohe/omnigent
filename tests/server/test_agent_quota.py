@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from fastapi import FastAPI
+from sqlalchemy import event
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.server.agent_quota import AgentQuotaService, QuotaContext, UsageAccountLimitError
@@ -148,6 +149,78 @@ def test_discovery_lists_pools_for_exclusion_without_duplicate_or_extra_prompt(s
         "work_types": ["work"],
         "pools": ["plan", "pi:kimi"],
     }
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_discovery_repeated_choice_links_bound_agent_database_reads(
+    service, db_uri, tmp_path, registered
+):
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from tests._helpers.session import bundle_files
+
+    conv = service.conversations.create_conversation(host_id=HOST, workspace="/opt/work/project")
+    owner = service.context(conv).owner_id
+    agents = SqlAlchemyAgentStore(db_uri)
+    service.agent_store = agents
+    # Missing agents must also be resolved once, even across many host rows.
+    agent_id = "b" * 32
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    cache = AgentCache(artifacts, tmp_path / "cache")
+    service.agent_cache = cache
+    if registered:
+        artifacts.put(
+            "bundle",
+            bundle_files(
+                {
+                    "config.yaml": (
+                        b"spec_version: 1\nname: test-agent\nexecutor:\n"
+                        b"  type: omnigent\n  config:\n    harness: codex\n"
+                    )
+                }
+            ),
+        )
+        agents.create(agent_id, "test-agent", "bundle")
+    settings = {
+        "enabled": True,
+        "workTypes": [{"id": "work", "label": "Work"}],
+        "hosts": {
+            f"host-{index}": {
+                "work": [
+                    [
+                        {
+                            "links": [
+                                {"agent": agent_id, "meter": "plan", "model": "m"},
+                                {"agent": agent_id, "model": "other"},
+                            ]
+                        }
+                    ]
+                ]
+            }
+            for index in range(40)
+        },
+    }
+    service.preferences.replace_session_choice(
+        owner, settings, service.preferences.session_choice(owner)["revision"]
+    )
+    agent_reads = []
+
+    def record_read(conn, cursor, statement, parameters, context, executemany):
+        if "FROM agents" in statement:
+            agent_reads.append(statement)
+
+    event.listen(agents._engine, "before_cursor_execute", record_read)
+    try:
+        payload = service.payload(conv, requester_id=owner, agent_store=agents, agent_cache=cache)
+    finally:
+        event.remove(agents._engine, "before_cursor_execute", record_read)
+    assert payload["session_choice"]["pools"] == [
+        "plan",
+        f"{'codex' if registered else agent_id}:other",
+    ]
+    assert payload["agents"]["antigravity"]["reason"] == "no_report"
+    assert 1 <= len(agent_reads) <= 2, f"repeated links caused {len(agent_reads)} agent reads"
 
 
 @pytest.fixture
