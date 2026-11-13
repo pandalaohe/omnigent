@@ -164,6 +164,7 @@
   "activity.mother": "Root session",
   "activity.unassigned": "No linked session",
   "activity.empty": "No activity to show.",
+  "activity.loadEarlier": "Load earlier",
   "activity.failed": "Could not read activity.",
   "activity.countsFailed": "Could not read closing counts.",
   "history.hold": "Keep closed tasks",

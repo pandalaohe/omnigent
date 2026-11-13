@@ -89,6 +89,7 @@ interface TaskPage {
   "omnigent.ai:changedThrough"?: string;
 }
 export interface BoardData {
+  partial?: boolean;
   sourceCaches?: Record<string, SourceCache>;
   sourceStates?: Record<string, string>;
   tasks: BoardTask[];
@@ -97,6 +98,8 @@ export interface BoardData {
 }
 export const taskIdentity = (task: BoardTask) =>
   JSON.stringify([task["omnigent.ai:source"], task.uid]);
+export const taskSourceGeneration = (source: TaskSource) =>
+  source.snapshot?.sourceGeneration ?? source.created ?? source.id;
 export const groupIdentity = (task: BoardTask) =>
   JSON.stringify([task["omnigent.ai:source"], task["omnigent.ai:group"]?.id ?? ""]);
 export const taskProgress = (task: BoardTask): TaskProgress => task.progress ?? "needs-action";
@@ -105,6 +108,7 @@ export const isOpenTask = (task: BoardTask) =>
 
 async function readTasks(
   params: URLSearchParams,
+  publish?: (tasks: BoardTask[]) => void,
 ): Promise<{ tasks: BoardTask[]; changedThrough?: string }> {
   const tasks: BoardTask[] = [];
   let cursor: string | undefined;
@@ -117,6 +121,7 @@ async function readTasks(
     const page = await readBoardJson<TaskPage>(`/v1/me/tasks?${query}`);
     if (!cursor) changedThrough = page["omnigent.ai:changedThrough"] ?? page.updated;
     tasks.push(...page.entries);
+    publish?.([...tasks]);
     cursor = page["omnigent.ai:cursor"];
     if (cursor && seen.has(cursor)) throw new Error("Repeated task cursor");
     if (cursor) seen.add(cursor);
@@ -124,11 +129,16 @@ async function readTasks(
   return { tasks, changedThrough };
 }
 
-/** Publish one atomic cache update only after every page and recreated source was read. */
-export async function readTaskBoard(previous?: BoardData, now = Date.now()): Promise<BoardData> {
+/** Keep refreshes atomic; initial reads can publish usable pages while the rest load. */
+export async function readTaskBoard(
+  previousData?: BoardData,
+  now = Date.now(),
+  publish?: (data: BoardData) => void,
+): Promise<BoardData> {
+  const previous = previousData?.partial ? undefined : previousData;
   const { sources } = await readBoardJson<{ sources: TaskSource[] }>("/v1/me/tasks/sources");
   if (sources.some((source) => source.snapshot && source.snapshot.phase !== "legacy")) {
-    return readPinnedSources(sources, previous, now);
+    return readPinnedSources(sources, previous, now, previous ? undefined : publish);
   }
   const cutoff = new Date(now - 365 * 86_400_000).toISOString();
   const sourceIds = new Set(sources.map((source) => source.id));
@@ -137,7 +147,8 @@ export async function readTaskBoard(previous?: BoardData, now = Date.now()): Pro
     sources
       .filter(
         (source) =>
-          !oldSources.has(source.id) || source.created !== oldSources.get(source.id)?.created,
+          !oldSources.has(source.id) ||
+          taskSourceGeneration(source) !== taskSourceGeneration(oldSources.get(source.id)!),
       )
       .map((source) => source.id),
   );
@@ -155,29 +166,45 @@ export async function readTaskBoard(previous?: BoardData, now = Date.now()): Pro
       else held.set(taskIdentity(task), task);
     }
   };
-  let changedThrough: string | undefined;
-  if (previous?.changedThrough) {
-    const result = await readTasks(
-      new URLSearchParams({
-        changed_after: new Date(Date.parse(previous.changedThrough) - 60_000).toISOString(),
-      }),
-    );
-    merge(result.tasks);
-    changedThrough = result.changedThrough;
+  let changedThrough = previous?.changedThrough;
+  const fullSources: (string | undefined)[] = previous ? [] : [undefined];
+  if (previous) {
+    for (const source of sources) {
+      const priorRevision = oldSources.get(source.id)?.last_write?.time;
+      if (recreated.has(source.id) || !priorRevision || !source.last_write?.time) {
+        fullSources.push(source.id);
+        continue;
+      }
+      if (source.last_write.time === priorRevision) continue;
+      // Committed source metadata cannot advance past an invisible feeder transaction.
+      // eslint-disable-next-line no-await-in-loop
+      const result = await readTasks(
+        new URLSearchParams({
+          source: source.id,
+          changed_after: new Date(Date.parse(priorRevision) - 60_000).toISOString(),
+        }),
+      );
+      merge(result.tasks);
+      changedThrough = result.changedThrough ?? changedThrough;
+    }
   }
-  const fullSources = previous?.changedThrough ? [...recreated] : [undefined];
   for (const source of fullSources) {
     const params = new URLSearchParams({ state: "open" });
     if (source) params.set("source", source);
     // eslint-disable-next-line no-await-in-loop
-    const open = await readTasks(params);
+    const open = await readTasks(
+      params,
+      !previous && publish ? (tasks) => publish({ tasks, sources, partial: true }) : undefined,
+    );
     params.set("state", "closed");
     params.set("closed_after", cutoff);
     // eslint-disable-next-line no-await-in-loop
     const closed = await readTasks(params);
+    if (source)
+      for (const [key, task] of held) if (task["omnigent.ai:source"] === source) held.delete(key);
     merge(open.tasks);
     merge(closed.tasks);
-    if (!previous?.changedThrough) changedThrough = open.changedThrough;
+    changedThrough = open.changedThrough ?? changedThrough;
   }
   const rows = new Map(sources.map((source) => [source.id, source]));
   const tasks = [...held.values()].filter(
@@ -197,7 +224,10 @@ export function useTaskBoardData() {
   const client = useQueryClient();
   return useQuery({
     queryKey: ["taskBoard", "list"],
-    queryFn: () => readTaskBoard(client.getQueryData<BoardData>(["taskBoard", "list"])),
+    queryFn: () =>
+      readTaskBoard(client.getQueryData<BoardData>(["taskBoard", "list"]), Date.now(), (data) =>
+        client.setQueryData(["taskBoard", "list"], data),
+      ),
     refetchInterval: cadence,
     refetchOnWindowFocus: true,
     retry: false,

@@ -66,6 +66,7 @@ export async function readPinnedSources(
   sources: TaskSource[],
   previous?: BoardData,
   now = Date.now(),
+  publish?: (data: BoardData) => void,
 ): Promise<BoardData> {
   const caches: Record<string, SourceCache> = {},
     states: Record<string, string> = {};
@@ -79,15 +80,40 @@ export async function readPinnedSources(
       prior && prior.pin.sourceGeneration === pin?.sourceGeneration && prior.timeZone === timeZone;
     if (!pin || pin.phase === "legacy") {
       const held: BoardTask[] = [];
-      for (const state of ["open", "closed"]) {
-        const query = new URLSearchParams({ source: source.id, state, include_history: "1" });
-        if (state === "closed") query.set("closed_after", cutoff);
+      if (
+        prior &&
+        pin?.phase === "legacy" &&
+        prior.pin.sourceGeneration === pin.sourceGeneration &&
+        previous?.sources.find((row) => row.id === source.id)?.last_write?.time ===
+          source.last_write?.time
+      ) {
+        caches[source.id] = prior;
+        tasks.push(...prior.tasks);
+        continue;
+      }
+      if (prior && compatible && prior.pin.phase === "legacy") {
+        const filters = new URLSearchParams({
+          source: source.id,
+          changed_after: new Date(Date.parse(prior.display.asOf) - 60_000).toISOString(),
+        });
         // eslint-disable-next-line no-await-in-loop
-        held.push(...(await pages<BoardTask>("/v1/me/tasks", query, "omnigent.ai:cursor")));
+        const changes = await pages<BoardTask>("/v1/me/tasks", filters, "omnigent.ai:cursor");
+        const merged = new Map(prior.tasks.map((task) => [task.uid, task]));
+        for (const task of changes) {
+          if (task["omnigent.ai:gone"]) merged.delete(task.uid);
+          else merged.set(task.uid, task);
+        }
+        held.push(...merged.values());
+      } else {
+        for (const state of ["open", "closed"]) {
+          const filters = new URLSearchParams({ source: source.id, state });
+          if (state === "closed") filters.set("closed_after", cutoff);
+          // eslint-disable-next-line no-await-in-loop
+          held.push(...(await pages<BoardTask>("/v1/me/tasks", filters, "omnigent.ai:cursor")));
+        }
       }
       const query = new URLSearchParams({ source: source.id });
-      // eslint-disable-next-line no-await-in-loop
-      const history = await pages<BoardEvent>("/v1/me/tasks/history", new URLSearchParams(query));
+      const history: BoardEvent[] = [];
       // eslint-disable-next-line no-await-in-loop
       const counts = await readLocalClosedCounts(new URLSearchParams(query));
       caches[source.id] = {
@@ -98,12 +124,23 @@ export async function readPinnedSources(
           asOf: null,
           phase: "legacy",
         },
-        display: { version: 1, asOf: new Date(now).toISOString(), timeZone: "UTC" },
+        display: {
+          version: 1,
+          asOf: source.last_write?.time ?? new Date(now).toISOString(),
+          timeZone: "UTC",
+        },
         tasks: held,
         history,
         counts: counts.days,
       };
       tasks.push(...held);
+      publish?.({
+        tasks: [...tasks],
+        sources,
+        sourceCaches: { ...caches },
+        sourceStates: { ...states },
+        partial: true,
+      });
       continue;
     }
     if (compatible && (pin.phase === "staging" || pin.id === prior.pin.id)) {
@@ -131,7 +168,6 @@ export async function readPinnedSources(
       for (const state of ["open", "closed"]) {
         const filters = new URLSearchParams(query);
         filters.set("state", state);
-        filters.set("include_history", "1");
         if (state === "closed") filters.set("closed_after", cutoff);
         // eslint-disable-next-line no-await-in-loop
         held.push(...(await pages<BoardTask>("/v1/me/tasks", filters, "omnigent.ai:cursor")));
@@ -143,8 +179,7 @@ export async function readPinnedSources(
         // eslint-disable-next-line no-await-in-loop
         Object.assign(display, { [part]: await pages<unknown>(path, filters) });
       }
-      // eslint-disable-next-line no-await-in-loop
-      const history = await pages<BoardEvent>("/v1/me/tasks/history", new URLSearchParams(query));
+      const history: BoardEvent[] = [];
       // eslint-disable-next-line no-await-in-loop
       const counts = await readLocalClosedCounts(new URLSearchParams(query));
       // A generation change between the final two reads invalidates the whole assembly.
@@ -152,6 +187,13 @@ export async function readPinnedSources(
       await readBoardJson(`${path}?${query}`);
       caches[source.id] = { pin, timeZone, display, tasks: held, history, counts: counts.days };
       tasks.push(...held);
+      publish?.({
+        tasks: [...tasks],
+        sources,
+        sourceCaches: { ...caches },
+        sourceStates: { ...states },
+        partial: true,
+      });
     } catch (error) {
       if (compatible) {
         caches[source.id] = prior;

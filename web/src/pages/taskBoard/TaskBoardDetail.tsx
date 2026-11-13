@@ -128,17 +128,25 @@ export function TaskBoardDetail({
 }) {
   const cadence = useBoardCadence();
   const query = useQuery({
-    queryKey: ["taskBoard", "item", task["omnigent.ai:source"], task.uid, task.updated],
+    queryKey: [
+      "taskBoard",
+      "item",
+      task["omnigent.ai:source"],
+      task.uid,
+      task.updated,
+      sourceCache?.pin?.id,
+      sourceCache?.pin?.sourceGeneration,
+    ],
     queryFn: () =>
       readBoardJson<BoardTask>(
-        `/v1/me/tasks/item?${new URLSearchParams({ source: task["omnigent.ai:source"], uid: task.uid })}`,
+        `/v1/me/tasks/item?${new URLSearchParams({ source: task["omnigent.ai:source"], uid: task.uid, ...(sourceCache?.pin?.id ? { snapshot: sourceCache.pin.id, source_generation: sourceCache.pin.sourceGeneration } : {}) })}`,
       ),
-    enabled: !sourceCache,
+    enabled: !sourceCache || (!!sourceCache.pin && sourceCache.pin.phase !== "staging"),
     retry: false,
     staleTime: 30_000,
     refetchInterval: cadence,
   });
-  const current = sourceCache ? task : (query.data ?? task);
+  const current = query.data ?? task;
   const display = current["omnigent.ai:sourceDisplay"];
   const ids = [
     ...new Set([

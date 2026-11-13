@@ -12,9 +12,9 @@ import httpx
 import jsonschema
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import select, update
+from sqlalchemy import event, select, update
 
-from omnigent.db.db_models import SqlTaskBoardItem, workspace_scope
+from omnigent.db.db_models import SqlTaskBoardHistory, SqlTaskBoardItem, workspace_scope
 from omnigent.db.utils import get_or_create_engine
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.routes.task_board import create_task_board_router
@@ -66,6 +66,82 @@ async def board_client(store):
         headers={"X-Forwarded-Email": "owner@example.com"},
     ) as client:
         yield client
+
+
+@pytest.mark.parametrize("fraction", ["0", "090", "100", "0000000"])
+async def test_query_accepts_iso_fraction_with_trailing_zero(board_client, fraction):
+    response = await board_client.get(
+        "/v1/me/tasks", params={"changed_after": f"2026-11-06T06:30:00.{fraction}Z"}
+    )
+    assert response.status_code == 200
+
+
+def test_read_endpoints_do_not_acquire_owner_write_lock(store, monkeypatch):
+    store.write("owner", "example", parse(task()), NOW)
+
+    def no_write_lock(*args):
+        pytest.fail("Read attempted to acquire the feeder write lock")
+
+    monkeypatch.setattr(store, "_lock_owner", no_write_lock)
+    from omnigent.stores.task_board_store import HistoryQuery
+
+    assert store.list_items("owner", ItemQuery())[0]
+    assert store.get_item("owner", "example", "eng-1")
+    store.list_history("owner", HistoryQuery())
+    store.list_sources("owner")
+    store.closed_counts("owner", after=None, before=None, offset=0, source=None)
+
+
+def test_history_pages_materialize_only_the_page_and_lookahead(store):
+    from omnigent.stores.task_board_store import HistoryQuery
+
+    store.write(
+        "owner",
+        "example",
+        parse(
+            task(
+                **{
+                    "omnigent.ai:history": [
+                        {"id": str(index), "time": STAMP, "kind": "comment"} for index in range(20)
+                    ]
+                }
+            )
+        ),
+        NOW,
+    )
+    loaded = []
+
+    def record(row, context):
+        loaded.append(row.entry_id)
+
+    event.listen(SqlTaskBoardHistory, "load", record)
+    try:
+        entries, cursor = store.list_history("owner", HistoryQuery(limit=2))
+        assert len(entries) == 2 and cursor
+        assert len(loaded) <= 3
+    finally:
+        event.remove(SqlTaskBoardHistory, "load", record)
+
+
+async def test_history_incremental_refresh_includes_backdated_append(board_client, store):
+    store.write("owner@example.com", "example", parse(task()), NOW)
+    store.write(
+        "owner@example.com",
+        "example",
+        parse(task(**{"omnigent.ai:history": [{"id": "late", "time": STAMP, "kind": "comment"}]})),
+        NOW + timedelta(minutes=2),
+    )
+    response = await board_client.get(
+        "/v1/me/tasks/history",
+        params={
+            "changed_after": utc_text((NOW + timedelta(minutes=1)).timestamp()),
+            "after": utc_text((NOW - timedelta(days=3)).timestamp()),
+            "uid": "eng-1",
+            "source": "example",
+        },
+    )
+    assert response.status_code == 200
+    assert [row["id"] for row in response.json()["entries"]] == ["late"]
 
 
 async def test_report_read_replay_and_owner_isolation(board_client, store, db_uri):
