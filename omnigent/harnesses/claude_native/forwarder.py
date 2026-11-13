@@ -5222,6 +5222,7 @@ async def _maybe_rotate_session_on_clear(
         ),
     )
     new_session_id: str | None = None
+    rolled_back = False
     try:
         if clear_record is not None and clear_record.clear_rotated_to:
             new_session_id = clear_record.clear_rotated_to
@@ -5244,8 +5245,33 @@ async def _maybe_rotate_session_on_clear(
             session_id,
             extra={"session_id": session_id},
         )
+        rolled_back = True
     await _write_hook_state_async(bridge_dir, durable)
     reset_transcript_forward_state(bridge_dir, reset_hooks=False)
+    if rolled_back:
+        try:
+            response = await client.post(
+                f"/v1/sessions/{url_component(session_id)}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "[System: Session handover did not complete. The rotation "
+                                "was rolled back; this session continues here. Continue using "
+                                "this session's tools and children.]",
+                            }
+                        ],
+                    },
+                },
+            )
+            response.raise_for_status()
+        except httpx.HTTPError:
+            _logger.warning(
+                "Could not post rotation rollback notice for session=%s", session_id, exc_info=True
+            )
     return new_session_id
 
 

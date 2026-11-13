@@ -9282,7 +9282,7 @@ def _activate_tool_relay(bridge_dir: Path, relay_info: _JsonObject) -> None:
 def _publish_tool_relay(bridge_dir: Path, relay_info: _JsonObject) -> None:
     with _bridge_metadata_write_lock(bridge_dir):
         config = _read_json_file(bridge_dir / _CONFIG_FILE)
-        active = config.get("active_session_id")
+        active = config.get("active_session_id") or config.get("conversation_id")
         candidate = _session_tool_relay_file(bridge_dir, relay_info.get("session_id"))
         # Claude successors initialize before their terminal transfer is confirmed.
         # Other native harnesses do not have an active-session bridge binding.

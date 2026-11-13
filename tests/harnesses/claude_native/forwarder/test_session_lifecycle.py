@@ -460,10 +460,14 @@ async def test_clear_hook_transfer_failure_does_not_loop(
     create_count = 0
     archived: list[str] = []
     closed: list[str] = []
+    notices: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         """Mock rotation endpoints with a failing terminal transfer."""
         nonlocal create_count
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_old/events":
+            notices.append(json.loads(request.content))
+            return httpx.Response(202, json={})
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_old":
             return httpx.Response(
                 200,
@@ -539,6 +543,16 @@ async def test_clear_hook_transfer_failure_does_not_loop(
     assert archived == ["conv_new"]
     assert closed == (["conv_new"] if target_has_terminal else [])
     assert read_active_session_id(bridge_dir) == "conv_old"
+    assert len(notices) == 1
+    assert notices[0]["type"] == "message"
+    assert notices[0]["data"]["role"] == "user"
+    assert notices[0]["data"]["content"] == [
+        {
+            "type": "input_text",
+            "text": "[System: Session handover did not complete. The rotation was rolled back; "
+            "this session continues here. Continue using this session's tools and children.]",
+        }
+    ]
 
 
 @pytest.mark.asyncio
