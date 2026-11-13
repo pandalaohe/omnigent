@@ -667,9 +667,10 @@ async def test_clear_uncertain_then_success_keeps_one_recovery_notice(
     binds = 0
     creates = 0
     notices = []
+    snapshot_failed = False
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal binds, creates
+        nonlocal binds, creates, snapshot_failed
         path = request.url.path
         if request.method == "GET" and path == "/v1/sessions/conv_old":
             return httpx.Response(
@@ -688,7 +689,8 @@ async def test_clear_uncertain_then_success_keeps_one_recovery_notice(
             creates += 1
             return httpx.Response(201, json={"id": "conv_new"})
         if request.method == "GET" and path == "/v1/sessions/conv_new":
-            if binds == 1:
+            if not snapshot_failed:
+                snapshot_failed = True
                 raise httpx.ReadTimeout("snapshot unavailable", request=request)
             return httpx.Response(
                 200, json={"archived": False, "runner_id": "runner", "labels": {}}
