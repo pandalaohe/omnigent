@@ -38,20 +38,18 @@ from omnigent.util.http_retry import bounded_retry_after_seconds
 
 _logger = logging.getLogger(__name__)
 
-# How long every non-tool-call phase (request / result) keeps retrying
-# transient 429 / 5xx / connect errors on the policy evaluate POST before
-# failing closed. Keeps those gates from blocking long on a sick server
-# while still absorbing brief DB hiccups on a hosted deployment. The
-# budget must also land the fail-closed block inside the tightest
-# retrying caller's prompt hook timeout: Claude Code kills a
-# UserPromptSubmit hook at 30s and a killed hook does not block, so a
-# budget that outlasted it would turn the block into a fail-open. Sized
-# 30 - (5 TCP + 5 TLS) - 2 (hook start-up and the failed relay curl) -
-# 3 (margin) = 15: an attempt started just under it can still spend 5s
-# in TCP connect plus 5s in the TLS handshake (httpcore times connect_tcp
-# and start_tls separately) before it fails. A gateway-severed held poll
-# resets it — see :func:`post_evaluate_with_retry`.
+# Default retry budget for request/result phases that do not provide an
+# explicit native enforcement outage wait. Callers that enforce a decision
+# through a longer-lived hook can pass that wait explicitly.
 _EVALUATE_POLICY_RETRY_BUDGET_S = 15.0
+# A result hook is observational: the tool already ran, so an outage must
+# fail open before Claude Code kills its command hook. Claude Code kills a
+# UserPromptSubmit hook at 30s and a killed hook does not block. Sized
+# 30 - (5 TCP + 5 TLS) - 2 (hook start-up and failed relay curl) - 3 (margin)
+# = 15, leaving an attempt started just under the budget enough time to spend
+# 5s in TCP connect plus 5s in the TLS handshake. A gateway-severed held poll
+# resets this budget — see :func:`post_evaluate_with_retry`.
+_EVALUATE_POLICY_FAIL_OPEN_RETRY_BUDGET_S = 15.0
 _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S = 1.0
 _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S = 10.0
 # The tool-call phase gets its own, much longer budget: every harness
@@ -98,6 +96,7 @@ _USER_PROMPT_SUBMIT = "UserPromptSubmit"
 # ``omnigent.policies.types.FAIL_CLOSED_PHASES`` without importing the
 # policy package into this dependency-light hook seam.
 _PHASE_TOOL_CALL = "PHASE_TOOL_CALL"
+_PHASE_TOOL_RESULT = "PHASE_TOOL_RESULT"
 
 # Reason surfaced when a tool call is denied because its policy verdict
 # could not be obtained (server unreachable / non-2xx / empty or malformed
@@ -380,7 +379,7 @@ def hook_payload_to_evaluation_request(
         tool_output = payload.get("tool_response", payload.get("tool_output", ""))
         return {
             "event": {
-                "type": "PHASE_TOOL_RESULT",
+                "type": _PHASE_TOOL_RESULT,
                 "target": "",
                 "data": {
                     "result": tool_output,
@@ -575,9 +574,11 @@ def _retry_budget_for_request(
 
     A ``PHASE_TOOL_CALL`` gate takes :data:`TOOL_CALL_POLICY_RETRY_BUDGET_S`
     with the tool-call backoff cap: its harness hook timeout sits far above
-    it, so the call can ride out a multi-minute outage. Every other phase
-    keeps :data:`_EVALUATE_POLICY_RETRY_BUDGET_S`, which must land its
-    fail-closed block before a prompt hook's kill.
+    it, so the call can ride out a multi-minute outage. A
+    ``PHASE_TOOL_RESULT`` evaluation uses the short fail-open budget because
+    the tool has already run. Other phases use
+    :data:`_EVALUATE_POLICY_RETRY_BUDGET_S` unless ``outage_wait_s`` supplies
+    an explicit native enforcement wait.
 
     :param eval_request: ``EvaluationRequest`` JSON body about to be POSTed.
     :param outage_wait_s: Optional wait limit for a native enforcement gate.
@@ -588,6 +589,8 @@ def _retry_budget_for_request(
     event = eval_request.get("event")
     if isinstance(event, Mapping) and event.get("type") == _PHASE_TOOL_CALL:
         return TOOL_CALL_POLICY_RETRY_BUDGET_S, _TOOL_CALL_POLICY_RETRY_MAX_BACKOFF_S
+    if isinstance(event, Mapping) and event.get("type") == _PHASE_TOOL_RESULT:
+        return _EVALUATE_POLICY_FAIL_OPEN_RETRY_BUDGET_S, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S
     return _EVALUATE_POLICY_RETRY_BUDGET_S, _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S
 
 

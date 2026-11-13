@@ -10123,7 +10123,7 @@ def _tool_relay_handler_factory(
             import httpx
 
             from omnigent.native.native_policy_hook import (
-                _EVALUATE_POLICY_RETRY_BUDGET_S,
+                _EVALUATE_POLICY_FAIL_OPEN_RETRY_BUDGET_S,
                 _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S,
                 _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S,
                 _PRE_TOOL_USE,
@@ -10177,7 +10177,7 @@ def _tool_relay_handler_factory(
             pre_tool_use_delays = iter(_PRE_TOOL_USE_POLICY_EVAL_RETRY_DELAYS_S)
             attempts = 0
             non_connect_failures = 0
-            deadline = time.monotonic() + _EVALUATE_POLICY_RETRY_BUDGET_S
+            deadline = time.monotonic() + _EVALUATE_POLICY_FAIL_OPEN_RETRY_BUDGET_S
             backoff_s = _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
             retry_delay = 0.4
             while enforcement_gate or non_connect_failures < 3:
