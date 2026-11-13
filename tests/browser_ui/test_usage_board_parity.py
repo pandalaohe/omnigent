@@ -221,9 +221,9 @@ def test_usage_ranges_pools_and_navigation(
             link.focus()
             page.keyboard.press("Enter")
         expect(page).to_have_url(appearance_url + "/frame/usage/board/cost")
-        expect(page.locator(".ua-kpi")).to_have_count(4)
+        expect(page.locator(".ua-kpi")).to_have_count(5)
         assert_usage_geometry(
-            page, {'[data-testid="usage-ring"]': 0, ".ua-kpi": 4, '[role="table"]': 1}
+            page, {'[data-testid="usage-ring"]': 0, ".ua-kpi": 5, '[role="table"]': 1}
         )
         page.get_by_role("link", name="Usage", exact=True).click()
         expect(page.get_by_test_id("usage-tile")).to_have_count(50)

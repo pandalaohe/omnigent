@@ -277,7 +277,7 @@ def test_analysis_selection(
     )
     analysis_geometry = {
         '[data-testid="usage-ring"]': 0,
-        ".ua-kpi": 4,
+        ".ua-kpi": 5,
         '[role="table"]': 1,
         ".usage-tabs a": 2,
         '[aria-label="Group by"] button': 4,
@@ -341,6 +341,7 @@ def test_analysis_selection(
     expect(page.get_by_text("90 days has no previous period", exact=True)).to_have_count(2)
     assert_usage_geometry(page, analysis_geometry)
     page.get_by_role("button", name="Card", exact=True).click()
+    analysis_geometry[".ua-kpi"] = 4
     expect(picks.get_by_role("button", name=long_card, exact=True)).to_have_attribute(
         "title", long_card
     )

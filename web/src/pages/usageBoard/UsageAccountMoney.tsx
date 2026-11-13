@@ -1,7 +1,7 @@
 import { Link } from "@/lib/routing";
 import { boardPath } from "@/lib/boardFrame";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
-import { useUsageAnalysis, type AnalysisValue } from "./usageAnalysisData";
+import { analysisValueText, useUsageAnalysis, type AnalysisValue } from "./usageAnalysisData";
 import { decimalDisplay } from "./usagePricingData";
 import type { UsageRange } from "./UsageRangeControl";
 
@@ -12,7 +12,7 @@ export function moneyText(value?: AnalysisValue, ratio = false) {
     value.high !== null
       ? (value.formatted?.high ?? decimalDisplay(value.high, ratio ? 3 : 2, ratio))
       : null;
-  return `${value.state === "partial" ? "≥" : ""}${ratio ? "" : `${value.currency ?? ""} `}${low}${value.state === "range" && high !== null ? `–${high}` : ""}`;
+  return analysisValueText({ ...value, formatted: { low, high } }, ratio ? "ratio" : "money");
 }
 
 export function UsageAccountMoney({

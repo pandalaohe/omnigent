@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { useState } from "react";
 import { UsageAnalysisTable } from "./UsageAnalysisAmounts";
+import { moneyText } from "./UsageAccountMoney";
 import { afterEach, expect, it } from "vitest";
 import {
   AnalysisCards,
@@ -16,6 +17,37 @@ import {
 } from "./usageAnalysisData";
 
 afterEach(cleanup);
+it.each([
+  ["USD", "$10.00"],
+  ["CNY", "¥10.00"],
+  ["HKD", "HK$10.00"],
+])("retains the accepted %s symbol in class-specific Analysis amounts", (currency, expected) => {
+  const paid = value("10", "10.00", currency);
+  render(
+    <UsageAnalysisTable
+      items={[{ key: "a", name: "Alpha", rows: [], projection: { ...fixture().projection, paid } }]}
+      incomplete={false}
+      sort={{ key: "paid", direction: 1 }}
+      onSort={() => {}}
+    />,
+  );
+  const table = screen.getByRole("table", { name: "Each item" });
+  expect(within(table).getByText(expected, { exact: true })).toHaveAttribute(
+    "data-label",
+    "Paid / spend",
+  );
+});
+it("uses the accepted formatter for raw money, ranges, lower bounds and payback", () => {
+  const raw = { ...value("10", "10.00"), formatted: undefined };
+  expect(moneyText(raw)).toBe("$10.00");
+  expect(moneyText({ ...raw, state: "partial", high: null })).toBe("≥$10.00");
+  expect(moneyText({ ...raw, state: "range", high: "12" })).toBe("$10.00–$12.00");
+  expect(moneyText(value("9007199254740993.01", "9007199254740993.01"))).toBe(
+    "$9,007,199,254,740,993.01",
+  );
+  expect(moneyText(value("2", "2.00", null), true)).toBe("2×");
+  expect(moneyText({ ...raw, state: "unknown", low: null, high: null })).toBe("Unknown");
+});
 it.each([
   ["subscription", true, true, 7],
   ["prepaid", true, true, 7],

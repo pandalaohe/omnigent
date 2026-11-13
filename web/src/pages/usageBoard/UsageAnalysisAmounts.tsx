@@ -24,7 +24,7 @@ const number = (value: number | null) =>
     : new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 2 }).format(
         value,
       );
-const percent = (value: number | null) => (value === null ? "Unknown" : `${value.toFixed(2)}%`);
+const percent = (value: number | null) => (value === null ? "Unknown" : `${value.toFixed(1)}%`);
 const colors = [
   "var(--usage-series-1)",
   "var(--usage-series-2)",
