@@ -10,6 +10,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from omnigent.policies.builtins.prompt import _CLASSIFIER_SCHEMA, prompt_policy
+from omnigent.spec.types import DEFAULT_POLICY_CLASSIFIER_TIMEOUT
+
+
+def test_classifier_default_allows_slow_response() -> None:
+    assert DEFAULT_POLICY_CLASSIFIER_TIMEOUT == 60
 
 
 def _make_event(
@@ -89,10 +94,11 @@ async def test_structured_output_schema_forwarded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_llm_error_fails_closed() -> None:
+@pytest.mark.parametrize("error", [RuntimeError("LLM down"), TimeoutError("Classifier timed out")])
+async def test_llm_error_fails_closed(error) -> None:
     """LLM call failure → fail-closed DENY."""
     evaluate = prompt_policy(prompt="Test.")
-    event = _make_event(llm_error=RuntimeError("LLM down"))
+    event = _make_event(llm_error=error)
     result = await evaluate(event)
     assert result is not None
     assert result["result"] == "DENY"

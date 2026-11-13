@@ -18,6 +18,8 @@ from omnigent.harnesses.codex_native.app_server import (
 # Spell out expected approvals; deriving them from the production constant
 # would hide an unintended expansion of the approved tool surface.
 _PLAIN_TOOL_APPROVALS = {
+    "sys_session_get_history": {"approval_mode": "approve"},
+    "sys_standing_approval_read": {"approval_mode": "approve"},
     "sys_session_rename": {"approval_mode": "approve"},
     "sys_session_handover": {"approval_mode": "approve"},
 }

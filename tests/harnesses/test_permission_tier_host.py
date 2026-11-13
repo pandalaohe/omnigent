@@ -101,6 +101,7 @@ def test_windows_nondefault_installation_paths(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setenv("SystemRoot", r"C:\Windows")
     monkeypatch.setenv("ProgramFiles", r"D:\Apps")
     monkeypatch.setenv("ProgramFiles(x86)", r"E:\LegacyApps")
+    monkeypatch.setenv("USERPROFILE", r"C:\opt\work")
     monkeypatch.setattr(
         host,
         "resolve_local_path",
@@ -108,6 +109,7 @@ def test_windows_nondefault_installation_paths(monkeypatch: pytest.MonkeyPatch) 
     )
     state = host.HostPermissionState("s", "h", r"C:\work", "auto", 1, "ready")
     context = host.local_host_context(state, control_paths=(r"C:\control",))
+    assert context.environment["USERPROFILE"] == r"C:\opt\work"
     for path in (r"D:\Apps\Application\config", r"E:\LegacyApps\Application\config"):
         intent = adapt_tool_call("write", {"path": path, "content": "x"}, context)
         assert decide_tier("auto", intent, load_rules()).rule_id == "protected-path"

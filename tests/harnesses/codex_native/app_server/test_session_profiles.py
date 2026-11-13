@@ -30,6 +30,8 @@ from tests.harnesses.codex_native.app_server._support import (
 )
 
 _ROUTED_TOOL_APPROVALS = {
+    "sys_session_get_history": {"approval_mode": "approve"},
+    "sys_standing_approval_read": {"approval_mode": "approve"},
     "sys_session_rename": {"approval_mode": "approve"},
     "sys_session_handover": {"approval_mode": "approve"},
     "sys_session_create": {"approval_mode": "approve"},
@@ -46,6 +48,15 @@ def test_the_framework_tool_approvals_are_scoped_to_the_session_class() -> None:
     # The base set is a subset of the routed one, so a routed session never
     # loses an approval a plain session has.
     assert set(_FRAMEWORK_APPROVED_TOOLS) <= set(_ROUTED_TOOL_APPROVALS)
+
+
+def test_standing_approval_mutations_keep_native_review() -> None:
+    for routed in (False, True):
+        approved = framework_approved_tools(routed_spawns=routed)
+        assert "sys_session_get_history" in approved
+        assert "sys_standing_approval_read" in approved
+        assert "sys_standing_approval" not in approved
+        assert "sys_standing_pass" not in approved
 
 
 # ── The codex-native session classes ────────────────────────────────

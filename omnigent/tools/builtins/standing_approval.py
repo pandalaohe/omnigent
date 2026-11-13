@@ -13,6 +13,7 @@ class SysStandingApprovalTool(Tool):
     @classmethod
     def description(cls) -> str:
         return (
+            "Use sys_standing_approval_read for a read without native approval. "
             "Read the live standing approval before an approval-kind action. "
             "Children can only read. "
             "The parent can revoke kinds, optionally citing a user message as source. "
@@ -42,5 +43,25 @@ class SysStandingApprovalTool(Tool):
                     "required": ["op"],
                     "additionalProperties": False,
                 },
+            },
+        }
+
+
+class SysStandingApprovalReadTool(Tool):
+    @classmethod
+    def name(cls) -> str:
+        return "sys_standing_approval_read"
+
+    @classmethod
+    def description(cls) -> str:
+        return "Read live standing approval. This read-only tool cannot grant or revoke approval."
+
+    def get_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name(),
+                "description": self.description(),
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
             },
         }

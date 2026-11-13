@@ -281,9 +281,13 @@ class ToolManager:
             SysQuotaFloorTool(),
         ):
             self._tools[tool.name()] = tool
-        from omnigent.tools.builtins.standing_approval import SysStandingApprovalTool
+        from omnigent.tools.builtins.standing_approval import (
+            SysStandingApprovalReadTool,
+            SysStandingApprovalTool,
+        )
 
         self._tools[SysStandingApprovalTool.name()] = SysStandingApprovalTool()
+        self._tools[SysStandingApprovalReadTool.name()] = SysStandingApprovalReadTool()
         from omnigent.tools.builtins.approval_answer import SysApprovalAnswerTool
 
         self._tools[SysApprovalAnswerTool.name()] = SysApprovalAnswerTool()

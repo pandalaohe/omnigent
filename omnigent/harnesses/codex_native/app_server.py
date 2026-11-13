@@ -365,8 +365,11 @@ def _format_codex_version(version: tuple[int, int, int] | None) -> str:
 #: Omnigent tools the framework pre-approves so codex never raises an
 #: interactive prompt for them: the rename keeps a session's title current on
 #: any session, and the handover asks for a turn-end rotation whose prompt
-#: would land with nobody watching the terminal.
+#: would land with nobody watching the terminal. The two read tools retain
+#: their server-side authorization checks.
 _FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = (
+    "sys_session_get_history",
+    "sys_standing_approval_read",
     "sys_session_rename",
     "sys_session_handover",
 )
