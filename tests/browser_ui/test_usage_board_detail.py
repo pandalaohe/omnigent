@@ -363,7 +363,8 @@ def test_account_detail_keyboard_ranges_and_return(
             '[data-testid="usage-ring"]': 3,
             '[data-testid="usage-figure"]': 0,
             "[data-usage-amount]": 3,
-            "[data-usage-label]": 3,
+            # Three balance labels plus the window name inside each read compact ring.
+            "[data-usage-label]": 5,
         },
     )
     names_in_view(
