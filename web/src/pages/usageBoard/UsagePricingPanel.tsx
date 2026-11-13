@@ -15,6 +15,7 @@ import {
   RATE_KEYS,
   PRICING_QUERY_KEY,
   PricingSaveError,
+  accountPriceKey,
   decimalDisplay,
   multiplyDecimal,
   reapplyPricing,
@@ -698,17 +699,21 @@ function AccountPriceTable({
   const overrides = baseline.price_overrides ?? [];
   const rows = overrides.filter((row) => row.account_id === parent);
   const models = [
-    ...new Set([
-      ...(accounts.find((account) => account.id === parent)?.models?.map((model) => model.id) ??
-        []),
-      ...rows.map((row) => row.model),
-    ]),
+    ...new Map(
+      [
+        ...(accounts.find((account) => account.id === parent)?.models?.map((model) => model.id) ??
+          []),
+        ...rows.map((row) => row.model),
+      ].map((model) => [accountPriceKey(parent, model), model]),
+    ).values(),
   ].sort();
   function editModel(model: string, rates: Rates) {
     onChange({
       ...baseline,
       price_overrides: [
-        ...overrides.filter((row) => row.account_id !== parent || row.model !== model),
+        ...overrides.filter(
+          (row) => accountPriceKey(row.account_id, row.model) !== accountPriceKey(parent, model),
+        ),
         { account_id: parent, model, ...rates },
       ],
     });
@@ -744,7 +749,10 @@ function AccountPriceTable({
           disabled={
             !parent ||
             !newModel.trim() ||
-            models.some((model) => model.toLowerCase() === newModel.trim().toLowerCase())
+            models.some(
+              (model) =>
+                accountPriceKey(parent, model) === accountPriceKey(parent, newModel.trim()),
+            )
           }
           onClick={() => {
             editModel(newModel.trim(), EMPTY_RATES);
@@ -757,7 +765,7 @@ function AccountPriceTable({
       {models.map((model) => (
         <fieldset
           className="min-w-0 border-t border-border py-2"
-          key={JSON.stringify([parent, model])}
+          key={accountPriceKey(parent, model)}
         >
           <legend className="max-w-full break-all text-xs">{model}</legend>
           <RateInputs
@@ -765,7 +773,11 @@ function AccountPriceTable({
             accountId={parent}
             model={model}
             labelPrefix={`${model} · `}
-            rates={rows.find((row) => row.model === model) ?? EMPTY_RATES}
+            rates={
+              rows.find(
+                (row) => accountPriceKey(parent, row.model) === accountPriceKey(parent, model),
+              ) ?? EMPTY_RATES
+            }
             errors={errors}
             prefix={`price_overrides.${parent}.${model}.`}
             onChange={(rates) => editModel(model, rates)}

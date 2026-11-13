@@ -18,6 +18,9 @@ export interface AccountPriceOverride extends Rates {
   account_id: string;
   model: string;
 }
+export function accountPriceKey(accountId: string, model: string): string {
+  return JSON.stringify([accountId, model.toLowerCase()]);
+}
 export interface CurrentModelPrice {
   imported: Rates | null;
   builtin: Rates | null;
@@ -218,7 +221,7 @@ export function validatePricing(value: PricingBaseline): Record<string, string> 
   const seen = new Set<string>();
   for (const row of value.price_overrides ?? []) {
     const prefix = `price_overrides.${row.account_id}.${row.model}.`;
-    const key = JSON.stringify([row.account_id, row.model.toLowerCase()]);
+    const key = accountPriceKey(row.account_id, row.model);
     if (!row.account_id || !row.model.trim() || row.model.length > 128 || seen.has(key))
       errors[prefix + "model"] = "Choose an account and a unique model id (up to 128 characters).";
     seen.add(key);
@@ -244,16 +247,14 @@ export function reapplyPricing(
   for (const [account, kind] of Object.entries(edit.account_classes ?? {}))
     if (kind !== original.account_classes?.[account]) classes[account] = kind;
   const prices = new Map(
-    (latest.price_overrides ?? []).map((row) => [JSON.stringify([row.account_id, row.model]), row]),
+    (latest.price_overrides ?? []).map((row) => [accountPriceKey(row.account_id, row.model), row]),
   );
   for (const row of edit.price_overrides ?? []) {
-    const key = JSON.stringify([row.account_id, row.model]);
+    const key = accountPriceKey(row.account_id, row.model);
     if (
       JSON.stringify(row) !==
       JSON.stringify(
-        original.price_overrides?.find(
-          (old) => old.account_id === row.account_id && old.model === row.model,
-        ),
+        original.price_overrides?.find((old) => accountPriceKey(old.account_id, old.model) === key),
       )
     )
       prices.set(key, row);
