@@ -33,9 +33,9 @@ from tests.harnesses.claude_native.forwarder._support import (
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reject", [True, False])
+@pytest.mark.parametrize("reject", [True, False, "bound", "unknown"])
 async def test_clear_relay_follows_confirmed_terminal_owner(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reject: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reject: bool | str
 ) -> None:
     from omnigent.harnesses.claude_native import bridge
 
@@ -44,6 +44,8 @@ async def test_clear_relay_follows_confirmed_terminal_owner(
     relays = []
     archived = False
     during_binding = []
+    bind_budgets = []
+    notices = []
 
     def start(session_id: str) -> None:
         async def execute(name: str, arguments: dict[str, Any]) -> object:
@@ -74,6 +76,15 @@ async def test_clear_relay_follows_confirmed_terminal_owner(
             return httpx.Response(
                 200, json={"agent_id": "agent", "runner_id": "runner", "labels": {}}
             )
+        if request.method == "GET" and path == "/v1/sessions/conv_new":
+            if reject == "unknown":
+                raise httpx.ReadTimeout("snapshot unavailable", request=request)
+            return httpx.Response(
+                200, json={"runner_id": "runner" if reject == "bound" else "", "archived": False}
+            )
+        if path.endswith("/events"):
+            notices.append(json.loads(request.content))
+            return httpx.Response(202, json={})
         if path.endswith("/successor"):
             return httpx.Response(201, json={"id": "conv_new"})
         if request.method == "PATCH" and path.endswith("/conv_new"):
@@ -81,6 +92,7 @@ async def test_clear_relay_follows_confirmed_terminal_owner(
             if body.get("archived"):
                 archived = True
             elif body.get("runner_id"):
+                bind_budgets.append(request.extensions["timeout"]["read"])
                 start("conv_new")
                 during_binding.append(json.loads(await call()))
                 if reject:
@@ -94,8 +106,8 @@ async def test_clear_relay_follows_confirmed_terminal_owner(
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(handler), base_url="http://ap"
         ) as client:
-            if reject:
-                with pytest.raises(httpx.ReadTimeout):
+            if reject is True or reject == "unknown":
+                with pytest.raises((httpx.ReadTimeout, RuntimeError)):
                     await forwarder._create_clear_replacement_session(
                         client=client, old_session_id="conv_old", bridge_dir=directory
                     )
@@ -103,9 +115,12 @@ async def test_clear_relay_follows_confirmed_terminal_owner(
                 await forwarder._create_clear_replacement_session(
                     client=client, old_session_id="conv_old", bridge_dir=directory
                 )
-        assert archived is reject
-        assert json.loads(await call()) == {"session_id": "conv_old" if reject else "conv_new"}
+        assert archived is (reject is True)
+        assert json.loads(await call()) == {
+            "session_id": "conv_old" if reject is True or reject == "unknown" else "conv_new"
+        }
         assert during_binding == [{"session_id": "conv_old"}]
+        assert bind_budgets == [180.0]
     finally:
         for relay in reversed(relays):
             await asyncio.to_thread(relay.close)
@@ -291,9 +306,13 @@ async def test_requested_handover_keeps_empty_succession_default(
 
     bridge_dir = prepare_bridge_dir("conv_old", bridge_id="bridge_shared", workspace=tmp_path)
     paths: list[str] = []
+    notices: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         paths.append(request.url.path)
+        if request.url.path == "/v1/sessions/conv_new/events":
+            notices.append(json.loads(request.content))
+            return httpx.Response(202, json={})
         if request.method == "GET":
             return httpx.Response(
                 200,
@@ -321,6 +340,9 @@ async def test_requested_handover_keeps_empty_succession_default(
             == "conv_new"
         )
     assert not any(path.endswith("/succession") for path in paths)
+    assert len(notices) == 1
+    text = notices[0]["data"]["content"][0]["text"]
+    assert "Clear accepted" in text and "sys_session_get_history" in text and "conv_old" in text
 
 
 @pytest.mark.asyncio
@@ -546,13 +568,59 @@ async def test_clear_hook_transfer_failure_does_not_loop(
     assert len(notices) == 1
     assert notices[0]["type"] == "message"
     assert notices[0]["data"]["role"] == "user"
-    assert notices[0]["data"]["content"] == [
-        {
-            "type": "input_text",
-            "text": "[System: Session handover did not complete. The rotation was rolled back; "
-            "this session continues here. Continue using this session's tools and children.]",
-        }
-    ]
+    text = notices[0]["data"]["content"][0]["text"]
+    assert "Clear accepted" in text
+    assert "continues here" in text
+    assert "sys_session_get_history" in text
+    assert "conv_old" in text
+
+
+@pytest.mark.asyncio
+async def test_clear_successor_refusal_preserves_reason_and_handover_recovery(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    directory = prepare_bridge_dir("conv_old", bridge_id="shared", workspace=tmp_path)
+    record_hook_event(directory, {"hook_event_name": "SessionStart", "source": "clear"})
+    notices = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "agent_id": "agent",
+                    "runner_id": "runner",
+                    "labels": {"omnigent.handover_item": "note_one"},
+                },
+            )
+        if request.url.path.endswith("/successor"):
+            return httpx.Response(
+                409, json={"error": {"message": "Successor refused: Source incarnation changed"}}
+            )
+        assert request.url.path == "/v1/sessions/conv_old/events"
+        notices.append(json.loads(request.content))
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        for _ in range(2):
+            state = await forwarder._ensure_hook_state(
+                directory, start_at_end=False, session_id="conv_old"
+            )
+            assert (
+                await forwarder._maybe_rotate_session_on_clear(
+                    client=client, session_id="conv_old", bridge_dir=directory, state=state
+                )
+                is None
+            )
+    assert len(notices) == 1
+    text = notices[0]["data"]["content"][0]["text"]
+    assert "Clear accepted" in text
+    assert "successor creation was refused" in text
+    assert "HTTP 409" in text and "Source incarnation changed" in text
+    assert "sys_session_get_history" in text and "conv_old" in text
+    assert "HTTP 409" in caplog.text and "Source incarnation changed" in caplog.text
 
 
 @pytest.mark.asyncio

@@ -218,6 +218,7 @@ _PROVIDER_USAGE_LIMITS_REFRESH_INTERVAL_S = 300
 # progress rather than that a healthy backlog drain simply took a long time.
 _FORWARD_LOOP_STALL_DEADLINE_S = 300.0
 _POST_TIMEOUT_S = 10.0
+_CLEAR_SUCCESSOR_BIND_TIMEOUT_S = 180.0
 # A child-history POST carries up to 100 items and can outlast the live lane's
 # budget; that lane runs off the latency-sensitive path, so it gets more room.
 _SUBAGENT_POST_TIMEOUT_S = 30.0
@@ -5179,6 +5180,42 @@ async def supervise_forwarder(
         backoff_s = min(backoff_s * 2.0, _SUPERVISOR_MAX_BACKOFF_S)
 
 
+class _ClearSuccessorRefused(RuntimeError):
+    """The clear landed, but the server refused to prepare its successor."""
+
+
+async def _post_clear_recovery_notice(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    source_id: str,
+    detail: str,
+    notice_key: str,
+) -> None:
+    text = (
+        f"[System: Clear accepted. {detail} "
+        f"If the handover note is missing, call sys_session_get_history for session "
+        f"'{source_id}' and read its latest handover note before continuing work.]"
+    )
+    try:
+        response = await client.post(
+            f"/v1/sessions/{url_component(session_id)}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "stable_id": hashlib.sha256(notice_key.encode()).hexdigest()[:32],
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            },
+        )
+        response.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Could not post clear recovery notice for session=%s", session_id, exc_info=True
+        )
+
+
 async def _maybe_rotate_session_on_clear(
     *,
     client: httpx.AsyncClient,
@@ -5222,7 +5259,6 @@ async def _maybe_rotate_session_on_clear(
         ),
     )
     new_session_id: str | None = None
-    rolled_back = False
     try:
         if clear_record is not None and clear_record.clear_rotated_to:
             new_session_id = clear_record.clear_rotated_to
@@ -5234,8 +5270,20 @@ async def _maybe_rotate_session_on_clear(
             )
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as exc:
         pending = _read_hook_state(bridge_dir)
+        detail = (
+            str(exc)
+            if isinstance(exc, _ClearSuccessorRefused)
+            else f"Session handover did not complete ({type(exc).__name__})."
+        )
+        await _post_clear_recovery_notice(
+            client,
+            session_id=read_active_session_id(bridge_dir) or session_id,
+            source_id=session_id,
+            detail=detail + " This session continues here.",
+            notice_key=f"clear-recovery:{session_id}:{durable.event_cursor}",
+        )
         if pending is not None and pending.pending_clear_new_id:
             # Retry the same candidate; unknown ownership is not rejection.
             raise
@@ -5245,33 +5293,8 @@ async def _maybe_rotate_session_on_clear(
             session_id,
             extra={"session_id": session_id},
         )
-        rolled_back = True
     await _write_hook_state_async(bridge_dir, durable)
     reset_transcript_forward_state(bridge_dir, reset_hooks=False)
-    if rolled_back:
-        try:
-            response = await client.post(
-                f"/v1/sessions/{url_component(session_id)}/events",
-                json={
-                    "type": "message",
-                    "data": {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": "[System: Session handover did not complete. The rotation "
-                                "was rolled back; this session continues here. Continue using "
-                                "this session's tools and children.]",
-                            }
-                        ],
-                    },
-                },
-            )
-            response.raise_for_status()
-        except httpx.HTTPError:
-            _logger.warning(
-                "Could not post rotation rollback notice for session=%s", session_id, exc_info=True
-            )
     return new_session_id
 
 
@@ -5358,6 +5381,18 @@ async def _create_clear_replacement_session(
             raise RuntimeError("clear replacement was already rejected and archived")
     if new_session_id is None:
         create_resp = await client.post(f"/v1/sessions/{url_component(old_session_id)}/successor")
+        if create_resp.is_error:
+            try:
+                error = create_resp.json().get("error", {})
+                reason = error.get("message") if isinstance(error, dict) else None
+            except (ValueError, AttributeError):
+                reason = None
+            detail = (
+                f"successor creation was refused (HTTP {create_resp.status_code}: "
+                f"{reason[:500] if isinstance(reason, str) else 'no reason returned'})."
+            )
+            _logger.warning("Clear accepted but %s source=%s", detail, old_session_id)
+            raise _ClearSuccessorRefused(detail)
         create_resp.raise_for_status()
         created = _parse_json_response(create_resp, context="clear-replacement session create")
         new_session_id = created.get("id")
@@ -5396,11 +5431,27 @@ async def _create_clear_replacement_session(
             source_present, target_present = await owners()
             transferred = target_present and not source_present
         if isinstance(runner_id, str) and runner_id:
-            bind_resp = await client.patch(
-                f"/v1/sessions/{url_component(new_session_id)}",
-                json={"runner_id": runner_id},
-            )
-            bind_resp.raise_for_status()
+            try:
+                bind_resp = await client.patch(
+                    f"/v1/sessions/{url_component(new_session_id)}",
+                    json={"runner_id": runner_id},
+                    timeout=_CLEAR_SUCCESSOR_BIND_TIMEOUT_S,
+                )
+                bind_resp.raise_for_status()
+            except httpx.TimeoutException:
+                try:
+                    candidate = await _fetch_session_snapshot(client, new_session_id)
+                except (httpx.HTTPError, RuntimeError) as exc:
+                    # Keep the durable candidate: a missing read is not a failed bind.
+                    raise RuntimeError(
+                        "Successor binding is unconfirmed; retry reconciliation"
+                    ) from exc
+                if candidate.get("archived") or candidate.get("runner_id") != runner_id:
+                    raise
+                _logger.info(
+                    "Successor bind timed out but server confirms runner; session=%s",
+                    new_session_id,
+                )
         if not transferred:
             transfer_resp = await client.post(
                 (
@@ -5408,6 +5459,7 @@ async def _create_clear_replacement_session(
                     f"/resources/terminals/{url_component(terminal_id)}/transfer"
                 ),
                 json={"target_session_id": new_session_id},
+                timeout=_CLEAR_SUCCESSOR_BIND_TIMEOUT_S,
             )
             transfer_resp.raise_for_status()
     except httpx.HTTPError:
@@ -5475,6 +5527,14 @@ async def _create_clear_replacement_session(
             old_session_id=old_session_id,
             new_session_id=new_session_id,
             allow_empty=True,
+        )
+    else:
+        await _post_clear_recovery_notice(
+            client,
+            session_id=new_session_id,
+            source_id=old_session_id,
+            detail="Session handover is continuing in this session.",
+            notice_key=f"clear-handover:{old_session_id}:{new_session_id}",
         )
     return new_session_id
 
