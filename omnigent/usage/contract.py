@@ -473,6 +473,9 @@ class UsageAnalysisView(BaseModel):
     partial: bool = False
     row_limit: int = 0
     pricing: dict[str, Any] | None = None
+    account_cost_classes: dict[
+        str, Literal["subscription", "prepaid", "metered", "free"] | None
+    ] = Field(default_factory=dict)
     quota_closings: list[dict[str, Any]] = Field(default_factory=list)
 
 

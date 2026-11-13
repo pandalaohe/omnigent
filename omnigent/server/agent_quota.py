@@ -1532,6 +1532,9 @@ class AgentQuotaService:
         )
         return UsageAnalysisView(
             generated_at=now,
+            account_cost_classes=self.pricing_store.class_defaults(owner, list(views.values()))
+            if self.pricing_store is not None
+            else {},
             range=range_key,
             tz=tz,
             span=AnalysisSpan(

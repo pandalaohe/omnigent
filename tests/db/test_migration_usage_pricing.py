@@ -27,5 +27,13 @@ def test_pricing_migration_additive_roundtrip(db_uri):
         )
         assert amount["type"].precision == 38
         assert amount["type"].scale == 18
+        columns = {
+            column["name"]: column
+            for column in sa.inspect(engine).get_columns("usage_pricing_cards")
+        }
+        assert columns["allowance_usd"]["nullable"]
+        assert "account_classes" in {
+            column["name"] for column in sa.inspect(engine).get_columns("usage_pricing_defaults")
+        }
     finally:
         _alembic_command(db_uri, migration_engine, "upgrade", "head")

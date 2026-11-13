@@ -24,6 +24,23 @@ The compact settings UI is a separate consumer of these endpoints.
 6. Submit real pre-reset windows with `polling_seconds` to retain closing evidence.
    Analysis `quota_closings` returns observation time and bounds; absent polling
    cadence or stale evidence remains Unknown. Editing prices leaves it unchanged.
+7. Set the account class to subscription and enter a repeating monthly card with
+   no allowance. Use a January 31 start and inspect February and March: renewal
+   follows the original day, clamped only in shorter months. Future periods do
+   not appear as paid. Cancel before a later renewal or replace the card: earlier
+   periods retain their payment, and no new period starts at or after that
+   boundary. The detail page shows the next renewal while renewal remains active.
+8. Edit the existing repeating card's amount or inherited discount. Before saving,
+   inspect the recomputed past periods. To change only future fees, end that card
+   and start another at the chosen boundary instead. Refresh after saving and
+   confirm the retained cards and revision. A repeating card on a non-subscription
+   account must be refused, as must a one-off card without a positive allowance.
+9. Compare subscription, prepaid, metered, free and unset accounts in settings,
+   tile, detail and Analysis. Subscription/prepaid show API value, paid and
+   payback; metered shows spend without payback; free shows usage and quota
+   without money. Unset money remains Unknown with a pricing action. An old
+   Monthly fee prefills a draft only: cancel the draft and refresh to verify no
+   payment was created. Money has two decimal places throughout.
 
 Run the focused pricing math, route, store, quota-closing and migration tests
 through the repository's isolated test entry. Database verification covers all

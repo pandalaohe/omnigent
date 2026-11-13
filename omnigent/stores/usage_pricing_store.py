@@ -10,13 +10,15 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
+    SqlUsageHour,
     SqlUsagePricingCard,
     SqlUsagePricingDefaults,
     current_workspace_id,
 )
 from omnigent.db.utils import run_write_transaction
 from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
-from omnigent.usage.pricing import PricingBaseline, PricingDefaults
+from omnigent.usage.contract import UsageAccountView
+from omnigent.usage.pricing import CostClass, PricingBaseline, PricingDefaults, default_cost_class
 
 
 class PricingConflict(ValueError):
@@ -30,6 +32,32 @@ class UsagePricingStore:
     def read(self, owner: str) -> PricingBaseline:
         with self.sessions._read_session()("read_pricing_baseline") as session:
             return self._read(session, owner)
+
+    def class_defaults(
+        self, owner: str, accounts: list[UsageAccountView]
+    ) -> dict[str, CostClass | None]:
+        native_ids = {"native:" + account.id for account in accounts if account.kind == "native"}
+        bases: dict[str, set[str]] = {}
+        if native_ids:
+            with self.sessions._read_session()("read_account_billing_bases") as session:
+                for account_id, basis in session.execute(
+                    select(SqlUsageHour.account_id, SqlUsageHour.basis)
+                    .where(
+                        SqlUsageHour.workspace_id == current_workspace_id(),
+                        SqlUsageHour.owner_id == owner,
+                        SqlUsageHour.account_id.in_(native_ids),
+                    )
+                    .distinct()
+                ):
+                    bases.setdefault(account_id, set()).add(basis)
+        return {
+            account.id: default_cost_class(
+                account.source_type,
+                native=account.kind == "native",
+                bases=bases.get("native:" + account.id),
+            )
+            for account in accounts
+        }
 
     @staticmethod
     def _read(session: Session, owner: str) -> PricingBaseline:
@@ -54,6 +82,7 @@ class UsagePricingStore:
             if row is None
             else PricingDefaults.model_validate_json(row.payload),
             cards=[json.loads(card.payload) for _, card in rows if card is not None],
+            account_classes=json.loads(row.account_classes or "{}") if row is not None else {},
         )
 
     def save(
@@ -63,6 +92,7 @@ class UsagePricingStore:
         *,
         known_accounts: set[str],
         pools: set[tuple[str, str]],
+        default_classes: dict[str, CostClass | None] | None = None,
     ) -> PricingBaseline:
         def apply(session: Session) -> PricingBaseline:
             require_active_account(session, owner)
@@ -76,9 +106,27 @@ class UsagePricingStore:
             old_cards = {card.id: card for card in old.cards}
             new_cards = dict(old_cards)
             new_cards.update({card.id: card for card in edit.cards})
+            classes = dict(old.account_classes)
+            for account_id, kind in edit.account_classes.items():
+                if account_id not in known_accounts and account_id not in old.account_classes:
+                    raise ValueError("class account must belong to this owner/workspace")
+                if kind is None:
+                    classes.pop(account_id, None)
+                else:
+                    classes[account_id] = kind
             merged = PricingBaseline(
-                revision=old.revision + 1, defaults=edit.defaults, cards=list(new_cards.values())
+                revision=old.revision + 1,
+                defaults=edit.defaults,
+                cards=list(new_cards.values()),
+                account_classes=classes,
             )
+            for card in merged.cards:
+                if (
+                    card.repeats
+                    and (classes.get(card.parent) or (default_classes or {}).get(card.parent))
+                    != "subscription"
+                ):
+                    raise ValueError("automatic renewal requires subscription cost class")
             if old.defaults.display_currency != edit.defaults.display_currency:
                 merged.defaults = PricingDefaults(
                     default_discount=edit.defaults.default_discount,
@@ -103,7 +151,9 @@ class UsagePricingStore:
                         owner_id=owner,
                         card_id=card.id,
                         retail_amount=Decimal(card.retail_amount),
-                        allowance_usd=Decimal(card.allowance_usd),
+                        allowance_usd=Decimal(card.allowance_usd)
+                        if card.allowance_usd is not None
+                        else None,
                         discount_override=None
                         if card.discount_override is None
                         else Decimal(card.discount_override),
@@ -132,6 +182,7 @@ class UsagePricingStore:
                     if "HKD" in merged.defaults.fx_to_display
                     else None,
                     payload=merged.defaults.model_dump_json(),
+                    account_classes=json.dumps(merged.account_classes),
                 )
             )
             return merged
