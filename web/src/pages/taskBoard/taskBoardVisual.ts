@@ -1,3 +1,4 @@
+import { isBlankDetailValue } from "./taskBoardPresentation";
 import type { BoardTask } from "./taskBoardData";
 import type { TaskDisplay } from "./taskBoardDisplay";
 
@@ -29,7 +30,11 @@ export function boardFiles(rows: NonNullable<TaskDisplay["rows"]>) {
   const seen = new Set<string>();
   const files = rows
     .filter(
-      (row) => /^path(?:[._-]|$)/.test(row.id) && !seen.has(row.value) && !!seen.add(row.value),
+      (row) =>
+        !isBlankDetailValue(row.value) &&
+        /^path(?:[._-]|$)/.test(row.id) &&
+        !seen.has(row.value) &&
+        !!seen.add(row.value),
     )
     .map((row) => {
       const path = row.value,

@@ -7,7 +7,7 @@ import { TaskBoardLog } from "./TaskBoardLog";
 import { TaskBoardHistory } from "./TaskBoardHistory";
 import { TaskBoardToday } from "./TaskBoardToday";
 import { TaskBoardHistoryChart } from "./TaskBoardHistoryChart";
-import { activityMoney } from "./TaskBoardActivityParts";
+import { activityMoney, activityNumber, activityDuration } from "./TaskBoardActivityParts";
 import type { BoardTask } from "./taskBoardData";
 import type { SourceCache } from "./taskBoardSnapshotData";
 
@@ -633,4 +633,165 @@ it("opens the task button from the keyboard without toggling its enclosing event
   expect(select).toHaveBeenCalledWith(a);
   expect(screen.getByRole("button", { name: "Resume" })).toBeTruthy();
   expect(container.querySelector(".lr")?.getAttribute("aria-expanded")).toBe("false");
+});
+
+it.each(["agent", "outcome", "cost"])(
+  "keeps the History plot and totals consistent under the %s filter",
+  (filter) => {
+    const a = task("Matching"),
+      b = task("Excluded");
+    b["omnigent.ai:sourceDisplay"]!.historyState!.outcome = "dropped";
+    b["omnigent.ai:sourceDisplay"]!.intervals![0].agentId = "claude";
+    b["omnigent.ai:sourceDisplay"]!.intervals![0].cost!.amount = 5;
+    const { container } = render(
+      <MemoryRouter>
+        <TaskBoardHistory
+          tasks={[a, b]}
+          sessions={[]}
+          caches={{}}
+          counts={[]}
+          now={now}
+          onSelect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    const plotTotal = () =>
+      [...container.querySelectorAll(".r-hit title")].reduce(
+        (sum, el) => sum + Number(el.textContent?.match(/: (\d+) cards/)?.[1] ?? 0),
+        0,
+      );
+    expect(plotTotal()).toBe(2);
+    if (filter === "cost") fireEvent.click(screen.getByRole("button", { name: "≥ $10" }));
+    else {
+      fireEvent.click(container.querySelectorAll(".fdd")[filter === "agent" ? 1 : 2]);
+      const options = container.querySelector(".fopts")!;
+      fireEvent.click(
+        within(options as HTMLElement).getByRole("button", {
+          name: filter === "agent" ? /Codex/ : /Completed/,
+        }),
+      );
+    }
+    expect(container.querySelector(".h-stat>b")?.textContent).toBe("1");
+    expect(plotTotal()).toBe(1);
+    expect(container.querySelectorAll(".r-names button:not(:disabled)").length).toBeGreaterThan(0);
+  },
+);
+
+it.each([false, true])(
+  "distinguishes unavailable work duration from measured zero (measured=%s)",
+  (measured) => {
+    const value = task("Duration");
+    if (measured)
+      value["omnigent.ai:sourceDisplay"]!.intervals![0].to =
+        value["omnigent.ai:sourceDisplay"]!.intervals![0].from;
+    else value["omnigent.ai:sourceDisplay"]!.intervals = [];
+    const { container } = render(
+      <MemoryRouter>
+        <TaskBoardHistory
+          tasks={[value]}
+          sessions={[]}
+          caches={{}}
+          counts={[]}
+          now={now}
+          onSelect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(container.querySelectorAll(".h-stat>b")[1].textContent).toBe(measured ? "0 h" : "—");
+    expect(container.querySelectorAll(".h-p .h-num b")[1].textContent).toBe(measured ? "0m" : "—");
+    if (!measured)
+      expect(screen.getByText("No reported work intervals in this range")).toBeTruthy();
+  },
+);
+
+it("enforces decimal limits on small hours, ordinary values and compact counts", () => {
+  expect([45 / 3600, 0.000012345, 1.23456789, 1234, 1234567].map(activityNumber)).toEqual([
+    "0.013",
+    "0",
+    "1.23",
+    "1.23K",
+    "1.23M",
+  ]);
+  expect(activityMoney(0.0125)).toBe("$0.01");
+  expect(activityDuration(0)).toBe("0m");
+});
+
+it("keeps a current failing receipt ahead of recovered or hidden-host failures at the eleven-row limit", () => {
+  const at = new Date(now).toISOString(),
+    old = new Date(now - DAY).toISOString();
+  const values = Array.from({ length: 11 }, (_, i) => {
+    const value = task(`Recovered ${i}`);
+    value["omnigent.ai:sourceDisplay"]!.historyState!.active = true;
+    value["omnigent.ai:sourceDisplay"]!.lastActivity = at;
+    value["omnigent.ai:sourceDisplay"]!.checks = [
+      { id: "old", host: "visible", at: old, verdict: "failed", count: 1 },
+      { id: "latest", host: "visible", at, verdict: "passed", count: 2 },
+      { id: "hidden", host: "hidden", at, verdict: "failed", count: 1 },
+    ];
+    return value;
+  });
+  const current = task("Current failure");
+  current["omnigent.ai:sourceDisplay"]!.historyState!.active = true;
+  current["omnigent.ai:sourceDisplay"]!.lastActivity = old;
+  current["omnigent.ai:sourceDisplay"]!.checks = [
+    { id: "bad", host: "visible", at, verdict: "failed", count: 1 },
+  ];
+  const c = cache(values);
+  c.display.checkHosts = ["visible", "other"];
+  const { container } = render(
+    <TaskBoardToday
+      tasks={[...values, current]}
+      sessions={[]}
+      caches={{ engineering: c }}
+      now={now}
+      onSelect={vi.fn()}
+    />,
+  );
+  const rows = container.querySelectorAll(".td-rcp tbody tr");
+  expect(rows).toHaveLength(11);
+  expect(rows[0].textContent).toContain("Current failure");
+  expect(rows[0].querySelector(".v-failed")).toBeTruthy();
+  expect(rows[1].querySelector(".v-passed")).toBeTruthy();
+});
+
+it("shows Today task keys and uses the same account color for its mark and bar, with the cost explanation on the estimate", () => {
+  const value = task("Title");
+  value["omnigent.ai:sourceDisplay"]!.identity!.key = "ENG-123";
+  const c = cache([value]);
+  c.display.accounts = [
+    {
+      ref: { namespace: "team", id: "one" },
+      label: "Example account",
+      authoritySource: "engineering",
+      timeZone: "UTC",
+    },
+  ];
+  c.display.accountDays = [
+    {
+      id: "day",
+      account: { namespace: "team", id: "one" },
+      date: "2026-11-12",
+      amount: 2.345,
+      kind: "estimate",
+      sourceLabel: "Meter",
+    },
+  ];
+  const { container } = render(
+    <TaskBoardToday
+      tasks={[value]}
+      sessions={[]}
+      caches={{ engineering: c }}
+      now={now}
+      onSelect={vi.fn()}
+    />,
+  );
+  expect(container.querySelector(".td-x code")?.textContent).toBe("ENG-123");
+  const account = container.querySelector(".td-h")!;
+  expect((account.querySelector(".td-bar u") as HTMLElement).style.background).toBe(
+    (account.querySelector(".tb-identity-mark") as HTMLElement).style.background,
+  );
+  expect(container.querySelector(".td-foot")).toBeNull();
+  expect(container.querySelector(".td-res h3 em")?.getAttribute("title")).toContain(
+    "API price estimates",
+  );
 });

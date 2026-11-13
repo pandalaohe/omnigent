@@ -18,6 +18,7 @@ export function TaskBoardHistoryChart({
   historyStart,
   capped,
   sourceColors,
+  legendSources,
   selectedSources,
   onSource,
   sourceLabels,
@@ -32,6 +33,7 @@ export function TaskBoardHistoryChart({
   historyStart: number;
   capped: boolean;
   sourceColors: Map<string, string>;
+  legendSources?: string[];
   selectedSources: string[];
   onSource: (source: string) => void;
   sourceLabels?: Record<string, string>;
@@ -95,6 +97,9 @@ export function TaskBoardHistoryChart({
     ),
     top = sources.slice(0, 6),
     stacks = [...top, ...(sources.length > 6 ? ["other"] : [])],
+    legend = legendSources?.length
+      ? [...legendSources.slice(0, 6), ...(legendSources.length > 6 ? ["other"] : [])]
+      : stacks,
     palette = stacks.map((source) =>
       source === "other" ? "var(--fg3)" : (sourceColors.get(source) ?? "var(--muted-foreground)"),
     );
@@ -131,7 +136,7 @@ export function TaskBoardHistoryChart({
           )}
         </b>
         <span className="r-names">
-          {stacks.map((s, i) => (
+          {legend.map((s) => (
             <button
               type="button"
               key={s}
@@ -139,7 +144,7 @@ export function TaskBoardHistoryChart({
               aria-pressed={!selectedSources.length || selectedSources.includes(s)}
               onClick={() => onSource(s)}
             >
-              <i style={{ background: palette[i] }}>
+              <i style={{ background: s === "other" ? "var(--fg3)" : sourceColors.get(s) }}>
                 {s === "other" ? "…" : activitySourceName(s, undefined, sourceLabels).slice(0, 1)}
               </i>
               {s === "other" ? t("g6.other") : activitySourceName(s, undefined, sourceLabels)}

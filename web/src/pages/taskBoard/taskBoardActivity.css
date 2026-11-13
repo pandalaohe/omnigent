@@ -2009,17 +2009,52 @@
   --run-t: var(--link);
   --run-b: color-mix(in srgb, var(--link) 13%, var(--background));
   .td {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(12, minmax(0, 1fr));
     gap: 12px;
   }
-  .td-ship,
-  .td-rcp {
-    grid-column: 1/-1;
+  .td-ship {
+    grid-column: span 12;
   }
-  .td-dec,
+  .td.has-receipts .td-ship {
+    grid-column: span 5;
+  }
+  .td-rcp {
+    grid-column: span 7;
+  }
   .td-who,
   .td-res {
-    grid-column: span 1;
+    grid-column: span 6;
+  }
+  .td-dec {
+    grid-column: span 5;
+  }
+  .td.has-decisions .td-who {
+    grid-column: span 3;
+  }
+  .td.has-decisions .td-res {
+    grid-column: span 4;
+  }
+  .td.has-receipts .td-ship-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .td-x {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    min-width: 0;
+  }
+  .td-task-title {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .td-x code {
+    flex: none;
+    white-space: nowrap;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--fg2);
   }
   .td-ship-body {
     display: grid;
@@ -2209,6 +2244,9 @@
   @container (max-width: 620px) {
     .td {
       grid-template-columns: minmax(0, 1fr);
+    }
+    .td > .td-p {
+      grid-column: 1/-1;
     }
     .td-ship-body {
       grid-template-columns: minmax(0, 1fr);

@@ -17,6 +17,11 @@ const colours = [
   "#6cbe45",
   "#996633",
 ];
+export function boardIdentityColor(id: string) {
+  let hash = 0;
+  for (let index = 0; index < id.length; index++) hash = (hash * 31 + id.charCodeAt(index)) >>> 0;
+  return colours[hash % colours.length];
+}
 function agentIcon(product?: string | null) {
   return product === "claude"
     ? Claude
@@ -65,8 +70,6 @@ export function BoardIdentityMark({
   neutral?: boolean;
   color?: string;
 }) {
-  let hash = 0;
-  for (let index = 0; index < id.length; index++) hash = (hash * 31 + id.charCodeAt(index)) >>> 0;
   const Icon = agentIcon(product);
   return (
     <span
@@ -80,7 +83,7 @@ export function BoardIdentityMark({
           ? undefined
           : neutral
             ? "var(--secondary)"
-            : (color ?? colours[hash % colours.length]),
+            : (color ?? boardIdentityColor(id)),
         color: !Icon && neutral ? "var(--muted-foreground)" : undefined,
         fontSize: Math.round(size * 0.58),
       }}

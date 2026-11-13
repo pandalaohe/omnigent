@@ -27,3 +27,10 @@ it("removes date, task and type affixes and distinguishes otherwise equal file e
     ["task placement", "design", true],
   ]);
 });
+
+it.each(["", " ", "—", "-", "none", "n/a"])(
+  "does not turn a blank artifact placeholder %j into a file",
+  (value) => {
+    expect(boardFiles([{ id: "path-0", label: "Design", value }])).toEqual([]);
+  },
+);

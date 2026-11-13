@@ -6,10 +6,11 @@ import { accountTotals } from "./taskBoardHistoryData";
 import { latestRelease, type SourceCache } from "./taskBoardSnapshotData";
 import { localDay } from "./taskBoardActivityData";
 import { t } from "./taskBoardText";
-import { BoardIdentityMark } from "./BoardIdentityMark";
+import { BoardIdentityMark, boardIdentityColor } from "./BoardIdentityMark";
 import {
   activityNumber,
   activityTaskName,
+  activityTaskKey,
   activityAgentName,
   activitySourceName,
   activityStamp,
@@ -98,26 +99,30 @@ export function TaskBoardToday({
       2,
     );
   const receipts = tasks
-    .filter(
-      (task) =>
-        task["omnigent.ai:sourceDisplay"]?.historyState?.active !== false &&
-        task["omnigent.ai:sourceDisplay"]?.checks?.some((c) => hosts.includes(c.host)),
-    )
-    .sort(
-      (a, b) =>
+    .filter((task) => task["omnigent.ai:sourceDisplay"]?.historyState?.active !== false)
+    .map((task) => ({
+      task,
+      checks: hosts.map(
+        (host) =>
+          task["omnigent.ai:sourceDisplay"]?.checks
+            ?.filter((check) => check.host === host)
+            .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0],
+      ),
+    }))
+    .filter((row) => row.checks.some(Boolean))
+    .sort((a, b) => {
+      const priority = (checks: typeof a.checks) =>
         Math.min(
-          ...(a["omnigent.ai:sourceDisplay"]?.checks ?? []).map((c) =>
-            c.verdict === "failed" ? 0 : c.verdict === "flaky" ? 1 : 2,
+          ...checks.map((check) =>
+            check?.verdict === "failed" ? 0 : check?.verdict === "flaky" ? 1 : 2,
           ),
-        ) -
-          Math.min(
-            ...(b["omnigent.ai:sourceDisplay"]?.checks ?? []).map((c) =>
-              c.verdict === "failed" ? 0 : c.verdict === "flaky" ? 1 : 2,
-            ),
-          ) ||
-        Date.parse(b["omnigent.ai:sourceDisplay"]?.lastActivity ?? b.updated ?? "") -
-          Date.parse(a["omnigent.ai:sourceDisplay"]?.lastActivity ?? a.updated ?? ""),
-    );
+        );
+      return (
+        priority(a.checks) - priority(b.checks) ||
+        Date.parse(b.task["omnigent.ai:sourceDisplay"]?.lastActivity ?? b.task.updated ?? "") -
+          Date.parse(a.task["omnigent.ai:sourceDisplay"]?.lastActivity ?? a.task.updated ?? "")
+      );
+    });
   const quotes = tasks
     .flatMap((task) =>
       (task["omnigent.ai:sourceDisplay"]?.quotes ?? [])
@@ -162,7 +167,9 @@ export function TaskBoardToday({
       .slice(0, 6),
     maxCost = Math.max(1, ...rows.map((a) => a.amount ?? 0));
   return (
-    <div className="td">
+    <div
+      className={`td${receipts.length ? " has-receipts" : ""}${quotes.length ? " has-decisions" : ""}`}
+    >
       <section className="td-p td-ship">
         <h3>
           <PackageCheck size={16} />
@@ -216,7 +223,8 @@ export function TaskBoardToday({
                   )}
                 </span>
                 <button type="button" className="td-x" onClick={() => onSelect(task)}>
-                  {task.title || activityTaskName(task)}
+                  <span className="td-task-title">{task.title || activityTaskName(task)}</span>
+                  {activityTaskKey(task) && <code>{activityTaskKey(task)}</code>}
                 </button>
               </li>
             ))}
@@ -241,17 +249,15 @@ export function TaskBoardToday({
               </tr>
             </thead>
             <tbody>
-              {receipts.slice(0, 11).map((task) => (
+              {receipts.slice(0, 11).map(({ task, checks }) => (
                 <tr key={JSON.stringify([task["omnigent.ai:source"], task.uid])}>
                   <th>
                     <button type="button" onClick={() => onSelect(task)}>
                       <b>{activityTaskName(task)}</b>
                     </button>
                   </th>
-                  {hosts.map((host) => {
-                    const check = task["omnigent.ai:sourceDisplay"]?.checks
-                      ?.filter((c) => c.host === host)
-                      .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0];
+                  {hosts.map((host, index) => {
+                    const check = checks[index];
                     return (
                       <td key={host} className={`v-${check?.verdict ?? "none"}`}>
                         {check?.verdict === "passed" ? (
@@ -268,9 +274,7 @@ export function TaskBoardToday({
                   })}
                   <td className="td-t">
                     {activityStamp(
-                      Math.max(
-                        ...task["omnigent.ai:sourceDisplay"]!.checks!.map((c) => Date.parse(c.at)),
-                      ),
+                      Math.max(...checks.flatMap((check) => (check ? [Date.parse(check.at)] : []))),
                     )}
                   </td>
                 </tr>
@@ -347,7 +351,7 @@ export function TaskBoardToday({
         <h3>
           <Coins size={18} />
           {t("g6.accountCosts")}
-          <em>{t("g6.estimatedUsage")}</em>
+          <em title={t("g6.costFootnote")}>{t("g6.estimatedUsage")}</em>
         </h3>
         {!rows.length && <p className="td-empty">{t("visual.noUsage")}</p>}
         {rows.map((a) => (
@@ -358,14 +362,18 @@ export function TaskBoardToday({
               {a.id.startsWith("native:") ? ` · ${t("g6.nativeUsage")}` : ""}
             </b>
             <i className="td-bar">
-              <u style={{ width: `${((a.amount ?? 0) / maxCost) * 100}%` }} />
+              <u
+                style={{
+                  background: boardIdentityColor(a.id),
+                  width: `${((a.amount ?? 0) / maxCost) * 100}%`,
+                }}
+              />
             </i>
             <span title={t("sessions.cost.estimate.hint")}>
               {a.amount === null ? "—" : activityMoney(a.amount)}
             </span>
           </div>
         ))}
-        <p className="muted td-foot">{t("g6.costFootnote")}</p>
       </section>
       {(!receipts.length || !quotes.length) && (
         <p className="td-missing">

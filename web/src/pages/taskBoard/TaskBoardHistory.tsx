@@ -160,7 +160,7 @@ function HistoryNumbers({ cards }: { cards: HistoryCard[] }) {
         <b>{activityNumber(r.n)}</b>
       </span>
       <span className="h-num">
-        <b>{activityDuration(r.seconds)}</b>
+        <b>{r.durationNodes ? activityDuration(r.seconds) : "—"}</b>
       </span>
       <span className="h-num h-usd">
         <ActivityMoney amount={r.usd} />
@@ -460,9 +460,17 @@ export function TaskBoardHistory({
           })}
         />
         <ActivityTile
-          value={t("g6.hours", { count: activityNumber(total.seconds / 3600) })}
+          value={
+            total.durationNodes
+              ? t("g6.hours", { count: activityNumber(total.seconds / 3600) })
+              : "—"
+          }
           label={t("g6.workTime")}
-          note={t("g6.nodes", { count: activityNumber(total.nodes) })}
+          note={
+            total.durationNodes
+              ? t("g6.nodes", { count: activityNumber(total.durationNodes) })
+              : t("visual.noDuration")
+          }
         />
         <ActivityTile
           value={total.usd !== null ? activityMoney(total.usd) : "—"}
@@ -491,14 +499,15 @@ export function TaskBoardHistory({
         />
       </div>
       <TaskBoardHistoryChart
-        cards={all}
+        cards={all.filter(matches)}
+        legendSources={[...sourceColors.keys()]}
         counts={counts.filter((c) => !sets.source.length || sets.source.includes(c.source))}
         accounts={daily}
         from={from}
         to={to}
         now={now}
         historyStart={historyStart}
-        capped={hasOldMonths}
+        capped={hasOldMonths && !sets.agent.length && !sets.outcome.length && cost === "all"}
         sourceColors={sourceColors}
         selectedSources={sets.source}
         onSource={(source) =>
@@ -841,7 +850,12 @@ export function TaskBoardHistory({
                                         ))}
                                       </span>
                                       <span className="h-dur">
-                                        {c.seconds ? activityDuration(c.seconds) : ""}
+                                        {c.nodes.some(
+                                          (node) =>
+                                            Number.isFinite(node.from) && Number.isFinite(node.to),
+                                        )
+                                          ? activityDuration(c.seconds)
+                                          : "—"}
                                       </span>
                                       <ActivityMoney
                                         amount={c.usd}
@@ -867,7 +881,7 @@ export function TaskBoardHistory({
                                               </span>
                                               <span className="n-d">
                                                 {activityDuration(
-                                                  Math.max(60, (n.to - n.from) / 1000),
+                                                  Math.max(0, (n.to - n.from) / 1000),
                                                 )}
                                               </span>
                                               <span className="n-h">{n.host}</span>

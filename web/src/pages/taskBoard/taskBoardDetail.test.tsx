@@ -1,3 +1,4 @@
+import userEvent from "@testing-library/user-event";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
@@ -430,4 +431,31 @@ it("shows file short names, deduplicates paths, folds old versions and reports c
   await screen.findByText("Copy failed — try again");
   fireEvent.click(screen.getByRole("button", { name: "Older versions (1)" }));
   expect(screen.getByTitle(/generation-history/)).toBeTruthy();
+});
+
+it("activates artifact copy by keyboard and hides placeholder path actions", async () => {
+  const { TaskSourceDetails } = await import("./TaskSourceDetails");
+  const user = userEvent.setup();
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+  const path = "/opt/work/omnigent/fork/example/design.html";
+  const { container } = render(
+    <TaskSourceDetails
+      display={{
+        version: 1,
+        rows: [
+          { id: "path-0", label: "Design", value: "—" },
+          { id: "path-1", label: "Design", value: path },
+        ],
+      }}
+    />,
+  );
+  expect(container.querySelectorAll(".tb-file")).toHaveLength(1);
+  await user.tab();
+  expect(document.activeElement).toBe(screen.getByTitle(path));
+  await user.keyboard("{Enter}");
+  await screen.findByText("Copied");
+  expect(writeText).toHaveBeenCalledWith(path);
+  await user.keyboard(" ");
+  expect(writeText).toHaveBeenCalledTimes(2);
 });
