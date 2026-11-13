@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -122,6 +122,77 @@ afterEach(() => {
   clients.forEach((client) => client.clear());
   clients.length = 0;
   vi.unstubAllGlobals();
+});
+
+it("keeps an unchanged all-legacy Log incremental through the real task-board page", async () => {
+  enableBoard("log");
+  const stamp = new Date().toISOString();
+  let revision = stamp;
+  const row: BoardTask = {
+    uid: "one",
+    title: "Legacy task",
+    progress: "in-process",
+    "omnigent.ai:source": "tracker",
+  };
+  mocks.tasks.mockImplementation(async (path: string) => {
+    const url = new URL(path, "https://example.test");
+    if (url.pathname.endsWith("/sources"))
+      return Response.json({
+        sources: [
+          {
+            id: "tracker",
+            name: "Tracker",
+            source: null,
+            created: stamp,
+            last_write: { time: revision },
+            snapshot: {
+              sourceGeneration: "legacy-generation",
+              phase: "legacy",
+              id: null,
+              asOf: null,
+            },
+          },
+        ],
+      });
+    if (url.pathname.endsWith("/history"))
+      return Response.json({
+        entries: [{ id: "event", source: "tracker", uid: "one", time: stamp, kind: "comment" }],
+        ...(url.searchParams.has("changed_after") ? {} : { cursor: "more" }),
+        changedThrough: stamp,
+      });
+    return Response.json({
+      entries: url.searchParams.get("state") === "closed" ? [] : [row],
+      "omnigent.ai:changedThrough": stamp,
+    });
+  });
+  renderBoard();
+  await screen.findByRole("button", { name: "Legacy task" });
+  const histories = () =>
+    mocks.tasks.mock.calls
+      .map(([path]) => new URL(path, "https://example.test"))
+      .filter((url) => url.pathname.endsWith("/history"));
+  expect(histories()).toHaveLength(1);
+  await act(async () => {
+    await clients[0].invalidateQueries({ queryKey: ["taskBoard", "list"] });
+  });
+  expect(histories()).toHaveLength(1);
+  // Refresh the same active query used by the 60-second cadence, without advancing timers.
+  await act(async () => {
+    await clients[0].invalidateQueries({ queryKey: ["taskBoard", "windowedHistory"] });
+  });
+  expect(histories()).toHaveLength(2);
+  expect(histories()[1].searchParams.has("changed_after")).toBe(true);
+  expect(histories()[1].searchParams.has("cursor")).toBe(false);
+  revision = new Date(Date.parse(stamp) + 60_000).toISOString();
+  await act(async () => {
+    await clients[0].invalidateQueries({ queryKey: ["taskBoard", "list"] });
+  });
+  await waitFor(() => expect(histories()).toHaveLength(3));
+  expect(histories()[2].searchParams.get("source")).toBe("tracker");
+  expect(histories()[2].searchParams.get("changed_after")).toBe(
+    new Date(Date.parse(stamp) - 60_000).toISOString(),
+  );
+  expect(histories()[2].searchParams.has("cursor")).toBe(false);
 });
 
 it.each(["none", "recent", "archive"])(

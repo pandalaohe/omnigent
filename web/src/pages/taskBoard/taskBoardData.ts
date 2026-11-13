@@ -98,6 +98,8 @@ export interface BoardData {
 }
 export const taskIdentity = (task: BoardTask) =>
   JSON.stringify([task["omnigent.ai:source"], task.uid]);
+export const taskSourceGeneration = (source: TaskSource) =>
+  source.snapshot?.sourceGeneration ?? source.created ?? source.id;
 export const groupIdentity = (task: BoardTask) =>
   JSON.stringify([task["omnigent.ai:source"], task["omnigent.ai:group"]?.id ?? ""]);
 export const taskProgress = (task: BoardTask): TaskProgress => task.progress ?? "needs-action";
@@ -145,7 +147,8 @@ export async function readTaskBoard(
     sources
       .filter(
         (source) =>
-          !oldSources.has(source.id) || source.created !== oldSources.get(source.id)?.created,
+          !oldSources.has(source.id) ||
+          taskSourceGeneration(source) !== taskSourceGeneration(oldSources.get(source.id)!),
       )
       .map((source) => source.id),
   );
@@ -163,17 +166,28 @@ export async function readTaskBoard(
       else held.set(taskIdentity(task), task);
     }
   };
-  let changedThrough: string | undefined;
-  if (previous?.changedThrough) {
-    const result = await readTasks(
-      new URLSearchParams({
-        changed_after: new Date(Date.parse(previous.changedThrough) - 60_000).toISOString(),
-      }),
-    );
-    merge(result.tasks);
-    changedThrough = result.changedThrough;
+  let changedThrough = previous?.changedThrough;
+  const fullSources: (string | undefined)[] = previous ? [] : [undefined];
+  if (previous) {
+    for (const source of sources) {
+      const priorRevision = oldSources.get(source.id)?.last_write?.time;
+      if (recreated.has(source.id) || !priorRevision || !source.last_write?.time) {
+        fullSources.push(source.id);
+        continue;
+      }
+      if (source.last_write.time === priorRevision) continue;
+      // Committed source metadata cannot advance past an invisible feeder transaction.
+      // eslint-disable-next-line no-await-in-loop
+      const result = await readTasks(
+        new URLSearchParams({
+          source: source.id,
+          changed_after: new Date(Date.parse(priorRevision) - 60_000).toISOString(),
+        }),
+      );
+      merge(result.tasks);
+      changedThrough = result.changedThrough ?? changedThrough;
+    }
   }
-  const fullSources = previous?.changedThrough ? [...recreated] : [undefined];
   for (const source of fullSources) {
     const params = new URLSearchParams({ state: "open" });
     if (source) params.set("source", source);
@@ -186,9 +200,11 @@ export async function readTaskBoard(
     params.set("closed_after", cutoff);
     // eslint-disable-next-line no-await-in-loop
     const closed = await readTasks(params);
+    if (source)
+      for (const [key, task] of held) if (task["omnigent.ai:source"] === source) held.delete(key);
     merge(open.tasks);
     merge(closed.tasks);
-    if (!previous?.changedThrough) changedThrough = open.changedThrough;
+    changedThrough = open.changedThrough ?? changedThrough;
   }
   const rows = new Map(sources.map((source) => [source.id, source]));
   const tasks = [...held.values()].filter(

@@ -168,10 +168,13 @@ it("reconciles a source revision whose commit missed the timestamp overlap", asy
   let committed = false;
   fetcher.mockImplementation(async (path: string) => {
     const params = new URL(path, "https://example.test").searchParams;
+    const lower = params.get("changed_after");
     return Response.json({
       entries: [
         event("first"),
-        ...(committed && !params.has("changed_after") ? [event("delayed")] : []),
+        ...(committed && (!lower || Date.parse(lower) <= Date.parse("2026-11-13T11:00:00Z"))
+          ? [event("delayed")]
+          : []),
       ],
       changedThrough: "2026-11-13T12:00:00Z",
     });
@@ -187,10 +190,10 @@ it("reconciles a source revision whose commit missed the timestamp overlap", asy
   view.rerender(ui("2026-11-13T11:00:00Z"));
   await screen.findByText("delayed,first", { selector: "output" });
   expect(
-    new URL(fetcher.mock.calls.at(-1)![0], "https://example.test").searchParams.has(
+    new URL(fetcher.mock.calls.at(-1)![0], "https://example.test").searchParams.get(
       "changed_after",
     ),
-  ).toBe(false);
+  ).toBe("2026-11-13T09:59:00.000Z");
 });
 it("loads one history page, pages on demand, and recovers after a failed incremental refresh", async () => {
   let failed = true;

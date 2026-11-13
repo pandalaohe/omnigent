@@ -1,7 +1,13 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { useBoardCadence } from "./taskBoardPreferences";
-import { readBoardJson, type BoardTask, type TaskHistory } from "./taskBoardData";
+import {
+  readBoardJson,
+  taskSourceGeneration,
+  type BoardTask,
+  type TaskHistory,
+  type TaskSource,
+} from "./taskBoardData";
 import type { BoardSession } from "./taskBoardNative";
 import type { SourceCache } from "./taskBoardSnapshotData";
 
@@ -78,15 +84,30 @@ function mergeEvents(a: BoardEvent[], b: BoardEvent[]) {
       eventKey(right).localeCompare(eventKey(left)),
   );
 }
-export function useBoardHistory(enabled = true, sources?: Record<string, SourceCache>) {
+export function useBoardHistory(
+  enabled = true,
+  sourceCaches?: Record<string, SourceCache>,
+  sources?: TaskSource[],
+) {
   const client = useQueryClient(),
     cadence = useBoardCadence();
-  const identities = Object.entries(sources ?? {}).sort(([a], [b]) => a.localeCompare(b));
-  const generation = JSON.stringify(
-    identities.map(([id, source]) => [id, source.pin.sourceGeneration]),
-  );
+  const identities = sourceCaches
+    ? Object.entries(sourceCaches).map(([id, source]) => ({
+        id,
+        generation: source.pin.sourceGeneration,
+        publication: source.pin.id,
+        revision: source.display.asOf,
+      }))
+    : (sources ?? []).map((source) => ({
+        id: source.id,
+        generation: taskSourceGeneration(source),
+        publication: source.snapshot?.id ?? null,
+        revision: source.last_write?.time ?? source.created ?? "",
+      }));
+  identities.sort((a, b) => a.id.localeCompare(b.id));
+  const generation = JSON.stringify(identities.map((source) => [source.id, source.generation]));
   const revision = JSON.stringify(
-    identities.map(([id, source]) => [id, source.pin.id, source.display.asOf]),
+    identities.map((source) => [source.id, source.publication, source.revision]),
   );
   const key = ["taskBoard", "windowedHistory", generation];
   const query = useQuery({
@@ -100,7 +121,21 @@ export function useBoardHistory(enabled = true, sources?: Record<string, SourceC
       let through = new Date().toISOString();
       if (previous) {
         // Source revisions also catch commits delayed beyond the timestamp overlap.
-        const reconcile = !sources || previous.revision !== revision;
+        const reconcile = (!sourceCaches && !sources) || previous.revision !== revision;
+        const priorRevisions = new Map<string, [string | null, string]>(
+          JSON.parse(previous.revision).map(
+            ([id, publication, stamp]: [string, string | null, string]) => [
+              id,
+              [publication, stamp],
+            ],
+          ),
+        );
+        const changedSources = identities.filter(
+          (source) =>
+            JSON.stringify(priorRevisions.get(source.id)) !==
+            JSON.stringify([source.publication, source.revision]),
+        );
+        const replacedSources = new Set<string>();
         const params = new URLSearchParams();
         if (!reconcile)
           params.set(
@@ -108,13 +143,37 @@ export function useBoardHistory(enabled = true, sources?: Record<string, SourceC
             new Date(Date.parse(previous.through) - 60_000).toISOString(),
           );
         if (previous.after) params.set("after", previous.after);
-        const updates = await readBoardHistory(params, (value) => {
+        const watermark = (value: string) => {
           through = value;
-        });
+        };
+        const updates = changedSources.length
+          ? (
+              await Promise.all(
+                changedSources.map((source) => {
+                  const scoped = new URLSearchParams(params);
+                  scoped.set("source", source.id);
+                  const prior = priorRevisions.get(source.id);
+                  if (
+                    source.publication === null &&
+                    prior?.[0] === null &&
+                    Number.isFinite(Date.parse(prior[1]))
+                  ) {
+                    scoped.set(
+                      "changed_after",
+                      new Date(Date.parse(prior[1]) - 60_000).toISOString(),
+                    );
+                  } else replacedSources.add(source.id);
+                  return readBoardHistory(scoped, watermark);
+                }),
+              )
+            ).flat()
+          : await readBoardHistory(params, watermark);
         const latest = client.getQueryData<HistoryCache>(key) ?? previous;
         const retained = reconcile
           ? latest.entries.filter(
-              (entry) => previous.after && Date.parse(entry.time) < Date.parse(previous.after),
+              (entry) =>
+                (changedSources.length > 0 && !replacedSources.has(entry.source)) ||
+                (previous.after && Date.parse(entry.time) < Date.parse(previous.after)),
             )
           : latest.entries;
         return { ...latest, entries: mergeEvents(retained, updates), through, revision };

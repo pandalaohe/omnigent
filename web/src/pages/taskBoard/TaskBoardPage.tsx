@@ -299,7 +299,7 @@ function TaskBoardContent({
         </p>
       )}
       {(["log", "history", "today"] as const).map((view) =>
-        preferences.view === view ? (
+        preferences.view === view && tasksQuery.data ? (
           <TaskBoardActivity
             inlineDetail={panel ? undefined : inlineDetail}
             detailSelection={
@@ -309,6 +309,7 @@ function TaskBoardContent({
             view={view}
             hiddenSources={view === "history" ? preferences.hiddenSources : []}
             sourceCaches={tasksQuery.data?.sourceCaches}
+            sources={tasksQuery.data?.sources}
             tasks={tasks}
             sessions={sessions}
             onSelect={select}

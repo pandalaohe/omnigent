@@ -5,7 +5,7 @@ import { usageRangeQuery } from "@/pages/usageBoard/UsageRangeControl";
 import type { UsageActivity } from "@/pages/usageBoard/usageActivityData";
 import { useBoardCadence } from "./taskBoardPreferences";
 import { sourceHistory, type SourceCache } from "./taskBoardSnapshotData";
-import { readBoardJson, type BoardTask } from "./taskBoardData";
+import { readBoardJson, type BoardTask, type TaskSource } from "./taskBoardData";
 import type { BoardSession } from "./taskBoardNative";
 import { localDay, useBoardHistory, readLocalClosedCounts } from "./taskBoardActivityData";
 import { TaskBoardLog } from "./TaskBoardLog";
@@ -24,6 +24,7 @@ export function TaskBoardActivity({
   inlineDetail,
   detailSelection,
   sourceCaches,
+  sources,
   hiddenSources = EMPTY_HIDDEN,
 }: {
   view: "log" | "history" | "today";
@@ -33,6 +34,7 @@ export function TaskBoardActivity({
   inlineDetail?: ReactNode;
   detailSelection?: HistoryDetailSelection;
   sourceCaches?: Record<string, SourceCache>;
+  sources?: TaskSource[];
   hiddenSources?: string[];
 }) {
   const cadence = useBoardCadence(),
@@ -46,7 +48,7 @@ export function TaskBoardActivity({
   const now = Date.now(),
     today = localDay(now),
     offset = -new Date(now).getTimezoneOffset();
-  const history = useBoardHistory(view === "log", sourceCaches);
+  const history = useBoardHistory(view === "log", sourceCaches, sources);
   const counts = useQuery({
     queryKey: ["taskBoard", "closedCounts", offset],
     queryFn: () => readLocalClosedCounts(),
