@@ -328,6 +328,7 @@ async def test_price_door_read_labels_and_owner_isolation(request, db_uri):
         activity = {
             "schema_version": 2,
             "observed_at": now_epoch(),
+            "source_type": "relay",
             "activity": [
                 {
                     "hour": hour,

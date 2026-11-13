@@ -14,4 +14,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_column("usage_hours", "price_ref")
+    with op.batch_alter_table("usage_hours") as batch_op:
+        batch_op.drop_column("price_ref")

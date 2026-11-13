@@ -4,6 +4,8 @@ import json
 
 import pytest
 import sqlalchemy as sa
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 
 from omnigent.db.utils import get_or_create_engine
 from tests.db.test_migration_usage_hours import _alembic_command
@@ -54,6 +56,19 @@ def test_renewal_downgrade_payload_compatibility(db_uri, repeats):
 
 
 def test_pricing_migration_additive_roundtrip(db_uri):
+    config = Config()
+    config.set_main_option("script_location", "omnigent/db/migrations")
+    script = ScriptDirectory.from_config(config)
+    heads = script.get_heads()
+    assert len(heads) == 1
+    lineage = {revision.revision for revision in script.iterate_revisions(heads[0], "base")}
+    assert "a71c20261113" in lineage
+    for revision, parent in [
+        ("a71c20261113", "a70c20261113"),
+        ("a70c20261113", "a69c20261113"),
+        ("a69c20261113", "a68c20261112"),
+    ]:
+        assert script.get_revision(revision).down_revision == parent
     engine = get_or_create_engine(db_uri)
     migration_engine = (
         engine.execution_options(isolation_level="SERIALIZABLE")

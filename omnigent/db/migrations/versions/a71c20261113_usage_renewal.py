@@ -52,4 +52,5 @@ def downgrade() -> None:
         )
     with op.batch_alter_table("usage_pricing_cards") as batch:
         batch.alter_column("allowance_usd", existing_type=sa.Numeric(38, 18), nullable=False)
-    op.drop_column("usage_pricing_defaults", "account_classes")
+    with op.batch_alter_table("usage_pricing_defaults") as batch:
+        batch.drop_column("account_classes")

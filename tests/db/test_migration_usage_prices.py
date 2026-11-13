@@ -26,6 +26,10 @@ def test_price_migration_roundtrip(db_uri):
         config = Config()
         config.set_main_option("script_location", "omnigent/db/migrations")
         script = ScriptDirectory.from_config(config)
-        assert script.get_heads() == ["a68c20261112"]
+        heads = script.get_heads()
+        assert len(heads) == 1
+        lineage = {revision.revision for revision in script.iterate_revisions(heads[0], "base")}
+        assert "a68c20261112" in lineage
+        assert script.get_revision("a68c20261112").down_revision == "a67c20261112"
     finally:
         _alembic_command(db_uri, migration_engine, "upgrade", "head")
