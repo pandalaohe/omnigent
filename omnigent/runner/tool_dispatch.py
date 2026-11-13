@@ -5857,6 +5857,7 @@ async def _complete_created_session(
             **({"host_load": data["host_load"]} if "host_load" in data else {}),
             **({"startup": data["startup"]} if "startup" in data else {}),
             **({"session_choice": data["session_choice"]} if data.get("session_choice") else {}),
+            **({"warnings": data["warnings"]} if data.get("warnings") else {}),
         }
     )
 
@@ -6366,6 +6367,7 @@ async def _execute_session_create_impl(
             "agent_id": data.get("agent_id") or agent_id,
             "title": data.get("title") or args.get("title"),
             **({"session_choice": data["session_choice"]} if data.get("session_choice") else {}),
+            **({"warnings": data["warnings"]} if data.get("warnings") else {}),
         }
         initial_message = data.get("initial_message")
         if placement_mode == "same_host" and args.get("message"):
@@ -6676,6 +6678,7 @@ async def _session_create_from_config_path(
             "agent_name": data.get("agent_name"),
             "status": "created",
             "project_id": data.get("project_id"),
+            "warnings": data.get("warnings", []),
         },
         server_client=server_client,
         conversation_id=conversation_id,

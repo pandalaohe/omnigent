@@ -634,6 +634,14 @@ async def test_load_master_reads_the_namespace_and_defaults_on_gaps(db_uri: str)
     assert await load_master("nobody@example.com", store) == {}
     assert await load_master("alice@example.com", None) == {}
     assert await load_master("broken@example.com", _RaisingStore()) == {}
+    warnings = []
+    assert await load_master("broken@example.com", _RaisingStore(), warnings=warnings) == {}
+    assert warnings == [
+        "calling defaults unavailable (storage_unavailable); used project or built-in defaults"
+    ]
+    warnings.clear()
+    assert await load_master("nobody@example.com", store, warnings=warnings) == {}
+    assert not warnings
 
 
 @pytest.mark.parametrize("field,value", [("speed", "fast"), ("permission", "approve-for-me")])

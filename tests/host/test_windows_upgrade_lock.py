@@ -4,11 +4,47 @@ import json
 import os
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from omnigent.host import windows_upgrade_lock as locks
+
+
+@pytest.mark.parametrize("contents", ["{", "[]", '{"pid": "bad"}', "\ufffd"])
+def test_old_damaged_owner_recovers_under_guard(monkeypatch, tmp_path, contents):
+    path = tmp_path / "upgrade.lock"
+    path.write_text(contents)
+    old = time.time() - 1801
+    os.utime(path, (old, old))
+    monkeypatch.setattr(locks.psutil, "process_iter", lambda: iter([]))
+    owner = locks.acquire_lock(path)
+    assert owner["pid"] == os.getpid()
+    assert json.loads(path.read_text()) == owner
+    assert path.with_suffix(".lock.guard").exists()
+    locks.release_lock(path, owner)
+
+
+@pytest.mark.parametrize("blocker", ["recent", "helper", "denied"])
+def test_damaged_owner_recovery_requires_age_and_no_helper(monkeypatch, tmp_path, blocker):
+    path = tmp_path / "upgrade.lock"
+    path.write_text("{")
+    stamp = time.time() - (1801 if blocker != "recent" else 30)
+    os.utime(path, (stamp, stamp))
+
+    def cmdline():
+        if blocker == "denied":
+            raise locks.psutil.AccessDenied(pid=42)
+        return ["python", "-m", "omnigent.host.windows_upgrade_helper"]
+
+    monkeypatch.setattr(
+        locks.psutil, "process_iter", lambda: iter([SimpleNamespace(cmdline=cmdline)])
+    )
+    with pytest.raises(RuntimeError, match="Check") as refused:
+        locks.acquire_lock(path)
+    assert str(path) in str(refused.value)
+    assert path.read_text() == "{"
 
 
 def test_competing_stale_takeover_is_serialized(tmp_path):

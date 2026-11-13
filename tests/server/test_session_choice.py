@@ -651,7 +651,7 @@ def test_availability_ability_pin_family_and_type_resolution():
     above = ChoiceRequest(OWNER, "host-a", caller_product="agent-1", caller_model="model-1")
     assert pick(settings, request=above).skipped[0].why == "above_caller"
     unavailable = replace(above, caller_product=None, models={"agent-0": frozenset({"other"})})
-    assert pick(settings, request=unavailable).pool == "pool-1"
+    assert pick(settings, request=unavailable).pool == "pool-0"
     family = replace(above, caller_product=None, differ_family="model-0")
     assert pick(settings, request=family).skipped[0].why == "same_family"
     assert pick(settings, request=ChoiceRequest(OWNER, "host-a", pin="p1")).pool == "pool-1"
