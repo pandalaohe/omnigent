@@ -489,6 +489,45 @@ def test_metered_token_estimate_retains_its_label_without_a_reported_bill():
     assert result["show_payback"] is False
 
 
+@pytest.mark.parametrize("ref", ["import:v1", "builtin", "provider", "mixed", None])
+def test_native_metered_estimates_use_account_prices_not_recorded_cost(ref):
+    from omnigent.usage.pricing import AccountPriceOverride
+
+    sample = view(
+        account_id="native:codex",
+        parent_account_id="codex",
+        price_ref=ref,
+        priced=True,
+        cost_usd=2,
+        tokens=1_000_000,
+        uncached_input_tokens=1_000_000,
+        output_tokens=0,
+        cache_read_input_tokens=0,
+        cache_creation_input_tokens=0,
+    )
+    sample.account_spans = {"codex": sample.span}
+    sample.account_cost_classes = {"codex": "metered"}
+    state = PricingBaseline(
+        price_overrides=[
+            AccountPriceOverride(
+                account_id="codex",
+                model="model-a",
+                read="3",
+                write="0",
+                cache_read="0",
+                cache_write="0",
+            )
+        ]
+    )
+    result = value_usage(sample, state)
+    assert result["spend"].low == "3"
+    assert result["spend_estimated"] is True
+    sample.rows[0].basis = "billed"
+    billed = value_usage(sample, state)
+    assert billed["spend"].low == "2"
+    assert billed["spend_estimated"] is False
+
+
 def test_field_overrides_clear_restore_and_missing_partitions(monkeypatch):
     from omnigent.llms.context_window import ModelPricing
     from omnigent.usage.price_resolution import row_value

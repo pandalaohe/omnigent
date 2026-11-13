@@ -17,6 +17,81 @@ from tests.browser_ui.usage_geometry import assert_usage_geometry
 from tests.browser_ui.usage_long_names import LONG_NAMES
 
 
+def test_cost_class_table_tracks_and_narrow_layout(
+    page: Page, appearance_url: str, browser_contract: BrowserContract, tmp_path
+):
+    from fastapi.encoders import jsonable_encoder
+
+    from tests.server.test_usage_pricing_math import view
+
+    browser_contract.json("/v1/info", {"usage_board_enabled": True, "features": {}})
+    browser_contract.json(
+        "/v1/me/usage",
+        {
+            "generated_at": 1794268800,
+            "accounts": [
+                {
+                    "id": "account-a",
+                    "kind": "account",
+                    "display_name": "Alpha",
+                    "windows": [],
+                    "hosts": [],
+                    "freshness": "fresh",
+                }
+            ],
+        },
+    )
+    browser_contract.json("/v1/me/usage/activity", {"accounts": []})
+    source = view()
+    current = {"kind": "subscription"}
+
+    def analysis(request):
+        params = parse_qs(urlparse(request.url).query)
+        source.account_cost_classes = {"account-a": current["kind"]}
+        baseline = PricingBaseline()
+        payload = source.model_dump(mode="json")
+        payload["pricing"] = jsonable_encoder(value_usage(source, baseline))
+        if "dimension" in params:
+            payload["presentation"] = jsonable_encoder(
+                present_analysis(
+                    source,
+                    None,
+                    baseline,
+                    dimension=params["dimension"][0],
+                    keys=json.loads(params["selection"][0]),
+                    excluded=set(),
+                )
+            )
+        return payload
+
+    browser_contract.json("/v1/me/usage/analysis", analysis)
+    page.add_init_script(
+        "localStorage.setItem('omnigent:usage-context-preferences',JSON.stringify({version:1,board:{enabled:true}}))"
+    )
+    for kind, count in [("subscription", 7), ("prepaid", 7), ("metered", 6), ("free", 4)]:
+        current["kind"] = kind
+        page.set_viewport_size({"width": 1280, "height": 900})
+        page.goto(appearance_url + "/frame/usage/board/cost")
+        table = page.get_by_role("table", name="Each item", exact=True)
+        row = table.get_by_role("row").nth(1)
+        expect(row.get_by_role("cell")).to_have_count(count)
+        geometry = row.evaluate(
+            "el => ({tracks:getComputedStyle(el).gridTemplateColumns.split(' ').length, "
+            "tops:[...el.children].map(child=>child.getBoundingClientRect().top)})"
+        )
+        assert geometry["tracks"] == count
+        assert max(geometry["tops"]) - min(geometry["tops"]) < 20
+        page.screenshot(path=str(tmp_path / f"{kind}-wide.png"))
+        page.set_viewport_size({"width": 390, "height": 900})
+        expect(row).to_be_visible()
+        page.wait_for_function(
+            "getComputedStyle(document.querySelector('.ua-table-row'))"
+            ".gridTemplateColumns.split(' ').length === 2"
+        )
+        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+        page.screenshot(path=str(tmp_path / f"{kind}-narrow.png"))
+
+
 @pytest.mark.parametrize("width", [1280, 900, 390])
 def test_analysis_selection(
     page: Page, appearance_url: str, browser_contract: BrowserContract, width: int, record_property

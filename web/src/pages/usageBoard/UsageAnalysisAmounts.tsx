@@ -9,6 +9,7 @@ import { UsageTip } from "./UsageTip";
 import { AnalysisTrend, compareAnalysisDecimals } from "./UsageAnalysisDetails";
 import { UsageName } from "./UsageName";
 import { moneyText } from "./UsageAccountMoney";
+import type { CSSProperties } from "react";
 
 interface Item {
   key: string;
@@ -47,8 +48,8 @@ export function UsageAnalysisTable({
   const showPayback = items.some((item) => item.projection?.show_payback !== false);
   const paymentLabel = showPayback ? "Paid / spend" : "Spend";
   const columns = {
-    gridTemplateColumns: `minmax(120px, 2fr) repeat(${2 + (showMoney ? 2 : 0) + (showPayback ? 1 : 0)}, minmax(0, 1fr))`,
-  };
+    "--ua-metric-columns": 2 + (showMoney ? 2 : 0) + (showPayback ? 1 : 0),
+  } as CSSProperties;
   data.sort((a, b) => {
     if (sort.key === "paid" || sort.key === "payback") {
       const av = a.projection?.[sort.key]?.low,
@@ -67,8 +68,8 @@ export function UsageAnalysisTable({
   });
   return (
     <AnalysisPanel title="Each item" caption={`${items.length} items`}>
-      <div className="ua-table" role="table" aria-label="Each item">
-        <div className="ua-table-head" role="row" style={columns}>
+      <div className="ua-table" role="table" aria-label="Each item" style={columns}>
+        <div className="ua-table-head" role="row">
           <span role="columnheader">Item</span>
           <span role="columnheader">Trend</span>
           {(
@@ -100,13 +101,7 @@ export function UsageAnalysisTable({
             ))}
         </div>
         {data.map((item) => (
-          <div
-            role="row"
-            className="ua-table-row"
-            key={item.key}
-            data-item={item.key}
-            style={columns}
-          >
+          <div role="row" className="ua-table-row" key={item.key} data-item={item.key}>
             <span role="cell" className="ua-name">
               <UsageName>{item.name}</UsageName>
             </span>

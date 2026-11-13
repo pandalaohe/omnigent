@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { useState } from "react";
+import { UsageAnalysisTable } from "./UsageAnalysisAmounts";
 import { afterEach, expect, it } from "vitest";
 import {
   AnalysisCards,
@@ -15,6 +16,31 @@ import {
 } from "./usageAnalysisData";
 
 afterEach(cleanup);
+it.each([
+  ["subscription", true, true, 7],
+  ["prepaid", true, true, 7],
+  ["metered", true, false, 6],
+  ["free", false, false, 4],
+] as const)(
+  "keeps %s table tracks aligned with visible cells and lets CSS own responsive columns",
+  (_kind, money, payback, count) => {
+    const projection = { ...fixture().projection, show_money: money, show_payback: payback };
+    render(
+      <UsageAnalysisTable
+        items={[{ key: "a", name: "Alpha", rows: [], projection }]}
+        incomplete={false}
+        sort={{ key: "paid", direction: 1 }}
+        onSort={() => {}}
+      />,
+    );
+    const table = screen.getByRole("table", { name: "Each item" });
+    const rows = within(table).getAllByRole("row");
+    expect(within(rows[0]).getAllByRole("columnheader")).toHaveLength(count);
+    expect(within(rows[1]).getAllByRole("cell")).toHaveLength(count);
+    expect(rows[1].style.gridTemplateColumns).toBe("");
+    expect(table.style.getPropertyValue("--ua-metric-columns")).toBe(String(count - 2));
+  },
+);
 function value(raw: string, formatted: string, currency: string | null = "USD"): AnalysisValue {
   return {
     state: "exact",

@@ -569,6 +569,9 @@ def value_usage(
                     continue
                 if row.channel not in {None, "usage", "metered_cost"}:
                     continue
+                # Native metered is a login basis; recorder prices are estimates.
+                if row.account_id.startswith("native:") and row.basis != "billed":
+                    continue
                 if (
                     (pools is not None and (row.parent_account_id, row.pool_id) not in pools)
                     or (models is not None and row.model not in models)

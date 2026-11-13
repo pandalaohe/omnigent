@@ -1,9 +1,56 @@
 """The pricing migration expands schema without altering existing usage."""
 
+import json
+
+import pytest
 import sqlalchemy as sa
 
 from omnigent.db.utils import get_or_create_engine
 from tests.db.test_migration_usage_hours import _alembic_command
+
+
+@pytest.mark.parametrize("repeats", [False, True])
+def test_renewal_downgrade_payload_compatibility(db_uri, repeats):
+    from omnigent.stores.usage_pricing_store import UsagePricingStore
+    from omnigent.usage.pricing import PricingBaseline, PurchasedCard
+    from tests.server.test_usage_pricing_math import card
+
+    engine = get_or_create_engine(db_uri)
+    migration_engine = (
+        engine.execution_options(isolation_level="SERIALIZABLE")
+        if engine.dialect.name == "cockroachdb"
+        else engine
+    )
+    store = UsagePricingStore(db_uri)
+    store.save(
+        "rollback@example.test",
+        PricingBaseline(
+            cards=[card(repeats=repeats)], account_classes={"account-a": "subscription"}
+        ),
+        known_accounts={"account-a"},
+        pools=set(),
+    )
+    try:
+        if repeats:
+            with pytest.raises(RuntimeError, match="repeating"):
+                _alembic_command(db_uri, migration_engine, "downgrade", "a70c20261113")
+            assert "account_classes" in {
+                column["name"]
+                for column in sa.inspect(engine).get_columns("usage_pricing_defaults")
+            }
+            assert store.read("rollback@example.test").cards[0].repeats
+        else:
+            _alembic_command(db_uri, migration_engine, "downgrade", "a70c20261113")
+            with engine.connect() as connection:
+                payload = connection.execute(
+                    sa.text("SELECT payload FROM usage_pricing_cards")
+                ).scalar_one()
+            # a70's PurchasedCard forbids fields introduced by a71.
+            data = json.loads(payload)
+            assert "repeats" not in data and "ends_on" not in data
+            assert PurchasedCard.model_validate(data).allowance_usd == "100"
+    finally:
+        _alembic_command(db_uri, migration_engine, "upgrade", "head")
 
 
 def test_pricing_migration_additive_roundtrip(db_uri):
