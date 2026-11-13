@@ -1456,6 +1456,14 @@ def test_windows_shell_data_roles_keep_normal_tier_policy(platform, tool, key, c
     "command",
     [
         r"Get-Content C:\x\file.txt:stream",
+        "rg -f patterns.txt file.txt:stream",
+        "grep -fpatterns.txt file.txt:stream",
+        "rg -e pattern file.txt:stream",
+        "rg file.txt:stream -e needle",
+        "rg file.txt:stream --regexp=needle",
+        "rg file.txt:stream -f patterns.txt",
+        "rg NUL -e needle",
+        "grep file.txt:stream -e needle",
         "Get-Content file.txt:stream",
         r"Get-Content %MISSING%\file.txt",
         "Get-Content 100%",
@@ -1533,6 +1541,105 @@ def test_windows_shell_adjacent_operators_preserve_redirection_paths(shell, comm
 )
 def test_windows_shell_data_roles_preserve_path_protections(command, rule):
     assert decision("auto", "sys_os_shell", {"command": command}, windows_host()).rule_id == rule
+
+
+@pytest.mark.parametrize(
+    "shell,command",
+    [
+        ("bash", 'echo "exit=$?"'),
+        ("bash", "powershell -NoProfile -Command \"Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK'\""),
+        ("bash", 'ls C:/work/project | grep -i "omnigent.*dist-info"'),
+        ("bash", '"$USERPROFILE/.local/bin/uv.exe" tool dir'),
+        ("cmd", '"%USERPROFILE%/.local/bin/uv.exe" tool dir'),
+        ("pwsh", '"$env:USERPROFILE/.local/bin/uv.exe" tool dir'),
+        ("bash", 'rg -e "file:stream" C:/work/project'),
+    ],
+)
+def test_windows_live_data_and_environment(shell, command):
+    host = windows_host(
+        shell=shell, environment={"SystemRoot": r"C:\Windows", "USERPROFILE": r"C:\work\sample"}
+    )
+    assert decision("auto", "sys_os_shell", {"command": command}, host).action == Verdict.ALLOW
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rg ordinary.txt -e needle",
+        "rg ordinary.txt --regexp=needle",
+        "rg ordinary.txt -f patterns.txt",
+        "grep ordinary.txt -e needle",
+        "grep ordinary.txt -f patterns.txt",
+        'rg -- "file:stream" ordinary.txt',
+        'rg -e "--regexp" ordinary.txt',
+    ],
+)
+def test_windows_search_late_patterns_keep_normal_tier_policy(command):
+    assert tuple(
+        decision(tier, "sys_os_shell", {"command": command}, windows_host()).action
+        for tier in PERMISSION_TIERS
+    ) == (Verdict.ASK, Verdict.DENY, Verdict.ASK, Verdict.ALLOW, Verdict.ALLOW)
+
+
+@pytest.mark.parametrize("shell", ["bash", "pwsh", "cmd"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        'ls C:/work/project | grep -i "omnigent.*dist-info"',
+        'rg -e "omnigent.*dist-info" C:/work/project',
+        'rg C:/work/project -e "omnigent.*dist-info"',
+        'grep C:/work/project --regexp="omnigent.*dist-info"',
+    ],
+)
+def test_windows_search_pattern_never_reaches_resolver(shell, command):
+    resolved = []
+    host = windows_host(shell=shell)
+
+    def resolve(path):
+        if "omnigent.*dist-info" in path:
+            raise OSError(123, "The filename, directory name, or volume label syntax is incorrect")
+        resolved.append(path)
+        return host.resolver(path)
+
+    result = decision(
+        "auto", "sys_os_shell", {"command": command}, replace(host, resolver=resolve)
+    )
+    assert result.action == Verdict.ALLOW
+    assert resolved
+    assert all("omnigent.*dist-info" not in path for path in resolved)
+
+
+@pytest.mark.parametrize(
+    "shell,variable", [("bash", "$MISSING"), ("cmd", "%MISSING%"), ("pwsh", "$env:MISSING")]
+)
+def test_windows_missing_environment_names_variable(shell, variable):
+    result = decision(
+        "auto",
+        "sys_os_shell",
+        {"command": f'cat "{variable}/file.txt"'},
+        windows_host(shell=shell),
+    )
+    assert result.action == Verdict.DENY
+    assert "MISSING" in result.reason
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "file.txt:stream",
+        r"\\?\C:\work\file",
+        r"C:\work\control\tier",
+        r"C:\work\sample\.ssh\private_key",
+    ],
+)
+def test_windows_live_data_keeps_redirect_guards(target):
+    result = decision(
+        "auto",
+        "sys_os_shell",
+        {"command": f'echo "exit=$?" > {target}'},
+        windows_host(shell="bash"),
+    )
+    assert result.action == Verdict.DENY
 
 
 def test_terminal_and_malformed_calls_fail_closed() -> None:

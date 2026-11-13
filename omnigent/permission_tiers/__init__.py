@@ -278,6 +278,7 @@ _READ_NO_PATH = frozenset(
         "sys_session_list",
         "sys_session_get_info",
         "sys_session_get_history",
+        "sys_standing_approval_read",
         "sys_agent_list",
         "sys_agent_get",
         "sys_list_models",
@@ -609,13 +610,13 @@ def _windows_absolute(path: str, context: TrustedHostContext) -> str:
         env = {key.upper(): value for key, value in context.environment.items()}
         if name in ("USERPROFILE", "HOME"):
             return context.home
-        if name in ("SYSTEMROOT", "WINDIR") and name in env:
+        if name in env:
             return env[name]
-        raise ValueError("Unknown Windows path variable")
+        raise ValueError(f"Unknown Windows path variable: {name}")
 
     path = _WINDOWS_ENV.sub(expand, path)
     if "$" in path or "%" in path:
-        raise ValueError("Unresolved Windows path variable")
+        raise ValueError(f"Unresolved Windows path variable: {path}")
     drive, tail = ntpath.splitdrive(path)
     if not drive and path.startswith("\\") and not path.startswith("\\\\"):
         raise ValueError("Root-relative Windows path without drive")
@@ -1620,6 +1621,9 @@ def _windows_path_operands(tokens: list[str], raw_tokens: list[str], shell: str)
         return []
     conservative = [value for value in tokens if not value.startswith("-")]
     dialect = ntpath.basename(shell).lower().removesuffix(".exe")
+    if dialect in _HEREDOC_SHELLS and tokens[0] == "echo":
+        if all(not re.search(r"\$(?!\?)|[`{}\r\n]", raw) for raw in raw_tokens[1:]):
+            return tokens[:1]
     if dialect not in ("pwsh", "powershell", "cmd", "sh", "bash", "zsh") or any(
         any(char in raw for char in "$`^!{}\r\n")
         or (dialect == "cmd" and any(char in raw for char in "%'"))
@@ -1630,7 +1634,28 @@ def _windows_path_operands(tokens: list[str], raw_tokens: list[str], shell: str)
     command = tokens[0].lower().removesuffix(".exe")
     if tokens[0].lower() in ("echo", "write-output"):
         return conservative if any(value.startswith("-") for value in tokens[1:]) else tokens[:1]
-    if command == "git" and tokens[1:2] == ["commit"]:
+    if command == "get-date":
+        start = 1
+        data_options = ("-Format", "-format")
+        file_options = ()
+        flags = ()
+    elif command in ("grep", "egrep", "fgrep", "rg"):
+        start = 1
+        data_options = ("-e", "--regexp")
+        file_options = ("-f", "--file")
+        flags = (
+            "-i",
+            "--ignore-case",
+            "-n",
+            "-r",
+            "-R",
+            "-E",
+            "-F",
+            "-l",
+            "-q",
+            "--fixed-strings",
+        )
+    elif command == "git" and tokens[1:2] == ["commit"]:
         start = 2
         data_options = ("-m", "--message")
         file_options = ("-F", "--file")
@@ -1691,6 +1716,8 @@ def _windows_path_operands(tokens: list[str], raw_tokens: list[str], shell: str)
     files = set()
     certain = True
     options = True
+    explicit_pattern = False
+    positionals = []
     index = start
     while index < len(tokens):
         value = tokens[index]
@@ -1707,23 +1734,31 @@ def _windows_path_operands(tokens: list[str], raw_tokens: list[str], shell: str)
             if option in file_options:
                 candidates[index] = attached
                 files.add(index)
+                explicit_pattern = command in ("grep", "egrep", "fgrep", "rg") or explicit_pattern
             elif command != "curl" or (
                 urlsplit(attached).scheme in ("http", "https") and urlsplit(attached).hostname
             ):
                 data.add(index)
+                explicit_pattern = True
         elif options and any(
             len(option) == 2 and value.startswith(option) and len(value) > 2
             for option in file_options
         ):
             candidates[index] = value[2:]
             files.add(index)
+            explicit_pattern = command in ("grep", "egrep", "fgrep", "rg") or explicit_pattern
         elif options and value.startswith("-"):
             certain &= value in flags
+        elif command in ("grep", "egrep", "fgrep", "rg"):
+            positionals.append(index)
         elif command == "curl":
             url = urlsplit(value)
             if url.scheme in ("http", "https") and url.hostname:
                 data.add(index)
         index += 1
+    # Explicit patterns apply to all positionals, even those preceding the option.
+    if positionals and not explicit_pattern:
+        data.add(positionals[0])
     return [
         value
         for index, value in enumerate(candidates)
@@ -1813,6 +1848,10 @@ def _windows_command_paths(
             candidates.extend(_windows_path_operands(segment, raw_segment, context.shell))
     for token in candidates:
         if token:
+            expanded = _expand_trusted(token, context, frozenset())
+            if expanded is None:
+                raise ValueError(f"Unresolved Windows path variable: {token}")
+            token = expanded
             paths.append(_resolve(token, context).path)
     return tuple(paths)
 
@@ -2034,6 +2073,29 @@ def _expand_trusted(
     token: str, context: TrustedHostContext, assigned: frozenset[str]
 ) -> str | None:
     """Expand the trusted variables a target may name; None when it stays unresolved."""
+    if context.platform == "windows":
+        dialect = ntpath.basename(context.shell).lower().removesuffix(".exe")
+        pattern = (
+            _WINDOWS_ENV
+            if dialect == "cmd"
+            else re.compile(r"\$env:([A-Za-z_][A-Za-z0-9_]*)", re.I)
+            if dialect in ("pwsh", "powershell")
+            else re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+        )
+        values = dict(context.environment)
+        if dialect in ("cmd", "pwsh", "powershell"):
+            values = {name.upper(): value for name, value in values.items()}
+
+        def windows_expand(match: re.Match[str]) -> str:
+            name = next(value for value in match.groups() if value is not None)
+            if dialect in ("cmd", "pwsh", "powershell"):
+                name = name.upper()
+            if name in assigned or not values.get(name):
+                raise ValueError(f"Unknown Windows path variable: {name}")
+            return values[name]
+
+        expanded = pattern.sub(windows_expand, token)
+        return None if "$" in expanded or "`" in expanded else expanded
     values = {
         "HOME": context.home,
         "TMPDIR": (context.environment.get("TMPDIR") or "").rstrip("/"),
@@ -2088,7 +2150,15 @@ def _shell_writes(
     windows = context.platform == "windows"
     command = command.replace("\\\n", "")
     tokens, raw_tokens = _write_tokens(command, windows=windows or powershell)
-    assigned = untrusted | {name for name in _TRUSTED_VARIABLES if name + "=" in command}
+    assigned = untrusted | {
+        name
+        for name in (*_TRUSTED_VARIABLES, *context.environment)
+        if (
+            re.search(r"\b" + re.escape(name) + r"\s*=", command, re.I)
+            if windows
+            else name + "=" in command
+        )
+    }
     nested = _ShellWrites()
     for body in _shell_scan(command)[2]:
         try:

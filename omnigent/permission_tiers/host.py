@@ -91,11 +91,15 @@ def local_host_context(
     platform = "windows" if sys.platform == "win32" else sys.platform
     if platform not in ("linux", "darwin", "windows"):
         raise ValueError("Unsupported permission host platform")
-    environment = {
-        name: value
-        for name in ("SystemRoot", "SYSTEMROOT", "WINDIR", "ProgramFiles", "ProgramFiles(x86)")
-        if (value := os.environ.get(name)) is not None
-    }
+    environment = (
+        dict(os.environ)
+        if platform == "windows"
+        else {
+            name: value
+            for name in ("SystemRoot", "SYSTEMROOT", "WINDIR", "ProgramFiles", "ProgramFiles(x86)")
+            if (value := os.environ.get(name)) is not None
+        }
+    )
     # The current drive's cwd is known; other drive-relative paths stay denied.
     drive_cwds = {}
     if platform == "windows":

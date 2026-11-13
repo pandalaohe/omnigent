@@ -557,7 +557,9 @@ _PROJECT_SETTINGS_TOOLS = frozenset({"sys_project_settings_read", "sys_project_s
 _SESSION_CHOICE_TOOLS = frozenset(
     {"sys_session_choice_read", "sys_session_choice_update", "sys_quota_floor"}
 )
-_STANDING_APPROVAL_TOOLS = frozenset({"sys_standing_approval", "sys_standing_pass"})
+_STANDING_APPROVAL_TOOLS = frozenset(
+    {"sys_standing_approval", "sys_standing_pass", "sys_standing_approval_read"}
+)
 _APPROVAL_ANSWER_TOOLS = frozenset({"sys_approval_answer"})
 
 # Priority 5l.1: Scheduled-task management — the runner proxies the Omnigent
@@ -7683,11 +7685,16 @@ async def _execute_standing_approval_tool(
     *,
     conversation_id: str | None,
     server_client: httpx.AsyncClient | None,
+    read_only: bool = False,
 ) -> str:
     if server_client is None or conversation_id is None:
         return json.dumps({"error": "sys_standing_approval requires server access and a session"})
     try:
         args = json.loads(arguments)
+        if read_only:
+            if args != {}:
+                raise ValueError("sys_standing_approval_read takes no arguments")
+            args = {"op": "read"}
         if not isinstance(args, dict) or args.keys() - {"op", "kinds", "source"}:
             raise ValueError("unexpected standing approval arguments")
         url = f"{_session_url(conversation_id)}/standing-approval"
@@ -11561,7 +11568,10 @@ async def execute_tool(
             if tool_name == "sys_standing_pass":
                 _logger.info("legacy name used: sys_standing_pass")
             output = await _execute_standing_approval_tool(
-                arguments, conversation_id=conversation_id, server_client=server_client
+                arguments,
+                conversation_id=conversation_id,
+                server_client=server_client,
+                read_only=tool_name == "sys_standing_approval_read",
             )
         elif tool_name in _POLICY_TOOLS:
             output = await _execute_policy_tool(

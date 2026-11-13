@@ -148,6 +148,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_session_choice_update",
         "sys_quota_floor",
         "sys_standing_approval",
+        "sys_standing_approval_read",
         "sys_approval_answer",
         # Scheduled-task management tools are always auto-registered
         # so agents can create, list, update, and delete recurring
