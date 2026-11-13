@@ -4,10 +4,7 @@ import { MemoryRouter, Routes, Route } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
-import {
-  patchUsageBoardPreferences,
-  readUsageContextPreferences,
-} from "@/lib/usageContextPreferences";
+import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
 import { UsageBoardRoute } from "./UsageBoardRoute";
 import { usageBoardData } from "./usageBoardFixtures";
 import { sampleTotals, usageActivityFixture, usageIssuesFixture } from "./usageActivityFixtures";
@@ -35,26 +32,51 @@ beforeEach(() => {
     };
     return new Response(
       JSON.stringify(
-        url.pathname.endsWith("/activity")
-          ? activity
-          : url.pathname.endsWith("/issues")
-            ? usageIssuesFixture(activity)
-            : url.pathname.endsWith("/models")
-              ? {
-                  account: "litellm",
-                  display_name: "LiteLLM",
-                  range: "d7",
-                  span: null,
-                  models: [
-                    {
-                      id: "model-a",
-                      sources: [],
-                      pricing: null,
-                      usage: sampleTotals(1, 1000),
-                    },
-                  ],
-                }
-              : overview,
+        url.pathname.endsWith("/analysis")
+          ? {
+              generated_at: activity.generated_at,
+              span: activity.accounts[0].span,
+              pool_catalog: [],
+              rows: activity.accounts.flatMap((item) =>
+                item.series.map((point) => ({
+                  account_id: item.account,
+                  parent_account_id: item.account,
+                  model: item.models?.[0]?.model ?? "",
+                  hour: point.at,
+                  tokens: point.tokens,
+                  requests: point.requests,
+                  failed: point.failed,
+                  contributes_usage: true,
+                  contributes_money: true,
+                  coverage: "complete",
+                  reason: null,
+                  attributed: false,
+                  pool_id: null,
+                })),
+              ),
+              partial: false,
+              truncated: false,
+            }
+          : url.pathname.endsWith("/activity")
+            ? activity
+            : url.pathname.endsWith("/issues")
+              ? usageIssuesFixture(activity)
+              : url.pathname.endsWith("/models")
+                ? {
+                    account: "litellm",
+                    display_name: "LiteLLM",
+                    range: "d7",
+                    span: null,
+                    models: [
+                      {
+                        id: "model-a",
+                        sources: [],
+                        pricing: null,
+                        usage: sampleTotals(1, 1000),
+                      },
+                    ],
+                  }
+                : overview,
       ),
     );
   });
@@ -292,18 +314,12 @@ it("shows empty Issues only after a successful empty read", async () => {
   expect(screen.getByText("No source issues in this range.")).toBeTruthy();
 });
 
-it("keeps hidden accounts out of totals, the account list and By model", async () => {
+it("keeps hidden accounts out of analysis picks and item rows", async () => {
   patchUsageBoardPreferences({ hidden: ["litellm", "pi"] });
   mount();
-  const list = await screen.findByRole("region", { name: "Accounts" });
+  const list = await screen.findByRole("table", { name: "Each item" });
   expect(within(list).queryByText("LiteLLM")).toBeNull();
-  const cost = screen.getByRole("region", { name: "Cost" });
-  expect(within(cost).getByRole("button", { name: "~$0.00" })).toBeTruthy();
-  fireEvent.click(screen.getByText("By model"));
-  expect(screen.queryByText("model-b")).toBeNull();
-  fireEvent.click(screen.getByRole("button", { name: "Tokens" }));
-  await waitFor(() => expect(readUsageContextPreferences().board.unit).toBe("tokens"));
-  expect(screen.getByRole("button", { name: "Money" }).getAttribute("aria-pressed")).toBe("false");
+  expect(screen.queryByRole("button", { name: "LiteLLM" })).toBeNull();
 });
 
 it("takes the summary tap to Cost, then its failure row to ranged Issues blocks", async () => {
@@ -312,7 +328,9 @@ it("takes the summary tap to Cost, then its failure row to ranged Issues blocks"
   await waitFor(() => expect(summary.textContent).toContain("$"));
   fireEvent.click(within(summary).getByRole("link", { name: "Open usage analysis" }));
   await screen.findByRole("heading", { name: "Usage board", level: 1 });
-  fireEvent.click(screen.getByRole("link", { name: /requests.*failed.*unpriced.*Issues/ }));
+  await screen.findByRole("table", { name: "Each item" });
+  fireEvent.click(screen.getByText("Analysis tools"));
+  fireEvent.click(screen.getByRole("link", { name: "Issues" }));
   await screen.findByRole("heading", { name: "Issues", level: 1 });
   expect((await screen.findByRole("region", { name: "Failures" })).textContent).toContain(
     "timeout",
@@ -357,7 +375,7 @@ it("keeps missing usage, request counts and Previous absent instead of inventing
 
 it("reports a failed activity read and does not fetch while the user switch is off", async () => {
   fetchMock.mockImplementation(async (path: string) =>
-    path.includes("/activity")
+    path.includes("/analysis")
       ? new Response(JSON.stringify({ detail: "Hours unavailable" }), { status: 503 })
       : new Response(JSON.stringify(usageBoardData())),
   );
@@ -390,11 +408,43 @@ it("loads Issues, account activity and account models while the board switch is 
   );
   cleanup();
   mount("/usage/board/litellm");
-  await screen.findByRole("heading", { name: "LiteLLM", level: 1 });
+  await screen.findByRole("heading", { name: "LiteLLM", level: 2 });
   await waitFor(() =>
     expect(fetchMock.mock.calls.some(([path]) => String(path).includes("/activity"))).toBe(true),
   );
   cleanup();
   mount("/usage/board/litellm/models");
   await screen.findByText("model-a");
+});
+
+it("does not compare a subset of account Previous against the selected total", async () => {
+  const { UsageAnalysisChart } = await import("./UsageCostChart");
+  const account = usageActivityFixture().accounts[0];
+  const rows = [account.account, "other"].map((id) => ({
+    account_id: id,
+    parent_account_id: id,
+    pool_id: null,
+    hour: account.span.counted_from,
+    model: "Claude",
+    basis: "metered",
+    tokens: 100,
+    requests: 10,
+    failed: 0,
+    cost_usd: null,
+    contributes_usage: true,
+    contributes_money: false,
+    attributed: false,
+    coverage: "complete",
+    reason: null,
+  }));
+  render(
+    <UsageAnalysisChart
+      rows={rows}
+      span={account.span}
+      unknown={false}
+      previousUnavailable
+      previousAccounts={[account]}
+    />,
+  );
+  expect(screen.getByText("Previous selected hourly series not available yet")).toBeTruthy();
 });

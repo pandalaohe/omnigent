@@ -173,8 +173,13 @@ class PricingBaseline(PricingModel):
             if card.ends_on
             else float("inf")
         )
+        return min(boundary, self.replacement_boundary(card))
+
+    def replacement_boundary(self, card: PurchasedCard) -> float:
+        boundary = float("inf")
         for other in self.cards:
-            if other.id != card.id and (other.target_kind, other.target_id) == (
+            if other.id != card.id and (other.parent, other.target_kind, other.target_id) == (
+                card.parent,
                 card.target_kind,
                 card.target_id,
             ):
@@ -261,7 +266,11 @@ class PricingBaseline(PricingModel):
                     continue
                 a, b = card.billing_span()
                 c, d = other.billing_span()
-                if (card.target_kind, card.target_id) == (other.target_kind, other.target_id):
+                if (card.parent, card.target_kind, card.target_id) == (
+                    other.parent,
+                    other.target_kind,
+                    other.target_id,
+                ):
                     if a.timestamp() < c.timestamp() and card.repeats:
                         continue
                     if c.timestamp() < a.timestamp() and other.repeats:

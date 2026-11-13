@@ -1,6 +1,12 @@
 import { boardPath } from "@/lib/boardFrame";
 import { Link } from "@/lib/routing";
-import { ArrowDownRightIcon, ArrowUpRightIcon, HistoryIcon, TriangleAlertIcon } from "lucide-react";
+import {
+  ArrowDownRightIcon,
+  ArrowUpRightIcon,
+  CircleHelpIcon,
+  HistoryIcon,
+  TriangleAlertIcon,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
@@ -9,11 +15,13 @@ import { useUsageActivity } from "./usageActivityData";
 import { t } from "./usageText";
 import type { UsageAccountActivity, UsageAmount } from "./usageActivityData";
 import type { UsageAccountView } from "./usageBoardData";
-import { formatFullDate, formatMoney } from "./usageBoardFormat";
+import { formatCount, formatFullDate, formatMoney } from "./usageBoardFormat";
 import { amountTip, boardAmount, sumUsage, usageFigure } from "./usageAmountData";
 import { UsageTip, UsageTipButton } from "./UsageTip";
 import { UsageRangeControl } from "./UsageRangeControl";
 import { UsageCostChart } from "./UsageCostChart";
+import { UsageName } from "./UsageName";
+import { FigureText } from "./UsageFigure";
 
 export function UsageUnitControl() {
   const tokens = useUsageContextPreferences().board.unit === "tokens";
@@ -85,8 +93,8 @@ export function UsageAmountFigure({
 }) {
   const figure = (
     <>
-      {!tokens ? amount.mark : null}
-      {usageFigure(amount.totals, tokens)}
+      {!tokens && amount.mark ? <span className="usage-approx">{amount.mark}</span> : null}
+      <FigureText text={usageFigure(amount.totals, tokens, true)} />
     </>
   );
   return (
@@ -148,7 +156,7 @@ export function UsageSummary({ accountIds }: { accountIds: string[] }) {
                     model={amountTip(amount, true)}
                     className="usage-summary-tip"
                   >
-                    ?
+                    <CircleHelpIcon className="size-3.5" aria-hidden="true" />
                   </UsageTipButton>
                 ) : null}
               </div>
@@ -157,8 +165,8 @@ export function UsageSummary({ accountIds }: { accountIds: string[] }) {
                   "Unavailable"
                 ) : amount && amount.totals.cost_usd !== null ? (
                   <span className="tabular-nums">
-                    {amount.mark}
-                    {usageFigure(amount.totals, false)}
+                    {amount.mark ? <span className="usage-approx">{amount.mark}</span> : null}
+                    <FigureText text={usageFigure(amount.totals, false, true)} />
                   </span>
                 ) : (
                   "—"
@@ -295,7 +303,7 @@ export function UsageCostCard({
           <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
           {failures.requests !== null ? (
             <>
-              <span>{failures.requests.toLocaleString("en-US")} requests</span>
+              <span>{formatCount(failures.requests)} requests</span>
               <span>
                 {failures.failed} failed · {(failures.failure_pct ?? 0).toFixed(1)}%
               </span>
@@ -339,7 +347,7 @@ export function UsageByModel({
               key={model}
               className="flex min-w-0 items-center gap-3 border-t border-border py-2 text-xs"
             >
-              <span className="min-w-0 flex-1 break-all">{model}</span>
+              <UsageName className="flex-1">{model}</UsageName>
               <span className="shrink-0 tabular-nums">{usageFigure(totals, tokens)}</span>
             </div>
           );

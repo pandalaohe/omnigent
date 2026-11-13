@@ -1,5 +1,5 @@
 import type { UsageAccountActivity, UsageAmount, UsageTotals } from "./usageActivityData";
-import { formatMoney } from "./usageBoardFormat";
+import { formatCount, formatMoney, formatTileAmount } from "./usageBoardFormat";
 import type { UsageTipModel } from "./UsageTip";
 
 export function sumUsage(values: UsageTotals[]): UsageTotals {
@@ -90,12 +90,17 @@ export function boardAmount(
   };
 }
 
-export function usageFigure(totals: UsageTotals, tokens: boolean): string {
-  if (!tokens) return formatMoney(totals.cost_usd ?? (totals.unpriced > 0 ? 0 : null));
+/**
+ * Money (two decimals) or tokens (three significant digits). `compact` is for
+ * constrained cells: money from six integer digits becomes `$123.45K`.
+ */
+export function usageFigure(totals: UsageTotals, tokens: boolean, compact = false): string {
+  if (!tokens) {
+    const cost = totals.cost_usd ?? (totals.unpriced > 0 ? 0 : null);
+    return compact && cost !== null ? formatTileAmount(cost, "USD") : formatMoney(cost);
+  }
   if (totals.tokens === null) return "—";
-  return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(
-    totals.tokens,
-  );
+  return formatCount(totals.tokens);
 }
 export function amountTip(amount: UsageAmount, total = false): UsageTipModel {
   const rows: UsageTipModel["rows"] = [];
@@ -118,6 +123,8 @@ export function amountTip(amount: UsageAmount, total = false): UsageTipModel {
       label: "Covers",
       value: `${Math.round(amount.totals.cost_coverage_pct)}% of cost`,
     });
+  if (amount.totals.cost_usd !== null && Math.abs(amount.totals.cost_usd) >= 1e5)
+    rows.push({ label: "Exact", value: formatMoney(amount.totals.cost_usd) });
   if (!rows.length) rows.push({ label: "Basis", value: "Metered usage" });
   return { title: "Usage amount", rows };
 }

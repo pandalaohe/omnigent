@@ -29,15 +29,23 @@ def _value_usage(
     pool: str | None = None,
     model: str | None = None,
     card_id: str | None = None,
+    pools: set[tuple[str, str]] | None = None,
+    models: set[str] | None = None,
+    card_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Never split a shared purchase by model or infer pool activity from payment."""
+    pools = {(parent, pool) for parent in view.account_spans} if pool is not None else pools
+    models = {model} if model is not None else models
+    card_ids = {card_id} if card_id is not None else card_ids
     start, until = int(view.span.counted_from), int(view.span.until)
     defaults = baseline.defaults
     as_of = int(view.generated_at)
     currency = defaults.display_currency
     cohort = (
         f"{start}:{until}:{','.join(sorted(view.account_spans))}:"
-        f"{pool or ''}:{model or ''}:{card_id or ''}"
+        f"{sorted(pools) if pools is not None else None}:"
+        f"{sorted(models) if models is not None else None}:"
+        f"{sorted(card_ids) if card_ids is not None else None}"
     )
     metadata = {"cohort_id": cohort, "as_of": as_of}
 
@@ -61,8 +69,11 @@ def _value_usage(
         card
         for card in baseline.cards
         if (card.parent in accounts or card.target_id in accounts)
-        and (pool is None or (card.target_kind == "pool" and card.target_id == pool))
-        and (card_id is None or card.id == card_id)
+        and (
+            pools is None
+            or (card.target_kind == "pool" and (card.parent, card.target_id) in pools)
+        )
+        and (card_ids is None or card.id in card_ids)
     ]
     periods = [
         (card, index, billing)
@@ -76,27 +87,23 @@ def _value_usage(
     ]
     actual_rows = [row for row in view.rows if row.contributes_usage]
     rows = actual_rows
-    if card_id is not None:
-        if all_cards:
-            selected_card = all_cards[0]
-            rows = [
-                row
-                for row in rows
-                if _matches(selected_card, row)
-                and any(
-                    b <= row.hour < min(e, baseline.renewal_boundary(selected_card))
-                    for _, _, (b, e) in periods
-                )
-            ]
-        else:
-            rows = []
+    if card_ids is not None:
+        rows = [
+            row
+            for row in rows
+            if any(
+                _matches(card, row) and b <= row.hour < min(e, baseline.replacement_boundary(card))
+                for card, _, (b, e) in periods
+            )
+        ]
     rows = [
         row
         for row in rows
-        if (pool is None or (row.attributed and row.pool_id == pool))
-        and (model is None or row.model == model)
+        if (pools is None or (row.attributed and (row.parent_account_id, row.pool_id) in pools))
+        and (models is None or row.model in models)
     ]
     cards = []
+    paid_components = []
     known_paid_rows: list[AnalysisRowView] = []
     converted_paid = Fraction(0)
     ratio_paid = Fraction(0)
@@ -140,13 +147,20 @@ def _value_usage(
         paid = allocation(paid_full, billing, selected)
         original = exact(paid, unit="money", currency=card.purchase_currency, **metadata)
         converted = money(paid, card.purchase_currency)
-        if model is not None:
+        if models is not None:
             converted = unknown("shared_payment_cannot_be_split_by_model")
         if converted.low is None:
             paid_missing = True
         else:
             converted_paid += paid * Fraction(defaults.fx_to_display[card.purchase_currency])
             known_paid += 1
+            paid_components.append(
+                {
+                    "start": billing[0],
+                    "until": billing[1],
+                    "amount": money(paid_full, card.purchase_currency),
+                }
+            )
         reset_results = []
         for reset in card.reset_spans(period_index):
             reset_paid = allocation(
@@ -173,7 +187,7 @@ def _value_usage(
             row
             for row in rows_by_parent.get(card.parent, [])
             if _matches(card, row)
-            and billing[0] <= row.hour < min(billing[1], baseline.renewal_boundary(card))
+            and billing[0] <= row.hour < min(billing[1], baseline.replacement_boundary(card))
         ]
         if converted.low is not None:
             known_paid_cohort_units += sum(row.tokens or 0 for row in card_rows)
@@ -188,7 +202,7 @@ def _value_usage(
             row
             for row in actual_by_parent.get(card.parent, [])
             if _matches(card, row)
-            and billing[0] <= row.hour < min(billing[1], baseline.renewal_boundary(card))
+            and billing[0] <= row.hour < min(billing[1], baseline.replacement_boundary(card))
         ]
         compatible = rates is not None and (
             rates.model is not None or len({row.model for row in target_rows}) <= 1
@@ -240,6 +254,8 @@ def _value_usage(
                 "repeats": card.repeats,
                 "next_renewal": baseline.next_renewal(card, as_of),
                 "name": card.name,
+                "parent_account_id": card.parent,
+                "pool_id": card.target_id if card.target_kind == "pool" else None,
                 "starts_at": billing[0],
                 "ends_at": billing[1],
                 "effective_discount": discount,
@@ -256,7 +272,7 @@ def _value_usage(
     source_money = [
         row
         for row in view.rows
-        if card_id is None
+        if card_ids is None
         and row.reason is None
         and (
             row.channel is None
@@ -266,8 +282,8 @@ def _value_usage(
         and (row.channel != "metered_cost" or row.basis not in LIST_BASES)
         and row.priced
         and row.cost_usd is not None
-        and (pool is None or row.pool_id == pool)
-        and (model is None or row.model == model)
+        and (pools is None or (row.parent_account_id, row.pool_id) in pools)
+        and (models is None or row.model in models)
     ]
     legacy_paid: dict[str, Fraction] = {}
     legacy_api: dict[str, Fraction] = {}
@@ -298,6 +314,14 @@ def _value_usage(
             legacy_paid[row.parent_account_id] = legacy_paid.get(
                 row.parent_account_id, Fraction(0)
             ) + Fraction(str(billed.cost_usd))
+            if defaults.fx_to_display.get("USD") is not None:
+                paid_components.append(
+                    {
+                        "start": row.hour,
+                        "until": row.hour,
+                        "amount": money(Fraction(str(billed.cost_usd)), "USD"),
+                    }
+                )
             known_paid_cohort_units += row.tokens or 0
             ratio_units_complete = ratio_units_complete and row.tokens is not None
         else:
@@ -342,14 +366,14 @@ def _value_usage(
         api = api.model_copy(
             update={"state": "partial", "high": None, "reason": "incomplete_usage_or_pricing"}
         )
-    if card_id is not None:
+    if card_ids is not None:
         api = unknown("per_card_usage_not_attributable")
     paid_value = (
         money(converted_paid, currency, coverage)
         if items and not paid_missing
         else unknown("missing_fx_or_payment_baseline")
     )
-    if model is not None:
+    if models is not None:
         paid_value = unknown("shared_payment_cannot_be_split_by_model")
     elif missing_paid_accounts and paid_value.low is not None:
         paid_value = paid_value.model_copy(
@@ -402,7 +426,7 @@ def _value_usage(
         else tokens
     )
     unit_cost = divide(paid_value, million, unit="money_per_million_tokens", currency=currency)
-    if card_id is not None:
+    if card_ids is not None:
         tokens = unknown("per_card_usage_not_attributable", "tokens", None)
         payback = unknown("per_card_usage_not_attributable", "ratio", None)
         unit_cost = unknown("per_card_usage_not_attributable", "money_per_million_tokens")
@@ -419,6 +443,7 @@ def _value_usage(
         fx_basis="configured_source_to_display",
         revision=baseline.revision,
         cards=cards,
+        paid_components=paid_components,
         coverage=coverage,
         **values,
         display={
@@ -436,9 +461,15 @@ def value_usage(
     pool: str | None = None,
     model: str | None = None,
     card_id: str | None = None,
+    pools: set[tuple[str, str]] | None = None,
+    models: set[str] | None = None,
+    card_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Keep fee/payback cohorts separate from metered spend and free usage."""
-    options = {"pool": pool, "model": model, "card_id": card_id}
+    pools = {(parent, pool) for parent in view.account_spans} if pool is not None else pools
+    models = {model} if model is not None else models
+    card_ids = {card_id} if card_id is not None else card_ids
+    options = {"pools": pools, "models": models, "card_ids": card_ids}
     classes = {**view.account_cost_classes, **baseline.account_classes}
     if not classes:
         return _value_usage(view, baseline, **options)
@@ -454,6 +485,10 @@ def value_usage(
         )
 
     accounts = set(view.account_spans)
+    if pools is not None:
+        accounts &= {parent for parent, _ in pools}
+    if card_ids is not None:
+        accounts &= {card.parent for card in baseline.cards if card.id in card_ids}
     fee_accounts = {key for key in accounts if classes.get(key) in {"subscription", "prepaid"}}
     result = _value_usage(selected(fee_accounts), baseline, **options)
     money_by_account = {}
@@ -483,8 +518,10 @@ def value_usage(
                     continue
                 if row.channel not in {None, "usage", "metered_cost"}:
                     continue
-                if (pool is not None and row.pool_id != pool) or (
-                    model is not None and row.model != model
+                if (
+                    (pools is not None and (row.parent_account_id, row.pool_id) not in pools)
+                    or (models is not None and row.model not in models)
+                    or card_ids is not None
                 ):
                     continue
                 key = row.hour, row.model, row.host_id, row.pool_id
@@ -510,6 +547,8 @@ def value_usage(
                         if row.contributes_usage
                         and (pool is None or row.pool_id == pool)
                         and (model is None or row.model == model)
+                        and (models is None or row.model in models)
+                        and (pools is None or (row.parent_account_id, row.pool_id) in pools)
                     }
                     if (
                         view.partial

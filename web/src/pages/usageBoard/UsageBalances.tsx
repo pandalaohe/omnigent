@@ -1,6 +1,8 @@
 import type { UsageAccountView } from "./usageBoardData";
-import { formatFullDate, formatUsageValue } from "./usageBoardFormat";
+import { formatFullDate, formatTileAmount, formatUsageValue } from "./usageBoardFormat";
 import { t } from "./usageText";
+import { UsageFigure } from "./UsageFigure";
+import { UsageName } from "./UsageName";
 
 /** Balances have their own reading time and never borrow a window's pace. */
 export function UsageBalances({
@@ -18,53 +20,58 @@ export function UsageBalances({
     return (
       <div className="usage-tile-balance" data-testid="usage-balances">
         {account.balances.map((balance) => (
-          <div key={balance.id}>
-            <div className="usage-balance-ring">
-              {formatUsageValue(balance.remaining, balance.unit)}
-            </div>
-            <span>{balance.label ?? t("balance")}</span>
-            {stale ? <span className="block text-muted-foreground">{t("balanceOld")}</span> : null}
+          <div key={balance.id} className="usage-balance-item">
+            <UsageFigure
+              label={balance.label === "" ? undefined : (balance.label ?? t("balance"))}
+              value={balance.remaining}
+              unit={balance.unit}
+              size={88}
+            />
+            {stale ? <span className="usage-caption">{t("balanceOld")}</span> : null}
           </div>
         ))}
       </div>
     );
   return (
-    <div className="flex min-w-0 flex-wrap justify-center gap-2" data-testid="usage-balances">
+    <div className="usage-balance-list" data-testid="usage-balances">
       {account.balances.map((balance) => (
-        <div
-          key={balance.id}
-          className="flex min-w-0 max-w-full flex-col items-center gap-0.5 text-center text-xs"
-        >
-          <span
-            className={
-              compact
-                ? "font-medium tabular-nums"
-                : "flex size-[88px] flex-col items-center justify-center rounded-full border border-dashed border-muted-foreground/40 px-1"
-            }
-          >
-            <span className="max-w-full break-words text-[10px] text-muted-foreground">
-              {balance.label ?? t("balance")}
+        <div key={balance.id} className="usage-balance-entry">
+          {compact ? (
+            <span className="usage-balance-compact">
+              <UsageName data-usage-label className="usage-caption">
+                {balance.label ?? t("balance")}
+              </UsageName>
+              <span
+                data-usage-amount
+                className="shrink-0"
+                title={formatUsageValue(balance.remaining, balance.unit)}
+              >
+                {formatTileAmount(balance.remaining, balance.unit)}
+              </span>
             </span>
-            <span className="max-w-full break-all font-semibold tabular-nums">
-              {formatUsageValue(balance.remaining, balance.unit)}
-            </span>
-          </span>
-          {balance.group ? (
-            <span className="max-w-full break-words text-muted-foreground">{balance.group}</span>
+          ) : (
+            <UsageFigure
+              label={balance.label ?? t("balance")}
+              value={balance.remaining}
+              unit={balance.unit}
+              size={64}
+              full
+            />
+          )}
+          {balance.group && balance.group !== balance.label ? (
+            <span className="usage-caption wrap-anywhere">{balance.group}</span>
           ) : null}
           {balance.note ? (
-            <span className="max-w-full break-words text-muted-foreground">{balance.note}</span>
+            <span className="usage-caption wrap-anywhere">{balance.note}</span>
           ) : null}
-          <span className="text-[10px] text-muted-foreground">
+          <span className="usage-caption">
             {account.balance_read_at == null
               ? t("balanceNone")
               : t("balanceRead", { date: formatFullDate(account.balance_read_at) })}
           </span>
-          {stale ? (
-            <span className="text-[10px] text-muted-foreground">{t("balanceOld")}</span>
-          ) : null}
+          {stale ? <span className="usage-caption">{t("balanceOld")}</span> : null}
           {balance.expires_at != null ? (
-            <span className="text-[10px] text-muted-foreground">
+            <span className="usage-caption">
               {t("expires", { date: formatFullDate(balance.expires_at) })}
             </span>
           ) : null}

@@ -1354,6 +1354,7 @@ class AgentQuotaService:
         from_date: date | None = None,
         to_date: date | None = None,
         account: str | None = None,
+        account_ids: set[str] | None = None,
         now: float | None = None,
         previous: bool = False,
     ) -> UsageAnalysisView:
@@ -1373,12 +1374,16 @@ class AgentQuotaService:
         :param from_date: First local day of a ``custom`` range.
         :param to_date: Last local day of a ``custom`` range.
         :param account: Restrict the returned rows and totals to one account.
+        :param account_ids: Restrict to these parent tiles before the row bound.
         :param now: Reference time; injectable for tests.
         :returns: The bounded, typed analysis view.
         :raises ValueError: For an invalid range, zone or an empty span.
         """
         from omnigent.harness_plugins import native_agents
 
+        requested = (
+            account_ids if account_ids is not None else {account} if account is not None else None
+        )
         now = time.time() if now is None else now
         zone = ZoneInfo(tz)
         overview = self.overview(owner, now=now, include_marks=False)
@@ -1426,9 +1431,9 @@ class AgentQuotaService:
         selected_spans = {
             key: value
             for key, value in spans.items()
-            if account is None
-            or key == account
-            or (key in relations and relations[key].parent_account_id == account)
+            if requested is None
+            or key in requested
+            or (key in relations and relations[key].parent_account_id in requested)
         }
         if selected_spans:
             span = Span.starting(
@@ -1448,9 +1453,11 @@ class AgentQuotaService:
         }
         cohort: set[str] | None = None
         native_models: dict[str, tuple[bool, set[str]]] = {}
-        if account is not None:
-            cohort = {account} | {
-                item.account_id for item in relations.values() if item.parent_account_id == account
+        if requested is not None:
+            cohort = requested | {
+                item.account_id
+                for item in relations.values()
+                if item.parent_account_id in requested
             }
             linked: dict[str, str] = {}
             for account_id, record in sorted(usage_records.items()):
@@ -1510,19 +1517,19 @@ class AgentQuotaService:
         ]
         selected.sort(key=lambda item: (item.hour_utc, item.account_id, item.model, item.host_id))
         projection = attribute_rows(selected, relations, views)
-        if account is not None:
-            # The filter names a tile: the account itself and the pools under it.
+        if requested is not None:
+            # The filter names tiles and their proven destinations.
             visible = [
                 item
                 for item in projection.rows
-                if item.account_id == account or item.parent_account_id == account
+                if item.account_id in requested or item.parent_account_id in requested
             ]
             projection = PoolProjection(rows=visible, partial=projection.partial)
         catalog = pool_catalog(list(relations.values()), views)
-        if account is not None:
-            catalog = [item for item in catalog if item.parent_account_id == account]
+        if requested is not None:
+            catalog = [item for item in catalog if item.parent_account_id in requested]
         parents = sorted({item.parent_account_id for item in projection.rows})
-        account_ids = sorted({item.account_id for item in projection.rows})
+        projected_account_ids = sorted({item.account_id for item in projection.rows})
         pool_keys = sorted(
             {
                 (item.parent_account_id, item.pool_id, item.account_id, item.channel)
@@ -1570,7 +1577,7 @@ class AgentQuotaService:
                         ],
                     ),
                 )
-                for value in account_ids
+                for value in projected_account_ids
             ],
             parents=[
                 AnalysisParentTotal(

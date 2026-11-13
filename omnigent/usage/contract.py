@@ -476,7 +476,9 @@ class UsageAnalysisView(BaseModel):
     account_cost_classes: dict[
         str, Literal["subscription", "prepaid", "metered", "free"] | None
     ] = Field(default_factory=dict)
+    presentation: dict[str, Any] | None = None
     quota_closings: list[dict[str, Any]] = Field(default_factory=list)
+    previous: UsageAnalysisView | None = None
 
 
 AnalysisTotals.model_rebuild()
