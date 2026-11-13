@@ -79,12 +79,25 @@ class PricingDefaults(PricingModel):
         return self
 
 
-class TokenRates(PricingModel):
-    read: DecimalInput
-    write: DecimalInput
-    cache_read: DecimalInput
-    cache_write: DecimalInput
+class NullableRates(PricingModel):
+    read: DecimalInput | None = None
+    write: DecimalInput | None = None
+    cache_read: DecimalInput | None = None
+    cache_write: DecimalInput | None = None
+
+    @field_validator("read", "write", "cache_read", "cache_write", mode="before")
+    @classmethod
+    def blank_inherits(cls, value):
+        return None if value == "" else value
+
+
+class TokenRates(NullableRates):
     model: str | None = Field(default=None, max_length=128)
+
+
+class AccountPriceOverride(NullableRates):
+    account_id: Annotated[Identifier, Field(max_length=64)]
+    model: str = Field(min_length=1, max_length=128)
 
 
 class PurchasedCard(PricingModel):
@@ -252,8 +265,13 @@ class PricingBaseline(PricingModel):
             index -= 1
         return 0
 
+    price_overrides: list[AccountPriceOverride] = Field(default_factory=list, max_length=4096)
+
     @model_validator(mode="after")
     def no_overlapping_cards(self) -> PricingBaseline:
+        keys = [(row.account_id, row.model.lower()) for row in self.price_overrides]
+        if len(set(keys)) != len(keys):
+            raise ValueError("account/model price rows must be unique")
         if len({card.id for card in self.cards}) != len(self.cards):
             raise ValueError("card ids must be unique")
         by_parent: dict[str, list[PurchasedCard]] = {}

@@ -2044,6 +2044,7 @@ class SqlUsageHour(OmnigentBase):
     )
     reasoning_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     coverage: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    price_ref: Mapped[str | None] = mapped_column(String(160), nullable=True)
     requests: Mapped[int | None] = mapped_column(Integer, nullable=True)
     failed: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reasons: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -3493,6 +3494,21 @@ class SqlUsageSourceEvent(OmnigentBase):
     severity: Mapped[str] = mapped_column(String(8))
     data: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     received_at: Mapped[int] = mapped_column(BigInteger)
+
+
+class SqlUsagePriceOverride(OmnigentBase):
+    __tablename__ = "usage_price_overrides"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id
+    )
+    owner_id: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True)
+    account_id: Mapped[str] = mapped_column(_usage_evidence_key(64), primary_key=True)
+    model: Mapped[str] = mapped_column(_usage_evidence_key(128), primary_key=True)
+    read_rate: Mapped[Decimal | None] = mapped_column(Numeric(38, 18, asdecimal=True))
+    write_rate: Mapped[Decimal | None] = mapped_column(Numeric(38, 18, asdecimal=True))
+    cache_read_rate: Mapped[Decimal | None] = mapped_column(Numeric(38, 18, asdecimal=True))
+    cache_write_rate: Mapped[Decimal | None] = mapped_column(Numeric(38, 18, asdecimal=True))
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
 
 
 class SqlUsagePricingDefaults(OmnigentBase):

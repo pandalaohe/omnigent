@@ -17,7 +17,16 @@ from tests.server.test_usage_pricing_math import card
 
 
 @pytest.mark.asyncio
-async def test_settings_auth_save_read_stale_and_invalid_target(request, db_uri):
+async def test_settings_auth_save_read_stale_and_invalid_target(request, db_uri, monkeypatch):
+    from omnigent.llms.context_window import ModelPricing
+
+    monkeypatch.setattr(
+        "omnigent.usage.price_resolution.selected_price",
+        lambda model: ModelPricing(2e-6, 4e-6, None, 0),
+    )
+    monkeypatch.setattr(
+        "omnigent.usage.price_resolution.fetch_model_pricing", lambda *a, **k: None
+    )
     app = request.getfixturevalue("authenticated_app")
     _make_user(db_uri, "owner@example.test", is_admin=False)
     _make_user(db_uri, "other@example.test", is_admin=False)
@@ -37,12 +46,32 @@ async def test_settings_auth_save_read_stale_and_invalid_target(request, db_uri)
             json={"schema_version": 2, "observed_at": time.time()},
         )
         assert push.status_code == 200, push.text
-        payload = {"revision": 0, "cards": [card().model_dump(mode="json")]}
+        payload = {
+            "revision": 0,
+            "cards": [card().model_dump(mode="json")],
+            "price_overrides": [{"account_id": "account-a", "model": "m", "read": "0"}],
+        }
         saved = await client.put(path, headers=headers, json=payload)
         assert saved.status_code == 200, saved.text
         assert saved.json()["revision"] == 1
         assert saved.json()["cards"][0]["purchase_currency"] == "HKD"
         assert "preview" in saved.json()
+        assert saved.json()["price_overrides"][0]["read"] == "0"
+        assert saved.json()["price_overrides"][0]["write"] is None
+        assert saved.json()["current_prices"]["m"]["imported"] == {
+            "read": "2.000000",
+            "write": "4.000000",
+            "cache_read": None,
+            "cache_write": "0",
+        }
+        model_path = path + "/model-price"
+        assert (await client.get(model_path, params={"model": "m"})).status_code == 401
+        hinted = await client.get(model_path, params={"model": "m"}, headers=headers)
+        assert hinted.json()["imported"]["read"] == "2.000000"
+        assert hinted.headers["cache-control"] == "private, no-store"
+        assert (
+            await client.get(model_path, params={"model": "m" * 129}, headers=headers)
+        ).status_code == 422
         assert (await client.put(path, headers=headers, json=payload)).status_code == 409
         payload["revision"] = 1
         payload["cards"][0]["retail_amount"] = 12.3

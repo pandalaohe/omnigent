@@ -13,6 +13,15 @@ export const COST_CLASSES: Record<CostClass, string> = {
 };
 export const CURRENCIES: Currency[] = ["CNY", "USD", "HKD"];
 export const RATE_KEYS = ["read", "write", "cache_read", "cache_write"] as const;
+export type Rates = Record<(typeof RATE_KEYS)[number], string | null>;
+export interface AccountPriceOverride extends Rates {
+  account_id: string;
+  model: string;
+}
+export interface CurrentModelPrice {
+  imported: Rates | null;
+  builtin: Rates | null;
+}
 export interface PricingCard {
   id: string;
   name: string;
@@ -27,8 +36,7 @@ export interface PricingCard {
   target_kind: "account" | "pool";
   target_id: string;
   parent_account_id: string | null;
-  rates_usd_per_million:
-    (Record<(typeof RATE_KEYS)[number], string> & { model?: string | null }) | null;
+  rates_usd_per_million: (Rates & { model?: string | null }) | null;
   discount_override: string | null;
 }
 export interface PricingBaseline {
@@ -50,6 +58,8 @@ export interface PricingBaseline {
     payment: AnalysisValue;
     total: AnalysisValue;
   }[];
+  price_overrides?: AccountPriceOverride[];
+  current_prices?: Record<string, CurrentModelPrice>;
 }
 export function accountCostClass(value: PricingBaseline, account: string): CostClass | null {
   return value.account_classes?.[account] ?? value.account_class_defaults?.[account] ?? null;
@@ -89,6 +99,7 @@ export async function savePricingBaseline(
         revision: value.revision,
         defaults: value.defaults,
         cards: value.cards,
+        price_overrides: value.price_overrides ?? [],
         account_classes: value.account_classes ?? {},
       }),
     },
@@ -101,6 +112,10 @@ export async function savePricingBaseline(
         const loc = item.loc?.slice(1) ?? [];
         if (loc[0] === "cards" && typeof loc[1] === "number")
           loc[1] = value.cards[loc[1]]?.id ?? loc[1];
+        if (loc[0] === "price_overrides" && typeof loc[1] === "number") {
+          const row = value.price_overrides?.[loc[1]];
+          if (row) loc.splice(1, 1, row.account_id, row.model);
+        }
         fields[loc.join(".")] = item.msg;
       }
     throw new PricingSaveError(
@@ -118,6 +133,15 @@ export function validDecimal(value: string): boolean {
   if (!/^(0|[1-9]\d*)(\.\d+)?$/.test(value)) return false;
   const [whole, part = ""] = value.split(".");
   return whole.length <= 20 && part.length <= 18 && whole.length + part.length <= 38;
+}
+export function sameRate(a: string | null, b: string | null): boolean {
+  if (a === b) return true;
+  if (a === null || b === null || !validDecimal(a) || !validDecimal(b)) return false;
+  const normalized = (value: string) => {
+    const [whole, fraction = ""] = value.split(".");
+    return `${whole}.${fraction.replace(/0+$/, "")}`;
+  };
+  return normalized(a) === normalized(b);
 }
 // Fixed-point strings use native integers, so the draft preview never passes
 // through binary floating point or display-rounded input.
@@ -188,7 +212,18 @@ export function validatePricing(value: PricingBaseline): Record<string, string> 
       decimal(prefix + "discount_override", card.discount_override, false, true);
     if (card.rates_usd_per_million)
       for (const key of RATE_KEYS)
-        decimal(prefix + "rates_usd_per_million." + key, card.rates_usd_per_million[key]);
+        if (card.rates_usd_per_million[key] !== null && card.rates_usd_per_million[key] !== "")
+          decimal(prefix + "rates_usd_per_million." + key, card.rates_usd_per_million[key]!);
+  }
+  const seen = new Set<string>();
+  for (const row of value.price_overrides ?? []) {
+    const prefix = `price_overrides.${row.account_id}.${row.model}.`;
+    const key = JSON.stringify([row.account_id, row.model.toLowerCase()]);
+    if (!row.account_id || !row.model.trim() || row.model.length > 128 || seen.has(key))
+      errors[prefix + "model"] = "Choose an account and a unique model id (up to 128 characters).";
+    seen.add(key);
+    for (const field of RATE_KEYS)
+      if (row[field] !== null && row[field] !== "") decimal(prefix + field, row[field]!);
   }
   return errors;
 }
@@ -208,6 +243,21 @@ export function reapplyPricing(
   const classes = { ...latest.account_classes };
   for (const [account, kind] of Object.entries(edit.account_classes ?? {}))
     if (kind !== original.account_classes?.[account]) classes[account] = kind;
+  const prices = new Map(
+    (latest.price_overrides ?? []).map((row) => [JSON.stringify([row.account_id, row.model]), row]),
+  );
+  for (const row of edit.price_overrides ?? []) {
+    const key = JSON.stringify([row.account_id, row.model]);
+    if (
+      JSON.stringify(row) !==
+      JSON.stringify(
+        original.price_overrides?.find(
+          (old) => old.account_id === row.account_id && old.model === row.model,
+        ),
+      )
+    )
+      prices.set(key, row);
+  }
   return {
     ...latest,
     revision: latest.revision,
@@ -217,5 +267,7 @@ export function reapplyPricing(
         : edit.defaults,
     cards: [...cards.values()],
     account_classes: classes,
+    price_overrides: [...prices.values()],
+    current_prices: latest.current_prices,
   };
 }

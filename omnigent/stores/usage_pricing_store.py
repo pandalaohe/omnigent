@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import literal, select, union_all
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
     SqlUsageHour,
+    SqlUsagePriceOverride,
     SqlUsagePricingCard,
     SqlUsagePricingDefaults,
     current_workspace_id,
@@ -62,27 +63,41 @@ class UsagePricingStore:
     @staticmethod
     def _read(session: Session, owner: str) -> PricingBaseline:
         key = (current_workspace_id(), owner)
+
+        def part(table, kind, revision):
+            return select(
+                literal(kind).label("kind"),
+                revision.label("revision"),
+                table.payload,
+                (
+                    table.account_classes if table is SqlUsagePricingDefaults else literal(None)
+                ).label("account_classes"),
+            ).where(table.workspace_id == key[0], table.owner_id == owner)
+
+        # One statement keeps revision, cards and prices on the same snapshot,
+        # including databases whose default isolation is READ COMMITTED.
         rows = session.execute(
-            select(SqlUsagePricingDefaults, SqlUsagePricingCard)
-            .outerjoin(
-                SqlUsagePricingCard,
-                (SqlUsagePricingCard.workspace_id == SqlUsagePricingDefaults.workspace_id)
-                & (SqlUsagePricingCard.owner_id == SqlUsagePricingDefaults.owner_id),
+            union_all(
+                part(SqlUsagePricingDefaults, "defaults", SqlUsagePricingDefaults.revision),
+                part(SqlUsagePricingCard, "card", literal(0)),
+                part(SqlUsagePriceOverride, "price", literal(0)),
             )
-            .where(
-                SqlUsagePricingDefaults.workspace_id == key[0],
-                SqlUsagePricingDefaults.owner_id == owner,
-            )
-            .order_by(SqlUsagePricingCard.card_id)
         ).all()
-        row = rows[0][0] if rows else None
+        defaults = next((row for row in rows if row.kind == "defaults"), None)
+        cards = [json.loads(row.payload) for row in rows if row.kind == "card"]
+        prices = [json.loads(row.payload) for row in rows if row.kind == "price"]
         return PricingBaseline(
-            revision=0 if row is None else row.revision,
+            revision=0 if defaults is None else defaults.revision,
             defaults=PricingDefaults()
-            if row is None
-            else PricingDefaults.model_validate_json(row.payload),
-            cards=[json.loads(card.payload) for _, card in rows if card is not None],
-            account_classes=json.loads(row.account_classes or "{}") if row is not None else {},
+            if defaults is None
+            else PricingDefaults.model_validate_json(defaults.payload),
+            cards=sorted(cards, key=lambda card: card["id"]),
+            account_classes=json.loads(defaults.account_classes or "{}")
+            if defaults is not None
+            else {},
+            price_overrides=sorted(
+                prices, key=lambda row: (row["account_id"], row["model"].lower())
+            ),
         )
 
     def save(
@@ -114,11 +129,33 @@ class UsagePricingStore:
                     classes.pop(account_id, None)
                 else:
                     classes[account_id] = kind
+            overrides = {(row.account_id, row.model.lower()): row for row in old.price_overrides}
+            for row in edit.price_overrides:
+                key = (row.account_id, row.model.lower())
+                if key not in overrides and row.account_id not in known_accounts:
+                    raise ValueError("price account must belong to this owner/workspace")
+                overrides[key] = row
+                session.merge(
+                    SqlUsagePriceOverride(
+                        workspace_id=current_workspace_id(),
+                        owner_id=owner,
+                        account_id=row.account_id,
+                        model=row.model.lower(),
+                        **{
+                            name + "_rate": None
+                            if getattr(row, name) is None
+                            else Decimal(getattr(row, name))
+                            for name in ("read", "write", "cache_read", "cache_write")
+                        },
+                        payload=row.model_dump_json(),
+                    )
+                )
             merged = PricingBaseline(
                 revision=old.revision + 1,
                 defaults=edit.defaults,
                 cards=list(new_cards.values()),
                 account_classes=classes,
+                price_overrides=list(overrides.values()),
             )
             for card in merged.cards:
                 if (
@@ -159,7 +196,7 @@ class UsagePricingStore:
                         else Decimal(card.discount_override),
                         **{
                             name + "_rate": None
-                            if rates is None
+                            if rates is None or getattr(rates, name) is None
                             else Decimal(getattr(rates, name))
                             for name in ("read", "write", "cache_read", "cache_write")
                         },

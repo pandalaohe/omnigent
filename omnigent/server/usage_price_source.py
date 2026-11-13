@@ -210,7 +210,7 @@ class UsagePriceSource:
             )
             if self.failures and self.failures[-1]["at"] > fetched_at:
                 self.error = self.failures[-1]["error"]
-            install_price_map(self.prices)
+            install_price_map(self.prices, self.version, self.fetched_at)
         except (OSError, ValueError, TypeError, KeyError, AttributeError, SQLAlchemyError):
             self.error = "Price cache could not be restored; using built-in catalog"
             _logger.warning("Could not restore the usage price source cache")
@@ -280,7 +280,7 @@ class UsagePriceSource:
             self.fetched_at = now if prices is not None else None
             self.version = version
             self.last_attempt_at, self.error = now, None
-            install_price_map(prices)
+            install_price_map(prices, self.version, self.fetched_at)
             await self._fill()
             return self.status()
 
@@ -327,7 +327,7 @@ class UsagePriceSource:
                 return
             self.prices, self.fetched_at, self.error = prices, now, None
             self.version = version
-            install_price_map(prices)
+            install_price_map(prices, self.version, self.fetched_at)
             await self._fill()
 
     async def run(self) -> None:

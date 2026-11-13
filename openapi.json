@@ -1,6 +1,74 @@
 {
   "components": {
     "schemas": {
+      "AccountPriceOverride": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9:_.-]*$",
+            "title": "Account Id",
+            "type": "string"
+          },
+          "cache_read": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Read"
+          },
+          "cache_write": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Write"
+          },
+          "model": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Model",
+            "type": "string"
+          },
+          "read": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Read"
+          },
+          "write": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Write"
+          }
+        },
+        "required": [
+          "account_id",
+          "model"
+        ],
+        "title": "AccountPriceOverride",
+        "type": "object"
+      },
       "AddCommentRequest": {
         "description": "Request body for `POST /sessions/{id}/comments`.",
         "properties": {
@@ -983,6 +1051,27 @@
               }
             ],
             "title": "Pool Id"
+          },
+          "price_estimate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PriceEstimate"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "price_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price Ref"
           },
           "priced": {
             "default": false,
@@ -8196,6 +8285,216 @@
         "title": "PresenceViewer",
         "type": "object"
       },
+      "PriceEstimate": {
+        "additionalProperties": false,
+        "properties": {
+          "as_of": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "maximum": 253402300799.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "As Of"
+          },
+          "cache_savings_high_usd": {
+            "anyOf": [
+              {
+                "maxLength": 40,
+                "pattern": "^(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Savings High Usd"
+          },
+          "cache_savings_low_usd": {
+            "anyOf": [
+              {
+                "maxLength": 40,
+                "pattern": "^(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Savings Low Usd"
+          },
+          "fetched_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "maximum": 253402300799.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fetched At"
+          },
+          "high_usd": {
+            "anyOf": [
+              {
+                "maxLength": 40,
+                "pattern": "^(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "High Usd"
+          },
+          "low_usd": {
+            "anyOf": [
+              {
+                "maxLength": 40,
+                "pattern": "^(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Low Usd"
+          },
+          "missing": {
+            "default": [],
+            "items": {
+              "maxLength": 64,
+              "type": "string"
+            },
+            "maxItems": 16,
+            "title": "Missing",
+            "type": "array"
+          },
+          "price_source": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price Source"
+          },
+          "price_version": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price Version"
+          },
+          "priced_as": {
+            "default": [],
+            "items": {
+              "maxLength": 128,
+              "type": "string"
+            },
+            "maxItems": 8,
+            "title": "Priced As",
+            "type": "array"
+          },
+          "priced_units": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "maximum": 9.223372036854776e+18,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priced Units"
+          },
+          "rates": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/PriceRate"
+            },
+            "maxItems": 32,
+            "title": "Rates",
+            "type": "array"
+          },
+          "state": {
+            "enum": [
+              "exact",
+              "range",
+              "partial",
+              "unknown"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "usage_units": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "maximum": 9.223372036854776e+18,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Usage Units"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "PriceEstimate",
+        "type": "object"
+      },
+      "PriceRate": {
+        "additionalProperties": false,
+        "properties": {
+          "per_token": {
+            "maxLength": 40,
+            "pattern": "^(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?$",
+            "title": "Per Token",
+            "type": "string"
+          },
+          "token_kind": {
+            "enum": [
+              "uncached_input",
+              "output",
+              "cache_read",
+              "cache_write",
+              "cache_write_5m",
+              "cache_write_1h"
+            ],
+            "title": "Token Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token_kind",
+          "per_token"
+        ],
+        "title": "PriceRate",
+        "type": "object"
+      },
       "PriceSourceSelection": {
         "additionalProperties": false,
         "properties": {
@@ -8403,6 +8702,14 @@
           },
           "defaults": {
             "$ref": "#/components/schemas/PricingDefaults"
+          },
+          "price_overrides": {
+            "items": {
+              "$ref": "#/components/schemas/AccountPriceOverride"
+            },
+            "maxItems": 4096,
+            "title": "Price Overrides",
+            "type": "array"
           },
           "revision": {
             "default": 0,
@@ -17272,12 +17579,26 @@
         "additionalProperties": false,
         "properties": {
           "cache_read": {
-            "title": "Cache Read",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Read"
           },
           "cache_write": {
-            "title": "Cache Write",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cache Write"
           },
           "model": {
             "anyOf": [
@@ -17292,20 +17613,28 @@
             "title": "Model"
           },
           "read": {
-            "title": "Read",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Read"
           },
           "write": {
-            "title": "Write",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Write"
           }
         },
-        "required": [
-          "read",
-          "write",
-          "cache_read",
-          "cache_write"
-        ],
         "title": "TokenRates",
         "type": "object"
       },
@@ -30192,6 +30521,45 @@
           }
         },
         "summary": "Save Baseline"
+      }
+    },
+    "/v1/me/usage/pricing-baseline/model-price": {
+      "get": {
+        "operationId": "read_model_price_v1_me_usage_pricing_baseline_model_price_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "model",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Model",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Model Price"
       }
     },
     "/v1/me/usage/pricing-baseline/preview": {

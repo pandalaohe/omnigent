@@ -22,10 +22,13 @@ import {
   usePricingBaseline,
   validatePricing,
   validDecimal,
+  sameRate,
   type Currency,
   type CostClass,
   type PricingCard,
   type PricingBaseline,
+  type Rates,
+  type CurrentModelPrice,
 } from "./usagePricingData";
 
 interface Pool {
@@ -340,6 +343,13 @@ function PricingEditor({
           )}
         </div>
       </details>
+      <AccountPriceTable
+        accounts={accounts}
+        accountId={accountId}
+        baseline={baseline}
+        errors={errors}
+        onChange={edit}
+      />
       {!accountId ||
       ["subscription", "prepaid"].includes(accountCostClass(baseline, accountId) ?? "") ||
       cards.length > 0 ? (
@@ -524,7 +534,7 @@ function PricingEditor({
                 onChange={(event) =>
                   editCard({
                     rates_usd_per_million: event.target.checked
-                      ? { read: "", write: "", cache_read: "", cache_write: "" }
+                      ? { read: null, write: null, cache_read: null, cache_write: null }
                       : null,
                   })
                 }
@@ -533,23 +543,9 @@ function PricingEditor({
             </label>
             {card.rates_usd_per_million ? (
               <>
-                <div className="usage-pricing-two">
-                  {RATE_KEYS.map((key, index) => (
-                    <DecimalField
-                      key={key}
-                      label={["Read", "Write", "Cache read", "Cache write"][index]}
-                      value={card.rates_usd_per_million![key]}
-                      error={errors[prefix + "rates_usd_per_million." + key]}
-                      onChange={(value) =>
-                        editCard({
-                          rates_usd_per_million: { ...card.rates_usd_per_million!, [key]: value },
-                        })
-                      }
-                    />
-                  ))}
-                </div>
                 <Field label="Rate model (optional)">
                   <Input
+                    maxLength={128}
                     value={card.rates_usd_per_million.model ?? ""}
                     title={card.rates_usd_per_million.model ?? ""}
                     onChange={(event) =>
@@ -562,6 +558,25 @@ function PricingEditor({
                     }
                   />
                 </Field>
+                <RateInputs
+                  baseline={baseline}
+                  model={card.rates_usd_per_million.model ?? ""}
+                  accountId={card.parent_account_id ?? card.target_id}
+                  card
+                  rates={card.rates_usd_per_million}
+                  errors={errors}
+                  prefix={prefix + "rates_usd_per_million."}
+                  onChange={(rates) =>
+                    editCard({
+                      rates_usd_per_million: { ...card.rates_usd_per_million!, ...rates },
+                    })
+                  }
+                />
+                <p className="text-muted-foreground">
+                  Blank card fields inherit the account price, then the current imported or built-in
+                  price. With no model named, set fields apply only when the covered usage has one
+                  model.
+                </p>
               </>
             ) : null}
           </details>
@@ -658,6 +673,221 @@ function PricingEditor({
   );
 }
 
+const EMPTY_RATES: Rates = { read: null, write: null, cache_read: null, cache_write: null };
+
+function AccountPriceTable({
+  accounts,
+  accountId,
+  baseline,
+  errors,
+  onChange,
+}: {
+  accounts: UsageAccountView[];
+  accountId?: string;
+  baseline: PricingBaseline;
+  errors: Record<string, string>;
+  onChange: (value: PricingBaseline) => void;
+}) {
+  const [selectedAccount, setSelectedAccount] = useState("");
+  const [newModel, setNewModel] = useState("");
+  const parent =
+    accountId ??
+    (accounts.some((account) => account.id === selectedAccount)
+      ? selectedAccount
+      : (accounts[0]?.id ?? ""));
+  const overrides = baseline.price_overrides ?? [];
+  const rows = overrides.filter((row) => row.account_id === parent);
+  const models = [
+    ...new Set([
+      ...(accounts.find((account) => account.id === parent)?.models?.map((model) => model.id) ??
+        []),
+      ...rows.map((row) => row.model),
+    ]),
+  ].sort();
+  function editModel(model: string, rates: Rates) {
+    onChange({
+      ...baseline,
+      price_overrides: [
+        ...overrides.filter((row) => row.account_id !== parent || row.model !== model),
+        { account_id: parent, model, ...rates },
+      ],
+    });
+  }
+  return (
+    <section
+      className="usage-pricing-editor border-t border-border pt-3"
+      aria-label="Account model prices"
+    >
+      <h3 className="usage-card-title">Account model prices · USD / 1M</h3>
+      {!accountId ? (
+        <Field label="Price account">
+          <select value={parent} onChange={(event) => setSelectedAccount(event.target.value)}>
+            {accounts.map((account) => (
+              <option key={account.id} value={account.id}>
+                {account.display_name}
+              </option>
+            ))}
+          </select>
+        </Field>
+      ) : null}
+      <div className="usage-pricing-card-list">
+        <Field label="Model id">
+          <Input
+            value={newModel}
+            maxLength={128}
+            onChange={(event) => setNewModel(event.target.value)}
+          />
+        </Field>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={
+            !parent ||
+            !newModel.trim() ||
+            models.some((model) => model.toLowerCase() === newModel.trim().toLowerCase())
+          }
+          onClick={() => {
+            editModel(newModel.trim(), EMPTY_RATES);
+            setNewModel("");
+          }}
+        >
+          Add model price
+        </Button>
+      </div>
+      {models.map((model) => (
+        <fieldset
+          className="min-w-0 border-t border-border py-2"
+          key={JSON.stringify([parent, model])}
+        >
+          <legend className="max-w-full break-all text-xs">{model}</legend>
+          <RateInputs
+            baseline={baseline}
+            accountId={parent}
+            model={model}
+            labelPrefix={`${model} · `}
+            rates={rows.find((row) => row.model === model) ?? EMPTY_RATES}
+            errors={errors}
+            prefix={`price_overrides.${parent}.${model}.`}
+            onChange={(rates) => editModel(model, rates)}
+          />
+          {errors[`price_overrides.${parent}.${model}.model`] ? (
+            <p role="alert" className="text-xs text-destructive">
+              {errors[`price_overrides.${parent}.${model}.model`]}
+            </p>
+          ) : null}
+        </fieldset>
+      ))}
+      {!models.length ? (
+        <p className="text-xs text-muted-foreground">Add a model id to override its prices.</p>
+      ) : null}
+      <p className="text-xs text-muted-foreground">
+        Grey values show current inherited prices. Changing any field recalculates this model's
+        history using your overrides plus current prices. Clear every override to restore recorded
+        valuations; these can differ from today's grey values. Missing imported models keep their
+        overrides.
+      </p>
+    </section>
+  );
+}
+
+function RateInputs({
+  baseline,
+  accountId,
+  model,
+  card = false,
+  rates,
+  errors,
+  prefix,
+  labelPrefix = "",
+  onChange,
+}: {
+  baseline: PricingBaseline;
+  accountId: string;
+  model: string;
+  card?: boolean;
+  rates: Rates;
+  errors: Record<string, string>;
+  prefix: string;
+  labelPrefix?: string;
+  onChange: (rates: Rates) => void;
+}) {
+  const current = baseline.current_prices?.[model];
+  const query = useQuery({
+    queryKey: ["usageBoard", "pricingModel", model],
+    queryFn: () =>
+      usageJson<CurrentModelPrice>(
+        `pricing-baseline/model-price?model=${encodeURIComponent(model)}`,
+      ),
+    enabled: !!model && !current,
+    retry: false,
+    staleTime: 60_000,
+  });
+  const prices = current ?? query.data;
+  const accountRows = (baseline.price_overrides ?? []).filter(
+    (row) => row.account_id === accountId,
+  );
+  const modelKey = model.toLowerCase(),
+    bare = modelKey.split("/").at(-1);
+  let account =
+    accountRows.find((row) => row.model.toLowerCase() === modelKey) ??
+    accountRows.find((row) => row.model.toLowerCase() === bare);
+  if (!account) {
+    const candidates = accountRows.filter(
+      (row) => row.model.toLowerCase().split("/").at(-1) === bare,
+    );
+    if (
+      candidates.length &&
+      candidates.every((row) =>
+        RATE_KEYS.every((field) => sameRate(row[field], candidates[0][field])),
+      )
+    )
+      account = candidates[0];
+  }
+  return (
+    <>
+      <div className="usage-pricing-two">
+        {RATE_KEYS.map((key, index) => {
+          const inherited =
+            (card ? account?.[key] : null) ?? prices?.imported?.[key] ?? prices?.builtin?.[key];
+          const layer =
+            card && account?.[key] != null
+              ? "Account price"
+              : prices?.imported?.[key] != null
+                ? "Current imported price"
+                : "Built-in price";
+          return (
+            <DecimalField
+              key={key}
+              label={labelPrefix + ["Read", "Write", "Cache read", "Cache write"][index]}
+              value={rates[key] ?? ""}
+              optional
+              error={errors[prefix + key]}
+              placeholder={inherited != null ? decimalDisplay(inherited) : "Unknown"}
+              hint={
+                inherited != null
+                  ? `${layer}: USD ${decimalDisplay(inherited)} / 1M`
+                  : "No inherited price available"
+              }
+              onChange={(value) => onChange({ ...rates, [key]: value || null })}
+            />
+          );
+        })}
+      </div>
+      {model && prices && !prices.imported ? (
+        <p className="text-xs text-muted-foreground">
+          This model is missing from the imported list. Overrides are retained; blank fields use
+          built-in prices when available.
+        </p>
+      ) : null}
+      {model && query.error ? (
+        <p role="alert" className="text-xs text-destructive">
+          Inherited prices could not be read. Your draft is retained.
+        </p>
+      ) : null}
+    </>
+  );
+}
+
 function Field({
   label,
   error,
@@ -693,6 +923,7 @@ function DecimalField({
   error,
   disabled = false,
   placeholder,
+  hint,
 }: {
   label: string;
   value: string;
@@ -702,6 +933,7 @@ function DecimalField({
   error?: string;
   disabled?: boolean;
   placeholder?: string;
+  hint?: string;
 }) {
   const [editing, setEditing] = useState(false);
   const id = useId();
@@ -719,6 +951,7 @@ function DecimalField({
         aria-invalid={!!error}
         aria-describedby={error ? id : undefined}
         placeholder={placeholder ?? (optional ? "Not set" : "")}
+        title={hint}
         onFocus={() => setEditing(true)}
         onBlur={() => setEditing(false)}
         onChange={(event) => onChange(event.target.value)}

@@ -310,6 +310,8 @@ async def test_price_door_read_labels_and_owner_isolation(request, db_uri):
                     "state": "exact",
                     "low_usd": "0.10",
                     "high_usd": "0.10",
+                    "priced_units": 100,
+                    "usage_units": 100,
                     "price_source": "public",
                     "price_version": "v1",
                     "fetched_at": hour,
@@ -323,6 +325,39 @@ async def test_price_door_read_labels_and_owner_isolation(request, db_uri):
         response = await client.put("/v1/me/usage/evidence", headers=headers, json=payload)
         assert response.status_code == 200, response.text
         assert response.json()["applied"]["prices"] == 1
+        activity = {
+            "schema_version": 2,
+            "observed_at": now_epoch(),
+            "activity": [
+                {
+                    "hour": hour,
+                    "model": "model-a",
+                    "tokens": 100,
+                    "uncached_input_tokens": 100,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cost_usd": 999,
+                    "cost_basis": "list",
+                    "coverage": "complete",
+                }
+            ],
+        }
+        response = await client.put("/v1/me/usage/accounts/a", headers=headers, json=activity)
+        assert response.status_code == 200, response.text
+        response = await client.get("/v1/me/usage/analysis?range=d7", headers=headers)
+        assert response.status_code == 200, response.text
+        value = response.json()["pricing"]["api_value"]
+        assert value["low"] == "0.1"
+        assert response.json()["pricing"]["display"]["api_value"]["low"] == "0.10"
+        assert value["price_sources"][0]["version"] == "v1"
+        activity["activity"].append({**activity["activity"][0], "host": "other-host"})
+        response = await client.put("/v1/me/usage/accounts/a", headers=headers, json=activity)
+        assert response.status_code == 200, response.text
+        response = await client.get("/v1/me/usage/analysis?range=d7", headers=headers)
+        assert response.status_code == 200, response.text
+        assert response.json()["pricing"]["api_value"]["state"] == "unknown"
+
         response = await client.get("/v1/me/usage/prices?detail=hours", headers=headers)
         assert response.status_code == 200, response.text
         assert response.json()["rows"][0]["hourly"][0]["estimate"]["price_source"] == "public"

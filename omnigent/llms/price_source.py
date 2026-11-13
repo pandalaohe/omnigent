@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -115,14 +116,32 @@ class PriceMap:
         )
 
 
-_selected: PriceMap | None = None
+_selected: tuple[PriceMap | None, str | None, float | None] = (None, None, None)
 
 
-def install_price_map(prices: PriceMap | None) -> None:
-    """Replace the immutable lookup atomically in the server process."""
+def install_price_map(
+    prices: PriceMap | None, version: str | None = None, fetched_at: float | None = None
+) -> None:
+    """Replace prices and provenance as one immutable snapshot."""
     global _selected
-    _selected = prices
+    _selected = (prices, version, fetched_at)
 
 
 def selected_price(model: str) -> ModelPricing | None:
-    return _selected.get(model) if _selected is not None else None
+    prices, version, _ = _selected
+    price = prices.get(model) if prices is not None else None
+    return (
+        replace(price, price_ref="import:" + (version or "unreported"))
+        if price is not None
+        else None
+    )
+
+
+def selected_source() -> dict:
+    _, version, fetched_at = _selected
+    return {
+        "layer": "import",
+        "name": "导入价",
+        "version": version,
+        "fetched_at": int(fetched_at) if fetched_at is not None else None,
+    }

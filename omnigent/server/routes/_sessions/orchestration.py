@@ -3321,6 +3321,7 @@ def _accumulate_session_usage(
     # created only on this priced branch, so an unpriced session never
     # gains a (misleading $0.00) cost key.
     cost_delta = 0.0
+    price_ref = None
     priced = False
     # Prefer an authoritative harness-reported cost over the catalog estimate.
     provider_cost = usage_obj.get("cost_usd")
@@ -3342,6 +3343,7 @@ def _accumulate_session_usage(
             and math.isfinite(provider_cost)
             and provider_cost >= 0
         ):
+            price_ref = "provider"
             cost_delta = float(provider_cost)
             priced = True
         else:
@@ -3358,6 +3360,7 @@ def _accumulate_session_usage(
             pricing = fetch_model_pricing_with_provider(
                 llm_model, provider_config=provider_config, harness=harness
             )
+            price_ref = pricing.price_ref if pricing is not None else None
             priced = pricing is not None
             if pricing is not None:
                 # Cache-aware: price the sanitized cache-read / cache-creation
@@ -3423,6 +3426,7 @@ def _accumulate_session_usage(
         ),
         cost_usd=cost_delta,
         priced=priced,
+        price_ref=price_ref,
     )
     return _priced_cost_for_display(new_current)
 
@@ -3643,6 +3647,7 @@ def _persist_native_cumulative_usage(
     # covers it; so does a price for the model its tokens are priced with.
     # Anything else records the growth as an unpriced row the board can fill
     # once a price exists.
+    price_ref = "provider" if cost is not None else None
     growth_priced = cost is not None
     needs_model = has_tokens or cost is not None
     model_name = (
@@ -3686,6 +3691,7 @@ def _persist_native_cumulative_usage(
                     for key in _MODEL_TOKEN_KEYS
                 }
                 current["total_cost_usd"] = old_cost + compute_llm_cost(growth, pricing)
+                price_ref = pricing.price_ref
                 growth_priced = True
 
     if has_tokens:
@@ -3794,6 +3800,7 @@ def _persist_native_cumulative_usage(
             current=current,
             cost_growth=cost_growth,
             priced=growth_priced,
+            price_ref=price_ref,
             tokens_by_model_reported=bool(tokens_by_model),
             token_growth_by_model=token_growth_by_model,
         )
