@@ -1296,6 +1296,16 @@ def test_post_evaluate_with_retry_budget_follows_the_request_phase(
     )
 
 
+def test_post_evaluate_with_retry_uses_short_budget_for_tool_results() -> None:
+    """An observational PostToolUse evaluation keeps the fail-open backstop."""
+    budget, _max_backoff = native_policy_hook._retry_budget_for_request(
+        {"event": {"type": "PHASE_TOOL_RESULT"}}
+    )
+
+    assert budget == native_policy_hook._EVALUATE_POLICY_FAIL_OPEN_RETRY_BUDGET_S
+    assert budget == 15.0
+
+
 def test_post_evaluate_with_retry_reauths_on_403_invalid_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
