@@ -159,10 +159,15 @@ USAGE_GEOMETRY = """expected => {
           : /^[<>]?\\d+(?:\\.\\d{1,2})?%$/;
         if (!pattern.test(reading))
           failures.push(`split percentage: ${describe(el)}`);
-        const height = Math.max(...rects.map(rect => rect.height));
-        if (Math.max(...rects.map(rect => rect.bottom)) -
-            Math.min(...rects.map(rect => rect.bottom)) > height * 0.6)
-          failures.push(`wrapped percentage: ${describe(el)}`);
+        // A stacked reading (whole above decimals) keeps each of its lines unbroken.
+        const lines = el.dataset.usagePercent === 'stack'
+          ? [...el.children].map(textRects) : [rects];
+        for (const line of lines) {
+          const height = Math.max(...line.map(rect => rect.height));
+          if (Math.max(...line.map(rect => rect.bottom)) -
+              Math.min(...line.map(rect => rect.bottom)) > height * 0.6)
+            failures.push(`wrapped percentage: ${describe(el)}`);
+        }
       }
     }
   }

@@ -146,7 +146,7 @@ export function UsageAnalysisChart({
   if (!span || (unknown && !hasPaid) || (!rows.length && !hasPaid))
     return (
       <div className="ua-unknown">
-        <strong>Unknown</strong>
+        <strong data-unknown="">Unknown</strong>
         <small>No complete selected token series</small>
       </div>
     );
@@ -163,7 +163,7 @@ export function UsageAnalysisChart({
               tickFormatter={(at) =>
                 new Date(at * 1000).toLocaleDateString("en-US", { month: "short", day: "numeric" })
               }
-              tick={{ fontSize: 11 }}
+              tick={{ fontSize: 11, fill: "var(--usage-ink-3)" }}
               tickLine={false}
               axisLine={false}
             />
@@ -176,7 +176,7 @@ export function UsageAnalysisChart({
                   maximumFractionDigits: 2,
                 }).format(value)
               }
-              tick={{ fontSize: 11 }}
+              tick={{ fontSize: 11, fill: "var(--usage-ink-3)" }}
               tickLine={false}
               axisLine={false}
             />
@@ -186,7 +186,7 @@ export function UsageAnalysisChart({
                 orientation="right"
                 width={60}
                 tickFormatter={(value) => formatUsageValue(value, currency)}
-                tick={{ fontSize: 10 }}
+                tick={{ fontSize: 10, fill: "var(--usage-ink-3)" }}
                 tickLine={false}
                 axisLine={false}
               />
@@ -199,7 +199,7 @@ export function UsageAnalysisChart({
                 name="Token"
                 type="linear"
                 dot={false}
-                stroke="var(--info)"
+                stroke="var(--usage-time)"
                 strokeWidth={2}
                 isAnimationActive={false}
               />
@@ -211,9 +211,9 @@ export function UsageAnalysisChart({
                 name="Previous"
                 type="linear"
                 dot={false}
-                stroke="var(--muted-foreground)"
+                stroke="var(--usage-ink-3)"
                 strokeDasharray="4 4"
-                strokeWidth={1.25}
+                strokeWidth={1.7}
                 isAnimationActive={false}
               />
             ) : null}
@@ -224,7 +224,7 @@ export function UsageAnalysisChart({
                 name="Paid"
                 type="linear"
                 dot={false}
-                stroke="var(--success)"
+                stroke="var(--usage-ok)"
                 strokeWidth={2}
                 isAnimationActive={false}
               />
@@ -438,13 +438,13 @@ export function UsageCostChart({
             <CartesianGrid
               yAxisId="total"
               vertical={false}
-              stroke="var(--border)"
+              stroke="var(--usage-grid)"
               strokeDasharray="2 4"
             />
             <XAxis
               dataKey="at"
               tickFormatter={dateLabel}
-              tick={{ fontSize: 12, fill: "var(--muted-foreground)" }}
+              tick={{ fontSize: 12, fill: "var(--usage-ink-3)" }}
               tickLine={false}
               axisLine={false}
               interval="preserveStartEnd"
@@ -457,7 +457,7 @@ export function UsageCostChart({
               ticks={ticks}
               domain={[0, ticks[ticks.length - 1]]}
               tickFormatter={tickText}
-              tick={{ fontSize: 12, fill: "var(--muted-foreground)" }}
+              tick={{ fontSize: 12, fill: "var(--usage-ink-3)" }}
               tickLine={false}
               axisLine={false}
             />
@@ -465,8 +465,7 @@ export function UsageCostChart({
             <Bar
               yAxisId="total"
               dataKey="bucket"
-              fill="var(--muted-foreground)"
-              fillOpacity={0.8}
+              fill="var(--usage-bar)"
               radius={[2, 2, 0, 0]}
               maxBarSize={28}
               isAnimationActive={false}
@@ -475,9 +474,9 @@ export function UsageCostChart({
               yAxisId="total"
               type="stepAfter"
               dataKey="previous"
-              stroke="var(--muted-foreground)"
+              stroke="var(--usage-ink-3)"
               strokeDasharray="4 4"
-              strokeWidth={1.25}
+              strokeWidth={1.7}
               dot={false}
               isAnimationActive={false}
             />
@@ -494,8 +493,8 @@ export function UsageCostChart({
               <ReferenceLine
                 yAxisId="total"
                 y={fee}
-                stroke="var(--warning)"
-                strokeDasharray="3 3"
+                stroke="var(--usage-ink-2)"
+                strokeDasharray="6 4"
               />
             ) : null}
           </ComposedChart>

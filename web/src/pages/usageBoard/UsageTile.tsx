@@ -29,8 +29,9 @@ import {
 } from "./usageBoardSelect";
 import {
   formatAge,
-  formatPercentReading,
+  formatRingPercent,
   formatTileAmount,
+  splitPercentReading,
   formatTimeLeft,
   windowName,
   stateTone,
@@ -44,10 +45,10 @@ import { UsageBalances } from "./UsageBalances";
 import { t } from "./usageText";
 import { UsageName } from "./UsageName";
 
-const TONE_TILE: Record<string, string> = {
-  warn: "border-warning/45",
-  crit: "border-destructive/50",
-};
+/** Renewal urgency, as the footer colours it: late, or within three days. */
+function renewalTone(days: number): "crit" | "warn" | undefined {
+  return days < 0 ? "crit" : days <= 3 ? "warn" : undefined;
+}
 
 interface UsageTileProps {
   account: UsageAccountView;
@@ -110,23 +111,16 @@ export function UsageTile({
             activate();
           }
         }}
-        className={cn(
-          "flex min-h-[54px] min-w-0 cursor-pointer items-center gap-2 rounded-[10px] border border-border bg-card py-1.5 pl-1.5 pr-2.5 transition-colors hover:border-foreground/30",
-          TONE_TILE[tone],
-        )}
+        className="usage-mini flex min-h-[54px] min-w-0 cursor-pointer items-center gap-2"
+        data-tone={tone === "warn" || tone === "crit" ? tone : undefined}
         data-testid="usage-tile"
         data-account={account.id}
       >
         {!account.windows.length && account.balances?.length ? null : (
-          <UsageRing
-            window={first?.window ?? null}
-            stale={stale || empty}
-            size={42}
-            showName={false}
-          />
+          <UsageRing window={first?.window ?? null} stale={stale || empty} size={54} />
         )}
         <div className="flex min-w-0 flex-1 flex-col leading-tight">
-          <UsageName className="font-medium">{name}</UsageName>
+          <UsageName className="usage-mini-name">{name}</UsageName>
           {plan ? <UsageName className="usage-caption">{plan}</UsageName> : null}
           {shownModel && <UsageName className="usage-caption">{shownModel}</UsageName>}
           <UsageBalances account={account} compact />
@@ -146,9 +140,24 @@ export function UsageTile({
             </span>
           ) : null}
           {first?.window && first.window.percent_used !== null ? (
-            <span className={cn("usage-countdown", stale && "text-muted-foreground")}>
-              {formatTimeLeft(first.window.time_left_s)}
-            </span>
+            <>
+              <span
+                className="usage-mini-percent"
+                data-tone={stale || empty ? "mute" : stateTone(first.window.state)}
+              >
+                {splitPercentReading(formatRingPercent(first.window.percent_used)).map(
+                  (part, index) =>
+                    index ? (
+                      <span key="decimals" className="usage-unit-mark">{`${part}%`}</span>
+                    ) : (
+                      part
+                    ),
+                )}
+              </span>
+              <span className={cn("usage-countdown", stale && "text-muted-foreground")}>
+                {formatTimeLeft(first.window.time_left_s)}
+              </span>
+            </>
           ) : first?.window?.used_value !== null && first?.window ? (
             <span className="usage-countdown">
               {formatTileAmount(first.window.used_value, first.window.unit)}
@@ -238,7 +247,7 @@ export function UsageTile({
                     : readingTip(account)
                 }
               >
-                <UsageRing window={main} stale={stale || empty} size={88} />
+                <UsageRing window={main} stale={stale || empty} size={96} />
               </UsageTip>
               <span className={cn("usage-countdown", stale && "text-muted-foreground")}>
                 {main ? formatTimeLeft(main.time_left_s) || "—" : t("notReported")}
@@ -257,17 +266,17 @@ export function UsageTile({
                         <UsageRing
                           window={item}
                           stale={stale || empty}
-                          size={14}
+                          size={16}
                           showName={false}
                         />
                         <UsageName>{windowName(item)}</UsageName>
                         <span>{formatTimeLeft(item.time_left_s)}</span>
-                        <b>
+                        <b data-tone={stale || empty ? undefined : stateTone(item.state)}>
                           {item.percent_used === null ? (
                             "—"
                           ) : (
                             <>
-                              {formatPercentReading(item.percent_used)}
+                              {formatRingPercent(item.percent_used)}
                               <span className="usage-unit-mark">%</span>
                             </>
                           )}
@@ -341,7 +350,7 @@ export function UsageTile({
             <UsageTip model={renewalTip(renewal.at, renewal.official)}>
               <span className="usage-renewal">
                 <CalendarClockIcon className="size-3.5" aria-hidden="true" />
-                <b>{renewDays}d</b>
+                <b data-tone={renewalTone(renewDays)}>{renewDays}d</b>
               </span>
             </UsageTip>
           ) : (

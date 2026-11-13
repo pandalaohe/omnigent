@@ -243,7 +243,7 @@ export function UsageCostPage() {
             ].map(([label, value, caption]) => (
               <div className="ua-kpi" key={label}>
                 <span>{label}</span>
-                <strong>{value}</strong>
+                <strong data-unknown={value === "Unknown" || undefined}>{value}</strong>
                 <small>{caption}</small>
               </div>
             ))}

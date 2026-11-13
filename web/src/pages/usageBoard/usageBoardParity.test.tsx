@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 import { UsageBoardFrame } from "./UsageBoardFrame";
 import { UsageTile } from "./UsageTile";
+import { UsageRing } from "./UsageRing";
 import { niceTicks } from "./UsageCostChart";
 import { UsageSummary } from "./UsageAmounts";
 import { usageBoardData } from "./usageBoardFixtures";
@@ -14,6 +15,8 @@ import {
   formatCount,
   formatTileAmount,
   formatPercentReading,
+  formatRingPercent,
+  splitPercentReading,
   formatMoney,
   formatUsageValue,
 } from "./usageBoardFormat";
@@ -73,7 +76,7 @@ it("keeps independent pool links inside a single account tile, with a main ring 
   const pool = screen.getByRole("link", { name: "Codex Pool B" });
   expect(pool.getAttribute("href")).toContain("focus=Pool%20B");
   expect(within(pool).getAllByTestId("usage-ring")).toHaveLength(2);
-  expect(pool.textContent).toContain("90.6%");
+  expect(pool.textContent).toContain("90.61%");
   fireEvent.click(pool);
   expect(open).toHaveBeenCalledWith("Pool B");
 });
@@ -229,6 +232,35 @@ it.each([
   [1234, ">999"],
 ])("formats percent %s without false zero or full", (value, expected) => {
   expect(formatPercentReading(value)).toBe(expected);
+});
+it("draws a row glyph as one used arc and a full ring with its time arc and stacked reading", () => {
+  const window = { ...usageBoardData().accounts[0].windows[0], percent_used: 42.5 };
+  const { container } = render(
+    <>
+      <UsageRing window={window} size={16} showName={false} />
+      <UsageRing window={window} size={96} />
+    </>,
+  );
+  const [glyph, ring] = container.querySelectorAll('[data-testid="usage-ring"]');
+  expect(glyph.querySelector(".usage-ring-time-track")).toBeNull();
+  expect(glyph.querySelectorAll("circle")).toHaveLength(2);
+  expect(glyph.textContent).toBe("");
+  expect(ring.querySelector(".usage-ring-time-track")).toBeTruthy();
+  const reading = ring.querySelector('[data-usage-percent="stack"]')!;
+  expect(reading.textContent).toBe("42.50%");
+  expect(reading.querySelector(".usage-ring-whole")!.textContent).toBe("42");
+});
+it.each([
+  [0, "0.00", "0", ".00"],
+  [0.004, "<0.01", "<0", ".01"],
+  [12, "12.00", "12", ".00"],
+  [90.613, "90.61", "90", ".61"],
+  [99.996, "99.99", "99", ".99"],
+  [100, "100.00", "100", ".00"],
+  [1234, ">999", ">999", ""],
+])("writes ring percent %s with two decimals, split for the stack", (value, text, whole, rest) => {
+  expect(formatRingPercent(value)).toBe(text);
+  expect(splitPercentReading(text)).toEqual([whole, rest]);
 });
 it.each([0, 0.004, 3.45, 1.3e10])("gives distinct monetary axis labels for %s", (top) => {
   const ticks = niceTicks(top, 4, 0.01);

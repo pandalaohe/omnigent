@@ -148,7 +148,7 @@ export function UsageAccountPage() {
                 </div>
                 {groups.length === 0 ? (
                   <div className="flex flex-col items-center gap-2 py-6">
-                    <UsageRing window={null} stale size={88} />
+                    <UsageRing window={null} stale size={100} />
                     <p className="usage-caption">
                       {empty ? "No reading yet." : "The last read returned no window."}
                     </p>
@@ -182,7 +182,7 @@ export function UsageAccountPage() {
                                   <UsageRing
                                     window={window}
                                     stale={stale || empty}
-                                    size={88}
+                                    size={100}
                                     showName
                                   />
                                 </UsageTip>

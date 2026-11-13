@@ -614,9 +614,9 @@ export function UsagePricingSummary({ accountId }: { accountId: string }) {
     query.data?.cards.filter((card) => (card.parent_account_id ?? card.target_id) === accountId) ??
     [];
   return (
-    <section className="rounded-[11px] border border-border bg-card px-3.5 py-3">
+    <section className="usage-card">
       <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold">Card pricing</h2>
+        <h2 className="usage-card-title">Card pricing</h2>
         <Link
           className="inline-flex min-h-11 items-center text-xs underline"
           to={boardPath(`/usage/board/${encodeURIComponent(accountId)}/settings#usage-pricing`)}

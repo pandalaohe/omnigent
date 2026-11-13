@@ -29,9 +29,9 @@ export const TONE_TEXT: Record<UsageTone, string> = {
 };
 
 export const TONE_STROKE: Record<UsageTone, string> = {
-  ok: "var(--success)",
-  warn: "var(--warning)",
-  crit: "var(--destructive)",
+  ok: "var(--usage-ok)",
+  warn: "var(--usage-warn)",
+  crit: "var(--usage-crit)",
   mute: "var(--muted-foreground)",
 };
 
@@ -166,6 +166,22 @@ export function formatPercentReading(value: number): string {
   if (value < 0.01) return "<0.01";
   const decimals = value >= 10 ? 1 : 2;
   return String(Number(value.toFixed(decimals)));
+}
+
+/** A window's used percent as its ring writes it: always two decimals. */
+export function formatRingPercent(value: number): string {
+  if (!Number.isFinite(value)) return "—";
+  if (value >= 999.995) return ">999";
+  if (value > 0 && value < 0.005) return "<0.01";
+  // Never round a window that is not yet full up to a full one.
+  if (value < 100 && value >= 99.995) return "99.99";
+  return Math.max(0, value).toFixed(2);
+}
+
+/** `90.61` → `["90", ".61"]`; `<0.01` → `["<0", ".01"]`; `>999` → `[">999", ""]`. */
+export function splitPercentReading(reading: string): [string, string] {
+  const dot = reading.indexOf(".");
+  return dot < 0 ? [reading, ""] : [reading.slice(0, dot), reading.slice(dot)];
 }
 
 const COMPACT_STEPS: [number, string][] = [

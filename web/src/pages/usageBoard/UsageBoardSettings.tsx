@@ -324,7 +324,7 @@ function ColourLine({
           <span>% left</span>
         </span>
       </div>
-      <div className="flex flex-wrap items-center gap-2.5" aria-hidden="true">
+      <div className="usage-palette flex flex-wrap items-center gap-2.5" aria-hidden="true">
         {samples.map((used) => (
           <UsageRing
             key={used}

@@ -5,24 +5,32 @@
   gap: 6px;
   margin-bottom: 8px;
 }
+/* Analysis colour roles: time blue for selection, section titles and the
+   selected series; green and red only where a value is good or failing;
+   the five-colour series set for categories; unknown values stay grey. */
 .ua-segment {
   display: inline-flex;
-  border: 1px solid var(--border);
+  border: 1px solid var(--usage-line);
   border-radius: 15px;
   overflow: hidden;
-  background: var(--card);
+  background: var(--usage-tile);
 }
 .ua-segment button {
   height: 28px;
   padding: 0 12px;
   white-space: nowrap;
+  color: var(--usage-ink-2);
+}
+.ua-segment button:hover {
+  color: var(--usage-time);
 }
 .ua-segment button + button {
-  border-left: 1px solid var(--border);
+  border-left: 1px solid var(--usage-line);
 }
-.ua-segment [aria-pressed="true"] {
-  background: var(--info);
-  color: var(--background);
+.ua-segment [aria-pressed="true"],
+.ua-segment [aria-pressed="true"]:hover {
+  background: var(--usage-time);
+  color: var(--usage-on-accent);
   font-weight: 700;
 }
 .ua-picks {
@@ -32,16 +40,19 @@
   margin-bottom: 8px;
 }
 .ua-picks button {
-  border: 1px solid var(--border);
+  border: 1px solid var(--usage-line);
   border-radius: 14px;
   padding: 3px 10px;
-  font-size: 12px;
-  color: var(--muted-foreground);
+  font-size: var(--usage-fs-xs);
+  color: var(--usage-ink-2);
+}
+.ua-picks button:hover {
+  color: var(--usage-time);
 }
 .ua-picks [aria-pressed="true"] {
-  border-color: var(--info);
-  background: color-mix(in srgb, var(--info) 14%, transparent);
-  color: var(--info);
+  border-color: color-mix(in srgb, var(--usage-time) 60%, transparent);
+  background: var(--usage-accent-soft);
+  color: var(--usage-time);
 }
 .ua-kpis {
   display: grid;
@@ -52,29 +63,40 @@
 .ua-kpi {
   display: grid;
   gap: 1px;
-  padding: 9px 12px 10px;
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
+  padding: 10px 14px 11px;
+  background: var(--usage-tile);
+  border: 1px solid var(--usage-line);
+  border-radius: 14px;
   min-width: 0;
 }
 .ua-kpi > span,
 .ua-comparisons > div > span {
-  font-size: 12px;
-  color: var(--muted-foreground);
+  font-size: var(--usage-fs-xs);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--usage-ink-2);
 }
 .ua-kpi strong,
 .ua-unknown strong {
-  font-size: 22px;
+  font-size: var(--usage-fs-l);
   line-height: 28px;
   font-weight: 700;
   letter-spacing: -0.02em;
   overflow-wrap: anywhere;
+  color: var(--usage-ink);
+}
+.usage-board [data-unknown] {
+  color: var(--usage-ink-3);
+  font-weight: 400;
+  letter-spacing: 0;
+}
+:is(.ua-kpi, .ua-unknown) strong[data-unknown] {
+  font-size: var(--usage-fs-count);
 }
 .ua-kpi small,
 .ua-unknown small {
-  font-size: 12px;
-  color: var(--muted-foreground);
+  font-size: var(--usage-fs-xs);
+  color: var(--usage-ink-3);
   overflow-wrap: anywhere;
 }
 .ua-main {
@@ -85,27 +107,31 @@
 }
 .ua-panel {
   display: grid;
-  gap: 8px;
+  gap: 10px;
   align-content: start;
-  padding: 10px 12px 12px;
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
+  padding: 12px 16px 14px;
+  background: var(--usage-tile);
+  border: 1px solid var(--usage-line);
+  border-radius: 16px;
   min-width: 0;
 }
 .ua-panel h2 {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
+  align-items: baseline;
   gap: 2px 8px;
-  font-size: 13px;
+  font-size: var(--usage-fs-s);
+  line-height: 20px;
   font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--usage-time);
 }
 .ua-panel h2 > span {
   margin-left: auto;
-  font-size: 12px;
+  font-size: var(--usage-fs-xs);
   font-weight: 400;
-  color: var(--muted-foreground);
+  letter-spacing: 0;
+  color: var(--usage-ink-3);
 }
 .ua-unknown,
 .ua-comparisons {
@@ -127,15 +153,24 @@
   grid-template-columns: minmax(100px, 1.4fr) 88px repeat(5, minmax(65px, 1fr));
   gap: 8px;
   align-items: center;
-  font-size: 12px;
+  font-size: var(--usage-fs-xs);
 }
 .ua-table-head {
-  color: var(--muted-foreground);
+  color: var(--usage-ink-3);
   padding-bottom: 6px;
+}
+.ua-table-head button:hover {
+  color: var(--usage-time);
+}
+.ua-table-head [aria-sort="ascending"],
+.ua-table-head [aria-sort="descending"] {
+  color: var(--usage-time);
+  font-weight: 700;
 }
 .ua-table-row {
   padding: 8px 0;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--usage-line);
+  color: var(--usage-ink-2);
 }
 .ua-table [role="cell"],
 .ua-table [role="columnheader"] {
@@ -148,7 +183,8 @@
   text-align: left;
 }
 .ua-name {
-  font-weight: 600;
+  font-weight: 700;
+  color: var(--usage-ink);
 }
 .ua-bars {
   display: grid;
@@ -159,7 +195,7 @@
   grid-template-columns: 74px minmax(0, 1fr) 46px;
   align-items: center;
   gap: 8px;
-  font-size: 12px;
+  font-size: var(--usage-fs-xs);
   min-height: 18px;
   width: 100%;
   text-align: left;
@@ -173,7 +209,7 @@
 }
 .ua-track {
   height: 8px;
-  background: var(--muted);
+  background: var(--usage-track);
   border-radius: 4px;
   position: relative;
   display: block;
@@ -183,19 +219,31 @@
   left: 0;
   top: 0;
   bottom: 0;
-  background: var(--info);
+  background: var(--usage-time);
   border-radius: 4px;
+}
+.ua-bars[data-kind="failure"] .ua-track i {
+  background: var(--usage-crit);
+}
+.ua-bars[data-kind="failure"] .ua-bar b {
+  color: var(--usage-crit-text);
+}
+.ua-bar {
+  color: var(--usage-ink-2);
+}
+.ua-bar b {
+  color: var(--usage-ink);
 }
 .ua-share-row {
   display: grid;
   grid-template-columns: 42px minmax(0, 1fr);
   gap: 8px;
   align-items: center;
-  font-size: 12px;
-  color: var(--muted-foreground);
+  font-size: var(--usage-fs-xs);
+  color: var(--usage-ink-2);
 }
 .ua-share-row > small {
-  font-size: 12px;
+  font-size: var(--usage-fs-xs);
   overflow-wrap: anywhere;
 }
 .ua-stack {
@@ -212,8 +260,8 @@
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 2px 14px;
-  font-size: 12px;
-  color: var(--muted-foreground);
+  font-size: var(--usage-fs-xs);
+  color: var(--usage-ink-2);
 }
 .ua-share-legend > span {
   display: flex;
@@ -231,13 +279,14 @@
 .ua-share-legend b {
   margin-left: auto;
   white-space: nowrap;
+  color: var(--usage-ink);
 }
 .ua-controls button:focus-visible,
 .ua-picks button:focus-visible,
 .ua-table button:focus-visible,
 .ua-bar:focus-visible,
 .ua-stack button:focus-visible {
-  outline: 2px solid var(--ring);
+  outline: 2px solid var(--usage-time);
   outline-offset: 2px;
 }
 .ua-share-piece {
@@ -256,12 +305,13 @@
   text-overflow: ellipsis;
   padding: 0 10px;
   border-radius: 13px;
-  background: var(--card);
+  background: var(--usage-tile);
   white-space: nowrap;
 }
 .ua-picks [aria-pressed="true"] {
   font-weight: 700;
-  color: var(--foreground);
+  background: var(--usage-accent-soft);
+  color: var(--usage-time);
 }
 .ua-table-head,
 .ua-table-row {
@@ -272,7 +322,7 @@
   min-height: 34px;
 }
 .ua-table-row [role="cell"] {
-  font-weight: 700;
+  font-weight: 500;
 }
 @media (pointer: coarse) {
   .ua-picks button {
@@ -319,7 +369,7 @@
   .ua-table [role="cell"][data-label]::before {
     content: attr(data-label);
     font-weight: 400;
-    color: var(--muted-foreground);
+    color: var(--usage-ink-3);
   }
   .ua-table-row > [data-label="At API price"] {
     grid-column: 1/-1;
@@ -333,7 +383,7 @@
 }
 .ua-spark path {
   fill: none;
-  stroke: var(--info);
+  stroke: var(--usage-time);
   stroke-width: 2;
   stroke-linejoin: round;
   stroke-linecap: round;
@@ -345,13 +395,19 @@
   gap: 8px;
   padding: 6px 4px;
   align-items: center;
-  font-size: 12px;
+  font-size: var(--usage-fs-xs);
 }
 .ua-card-head {
-  color: var(--muted-foreground);
+  color: var(--usage-ink-3);
+}
+.ua-card-head [aria-sort="ascending"],
+.ua-card-head [aria-sort="descending"] {
+  color: var(--usage-time);
+  font-weight: 700;
 }
 .ua-card-row {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--usage-line);
+  color: var(--usage-ink-2);
 }
 .ua-card-table [role="cell"]:not(:first-child),
 .ua-card-table [role="columnheader"]:not(:first-child) {
@@ -363,11 +419,12 @@
 }
 .ua-card-row small {
   display: block;
-  color: var(--muted-foreground);
+  color: var(--usage-ink-3);
   font-size: 11px;
 }
 .ua-card-row b {
   overflow-wrap: anywhere;
+  color: var(--usage-ink);
 }
 .ua-payback .ua-track {
   height: 2px;
@@ -377,7 +434,7 @@
   top: -5px;
   height: 12px;
   width: 1px;
-  background: var(--muted-foreground);
+  background: var(--usage-ink-3);
 }
 .ua-payback .ua-track i {
   position: absolute;
@@ -386,25 +443,35 @@
   height: 10px;
   border-radius: 50%;
   margin-left: -5px;
+  background: var(--usage-warn);
+}
+.ua-payback[data-tone="ok"] .ua-track i {
+  background: var(--usage-ok);
+}
+.ua-payback[data-tone="ok"] b {
+  color: var(--usage-ok-text);
+}
+.ua-payback[data-tone="warn"] b {
+  color: var(--usage-warn-text);
 }
 .ua-closing {
   display: grid;
   grid-template-columns: minmax(60px, 1fr) auto auto;
   gap: 8px;
-  font-size: 12px;
+  font-size: var(--usage-fs-xs);
   text-align: left;
   align-items: center;
   width: 100%;
 }
 .ua-closing small {
   font-size: 11px;
-  color: var(--muted-foreground);
+  color: var(--usage-ink-3);
 }
 .ua-heat {
   display: grid;
   gap: 2px;
   font-size: 11px;
-  color: var(--muted-foreground);
+  color: var(--usage-ink-3);
 }
 .ua-heat > div {
   display: grid;
@@ -458,7 +525,7 @@
   .ua-card-row > [data-label]::before {
     content: attr(data-label);
     font-weight: 400;
-    color: var(--muted-foreground);
+    color: var(--usage-ink-3);
   }
   .ua-card-row > [data-label="Paid"] {
     grid-column: 1/-1;

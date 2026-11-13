@@ -22,7 +22,7 @@ export function AnalysisPanel({
 export function AnalysisUnknown({ reason = "Not available yet" }: { reason?: string }) {
   return (
     <div className="ua-unknown">
-      <strong>Unknown</strong>
+      <strong data-unknown="">Unknown</strong>
       <small>{reason}</small>
     </div>
   );

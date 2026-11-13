@@ -18,7 +18,8 @@ export function AnalysisTrend({ rows }: { rows: AnalysisRow[] }) {
       points.set(row.hour, (points.get(row.hour) ?? 0) + row.tokens);
   const ordered = [...points].sort(([a], [b]) => a - b);
   const max = Math.max(1, ...ordered.map(([, value]) => value));
-  if (!ordered.length || analysisTotals(rows).tokens === null) return <span>Unknown</span>;
+  if (!ordered.length || analysisTotals(rows).tokens === null)
+    return <span data-unknown="">Unknown</span>;
   return (
     <svg className="ua-spark" viewBox="0 0 88 22" role="img" aria-label="Token trend">
       <path
@@ -65,7 +66,12 @@ export function AnalysisComparisons({
             <span>{String(label)}</span>
             {value && !ninety ? (
               <div className="ua-unknown">
-                <strong>
+                <strong
+                  data-unknown={
+                    analysisValueText(value as AnalysisValue, unit as "money" | "percent") ===
+                      "Unknown" || undefined
+                  }
+                >
                   {analysisValueText(value as AnalysisValue, unit as "money" | "percent") ===
                   "Unknown"
                     ? "Unknown"
@@ -120,7 +126,14 @@ export function AnalysisCards({
         ].map(([label, value, unit]) => (
           <div className="ua-kpi" key={String(label)}>
             <span>{String(label)}</span>
-            <strong>{analysisValueText(value as AnalysisValue, unit as "money" | "quota")}</strong>
+            <strong
+              data-unknown={
+                analysisValueText(value as AnalysisValue, unit as "money" | "quota") ===
+                  "Unknown" || undefined
+              }
+            >
+              {analysisValueText(value as AnalysisValue, unit as "money" | "quota")}
+            </strong>
             <small>
               {label === "At API price"
                 ? "Per-card usage is not attributable"
@@ -169,7 +182,15 @@ export function AnalysisCards({
                 ["Allowance", card.allowance, "quota"],
                 ["Paid per USD 1.00", card.paid_per_quota, "money"],
               ].map(([label, value, unit]) => (
-                <span role="cell" data-label={String(label)} key={String(label)}>
+                <span
+                  role="cell"
+                  data-label={String(label)}
+                  key={String(label)}
+                  data-unknown={
+                    analysisValueText(value as AnalysisValue, unit as "money" | "quota") ===
+                      "Unknown" || undefined
+                  }
+                >
                   {analysisValueText(value as AnalysisValue, unit as "money" | "quota")}
                 </span>
               ))}
@@ -213,13 +234,19 @@ export function AnalysisPayback({
               }}
               tapOpens
             >
-              <button type="button" className="ua-bar ua-payback">
+              <button
+                type="button"
+                className="ua-bar ua-payback"
+                data-tone={number === null ? undefined : number >= 1 ? "ok" : "warn"}
+              >
                 <UsageName>{item.name}</UsageName>
                 <span className="ua-track">
                   <s style={{ left: "50%" }} />
                   {position === null ? null : <i style={{ left: `${position}%` }} />}
                 </span>
-                <b>{analysisValueText(value, "ratio")}</b>
+                <b data-unknown={analysisValueText(value, "ratio") === "Unknown" || undefined}>
+                  {analysisValueText(value, "ratio")}
+                </b>
               </button>
             </UsageTip>
           );
@@ -355,7 +382,7 @@ export function AnalysisHeatmap({
                         type="button"
                         aria-label={`${day} ${h}:00 ${tokens} tokens`}
                         style={{
-                          background: `color-mix(in srgb, var(--info) ${Math.max(6, (tokens / max) * 100)}%, var(--muted))`,
+                          background: `color-mix(in srgb, var(--usage-time) ${Math.max(6, (tokens / max) * 100)}%, var(--usage-track))`,
                         }}
                       />
                     </UsageTip>

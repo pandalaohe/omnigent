@@ -24,11 +24,11 @@ const number = (value: number | null) =>
       );
 const percent = (value: number | null) => (value === null ? "Unknown" : `${value.toFixed(1)}%`);
 const colors = [
-  "var(--info)",
-  "var(--success)",
-  "var(--warning)",
-  "var(--destructive)",
-  "var(--muted-foreground)",
+  "var(--usage-series-1)",
+  "var(--usage-series-2)",
+  "var(--usage-series-3)",
+  "var(--usage-series-4)",
+  "var(--usage-series-5)",
 ];
 export function UsageAnalysisTable({
   items,
@@ -102,7 +102,12 @@ export function UsageAnalysisTable({
               ["Payback", analysisValueText(item.projection?.payback, "ratio")],
               ["Failure rate", percent(item.failure)],
             ].map(([label, value]) => (
-              <span key={label} role="cell" data-label={label}>
+              <span
+                key={label}
+                role="cell"
+                data-label={label}
+                data-unknown={value === "Unknown" || undefined}
+              >
                 {value}
               </span>
             ))}
@@ -209,7 +214,7 @@ export function UsageAnalysisFailures({
       caption={`${measured.filter((item) => item.failure !== null).length}/${items.length} measured items`}
     >
       {known.length ? (
-        <div className="ua-bars">
+        <div className="ua-bars" data-kind="failure">
           {known.map((item) => (
             <UsageTip
               key={item.key}
