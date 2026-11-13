@@ -590,6 +590,9 @@ def value_usage(
     result["account_money"] = money_by_account
     result["show_money"] = any(classes.get(key) != "free" for key in accounts)
     result["show_payback"] = bool(fee_accounts)
+    result["spend_estimated"] = any(
+        item["cost_class"] == "metered" and item["estimated"] for item in money_by_account.values()
+    )
     result["spend"] = (
         combine(spends, unit="money", currency=baseline.defaults.display_currency)
         if spends

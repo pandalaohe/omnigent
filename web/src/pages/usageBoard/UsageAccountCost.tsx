@@ -7,6 +7,8 @@ import { usageFigure } from "./usageAmountData";
 import { formatFullDate } from "./usageBoardFormat";
 import { UsageName } from "./UsageName";
 import { FigureText } from "./UsageFigure";
+import { UsageAccountMoney } from "./UsageAccountMoney";
+import { usePricingBaseline, accountCostClass } from "./usagePricingData";
 
 export function UsageAccountCost({ account }: { account: UsageAccountView }) {
   const [selected, setSelected] = useState(1);
@@ -22,6 +24,8 @@ export function UsageAccountCost({ account }: { account: UsageAccountView }) {
   const queryState = reads[selected];
   const own = amounts[selected];
   const error = queryState.error;
+  const pricing = usePricingBaseline();
+  if (pricing.data && accountCostClass(pricing.data, account.id) === "free") return null;
   return (
     <>
       <section aria-label="Cost" className="usage-card usage-detail-cost">
@@ -88,7 +92,13 @@ export function UsageAccountCost({ account }: { account: UsageAccountView }) {
             {focus ? "Not reported · No proven usage for this pool." : "No usage in this range."}
           </p>
         )}
-        <p className="usage-caption usage-card-note">API price · Not available yet</p>
+        {!focus ? (
+          <UsageAccountMoney
+            accountId={account.id}
+            range={{ key: selected === 0 ? "today" : selected === 1 ? "d7" : "period" }}
+            compact
+          />
+        ) : null}
       </section>
       <details className="usage-card usage-fold">
         <summary>Cost breakdown</summary>

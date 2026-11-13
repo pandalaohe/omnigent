@@ -10,6 +10,8 @@ import { usageJson } from "./usagePriceSourceData";
 import { UsageName } from "./UsageName";
 import {
   CURRENCIES,
+  COST_CLASSES,
+  accountCostClass,
   RATE_KEYS,
   PRICING_QUERY_KEY,
   PricingSaveError,
@@ -21,6 +23,7 @@ import {
   validatePricing,
   validDecimal,
   type Currency,
+  type CostClass,
   type PricingCard,
   type PricingBaseline,
 } from "./usagePricingData";
@@ -34,10 +37,12 @@ export function UsagePricingPanel({
   accounts,
   accountId,
   focus,
+  monthlyFee,
 }: {
   accounts: UsageAccountView[];
   accountId?: string;
   focus?: string | null;
+  monthlyFee?: number;
 }) {
   const location = useLocation();
   return (
@@ -47,7 +52,12 @@ export function UsagePricingPanel({
       open={["#usage-pricing", "#usage-settings"].includes(location.hash) ? true : undefined}
     >
       <summary className="min-h-8 cursor-pointer text-sm font-semibold">Pricing</summary>
-      <PricingEditor accounts={accounts} accountId={accountId} focus={focus} />
+      <PricingEditor
+        accounts={accounts}
+        accountId={accountId}
+        focus={focus}
+        monthlyFee={monthlyFee}
+      />
     </details>
   );
 }
@@ -56,10 +66,12 @@ function PricingEditor({
   accounts,
   accountId,
   focus,
+  monthlyFee,
 }: {
   accounts: UsageAccountView[];
   accountId?: string;
   focus?: string | null;
+  monthlyFee?: number;
 }) {
   const query = usePricingBaseline();
   const client = useQueryClient();
@@ -75,6 +87,8 @@ function PricingEditor({
   const [message, setMessage] = useState("");
   const [error, setError] = useState<PricingSaveError | null>(null);
   const [fields, setFields] = useState<Record<string, string>>({});
+  const [preview, setPreview] = useState<PricingBaseline | null>(null);
+  const [previewFor, setPreviewFor] = useState<string | null>(null);
   const baseline = draft ?? query.data;
   if (!baseline)
     return (
@@ -114,6 +128,8 @@ function PricingEditor({
   const currencyChanged =
     baseline.defaults.display_currency !== (original ?? query.data)?.defaults.display_currency;
   function edit(next: PricingBaseline) {
+    setPreview(null);
+    setPreviewFor(null);
     if (!draft && query.data) setOriginal(query.data);
     setDraft(next);
     setFields({});
@@ -142,9 +158,10 @@ function PricingEditor({
         : {
             id,
             name: "New card",
-            retail_amount: "",
-            purchase_currency: "CNY",
-            allowance_usd: "",
+            retail_amount: monthlyFee != null ? String(monthlyFee) : "",
+            purchase_currency: monthlyFee != null ? "USD" : "CNY",
+            allowance_usd: accountCostClass(baseline, parent) === "subscription" ? null : "",
+            repeats: accountCostClass(baseline, parent) === "subscription",
             period_kind: "month",
             starts_on: new Date().toLocaleDateString("en-CA"),
             timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -192,11 +209,21 @@ function PricingEditor({
     setError(null);
     setMessage("");
     try {
+      if (
+        baseline.cards.some((item) => item.repeats) &&
+        (!preview || previewFor !== JSON.stringify(baseline))
+      ) {
+        setPreview(await savePricingBaseline(baseline, true));
+        setPreviewFor(JSON.stringify(baseline));
+        setMessage("Review recomputed past periods, then save pricing.");
+        return;
+      }
       const saved = await savePricingBaseline(baseline);
       client.setQueryData(PRICING_QUERY_KEY, saved);
       setDraft(null);
       setOriginal(null);
       setFields({});
+      setPreview(null);
       setMessage("Pricing saved. History recalculated.");
       await client.invalidateQueries({
         predicate: (item) =>
@@ -218,6 +245,35 @@ function PricingEditor({
   }
   return (
     <fieldset disabled={saving} className="min-w-0 border-0 p-0">
+      {(accountId ? accounts.filter((item) => item.id === accountId) : accounts).map((account) => (
+        <Field key={account.id} label={`Cost class · ${account.display_name}`}>
+          <select
+            value={baseline.account_classes?.[account.id] ?? ""}
+            onChange={(event) =>
+              edit({
+                ...baseline,
+                account_classes: {
+                  ...baseline.account_classes,
+                  [account.id]: (event.target.value || null) as CostClass | null,
+                },
+              })
+            }
+          >
+            <option value="">
+              Automatic ·{" "}
+              {COST_CLASSES[baseline.account_class_defaults?.[account.id] as CostClass] ?? "Unset"}
+            </option>
+            {Object.entries(COST_CLASSES).map(([key, label]) => (
+              <option key={key} value={key}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </Field>
+      ))}
+      {accountId && accountCostClass(baseline, accountId) === null ? (
+        <p className="usage-caption">Set a cost class to show money.</p>
+      ) : null}
       <div className="usage-pricing-defaults">
         <DecimalField
           label="Default discount"
@@ -284,33 +340,43 @@ function PricingEditor({
           )}
         </div>
       </details>
-      <div className="usage-pricing-card-list">
-        <Field label="Purchased card">
-          <select
-            value={card?.id ?? ""}
-            title={card ? `${card.name} · ${card.starts_on}` : "No saved cards"}
-            onChange={(event) => setSelected(event.target.value)}
-          >
-            {!cards.length ? (
-              <option value="">No saved cards</option>
-            ) : (
-              cards.map((item) => (
-                <option value={item.id} key={item.id} title={`${item.name} · ${item.starts_on}`}>
-                  {item.name} · {item.starts_on}
-                </option>
-              ))
-            )}
-          </select>
-        </Field>
-        <Button variant="outline" size="sm" onClick={() => newCard()}>
-          Add card
-        </Button>
-        {card ? (
-          <Button variant="ghost" size="sm" onClick={() => newCard(true)}>
-            Copy card
+      {!accountId ||
+      ["subscription", "prepaid"].includes(accountCostClass(baseline, accountId) ?? "") ||
+      cards.length > 0 ? (
+        <div className="usage-pricing-card-list">
+          <Field label="Purchased card">
+            <select
+              value={card?.id ?? ""}
+              title={card ? `${card.name} · ${card.starts_on}` : "No saved cards"}
+              onChange={(event) => setSelected(event.target.value)}
+            >
+              {!cards.length ? (
+                <option value="">No saved cards</option>
+              ) : (
+                cards.map((item) => (
+                  <option value={item.id} key={item.id} title={`${item.name} · ${item.starts_on}`}>
+                    {item.name} · {item.starts_on}
+                  </option>
+                ))
+              )}
+            </select>
+          </Field>
+          <Button variant="outline" size="sm" onClick={() => newCard()}>
+            Add card
           </Button>
-        ) : null}
-      </div>
+          {card ? (
+            <Button variant="ghost" size="sm" onClick={() => newCard(true)}>
+              Copy card
+            </Button>
+          ) : null}
+        </div>
+      ) : (
+        <p className="usage-caption">
+          {accountId && accountCostClass(baseline, accountId) === "free"
+            ? "Free accounts show usage and quota only."
+            : "No purchase card required."}
+        </p>
+      )}
       {card ? (
         <div className="usage-pricing-editor" key={card.id}>
           <div className="usage-pricing-two">
@@ -364,9 +430,10 @@ function PricingEditor({
             </Field>
             <DecimalField
               label="USD allowance per reset"
-              value={card.allowance_usd}
+              value={card.allowance_usd ?? ""}
+              optional={card.repeats}
               error={errors[prefix + "allowance_usd"]}
-              onChange={(value) => editCard({ allowance_usd: value })}
+              onChange={(value) => editCard({ allowance_usd: value || null })}
             />
             <Field label="Billing period">
               <select
@@ -394,6 +461,47 @@ function PricingEditor({
               />
             </Field>
           </div>
+          {accountCostClass(baseline, card.parent_account_id ?? card.target_id) ===
+          "subscription" ? (
+            <>
+              <label className="flex min-h-9 items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={card.repeats ?? false}
+                  onChange={(event) => editCard({ repeats: event.target.checked, ends_on: null })}
+                />
+                Automatic renewal
+              </label>
+              {card.repeats ? (
+                <Field label="Ends on (exclusive)" error={errors[prefix + "ends_on"]}>
+                  <Input
+                    type="date"
+                    value={card.ends_on ?? ""}
+                    onChange={(event) => editCard({ ends_on: event.target.value || null })}
+                  />
+                </Field>
+              ) : null}
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={!card.repeats || !card.ends_on}
+                onClick={() => {
+                  const id = `card-${nanoid()}`;
+                  const next = {
+                    ...structuredClone(card),
+                    id,
+                    name: `${card.name} replacement`,
+                    starts_on: card.ends_on!,
+                    ends_on: null,
+                  };
+                  edit({ ...baseline, cards: [...baseline.cards, next] });
+                  setSelected(id);
+                }}
+              >
+                End here and start a new card
+              </Button>
+            </>
+          ) : null}
           <DecimalField
             label="Card discount"
             money={false}
@@ -467,8 +575,10 @@ function PricingEditor({
               : ""}
           </output>
           <p className="text-xs text-muted-foreground">
-            One purchase only. Weekly resets do not add another payment. Quota remaining comes from
-            provider readings.
+            {card.repeats
+              ? "Renewals create payments only when their period starts. Editing this card recalculates past periods."
+              : "One purchase only. Weekly resets do not add another payment."}{" "}
+            Quota remaining comes from provider readings.
           </p>
         </div>
       ) : (
@@ -476,6 +586,17 @@ function PricingEditor({
           Add an actual purchase to set its pricing baseline.
         </p>
       )}
+      {preview ? (
+        <output aria-label="Recomputed past periods" className="block usage-card-note">
+          {preview.history?.map((item) => (
+            <p key={item.card_id}>
+              {baseline.cards.find((purchase) => purchase.id === item.card_id)?.name} ·{" "}
+              {item.starts_on} · {item.periods} periods · {item.payment.currency}{" "}
+              {decimalDisplay(item.payment.low)} each · {decimalDisplay(item.total.low)} total
+            </p>
+          ))}
+        </output>
+      ) : null}
       {error ? (
         <div role="alert" className="py-2 text-xs text-destructive">
           <p>{error.message}</p>
@@ -489,6 +610,8 @@ function PricingEditor({
                   if (latest.error) throw latest.error;
                   if (latest.data && original && draft) {
                     setDraft(reapplyPricing(original, draft, latest.data));
+                    setPreview(null);
+                    setPreviewFor(null);
                     setOriginal(latest.data);
                     setError(null);
                     setMessage("Draft reapplied to the latest revision. Review and save.");
@@ -525,6 +648,7 @@ function PricingEditor({
             setFields({});
             setError(null);
             setMessage("Draft cancelled.");
+            setPreview(null);
           }}
         >
           Cancel pricing
@@ -613,6 +737,8 @@ export function UsagePricingSummary({ accountId }: { accountId: string }) {
   const cards =
     query.data?.cards.filter((card) => (card.parent_account_id ?? card.target_id) === accountId) ??
     [];
+  const kind = query.data ? accountCostClass(query.data, accountId) : null;
+  if (kind === "free" || kind === "metered") return null;
   return (
     <section className="usage-card">
       <div className="flex items-center justify-between">
@@ -631,6 +757,13 @@ export function UsagePricingSummary({ accountId }: { accountId: string }) {
             className="flex min-w-0 flex-wrap items-center justify-between gap-2 border-t border-border py-2 text-xs"
           >
             <UsageName className="flex-1">{`${card.name} · ${card.starts_on}`}</UsageName>
+            {card.repeats ? (
+              <span className="usage-caption">
+                {query.data?.renewals?.[card.id]
+                  ? `自动续 · 下次 ${new Date(query.data.renewals[card.id]! * 1000).toLocaleDateString(undefined, { timeZone: card.timezone })}`
+                  : "自动续已结束"}
+              </span>
+            ) : null}
             <span>
               {card.purchase_currency}{" "}
               {decimalDisplay(
@@ -639,6 +772,11 @@ export function UsagePricingSummary({ accountId }: { accountId: string }) {
                   card.discount_override ?? query.data!.defaults.default_discount,
                 ),
               )}
+              {kind === "prepaid" && card.allowance_usd ? (
+                <small className="block usage-caption">
+                  USD {decimalDisplay(card.allowance_usd)} allowance · paid per USD 1.00 in Analysis
+                </small>
+              ) : null}
             </span>
           </div>
         ))

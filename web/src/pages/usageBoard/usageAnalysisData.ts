@@ -108,11 +108,27 @@ export function analysisTotals(rows: AnalysisRow[], incomplete = false) {
 }
 
 export interface AnalysisProjection {
+  api_value?: AnalysisValue;
+  spend?: AnalysisValue;
+  spend_estimated?: boolean;
+  show_money?: boolean;
+  show_payback?: boolean;
+  account_money?: Record<string, AccountMoney>;
   paid: AnalysisValue;
   payback: AnalysisValue;
   tokens: AnalysisValue;
   coverage?: { known_paid: number; total_items: number };
   cards?: AnalysisCard[];
+}
+export interface AccountMoney {
+  cost_class: "subscription" | "prepaid" | "metered" | "free" | null;
+  show_money: boolean;
+  show_payback: boolean;
+  estimated: boolean;
+  spend: AnalysisValue;
+  api_value: AnalysisValue;
+  paid: AnalysisValue;
+  payback: AnalysisValue;
 }
 export interface AnalysisCard {
   id: string;

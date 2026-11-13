@@ -99,7 +99,7 @@ async def test_analysis_multi_pick_is_authenticated_bounded_and_never_all_owner_
             response = await client.put(
                 f"/v1/me/usage/accounts/account-{key}",
                 headers=headers,
-                json={"schema_version": 2, "observed_at": time.time()},
+                json={"schema_version": 2, "observed_at": time.time(), "source_type": "relay"},
             )
             assert response.status_code == 200
         purchases = [

@@ -441,3 +441,48 @@ def test_non_purchase_classes_never_show_payback(kind):
     if kind == "metered":
         assert result["spend"].low == "12.5"
         assert not result["account_money"]["account-a"]["estimated"]
+
+
+def test_cancel_preserves_started_period_pricing_and_other_account_pool_renewals():
+    purchase = card(
+        repeats=True,
+        allowance_usd=None,
+        period_kind="month",
+        starts_on="2026-01-01",
+        ends_on="2026-01-15",
+        target_kind="pool",
+        target_id="shared",
+        parent_account_id="account-a",
+    )
+    other = card(
+        id="other",
+        repeats=True,
+        allowance_usd=None,
+        starts_on="2026-02-01",
+        target_kind="pool",
+        target_id="shared",
+        parent_account_id="account-b",
+    )
+    state = PricingBaseline(cards=[purchase, other])
+    assert state.replacement_boundary(purchase) == float("inf")
+    assert state.past_period_count(purchase, purchase.period_start(3).timestamp()) == 1
+    sample = view(
+        purchase,
+        hour=int(purchase.period_start(0).timestamp()) + 20 * 86400,
+        pool_id="shared",
+        attributed=True,
+    )
+    result = value_usage(sample, state)
+    assert result["api_value"].low == "49"
+    ongoing = purchase.model_copy(update={"ends_on": None})
+    state = PricingBaseline(cards=[ongoing, other])
+    assert state.past_period_count(ongoing, ongoing.period_start(3).timestamp()) == 4
+
+
+def test_metered_token_estimate_retains_its_label_without_a_reported_bill():
+    sample = view()
+    sample.account_cost_classes = {"account-a": "metered"}
+    result = value_usage(sample, baseline())
+    assert result["spend"].low == "49"
+    assert result["spend_estimated"] is True
+    assert result["show_payback"] is False

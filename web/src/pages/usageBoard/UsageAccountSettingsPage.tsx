@@ -143,6 +143,7 @@ export function UsageAccountSettingsPage() {
               accounts={overview.data?.accounts ?? []}
               accountId={account.id}
               focus={search.get("focus")}
+              monthlyFee={board.fees?.[account.id]}
             />
             <QuotaFloorControl tile={account.id} label={account.display_name} account={account} />
             <Link

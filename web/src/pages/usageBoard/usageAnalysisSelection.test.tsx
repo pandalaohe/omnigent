@@ -149,7 +149,7 @@ it("selects the same account for KPI table shares failures and chart", () => {
   expect(screen.getByTestId("selected-chart").textContent).toBe("Claudeprevious unavailable");
   expect(screen.getByRole("table")).toHaveTextContent("Alpha");
   expect(screen.getByRole("table")).not.toHaveTextContent("Beta");
-  expect(screen.getByRole("button", { name: "Claude token share 100.0%" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Claude token share 100.00%" })).toBeVisible();
   expect(screen.queryByRole("button", { name: /Beta failure rate/ })).toBeNull();
 });
 it("changes grouping without reusing a different dimension's picks", () => {
@@ -233,6 +233,6 @@ it("combines versioned model identities into the target families and keeps other
       ]}
     />,
   );
-  expect(screen.getByRole("button", { name: "Claude token share 75.0%" })).toBeVisible();
-  expect(screen.getByRole("button", { name: "Other token share 25.0%" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Claude token share 75.00%" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Other token share 25.00%" })).toBeVisible();
 });

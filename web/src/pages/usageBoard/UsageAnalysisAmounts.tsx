@@ -8,6 +8,7 @@ import { AnalysisPanel, AnalysisUnknown } from "./UsageAnalysisPanel";
 import { UsageTip } from "./UsageTip";
 import { AnalysisTrend, compareAnalysisDecimals } from "./UsageAnalysisDetails";
 import { UsageName } from "./UsageName";
+import { moneyText } from "./UsageAccountMoney";
 
 interface Item {
   key: string;
@@ -22,7 +23,7 @@ const number = (value: number | null) =>
     : new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 2 }).format(
         value,
       );
-const percent = (value: number | null) => (value === null ? "Unknown" : `${value.toFixed(1)}%`);
+const percent = (value: number | null) => (value === null ? "Unknown" : `${value.toFixed(2)}%`);
 const colors = [
   "var(--usage-series-1)",
   "var(--usage-series-2)",
@@ -42,6 +43,12 @@ export function UsageAnalysisTable({
   onSort: (key: SortKey) => void;
 }) {
   const data = items.map((item) => ({ ...item, ...analysisTotals(item.rows, incomplete) }));
+  const showMoney = items.some((item) => item.projection?.show_money !== false);
+  const showPayback = items.some((item) => item.projection?.show_payback !== false);
+  const paymentLabel = showPayback ? "Paid / spend" : "Spend";
+  const columns = {
+    gridTemplateColumns: `minmax(120px, 2fr) repeat(${2 + (showMoney ? 2 : 0) + (showPayback ? 1 : 0)}, minmax(0, 1fr))`,
+  };
   data.sort((a, b) => {
     if (sort.key === "paid" || sort.key === "payback") {
       const av = a.projection?.[sort.key]?.low,
@@ -61,34 +68,45 @@ export function UsageAnalysisTable({
   return (
     <AnalysisPanel title="Each item" caption={`${items.length} items`}>
       <div className="ua-table" role="table" aria-label="Each item">
-        <div className="ua-table-head" role="row">
+        <div className="ua-table-head" role="row" style={columns}>
           <span role="columnheader">Item</span>
           <span role="columnheader">Trend</span>
           {(
             [
               ["api", "At API price"],
-              ["paid", "Paid"],
+              ["paid", paymentLabel],
               ["tokens", "Token"],
               ["payback", "Payback"],
               ["failure", "Failure rate"],
             ] as const
-          ).map(([key, label]) => (
-            <span
-              key={key}
-              role="columnheader"
-              aria-sort={
-                sort.key === key ? (sort.direction < 0 ? "descending" : "ascending") : "none"
-              }
-            >
-              <button type="button" onClick={() => onSort(key)}>
-                {label}
-                {sort.key === key ? (sort.direction < 0 ? " ↓" : " ↑") : ""}
-              </button>
-            </span>
-          ))}
+          )
+            .filter(
+              ([key]) =>
+                (showMoney || !["api", "paid"].includes(key)) && (showPayback || key !== "payback"),
+            )
+            .map(([key, label]) => (
+              <span
+                key={key}
+                role="columnheader"
+                aria-sort={
+                  sort.key === key ? (sort.direction < 0 ? "descending" : "ascending") : "none"
+                }
+              >
+                <button type="button" onClick={() => onSort(key)}>
+                  {label}
+                  {sort.key === key ? (sort.direction < 0 ? " ↓" : " ↑") : ""}
+                </button>
+              </span>
+            ))}
         </div>
         {data.map((item) => (
-          <div role="row" className="ua-table-row" key={item.key} data-item={item.key}>
+          <div
+            role="row"
+            className="ua-table-row"
+            key={item.key}
+            data-item={item.key}
+            style={columns}
+          >
             <span role="cell" className="ua-name">
               <UsageName>{item.name}</UsageName>
             </span>
@@ -96,21 +114,44 @@ export function UsageAnalysisTable({
               <AnalysisTrend rows={item.rows} />
             </span>
             {[
-              ["At API price", "Unknown"],
-              ["Paid", analysisValueText(item.projection?.paid)],
+              [
+                "At API price",
+                item.projection?.show_money === false ? "—" : moneyText(item.projection?.api_value),
+              ],
+              [
+                paymentLabel,
+                item.projection?.show_money === false
+                  ? "—"
+                  : `${item.projection?.spend_estimated ? "Estimated " : ""}${moneyText(
+                      item.projection?.show_payback === false
+                        ? item.projection?.spend
+                        : item.projection?.paid,
+                    )}`,
+              ],
               ["Token", number(item.tokens)],
-              ["Payback", analysisValueText(item.projection?.payback, "ratio")],
+              [
+                "Payback",
+                item.projection?.show_payback === false
+                  ? "—"
+                  : analysisValueText(item.projection?.payback, "ratio"),
+              ],
               ["Failure rate", percent(item.failure)],
-            ].map(([label, value]) => (
-              <span
-                key={label}
-                role="cell"
-                data-label={label}
-                data-unknown={value === "Unknown" || undefined}
-              >
-                {value}
-              </span>
-            ))}
+            ]
+              .filter(
+                ([label]) =>
+                  (showMoney || !["At API price", paymentLabel].includes(label)) &&
+                  (showPayback || label !== "Payback"),
+              )
+              .map(([label, value]) => (
+                <span
+                  key={label}
+                  role="cell"
+                  data-label={label}
+                  data-unknown={value === "Unknown" || undefined}
+                >
+                  {value}
+                </span>
+              ))}
           </div>
         ))}
       </div>
