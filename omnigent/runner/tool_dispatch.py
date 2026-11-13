@@ -1076,6 +1076,13 @@ def _bounded_discovery_result(
             "limit": candidate_limit,
             "has_more": has_more,
         }
+        errors = {
+            name: {"reason": "source_unavailable", "retryable": True}
+            for name, source in source_pages.items()
+            if source.failed
+        }
+        if errors:
+            metadata["source_errors"] = errors
         if any(has_more.values()):
             cursor = _encode_discovery_cursor(tool_name, filters, next_state)
             if cursor is None:
@@ -7604,6 +7611,24 @@ def _browser_screenshot_output(output: str) -> str:
     )
 
 
+async def _uncertain_control_write(
+    client: httpx.AsyncClient, url: str, expected_revision: object
+) -> str:
+    """Re-read a timed-out mutation; a lost response never authorizes replay."""
+    result: _JsonObject = {
+        "error": "write_outcome_unknown",
+        "expected_revision": expected_revision,
+        "next_step": "Compare the observed revision and values before a new guarded write.",
+    }
+    try:
+        response = await client.get(url, timeout=60.0)
+        response.raise_for_status()
+        result["observed"] = response.json()
+    except (httpx.HTTPError, ValueError):
+        result["reread_reason"] = "unavailable"
+    return json.dumps(result)
+
+
 async def _execute_instruction_layer_tool(
     tool_name: str,
     arguments: str,
@@ -7625,7 +7650,14 @@ async def _execute_instruction_layer_tool(
             fields = {"scope", "agent_key", "host_id", "text", "expected_revision_id"}
             if args.keys() - fields:
                 raise ValueError("unexpected update arguments")
-            response = await server_client.put("/v1/instruction-layers", json=args, timeout=30.0)
+            try:
+                response = await server_client.put(
+                    "/v1/instruction-layers", json=args, timeout=60.0
+                )
+            except httpx.TimeoutException:
+                return await _uncertain_control_write(
+                    server_client, "/v1/instruction-layers", args.get("expected_revision_id")
+                )
         else:
             mode = args.pop("mode", None)
             routes = {
@@ -7642,7 +7674,7 @@ async def _execute_instruction_layer_tool(
             if args.keys() - fields:
                 raise ValueError("unexpected arguments for read mode")
             response = await server_client.get(
-                "/v1/instruction-layers" + suffix, params=args, timeout=30.0
+                "/v1/instruction-layers" + suffix, params=args, timeout=60.0
             )
         if response.status_code != 200:
             return json.dumps(
@@ -7667,7 +7699,7 @@ async def _execute_standing_approval_tool(
             raise ValueError("unexpected standing approval arguments")
         url = f"{_session_url(conversation_id)}/standing-approval"
         if args.get("op") == "read":
-            response = await server_client.get(url, timeout=30.0)
+            response = await server_client.get(url, timeout=60.0)
         else:
             response = await server_client.post(url, json=args, timeout=None)
         if response.status_code != 200:
@@ -7769,14 +7801,22 @@ async def _execute_session_choice_tool(
         if not isinstance(args, dict):
             raise ValueError("arguments must be an object")
         url = "/v1/me/session-choice"
-        if tool_name == "sys_session_choice_update":
-            response = await server_client.put(url, json=args, timeout=30.0)
-        elif tool_name == "sys_quota_floor":
-            response = await server_client.post(url + "/floor", json=args, timeout=30.0)
-        else:
-            if args:
-                raise ValueError("read takes no arguments")
-            response = await server_client.get(url, timeout=30.0)
+        try:
+            if tool_name == "sys_session_choice_update":
+                response = await server_client.put(url, json=args, timeout=60.0)
+            elif tool_name == "sys_quota_floor":
+                url += "/floor"
+                response = await server_client.post(url, json=args, timeout=60.0)
+            else:
+                if args:
+                    raise ValueError("read takes no arguments")
+                response = await server_client.get(url, timeout=60.0)
+        except httpx.TimeoutException:
+            if tool_name in {"sys_session_choice_update", "sys_quota_floor"}:
+                return await _uncertain_control_write(
+                    server_client, url, args.get("expected_revision")
+                )
+            raise
         if response.status_code != 200:
             return json.dumps(
                 {"error": f"server returned {response.status_code}", "details": response.text}
@@ -8506,17 +8546,22 @@ async def _runner_online_or_none(
 async def _host_detail_or_none(
     host_id: str | None,
     server_client: httpx.AsyncClient,
+    *,
+    diagnostics: dict[str, str] | None = None,
 ) -> _JsonObject | None:
     """Return the bound host's ``GET /v1/hosts/{id}`` detail, best-effort."""
     if not host_id:
         return None
     try:
         resp = await server_client.get(f"/v1/hosts/{host_id}", timeout=30.0)
-        if resp.status_code != 200:
-            return None
+        resp.raise_for_status()
         detail = resp.json()
     except Exception:  # noqa: BLE001
+        if diagnostics is not None:
+            diagnostics["host_lookup_reason"] = "host_lookup_unavailable"
         return None
+    if not isinstance(detail, dict) and diagnostics is not None:
+        diagnostics["host_lookup_reason"] = "host_lookup_invalid_response"
     return detail if isinstance(detail, dict) else None
 
 
@@ -8859,10 +8904,11 @@ async def _session_info_item(
     # decides whether the session can take its next turn.
     resolved_host_id = snap_host_id or _optional_string(snap.get("effective_host_id"))
     host: _JsonObject | None = None
+    host_diagnostics: dict[str, str] = {}
     if include_host_readiness:
         runner_online, host = await asyncio.gather(
             _runner_online_or_none(snap_runner_id, server_client),
-            _host_detail_or_none(resolved_host_id, server_client),
+            _host_detail_or_none(resolved_host_id, server_client, diagnostics=host_diagnostics),
         )
     else:
         runner_online = await _runner_online_or_none(snap_runner_id, server_client)
@@ -8871,7 +8917,9 @@ async def _session_info_item(
     if runner_running is False and not include_host_readiness:
         # Only a stopped runner needs the host's status, so a batch read of
         # live children still makes no per-item host lookup.
-        host = await _host_detail_or_none(resolved_host_id, server_client)
+        host = await _host_detail_or_none(
+            resolved_host_id, server_client, diagnostics=host_diagnostics
+        )
     runner_state, runner_state_reason = _session_info_runner_state(
         runner_running,
         resolved_host_id,
@@ -8917,6 +8965,7 @@ async def _session_info_item(
         "runner_state": runner_state,
         "runner_state_reason": runner_state_reason,
         "host_id": snap.get("host_id"),
+        **host_diagnostics,
         "parent_session_id": snap.get("parent_session_id"),
         "family": snap.get("family"),
         "created_by_session_id": (_string_mapping(snap.get("labels")) or {}).get(
@@ -9547,18 +9596,29 @@ _AGENT_READINESS_MAX_DEPTH = 16
 async def _agent_list_host_readiness(
     server_client: httpx.AsyncClient,
     conversation_id: str | None,
+    *,
+    diagnostics: dict[str, str] | None = None,
 ) -> _JsonObject | None:
     """Use the runner's host identity, with a bounded legacy session fallback."""
     from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
+
+    async def host_readiness(host_id: str) -> _JsonObject | None:
+        detail = await _host_detail_or_none(host_id, server_client, diagnostics=diagnostics)
+        readiness = _configured_harnesses(detail)
+        if readiness is None and diagnostics is not None:
+            diagnostics.setdefault("host_lookup_reason", "readiness_not_reported")
+        return readiness
 
     try:
         async with asyncio.timeout(_AGENT_READINESS_TIMEOUT_S):
             host_id = os.environ.get(RUNNER_SLICE_KEY_ENV_VAR)
             if host_id:
-                return await _host_harnesses_or_none(host_id, server_client)
+                return await host_readiness(host_id)
             seen: set[str] = set()
             while conversation_id and conversation_id not in seen:
                 if len(seen) >= _AGENT_READINESS_MAX_DEPTH:
+                    if diagnostics is not None:
+                        diagnostics["host_lookup_reason"] = "readiness_depth_limit"
                     return None
                 seen.add(conversation_id)
                 response = await server_client.get(
@@ -9567,16 +9627,24 @@ async def _agent_list_host_readiness(
                     timeout=_AGENT_READINESS_TIMEOUT_S,
                 )
                 if response.status_code != 200:
+                    if diagnostics is not None:
+                        diagnostics["host_lookup_reason"] = "readiness_lookup_unavailable"
                     return None
                 snapshot = _string_object_dict(response.json())
                 if snapshot is None:
+                    if diagnostics is not None:
+                        diagnostics["host_lookup_reason"] = "readiness_invalid_response"
                     return None
                 host_id = _optional_string(snapshot.get("host_id"))
                 if host_id:
-                    return await _host_harnesses_or_none(host_id, server_client)
+                    return await host_readiness(host_id)
                 conversation_id = _optional_string(snapshot.get("parent_session_id"))
     except (TimeoutError, httpx.HTTPError, ValueError):
+        if diagnostics is not None:
+            diagnostics["host_lookup_reason"] = "readiness_lookup_unavailable"
         return None
+    if conversation_id and diagnostics is not None:
+        diagnostics["host_lookup_reason"] = "readiness_ancestry_cycle"
     return None
 
 
@@ -9586,12 +9654,20 @@ async def _agent_quotas_via_rest(
     if conversation_id is None:
         return {}
     try:
-        async with asyncio.timeout(2):
-            response = await client.get(f"/v1/sessions/{conversation_id}/agent-quota")
+        # Local advisory control gets the same user-impatience backstop as settings reads.
+        async with asyncio.timeout(60):
+            response = await client.get(
+                f"/v1/sessions/{conversation_id}/agent-quota", timeout=60.0
+            )
             response.raise_for_status()
-            return _string_object_dict(response.json()) or {}
+            payload = _string_object_dict(response.json())
+            if payload is None:
+                return {"quota_read_reason": "quota_unavailable"}
+            return payload
+    except (TimeoutError, httpx.TimeoutException):
+        return {"quota_read_reason": "quota_read_timeout"}
     except Exception:  # noqa: BLE001 — quota is advisory, discovery remains usable
-        return {}
+        return {"quota_read_reason": "quota_unavailable"}
 
 
 def _child_cap_error(response: httpx.Response) -> str | None:
@@ -9778,6 +9854,7 @@ async def _agent_list_via_rest(
     spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
     assert spec.cwd is not None
     configs_dir = Path(spec.cwd) / _AGENT_CONFIG_SUBDIR
+    readiness_diagnostics: dict[str, str] = {}
     builtins_page, sessions_page, local_configs, readiness, family, quotas = await asyncio.gather(
         _agent_list_fetch(
             "/v1/agents",
@@ -9794,7 +9871,9 @@ async def _agent_list_via_rest(
             exhausted=cursor_state["session_agents"][0] == _DISCOVERY_END,
         ),
         asyncio.to_thread(_scan_local_agent_configs, configs_dir),
-        _agent_list_host_readiness(server_client, conversation_id),
+        _agent_list_host_readiness(
+            server_client, conversation_id, diagnostics=readiness_diagnostics
+        ),
         _spawn_family(server_client, conversation_id),
         _agent_quotas_via_rest(server_client, conversation_id),
     )
@@ -9836,6 +9915,13 @@ async def _agent_list_via_rest(
                     key=lambda w: (severity.get(str(w.get("state")), 4), w.get("pace_pct") or 0)
                 )
                 quota["windows"] = evidence[:4]
+                if len(evidence) > 4:
+                    quota["total_windows"] = len(evidence)
+                    quota["omitted_windows"] = len(evidence) - 4
+                    quota["full_evidence"] = {
+                        "method": "GET",
+                        "path": f"/v1/sessions/{conversation_id}/agent-quota",
+                    }
         row["quota"] = quota
     result = _bounded_discovery_result(
         listing,
@@ -9856,6 +9942,10 @@ async def _agent_list_via_rest(
     choice = _string_object_dict(quotas.get("session_choice"))
     issues = quotas.get("usage_issues")
     extras: _JsonObject = {}
+    if readiness_diagnostics:
+        extras["readiness_lookup_reason"] = readiness_diagnostics["host_lookup_reason"]
+    if quotas.get("quota_read_reason"):
+        extras["quota_read_reason"] = quotas["quota_read_reason"]
     if choice is not None:
         extras["session_choice"] = choice
     if isinstance(issues, list) and issues:
@@ -9980,7 +10070,10 @@ async def _session_list_via_rest(
     :returns: The legacy complete JSON result while it fits, otherwise a
         bounded page with continuation metadata.
     """
-    sub_agents = await _collect_sub_agents(conversation_id, server_client)
+    partial_sources: dict[str, str] = {}
+    sub_agents = await _collect_sub_agents(
+        conversation_id, server_client, diagnostics=partial_sources
+    )
     sessions_page = (
         _DiscoveryPage([], False)
         if cursor_state["sessions"][0] == _DISCOVERY_END
@@ -10004,6 +10097,8 @@ async def _session_list_via_rest(
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
     )
+    if partial_sources:
+        result = json.dumps({**json.loads(result), "partial_sources": partial_sources})
     return await _fill_returned_runner_online(result, server_client)
 
 
@@ -10147,7 +10242,11 @@ async def _rename_descendant_session_via_rest(
                 "detail": patch.text[:200],
             }
         )
-    return json.dumps({"renamed": True, "title": full_title, "reason": None})
+    result: _JsonObject = {"renamed": True, "title": full_title, "reason": None}
+    if len(children) >= 1000:
+        result["uniqueness_check"] = "partial"
+        result["uniqueness_check_reason"] = "sibling_limit_reached"
+    return json.dumps(result)
 
 
 async def _rename_current_session_via_rest(
@@ -10472,6 +10571,8 @@ async def _session_archive_via_rest(
 async def _collect_sub_agents(
     conversation_id: str,
     server_client: httpx.AsyncClient,
+    *,
+    diagnostics: dict[str, str] | None = None,
 ) -> list[dict[str, str | None]]:
     """
     Collect the caller's named-sub-agent view via ``GET .../child_sessions``.
@@ -10496,13 +10597,25 @@ async def _collect_sub_agents(
             timeout=30.0,
         )
     except Exception:  # noqa: BLE001
+        if diagnostics is not None:
+            diagnostics["children"] = "children_lookup_unavailable"
         return []
     if resp.status_code != 200:
+        if diagnostics is not None:
+            diagnostics["children"] = "children_lookup_unavailable"
         return []
-    result = _child_rows_to_entries(resp.json().get("data", []))
+    try:
+        data = resp.json()["data"]
+        if not isinstance(data, list) or not all(isinstance(row, dict) for row in data):
+            raise ValueError("Invalid children")
+        result = _child_rows_to_entries(data)
+    except (ValueError, KeyError, TypeError):
+        if diagnostics is not None:
+            diagnostics["children"] = "children_lookup_unavailable"
+        return []
 
     # If the caller is itself a child, surface main + siblings too.
-    parent_id = await _session_parent_id(conversation_id, server_client)
+    parent_id = await _session_parent_id(conversation_id, server_client, diagnostics=diagnostics)
     if parent_id is not None:
         result.append({"agent": "main", "title": None, "conversation_id": parent_id})
         try:
@@ -10511,12 +10624,18 @@ async def _collect_sub_agents(
                 params={"limit": 100},
                 timeout=30.0,
             )
+            sib_resp.raise_for_status()
+            data = sib_resp.json()["data"]
+            if not isinstance(data, list) or not all(isinstance(row, dict) for row in data):
+                raise ValueError("Invalid siblings")
             if sib_resp.status_code == 200:
-                for entry in _child_rows_to_entries(sib_resp.json().get("data", [])):
+                for entry in _child_rows_to_entries(data):
                     # Exclude the caller itself from its own sibling list.
                     if entry["conversation_id"] != conversation_id:
                         result.append(entry)
         except Exception:
+            if diagnostics is not None:
+                diagnostics["siblings"] = "siblings_lookup_unavailable"
             _logger.debug(
                 "sys_session_list sibling enrichment failed for parent %s",
                 parent_id,
@@ -10795,6 +10914,8 @@ def _child_rows_to_entries(
 async def _session_parent_id(
     conversation_id: str,
     server_client: httpx.AsyncClient,
+    *,
+    diagnostics: dict[str, str] | None = None,
 ) -> str | None:
     """
     Return a session's ``parent_session_id`` (None if top-level/unknown).
@@ -10809,11 +10930,15 @@ async def _session_parent_id(
     """
     try:
         snap = await server_client.get(f"{_session_url(conversation_id)}", timeout=30.0)
+        snap.raise_for_status()
+        body = snap.json()
+        if not isinstance(body, dict) or "parent_session_id" not in body:
+            raise ValueError("Missing parent relationship")
+        parent = body["parent_session_id"]
     except Exception:  # noqa: BLE001
+        if diagnostics is not None:
+            diagnostics["parent"] = "parent_lookup_unavailable"
         return None
-    if snap.status_code != 200:
-        return None
-    parent = snap.json().get("parent_session_id")
     return parent if isinstance(parent, str) and parent else None
 
 
