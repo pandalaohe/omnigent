@@ -404,7 +404,7 @@ it("filters before rollups and expands source, group, task and nodes", () => {
   expect(document.querySelector(".r-head text")).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Priced" }));
   expect(screen.getByText("1 sources")).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: /engineering.*1 groups/ }));
+  fireEvent.click(screen.getByRole("button", { name: /Task source.*1 groups/ }));
   fireEvent.click(screen.getByRole("button", { name: /A group/ }));
   fireEvent.click(screen.getByRole("button", { name: /Priced.*Completed/ }));
   expect(screen.queryByText(/token/)).toBeFalsy();
@@ -495,7 +495,7 @@ it("loads pinned old-month cursor pages and discards a cancelled response", asyn
   expect(container.querySelector(".h-range")?.textContent).toContain("January 1");
   expect(fetcher).toHaveBeenCalledTimes(4);
   expect(fetcher.mock.calls[2][0]).toContain("cursor=later");
-  fireEvent.click(screen.getByRole("button", { name: /engineering.*1 groups/ }));
+  fireEvent.click(screen.getByRole("button", { name: /Task source.*1 groups/ }));
   fireEvent.click(screen.getByRole("button", { name: /A group/ }));
   expect(screen.getByRole("button", { name: /Old A.*Completed/ })).toBeTruthy();
   expect(screen.getByRole("button", { name: /Old B.*Completed/ })).toBeTruthy();
@@ -545,7 +545,7 @@ it("loads old-month cursor pages for a cacheless source without recent tasks", a
     expect(query.has("snapshot")).toBe(false);
     expect(query.has("source_generation")).toBe(false);
   }
-  fireEvent.click(screen.getByRole("button", { name: /engineering.*1 groups/ }));
+  fireEvent.click(screen.getByRole("button", { name: /Task source.*1 groups/ }));
   fireEvent.click(screen.getByRole("button", { name: /A group/ }));
   expect(screen.getByRole("button", { name: /Old A.*Completed/ })).toBeTruthy();
   expect(screen.getByRole("button", { name: /Old B.*Completed/ })).toBeTruthy();

@@ -155,6 +155,9 @@ it("keeps missing cost absent and known zero visible without empty footer scaffo
   const { container, unmount } = mount({ ...task, "omnigent.ai:sourceDisplay": { version: 1 } });
   expect(container.querySelector(".tb-dc-footer")).toBeNull();
   expect(screen.queryByText("Cost")).toBeNull();
+  expect(screen.queryByText("Handlers")).toBeNull();
+  expect(screen.queryByText("Tests")).toBeNull();
+  expect(screen.queryByText("Commits")).toBeNull();
   unmount();
   mount({
     ...task,

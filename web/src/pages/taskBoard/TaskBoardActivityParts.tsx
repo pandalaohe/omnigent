@@ -1,7 +1,6 @@
 import type { ReactNode } from "react";
 import { ChevronDown } from "lucide-react";
 import { t, formatDate, formatNumber } from "./taskBoardText";
-import type { BoardTask } from "./taskBoardData";
 import { BoardPager } from "./TaskBoardRoutes";
 
 export const activityStamp = (at: number, timeOnly = false) => {
@@ -137,5 +136,11 @@ export function ActivityTile({
 }
 export const ActivityChevron = () => <ChevronDown size={16} className="h-chev" />;
 
-export const activityTaskName = (task: BoardTask) =>
-  task["omnigent.ai:sourceDisplay"]?.identity?.label ?? task.title ?? task.uid;
+export {
+  activityTaskName,
+  activityTaskKey,
+  activityAgentName,
+  activitySourceName,
+  activityFieldName,
+  activityEventLabel,
+} from "./taskBoardPresentation";

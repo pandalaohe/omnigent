@@ -6,6 +6,8 @@ import { afterEach, expect, it, vi } from "vitest";
 import { taskBoardFixture } from "./taskBoardFixtures";
 import { TaskBoardActivity } from "./TaskBoardActivity";
 import { TaskBoardSources } from "./TaskBoardSources";
+import { TaskBoardLog } from "./TaskBoardLog";
+import { TaskSourceDetails } from "./TaskSourceDetails";
 import {
   eventMother,
   localDay,
@@ -21,6 +23,69 @@ vi.mock("@/lib/identity", () => ({ authenticatedFetch: fetcher }));
 afterEach(() => {
   cleanup();
   fetcher.mockReset();
+});
+it("folds only loaded changes by source, task and day, preserving every event on expansion", () => {
+  const task = {
+    ...taskBoardFixture().tasks[0],
+    uid: "same@abcdef0123456789",
+    title: "Readable task",
+  };
+  const events = Array.from({ length: 30 }, (_, i) => ({
+    source: "engineering",
+    uid: task.uid,
+    id: `change-${i}`,
+    time: "2026-11-13T12:00:00Z",
+    kind: i % 2 ? "field" : "assignee",
+    field: i % 2 ? "progress" : undefined,
+    note: `Change ${i}`,
+  }));
+  const { container } = wrap(
+    <TaskBoardLog
+      tasks={[task]}
+      sessions={[]}
+      events={[
+        ...events,
+        { ...events[0], id: "closed", kind: "closed" },
+        { ...events[0], id: "created", kind: "created" },
+        { ...events[0], id: "other-source", source: "docs", kind: "other" },
+      ]}
+      sourceLabels={{ engineering: "Engineering", docs: "Documentation" }}
+      onSelect={vi.fn()}
+    />,
+  );
+  expect(container.querySelectorAll(".lr")).toHaveLength(4);
+  expect(container.textContent).toContain("30 field changes");
+  expect(container.textContent).not.toContain(task.uid);
+  fireEvent.click(screen.getByRole("button", { name: "Field changes" }));
+  expect(container.querySelectorAll(".lr")).toHaveLength(2);
+  const summary = container.querySelector(".lr")!;
+  fireEvent.click(summary);
+  expect(container.querySelectorAll(".lgd-changes li")).toHaveLength(25);
+  fireEvent.click(screen.getByRole("button", { name: "Next page" }));
+  expect(container.querySelectorAll(".lgd-changes li")).toHaveLength(5);
+});
+it("hides empty source rows and offers the entire long source value on demand", () => {
+  const long = "Source text ".repeat(50);
+  const { container } = wrap(
+    <TaskSourceDetails
+      display={{
+        version: 1,
+        rows: [
+          { id: "empty", label: "Empty field", value: "None" },
+          { id: "long", label: "Details", value: long },
+          { id: "zero", label: "Count", value: "0" },
+        ],
+      }}
+    />,
+  );
+  expect(screen.queryByText("Empty field")).toBeNull();
+  expect(screen.getByText("0")).toBeTruthy();
+  expect(container.querySelector(".tb-fold-value.collapsed")?.textContent).toBe(long);
+  fireEvent.click(screen.getByRole("button", { name: "Show more" }));
+  expect(container.querySelector(".tb-fold-value.collapsed")).toBeNull();
+  expect(screen.getByRole("button", { name: "Show less" }).getAttribute("aria-expanded")).toBe(
+    "true",
+  );
 });
 function wrap(ui: React.ReactNode) {
   return render(

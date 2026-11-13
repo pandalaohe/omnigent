@@ -224,7 +224,7 @@ it.each(["none", "recent", "archive"])(
     if (relation !== "none") {
       fireEvent.click(trigger);
       const reopened = await screen.findByRole("region", { name: "Details: Archive recovery" });
-      fireEvent.click(within(reopened).getByRole("button", { name: /related.*Related task/ }));
+      fireEvent.click(within(reopened).getByRole("button", { name: /Related task/ }));
       const target = await screen.findByRole("region", { name: "Details: Related task" });
       expect(view.container.querySelectorAll(".tb-dc")).toHaveLength(1);
       expect(screen.queryByRole("region", { name: "Details: Archive recovery" })).toBeNull();

@@ -1,11 +1,11 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState, type ReactNode } from "react";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { usageRangeQuery } from "@/pages/usageBoard/UsageRangeControl";
 import type { UsageActivity } from "@/pages/usageBoard/usageActivityData";
 import { useBoardCadence } from "./taskBoardPreferences";
 import { sourceHistory, type SourceCache } from "./taskBoardSnapshotData";
-import { readBoardJson, type BoardTask } from "./taskBoardData";
+import { readBoardJson, type BoardData, type BoardTask } from "./taskBoardData";
 import type { BoardSession } from "./taskBoardNative";
 import { localDay, readBoardHistory, readLocalClosedCounts } from "./taskBoardActivityData";
 import { TaskBoardLog } from "./TaskBoardLog";
@@ -75,6 +75,13 @@ export function TaskBoardActivity({
   const events = (sourceCaches ? sourceHistory(caches) : (history.data ?? [])).filter(
     (e) => !excluded.includes(e.source),
   );
+  const list = useQueryClient().getQueryData<BoardData>(["taskBoard", "list"]);
+  const sourceLabels = Object.fromEntries([
+    ...(list?.sources ?? []).filter((s) => s.name).map((s) => [s.id, s.name!] as const),
+    ...Object.entries(caches)
+      .map(([id, cache]) => [id, cache.display.identity?.label] as const)
+      .filter((entry): entry is [string, string] => Boolean(entry[1])),
+  ]);
   const closedCounts = (
     sourceCaches ? Object.values(caches).flatMap((c) => c.counts) : (counts.data?.days ?? [])
   ).filter((c) => !excluded.includes(c.source));
@@ -105,7 +112,13 @@ export function TaskBoardActivity({
         </p>
       )}
       {view === "log" ? (
-        <TaskBoardLog tasks={visible} sessions={sessions} events={events} onSelect={select} />
+        <TaskBoardLog
+          tasks={visible}
+          sessions={sessions}
+          events={events}
+          sourceLabels={sourceLabels}
+          onSelect={select}
+        />
       ) : view === "history" ? (
         <TaskBoardHistory
           tasks={visible}
@@ -114,6 +127,7 @@ export function TaskBoardActivity({
           counts={closedCounts}
           now={now}
           onSelect={select}
+          sourceLabels={sourceLabels}
           detailSelection={detailSelection}
         />
       ) : (
@@ -124,6 +138,7 @@ export function TaskBoardActivity({
           now={now}
           usage={usage.data}
           onSelect={select}
+          sourceLabels={sourceLabels}
         />
       )}{" "}
       {detail && inlineDetail}

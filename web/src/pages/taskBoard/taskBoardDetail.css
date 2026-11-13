@@ -383,6 +383,26 @@
   padding: 8px 20px;
   font-size: 12px;
 }
+.tb-fold-text {
+  display: block;
+  min-width: 0;
+}
+.tb-fold-value {
+  display: block;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.tb-fold-value.collapsed {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+}
+.tb-fold-text > button {
+  cursor: pointer;
+  color: var(--primary);
+  font-size: 12px;
+}
 @media (max-width: 620px) {
   .tb-dc-body {
     grid-template-columns: minmax(0, 1fr);

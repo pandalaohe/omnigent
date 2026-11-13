@@ -9,6 +9,8 @@ import { BoardIdentityMark } from "./BoardIdentityMark";
 import {
   activityNumber,
   activityTaskName,
+  activityAgentName,
+  activitySourceName,
   activityStamp,
   activityMoney,
 } from "./TaskBoardActivityParts";
@@ -22,6 +24,7 @@ export function TaskBoardToday({
   now,
   onSelect,
   usage,
+  sourceLabels,
 }: {
   tasks: BoardTask[];
   sessions: BoardSession[];
@@ -29,8 +32,11 @@ export function TaskBoardToday({
   now: number;
   onSelect: (task: BoardTask) => void;
   usage?: UsageActivity;
+  sourceLabels?: Record<string, string>;
 }) {
   const today = localDay(now),
+    sourceName = (source: string, task?: BoardTask) =>
+      activitySourceName(source, task, sourceLabels),
     closed = tasks
       .filter((task) => {
         const d = task["omnigent.ai:sourceDisplay"];
@@ -98,6 +104,13 @@ export function TaskBoardToday({
         (a.q.rank ?? 0) - (b.q.rank ?? 0),
     );
   const projected = boardSessionRows(tasks, sessions, caches).map((row) => row.session);
+  const agentLabels = new Map(
+    tasks.flatMap((task) =>
+      (task["omnigent.ai:sourceDisplay"]?.actors ?? []).map(
+        (actor) => [actor.agentId, actor.label] as const,
+      ),
+    ),
+  );
   const agents = new Map<string, { n: number; live: number; cost: number | null }>();
   for (const s of projected)
     if (
@@ -151,7 +164,7 @@ export function TaskBoardToday({
           {topSources.map(([source, n]) => (
             <span key={source}>
               <i style={{ width: `${Math.max(4, (n / Math.max(1, commits.size)) * 100)}%` }} />
-              <b>{source}</b>
+              <b>{sourceName(source)}</b>
               <em>{activityNumber(n)}</em>
             </span>
           ))}
@@ -167,7 +180,6 @@ export function TaskBoardToday({
                   true,
                 )}
               </span>
-              <code>{task.uid}</code>
               <button type="button" className="td-x" onClick={() => onSelect(task)}>
                 {task.title || activityTaskName(task)}
               </button>
@@ -197,7 +209,6 @@ export function TaskBoardToday({
                 <th>
                   <button type="button" onClick={() => onSelect(task)}>
                     <b>{activityTaskName(task)}</b>
-                    <code>{task.uid}</code>
                   </button>
                 </th>
                 {hosts.map((host) => {
@@ -248,7 +259,6 @@ export function TaskBoardToday({
               {q.text.length > 80 ? "…" : ""}
               {"」"}
               <cite>
-                <code>{q.task.uid}</code>
                 {activityTaskName(task)}
                 {q.date ? " · " + q.date : ""}
               </cite>
@@ -267,10 +277,13 @@ export function TaskBoardToday({
           .slice(0, 6)
           .map(([agent, a]) => (
             <div className="td-a" key={agent}>
-              <BoardIdentityMark id={agent} product={agent} label={agent} size={26} />
-              <b>
-                {t("g6.agent." + agent) === "g6.agent." + agent ? agent : t("g6.agent." + agent)}
-              </b>
+              <BoardIdentityMark
+                id={agent}
+                product={agent}
+                label={activityAgentName(agent, agentLabels.get(agent))}
+                size={26}
+              />
+              <b>{activityAgentName(agent, agentLabels.get(agent))}</b>
               <i className="td-bar">
                 <u style={{ width: `${(a.n / maxN) * 100}%` }} />
               </i>

@@ -24,6 +24,8 @@ import {
   activityDuration,
   activityMoney,
   activityNumber,
+  activitySourceName,
+  activityAgentName,
   activityStamp,
 } from "./TaskBoardActivityParts";
 import { BoardAgentLogo, BoardIdentityMark } from "./BoardIdentityMark";
@@ -184,6 +186,7 @@ export function TaskBoardHistory({
   onSelect,
   detailSelection,
   now,
+  sourceLabels,
 }: {
   tasks: BoardTask[];
   sessions: BoardSession[];
@@ -192,7 +195,15 @@ export function TaskBoardHistory({
   onSelect: (task: BoardTask) => void;
   detailSelection?: HistoryDetailSelection;
   now: number;
+  sourceLabels?: Record<string, string>;
 }) {
+  const names = {
+    ...Object.fromEntries(
+      Object.entries(caches).map(([id, c]) => [id, c.display.identity?.label ?? ""]),
+    ),
+    ...sourceLabels,
+  };
+  const sourceName = (source: string) => activitySourceName(source, undefined, names);
   const [showMonths, setShowMonths] = useState(false);
   const [archiveGeneration, setArchiveGeneration] = useState<string | null>(null);
   const hasOldMonths = counts.some((c) => Date.parse(c.day + "T00:00:00") < now - 365 * DAY);
@@ -485,6 +496,7 @@ export function TaskBoardHistory({
         historyStart={historyStart}
         capped={hasOldMonths}
         sourceOrder={Object.keys(caches)}
+        sourceLabels={names}
         onRange={setTime}
       />
       <div className="h-filters">
@@ -498,14 +510,17 @@ export function TaskBoardHistory({
             );
             const list = [...count.keys()]
                 .sort((a, b) => count.get(b)! - count.get(a)!)
-                .filter((v) => key !== "source" || v.toLowerCase().includes(search.toLowerCase())),
+                .filter(
+                  (v) =>
+                    key !== "source" || sourceName(v).toLowerCase().includes(search.toLowerCase()),
+                ),
               selected = sets[key],
               label = (v: string) =>
                 key === "outcome"
                   ? t("g6.outcome." + (v || "unknown"))
-                  : key === "agent" && t("g6.agent." + v) !== "g6.agent." + v
-                    ? t("g6.agent." + v)
-                    : v;
+                  : key === "agent"
+                    ? activityAgentName(v)
+                    : sourceName(v);
             return (
               <div key={key} className="fwrap">
                 <button
@@ -723,7 +738,7 @@ export function TaskBoardHistory({
                   {p.source[0].toUpperCase()}
                 </span>
                 <span className="h-name">
-                  <b>{caches[p.source]?.display.identity?.label ?? p.source}</b>
+                  <b>{sourceName(p.source)}</b>
                   <small>
                     {t("g6.groups", { count: activityNumber(groups.length) })}
                     {" · "}
@@ -802,7 +817,6 @@ export function TaskBoardHistory({
                                       <span className="h-ttl">
                                         <b>{c.task.title || taskTitle(c.task)}</b>
                                         <small>
-                                          <code>{c.task.uid}</code>
                                           {" · "}
                                           {t("g6.outcome." + (c.outcome || "unknown"))}
                                           {" · "}
