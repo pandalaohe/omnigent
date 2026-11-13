@@ -465,6 +465,7 @@
 .usage-countdown.text-muted-foreground {
   font-size: var(--usage-fs-m);
   font-weight: 400;
+  color: var(--muted-foreground);
 }
 .usage-satellites {
   display: grid;
@@ -486,6 +487,9 @@
 .usage-satellite > :nth-child(3) {
   white-space: nowrap;
   color: var(--usage-time);
+}
+.usage-satellite[data-stale] > :nth-child(3) {
+  color: var(--muted-foreground);
 }
 .usage-satellite > b {
   text-align: right;

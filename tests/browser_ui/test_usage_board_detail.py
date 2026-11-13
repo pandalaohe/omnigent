@@ -400,7 +400,7 @@ def test_account_detail_keyboard_ranges_and_return(
         if item["id"] == "plan-0":
             names_in_view("detail-card", [LONG_NAMES["card"]])
         if item["id"] == "plan-1":
-            expect(page.locator("[data-usage-percent]").filter(has_text="100%")).to_be_visible()
+            expect(page.locator("[data-usage-percent]").filter(has_text="100.00%")).to_be_visible()
             expect(
                 page.locator("[data-usage-amount]").filter(has_text="$1,234,567,890,123.45")
             ).to_have_count(balances)

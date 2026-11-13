@@ -175,7 +175,19 @@ USAGE_GEOMETRY = """expected => {
     if (!visible(ring)) continue;
     reveal(ring);
     const bounds = ring.getBoundingClientRect();
-    const inner = bounds.width * 0.375;
+    // Text clearance runs to the innermost painted edge of the ring's own centred
+    // circles; a bare figure without a drawn ring falls back to 37.5 % of its width.
+    const edges = [];
+    for (const circle of ring.querySelectorAll('circle')) {
+      const box = circle.getBoundingClientRect(), matrix = circle.getScreenCTM();
+      const half = parseFloat(getComputedStyle(circle).strokeWidth) / 2 *
+        Math.hypot(matrix.a, matrix.c);
+      if (box.width > bounds.width * 0.3 && Math.hypot(
+          box.left + box.width / 2 - bounds.left - bounds.width / 2,
+          box.top + box.height / 2 - bounds.top - bounds.height / 2) < 1)
+        edges.push(box.width / 2 - half);
+    }
+    const inner = edges.length ? Math.min(...edges) : bounds.width * 0.375;
     for (const text of ring.querySelectorAll('.usage-ring-name, [data-usage-percent]')) {
       const rects = ellipsized(text) ? [text.getBoundingClientRect()] : textRects(text);
       for (const rect of rects) for (const x of [rect.left, rect.right])

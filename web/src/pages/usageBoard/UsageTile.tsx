@@ -262,7 +262,11 @@ export function UsageTile({
                   {group.windows
                     .filter((item) => item !== main)
                     .map((item) => (
-                      <div key={item.id} className="usage-satellite">
+                      <div
+                        key={item.id}
+                        className="usage-satellite"
+                        data-stale={stale || empty || undefined}
+                      >
                         <UsageRing
                           window={item}
                           stale={stale || empty}
