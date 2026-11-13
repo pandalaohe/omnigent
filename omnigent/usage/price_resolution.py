@@ -1,5 +1,6 @@
 """Field-level account/card overrides and recorded valuation fallback."""
 
+from decimal import Decimal
 from fractions import Fraction
 
 from omnigent.llms.context_window import fetch_model_pricing
@@ -21,6 +22,29 @@ PRICE_FIELDS = (
     "cache_read_per_token",
     "cache_write_per_token",
 )
+
+
+def current_model_prices(models: set[str]) -> dict:
+    """Current editor hints; never relabel or replace recorded valuations."""
+    result = {}
+    for model in sorted(models):
+        sources = {}
+        for name, price in (
+            ("imported", selected_price(model)),
+            ("builtin", fetch_model_pricing(model, cached_only=True)),
+        ):
+            sources[name] = (
+                {
+                    field: None
+                    if getattr(price, attribute) is None
+                    else format(Decimal(str(getattr(price, attribute))) * 1_000_000, "f")
+                    for field, attribute in zip(FIELDS, PRICE_FIELDS, strict=True)
+                }
+                if price is not None
+                else None
+            )
+        result[model] = sources
+    return result
 
 
 def recorded_source(ref: str | None, native: bool) -> PriceSource:

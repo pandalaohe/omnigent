@@ -38,6 +38,13 @@ function baseline(): PricingBaseline {
         discount_override: null,
       },
     ],
+    price_overrides: [],
+    current_prices: {
+      "model-a": {
+        imported: { read: "2", write: "4", cache_read: "0.2", cache_write: "2.5" },
+        builtin: null,
+      },
+    },
   };
 }
 let saved: PricingBaseline;
@@ -49,6 +56,8 @@ beforeEach(() => {
   fail = 0;
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const url = String(input);
+    if (url.includes("pricing-baseline/model-price"))
+      return new Response(JSON.stringify({ imported: null, builtin: null }));
     if (url.includes("pricing-baseline")) {
       if (init?.method === "PUT") {
         const body = JSON.parse(init.body as string) as PricingBaseline;
@@ -63,7 +72,7 @@ beforeEach(() => {
             }),
             { status: fail },
           );
-        saved = { ...body, revision: body.revision + 1 };
+        saved = { ...body, revision: body.revision + 1, current_prices: saved.current_prices };
       }
       return new Response(JSON.stringify(saved));
     }
@@ -101,6 +110,83 @@ function change(label: string, value: string) {
 }
 
 describe("Pricing settings", () => {
+  it("saves nullable account and card fields, shows grey current prices and preserves explicit zero", async () => {
+    panel();
+    await ready();
+    change("Model id", "model-a");
+    fireEvent.click(screen.getByRole("button", { name: "Add model price" }));
+    expect(screen.getByLabelText("model-a · Read")).toHaveAttribute("placeholder", "2.00");
+    expect(screen.getByLabelText("model-a · Read")).toHaveAttribute(
+      "title",
+      "Current imported price: USD 2.00 / 1M",
+    );
+    change("model-a · Read", "3.000000000000000001");
+    change("Rate model (optional)", "model-a");
+    change("Read", "");
+    expect(screen.getByLabelText("Read")).toHaveAttribute("placeholder", "3.00");
+    expect(screen.getByLabelText("Read")).toHaveAttribute("title", "Account price: USD 3.00 / 1M");
+    change("Write", "0");
+    fireEvent.click(screen.getByRole("button", { name: "Save pricing" }));
+    await screen.findByText("Pricing saved. History recalculated.");
+    expect(writes[0].price_overrides?.[0]).toEqual({
+      account_id: account.id,
+      model: "model-a",
+      read: "3.000000000000000001",
+      write: null,
+      cache_read: null,
+      cache_write: null,
+    });
+    expect(writes[0].cards[0].rates_usd_per_million).toMatchObject({ read: null, write: "0" });
+    change("model-a · Read", "");
+    fireEvent.click(screen.getByRole("button", { name: "Save pricing" }));
+    await waitFor(() => expect(writes).toHaveLength(2));
+    expect(writes[1].price_overrides?.[0].read).toBeNull();
+    expect(screen.getByLabelText("model-a · Read")).toHaveAttribute("placeholder", "2.00");
+  });
+  it("retains overrides missing from the import and reapplies them without losing concurrent model prices", async () => {
+    saved.price_overrides = [
+      {
+        account_id: account.id,
+        model: "missing-model",
+        read: "8",
+        write: null,
+        cache_read: null,
+        cache_write: null,
+      },
+    ];
+    saved.current_prices = { "missing-model": { imported: null, builtin: null } };
+    panel();
+    await ready();
+    expect(screen.getByText(/This model is missing from the imported list/)).toBeTruthy();
+    change("missing-model · Read", "9");
+    fail = 409;
+    fireEvent.click(screen.getByRole("button", { name: "Save pricing" }));
+    await screen.findByText("stale revision; refresh and reapply draft");
+    saved = {
+      ...saved,
+      revision: 2,
+      price_overrides: [
+        ...saved.price_overrides!,
+        {
+          account_id: account.id,
+          model: "concurrent-model",
+          read: "1",
+          write: null,
+          cache_read: null,
+          cache_write: null,
+        },
+      ],
+    };
+    fireEvent.click(screen.getByRole("button", { name: "Refresh and reapply draft" }));
+    await screen.findByText("Draft reapplied to the latest revision. Review and save.");
+    fail = 0;
+    fireEvent.click(screen.getByRole("button", { name: "Save pricing" }));
+    await screen.findByText("Pricing saved. History recalculated.");
+    expect(writes[1].price_overrides?.map((row) => [row.model, row.read])).toEqual([
+      ["missing-model", "9"],
+      ["concurrent-model", "1"],
+    ]);
+  });
   it("previews replacement discounts and clearing restores inheritance without rounding stored inputs", async () => {
     panel();
     await ready();
