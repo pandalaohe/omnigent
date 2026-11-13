@@ -582,6 +582,8 @@ class HookForwardState:
     pending_clear_old_id: str | None = None
     pending_clear_new_id: str | None = None
     pending_clear_transferred: bool = False
+    clear_rotation_attempt: str | None = None
+    clear_recovery_notice_attempt: str | None = None
     posted_compaction_status_key: str | None = None
 
 
@@ -5184,17 +5186,36 @@ class _ClearSuccessorRefused(RuntimeError):
     """The clear landed, but the server refused to prepare its successor."""
 
 
+_CLEAR_REFUSAL_REASONS = {
+    "not_top_level": "Only a top-level session can rotate.",
+    "source_changed": "Source session changed.",
+    "archived": "Source session is archived.",
+    "target_archived": "Successor is archived.",
+    "conflict": "Session state conflicts with successor creation.",
+}
+
+
 async def _post_clear_recovery_notice(
     client: httpx.AsyncClient,
     *,
     session_id: str,
     source_id: str,
     detail: str,
-    notice_key: str,
+    bridge_dir: Path,
 ) -> None:
+    checkpoint = _read_hook_state(bridge_dir) or HookForwardState(event_cursor=0)
+    attempt = checkpoint.clear_rotation_attempt or uuid.uuid4().hex
+    if checkpoint.clear_recovery_notice_attempt == attempt:
+        return
+    # Best-effort means one send attempt, including when its reply is lost.
+    await _write_hook_state_async(
+        bridge_dir,
+        replace(checkpoint, clear_rotation_attempt=attempt, clear_recovery_notice_attempt=attempt),
+    )
     text = (
         f"[System: Clear accepted. {detail} "
-        f"If the handover note is missing, call sys_session_get_history for session "
+        f"Read the handover note before continuing. If it is missing, "
+        f"call sys_session_get_history for session "
         f"'{source_id}' and read its latest handover note before continuing work.]"
     )
     try:
@@ -5204,7 +5225,9 @@ async def _post_clear_recovery_notice(
                 "type": "message",
                 "data": {
                     "role": "user",
-                    "stable_id": hashlib.sha256(notice_key.encode()).hexdigest()[:32],
+                    "stable_id": hashlib.sha256(
+                        f"clear-recovery:{source_id}:{attempt}".encode()
+                    ).hexdigest()[:32],
                     "content": [{"type": "input_text", "text": text}],
                 },
             },
@@ -5282,7 +5305,7 @@ async def _maybe_rotate_session_on_clear(
             session_id=read_active_session_id(bridge_dir) or session_id,
             source_id=session_id,
             detail=detail + " This session continues here.",
-            notice_key=f"clear-recovery:{session_id}:{durable.event_cursor}",
+            bridge_dir=bridge_dir,
         )
         if pending is not None and pending.pending_clear_new_id:
             # Retry the same candidate; unknown ownership is not rejection.
@@ -5359,6 +5382,9 @@ async def _create_clear_replacement_session(
     """
     checkpoint = _read_hook_state(bridge_dir) or HookForwardState(event_cursor=0)
     old_session_id = checkpoint.pending_clear_old_id or old_session_id
+    if checkpoint.clear_rotation_attempt is None:
+        checkpoint = replace(checkpoint, clear_rotation_attempt=uuid.uuid4().hex)
+        await _write_hook_state_async(bridge_dir, checkpoint)
     old = await _fetch_session_snapshot(client, old_session_id)
     agent_id = old.get("agent_id")
     if not isinstance(agent_id, str) or not agent_id:
@@ -5384,13 +5410,13 @@ async def _create_clear_replacement_session(
         if create_resp.is_error:
             try:
                 error = create_resp.json().get("error", {})
-                reason = error.get("message") if isinstance(error, dict) else None
+                reason_code = error.get("code") if isinstance(error, dict) else None
             except (ValueError, AttributeError):
-                reason = None
-            detail = (
-                f"successor creation was refused (HTTP {create_resp.status_code}: "
-                f"{reason[:500] if isinstance(reason, str) else 'no reason returned'})."
-            )
+                reason_code = None
+            reason = (
+                _CLEAR_REFUSAL_REASONS.get(reason_code) if isinstance(reason_code, str) else None
+            ) or "Successor rejection reason unavailable."
+            detail = f"successor creation was refused (HTTP {create_resp.status_code}: {reason})."
             _logger.warning("Clear accepted but %s source=%s", detail, old_session_id)
             raise _ClearSuccessorRefused(detail)
         create_resp.raise_for_status()
@@ -5528,14 +5554,13 @@ async def _create_clear_replacement_session(
             new_session_id=new_session_id,
             allow_empty=True,
         )
-    else:
-        await _post_clear_recovery_notice(
-            client,
-            session_id=new_session_id,
-            source_id=old_session_id,
-            detail="Session handover is continuing in this session.",
-            notice_key=f"clear-handover:{old_session_id}:{new_session_id}",
-        )
+    await _post_clear_recovery_notice(
+        client,
+        session_id=new_session_id,
+        source_id=old_session_id,
+        detail="Session handover is continuing in this session.",
+        bridge_dir=bridge_dir,
+    )
     return new_session_id
 
 
@@ -8241,6 +8266,8 @@ def _validated_hook_state(
         pending_clear_old_id=state.pending_clear_old_id,
         pending_clear_new_id=state.pending_clear_new_id,
         pending_clear_transferred=state.pending_clear_transferred,
+        clear_rotation_attempt=state.clear_rotation_attempt,
+        clear_recovery_notice_attempt=state.clear_recovery_notice_attempt,
     )
 
 
@@ -10067,6 +10094,12 @@ def _read_hook_state(bridge_dir: Path) -> HookForwardState | None:
         if isinstance(raw.get("pending_clear_new_id"), str)
         else None,
         pending_clear_transferred=raw.get("pending_clear_transferred") is True,
+        clear_rotation_attempt=raw.get("clear_rotation_attempt")
+        if isinstance(raw.get("clear_rotation_attempt"), str)
+        else None,
+        clear_recovery_notice_attempt=raw.get("clear_recovery_notice_attempt")
+        if isinstance(raw.get("clear_recovery_notice_attempt"), str)
+        else None,
         posted_compaction_status_key=posted_compaction_status_key,
     )
 
@@ -10094,6 +10127,10 @@ def _write_hook_state(bridge_dir: Path, state: HookForwardState) -> None:
         payload["pending_clear_transferred"] = state.pending_clear_transferred
     if state.posted_compaction_status_key is not None:
         payload["posted_compaction_status_key"] = state.posted_compaction_status_key
+    if state.clear_rotation_attempt is not None:
+        payload["clear_rotation_attempt"] = state.clear_rotation_attempt
+    if state.clear_recovery_notice_attempt is not None:
+        payload["clear_recovery_notice_attempt"] = state.clear_recovery_notice_attempt
     _write_json_atomic(bridge_dir / _HOOK_STATE_FILE, payload)
 
 
