@@ -434,3 +434,94 @@ def test_recorded_gateway_range_and_native_old_ref_survive_import_changes(monkey
     result = value_usage(sample, PricingBaseline())["api_value"]
     assert result.low == "999"
     assert result.price_sources[0].name == "记录时估价，来源未记录"
+
+
+@pytest.mark.parametrize("with_card", [False, True])
+def test_native_recorded_values_stay_with_their_basis_and_priced_bucket(monkeypatch, with_card):
+    monkeypatch.setattr("omnigent.usage.price_resolution.selected_price", lambda model: None)
+    monkeypatch.setattr(
+        "omnigent.usage.price_resolution.fetch_model_pricing", lambda *a, **k: None
+    )
+    sample = view(
+        account_id="native:codex",
+        basis="unknown",
+        coverage=None,
+        tokens=100,
+        uncached_input_tokens=100,
+        output_tokens=0,
+        cache_read_input_tokens=0,
+        cache_creation_input_tokens=0,
+    )
+    first = sample.rows[0]
+    sample.rows.extend(
+        [
+            first.model_copy(
+                update={
+                    "tokens": 200,
+                    "uncached_input_tokens": 200,
+                    "priced": True,
+                    "cost_usd": 2,
+                    "price_ref": "import:v1",
+                }
+            ),
+            first.model_copy(
+                update={
+                    "tokens": 300,
+                    "uncached_input_tokens": 300,
+                    "basis": "subscription",
+                    "priced": True,
+                    "cost_usd": 3,
+                    "price_ref": "provider",
+                }
+            ),
+        ]
+    )
+    state = baseline(card(rates_usd_per_million=None)) if with_card else PricingBaseline()
+    result = value_usage(sample, state)["api_value"]
+    assert (result.low, result.high, result.state) == ("5", None, "partial")
+    assert (result.coverage.priced_units, result.coverage.usage_units) == (500, 600)
+    assert {(source.layer, source.version) for source in result.price_sources} == {
+        ("import", "v1"),
+        ("provider", None),
+    }
+
+
+def test_blank_card_and_cleared_overrides_restore_separate_recorded_list_channel(monkeypatch):
+    from omnigent.llms.context_window import ModelPricing
+    from omnigent.usage.pricing import AccountPriceOverride, TokenRates
+
+    monkeypatch.setattr(
+        "omnigent.usage.price_resolution.selected_price",
+        lambda model: ModelPricing(2e-6, 4e-6, 0.2e-6, 2.5e-6),
+    )
+    monkeypatch.setattr(
+        "omnigent.usage.price_resolution.fetch_model_pricing", lambda *a, **k: None
+    )
+    sample = view(account_id="usage-source", pool_id="pool-a", channel="usage", attributed=True)
+    sample.rows.append(
+        sample.rows[0].model_copy(
+            update={
+                "account_id": "list-source",
+                "channel": "list_cost",
+                "basis": "list",
+                "contributes_usage": False,
+                "tokens": None,
+                "cost_usd": 7,
+                "priced": True,
+                "price_ref": "import:historical",
+            }
+        )
+    )
+    state = baseline(card(rates_usd_per_million=None))
+    assert value_usage(sample, state)["api_value"].low == "7"
+    state.price_overrides = [
+        AccountPriceOverride(account_id="account-a", model="model-a", read="3")
+    ]
+    assert value_usage(sample, state)["api_value"].low == "59"
+    state.price_overrides[0].read = None
+    state.cards[0].rates_usd_per_million = TokenRates(write="6", model="model-a")
+    assert value_usage(sample, state)["api_value"].low == "59"
+    state.cards[0].rates_usd_per_million.write = None
+    result = value_usage(sample, state)["api_value"]
+    assert result.low == "7"
+    assert result.price_sources[0].version == "historical"

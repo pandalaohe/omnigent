@@ -74,6 +74,7 @@ def test_migrated_store_has_the_table_and_its_key(db_uri) -> None:
         "updated_at",
         "reasoning_tokens",
         "coverage",
+        "price_ref",
     }
     primary_key = inspector.get_pk_constraint("usage_hours")["constrained_columns"]
     assert primary_key == [

@@ -127,6 +127,44 @@ def value_usage(
     actual_by_parent: dict[str, list[AnalysisRowView]] = {}
     for row in actual_rows:
         actual_by_parent.setdefault(row.parent_account_id, []).append(row)
+    # Reported list valuations also apply to cards whose rates are inherited.
+    # Billed/metered amounts supply paid, never an alternative API numerator.
+    source_money = [
+        row
+        for row in view.rows
+        if row.reason is None
+        and (
+            row.channel is None
+            or (row.pool_id is not None and row.channel in {"usage", "list_cost", "metered_cost"})
+        )
+        and (row.channel != "list_cost" or row.basis in LIST_BASES)
+        and (row.channel != "metered_cost" or row.basis not in LIST_BASES)
+        and row.priced
+        and row.cost_usd is not None
+        and (pools is None or (row.parent_account_id, row.pool_id) in pools)
+        and (models is None or row.model in models)
+    ]
+
+    def activity_key(row: AnalysisRowView):
+        return row.parent_account_id, row.pool_id, row.hour, row.model, row.host_id
+
+    money_by_activity: dict[tuple, list[AnalysisRowView]] = {}
+    for row in source_money:
+        money_by_activity.setdefault(activity_key(row), []).append(row)
+
+    def recorded_list(row: AnalysisRowView) -> AnalysisRowView | None:
+        if row.account_id.startswith("native:"):
+            return row if row.priced and row.cost_usd is not None else None
+        return max(
+            (
+                item
+                for item in money_by_activity.get(activity_key(row), [])
+                if item.basis in LIST_BASES and not item.account_id.startswith("native:")
+            ),
+            key=lambda item: item.channel == "list_cost",
+            default=None,
+        )
+
     for card in all_cards:
         b0, b1 = card.billing_span()
         billing = (int(b0.timestamp()), int(b1.timestamp()))
@@ -206,9 +244,7 @@ def value_usage(
                 baseline,
                 card=card,
                 card_models={item.model for item in target_rows},
-                recorded=row
-                if row.priced and (row.basis in LIST_BASES or row.account_id.startswith("native:"))
-                else None,
+                recorded=recorded_list(row),
             )
             if valued.low is None or row.hour < selected[0] or row.hour + 3600 > selected[1]:
                 if valued.reason and valued.reason not in pricing_reasons:
@@ -255,49 +291,21 @@ def value_usage(
             }
         )
 
-    # A reported compatible list valuation can price usage outside a card baseline.
-    # Billed/metered amounts supply paid, never an alternative API numerator.
-    source_money = [
-        row
-        for row in view.rows
-        if card_ids is None
-        and row.reason is None
-        and (
-            row.channel is None
-            or (row.pool_id is not None and row.channel in {"usage", "list_cost", "metered_cost"})
-        )
-        and (row.channel != "list_cost" or row.basis in LIST_BASES)
-        and (row.channel != "metered_cost" or row.basis not in LIST_BASES)
-        and row.priced
-        and row.cost_usd is not None
-        and (pools is None or (row.parent_account_id, row.pool_id) in pools)
-        and (models is None or row.model in models)
-    ]
     legacy_paid: dict[str, Fraction] = {}
     legacy_api: dict[str, Fraction] = {}
     legacy_precision = False
-
-    def activity_key(row: AnalysisRowView):
-        return row.parent_account_id, row.pool_id, row.hour, row.model, row.host_id
-
-    money_by_activity: dict[tuple, list[AnalysisRowView]] = {}
-    for row in source_money:
-        money_by_activity.setdefault(activity_key(row), []).append(row)
     for row in rows:
         if id(row) in card_covered:
             continue
         matches = money_by_activity.get(activity_key(row), [])
-        listed = max(
+        listed = recorded_list(row)
+        billed = max(
             (
                 item
                 for item in matches
-                if item.basis in LIST_BASES or item.account_id.startswith("native:")
+                if item.basis in {"billed", "metered"}
+                and (not row.account_id.startswith("native:") or item is row)
             ),
-            key=lambda item: item.channel == "list_cost",
-            default=None,
-        )
-        billed = max(
-            (item for item in matches if item.basis in {"billed", "metered"}),
             key=lambda item: item.basis == "billed",
             default=None,
         )

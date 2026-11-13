@@ -37,7 +37,33 @@ def test_pricing_migration_additive_roundtrip(db_uri):
 
 
 def test_account_price_and_native_ref_migrations(db_uri):
+    from omnigent.stores.usage_hours_store import UsageHoursStore
+    from omnigent.stores.usage_pricing_store import UsagePricingStore
+    from omnigent.usage.pricing import PricingBaseline
+    from tests.server.test_usage_pricing_math import card
+
     engine = get_or_create_engine(db_uri)
+    owner = "migration-owner@example.test"
+    hours = UsageHoursStore(db_uri)
+    hours.add_turn(
+        owner,
+        "native:codex",
+        1800000000,
+        "model-a",
+        "host-a",
+        "unknown",
+        True,
+        10,
+        2,
+        1,
+        3,
+        16,
+        0.25,
+    )
+    pricing = UsagePricingStore(db_uri)
+    saved = pricing.save(
+        owner, PricingBaseline(cards=[card()]), known_accounts={"account-a"}, pools=set()
+    )
     migration_engine = (
         engine.execution_options(isolation_level="SERIALIZABLE")
         if engine.dialect.name == "cockroachdb"
@@ -57,5 +83,8 @@ def test_account_price_and_native_ref_migrations(db_uri):
         assert next(
             c for c in sa.inspect(engine).get_columns("usage_hours") if c["name"] == "price_ref"
         )["nullable"]
+        [kept] = hours.read(owner, 1800000000, 1800003600)
+        assert (kept.total_tokens, kept.cost_usd, kept.price_ref) == (16, 0.25, None)
+        assert pricing.read(owner) == saved
     finally:
         _alembic_command(db_uri, migration_engine, "upgrade", "head")
