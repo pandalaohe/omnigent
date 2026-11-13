@@ -9,6 +9,8 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   GripVerticalIcon,
+  ReceiptIcon,
+  TriangleAlertIcon,
 } from "lucide-react";
 import { boardPath } from "@/lib/boardFrame";
 import { Link } from "@/lib/routing";
@@ -25,7 +27,15 @@ import {
   pickGroups,
   type UsageWindowGroup,
 } from "./usageBoardSelect";
-import { formatAge, formatTimeLeft, windowName, stateTone } from "./usageBoardFormat";
+import {
+  formatAge,
+  formatRingPercent,
+  formatTileAmount,
+  splitPercentReading,
+  formatTimeLeft,
+  windowName,
+  stateTone,
+} from "./usageBoardFormat";
 import { UsageRing } from "./UsageRing";
 import { UsageTip, UsageTipButton } from "./UsageTip";
 import { readingTip, renewalTip, windowTip } from "./usageBoardTips";
@@ -33,11 +43,12 @@ import type { UsageAmount } from "./usageActivityData";
 import { UsageAmountFigure, UsageErrorMark } from "./UsageAmounts";
 import { UsageBalances } from "./UsageBalances";
 import { t } from "./usageText";
+import { UsageName } from "./UsageName";
 
-const TONE_TILE: Record<string, string> = {
-  warn: "border-warning/60 bg-warning/13",
-  crit: "border-destructive/60 bg-destructive/13",
-};
+/** Renewal urgency, as the footer colours it: late, or within three days. */
+function renewalTone(days: number): "crit" | "warn" | undefined {
+  return days < 0 ? "crit" : days <= 3 ? "warn" : undefined;
+}
 
 interface UsageTileProps {
   account: UsageAccountView;
@@ -100,30 +111,21 @@ export function UsageTile({
             activate();
           }
         }}
-        className={cn(
-          "flex min-h-[54px] min-w-0 cursor-pointer items-center gap-2 rounded-[10px] border border-border bg-card py-1.5 pl-1.5 pr-2.5 transition-colors hover:border-foreground/30",
-          TONE_TILE[tone],
-        )}
+        className="usage-mini flex min-h-[54px] min-w-0 cursor-pointer items-center gap-2"
+        data-tone={tone === "warn" || tone === "crit" ? tone : undefined}
         data-testid="usage-tile"
         data-account={account.id}
       >
         {!account.windows.length && account.balances?.length ? null : (
-          <UsageRing
-            window={first?.window ?? null}
-            stale={stale || empty}
-            size={42}
-            showName={false}
-          />
+          <UsageRing window={first?.window ?? null} stale={stale || empty} size={54} />
         )}
         <div className="flex min-w-0 flex-1 flex-col leading-tight">
-          <span className="truncate font-semibold">{name}</span>
-          {plan ? <span className="truncate text-[11px] text-muted-foreground">{plan}</span> : null}
-          {shownModel && (
-            <span className="truncate text-xs text-muted-foreground">{shownModel}</span>
-          )}
+          <UsageName className="usage-mini-name">{name}</UsageName>
+          {plan ? <UsageName className="usage-caption">{plan}</UsageName> : null}
+          {shownModel && <UsageName className="usage-caption">{shownModel}</UsageName>}
           <UsageBalances account={account} compact />
           {(amount?.totals.partial_rows ?? 0) > 0 ? (
-            <span className="text-[10px] text-muted-foreground">{t("incomplete")}</span>
+            <span className="usage-caption">{t("incomplete")}</span>
           ) : null}
         </div>
         {floorControl}
@@ -133,22 +135,32 @@ export function UsageTile({
           (tokens
             ? amount.totals.tokens !== null
             : amount.totals.cost_usd !== null || amount.totals.unpriced > 0) ? (
-            <span className="text-xs">
+            <span className="usage-caption">
               <UsageAmountFigure amount={amount} tokens={tokens} />
             </span>
           ) : null}
           {first?.window && first.window.percent_used !== null ? (
-            <span
-              className={cn(
-                "text-[13px] font-semibold",
-                stale ? "text-muted-foreground" : "text-info",
-              )}
-            >
-              {formatTimeLeft(first.window.time_left_s)}
-            </span>
+            <>
+              <span
+                className="usage-mini-percent"
+                data-tone={stale || empty ? "mute" : stateTone(first.window.state)}
+              >
+                {splitPercentReading(formatRingPercent(first.window.percent_used)).map(
+                  (part, index) =>
+                    index ? (
+                      <span key="decimals" className="usage-unit-mark">{`${part}%`}</span>
+                    ) : (
+                      part
+                    ),
+                )}
+              </span>
+              <span className={cn("usage-countdown", stale && "text-muted-foreground")}>
+                {formatTimeLeft(first.window.time_left_s)}
+              </span>
+            </>
           ) : first?.window?.used_value !== null && first?.window ? (
-            <span className="text-[13px] font-semibold">
-              {first.window.used_value.toLocaleString("en-US")}
+            <span className="usage-countdown">
+              {formatTileAmount(first.window.used_value, first.window.unit)}
             </span>
           ) : null}
         </div>
@@ -164,9 +176,13 @@ export function UsageTile({
   const firstMain = picks[0] ? mainOf(picks[0]) : null;
   const displayTone = (window: typeof firstMain) =>
     stale || empty || !window ? "mute" : stateTone(window.state);
+  const units = Math.max(1, picks.length + balanceGroups.length);
+  const tones = picks.map((pick) => displayTone(mainOf(pick)));
+  const alert = tones.includes("crit") ? "crit" : tones.includes("warn") ? "warn" : null;
   return (
     <article
       className={cn("usage-tile", wideBoxes && "usage-tile-wide")}
+      data-span={Math.min(units, 3)}
       data-tone={!wideBoxes ? displayTone(firstMain) : undefined}
       data-testid="usage-tile"
       data-account={account.id}
@@ -177,11 +193,20 @@ export function UsageTile({
     >
       <div className="usage-tile-head">
         <button type="button" className="usage-tile-title" onClick={activate}>
-          {name}
+          <UsageName>{name}</UsageName>
         </button>
-        {plan ? <span className="usage-tile-plan">{plan}</span> : null}
-        <ReadingButton account={account} />
-        <UsageErrorMark account={account} />
+        <span className="usage-tile-marks">
+          {alert ? (
+            <TriangleAlertIcon
+              className="usage-tile-alert"
+              data-tone={alert}
+              aria-label={alert === "crit" ? "Nearly empty" : "Faster than time"}
+            />
+          ) : null}
+          <ReadingButton account={account} />
+          <UsageErrorMark account={account} />
+        </span>
+        <UsageName className="usage-tile-plan">{plan || "\u00a0"}</UsageName>
       </div>
       <div className="usage-units">
         {(picks.length
@@ -207,8 +232,11 @@ export function UsageTile({
                 else activate();
               }}
             >
-              {wideBoxes ? <span className="usage-unit-tag">{group.tag || "\u00a0"}</span> : null}
+              {wideBoxes ? (
+                <UsageName className="usage-unit-tag">{group.tag || "\u00a0"}</UsageName>
+              ) : null}
               <UsageTip
+                className="usage-ring-trigger"
                 model={
                   main
                     ? windowTip(account, main, group.tag, {
@@ -219,36 +247,44 @@ export function UsageTile({
                     : readingTip(account)
                 }
               >
-                <UsageRing window={main} stale={stale || empty} size={92} />
+                <UsageRing window={main} stale={stale || empty} size={96} />
               </UsageTip>
               <span className={cn("usage-countdown", stale && "text-muted-foreground")}>
                 {main ? formatTimeLeft(main.time_left_s) || "—" : t("notReported")}
               </span>
               {pinned ? (
-                <span className="usage-tile-plan">
-                  {t("pinned")} {main ? windowName(main) : ""}
-                </span>
+                <UsageName className="usage-tile-plan">
+                  {`${t("pinned")} ${main ? windowName(main) : ""}`}
+                </UsageName>
               ) : null}
               {!pinned ? (
                 <div className="usage-satellites">
                   {group.windows
                     .filter((item) => item !== main)
                     .map((item) => (
-                      <div key={item.id} className="usage-satellite">
+                      <div
+                        key={item.id}
+                        className="usage-satellite"
+                        data-stale={stale || empty || undefined}
+                      >
                         <UsageRing
                           window={item}
                           stale={stale || empty}
                           size={16}
                           showName={false}
                         />
-                        <span>{windowName(item)}</span>
-                        <b>
-                          {item.percent_used?.toLocaleString("en-US", {
-                            maximumFractionDigits: 2,
-                          }) ?? "—"}
-                          %
-                        </b>
+                        <UsageName>{windowName(item)}</UsageName>
                         <span>{formatTimeLeft(item.time_left_s)}</span>
+                        <b data-tone={stale || empty ? undefined : stateTone(item.state)}>
+                          {item.percent_used === null ? (
+                            "—"
+                          ) : (
+                            <>
+                              {formatRingPercent(item.percent_used)}
+                              <span className="usage-unit-mark">%</span>
+                            </>
+                          )}
+                        </b>
                       </div>
                     ))}
                 </div>
@@ -271,13 +307,26 @@ export function UsageTile({
               `/usage/board/${encodeURIComponent(account.id)}?focus=${encodeURIComponent(balance.group ?? balance.id)}`,
             )}
           >
-            {wideBoxes ? <span className="usage-unit-tag">{balance.group || "\u00a0"}</span> : null}
-            <UsageBalances tile account={{ ...account, balances: [balance] }} />
+            {wideBoxes ? (
+              <UsageName className="usage-unit-tag">{balance.group || "\u00a0"}</UsageName>
+            ) : null}
+            <UsageBalances
+              tile
+              account={{
+                ...account,
+                // The box's tag already names a balance whose label repeats it.
+                balances: [
+                  wideBoxes && balance.label === balance.group
+                    ? { ...balance, label: "" }
+                    : balance,
+                ],
+              }}
+            />
           </Link>
         ))}
       </div>
       {(amount?.totals.partial_rows ?? 0) > 0 ? (
-        <p className="text-center text-[11px] text-muted-foreground">{t("incomplete")}</p>
+        <p className="usage-caption text-center">{t("incomplete")}</p>
       ) : null}
       {arrange ? (
         <div className="usage-tile-footer">
@@ -303,15 +352,18 @@ export function UsageTile({
         <div className="usage-tile-footer">
           {renewal && renewDays !== null ? (
             <UsageTip model={renewalTip(renewal.at, renewal.official)}>
-              <span>
-                <CalendarClockIcon className="inline size-3" /> <b>{renewDays}d</b>
+              <span className="usage-renewal">
+                <CalendarClockIcon className="size-3.5" aria-hidden="true" />
+                <b data-tone={renewalTone(renewDays)}>{renewDays}d</b>
               </span>
             </UsageTip>
           ) : (
-            <span>{t("renewalUnknown")}</span>
+            <span className="usage-renewal" title={t("renewalUnknown")}>
+              <CalendarClockIcon className="size-3.5" aria-hidden="true" />—
+            </span>
           )}
-          <span>
-            {t("periodCost")}{" "}
+          <span className="usage-period" aria-label={t("periodCost")} title={t("periodCost")}>
+            <ReceiptIcon className="size-3.5" aria-hidden="true" />
             <b>
               {amount && amount.totals.cost_usd !== null ? (
                 <UsageAmountFigure amount={amount} tokens={false} />

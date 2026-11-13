@@ -4,10 +4,22 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 import { UsageBoardFrame } from "./UsageBoardFrame";
 import { UsageTile } from "./UsageTile";
+import { UsageRing } from "./UsageRing";
+import { niceTicks } from "./UsageCostChart";
 import { UsageSummary } from "./UsageAmounts";
 import { usageBoardData } from "./usageBoardFixtures";
 import { usageActivityFixture } from "./usageActivityFixtures";
-import { formatMoney, formatUsageValue } from "./usageBoardFormat";
+import {
+  figureEms,
+  ringFigureSize,
+  formatCount,
+  formatTileAmount,
+  formatPercentReading,
+  formatRingPercent,
+  splitPercentReading,
+  formatMoney,
+  formatUsageValue,
+} from "./usageBoardFormat";
 
 afterEach(() => {
   cleanup();
@@ -64,15 +76,17 @@ it("keeps independent pool links inside a single account tile, with a main ring 
   const pool = screen.getByRole("link", { name: "Codex Pool B" });
   expect(pool.getAttribute("href")).toContain("focus=Pool%20B");
   expect(within(pool).getAllByTestId("usage-ring")).toHaveLength(2);
-  expect(pool.textContent).toContain(".61%");
+  expect(pool.textContent).toContain("90.61%");
   fireEvent.click(pool);
   expect(open).toHaveBeenCalledWith("Pool B");
 });
 
 it("keeps navigation and the tools outside the matched tile composition", () => {
+  const name = "Long account name with multiple segments and meaningful suffix";
   mount(
     <UsageBoardFrame
       title="Usage board"
+      back={{ to: "/usage/board/plan", label: name }}
       actions={
         <details>
           <summary>Board tools</summary>
@@ -88,6 +102,7 @@ it("keeps navigation and the tools outside the matched tile composition", () => 
   expect(screen.getByRole("link", { name: "Analysis" }).getAttribute("href")).toBe(
     "/usage/board/cost",
   );
+  expect(screen.getByRole("link", { name }).getAttribute("title")).toBe(name);
 });
 
 it("renders monetary zero, small and large amounts with exactly two decimal places", () => {
@@ -101,7 +116,8 @@ it("renders monetary zero, small and large amounts with exactly two decimal plac
 
 it("formats monetary balances separately from non-monetary counts", () => {
   expect(formatUsageValue(298.244, "CNY")).toBe("¥298.24");
-  expect(formatUsageValue(1.23456, "credits")).toBe("1.235 credits");
+  expect(formatUsageValue(1.23456, "credits")).toBe("1.23 credits");
+  expect(formatUsageValue(1234567890123.45, "USD")).toBe("$1,234,567,890,123.45");
 });
 
 it("rounds monetary ties half-even only at the final display boundary", () => {
@@ -136,7 +152,7 @@ it("uses the same final monetary precision in the visible ring and opened Now/Li
       onOpen={() => {}}
     />,
   );
-  const ring = screen.getByTestId("usage-ring");
+  const ring = screen.getByTestId("usage-figure");
   expect(ring.textContent).toContain("$1.00");
   fireEvent.focus(ring.parentElement!, { target: ring.parentElement });
   fireEvent.pointerEnter(ring.parentElement!, { pointerType: "mouse" });
@@ -166,7 +182,7 @@ it("keeps a critical short window on its satellite while the normal main window 
     "ok",
     "crit",
   ]);
-  expect(screen.getByText("Period reported cost")).toBeTruthy();
+  expect(screen.getByLabelText("Period reported cost")).toBeTruthy();
   view.unmount();
   account.windows = account.windows.flatMap((w) => [
     { ...w, id: `a-${w.id}`, group: "A" },
@@ -184,3 +200,79 @@ it("keeps a critical short window on its satellite while the normal main window 
   expect(screen.getByRole("link", { name: "Codex A" }).getAttribute("data-tone")).toBe("ok");
   expect(screen.getByRole("link", { name: "Codex B" }).getAttribute("data-tone")).toBe("ok");
 });
+
+it.each([
+  [999, "999"],
+  [1000, "1K"],
+  [12345.678, "12.3K"],
+  [0.001234, "0.00123"],
+  [-12345.678, "-12.3K"],
+])("formats non-money %s with at most three significant digits", (value, expected) => {
+  expect(formatCount(value)).toBe(expected);
+});
+it.each([
+  [99999.99, "USD", "$99,999.99"],
+  [100000, "USD", "$100.00K"],
+  [999999.99, "USD", "$999.99K"],
+  [1.23e12, "USD", "$1.23T"],
+  [123456, "CNY", "¥123.45K"],
+  [123456, "HKD", "HK$123.45K"],
+  [123456, "requests", "123K requests"],
+])("compacts constrained amount %s %s", (value, unit, expected) => {
+  expect(formatTileAmount(value, unit)).toBe(expected);
+});
+it.each([
+  [0, "0"],
+  [0.004, "<0.01"],
+  [0.5, "0.5"],
+  [9.999, "10"],
+  [99.95, "99.9"],
+  [100, "100"],
+  [104, "104"],
+  [1234, ">999"],
+])("formats percent %s without false zero or full", (value, expected) => {
+  expect(formatPercentReading(value)).toBe(expected);
+});
+it("draws a row glyph as one used arc and a full ring with its time arc and stacked reading", () => {
+  const window = { ...usageBoardData().accounts[0].windows[0], percent_used: 42.5 };
+  const { container } = render(
+    <>
+      <UsageRing window={window} size={16} showName={false} />
+      <UsageRing window={window} size={96} />
+    </>,
+  );
+  const [glyph, ring] = container.querySelectorAll('[data-testid="usage-ring"]');
+  expect(glyph.querySelector(".usage-ring-time-track")).toBeNull();
+  expect(glyph.querySelectorAll("circle")).toHaveLength(2);
+  expect(glyph.textContent).toBe("");
+  expect(ring.querySelector(".usage-ring-time-track")).toBeTruthy();
+  const reading = ring.querySelector('[data-usage-percent="stack"]')!;
+  expect(reading.textContent).toBe("42.50%");
+  expect(reading.querySelector(".usage-ring-whole")!.textContent).toBe("42");
+});
+it.each([
+  [0, "0.00", "0", ".00"],
+  [0.004, "<0.01", "<0", ".01"],
+  [12, "12.00", "12", ".00"],
+  [90.613, "90.61", "90", ".61"],
+  [99.996, "99.99", "99", ".99"],
+  [100, "100.00", "100", ".00"],
+  [1234, ">999", ">999", ""],
+])("writes ring percent %s with two decimals, split for the stack", (value, text, whole, rest) => {
+  expect(formatRingPercent(value)).toBe(text);
+  expect(splitPercentReading(text)).toEqual([whole, rest]);
+});
+it.each([0, 0.004, 3.45, 1.3e10])("gives distinct monetary axis labels for %s", (top) => {
+  const ticks = niceTicks(top, 4, 0.01);
+  expect(ticks[0]).toBe(0);
+  expect(ticks.at(-1)).toBeGreaterThanOrEqual(top);
+  expect(new Set(ticks.map((value) => formatTileAmount(value, "USD"))).size).toBe(ticks.length);
+});
+it.each(["100", "90.6", "<0.01", ">999"])(
+  "fits %s and its name inside the clear ring",
+  (reading) => {
+    const ems = figureEms(reading, "%");
+    const size = ringFigureSize(ems, 15, 34.5);
+    expect(Math.hypot((ems * size) / 2, (15 + 0.74 * size) / 2)).toBeLessThanOrEqual(34.5);
+  },
+);

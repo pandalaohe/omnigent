@@ -6,6 +6,7 @@ import { UsageRangeControl } from "./UsageRangeControl";
 import { useUsageOverview } from "./usageBoardData";
 import { useUsageIssues } from "./usageActivityData";
 import { formatFullDate } from "./usageBoardFormat";
+import { UsageName } from "./UsageName";
 
 const SOURCE_LABELS: Record<string, string> = {
   rejected: "Report rejected",
@@ -29,10 +30,10 @@ export function UsageIssuesPage() {
   function accountLink(id: string) {
     return (
       <Link
-        className="font-medium underline underline-offset-2"
+        className="block min-w-0 max-w-full font-medium underline underline-offset-2"
         to={boardPath(`/usage/board/${encodeURIComponent(id)}`)}
       >
-        {names.get(id) ?? id}
+        <UsageName>{names.get(id) ?? id}</UsageName>
       </Link>
     );
   }
@@ -67,7 +68,9 @@ export function UsageIssuesPage() {
                   <dl className="text-muted-foreground">
                     {Object.entries(item.reasons).map(([reason, count]) => (
                       <div key={reason} className="flex gap-3">
-                        <dt className="min-w-0 flex-1 break-words">{reason}</dt>
+                        <dt className="min-w-0 flex-1">
+                          <UsageName>{reason}</UsageName>
+                        </dt>
                         <dd>{count}</dd>
                       </div>
                     ))}
@@ -87,9 +90,9 @@ export function UsageIssuesPage() {
               unpriced.map((item) => (
                 <div key={`${item.account}:${item.model}`} className="mb-3 text-xs last:mb-0">
                   {accountLink(item.account)}
-                  <p className="my-1 break-all text-muted-foreground">
+                  <UsageName className="my-1 text-muted-foreground">
                     {item.model || "Unknown model"}
-                  </p>
+                  </UsageName>
                   <p>{item.unpriced} unpriced rows</p>
                 </div>
               ))
@@ -109,7 +112,7 @@ export function UsageIssuesPage() {
                   className="mb-3 text-xs last:mb-0"
                 >
                   {accountLink(item.account)}
-                  <p className="my-1">{SOURCE_LABELS[item.kind] ?? item.kind}</p>
+                  <UsageName className="my-1">{SOURCE_LABELS[item.kind] ?? item.kind}</UsageName>
                   <p className="text-muted-foreground">{formatFullDate(item.at)}</p>
                 </div>
               ))

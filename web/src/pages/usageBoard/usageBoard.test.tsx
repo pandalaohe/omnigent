@@ -163,15 +163,15 @@ describe("board", () => {
     const ring = within(tile).getByTestId("usage-ring");
     expect(ring.getAttribute("data-tone")).toBe("mute");
     // The arcs are dimmed, not recoloured: the reading still shows its figure.
-    expect((ring.querySelector("svg") as SVGElement).style.opacity).toBe("0.45");
+    expect(ring.querySelector('circle[stroke="var(--muted-foreground)"]')).toBeTruthy();
     expect(within(tile).getByTestId("usage-ring").textContent).toContain("13");
   });
 
-  it("renders a value-only window as a dashed ring with the figure, not a percent", async () => {
+  it("renders a value-only window as a plain figure, not a percent", async () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
     renderRoute();
     const tile = (await screen.findByText("LiteLLM")).closest("[data-account]") as HTMLElement;
-    expect(within(tile).getByText("$41.00")).toBeTruthy();
+    expect(within(tile).getByTestId("usage-figure").textContent).toContain("$41.00");
     expect(within(tile).queryByText("%")).toBeNull();
   });
 
@@ -181,7 +181,7 @@ describe("board", () => {
     const tile = (await screen.findByText("Codex")).closest("[data-account]") as HTMLElement;
     tile.click();
     await waitFor(() => {
-      expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Codex");
+      expect(screen.getByRole("heading", { name: "Codex" }).textContent).toBe("Codex");
     });
     // The detail page lists every window, with the reset written out.
     expect(screen.getAllByText(/^Resets /).length).toBeGreaterThan(0);
@@ -205,7 +205,7 @@ describe("board", () => {
     // A bookmark to the account still resolves: the switch hides it from the
     // board, it does not delete its reading.
     renderRoute("/usage/board/codex");
-    expect(await screen.findByRole("heading", { level: 1 })).toBeTruthy();
+    expect(await screen.findByRole("heading", { level: 2, name: "Codex" })).toBeTruthy();
   });
 
   it("says an unknown account is gone rather than rendering an empty page", async () => {
@@ -225,7 +225,9 @@ describe("board", () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
     mocks.board.current = { ...mocks.board.current, enabled: false };
     renderRoute("/usage/board/codex");
-    expect((await screen.findByRole("heading", { level: 1 })).textContent).toBe("Codex");
+    expect((await screen.findByRole("heading", { level: 2, name: "Codex" })).textContent).toBe(
+      "Codex",
+    );
     expect(screen.queryByText("Usage board is off")).toBeNull();
     cleanup();
     renderRoute("/usage/board/codex/settings");

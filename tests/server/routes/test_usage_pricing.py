@@ -61,3 +61,66 @@ def test_usage_keys_cannot_edit_or_read_pricing_settings():
     for scope in ("usage", "usage:read", "tasks"):
         for method in ("GET", "PUT"):
             assert not scope_allows(scope, method, "/v1/me/usage/pricing-baseline")
+
+
+@pytest.mark.asyncio
+async def test_analysis_multi_pick_is_authenticated_bounded_and_never_all_owner_fallback(
+    request, db_uri
+):
+    import json
+
+    app = request.getfixturevalue("authenticated_app")
+    _make_user(db_uri, "analysis-owner@example.test", is_admin=False)
+    _make_user(db_uri, "analysis-other@example.test", is_admin=False)
+    headers = _headers("analysis-owner@example.test")
+    path = "/v1/me/usage/analysis"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        for key in ("a", "b", "c"):
+            response = await client.put(
+                f"/v1/me/usage/accounts/account-{key}",
+                headers=headers,
+                json={"schema_version": 2, "observed_at": time.time()},
+            )
+            assert response.status_code == 200
+        purchases = [
+            card(
+                id=f"card-{key}",
+                target_id=f"account-{key}",
+                retail_amount=amount,
+                purchase_currency="USD",
+                discount_override="1",
+            ).model_dump(mode="json")
+            for key, amount in [("a", "100"), ("b", "50"), ("c", "999")]
+        ]
+        saved = await client.put(
+            "/v1/me/usage/pricing-baseline",
+            headers=headers,
+            json={"revision": 0, "cards": purchases},
+        )
+        assert saved.status_code == 200, saved.text
+        query = {
+            "range": "custom",
+            "from": "2026-11-02",
+            "to": "2026-11-08",
+            "dimension": "account",
+            "selection": json.dumps(["account-a", "account-b"]),
+        }
+        assert (await client.get(path, params=query)).status_code == 401
+        response = await client.get(path, params=query, headers=headers)
+        assert response.status_code == 200, response.text
+        assert response.headers["cache-control"] == "private, no-store"
+        assert response.json()["presentation"]["projection"]["paid"]["low"] == "150"
+        query["selection"] = "[]"
+        assert (await client.get(path, params=query, headers=headers)).json()["presentation"][
+            "projection"
+        ]["paid"]["state"] == "unknown"
+        query["selection"] = json.dumps(["account-a", "account-b"])
+        other = await client.get(
+            path, params=query, headers=_headers("analysis-other@example.test")
+        )
+        assert other.json()["presentation"]["projection"]["paid"]["state"] == "unknown"
+        for invalid in ("{}", "not-json", json.dumps(["x"] * 257)):
+            query["selection"] = invalid
+            assert (await client.get(path, params=query, headers=headers)).status_code == 422

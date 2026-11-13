@@ -1,7 +1,16 @@
-import { useId } from "react";
+import { useMemo } from "react";
+import {
+  analysisTotals,
+  analysisValueText,
+  type AnalysisPresentation,
+  type AnalysisRow,
+  type AnalysisValue,
+  type UsageAnalysis,
+} from "./usageAnalysisData";
 import {
   Bar,
-  BarChart,
+  CartesianGrid,
+  ComposedChart,
   Line,
   LineChart,
   ReferenceLine,
@@ -11,7 +20,7 @@ import {
   YAxis,
 } from "recharts";
 import type { UsageAccountActivity } from "./usageActivityData";
-import { formatMoney } from "./usageBoardFormat";
+import { formatCount, formatMoney, formatTileAmount, formatUsageValue } from "./usageBoardFormat";
 import { UsageTipCard } from "./UsageTip";
 
 export interface UsageChartPoint {
@@ -19,6 +28,220 @@ export interface UsageChartPoint {
   now: number;
   previous?: number;
   bucket: number;
+}
+
+const EMPTY_PAID_SERIES: AnalysisPresentation["paid_series"] = [];
+function AnalysisChartTooltip({
+  active,
+  payload,
+  tokensUnknown,
+}: {
+  active?: boolean;
+  payload?: readonly {
+    payload?: { at: number; tokens?: number; previous?: number; payment?: AnalysisValue };
+  }[];
+  tokensUnknown: boolean;
+}) {
+  const point = payload?.[0]?.payload;
+  return active && point ? (
+    <div className="rounded-lg border border-border bg-popover p-2.5 shadow-md">
+      <UsageTipCard
+        model={{
+          title: new Date(point.at * 1000).toLocaleString(),
+          rows: [
+            ...(!tokensUnknown ? [{ label: "Token", value: String(point.tokens) }] : []),
+            ...(point.previous === undefined
+              ? []
+              : [{ label: "Previous", value: String(point.previous) }]),
+            ...(point.payment ? [{ label: "Paid", value: analysisValueText(point.payment) }] : []),
+          ],
+        }}
+      />
+    </div>
+  ) : null;
+}
+
+export function UsageAnalysisChart({
+  rows,
+  span,
+  unknown,
+  previousUnavailable,
+  previousAccounts,
+  previous,
+  paidSeries = EMPTY_PAID_SERIES,
+}: {
+  rows: AnalysisRow[];
+  span?: UsageAnalysis["span"];
+  unknown: boolean;
+  previousUnavailable: boolean;
+  previousAccounts?: UsageAccountActivity[];
+  previous?: AnalysisPresentation["previous"];
+  paidSeries?: AnalysisPresentation["paid_series"];
+}) {
+  const prior = useMemo(() => {
+    if (previous !== undefined) {
+      if (!previous || analysisTotals(previous.rows, previous.partial).tokens === null || !span)
+        return [];
+      const offset = span.counted_from - previous.span.counted_from,
+        buckets = new Map<number, number>();
+      for (const row of previous.rows)
+        if (row.contributes_usage && row.tokens !== null) {
+          const at = Math.min(span.until, Math.max(span.counted_from, row.hour + offset));
+          buckets.set(at, (buckets.get(at) ?? 0) + row.tokens);
+        }
+      let sum = 0;
+      return [...buckets]
+        .sort(([a], [b]) => a - b)
+        .map(([at, tokens]) => ({ at, previous: (sum += tokens) }));
+    }
+    const current = new Map<string, number>();
+    for (const row of rows) {
+      if (!row.contributes_usage) continue;
+      if (row.account_id !== row.parent_account_id || row.tokens === null) return [];
+      current.set(row.parent_account_id, (current.get(row.parent_account_id) ?? 0) + row.tokens);
+    }
+    return previousAccounts?.length &&
+      previousAccounts.length === current.size &&
+      previousAccounts.every(
+        (account) =>
+          current.get(account.account) === account.totals.tokens &&
+          account.totals.tokens_complete &&
+          account.previous?.totals.tokens_complete &&
+          account.previous.series.every((point) => point.tokens_complete),
+      )
+      ? usageChartPoints(previousAccounts, true, false, false, span?.until ?? 0)
+      : [];
+  }, [previous, previousAccounts, rows, span]);
+  const points = useMemo(() => {
+    const buckets = new Map<number, number>();
+    for (const row of rows)
+      if (row.contributes_usage && row.tokens !== null)
+        buckets.set(row.hour, (buckets.get(row.hour) ?? 0) + row.tokens);
+    const times = [
+      ...new Set([
+        ...buckets.keys(),
+        ...prior.map((point) => point.at),
+        ...paidSeries.map((point) => point.at),
+        ...(span ? [span.counted_from, span.until] : []),
+      ]),
+    ].sort((a, b) => a - b);
+    let total = 0,
+      index = 0,
+      paidIndex = 0;
+    return times.map((at) => {
+      total += buckets.get(at) ?? 0;
+      while (index + 1 < prior.length && prior[index + 1].at <= at) index++;
+      while (paidIndex + 1 < paidSeries.length && paidSeries[paidIndex + 1].at <= at) paidIndex++;
+      const payment = paidSeries.length ? paidSeries[paidIndex]?.value : undefined;
+      return {
+        at,
+        tokens: unknown ? undefined : total,
+        previous: prior.length && prior[index].at <= at ? prior[index].previous : undefined,
+        paid: payment?.low == null ? undefined : Number(payment.low),
+        payment,
+      };
+    });
+  }, [rows, span, prior, paidSeries, unknown]);
+  const hasPaid = paidSeries.some((point) => point.value.low !== null);
+  if (!span || (unknown && !hasPaid) || (!rows.length && !hasPaid))
+    return (
+      <div className="ua-unknown">
+        <strong data-unknown="">Unknown</strong>
+        <small>No complete selected token series</small>
+      </div>
+    );
+  const currency = paidSeries.find((point) => point.value.currency)?.value.currency ?? "USD";
+  return (
+    <figure aria-label="Cumulative selected tokens and paid">
+      <div style={{ height: 190, width: "100%", minWidth: 0 }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={points} margin={{ top: 8, right: 10, left: 0, bottom: 0 }}>
+            <XAxis
+              dataKey="at"
+              type="number"
+              domain={[span.counted_from, span.until]}
+              tickFormatter={(at) =>
+                new Date(at * 1000).toLocaleDateString("en-US", { month: "short", day: "numeric" })
+              }
+              tick={{ fontSize: 11, fill: "var(--usage-ink-3)" }}
+              tickLine={false}
+              axisLine={false}
+            />
+            <YAxis
+              yAxisId="tokens"
+              width={40}
+              tickFormatter={(value) =>
+                new Intl.NumberFormat("en-US", {
+                  notation: "compact",
+                  maximumFractionDigits: 2,
+                }).format(value)
+              }
+              tick={{ fontSize: 11, fill: "var(--usage-ink-3)" }}
+              tickLine={false}
+              axisLine={false}
+            />
+            {hasPaid ? (
+              <YAxis
+                yAxisId="paid"
+                orientation="right"
+                width={60}
+                tickFormatter={(value) => formatUsageValue(value, currency)}
+                tick={{ fontSize: 10, fill: "var(--usage-ink-3)" }}
+                tickLine={false}
+                axisLine={false}
+              />
+            ) : null}
+            <Tooltip content={<AnalysisChartTooltip tokensUnknown={unknown} />} />
+            {!unknown ? (
+              <Line
+                yAxisId="tokens"
+                dataKey="tokens"
+                name="Token"
+                type="linear"
+                dot={false}
+                stroke="var(--usage-time)"
+                strokeWidth={2}
+                isAnimationActive={false}
+              />
+            ) : null}
+            {prior.length ? (
+              <Line
+                yAxisId="tokens"
+                dataKey="previous"
+                name="Previous"
+                type="linear"
+                dot={false}
+                stroke="var(--usage-ink-3)"
+                strokeDasharray="4 4"
+                strokeWidth={1.7}
+                isAnimationActive={false}
+              />
+            ) : null}
+            {hasPaid ? (
+              <Line
+                yAxisId="paid"
+                dataKey="paid"
+                name="Paid"
+                type="linear"
+                dot={false}
+                stroke="var(--usage-ok)"
+                strokeWidth={2}
+                isAnimationActive={false}
+              />
+            ) : null}
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+      <figcaption className="text-xs text-muted-foreground">
+        Token · {hasPaid ? "Paid (right axis) · " : ""}At API price: Not available yet
+      </figcaption>
+      {previousUnavailable && !prior.length ? (
+        <figcaption className="text-xs text-muted-foreground">
+          Previous selected hourly series not available yet
+        </figcaption>
+      ) : null}
+    </figure>
+  );
 }
 
 /** Rebucket after aligning each account's Previous to its own current start. */
@@ -108,10 +331,7 @@ function ChartTip({
 }) {
   const point = payload?.[0]?.payload;
   if (!active || !point) return null;
-  const figure = (value: number) =>
-    tokens
-      ? new Intl.NumberFormat("en-US", { notation: "compact" }).format(value)
-      : formatMoney(value);
+  const figure = (value: number) => (tokens ? formatCount(value) : formatMoney(value));
   return (
     <div className="rounded-lg border border-border bg-popover p-2.5 shadow-md">
       <UsageTipCard
@@ -136,6 +356,22 @@ function ChartTip({
   );
 }
 
+/** Round axis steps (1, 2, 2.5 or 5 × 10ⁿ) from zero past the series' top. */
+export function niceTicks(top: number, count = 4, minStep = 0): number[] {
+  if (!(top > 0)) return [0, Math.max(1, minStep)];
+  const raw = Math.max(top / count, minStep);
+  const power = 10 ** Math.floor(Math.log10(raw));
+  const step = ([1, 2, 2.5, 5, 10].find((factor) => factor * power >= raw) ?? 10) * power;
+  const ticks: number[] = [];
+  for (let value = 0; value < top + step * 0.001; value += step) ticks.push(value);
+  if (ticks[ticks.length - 1] < top) ticks.push(ticks[ticks.length - 1] + step);
+  return ticks.map((value) => Number(value.toPrecision(12)));
+}
+
+function LegendSwatch({ kind }: { kind: "now" | "previous" | "bucket" | "fee" }) {
+  return <span className="usage-legend-swatch" data-kind={kind} aria-hidden="true" />;
+}
+
 export function UsageCostChart({
   accounts,
   tokens,
@@ -151,109 +387,117 @@ export function UsageCostChart({
   now: number;
   fee?: number;
 }) {
-  const syncId = useId();
   const points = usageChartPoints(accounts, tokens, total, period, now);
   const last = points.at(-1);
-  const formatter = (value: number) =>
-    tokens
-      ? new Intl.NumberFormat("en-US", { notation: "compact" }).format(value)
-      : formatMoney(value);
+  const formatter = (value: number) => (tokens ? formatCount(value) : formatMoney(value));
+  // Axis ticks are scale labels: two-decimal steps never repeat, large ones shorten.
+  const tickText = (value: number) =>
+    tokens ? formatCount(value) : formatTileAmount(value, "USD");
+  const hourly = points.length > 1 && points[1].at - points[0].at <= 3600;
   const dateLabel = (at: number) =>
     new Date(at * 1000).toLocaleString(
       "en-US",
-      points.length > 1 && points[1].at - points[0].at <= 3600
-        ? { hour: "numeric" }
-        : { month: "short", day: "numeric" },
+      hourly ? { hour: "numeric" } : { month: "short", day: "numeric" },
     );
-  if (!points.length)
-    return (
-      <p className="py-10 text-center text-sm text-muted-foreground">
-        No usage recorded in this range.
-      </p>
-    );
+  if (!points.length) return <p className="usage-chart-empty">No usage recorded in this range.</p>;
+  const showFee = !tokens && fee !== undefined && fee <= 4 * (last?.now ?? 0);
+  const top = Math.max(
+    ...points.map((point) => Math.max(point.now, point.previous ?? 0)),
+    showFee ? (fee ?? 0) : 0,
+  );
+  // Bars and lines share this one axis, so a bar's height is its real amount.
+  const ticks = niceTicks(top, 4, tokens ? 1 : 0.01);
+  const axisWidth = Math.max(44, Math.max(...ticks.map((tick) => tickText(tick).length)) * 7 + 18);
   return (
-    <figure aria-label="Cumulative usage and usage per bucket" className="min-w-0">
-      <figcaption className="mb-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-        <span className="text-info">Now {formatter(last?.now ?? 0)}</span>
-        {last?.previous !== undefined ? <span>Previous {formatter(last.previous)}</span> : null}
-        {!tokens && fee !== undefined ? <span>Monthly fee {formatMoney(fee)}</span> : null}
+    <figure aria-label="Cumulative usage and usage per bucket" className="usage-chart">
+      <figcaption className="usage-legend">
+        <span>
+          <LegendSwatch kind="now" />
+          Now <b>{formatter(last?.now ?? 0)}</b>
+        </span>
+        {last?.previous !== undefined ? (
+          <span>
+            <LegendSwatch kind="previous" />
+            Previous <b>{formatter(last.previous)}</b>
+          </span>
+        ) : null}
+        <span>
+          <LegendSwatch kind="bucket" />
+          {hourly ? "Per hour" : "Per day"}
+        </span>
+        {!tokens && fee !== undefined ? (
+          <span>
+            <LegendSwatch kind="fee" />
+            Monthly fee <b>{formatMoney(fee)}</b>
+          </span>
+        ) : null}
       </figcaption>
-      <div className="h-40 w-full min-w-0">
+      <div className="usage-chart-plot">
         <ResponsiveContainer width="100%" height="100%">
-          <LineChart
-            data={points}
-            syncId={syncId}
-            margin={{ top: 8, right: 10, left: 0, bottom: 0 }}
-          >
-            <XAxis dataKey="at" hide />
-            <YAxis
-              width={52}
-              tickFormatter={formatter}
-              tick={{ fontSize: 11 }}
-              tickLine={false}
-              axisLine={false}
+          <ComposedChart data={points} margin={{ top: 6, right: 4, left: 0, bottom: 0 }}>
+            <CartesianGrid
+              yAxisId="total"
+              vertical={false}
+              stroke="var(--usage-grid)"
+              strokeDasharray="2 4"
             />
-            <Tooltip content={<ChartTip tokens={tokens} />} />
-            <Line
-              type="stepAfter"
-              dataKey="now"
-              stroke="var(--info)"
-              dot={false}
-              strokeWidth={2}
-              isAnimationActive={false}
-            />
-            <Line
-              type="stepAfter"
-              dataKey="previous"
-              stroke="var(--muted-foreground)"
-              strokeDasharray="4 4"
-              dot={false}
-              isAnimationActive={false}
-            />
-            {!tokens && fee !== undefined && fee <= 4 * (last?.now ?? 0) ? (
-              <ReferenceLine
-                y={fee}
-                stroke="var(--warning)"
-                strokeDasharray="3 3"
-                ifOverflow="extendDomain"
-              />
-            ) : null}
-          </LineChart>
-        </ResponsiveContainer>
-      </div>
-      <div className="h-20 w-full min-w-0">
-        <ResponsiveContainer width="100%" height="100%">
-          <BarChart
-            data={points}
-            syncId={syncId}
-            margin={{ top: 4, right: 10, left: 0, bottom: 0 }}
-          >
             <XAxis
               dataKey="at"
               tickFormatter={dateLabel}
-              tick={{ fontSize: 10 }}
+              tick={{ fontSize: 12, fill: "var(--usage-ink-3)" }}
               tickLine={false}
               axisLine={false}
               interval="preserveStartEnd"
-              minTickGap={24}
+              minTickGap={28}
+              tickMargin={6}
             />
             <YAxis
-              width={52}
-              tickFormatter={formatter}
-              tick={{ fontSize: 10 }}
+              yAxisId="total"
+              width={axisWidth}
+              ticks={ticks}
+              domain={[0, ticks[ticks.length - 1]]}
+              tickFormatter={tickText}
+              tick={{ fontSize: 12, fill: "var(--usage-ink-3)" }}
               tickLine={false}
               axisLine={false}
-              tickCount={2}
             />
             <Tooltip content={<ChartTip tokens={tokens} />} cursor={{ fill: "var(--accent)" }} />
             <Bar
+              yAxisId="total"
               dataKey="bucket"
-              fill="var(--info)"
-              opacity={0.35}
+              fill="var(--usage-bar)"
               radius={[2, 2, 0, 0]}
+              maxBarSize={28}
               isAnimationActive={false}
             />
-          </BarChart>
+            <Line
+              yAxisId="total"
+              type="stepAfter"
+              dataKey="previous"
+              stroke="var(--usage-ink-3)"
+              strokeDasharray="4 4"
+              strokeWidth={1.7}
+              dot={false}
+              isAnimationActive={false}
+            />
+            <Line
+              yAxisId="total"
+              type="stepAfter"
+              dataKey="now"
+              stroke="var(--usage-series)"
+              strokeWidth={2}
+              dot={false}
+              isAnimationActive={false}
+            />
+            {showFee ? (
+              <ReferenceLine
+                yAxisId="total"
+                y={fee}
+                stroke="var(--usage-ink-2)"
+                strokeDasharray="6 4"
+              />
+            ) : null}
+          </ComposedChart>
         </ResponsiveContainer>
       </div>
     </figure>
