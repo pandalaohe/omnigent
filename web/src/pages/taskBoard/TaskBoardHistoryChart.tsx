@@ -4,7 +4,7 @@ import type { HistoryCard } from "./taskBoardHistoryData";
 import { DAY, activityColors } from "./taskBoardHistoryData";
 import type { ClosedDay } from "./taskBoardActivityData";
 import { localDay } from "./taskBoardActivityData";
-import { activityMoney, activityNumber } from "./TaskBoardActivityParts";
+import { activityMoney, activityNumber, activitySourceName } from "./TaskBoardActivityParts";
 import { mapAxisTicks } from "./taskBoardRouteModel";
 import { t } from "./taskBoardText";
 
@@ -18,6 +18,7 @@ export function TaskBoardHistoryChart({
   historyStart,
   capped,
   sourceOrder,
+  sourceLabels,
   onRange,
 }: {
   cards: HistoryCard[];
@@ -29,6 +30,7 @@ export function TaskBoardHistoryChart({
   historyStart: number;
   capped: boolean;
   sourceOrder: string[];
+  sourceLabels?: Record<string, string>;
   onRange: (from: number, to: number) => void;
 }) {
   const [preview, setPreview] = useState<[number, number] | null>(null);
@@ -212,7 +214,12 @@ export function TaskBoardHistoryChart({
                     ]
                       .sort((a, b) => b[1] - a[1])
                       .slice(0, 5)
-                      .map(([source, count]) => source + " " + activityNumber(count))
+                      .map(
+                        ([source, count]) =>
+                          activitySourceName(source, undefined, sourceLabels) +
+                          " " +
+                          activityNumber(count),
+                      )
                       .join(
                         ", ",
                       )}${costs[i] !== null ? "\n" + t("g6.allAccounts") + " " + activityMoney(costs[i]!) : ""}`,

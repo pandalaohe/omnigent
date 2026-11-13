@@ -1,10 +1,12 @@
 import type { TaskDisplay } from "./taskBoardDisplay";
 import { safeSourceLink } from "./taskBoardData";
 import { t } from "./taskBoardText";
+import { isBlankDetailValue } from "./taskBoardPresentation";
+import { TaskBoardFoldText } from "./TaskBoardFoldText";
 
 export function TaskSourceDetails({ display }: { display?: TaskDisplay }) {
-  if (!display || !(display.badges?.length || display.rows?.length || display.links?.length))
-    return null;
+  const rows = display?.rows?.filter((row) => !isBlankDetailValue(row.value)) ?? [];
+  if (!display || !(display.badges?.length || rows.length || display.links?.length)) return null;
   return (
     <section
       aria-label={t("detail.sourceDetails")}
@@ -24,12 +26,14 @@ export function TaskSourceDetails({ display }: { display?: TaskDisplay }) {
           ))}
         </ul>
       )}
-      {!!display.rows?.length && (
+      {!!rows.length && (
         <dl className="space-y-2">
-          {display.rows.map((row) => (
+          {rows.map((row) => (
             <div key={row.id} className="min-w-0">
               <dt className="text-xs text-muted-foreground">{row.label}</dt>
-              <dd className="whitespace-pre-wrap break-words">{row.value}</dd>
+              <dd>
+                <TaskBoardFoldText key={row.value} value={row.value} />
+              </dd>
             </div>
           ))}
         </dl>

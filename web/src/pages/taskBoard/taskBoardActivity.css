@@ -764,7 +764,7 @@
   }
   .td-list li {
     display: grid;
-    grid-template-columns: 41.5px 79px 1fr;
+    grid-template-columns: 41.5px minmax(0, 1fr);
     gap: 7px;
     font-size: 13px;
     padding: 5.5px 0;
@@ -877,30 +877,38 @@
   }
   .td-a {
     display: grid;
-    grid-template-columns: 27px minmax(0, 1fr) auto;
+    grid-template-columns: 27px minmax(0, 1fr);
     column-gap: 9px;
-    row-gap: 3px;
+    row-gap: 4px;
     align-items: center;
     font-size: 13px;
     padding: 7px 0;
   }
   .td-a b {
+    grid-column: 2;
+    min-width: 0;
     font-weight: 600;
     white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .td-a .mark {
-    grid-row: 1/3;
+    grid-row: 1/4;
   }
   .td-a .td-bar {
-    grid-column: 2/4;
-    grid-row: 2;
+    grid-column: 2;
+    grid-row: 3;
   }
   .td-a em {
+    grid-column: 2;
+    grid-row: 2;
+    min-width: 0;
     font-style: normal;
     color: var(--fg2);
     font-size: 12px;
-    grid-column: 3;
-    grid-row: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .td-bar {
     display: block;
@@ -1736,7 +1744,28 @@
   align-items: center;
 }
 .tb-activity-final .td-a > .tb-identity-mark {
-  grid-row: 1/3;
+  grid-row: 1/4;
+}
+.tb-activity-final .lgd-changes ol {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0;
+}
+.tb-activity-final .lgd-changes li {
+  display: block;
+  padding: 8px 0;
+  border-top: 1px solid var(--line2);
+  overflow-wrap: anywhere;
+}
+.tb-activity-final .lgd-changes li > div {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 8px;
+  padding: 3px 0;
+}
+.tb-activity-final .lgd-changes small,
+.tb-activity-final .lgd-changes time {
+  color: var(--fg2);
 }
 .tb-activity-final .dc-tiles {
   display: grid;

@@ -28,13 +28,19 @@ import { taskLocalTime, taskRelations } from "./taskBoardRouteData";
 import { displayCost, sessionObservation, type TaskDisplay } from "./taskBoardDisplay";
 import { boardSessionRows, boardGroupColors } from "./taskBoardSessionData";
 import { formatDate, formatNumber, t } from "./taskBoardText";
+import {
+  activityAgentName,
+  activityName,
+  activityTaskName,
+  activityTaskKey,
+} from "./taskBoardPresentation";
 import { BoardIdentityMark, BoardAgentLogo } from "./BoardIdentityMark";
 import { TaskSourceDetails } from "./TaskSourceDetails";
+import { TaskBoardFoldText } from "./TaskBoardFoldText";
 import { TaskBoardActions, taskActions } from "./TaskBoardActions";
 import "./taskBoardDetail.css";
 
-export const taskTitle = (task: BoardTask) =>
-  task.title || task["omnigent.ai:key"] || task.uid || t("task.untitled");
+export const taskTitle = (task: BoardTask) => activityTaskName(task);
 export function BoardDate({
   value,
   observed,
@@ -211,18 +217,11 @@ export function TaskBoardDetail({
     ? (Date.parse(toolClock) - Date.parse(tool.startedAt)) / 1000
     : undefined;
   const next = live?.next ?? display?.next ?? current["omnigent.ai:next"];
-  const actors = new Map((display?.actors ?? []).map((a) => [a.agentId, a.label]));
+  const actors = new Map(
+    (display?.actors ?? []).map((a) => [a.agentId, activityAgentName(a.agentId, a.label)]),
+  );
   linked.forEach((s) => {
-    if (!actors.has(s.agentId))
-      actors.set(
-        s.agentId,
-        (
-          { pi: "Pi", codex: "Codex", claude: "Claude", antigravity: "Antigravity" } as Record<
-            string,
-            string
-          >
-        )[s.agentId] ?? s.agentId,
-      );
+    if (!actors.has(s.agentId)) actors.set(s.agentId, activityAgentName(s.agentId));
   });
   const last = display?.lastActivity ?? current.updated;
   const checks = display?.checks ?? [];
@@ -326,22 +325,18 @@ export function TaskBoardDetail({
           <StateIcon size={14} />
           {t(`detail.state.${state}`)}
         </span>
-        <b>
-          {selectedSessionId
-            ? (display?.identity?.label ?? taskTitle(current))
-            : taskTitle(current)}
-        </b>
-        <code>{display?.identity?.key ?? current["omnigent.ai:key"] ?? current.uid}</code>
+        <b>{taskTitle(current)}</b>
+        {activityTaskKey(current) && <code>{activityTaskKey(current)}</code>}
         <span className="tb-dc-group">
           {display?.identity?.groupBadge && (
             <span
               className="tb-dc-group-badge"
               style={{ background: groupColor ?? "var(--primary)" }}
             >
-              {display.identity.groupBadge}
+              {activityName(display.identity.groupBadge) ?? t("g6.other")}
             </span>
           )}
-          {display?.identity?.groupLabel ?? current["omnigent.ai:group"]?.name}
+          {activityName(display?.identity?.groupLabel, current["omnigent.ai:group"]?.name)}
         </span>
         <button type="button" aria-label={t("detail.close")} onClick={onClose}>
           <XIcon size={15} />
@@ -385,21 +380,20 @@ export function TaskBoardDetail({
           {need && (
             <div className="tb-dc-need">
               <HandIcon size={16} />
-              <span>{need}</span>
+              <TaskBoardFoldText key={need} value={need} />
             </div>
           )}
           {next && (
             <div className="tb-dc-next">
               <em>{t("detail.next")}</em>
               <p>
-                {next.slice(0, 150)}
-                {next.length > 150 ? "…" : ""}
+                <TaskBoardFoldText key={next} value={next} />
               </p>
             </div>
           )}
           <div className="tb-dc-tiles">
-            <Tile label={t("detail.handlers")} sub={live?.host}>
-              {actors.size ? (
+            {actors.size > 0 && (
+              <Tile label={t("detail.handlers")} sub={live?.host}>
                 <>
                   <span className="tb-dc-who">
                     {[...actors].map(([agent]) => (
@@ -410,46 +404,46 @@ export function TaskBoardDetail({
                     ? [...actors.values()][0]
                     : t("detail.actorCount", { count: actors.size })}
                 </>
-              ) : (
-                "—"
-              )}
-            </Tile>
-            <Tile label={t("detail.lastMovement")} sub={last ? stamp(last) : undefined}>
-              {last
-                ? t("detail.ago", { time: duration(Math.max(60, (end - Date.parse(last)) / 1000)) })
-                : "—"}
-            </Tile>
-            <Tile
-              label={t("detail.tests")}
-              verdict={verdict}
-              sub={
-                checks.length > 0 &&
-                checkHosts.map((host) => {
-                  const check = checks.find((item) => item.host === host);
-                  return (
-                    <span key={host}>
-                      {host}{" "}
-                      {check ? (
-                        <>
-                          {t(`sessions.check.${check.verdict}`)}{" "}
-                          {t("detail.checkCount", { count: check.count })}
-                        </>
-                      ) : (
-                        t("detail.noCheckRecord")
-                      )}
-                      <br />
-                    </span>
-                  );
-                })
-              }
-            >
-              {verdict ? t(`sessions.check.${verdict}`) : t("detail.notTested")}
-            </Tile>
-            <Tile label={t("detail.commits")} sub={commits[0] && <code>{commits[0].sha}</code>}>
-              {commits.length
-                ? t("detail.commitCount", { count: commits.length })
-                : t("detail.noCommits")}
-            </Tile>
+              </Tile>
+            )}
+            {last && (
+              <Tile label={t("detail.lastMovement")} sub={stamp(last)}>
+                {t("detail.ago", { time: duration(Math.max(60, (end - Date.parse(last)) / 1000)) })}
+              </Tile>
+            )}
+            {checks.length > 0 && (
+              <Tile
+                label={t("detail.tests")}
+                verdict={verdict}
+                sub={
+                  checks.length > 0 &&
+                  checkHosts.map((host) => {
+                    const check = checks.find((item) => item.host === host);
+                    return (
+                      <span key={host}>
+                        {host}{" "}
+                        {check ? (
+                          <>
+                            {t(`sessions.check.${check.verdict}`)}{" "}
+                            {t("detail.checkCount", { count: check.count })}
+                          </>
+                        ) : (
+                          t("detail.noCheckRecord")
+                        )}
+                        <br />
+                      </span>
+                    );
+                  })
+                }
+              >
+                {t(`sessions.check.${verdict}`)}
+              </Tile>
+            )}
+            {commits.length > 0 && (
+              <Tile label={t("detail.commits")} sub={<code>{commits[0].sha}</code>}>
+                {t("detail.commitCount", { count: commits.length })}
+              </Tile>
+            )}
             {roll.amount !== null && (
               <Tile
                 label={t("detail.cost")}
@@ -499,7 +493,7 @@ export function TaskBoardDetail({
                           left: `${((Date.parse(s.from) - start) / span) * 100}%`,
                           width: `${Math.max(0.8, ((Date.parse(to) - Date.parse(s.from)) / span) * 100)}%`,
                         }}
-                        title={`${s.agentId} ${stamp(s.from)} → ${liveSegment ? t("detail.now") : stamp(to)} (${duration(Math.max(0, (Date.parse(to) - Date.parse(s.from)) / 1000))})`}
+                        title={`${activityAgentName(s.agentId, actors.get(s.agentId))} ${stamp(s.from)} → ${liveSegment ? t("detail.now") : stamp(to)} (${duration(Math.max(0, (Date.parse(to) - Date.parse(s.from)) / 1000))})`}
                       />
                     );
                   })}
@@ -553,15 +547,11 @@ export function TaskBoardDetail({
                       {target ? (
                         <button type="button" onClick={() => onSelect(target)}>
                           <TargetIcon size={12} />
-                          <b>
-                            {target["omnigent.ai:sourceDisplay"]?.identity?.key ??
-                              target["omnigent.ai:key"] ??
-                              target.uid}
-                          </b>
+                          {activityTaskKey(target) && <b>{activityTaskKey(target)}</b>}
                           <span>{taskTitle(target)}</span>
                         </button>
                       ) : (
-                        <span>{ref.uid}</span>
+                        <span>{t("g6.untitledTask")}</span>
                       )}
                       {edge.kind === "parent" && edge.since ? (
                         <small className="tb-dc-parent-since" title={edge.provenance}>
