@@ -9267,6 +9267,8 @@ async def test_sys_session_create_spawns_child_and_posts_first_message() -> None
     assert captured["parent_session_id"] == "conv_caller"
     assert captured["agent_id"] == "ag_x"
     assert captured["title"] == "auth"
+    attempt = captured["labels"].pop("omnigent.create_attempt")
+    assert len(attempt) == 32 and int(attempt, 16) > 0
     assert captured["labels"] == {"omnigent.speed_tier": "fast"}
     assert "initial_items" not in captured
     # The message posts after the work entry exists.
@@ -9553,6 +9555,8 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     # Agent origin rides the multipart create too: the server counts it.
     assert create_requests[0].headers["X-Omnigent-Create-Origin"] == "agent"
     parts = _parse_multipart_create(create_requests[0])
+    attempt = parts["metadata"].pop("labels")["omnigent.create_attempt"]
+    assert len(attempt) == 32 and int(attempt, 16) > 0
     assert parts["metadata"] == {
         "parent_session_id": "conv_caller",
         "title": "auth",
@@ -17801,3 +17805,423 @@ async def test_child_message_keeps_approval_transport_lifetime(monkeypatch):
         finally:
             finish.set()
             await asyncio.gather(call, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_cwd", [True, False], ids=["same-cwd", "different-cwd"])
+async def test_session_create_sdk_dispatch_preserves_child_cwd_resolver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, same_cwd: bool
+) -> None:
+    from omnigent.runner import tool_dispatch
+    from tests.runner.conftest import _sse
+
+    parent, child = "parent_runtime_cwd", "child_runtime_cwd"
+    workspace = tmp_path / "parent"
+    runner_base = workspace if same_cwd else tmp_path / "runner"
+    workspace.mkdir()
+    runner_base.mkdir(exist_ok=True)
+    captured: list[tuple[Path | None, Path | None]] = []
+    dispatched = asyncio.Event()
+
+    async def dispatch(**kwargs: Any) -> str:
+        try:
+            cwd = await kwargs["session_runtime_cwd"](child)
+            captured.append((kwargs["runner_workspace"], cwd))
+            return "ok"
+        finally:
+            dispatched.set()
+
+    monkeypatch.setattr(tool_dispatch, "dispatch_tool_locally", dispatch)
+    spec = AgentSpec(spec_version=1, name="parent", spawn=True)
+
+    async def resolve(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    def server_response(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path in {
+            f"/v1/sessions/{parent}",
+            f"/v1/sessions/{child}",
+        }:
+            session_id = request.url.path.rsplit("/", 1)[1]
+            return httpx.Response(
+                200,
+                json={
+                    "id": session_id,
+                    "agent_id": "ag_parent",
+                    "created_at": 1,
+                    "workspace": str(workspace) if session_id == parent else None,
+                    "labels": {},
+                },
+            )
+        if request.url.path.endswith("/items"):
+            return httpx.Response(200, json={"data": [], "has_more": False})
+        return httpx.Response(200, json={})
+
+    frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_cwd"}}),
+        _sse(
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "status": "action_required",
+                    "name": "sys_session_create",
+                    "call_id": "call_create",
+                    "arguments": "{}",
+                },
+            }
+        ),
+        _sse({"type": "response.completed", "response": {"id": "resp_cwd"}}),
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(server_response), base_url="http://server"
+    ) as server:
+        app = create_runner_app(
+            process_manager=_RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient(frames)),
+            spec_resolver=resolve,
+            server_client=server,
+            runner_workspace=runner_base,
+        )
+        async with _recovery_runner_client(app) as client:
+            response = await client.post(
+                f"/v1/sessions/{parent}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_parent",
+                    "model": "parent",
+                    "harness": "openai-agents",
+                    "content": [{"type": "input_text", "text": "run"}],
+                },
+            )
+            assert response.status_code == 202
+            await asyncio.wait_for(dispatched.wait(), 2)
+    assert captured == [(workspace, runner_base)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bundle", [False, True], ids=["json", "multipart"])
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "recover",
+        "gateway",
+        "preexisting",
+        "ambiguous",
+        "wrong-host",
+        "wrong-workspace",
+        "wrong-agent",
+        "archived",
+        "incomplete",
+        "pending",
+        "cancel",
+        "wrong-parent",
+        "closed",
+        "read-timeout",
+        "missing-placement",
+        "malformed-id",
+        "wrong-route-id",
+        "missing-agent",
+        "malformed-no-candidates",
+        "inherited-null",
+        "inherited-omitted",
+        "inherited-host",
+        "inherited-workspace",
+        "inherited-wrong-runner",
+        "inherited-no-runner",
+        "inherited-no-parent-runner",
+        "inherited-parent-runner-changed",
+        "inherited-parent-host-changed",
+        "inherited-parent-workspace-changed",
+        "inherited-parent-unavailable",
+        "inherited-parent-wrong-id",
+        "inherited-wrong-host",
+        "inherited-wrong-workspace",
+        "inherited-preexisting",
+        "inherited-ambiguous",
+        "inherited-no-agent",
+        "inherited-no-id",
+        "inherited-cwd-mismatch",
+        "inherited-cwd-unavailable",
+        "inherited-cwd-failure",
+        "inherited-no-cwd-resolver",
+    ],
+)
+async def test_session_create_lost_response(
+    tmp_path: Path,
+    bundle: bool,
+    outcome: str,
+) -> None:
+    from omnigent.runner import tool_dispatch
+
+    parent, child = "parent_lost_create", "child_lost_create"
+    snapshot: dict[str, Any] = {}
+    creates: list[httpx.Request] = []
+    messages: list[dict[str, Any]] = []
+    cwd_queries: list[str] = []
+    listed = asyncio.Event()
+
+    async def runtime_cwd(session_id: str) -> Path | None:
+        cwd_queries.append(session_id)
+        assert session_id == child
+        if outcome == "inherited-cwd-unavailable":
+            return None
+        if outcome == "inherited-cwd-failure":
+            raise OSError("test-owned cwd resolution failed")
+        if outcome == "inherited-cwd-mismatch":
+            return Path("/opt/runner-other")
+        return Path("/opt/work")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path == "/v1/sessions":
+            creates.append(request)
+            body = (
+                _parse_multipart_create(request)["metadata"]
+                if bundle
+                else json.loads(request.content)
+            )
+            snapshot.update(
+                {
+                    "id": child,
+                    "parent_session_id": parent,
+                    "agent_id": "ag_worker",
+                    "agent_name": "worker",
+                    "runner_id": "runner_worker",
+                    "host_id": "host_worker",
+                    "workspace": "/opt/work",
+                    "labels": body.get("labels", {}),
+                    "archived": False,
+                }
+            )
+            if outcome.startswith("inherited-"):
+                snapshot.update(host_id=None, workspace=None)
+                if outcome == "inherited-omitted":
+                    snapshot.pop("host_id")
+                    snapshot.pop("workspace")
+                if outcome == "inherited-host":
+                    snapshot["workspace"] = "/opt/work"
+                if outcome == "inherited-workspace":
+                    snapshot["host_id"] = "host_worker"
+                if outcome == "inherited-wrong-runner":
+                    snapshot["runner_id"] = "runner_other"
+                if outcome == "inherited-no-runner":
+                    snapshot.pop("runner_id")
+                if outcome == "inherited-wrong-host":
+                    snapshot["host_id"] = "host_other"
+                if outcome == "inherited-wrong-workspace":
+                    snapshot["workspace"] = "/opt/other"
+                if outcome == "inherited-preexisting":
+                    snapshot["labels"] = {}
+                if outcome == "inherited-no-agent":
+                    snapshot.pop("agent_id")
+                if outcome == "inherited-no-id":
+                    snapshot.pop("id")
+            if outcome == "preexisting":
+                snapshot["labels"] = {}
+            if outcome == "wrong-host":
+                snapshot["host_id"] = "host_other"
+            if outcome == "wrong-workspace":
+                snapshot["workspace"] = "/opt/other"
+            if outcome == "wrong-agent":
+                snapshot["agent_id"] = "ag_other"
+            if outcome == "archived":
+                snapshot["archived"] = True
+            if outcome == "wrong-parent":
+                snapshot["parent_session_id"] = "other_parent"
+            if outcome == "closed":
+                snapshot["labels"] = {**snapshot["labels"], "omnigent.closed": "true"}
+            if outcome == "pending":
+                snapshot["labels"] = {
+                    **snapshot["labels"],
+                    "omnigent.initial_message": '{"status":"pending"}',
+                }
+            if outcome == "gateway":
+                return httpx.Response(502)
+            if outcome in {
+                "malformed-id",
+                "wrong-route-id",
+                "missing-agent",
+                "malformed-no-candidates",
+            }:
+                identity = "session_id" if bundle else "id"
+                response = {identity: child, "agent_id": "ag_worker"}
+                if outcome in {"malformed-id", "malformed-no-candidates"}:
+                    response[identity] = 42
+                elif outcome == "wrong-route-id":
+                    response = {"id" if bundle else "session_id": child, "agent_id": "ag_worker"}
+                elif outcome == "missing-agent":
+                    response.pop("agent_id")
+                return httpx.Response(201, json=response)
+            raise httpx.ReadTimeout("response lost after commit", request=request)
+        if request.method == "GET" and path.endswith("/child_sessions"):
+            listed.set()
+            if outcome == "read-timeout":
+                raise httpx.ReadTimeout("reconciliation timed out", request=request)
+            if outcome == "cancel":
+                await asyncio.Event().wait()
+            rows = [snapshot]
+            if outcome == "malformed-no-candidates":
+                rows = []
+            if outcome == "wrong-agent":
+                rows = [{**snapshot, "agent_id": "ag_worker"}]
+            if outcome in {"ambiguous", "inherited-ambiguous"}:
+                rows.append({**snapshot, "id": "other_child"})
+            return httpx.Response(200, json={"data": rows, "has_more": outcome == "incomplete"})
+        if request.method == "GET" and path == f"/v1/sessions/{parent}":
+            parent_snapshot = {
+                "id": parent,
+                "runner_id": None if outcome == "inherited-no-parent-runner" else "runner_worker",
+                "host_id": "host_worker",
+                "workspace": None if outcome == "missing-placement" else "/opt/work",
+                "labels": {},
+            }
+            if listed.is_set():
+                if outcome == "inherited-parent-unavailable":
+                    return httpx.Response(503)
+                if outcome == "inherited-parent-runner-changed":
+                    parent_snapshot["runner_id"] = "runner_replacement"
+                if outcome == "inherited-parent-host-changed":
+                    parent_snapshot["host_id"] = "host_other"
+                if outcome == "inherited-parent-workspace-changed":
+                    parent_snapshot["workspace"] = "/opt/other"
+                if outcome == "inherited-parent-wrong-id":
+                    parent_snapshot["id"] = "other_parent"
+            return httpx.Response(
+                200,
+                json=parent_snapshot,
+            )
+        if request.method == "GET" and path == f"/v1/sessions/{child}":
+            return httpx.Response(200, json=snapshot)
+        if request.method == "PATCH":
+            return httpx.Response(200, json={})
+        if request.method == "POST" and path.endswith("/events"):
+            messages.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404)
+
+    args: dict[str, Any] = {"title": "same title", "message": "do the work"}
+    if bundle:
+        (tmp_path / "worker.yaml").write_text("name: worker\nprompt: help\n")
+        args["config_path"] = "worker.yaml"
+    else:
+        args["agent_id"] = "ag_worker"
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://server"
+        ) as client:
+            call = asyncio.create_task(
+                tool_dispatch.execute_tool(
+                    tool_name="sys_session_create",
+                    arguments=json.dumps(args),
+                    server_client=client,
+                    conversation_id=parent,
+                    runner_workspace=tmp_path,
+                    session_runtime_cwd=(
+                        None if outcome == "inherited-no-cwd-resolver" else runtime_cwd
+                    ),
+                )
+            )
+            if outcome == "cancel":
+                listing = asyncio.create_task(listed.wait())
+                try:
+                    await asyncio.wait(
+                        {call, listing}, timeout=2, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    assert listed.is_set(), "create did not enter reconciliation"
+                    call.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await call
+                finally:
+                    listing.cancel()
+                    call.cancel()
+                    await asyncio.gather(listing, call, return_exceptions=True)
+            else:
+                result = json.loads(await call)
+                if outcome in {
+                    "recover",
+                    "gateway",
+                    "malformed-id",
+                    "wrong-route-id",
+                    "missing-agent",
+                    "inherited-null",
+                    "inherited-omitted",
+                    "inherited-host",
+                    "inherited-workspace",
+                }:
+                    assert result.get("conversation_id") == child, result
+                    assert result["initial_message"]["status"] == "sent", result
+                    assert len(messages) == 1
+                    if outcome in {"inherited-null", "inherited-omitted", "inherited-workspace"}:
+                        assert cwd_queries == [child]
+                else:
+                    assert result["status"] == "unknown", result
+                    assert "not automatically" in json.dumps(result)
+                    assert "Recovery" in result["detail"], result
+                    assert result["create_attempt"], result
+                    assert "their labels" not in result["message"], result
+                    assert "/v1/" not in result["message"], result
+                    assert "operator" in result["message"].lower(), result
+                    reason = {
+                        "preexisting": "no child matches",
+                        "ambiguous": "multiple children",
+                        "incomplete": "listing is incomplete",
+                        "read-timeout": "ReadTimeout",
+                        "missing-placement": "baseline unavailable",
+                        "malformed-no-candidates": "Malformed create success response",
+                        "inherited-preexisting": "no child matches",
+                        "inherited-ambiguous": "multiple children",
+                        "inherited-no-id": "matching child has no usable session id",
+                        "inherited-cwd-unavailable": "runtime cwd could not be proven",
+                        "inherited-cwd-failure": "runtime cwd lookup failed (OSError)",
+                        "inherited-no-cwd-resolver": "runtime cwd resolver is unavailable",
+                    }.get(outcome, "candidate identity")
+                    assert reason in result["detail"], result
+                    if outcome in {
+                        "ambiguous",
+                        "wrong-host",
+                        "wrong-workspace",
+                        "wrong-agent",
+                        "archived",
+                        "pending",
+                        "wrong-parent",
+                        "closed",
+                        "incomplete",
+                        "inherited-null",
+                        "inherited-omitted",
+                        "inherited-host",
+                        "inherited-workspace",
+                        "inherited-wrong-runner",
+                        "inherited-no-runner",
+                        "inherited-no-parent-runner",
+                        "inherited-parent-runner-changed",
+                        "inherited-parent-host-changed",
+                        "inherited-parent-workspace-changed",
+                        "inherited-parent-unavailable",
+                        "inherited-parent-wrong-id",
+                        "inherited-wrong-host",
+                        "inherited-wrong-workspace",
+                        "inherited-ambiguous",
+                        "inherited-no-agent",
+                        "inherited-cwd-mismatch",
+                        "inherited-cwd-unavailable",
+                        "inherited-cwd-failure",
+                        "inherited-no-cwd-resolver",
+                    }:
+                        assert child in result["message"], result
+                        assert "sys_session_get_info" in result["message"], result
+                        if outcome in {"ambiguous", "inherited-ambiguous"}:
+                            assert "other_child" in result["message"], result
+                    else:
+                        assert "No trustworthy session id" in result["message"], result
+                    assert not messages
+                    if outcome in {
+                        "inherited-cwd-mismatch",
+                        "inherited-cwd-unavailable",
+                        "inherited-cwd-failure",
+                    }:
+                        assert cwd_queries == [child]
+        assert len(creates) == 1, "uncertain creates must never be replayed"
+    finally:
+        subagent_work.unregister_subagent_work_for_session(parent)
+        subagent_work.unregister_subagent_work_for_session(child)

@@ -449,6 +449,7 @@ def register_mcp_routes(
                         agent_id=_agent_id_local,
                         agent_name=getattr(spec, "name", None),
                         runner_workspace=dispatch_workspace,
+                        session_runtime_cwd=_session_runtime_cwd,
                         local_tool_workdir=spec_workdir,
                         mcp_manager=None,
                         session_inbox=_session_inboxes.get(session_id),

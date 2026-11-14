@@ -352,6 +352,7 @@ _SESSION_START_DEADLINE: ContextVar[float | None] = ContextVar(
     "session_start_deadline", default=None
 )
 _INITIAL_MESSAGE_LABEL = "omnigent.initial_message"
+_CREATE_ATTEMPT_LABEL = "omnigent.create_attempt"
 _INITIAL_MESSAGE_LABEL_RETRY_DELAY_S = 0.5
 _SESSION_CREATE_DELIVERIES: set[asyncio.Task[str]] = set()
 
@@ -5493,6 +5494,188 @@ def _session_create_fields(args: Mapping[str, object]) -> _JsonObject:
     return fields
 
 
+async def _post_child_create(
+    post: Callable[[], Awaitable[httpx.Response]],
+    metadata: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    caller_snapshot: _JsonObject | None,
+    required_identity_fields: tuple[str, ...],
+    session_runtime_cwd: Callable[[str], Awaitable[Path | None]] | None = None,
+) -> httpx.Response | str:
+    """Recover a lost create response only through this request's fresh label."""
+    attempt = uuid.uuid4().hex
+    labels = _string_object_dict(metadata.get("labels")) or {}
+    metadata["labels"] = {**labels, _CREATE_ATTEMPT_LABEL: attempt}
+    failure_detail = "The create response did not contain a usable session identity."
+    candidate_ids: list[str] = []
+
+    def remember_candidate(value: object) -> None:
+        if (
+            isinstance(value, str)
+            and value
+            and len(value) <= 256
+            and value not in candidate_ids
+            and len(candidate_ids) < 5
+        ):
+            candidate_ids.append(value)
+
+    def unknown(reason: str) -> str:
+        inspection = (
+            "Inspect these unverified candidate session ids with sys_session_get_info: "
+            f"{json.dumps(candidate_ids)}. These reads do not expose the attempt marker; "
+            "ask the operator to verify the attempt in server-side records before "
+            "adopting a candidate or delivering input. "
+            if candidate_ids
+            else "No trustworthy session id is available for inspection with sys tools. "
+            "Ask the operator to verify this attempt in server-side records before "
+            "any further creation or task delivery. "
+        )
+        return json.dumps(
+            {
+                "status": "unknown",
+                "detail": f"{failure_detail} Recovery not confirmed: {reason}.",
+                "create_attempt": attempt,
+                "initial_message": {"status": "not_sent"},
+                "message": (
+                    "Creation outcome unknown; the first task has not been sent. "
+                    f"Attempt reference: {attempt}. {inspection}Do not automatically "
+                    "retry creation or resend the task."
+                ),
+            }
+        )
+
+    try:
+        response = await post()
+        failure_detail = f"sys_session_create returned {response.status_code}: {response.text}"
+        if response.status_code < 500 and response.status_code != 408:
+            if response.status_code >= 400:
+                return response
+            data = _string_object_dict(response.json())
+            if data is not None:
+                if all(_optional_string(data.get(field)) for field in required_identity_fields):
+                    return response
+                for field in ("id", "session_id"):
+                    remember_candidate(data.get(field))
+            failure_detail = (
+                "Malformed create success response; required nonempty string fields: "
+                + ", ".join(required_identity_fields)
+            )
+    except (httpx.HTTPError, ValueError) as exc:
+        failure_detail = f"sys_session_create: {type(exc).__name__}: {exc}"
+
+    # Without a complete identity/placement baseline, a matching title is no proof.
+    host = metadata.get("host_id") or (caller_snapshot or {}).get("host_id")
+    workspace = metadata.get("workspace") or (caller_snapshot or {}).get("workspace")
+    if not host or not workspace:
+        return unknown("parent host/workspace baseline unavailable")
+    if metadata.get("git"):
+        return unknown("git worktree placement cannot be proven from the create request")
+    deadline = _SESSION_START_DEADLINE.get()
+    remaining = min(30.0, max(0.0, deadline - time.time())) if deadline else 30.0
+    try:
+        async with asyncio.timeout(remaining):
+            response = await server_client.get(
+                f"{_session_url(conversation_id)}/child_sessions",
+                params={"limit": 100, "order": "desc", "include_archived": "true"},
+                timeout=remaining,
+            )
+            response.raise_for_status()
+            page = _string_object_dict(response.json())
+            rows = page.get("data") if page else None
+            if page is None or not isinstance(rows, list):
+                return unknown("child listing is malformed")
+            matches = [
+                row
+                for raw in rows
+                if (row := _string_object_dict(raw)) is not None
+                and (_string_object_dict(row.get("labels")) or {}).get(_CREATE_ATTEMPT_LABEL)
+                == attempt
+            ]
+            for match in matches:
+                remember_candidate(match.get("id"))
+            if page.get("has_more") is not False:
+                return unknown("child listing is incomplete")
+            if not matches:
+                return unknown("no child matches this create attempt")
+            if len(matches) > 1:
+                return unknown("multiple children match this create attempt")
+            if len(matches) != 1 or not _optional_string(matches[0].get("id")):
+                return unknown("matching child has no usable session id")
+            child_id = str(matches[0]["id"])
+            snapshot = await _session_snapshot(server_client, child_id)
+            if snapshot is None:
+                return unknown("candidate snapshot is unavailable")
+            child_labels = {
+                key: value
+                for key, value in (_string_object_dict(snapshot.get("labels")) or {}).items()
+                if isinstance(value, str)
+            }
+            if (
+                snapshot.get("id") != child_id
+                or snapshot.get("parent_session_id") != conversation_id
+                or snapshot.get("agent_id") != matches[0].get("agent_id")
+                or snapshot.get("archived") is not False
+                or not _optional_string(snapshot.get("agent_id"))
+                or (
+                    metadata.get("agent_id") is not None
+                    and snapshot.get("agent_id") != metadata["agent_id"]
+                )
+                or child_labels.get(_CREATE_ATTEMPT_LABEL) != attempt
+                or _INITIAL_MESSAGE_LABEL in child_labels
+                or is_session_closed(child_labels, _optional_string(snapshot.get("title")))
+            ):
+                return unknown(
+                    "candidate identity, placement or lifecycle does not match, "
+                    "or its first task is already tracked"
+                )
+            child_host = snapshot.get("host_id")
+            child_workspace = snapshot.get("workspace")
+            if child_host is None or child_workspace is None:
+                # Default children can omit placement while sharing the parent's runner.
+                # Explicit placement and an unproven runner binding cannot inherit it.
+                runner_id = _optional_string(snapshot.get("runner_id"))
+                if (
+                    metadata.get("host_id") is not None
+                    or metadata.get("workspace") is not None
+                    or not runner_id
+                    or runner_id != (caller_snapshot or {}).get("runner_id")
+                ):
+                    return unknown("candidate identity or inherited placement cannot be proven")
+                parent = await _fetch_session_metadata(server_client, conversation_id)
+                if (
+                    parent is None
+                    or parent.get("id") != conversation_id
+                    or parent.get("runner_id") != runner_id
+                    or parent.get("workspace") != (caller_snapshot or {}).get("workspace")
+                    or parent.get("parent_session_id")
+                    != (caller_snapshot or {}).get("parent_session_id")
+                ):
+                    return unknown("candidate identity or inherited placement cannot be proven")
+                if child_host is None:
+                    child_host = await _effective_host_id(
+                        server_client, conversation_id, snapshot=parent
+                    )
+                if child_workspace is None:
+                    if session_runtime_cwd is None:
+                        return unknown("candidate runtime cwd resolver is unavailable")
+                    try:
+                        cwd = await session_runtime_cwd(child_id)
+                    except Exception as exc:  # noqa: BLE001 — unreadable cwd cannot prove placement.
+                        return unknown(
+                            f"candidate runtime cwd lookup failed ({type(exc).__name__})"
+                        )
+                    if not isinstance(cwd, Path) or not cwd.is_absolute():
+                        return unknown("candidate runtime cwd could not be proven")
+                    child_workspace = str(cwd)
+            if child_host != host or child_workspace != workspace:
+                return unknown("candidate identity or placement does not match")
+            return httpx.Response(200, json={**snapshot, "session_id": child_id})
+    except (httpx.HTTPError, RuntimeError, ValueError, TimeoutError) as exc:
+        return unknown(f"reconciliation read failed ({type(exc).__name__})")
+
+
 def _build_session_create_body(
     agent_id: str | None,
     conversation_id: str,
@@ -6029,6 +6212,7 @@ async def _execute_session_create(
     publish_event: Callable[[str, _JsonObject], None] | None,
     agent_spec: AgentSpec | None = None,
     runner_workspace: Path | None = None,
+    session_runtime_cwd: Callable[[str], Awaitable[Path | None]] | None = None,
 ) -> str:
     progress = _SessionCreateProgress()
     token = _SESSION_START_DEADLINE.set(time.time() + min(300.0, _SESSION_CREATE_TOOL_TIMEOUT_S))
@@ -6041,6 +6225,7 @@ async def _execute_session_create(
                 publish_event=publish_event,
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
+                session_runtime_cwd=session_runtime_cwd,
                 progress=progress,
             )
     except TimeoutError:
@@ -6062,8 +6247,10 @@ async def _execute_session_create(
             {
                 "status": "unknown",
                 "detail": (
-                    "Creation timed out before its id was received. "
-                    "Check sub_agents before retrying."
+                    "Creation timed out before its id was received; the first task "
+                    "was not sent by this call. Inspect sub_agents and use "
+                    "sys_session_get_info with a discovered id. Do not automatically "
+                    "retry creation or resend the task."
                 ),
             }
         )
@@ -6081,6 +6268,7 @@ async def _execute_session_create_impl(
     agent_spec: AgentSpec | None = None,
     runner_workspace: Path | None = None,
     progress: _SessionCreateProgress,
+    session_runtime_cwd: Callable[[str], Awaitable[Path | None]] | None = None,
 ) -> str:
     """
     Create a child or an independent session (``sys_session_create``).
@@ -6194,6 +6382,7 @@ async def _execute_session_create_impl(
             publish_event=publish_event,
             agent_spec=agent_spec,
             runner_workspace=runner_workspace,
+            session_runtime_cwd=session_runtime_cwd,
             progress=progress,
         )
     caller_snapshot = await _session_snapshot(server_client, conversation_id)
@@ -6308,9 +6497,27 @@ async def _execute_session_create_impl(
             )
         else:
             create_requested = True
-            resp = await server_client.post(
-                endpoint, json=body, headers=headers, timeout=_SESSION_CREATE_TIMEOUT
-            )
+
+            async def post() -> httpx.Response:
+                return await server_client.post(
+                    endpoint, json=body, headers=headers, timeout=_SESSION_CREATE_TIMEOUT
+                )
+
+            if placement_mode == "child":
+                created = await _post_child_create(
+                    post,
+                    body,
+                    server_client=server_client,
+                    conversation_id=conversation_id,
+                    caller_snapshot=caller_snapshot,
+                    required_identity_fields=("id",),
+                    session_runtime_cwd=session_runtime_cwd,
+                )
+                if isinstance(created, str):
+                    return created
+                resp = created
+            else:
+                resp = await post()
     except Exception as exc:  # noqa: BLE001
         if placement_mode != "child" and create_requested:
             return json.dumps(unconfirmed_creation)
@@ -6537,6 +6744,7 @@ async def _upload_config_bundle(
     conversation_id: str,
     agent_spec: AgentSpec | None,
     runner_workspace: Path | None,
+    session_runtime_cwd: Callable[[str], Awaitable[Path | None]] | None = None,
 ) -> _JsonObject | str:
     """
     Resolve, bundle, and upload a local agent config as a child session.
@@ -6576,7 +6784,10 @@ async def _upload_config_bundle(
 
     # A child caller is refused here, after the local path checks (so a bad
     # config_path never pays for a server read) and before the create POST.
-    refusal = await _child_session_create_refusal(server_client, conversation_id)
+    caller_snapshot = await _session_snapshot(server_client, conversation_id)
+    refusal = await _child_session_create_refusal(
+        server_client, conversation_id, snapshot=caller_snapshot
+    )
     if refusal is not None:
         return refusal
     for arg_name in ("model", "reasoning_effort"):
@@ -6598,14 +6809,29 @@ async def _upload_config_bundle(
         unsupported = await _bundle_model_override_unsupported(server_client)
         if unsupported is not None:
             return unsupported
-    try:
-        resp = await server_client.post(
+
+    async def post() -> httpx.Response:
+        return await server_client.post(
             "/v1/sessions",
             data={"metadata": json.dumps(metadata)},
             files={"bundle": (f"{source.name}.tar.gz", bundle_bytes, "application/gzip")},
             timeout=_SESSION_CREATE_TIMEOUT,
             headers=_AGENT_CREATE_HEADERS,
         )
+
+    try:
+        created = await _post_child_create(
+            post,
+            metadata,
+            server_client=server_client,
+            conversation_id=conversation_id,
+            caller_snapshot=caller_snapshot,
+            required_identity_fields=("session_id", "agent_id"),
+            session_runtime_cwd=session_runtime_cwd,
+        )
+        if isinstance(created, str):
+            return created
+        resp = created
     except Exception as exc:  # noqa: BLE001
         return json.dumps(
             {
@@ -6640,6 +6866,7 @@ async def _session_create_from_config_path(
     agent_spec: AgentSpec | None,
     runner_workspace: Path | None,
     progress: _SessionCreateProgress,
+    session_runtime_cwd: Callable[[str], Awaitable[Path | None]] | None = None,
 ) -> str:
     """
     Bundle-mode ``sys_session_create``: upload a new agent and launch it.
@@ -6669,6 +6896,7 @@ async def _session_create_from_config_path(
         conversation_id=conversation_id,
         agent_spec=agent_spec,
         runner_workspace=runner_workspace,
+        session_runtime_cwd=session_runtime_cwd,
     )
     if isinstance(data, str):
         return data
@@ -11187,6 +11415,7 @@ async def execute_tool(
     agent_id: str | None = None,
     agent_name: str | None = None,
     runner_workspace: Path | None = None,
+    session_runtime_cwd: Callable[[str], Awaitable[Path | None]] | None = None,
     local_tool_workdir: Path | _UnsetLocalToolWorkdir | None = _UNSET_LOCAL_TOOL_WORKDIR,
     mcp_manager: RunnerMcpManager | None = None,
     session_inbox: asyncio.Queue[_JsonObject] | None = None,
@@ -11215,6 +11444,8 @@ async def execute_tool(
     :param resource_registry: Optional session-resource registry used to
         observe tool-launched terminals through the same lifecycle path as
         runner-launched terminals.
+    :param session_runtime_cwd: Existing runner-owned cwd lookup for a session id.
+        Lost-create recovery needs the actual child's cwd, not the caller's.
     :param filesystem_registry: Optional registry for tracking agent
         file modifications. Forwarded to ``_execute_os_env_tool``
         so that ``sys_os_write`` and ``sys_os_edit`` calls record changed
@@ -11391,6 +11622,7 @@ async def execute_tool(
                 publish_event=publish_event,
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
+                session_runtime_cwd=session_runtime_cwd,
             )
         elif tool_name in _UI_TOOLS:
             output = await _open_file_via_rest(args, conversation_id, server_client)
@@ -11719,6 +11951,7 @@ async def dispatch_tool_locally(
     agent_id: str | None = None,
     agent_name: str | None = None,
     runner_workspace: Path | None = None,
+    session_runtime_cwd: Callable[[str], Awaitable[Path | None]] | None = None,
     local_tool_workdir: Path | _UnsetLocalToolWorkdir | None = _UNSET_LOCAL_TOOL_WORKDIR,
     mcp_manager: RunnerMcpManager | None = None,
     session_inbox: asyncio.Queue[_JsonObject] | None = None,
@@ -11734,6 +11967,8 @@ async def dispatch_tool_locally(
     :param runner_workspace: Optional CLI launch workspace used to
         resolve placeholder cwd values for runner-owned filesystem
         tools.
+    :param session_runtime_cwd: Runner-owned per-session cwd lookup, forwarded
+        unchanged so recovery can verify a newly created child's placement.
     :param mcp_manager: When set, dispatch via
         :meth:`RunnerMcpManager.call_tool`. Caller (proxy_stream)
         passes this only for MCP-owned tools.
@@ -11774,6 +12009,7 @@ async def dispatch_tool_locally(
         agent_id=agent_id,
         agent_name=agent_name,
         runner_workspace=runner_workspace,
+        session_runtime_cwd=session_runtime_cwd,
         local_tool_workdir=local_tool_workdir,
         mcp_manager=mcp_manager,
         session_inbox=session_inbox,

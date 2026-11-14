@@ -152,7 +152,11 @@ class Harness:
             return self.resolved_entry
 
         async def _runtime_cwd(session_id: str) -> Path | None:
-            return Path("/tmp/runtime-cwd")
+            return (
+                Path("/tmp/runtime-cwd")
+                if session_id == SESSION
+                else Path("/tmp/runner-workspace")
+            )
 
         mcp_routes.register_mcp_routes(
             self.app,
@@ -387,6 +391,7 @@ async def test_builtin_tool_dispatch_passes_session_context(
     assert seen["agent_spec"] is spec
     assert seen["local_tool_workdir"] == Path("/tmp/bundle")
     assert seen["runner_workspace"] == Path("/tmp/runtime-cwd")
+    assert await seen["session_runtime_cwd"]("child_runtime") == Path("/tmp/runner-workspace")
     assert seen["conversation_id"] == seen["task_id"] == SESSION
     assert seen["agent_id"] == "ag_1"
     assert seen["effective_harness"] == "claude-sdk"

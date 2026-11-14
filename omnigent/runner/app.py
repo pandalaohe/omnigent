@@ -11264,6 +11264,7 @@ def create_runner_app(
                                                     agent_id=_agent_id_for_dispatch,
                                                     agent_name=cast(str | None, body.get("model")),
                                                     runner_workspace=_dispatch_workspace,
+                                                    session_runtime_cwd=_session_runtime_cwd,
                                                     local_tool_workdir=_local_tool_workdir,
                                                     mcp_manager=cast(
                                                         "RunnerMcpManager", _dispatch_mcp
