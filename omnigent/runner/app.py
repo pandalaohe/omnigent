@@ -6502,6 +6502,7 @@ def create_runner_app(
         require_label: bool = True,
         recovery: bool = False,
         expected_revision: str | None = None,
+        expected_attempt: str | None = None,
     ) -> str:
         """Type ``/clear`` for a session whose handover asked for rotation.
 
@@ -6573,6 +6574,8 @@ def create_runner_app(
             ):
                 return "not_requested"
             attempt = rotation_attempt(labels, revision)
+            if expected_attempt is not None and expected_attempt != attempt:
+                return "not_requested"
             if labels.get(DRAFT_LABEL_KEY):
                 return "draft_may_remain"
             if labels.get(FAILED_ATTEMPT_LABEL_KEY) == attempt:
@@ -6787,6 +6790,7 @@ def create_runner_app(
         require_label: bool = True,
         recovery: bool = False,
         expected_revision: str | None = None,
+        expected_attempt: str | None = None,
     ) -> str:
         if require_label and conv_id in _succeeded_parents:
             return "superseded"
@@ -6804,12 +6808,14 @@ def create_runner_app(
                         conv_id,
                         recovery=recovery,
                         expected_revision=expected_revision,
+                        expected_attempt=expected_attempt,
                     )
             return await _rotate_session(
                 conv_id,
                 require_label=require_label,
                 recovery=recovery,
                 expected_revision=expected_revision,
+                expected_attempt=expected_attempt,
             )
         except HTTPException:
             raise
@@ -6828,7 +6834,10 @@ def create_runner_app(
     ) -> dict[str, str]:
         return {
             "status": await _execute_pending_rotation(
-                session_id, recovery=True, expected_revision=(body or {}).get("archive_revision")
+                session_id,
+                recovery=True,
+                expected_revision=(body or {}).get("archive_revision"),
+                expected_attempt=(body or {}).get("attempt"),
             )
         }
 

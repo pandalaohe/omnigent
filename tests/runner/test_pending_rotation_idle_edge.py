@@ -798,7 +798,8 @@ async def test_recovery_can_heal_pane_under_rotation_lock(monkeypatch, tmp_path,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "failure", ["switch_off", "stale_revision", "missing_revision", "expected_revision"]
+    "failure",
+    ["switch_off", "stale_revision", "missing_revision", "expected_revision", "expected_attempt"],
 )
 async def test_recovery_fails_closed_on_disabled_or_stale_request(monkeypatch, failure):
     effects = []
@@ -812,12 +813,17 @@ async def test_recovery_fails_closed_on_disabled_or_stale_request(monkeypatch, f
         server.archive_revision = 1
     elif failure == "missing_revision":
         server.archive_revision = None
+    elif failure == "expected_attempt":
+        server.labels["omnigent.auto_rotation_state.attempt"] = "new-attempt"
     app = _build_app(server)
     async with _runner_client(app) as client:
         await _seed_session(client)
         result = await client.post(
             f"/v1/sessions/{CONV_ID}/pending-rotation",
-            json={"archive_revision": "1" if failure == "expected_revision" else "0"},
+            json={
+                "archive_revision": "1" if failure == "expected_revision" else "0",
+                "attempt": "0:old-attempt" if failure == "expected_attempt" else "0:",
+            },
         )
         assert result.json() == {"status": "not_requested"}
         assert effects == []
