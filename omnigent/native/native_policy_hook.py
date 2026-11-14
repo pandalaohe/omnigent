@@ -38,27 +38,20 @@ from omnigent.util.http_retry import bounded_retry_after_seconds
 
 _logger = logging.getLogger(__name__)
 
-# Default retry budget for request/result phases that do not provide an
-# explicit native enforcement outage wait. Callers that enforce a decision
-# through a longer-lived hook can pass that wait explicitly.
-_EVALUATE_POLICY_RETRY_BUDGET_S = 15.0
+# Request gates without an explicit native enforcement wait use this budget.
+# Their hook deadlines must leave time to deliver a fail-closed verdict.
+_EVALUATE_POLICY_RETRY_BUDGET_S = 120.0
 # A result hook is observational: the tool already ran, so an outage must
-# fail open before Claude Code kills its command hook. Claude Code kills a
-# UserPromptSubmit hook at 30s and a killed hook does not block. Sized
-# 30 - (5 TCP + 5 TLS) - 2 (hook start-up and failed relay curl) - 3 (margin)
-# = 15, leaving an attempt started just under the budget enough time to spend
-# 5s in TCP connect plus 5s in the TLS handshake. A gateway-severed held poll
-# resets this budget — see :func:`post_evaluate_with_retry`.
+# fail open within the observer's 30s hook deadline, reserving 10s for TCP/TLS
+# connect and 5s for hook startup, relay fallback and margin.
 _EVALUATE_POLICY_FAIL_OPEN_RETRY_BUDGET_S = 15.0
 _EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S = 1.0
 _EVALUATE_POLICY_RETRY_MAX_BACKOFF_S = 10.0
 # The tool-call phase gets its own, much longer budget: every harness
 # registers a tool-call hook timeout far above it, so a call in flight can
 # ride out a multi-minute server outage instead of forcing an approval card.
-# The request / result phases keep the short budget above — a prompt or
-# result hook that times out is not the sole gate and blocking it longer
-# buys nothing. Public because the claude-native relay, which owns its own
-# retry loop, shares the budget.
+# Request and result phases use their separate budgets above. Public because
+# the claude-native relay, which owns its own retry loop, shares the budget.
 TOOL_CALL_POLICY_RETRY_BUDGET_S = 300.0
 # Claude/Codex enforcement hooks retain the original operation through an outage.
 # Their hook timeouts exceed this bounded wait.
@@ -640,8 +633,9 @@ def post_evaluate_with_retry(
     phase-dependent budget: the tool-call phase (``PHASE_TOOL_CALL``) gets
     :data:`TOOL_CALL_POLICY_RETRY_BUDGET_S` with a
     :data:`_TOOL_CALL_POLICY_RETRY_MAX_BACKOFF_S` cap, so a tool call rides
-    out a multi-minute server outage; every other phase keeps
-    :data:`_EVALUATE_POLICY_RETRY_BUDGET_S`. Returns the successful response,
+    out a multi-minute server outage; tool results use the short fail-open
+    budget, and other phases use :data:`_EVALUATE_POLICY_RETRY_BUDGET_S`.
+    Returns the successful response,
     or ``None`` if the budget is exhausted or a non-retryable error occurs.
     A 429 ``Retry-After`` hint takes precedence over exponential backoff but
     is capped by :data:`_EVALUATE_POLICY_MAX_RETRY_AFTER_S`.
