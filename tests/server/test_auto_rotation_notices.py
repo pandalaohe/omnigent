@@ -55,7 +55,7 @@ def due_session(store, harness="antigravity-native", enabled="on"):
 
 
 @pytest.mark.asyncio
-async def test_notice_waits_retries_then_records_once(db_uri):
+async def test_notice_waits_retries_until_handover_is_requested(db_uri):
     store = SqlAlchemyConversationStore(db_uri)
     conv = due_session(store)
     posts, state, outcome = [], ["busy"], [{"forwarded": False}]
@@ -81,7 +81,16 @@ async def test_notice_waits_retries_then_records_once(db_uri):
             "with rotate=false only or never to clear."
         ) in posts[-1]["content"][0]["text"]
         await notices.tick()
+        await notices._deliveries[(0, conv.id)]
         assert len(posts) == 2
+        state[0] = "idle"
+        await notices.tick()
+        await notices._deliveries[(0, conv.id)]
+        assert len(posts) == 3
+        store.set_labels(conv.id, {ROTATE_REQUESTED_LABEL_KEY: "0"})
+        await notices.tick()
+        await notices._deliveries[(0, conv.id)]
+        assert len(posts) == 3
     finally:
         await notices.shutdown()
 
@@ -103,6 +112,37 @@ async def test_dropped_notice_writes_no_marker(db_uri, change):
     assert NOTICED_COUNT_LABEL_KEY not in store.get_conversation(conv.id).labels
     await notices.tick()
     assert len(posts) == (1 if change == "denied" else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed", [False, True])
+async def test_restart_resumes_due_notice_without_new_usage(db_uri, failed):
+    from omnigent.server.auto_rotation import ATTEMPT_LABEL_KEY, FAILED_ATTEMPT_LABEL_KEY
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = due_session(store)
+    store.set_labels(conv.id, {NOTICED_COUNT_LABEL_KEY: "1"})
+    if failed:
+        store.set_labels(
+            conv.id,
+            {
+                ROTATE_REQUESTED_LABEL_KEY: "0",
+                ATTEMPT_LABEL_KEY: "failed-before-injection",
+                FAILED_ATTEMPT_LABEL_KEY: "0:failed-before-injection",
+            },
+        )
+    posts = []
+    notices = service(store, None, posts, ["idle"], [{"forwarded": True}])
+    await notices.start(SimpleNamespace())
+    try:
+        await notices._deliveries[(0, conv.id)]
+        assert len(posts) == 1
+        store.set_labels(conv.id, {"omnigent.auto_rotation": "off"})
+        await notices.tick()
+        await notices._deliveries[(0, conv.id)]
+        assert len(posts) == 1
+    finally:
+        await notices.shutdown()
 
 
 @pytest.mark.asyncio
@@ -276,7 +316,7 @@ async def test_switch_disabled_during_probe_prevents_retrigger(db_uri):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["unconfirmed", "draft_may_remain"])
-async def test_failed_attempt_allows_notice_only_after_another_interval(db_uri, outcome):
+async def test_unconfirmed_attempt_stays_fenced_across_rounds(db_uri, outcome):
     from omnigent.server.auto_rotation import auto_rotation_for
 
     store = SqlAlchemyConversationStore(db_uri)
@@ -302,7 +342,7 @@ async def test_failed_attempt_allows_notice_only_after_another_interval(db_uri, 
                 },
             )
             status = auto_rotation_for(store.get_conversation(conv.id), store)
-            assert status.due is (outcome == "unconfirmed")
+            assert not status.due
             assert store.get_conversation(conv.id).labels[ROTATE_REQUESTED_LABEL_KEY] == "0"
             # Rediscovery must not re-trigger a completed attempt.
             notices._rediscover()

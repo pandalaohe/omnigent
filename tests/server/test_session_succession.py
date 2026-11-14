@@ -12,7 +12,8 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -145,6 +146,12 @@ RUNNER_ID_B = "b1b2c3d4e5f60718293a4b5c6d7e8f02"
 QUESTION_ID = "elicit_q1"
 
 
+class _HeartbeatStream(httpx.AsyncByteStream):
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield b'data: {"type": "session.heartbeat"}\n\n'
+        await asyncio.Event().wait()
+
+
 class _FakeRunnerClient:
     """Records runner POSTs and answers succession/release with canned bodies."""
 
@@ -154,6 +161,21 @@ class _FakeRunnerClient:
         self.succession_failures = 0
         self.release_failures = 0
         self.dropped: list[dict[str, Any]] = []
+
+    @asynccontextmanager
+    async def stream(
+        self, method: str, url: str, *, timeout: httpx.Timeout
+    ) -> AsyncIterator[httpx.Response]:
+        del timeout
+        response = httpx.Response(
+            200,
+            request=httpx.Request(method, f"http://runner.test{url}"),
+            stream=_HeartbeatStream(),
+        )
+        try:
+            yield response
+        finally:
+            await response.aclose()
 
     async def post(
         self,

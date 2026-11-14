@@ -515,7 +515,7 @@ async def test_new_attempt_same_revision_claims_once_and_rejects_old_request(cli
 
 
 @pytest.mark.parametrize("harness", ["claude-native", "antigravity-native"])
-async def test_failed_round_rearms_after_four_compactions(client, store, harness):
+async def test_failed_round_retries_without_resetting_compactions(client, store, harness):
     from omnigent.server.auto_rotation import (
         ATTEMPT_LABEL_KEY,
         DRAFT_LABEL_KEY,
@@ -528,63 +528,48 @@ async def test_failed_round_rearms_after_four_compactions(client, store, harness
     from tests.server.test_auto_rotation import _compact
 
     conv = store.create_conversation(harness_override=harness)
+    if harness != "antigravity-native":
+        for _ in range(3):
+            _compact(store, conv.id)
     store.set_labels(
         conv.id,
         {
             "omnigent.auto_rotation": "on",
+            "omnigent.auto_rotation.compactions": "3",
+            INFERRED_COMPACTIONS_LABEL_KEY: "3",
             "omnigent.last_context_tokens": "150000",
             "omnigent.last_context_window": "200000",
-            FRESH_ROUND_LABEL_KEY: "0",
         },
     )
+    status = auto_rotation_for(store.get_conversation(conv.id), store)
+    store.set_labels(conv.id, {FRESH_ROUND_LABEL_KEY: str(status.round_marker)})
     url = f"/v1/sessions/{conv.id}/handover"
-    first = await client.post(url, json={"handover": "Same note", "rotate": True, "auto": True})
-    assert first.json()["rotate"] is True
-    first_row = store.get_conversation(conv.id)
-    first_attempt = rotation_attempt(first_row.labels, 0)
-    store.set_labels(conv.id, {FAILED_ATTEMPT_LABEL_KEY: first_attempt})
-    for count in range(5):
-        row = store.get_conversation(conv.id)
-        status = auto_rotation_for(row, store)
-        store.set_labels(conv.id, {FRESH_ROUND_LABEL_KEY: str(status.round_marker)})
-        assert auto_rotation_for(store.get_conversation(conv.id), store).due is (count == 4)
-        if count == 1:
-            refused = await client.post(
-                url, json={"handover": "Same note", "rotate": True, "auto": True}
-            )
-            assert refused.json()["rotate"] is False
-        if count < 4:
-            if harness == "antigravity-native":
-                store.set_labels(conv.id, {INFERRED_COMPACTIONS_LABEL_KEY: str(count + 1)})
-            else:
-                _compact(store, conv.id)
-    next_round = await client.post(
-        url, json={"handover": "Same note", "rotate": True, "auto": True}
-    )
-    assert next_round.json()["rotate"] is True
+    body = {"handover": "Same note", "rotate": True, "auto": True}
+    assert (await client.post(url, json=body)).json()["rotate"] is True
+    first = store.get_conversation(conv.id)
+    store.set_labels(conv.id, {FAILED_ATTEMPT_LABEL_KEY: rotation_attempt(first.labels, 0)})
+    assert auto_rotation_for(store.get_conversation(conv.id), store).due
+    # The fourth round retains the cumulative eligibility from the first three.
+    if harness == "antigravity-native":
+        store.set_labels(conv.id, {INFERRED_COMPACTIONS_LABEL_KEY: "4"})
+    else:
+        _compact(store, conv.id)
+    status = auto_rotation_for(store.get_conversation(conv.id), store)
+    store.set_labels(conv.id, {FRESH_ROUND_LABEL_KEY: str(status.round_marker)})
+    assert auto_rotation_for(store.get_conversation(conv.id), store).due
+    assert (await client.post(url, json=body)).json()["rotate"] is True
     row = store.get_conversation(conv.id)
-    assert row.archive_revision == 0
-    assert row.labels[ATTEMPT_LABEL_KEY] != first_row.labels[ATTEMPT_LABEL_KEY]
-    body = {"archive_revision": "0", "attempt": row.labels[ATTEMPT_LABEL_KEY]}
+    assert row.labels[ATTEMPT_LABEL_KEY] != first.labels[ATTEMPT_LABEL_KEY]
+    claim = {"archive_revision": "0", "attempt": row.labels[ATTEMPT_LABEL_KEY]}
     claim_url = url + "/injection"
-    assert (await client.post(claim_url, json=body)).json()["status"] == "claimed"
+    assert (await client.post(claim_url, json=claim)).json()["status"] == "claimed"
     assert store.get_conversation(conv.id).labels[DRAFT_LABEL_KEY] == "true"
-    assert (await client.post(claim_url, json=body | {"input_cleared": "true"})).json()[
+    assert (await client.post(claim_url, json=claim | {"input_cleared": "true"})).json()[
         "status"
     ] == "unconfirmed"
-    assert DRAFT_LABEL_KEY not in store.get_conversation(conv.id).labels
-    assert (await client.post(claim_url, json=body)).json()["status"] == "unconfirmed"
     store.set_labels(conv.id, {FAILED_ATTEMPT_LABEL_KEY: rotation_attempt(row.labels, 0)})
-    # A note persisted during deferral must not shorten the next interval.
-    for count in range(5):
-        status = auto_rotation_for(store.get_conversation(conv.id), store)
-        store.set_labels(conv.id, {FRESH_ROUND_LABEL_KEY: str(status.round_marker)})
-        assert auto_rotation_for(store.get_conversation(conv.id), store).due is (count == 4)
-        if count < 4:
-            if harness == "antigravity-native":
-                store.set_labels(conv.id, {INFERRED_COMPACTIONS_LABEL_KEY: str(5 + count)})
-            else:
-                _compact(store, conv.id)
+    assert not auto_rotation_for(store.get_conversation(conv.id), store).due
+    assert (await client.post(url, json=body)).json()["rotate"] is False
 
 
 @pytest.mark.parametrize(

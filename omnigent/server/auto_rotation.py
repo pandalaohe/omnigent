@@ -55,21 +55,17 @@ def attempt_failed(conv: Conversation) -> bool:
     )
 
 
-def compactions_since_attempt(
-    conv: Conversation, store: ConversationStore, status: AutoRotationStatus
-) -> int:
-    if status.harness == "antigravity-native":
-        baseline = _label_int(conv.labels.get(ATTEMPT_COMPACTIONS_LABEL_KEY))
-        return max(
-            0, status.compactions - (baseline if baseline is not None else status.compactions)
-        )
-    cursor = conv.labels.get(ATTEMPT_ITEM_LABEL_KEY) or conv.labels.get("omnigent.handover_item")
-    if cursor is None:
-        return 0
-    return len(
-        store.list_items(
-            conv.id, after=cursor, type="compaction", limit=status.compactions_setting
-        ).data
+def rotation_injected(conv: Conversation) -> bool:
+    """An unconfirmed injection must be reconciled before issuing another attempt."""
+    if conv.labels.get(INJECTED_ATTEMPT_LABEL_KEY) == rotation_attempt(
+        conv.labels, conv.archive_revision
+    ):
+        return True
+    injected = _label_int(conv.labels.get(INJECTED_REVISION_LABEL_KEY))
+    return (
+        not conv.labels.get(ATTEMPT_LABEL_KEY)
+        and injected is not None
+        and injected >= conv.archive_revision
     )
 
 
@@ -175,19 +171,14 @@ def auto_rotation_for(
         status.due = (
             status.eligible
             and status.enabled
-            and (
-                compactions_since_attempt(conv, conversation_store, status)
-                if attempt_failed(conv)
-                else status.compactions
-            )
-            >= status.compactions_setting
+            and status.compactions >= status.compactions_setting
             and _label_int(conv.labels.get(FRESH_ROUND_LABEL_KEY)) == status.round_marker
             and status.remaining_pct is not None
             and status.remaining_pct <= status.remaining_pct_setting
             and (not status.rotation_pending or attempt_failed(conv))
             and not conv.labels.get(DRAFT_LABEL_KEY)
+            and not rotation_injected(conv)
             and not conv.labels.get(SUCCEEDED_BY_LABEL_KEY)
-            and _label_int(conv.labels.get(NOTICED_COUNT_LABEL_KEY)) != status.round_marker
         )
     except Exception:
         logger.warning("Could not read auto-rotation state for %s", conv.id, exc_info=True)

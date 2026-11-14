@@ -36,8 +36,14 @@ user to type `/clear`.
 Before sending a command, the server durably claims its revision and attempt;
 if that write fails, no command is sent. The same attempt is never injected twice,
 including after a runner restart. A failed attempt keeps its pending request so a
-late clear can still deliver the note. After another `n` compactions from that
-attempt's acceptance, a fresh threshold crossing can notify and arm a new attempt.
+late clear can still deliver the note. If a notice produces no handover request,
+expect another notice on a later 60-second tick once the session is idle and
+still meets the fresh context and cumulative compaction gates. Usage updates
+within the same round must not bypass that interval. A failed attempt that never
+claimed injection can notify and arm a new attempt without another `n` compactions.
+Restart the isolated server and confirm that still-due sessions resume notices
+without requiring another usage update. A pending request or confirmed successor
+must prevent duplicate notices and attempts.
 A crash between claim and delivery leaves terminal input uncertain; inspect the
 terminal before retrying manually.
 If SessionStart is late or absent, expect a rotation-unconfirmed warning. If abort cleanup
@@ -50,13 +56,15 @@ Report each unavailable harness separately. Stop the isolated instance using its
 recipe's cleanup command; the component test wrapper cleans its own temporary
 HOME and runtime files.
 
-After installing this change, check a previously stuck top-level session with
-a clean terminal input. Keep its current `n` and threshold settings. Complete
-`n` additional compactions from the failed attempt, allowing a fresh usage
-reading above and then below the threshold. Expect one context notice, one
+After installing this change, check a previously stuck top-level session whose
+failed attempt never claimed injection. Keep its current `n` and threshold settings.
+If its cumulative count and fresh context reading still meet those settings,
+expect a context notice on an idle tick without additional compactions, then one
 automatic handover and one clear command; the successor must open with the
 latest handover note. Check the session link and successor ID in the web UI.
 If the earlier clear confirms late, expect immediate succession and note
 delivery instead. A warning that a draft may remain requires clearing terminal
-input manually; it must never lead to another automatic injection. Record
+input manually; it must never lead to another automatic injection. An injection
+whose outcome remains unconfirmed stays blocked even after input cleanup or a
+new compaction round; reconcile the terminal and successor before a manual retry. Record
 source/successor IDs, compaction count, timestamps and the visible note.

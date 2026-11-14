@@ -37,8 +37,8 @@ from omnigent.server.auto_rotation import (
     INJECTED_REVISION_LABEL_KEY,
     _label_int,
     attempt_failed,
-    compactions_since_attempt,
     rotation_attempt,
+    rotation_injected,
 )
 from omnigent.server.child_cap import CHILD_CAP_LABEL_KEY
 from omnigent.server.permission_tiers import ConfirmedPermissionState, read_permission_state
@@ -415,12 +415,10 @@ def register_succession_routes(
                 ):
                     deferred = "above_threshold"
                 failed = attempt_failed(replace(latest, labels=labels))
-                if labels.get(DRAFT_LABEL_KEY) or (
-                    failed
-                    and compactions_since_attempt(
-                        replace(latest, labels=labels), conversation_store, status
-                    )
-                    < status.compactions_setting
+                if (
+                    labels.get(DRAFT_LABEL_KEY)
+                    or (failed and rotation_injected(replace(latest, labels=labels)))
+                    or labels.get(SUCCEEDED_BY_LABEL_KEY)
                 ):
                     deferred = "compacted"
                 rotate = deferred is None

@@ -179,7 +179,9 @@ async def test_fresh_round_and_due_boundaries(runtime_init, db_uri):
     assert store.get_conversation(conv.id).labels[FRESH_ROUND_LABEL_KEY] == "1700000004000000"
     assert not (await usage({"context_tokens": 148000})).due
     assert (await usage({"context_tokens": 150000})).due
-    for key in (NOTICED_COUNT_LABEL_KEY, ROTATE_REQUESTED_LABEL_KEY, SUCCEEDED_BY_LABEL_KEY):
+    store.set_labels(conv.id, {NOTICED_COUNT_LABEL_KEY: "1700000004000000"})
+    assert (await usage({"context_tokens": 160000})).due
+    for key in (ROTATE_REQUESTED_LABEL_KEY, SUCCEEDED_BY_LABEL_KEY):
         store.set_labels(conv.id, {key: "1700000004000000"})
         assert not (await usage({"context_tokens": 160000})).due
         store.delete_label(conv.id, key)

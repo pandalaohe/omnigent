@@ -20,6 +20,8 @@ from omnigent.server.auto_rotation import (
     ATTEMPT_LABEL_KEY,
     DRAFT_LABEL_KEY,
     FAILED_ATTEMPT_LABEL_KEY,
+    FRESH_ROUND_LABEL_KEY,
+    INJECTED_ATTEMPT_LABEL_KEY,
     NOTICED_COUNT_LABEL_KEY,
     attempt_failed,
     auto_rotation_for,
@@ -98,8 +100,9 @@ class AutoRotationNotices:
 
     def mark_due(self, session_id: str, marker: int) -> None:
         key = (current_workspace_id(), session_id)
+        previous = self._due.get(key)
         self._due[key] = marker
-        if self._app is not None:
+        if self._app is not None and previous != marker:
             self._schedule(key)
 
     def track(self, session_id: str, revision: str) -> None:
@@ -113,6 +116,12 @@ class AutoRotationNotices:
             self._retry[key] = _Retry(revision, attempt)
 
     def _rediscover(self) -> None:
+        for session_id in self._store.list_label_values(FRESH_ROUND_LABEL_KEY):
+            conv = self._store.get_conversation(session_id)
+            if conv is not None:
+                status = self._status(conv)
+                if status.due:
+                    self._due[(current_workspace_id(), session_id)] = status.round_marker
         for session_id, revision in self._store.list_label_values(
             ROTATE_REQUESTED_LABEL_KEY
         ).items():
@@ -147,6 +156,8 @@ class AutoRotationNotices:
             await asyncio.to_thread(self._rediscover)
         except Exception:
             _logger.exception("Could not rediscover pending rotations at startup")
+        for key in self._due:
+            self._schedule(key)
         if self._task is None:
             self._task = asyncio.create_task(self._run(), name="auto-rotation-notices")
 
@@ -196,6 +207,9 @@ class AutoRotationNotices:
                 state, _ = await self._state(conv)
                 if state not in {"idle", "steerable"}:
                     return
+                # Once delivered, wait for the agent's turn to finish before reminding it.
+                if conv.labels.get(NOTICED_COUNT_LABEL_KEY) == str(marker) and state != "idle":
+                    return
                 fresh = await asyncio.to_thread(self._store.get_conversation, session_id)
                 if fresh is None or fresh.runner_id != conv.runner_id or not self._owns(fresh):
                     return
@@ -234,7 +248,7 @@ class AutoRotationNotices:
                 await asyncio.to_thread(
                     self._store.mutate_label_group, session_id, "omnigent.", mark
                 )
-                self._forget_due(key, marker)
+                # Forwarding a notice is not a completed rotation. Retain it for the next tick.
         except Exception as exc:
             from omnigent.errors import ErrorCode, OmnigentError
 
@@ -306,7 +320,7 @@ class AutoRotationNotices:
             retry.attempts += 1
             response = await routed.client.post(
                 f"/v1/sessions/{quote(session_id, safe='')}/pending-rotation",
-                json={"archive_revision": retry.revision},
+                json={"archive_revision": retry.revision, "attempt": retry.attempt},
                 timeout=30,
             )
             response.raise_for_status()
@@ -327,6 +341,8 @@ class AutoRotationNotices:
                 if rotation_attempt(labels, fresh.archive_revision) != attempt:
                     return LabelGroupChange({}, set())
                 updates = {FAILED_ATTEMPT_LABEL_KEY: attempt}
+                if retry.unconfirmed:
+                    updates[INJECTED_ATTEMPT_LABEL_KEY] = attempt
                 if ATTEMPT_COMPACTIONS_LABEL_KEY not in labels:
                     updates[ATTEMPT_COMPACTIONS_LABEL_KEY] = str(self._status(fresh).compactions)
                 if retry.draft_may_remain:
@@ -334,6 +350,11 @@ class AutoRotationNotices:
                 return LabelGroupChange(updates, set())
 
             await asyncio.to_thread(self._store.mutate_label_group, session_id, "omnigent.", fail)
+            latest = await asyncio.to_thread(self._store.get_conversation, session_id)
+            if latest is not None:
+                status = await asyncio.to_thread(self._status, latest)
+                if status.due:
+                    self._due[key] = status.round_marker
             items = await asyncio.to_thread(
                 self._store.append,
                 session_id,
