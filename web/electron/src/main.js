@@ -1849,6 +1849,7 @@ let browserPlacesUi;
 const browserPlaces = createBrowserPlaces({
   directory: () => app.getPath("userData"),
   settings: loadSettings,
+  saveSettings,
 });
 const browserPermissionPrompt = createBrowserPermissionPrompt({
   BrowserWindow,

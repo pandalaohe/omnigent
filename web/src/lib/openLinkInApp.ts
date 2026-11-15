@@ -43,7 +43,7 @@ export function onInAppLinkOpen(
   return () => void listeners.delete(listener);
 }
 
-async function openInApp(conversationId: string, url: string): Promise<void> {
+async function openInApp(conversationId: string, url: string, agent = true): Promise<void> {
   const bridge = (window as unknown as { omnigentDesktop: BrowserBridge }).omnigentDesktop;
   let error: string | undefined;
   let newViewId: string | undefined;
@@ -75,7 +75,7 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
     // Chat and file content can come from an agent, so their links use the
     // agent policy even when a user clicks them.
     const result = await bridge.browserOpenOrNavigate(newViewId, url, undefined, {
-      agent: true,
+      agent,
       ...navigationHostOptions(hostId),
     });
     if (result?.ok) {
@@ -102,6 +102,11 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
       console.warn("[openLinkInApp] browserClose failed:", err);
     }
   }
+}
+
+export async function openUrlInSessionBrowser(conversationId: string, href: string): Promise<void> {
+  const url = parseHttpUrl(href);
+  if (url && supportsBrowser()) await openInApp(conversationId, url.href, false);
 }
 
 /** Resolve `href` against the page, or null unless it is an http(s) URL — so a

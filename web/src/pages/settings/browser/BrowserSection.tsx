@@ -2,7 +2,8 @@ import { useEffect, useRef } from "react";
 import { useLocation, useNavigate } from "@/lib/routing";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { SettingsGroup } from "@/components/SettingsGroup";
-import { BrowserPlacesSettings } from "@/components/BrowserPane/BrowserPlacesSettings";
+import { HistoryTab } from "./HistoryTab";
+import { BookmarksTab } from "./BookmarksTab";
 import { BrowserExtensionsControl } from "@/components/BrowserExtensionsControl";
 import { BrowserAccessControl } from "@/components/BrowserAccessControl";
 import { BrowserLoginControl, OpenLinksInAppControl } from "./legacyControls";
@@ -76,11 +77,8 @@ export function BrowserSection() {
         aria-labelledby={`tab-${active}`}
         className="space-y-6"
       >
-        {(active === "history" || active === "bookmarks") && (
-          <SettingsGroup title={active === "history" ? "History" : "Bookmarks"}>
-            <BrowserPlacesSettings />
-          </SettingsGroup>
-        )}
+        {active === "history" && <HistoryTab />}
+        {active === "bookmarks" && <BookmarksTab />}
         {active === "signin" && (
           <SettingsGroup title="Stay signed in">
             <BrowserLoginControl />
