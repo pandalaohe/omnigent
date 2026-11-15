@@ -6,6 +6,8 @@ import {
   addToOtherTypes,
   applyPreset,
   copyStrategy,
+  choiceDocumentLinks,
+  referencedChoicePools,
   removePreset,
   removeWorkType,
   renameWorkType,
@@ -56,6 +58,70 @@ function document(): SessionChoiceDocument {
 }
 
 describe("policy edits preserve working copies", () => {
+  it("derives unique pools from every preset and host link without using legacy limits", () => {
+    const before = document();
+    before.presets[0].links.push({ agent: "other", meter: "shared" });
+    before.hosts.b = {
+      review: [[{ links: [{ agent: "sdk", model: "old-model" }, { agent: "missing" }] }]],
+    };
+    expect([
+      ...referencedChoicePools(before, agents, {
+        codex: "codex",
+        "codex-native": "codex",
+        "pi-native": "pi",
+      }).pools,
+    ]).toEqual(["codex:new-model", "shared", "codex:old-model", "pi:"]);
+    expect(choiceDocumentLinks(before).map((link) => link.agent)).toEqual([
+      "native",
+      "other",
+      "native",
+      "other",
+      "sdk",
+      "missing",
+    ]);
+    expect(before.limits).toEqual({ pool: { reserveExempt: ["work"] } });
+  });
+
+  it.each(["missing agent", "missing harness", "missing product map"])(
+    "keeps explicit meters but offers no guessed pool with %s",
+    (unknown) => {
+      const policy = {
+        ...structuredClone(EMPTY_CHOICE),
+        presets: [
+          {
+            id: "code",
+            name: "Code",
+            links: [
+              { agent: "native", model: "model-x" },
+              { agent: "missing", meter: "shared" },
+            ],
+          },
+        ],
+      };
+      const references = referencedChoicePools(
+        policy,
+        unknown === "missing agent"
+          ? []
+          : unknown === "missing harness"
+            ? [{ ...agents[0], harness: null }]
+            : agents,
+        unknown === "missing product map" ? {} : { "codex-native": "codex" },
+      );
+      expect([...references.pools]).toEqual(["shared"]);
+      expect(references.complete).toBe(false);
+    },
+  );
+
+  it("uses an agent pool only when its loaded harness explicitly has no product", () => {
+    const policy = {
+      ...structuredClone(EMPTY_CHOICE),
+      presets: [{ id: "code", name: "Code", links: [{ agent: "native", model: "model-x" }] }],
+    };
+    const references = referencedChoicePools(policy, agents, { "codex-native": null });
+    expect([...references.pools]).toEqual(["native:model-x"]);
+    expect(references.complete).toBe(true);
+  });
+
   it("renames ids, aliases, defaults, every host and reserve exemptions", () => {
     const before = document();
     const next = renameWorkType(before, "work", "Big Design");

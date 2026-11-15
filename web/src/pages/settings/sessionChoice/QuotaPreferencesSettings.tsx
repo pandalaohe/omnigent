@@ -14,6 +14,10 @@ import {
 } from "@/lib/sessionCollabPreferences";
 import { USER_PREFERENCES_PATCH_REJECTED_EVENT } from "@/lib/userPreferencesSync";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
+import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { useQuery } from "@tanstack/react-query";
+import { listCallingDefaultCatalogs } from "@/lib/callingDefaultsApi";
+import { canonicalNativeHarness } from "@/lib/nativeHarnessModes";
 
 interface Draft {
   quotaTightBelowPct: string;
@@ -21,6 +25,7 @@ interface Draft {
   quotaFloorPct: string;
   quotaPeriodDefault: string;
   quotaPeriods: Record<string, { period: string }>;
+  quotaPeriodRules: (SessionCollabPreferences["quotaPeriodRules"][number] & { draftId: string })[];
 }
 
 const EMPTY_CAPABILITIES: Record<string, HarnessCapability> = {};
@@ -34,7 +39,15 @@ function draftFromPreferences(preferences: SessionCollabPreferences): Draft {
     quotaPeriods: Object.fromEntries(
       Object.entries(preferences.quotaPeriods).map(([product, period]) => [product, { period }]),
     ),
+    quotaPeriodRules: (preferences.quotaPeriodRules ?? []).map((row) => ({
+      ...row,
+      draftId: crypto.randomUUID(),
+    })),
   };
+}
+
+function draftKey(draft: Draft) {
+  return JSON.stringify(draft, (key, value) => (key === "draftId" ? undefined : value));
 }
 
 function parsePercentage(text: string): number | null {
@@ -46,12 +59,18 @@ function parsePercentage(text: string): number | null {
 export function QuotaPreferencesSettings() {
   const preferences = useSessionCollabPreferences();
   const registry = useAgentRegistry();
+  const agents = useAvailableAgents();
+  const catalogs = useQuery({
+    queryKey: ["calling-defaults-catalogs"],
+    queryFn: listCallingDefaultCatalogs,
+    retry: false,
+  });
   const capabilities = useHarnessCatalog(
     (catalog) => catalog.capabilitiesByHarness,
     EMPTY_CAPABILITIES,
   );
   const [draft, setDraft] = useState(() => draftFromPreferences(preferences));
-  const storedDraft = useRef(JSON.stringify(draftFromPreferences(preferences)));
+  const storedDraft = useRef(draftKey(draftFromPreferences(preferences)));
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const productKeys = new Set<string>();
@@ -69,7 +88,7 @@ export function QuotaPreferencesSettings() {
 
   useEffect(() => {
     const incoming = draftFromPreferences(preferences);
-    const key = JSON.stringify(incoming);
+    const key = draftKey(incoming);
     if (storedDraft.current !== key) {
       storedDraft.current = key;
       setDraft(incoming);
@@ -87,7 +106,7 @@ export function QuotaPreferencesSettings() {
     return () => window.removeEventListener(USER_PREFERENCES_PATCH_REJECTED_EVENT, rejected);
   }, []);
 
-  const update = (field: keyof Omit<Draft, "quotaPeriods">, value: string) => {
+  const update = (field: keyof Omit<Draft, "quotaPeriods" | "quotaPeriodRules">, value: string) => {
     setDraft((current) => ({ ...current, [field]: value }));
     setError(null);
     setSaved(false);
@@ -129,6 +148,22 @@ export function QuotaPreferencesSettings() {
       return;
     }
     const periods: SessionCollabPreferences["quotaPeriods"] = {};
+    const scopes = new Set<string>();
+    for (const row of draft.quotaPeriodRules) {
+      const scope = JSON.stringify([row.agent, row.model ?? null]);
+      if (
+        !row.agent ||
+        (row.model !== undefined && !row.model.trim()) ||
+        !QUOTA_PERIOD_PATTERN.test(row.period) ||
+        scopes.has(scope)
+      ) {
+        setError(
+          "Choose an agent and a valid period for every exception. Each Agent / Model combination can appear once.",
+        );
+        return;
+      }
+      scopes.add(scope);
+    }
     for (const [product, row] of Object.entries(draft.quotaPeriods)) {
       const period = row.period.trim();
       if (period === "") {
@@ -148,6 +183,11 @@ export function QuotaPreferencesSettings() {
       quotaFloorPct: floor,
       quotaPeriodDefault: defaultPeriod || null,
       quotaPeriods: periods,
+      quotaPeriodRules: draft.quotaPeriodRules.map(({ agent, model, period }) => ({
+        agent,
+        ...(model === undefined ? {} : { model }),
+        period,
+      })),
     });
     setError(null);
     setSaved(true);
@@ -219,7 +259,8 @@ export function QuotaPreferencesSettings() {
           Quota window
           <HelpTip label="About deciding periods">
             Automatic uses the source-pinned window, or the tightest window when none is pinned.
-            Period names can be 5h, 7d or month. An exception takes precedence for its product.
+            Period names can be 5h, 7d or month. Agent + Model overrides Agent, then legacy product
+            and the default. Model IDs match exactly.
           </HelpTip>
         </div>
         <label className="mt-3 block max-w-sm text-sm font-medium">
@@ -234,45 +275,166 @@ export function QuotaPreferencesSettings() {
           />
         </label>
         <div className="mt-4 border-t border-border pt-3">
-          <ExceptionList
-            rows={draft.quotaPeriods}
-            items={quotaItems}
-            summary={(row) => row.period || "Choose a period"}
-            editor={renderPeriodEditor}
-            supports={(item) =>
-              productKeys.has(item.key) ? null : "Quota periods apply only to native products"
-            }
-            onAdd={(key) => {
-              setDraft((current) => ({
-                ...current,
-                quotaPeriods: { ...current.quotaPeriods, [key]: { period: "" } },
-              }));
-              setSaved(false);
-            }}
-            onPatch={(key, patch) => {
-              setDraft((current) => ({
-                ...current,
-                quotaPeriods: {
-                  ...current.quotaPeriods,
-                  [key]: { ...current.quotaPeriods[key], ...patch },
-                },
-              }));
-              setError(null);
-              setSaved(false);
-            }}
-            onRemove={(key) => {
-              setDraft((current) => ({
-                ...current,
-                quotaPeriods: Object.fromEntries(
-                  Object.entries(current.quotaPeriods).filter(([product]) => product !== key),
+          <div className="space-y-3">
+            <p className="text-sm font-medium">Agent exceptions</p>
+            {draft.quotaPeriodRules.map((row, index) => {
+              const agent = agents.data?.find((item) => item.id === row.agent);
+              const models = [
+                ...new Set(
+                  (catalogs.data ?? [])
+                    .filter(
+                      (item) =>
+                        agent?.harness &&
+                        canonicalNativeHarness(item.harness.replaceAll("_", "-")) ===
+                          canonicalNativeHarness(agent.harness.replaceAll("_", "-")),
+                    )
+                    .flatMap((item) => item.models.map((model) => model.id)),
                 ),
-              }));
-              setSaved(false);
-            }}
-            isLoading={registry.isLoading}
-            isError={registry.isError}
-            onRetry={registry.retry}
-          />
+              ];
+              const patch = (next: Partial<typeof row>) => {
+                setDraft((current) => ({
+                  ...current,
+                  quotaPeriodRules: current.quotaPeriodRules.map((item, position) =>
+                    position === index ? { ...item, ...next } : item,
+                  ),
+                }));
+                setSaved(false);
+                setError(null);
+              };
+              return (
+                <div key={row.draftId} className="flex flex-wrap items-end gap-2">
+                  <label className="grid gap-1 text-sm">
+                    Agent
+                    <select
+                      aria-label={`Exception ${index + 1} agent`}
+                      className="h-9 max-w-full rounded border border-input bg-background px-2"
+                      value={row.agent}
+                      onChange={(event) => patch({ agent: event.target.value, model: undefined })}
+                    >
+                      <option value="" disabled>
+                        Choose an agent
+                      </option>
+                      {row.agent && !agent && (
+                        <option value={row.agent}>{row.agent} (unavailable)</option>
+                      )}
+                      {agents.data?.map((item) => (
+                        <option key={item.id} value={item.id}>
+                          {item.display_name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="grid gap-1 text-sm">
+                    Model (optional)
+                    <Input
+                      aria-label={`Exception ${index + 1} model`}
+                      list={`quota-period-models-${index}`}
+                      placeholder="All models"
+                      value={row.model ?? ""}
+                      onChange={(event) => patch({ model: event.target.value || undefined })}
+                    />
+                    <datalist id={`quota-period-models-${index}`}>
+                      {models.map((model) => (
+                        <option key={model} value={model} />
+                      ))}
+                    </datalist>
+                  </label>
+                  <label className="grid gap-1 text-sm">
+                    Period
+                    <Input
+                      aria-label={`Exception ${index + 1} period`}
+                      maxLength={32}
+                      placeholder="e.g. 5h"
+                      value={row.period}
+                      onChange={(event) => patch({ period: event.target.value })}
+                    />
+                  </label>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    aria-label={`Remove exception ${index + 1}`}
+                    onClick={() => {
+                      setDraft((current) => ({
+                        ...current,
+                        quotaPeriodRules: current.quotaPeriodRules.filter(
+                          (_, position) => position !== index,
+                        ),
+                      }));
+                      setSaved(false);
+                    }}
+                  >
+                    Remove
+                  </Button>
+                </div>
+              );
+            })}
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                setDraft((current) => ({
+                  ...current,
+                  quotaPeriodRules: [
+                    ...current.quotaPeriodRules,
+                    { draftId: crypto.randomUUID(), agent: "", period: "" },
+                  ],
+                }));
+                setSaved(false);
+              }}
+            >
+              Add agent exception
+            </Button>
+            {agents.isError && (
+              <p role="alert">
+                Could not load agents.{" "}
+                <button type="button" className="underline" onClick={() => void agents.refetch()}>
+                  Retry
+                </button>
+              </p>
+            )}
+          </div>
+          <details className="mt-3">
+            <summary className="cursor-pointer text-sm">Legacy product exceptions</summary>
+            <ExceptionList
+              rows={draft.quotaPeriods}
+              items={quotaItems}
+              summary={(row) => row.period || "Choose a period"}
+              editor={renderPeriodEditor}
+              supports={(item) =>
+                productKeys.has(item.key) ? null : "Quota periods apply only to native products"
+              }
+              onAdd={(key) => {
+                setDraft((current) => ({
+                  ...current,
+                  quotaPeriods: { ...current.quotaPeriods, [key]: { period: "" } },
+                }));
+                setSaved(false);
+              }}
+              onPatch={(key, patch) => {
+                setDraft((current) => ({
+                  ...current,
+                  quotaPeriods: {
+                    ...current.quotaPeriods,
+                    [key]: { ...current.quotaPeriods[key], ...patch },
+                  },
+                }));
+                setError(null);
+                setSaved(false);
+              }}
+              onRemove={(key) => {
+                setDraft((current) => ({
+                  ...current,
+                  quotaPeriods: Object.fromEntries(
+                    Object.entries(current.quotaPeriods).filter(([product]) => product !== key),
+                  ),
+                }));
+                setSaved(false);
+              }}
+              isLoading={registry.isLoading}
+              isError={registry.isError}
+              onRetry={registry.retry}
+            />
+          </details>
         </div>
       </details>
       <div className="mt-4 flex flex-wrap items-center gap-3">

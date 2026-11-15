@@ -94,9 +94,21 @@ async def test_session_choice_tools_registered_on_native_and_dispatch_routes(tmp
     assert names <= set(build_mcp_config(tmp_path)["mcpServers"]["omnigent"]["autoApprove"])
     assert names <= set(_AGY_ENABLED_TOOLS)
     seen = []
+    proof = {
+        "source_revision": "current",
+        "mapping_fingerprint": "mapping",
+        "replaced_paths": [["limits", "shared"]],
+        "new_rule_ids": ["converted"],
+    }
 
     def receive(request):
-        seen.append((request.method, request.url.path))
+        seen.append(
+            (
+                request.method,
+                request.url.path,
+                json.loads(request.content) if request.content else None,
+            )
+        )
         return httpx.Response(200, json={"revision": "next"})
 
     async with httpx.AsyncClient(
@@ -104,7 +116,14 @@ async def test_session_choice_tools_registered_on_native_and_dispatch_routes(tmp
     ) as client:
         for name, args in (
             ("sys_session_choice_read", {}),
-            ("sys_session_choice_update", {"settings": None, "expected_revision": "current"}),
+            (
+                "sys_session_choice_update",
+                {
+                    "settings": {"schemaVersion": 2, "limitRules": []},
+                    "expected_revision": "current",
+                    "conversion_proof": proof,
+                },
+            ),
             ("sys_quota_floor", {"tile": "account-a", "off": True, "keep": True}),
         ):
             validate(args, schemas[name]["parameters"])
@@ -113,7 +132,15 @@ async def test_session_choice_tools_registered_on_native_and_dispatch_routes(tmp
             )
             assert json.loads(result) == {"revision": "next"}
     assert seen == [
-        ("GET", "/v1/me/session-choice"),
-        ("PUT", "/v1/me/session-choice"),
-        ("POST", "/v1/me/session-choice/floor"),
+        ("GET", "/v1/me/session-choice", None),
+        (
+            "PUT",
+            "/v1/me/session-choice",
+            {
+                "settings": {"schemaVersion": 2, "limitRules": []},
+                "expected_revision": "current",
+                "conversion_proof": proof,
+            },
+        ),
+        ("POST", "/v1/me/session-choice/floor", {"tile": "account-a", "off": True, "keep": True}),
     ]

@@ -4,10 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
+from typing import Annotated, Any, Literal, Self
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, StrictStr, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictStr,
+    ValidationError,
+    model_validator,
+)
 
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, UnifiedAuthProvider
 from omnigent.server.routes._auth_helpers import require_user
@@ -17,12 +25,15 @@ from omnigent.server.session_choice import (
     SessionChoice,
     TileLimits,
     active_on,
+    choice_revision,
     floor_off_active,
     parse_session_choice,
     state_for,
     tile_line,
 )
 from omnigent.server.user_preferences_store import (
+    ChoiceConversionPlanner,
+    ChoiceConversionProof,
     SqlAlchemyUserPreferencesStore,
     UserPreferencesUserNotFoundError,
     UserPreferencesValidationError,
@@ -33,16 +44,43 @@ class SessionChoiceUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     settings: dict[str, Any] | None
     expected_revision: StrictStr
+    conversion_proof: ChoiceConversionProof | None = None
+
+
+class PreviewCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    agent_id: Annotated[StrictStr, Field(min_length=1)]
+    model: Annotated[StrictStr, Field(min_length=1)] | None = None
 
 
 class ChoicePreview(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    host_id: str
+    mode: Literal["selection", "candidate"] = "selection"
+    host_id: Annotated[StrictStr, Field(min_length=1)]
     work_type: str | None = None
     caller_id: str | None = None
     pin: str | None = None
     exclude: list[str] = []
     differ_from: str | None = None
+    settings: dict[str, Any] | None = None
+    candidate: PreviewCandidate | None = None
+    include_running: StrictBool = False
+    conversion: StrictBool = False
+
+    @model_validator(mode="after")
+    def mode_fields(self) -> Self:
+        if "settings" in self.model_fields_set and self.settings is None:
+            raise ValueError("settings must be a complete document, not null")
+        if self.mode == "candidate":
+            if self.candidate is None:
+                raise ValueError("candidate mode requires candidate")
+            if self.model_fields_set & {"pin", "exclude", "differ_from", "conversion"}:
+                raise ValueError("candidate mode forbids pin/exclude/differ_from/conversion")
+        elif "candidate" in self.model_fields_set:
+            raise ValueError("selection mode forbids candidate")
+        if self.conversion and "settings" in self.model_fields_set:
+            raise ValueError("conversion previews must use the saved source document")
+        return self
 
 
 class QuotaFloorChange(BaseModel):
@@ -53,7 +91,10 @@ class QuotaFloorChange(BaseModel):
 
 
 def create_session_choice_router(
-    store: SqlAlchemyUserPreferencesStore | None, auth_provider: AuthProvider | None
+    store: SqlAlchemyUserPreferencesStore | None,
+    auth_provider: AuthProvider | None,
+    *,
+    conversion_plan: ChoiceConversionPlanner | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -75,13 +116,10 @@ def create_session_choice_router(
         from dataclasses import asdict
 
         from omnigent.runtime.instruction_layers import instruction_agents
-        from omnigent.server.session_choice_runtime import context_request, inputs
-        from omnigent.server.user_preferences_store import read_collab_settings
+        from omnigent.server.session_choice_runtime import choice_settings, context_request, inputs
 
         owner = await owned_host(request, host_id)
-        settings = (
-            await asyncio.to_thread(read_collab_settings, preferences(), owner)
-        ).session_choice
+        settings = await asyncio.to_thread(choice_settings, request.app, owner)
         context = await context_request(request.app, owner, host_id, settings, None, preview=True)
         readings, running, floors = await asyncio.to_thread(
             inputs, request.app, settings, context, time.time()
@@ -91,7 +129,7 @@ def create_session_choice_router(
                 harness: agent.key for agent in instruction_agents() for harness in agent.harnesses
             },
             "meters": [reading.model_dump(mode="json") for reading in readings.values()],
-            "running": running,
+            "running": dict(running),
             "floors": {
                 pool: {
                     **asdict(entry),
@@ -155,20 +193,44 @@ def create_session_choice_router(
 
     @router.post("/me/session-choice/preview")
     async def preview(request: Request, body: ChoicePreview) -> dict[str, Any]:
+        from omnigent.server.session_choice_preview import (
+            candidate_preview,
+            explain_limits,
+            read_preview_settings,
+        )
         from omnigent.server.session_choice_runtime import (
             authorize_agents,
             context_request,
             inputs,
         )
         from omnigent.server.session_collab import collab_owner_for
-        from omnigent.server.user_preferences_store import read_collab_settings
 
         owner = await owned_host(request, body.host_id)
-        settings = (
-            await asyncio.to_thread(read_collab_settings, preferences(), owner)
-        ).session_choice
-        if not active_on(settings, body.host_id):
-            return {"enabled": False}
+        try:
+            settings, saved = await asyncio.to_thread(
+                read_preview_settings,
+                preferences(),
+                owner,
+                draft=body.settings,
+            )
+        except ValidationError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        metadata = {
+            "savedRevision": saved["revision"],
+            "draftFingerprint": choice_revision(body.settings)
+            if body.settings is not None
+            else None,
+        }
+        if body.conversion:
+            from omnigent.server.session_choice_conversion import conversion_preview
+
+            metadata["legacyConversion"] = await asyncio.to_thread(
+                conversion_preview,
+                request.app,
+                owner,
+                settings,
+            )
+            metadata["legacyConversion"]["sourceRevision"] = saved["revision"]
         caller = (
             await asyncio.to_thread(
                 request.app.state.conversation_store.get_conversation, body.caller_id
@@ -176,9 +238,9 @@ def create_session_choice_router(
             if body.caller_id
             else None
         )
-        if (
-            caller
-            and await asyncio.to_thread(
+        if body.caller_id and (
+            caller is None
+            or await asyncio.to_thread(
                 collab_owner_for,
                 caller,
                 request.app.state.conversation_store,
@@ -187,6 +249,24 @@ def create_session_choice_router(
             != owner
         ):
             raise HTTPException(404, "Session not found")
+        if body.mode == "candidate":
+            assert body.candidate is not None
+            return {
+                **await candidate_preview(
+                    request.app,
+                    owner,
+                    body.host_id,
+                    settings,
+                    body.candidate.agent_id,
+                    body.candidate.model,
+                    caller=caller,
+                    work_type=body.work_type,
+                    include_running=body.include_running,
+                ),
+                **metadata,
+            }
+        if not active_on(settings, body.host_id):
+            return {"enabled": False, "mode": "selection", **metadata}
         choice_request = await context_request(
             request.app,
             owner,
@@ -203,11 +283,30 @@ def create_session_choice_router(
         readings, running, floors = await asyncio.to_thread(
             inputs, request.app, settings, choice_request, now
         )
-        return (
-            state_for(request.app)
-            .select(settings, body.work_type, choice_request, readings, running, floors, now=now)
-            .payload()
+        choice = state_for(request.app).select(
+            settings, body.work_type, choice_request, readings, running, floors, now=now
         )
+        result: dict[str, Any] = {**choice.payload(), "mode": "selection", **metadata}
+        if choice.link is not None:
+            result["legacyChecks"] = {
+                "pool": choice.pool,
+                "limits": settings.limits.get(choice.pool) if choice.pool is not None else None,
+                "linkMaxRunning": choice.link.max_running,
+            }
+            result["effectiveLimits"] = await asyncio.to_thread(
+                explain_limits,
+                settings,
+                choice.link,
+                choice_request,
+                running,
+                include_running=body.include_running,
+                load_sessions=request.app.state.conversation_store.get_conversations,
+                now=now,
+            )
+        if not body.include_running:
+            for skipped in result["skipped"]:
+                skipped.pop("running", None)
+        return result
 
     @router.get("/me/session-choice/preview")
     async def preview_query(
@@ -221,13 +320,40 @@ def create_session_choice_router(
     ) -> dict[str, Any]:
         from omnigent.entities import Conversation
         from omnigent.server.session_choice import pool_of_session
+        from omnigent.server.session_choice_preview import read_preview_settings
         from omnigent.server.session_choice_runtime import context_request, inputs
-        from omnigent.server.user_preferences_store import read_collab_settings
 
         owner = await owned_host(request, host_id)
-        settings = (
-            await asyncio.to_thread(read_collab_settings, preferences(), owner)
-        ).session_choice
+        settings, saved = await asyncio.to_thread(read_preview_settings, preferences(), owner)
+        if settings.schema_version == 2:
+            from omnigent.server.session_choice_preview import candidate_preview
+
+            result = await candidate_preview(
+                request.app, owner, host_id, settings, agent_id, model
+            )
+            line = next(
+                (
+                    line
+                    for state in ("stop", "exhausted", "warn")
+                    for line in result["lines"]
+                    if line["state"] == state
+                ),
+                None,
+            )
+            return {
+                "notice": (
+                    f"{line['window'] or 'Quota'}: {line['state']} "
+                    f"({line['remaining_pct']}% left)."
+                )
+                if line
+                else None,
+                "pool": result["legacyChecks"]["pool"],
+                "effectiveLimits": result["effectiveLimits"],
+                "legacyChecks": result["legacyChecks"],
+                "lines": result["lines"],
+                "check": result["check"],
+                "savedRevision": saved["revision"],
+            }
         if not active_on(settings, host_id):
             return {"notice": None}
         context = await context_request(request.app, owner, host_id, settings, None, preview=True)
@@ -296,21 +422,40 @@ def create_session_choice_router(
     @router.get("/me/session-choice")
     async def read(request: Request) -> dict[str, Any]:
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
-        return await asyncio.to_thread(preferences().session_choice, owner)
+        result = await asyncio.to_thread(preferences().session_choice, owner)
+        return {
+            **result,
+            "capabilities": {
+                "documentVersions": [1, 2],
+                "limitRules": True,
+                "effectiveLimits": True,
+            },
+        }
 
     @router.put("/me/session-choice", dependencies=[Depends(require_json_content_type)])
     async def update(request: Request, body: SessionChoiceUpdate) -> dict[str, Any]:
+        from omnigent.server.session_choice_conversion import require_conversion_plan
+
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         accounts_mode = (
             isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
         )
         try:
+            if body.settings is not None:
+                from omnigent.server.session_choice_preview import validate_known_windows
+
+                await validate_known_windows(
+                    request.app, owner, parse_session_choice(body.settings)
+                )
             result = await asyncio.to_thread(
                 preferences().replace_session_choice,
                 owner,
                 body.settings,
                 body.expected_revision,
                 create_if_missing=not accounts_mode,
+                conversion_proof=body.conversion_proof,
+                conversion_plan=conversion_plan
+                or (lambda user, stored: require_conversion_plan(request.app, user, stored)),
             )
             state_for(request.app).saved(
                 owner,

@@ -35,6 +35,7 @@ export interface SessionCollabPreferences {
   quotaFloorPct: number | null;
   quotaPeriodDefault: string | null;
   quotaPeriods: Record<string, string>;
+  quotaPeriodRules: { agent: string; model?: string; period: string }[];
   autoRotationEnabled: boolean;
   autoRotationCompactions: number;
   autoRotationRemainingPct: number;
@@ -101,6 +102,7 @@ export const SESSION_COLLAB_DEFAULTS: SessionCollabPreferences = {
   quotaFloorPct: null,
   quotaPeriodDefault: null,
   quotaPeriods: {},
+  quotaPeriodRules: [],
   autoRotationEnabled: false,
   autoRotationCompactions: 4,
   autoRotationRemainingPct: 25,
@@ -208,6 +210,25 @@ function normalizePreferences(value: unknown): SessionCollabPreferences {
     quotaFloorPct: normalizePercentage(raw.quotaFloorPct, 0, 100),
     quotaPeriodDefault: normalizeQuotaPeriod(raw.quotaPeriodDefault),
     quotaPeriods: normalizeQuotaPeriods(raw.quotaPeriods),
+    quotaPeriodRules: Array.isArray(raw.quotaPeriodRules)
+      ? raw.quotaPeriodRules
+          .filter((row): row is SessionCollabPreferences["quotaPeriodRules"][number] =>
+            Boolean(
+              row &&
+              typeof row === "object" &&
+              typeof row.agent === "string" &&
+              row.agent.trim() &&
+              (row.model === undefined || (typeof row.model === "string" && row.model.trim())) &&
+              typeof row.period === "string" &&
+              QUOTA_PERIOD_PATTERN.test(row.period),
+            ),
+          )
+          .map(({ agent, model, period }) => ({
+            agent,
+            ...(model === undefined ? {} : { model }),
+            period,
+          }))
+      : [],
     autoRotationEnabled: normalizeBoolean(
       raw.autoRotationEnabled,
       SESSION_COLLAB_DEFAULTS.autoRotationEnabled,
@@ -228,9 +249,11 @@ export function isSessionCollabPreferencesDefault(preferences: SessionCollabPref
     (key) =>
       key === "standingPassDefault"
         ? preferences.standingPassDefault.length === 0
-        : key === "quotaPeriods"
-          ? Object.keys(preferences.quotaPeriods).length === 0
-          : preferences[key] === SESSION_COLLAB_DEFAULTS[key],
+        : key === "quotaPeriodRules"
+          ? preferences.quotaPeriodRules.length === 0
+          : key === "quotaPeriods"
+            ? Object.keys(preferences.quotaPeriods).length === 0
+            : preferences[key] === SESSION_COLLAB_DEFAULTS[key],
   );
 }
 

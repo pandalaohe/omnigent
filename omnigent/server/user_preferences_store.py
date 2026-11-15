@@ -16,15 +16,15 @@ import logging
 import math
 import re
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Literal, TypeAlias
+from typing import Annotated, Any, Literal, TypeAlias
 
 import zstandard
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, ValidationError
 from sqlalchemy import LargeBinary, delete, select, type_coerce
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -473,6 +473,125 @@ def read_approval_timeout(
 SESSION_COLLAB_NAMESPACE = "session_collab"
 
 
+class ChoiceConversionProof(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    source_revision: StrictStr
+    mapping_fingerprint: Annotated[StrictStr, Field(min_length=1)]
+    replaced_paths: Annotated[tuple[tuple[StrictStr | StrictInt, ...], ...], Field(min_length=1)]
+    new_rule_ids: Annotated[tuple[StrictStr, ...], Field(min_length=1)]
+
+
+@dataclass(frozen=True)
+class LegacyChoiceConversionPlan:
+    """A freshly verified server plan; never reconstructed from the client proof."""
+
+    mapping_fingerprint: str
+    target: SessionChoice
+    replaced_paths: tuple[tuple[str | int, ...], ...]
+    new_rule_ids: tuple[str, ...]
+
+
+ChoiceConversionPlanner = Callable[[str, SessionChoice], LegacyChoiceConversionPlan]
+
+
+def _legacy_choice_values(document: dict[str, Any]) -> dict[tuple[str | int, ...], Any]:
+    values: dict[tuple[str | int, ...], Any] = {
+        ("limits", pool): value for pool, value in document.get("limits", {}).items()
+    }
+    links: list[tuple[tuple[str | int, ...], dict[str, Any]]] = [
+        (("presets", index, "links", position), link)
+        for index, preset in enumerate(document.get("presets", []))
+        for position, link in enumerate(preset["links"])
+    ]
+    links.extend(
+        (("hosts", host, work, tier_index, row_index, "links", position), link)
+        for host, types in document.get("hosts", {}).items()
+        for work, tiers in types.items()
+        for tier_index, tier in enumerate(tiers)
+        for row_index, row in enumerate(tier)
+        for position, link in enumerate(row["links"])
+    )
+    for path, link in links:
+        if link.get("maxRunning") is not None:
+            cap_path: tuple[str | int, ...] = (*path, "maxRunning")
+            values[cap_path] = link["maxRunning"]
+    return values
+
+
+def validate_legacy_conversion(
+    stored: SessionChoice,
+    incoming: SessionChoice,
+    proof: ChoiceConversionProof,
+    plan: LegacyChoiceConversionPlan,
+    source_revision: str,
+) -> None:
+    """Bind a conversion to current mapping, exact target and unchanged legacy leftovers."""
+    from omnigent.server.session_choice import (
+        ChoiceRevisionConflict,
+        choice_document,
+        normalize_rows,
+    )
+
+    if (
+        proof.source_revision != source_revision
+        or proof.mapping_fingerprint != plan.mapping_fingerprint
+        or proof.replaced_paths != plan.replaced_paths
+        or proof.new_rule_ids != plan.new_rule_ids
+        or len(set(proof.replaced_paths)) != len(proof.replaced_paths)
+        or len(set(proof.new_rule_ids)) != len(proof.new_rule_ids)
+        or incoming.schema_version != 2
+        or plan.target.schema_version != 2
+    ):
+        raise ChoiceRevisionConflict(
+            "Conversion changed. Read and preview it again before saving."
+        )
+    before: dict[str, Any] = choice_document(stored)
+    after: dict[str, Any] = choice_document(incoming)
+    expected = choice_document(normalize_rows(plan.target, stored)[0])
+    legacy = _legacy_choice_values(before)
+    if (
+        any(path not in legacy for path in proof.replaced_paths)
+        or _legacy_choice_values(after)
+        != {path: value for path, value in legacy.items() if path not in proof.replaced_paths}
+        or after != expected
+    ):
+        raise ChoiceRevisionConflict(
+            "Conversion target changed or removes unmapped legacy limits."
+        )
+    old_rules = before.get("limitRules", [])
+    new_ids = set(proof.new_rule_ids)
+    target_rules = after["limitRules"]
+    if (
+        any(rule["id"] in new_ids for rule in old_rules)
+        or [rule for rule in target_rules if rule["id"] not in new_ids] != old_rules
+        or {rule["id"] for rule in target_rules if rule["id"] in new_ids} != new_ids
+    ):
+        raise ChoiceRevisionConflict(
+            "Conversion must preserve existing rules and add its planned IDs."
+        )
+
+
+def _choice_configuration_error(value: Any) -> dict[str, Any] | None:
+    from omnigent.server.session_choice import parse_session_choice
+
+    if value is None:
+        return None
+    try:
+        parse_session_choice(value)
+    except ValidationError as exc:
+        version = value.get("schemaVersion", 1) if isinstance(value, dict) else None
+        return {
+            "state": "unsupported"
+            if type(version) is int and version not in (1, 2)
+            else "invalid",
+            "schemaVersion": version,
+            "issues": [
+                {"path": list(error["loc"]), "reason": error["msg"]} for error in exc.errors()
+            ],
+        }
+    return None
+
+
 def _approval_preference(value: Any, *, persisted: bool = False) -> Any:
     if not isinstance(value, dict) or not {
         "standingPassDefault",
@@ -544,7 +663,21 @@ class CollabSettings:
     quota_floor_pct: float | None = None
     quota_period_default: str | None = None
     quota_periods: dict[str, str] = field(default_factory=dict)
+    quota_period_rules: list[dict[str, str]] = field(default_factory=list)
     session_choice: SessionChoice = field(default_factory=SessionChoice)
+    session_choice_error: dict[str, Any] | None = None
+
+    def quota_period(
+        self, product: str | None, agent: str | None = None, model: str | None = None
+    ) -> str | None:
+        matches = [
+            row
+            for row in self.quota_period_rules
+            if row["agent"] == agent and ("model" not in row or row["model"] == model)
+        ]
+        if matches:
+            return max(matches, key=lambda row: "model" in row)["period"]
+        return self.quota_periods.get(product or "") or self.quota_period_default
 
 
 _CollabFieldKind: TypeAlias = Literal["bool", "positive_int"]
@@ -633,8 +766,12 @@ def _parse_collab_settings(value: Any) -> CollabSettings:
     from omnigent.server.session_choice import parse_session_choice
 
     if "sessionChoice" in value:
-        with suppress(ValidationError):
-            resolved["session_choice"] = parse_session_choice(value["sessionChoice"])
+        raw_choice = value["sessionChoice"]
+        error = _choice_configuration_error(raw_choice)
+        if error is not None:
+            resolved["session_choice_error"] = error
+        elif raw_choice is not None:
+            resolved["session_choice"] = parse_session_choice(raw_choice)
     from omnigent.server.standing_approval import approval_strings
 
     try:
@@ -684,6 +821,21 @@ def _parse_collab_settings(value: Any) -> CollabSettings:
             and isinstance(period, str)
             and _QUOTA_PERIOD_PATTERN.fullmatch(period)
         }
+    rules = value.get("quotaPeriodRules")
+    if isinstance(rules, list):
+        resolved["quota_period_rules"] = [
+            {key: row[key] for key in ("agent", "model", "period") if key in row}
+            for row in rules
+            if isinstance(row, dict)
+            and isinstance(row.get("agent"), str)
+            and bool(row["agent"].strip())
+            and (
+                "model" not in row
+                or (isinstance(row["model"], str) and bool(row["model"].strip()))
+            )
+            and isinstance(row.get("period"), str)
+            and _QUOTA_PERIOD_PATTERN.fullmatch(row["period"])
+        ]
     return CollabSettings(**resolved)
 
 
@@ -1951,6 +2103,9 @@ class SqlAlchemyUserPreferencesStore:
                 if any(
                     cap.reserve and cap.reserve.stop_pct is not None
                     for cap in settings.limits.values()
+                ) or any(
+                    rule.reserve and rule.reserve.stop_pct is not None
+                    for rule in settings.limit_rules
                 ):
                     result.append((workspace, owner, settings))
             except (ValueError, zstandard.ZstdError):
@@ -2165,7 +2320,11 @@ class SqlAlchemyUserPreferencesStore:
         envelope = self.get(user_id)
         collab = (envelope or {}).get("settings", {}).get(SESSION_COLLAB_NAMESPACE)
         value = collab.get("sessionChoice") if isinstance(collab, dict) else None
-        return {"settings": value, "revision": choice_revision(value)}
+        result = {"settings": value, "revision": choice_revision(value)}
+        error = _choice_configuration_error(value)
+        if error is not None:
+            result["configurationError"] = error
+        return result
 
     def choice_floor_off(self, user_id: str) -> dict[str, Any]:
         from omnigent.server.session_choice import FloorOff
@@ -2236,6 +2395,8 @@ class SqlAlchemyUserPreferencesStore:
         expected_revision: str,
         *,
         create_if_missing: bool = True,
+        conversion_proof: ChoiceConversionProof | None = None,
+        conversion_plan: ChoiceConversionPlanner | None = None,
     ) -> dict[str, Any]:
         """Compare and replace only the choice document under the preference lock."""
         from omnigent.server.session_choice import (
@@ -2264,6 +2425,16 @@ class SqlAlchemyUserPreferencesStore:
                 raise ChoiceRevisionConflict(
                     "Session choice changed. Read it again before saving."
                 )
+            previous_version = (
+                previous.get("schemaVersion", 1) if isinstance(previous, dict) else 1
+            )
+            if incoming is not None and (
+                (type(previous_version) is int and previous_version not in (1, 2))
+                or (previous_version != 1 and incoming.schema_version == 1)
+            ):
+                raise ChoiceRevisionConflict(
+                    "Session choice version conflict. Reload a compatible settings editor."
+                )
             stored = None
             if previous is not None:
                 with suppress(ValidationError):
@@ -2272,9 +2443,21 @@ class SqlAlchemyUserPreferencesStore:
             document = None
             if incoming is not None:
                 normalized, corrected = normalize_rows(incoming, stored)
+                if conversion_proof is not None:
+                    if stored is None or conversion_plan is None:
+                        raise ChoiceRevisionConflict("Fresh conversion mapping is unavailable.")
+                    validate_legacy_conversion(
+                        stored,
+                        normalized,
+                        conversion_proof,
+                        conversion_plan(user_id, stored),
+                        expected_revision,
+                    )
                 document = choice_document(normalized)
                 collab["sessionChoice"] = document
             else:
+                if conversion_proof is not None:
+                    raise ChoiceRevisionConflict("A conversion cannot clear the choice document.")
                 collab.pop("sessionChoice", None)
             settings[SESSION_COLLAB_NAMESPACE] = collab
             validated = _assemble_envelope(settings)

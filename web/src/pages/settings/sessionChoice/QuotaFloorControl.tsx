@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { choiceRequest, useSessionChoiceDocument } from "./sessionChoiceData";
 import type { UsageAccountView } from "@/pages/usageBoard/usageBoardData";
+import { refreshChoiceConsumers } from "./choiceInvalidation";
 
 export interface ChoiceFloor {
   until: "reset" | "manual";
@@ -69,8 +70,7 @@ export function QuotaFloorControl({
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ tile, off: mode !== "kept", keep: mode === "manual" }),
               });
-              await floors.refetch();
-              await queryClient.invalidateQueries({ queryKey: ["sessionChoiceMeters"] });
+              await refreshChoiceConsumers(queryClient);
             } catch (failure) {
               setError((failure as Error).message);
             } finally {

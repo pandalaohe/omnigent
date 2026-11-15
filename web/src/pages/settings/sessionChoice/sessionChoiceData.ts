@@ -35,6 +35,9 @@ export interface ChoiceLimit {
   maxRunning?: number | null;
 }
 export interface SessionChoiceDocument {
+  [key: string]: unknown;
+  schemaVersion?: number;
+  limitRules?: ChoiceLimitRule[];
   enabled: boolean;
   strategy: "drain" | "balance";
   defaultWorkType?: string | null;
@@ -48,6 +51,72 @@ export interface ChoiceEnvelope {
   settings: SessionChoiceDocument | null;
   revision: string;
   corrected?: string[];
+  capabilities?: { documentVersions: number[]; limitRules: boolean; effectiveLimits: boolean };
+  configurationError?: { code?: string; message?: string };
+}
+
+export interface ChoiceConversionPlan {
+  sourceRevision: string;
+  mappingFingerprint: string;
+  replacedPaths: string[][];
+  newRuleIds: string[];
+  newRules: ChoiceLimitRule[];
+  unmapped: { path: (string | number)[]; reason: string }[];
+  convertible: boolean;
+  settings: SessionChoiceDocument | null;
+}
+
+export interface ChoiceLimitRule {
+  [key: string]: unknown;
+  id: string;
+  agent: string;
+  host?: string | null;
+  model?: string | null;
+  maxRunning?: number | null;
+  reserve?: {
+    [key: string]: unknown;
+    mode?: "daily" | "total";
+    window?: string;
+    pct?: number | null;
+    stopPct?: number | null;
+  } | null;
+  reserveExempt?: string[];
+}
+
+export interface ChoiceEffectiveField {
+  defined: boolean;
+  value: unknown;
+  sourceRuleId: string | null;
+  specificity: number | null;
+  scope: { agent: string; host?: string | null; model?: string | null } | null;
+  runningCount?: number | null;
+  reservedCount?: number | null;
+  countState?: string;
+}
+
+export interface ChoiceCandidatePreview {
+  mode: "candidate";
+  candidate: { agent_id: string; host_id: string; model: string };
+  policyActive: boolean;
+  configuredInTiers: boolean;
+  effectiveLimits: Record<string, ChoiceEffectiveField>;
+  legacyChecks: { pool: string; limits: ChoiceLimit | null; linkMaxRunning: number | null };
+  lines?: ChoiceLine[];
+  check: { state: "passes_checks" | "blocked" | "unknown"; reason: string | null };
+  admission: false;
+  savedRevision: string;
+  draftFingerprint: string | null;
+}
+
+export class ChoiceRequestError extends Error {
+  status: number;
+  detail: unknown;
+  constructor(status: number, detail: unknown) {
+    super(typeof detail === "string" ? detail : JSON.stringify(detail));
+    this.name = "ChoiceRequestError";
+    this.status = status;
+    this.detail = detail;
+  }
 }
 export const EMPTY_CHOICE: SessionChoiceDocument = {
   enabled: false,
@@ -69,10 +138,9 @@ export async function choiceRequest<T>(path = "", init?: RequestInit): Promise<T
   const response = await authenticatedFetch(`/v1/me/session-choice${path}`, init);
   const data = await response.json();
   if (!response.ok)
-    throw new Error(
-      typeof data.detail === "string"
-        ? data.detail
-        : `Could not save session choice (${response.status}). Reload and try again.`,
+    throw new ChoiceRequestError(
+      response.status,
+      data.detail ?? `Session choice request failed (${response.status}).`,
     );
   return data as T;
 }

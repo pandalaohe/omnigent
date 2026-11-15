@@ -93,6 +93,9 @@ _DELETE = object()
 class QuotaContext:
     owner_id: str
     host_id: str | None
+    agent_id: str | None = None
+    model: str | None = None
+    product: str | None = None
 
 
 class UsageAccountLimitError(ValueError):
@@ -260,7 +263,31 @@ class AgentQuotaService:
             if self.permissions is not None
             else RESERVED_USER_LOCAL
         )
-        return QuotaContext(owner or owner_hint or RESERVED_USER_LOCAL, host_id)
+        from omnigent.runtime.instruction_layers import agent_key_for_harness
+        from omnigent.server.routes._sessions.helpers import (
+            _resolve_harness_impl,
+            _resolve_llm_model,
+        )
+
+        product = agent_key_for_harness(
+            _resolve_harness_impl(
+                conversation, agent_store=self.agent_store, agent_cache=self.agent_cache
+            )
+        )
+        model = (
+            conversation.reported_model
+            or conversation.model_override
+            or _resolve_llm_model(
+                conversation, agent_store=self.agent_store, agent_cache=self.agent_cache
+            )
+        )
+        return QuotaContext(
+            owner or owner_hint or RESERVED_USER_LOCAL,
+            host_id,
+            conversation.agent_id,
+            model,
+            product,
+        )
 
     def report(
         self,
@@ -1105,11 +1132,9 @@ class AgentQuotaService:
                     normalize_claude_labels=str(newest.get("provider", "")).lower() == "claude",
                 )
             )
-            period = (
-                settings.quota_periods.get(product)
-                or settings.quota_period_default
-                or newest.get("pinned_period")
-            )
+            period = settings.quota_period(
+                product, context.agent_id if context.product == product else None, context.model
+            ) or newest.get("pinned_period")
             quota = agent_quota(windows, tiers, now=now, deciding_period=period)
             if not fresh:
                 quota = AgentQuota("unknown", None, None, (), reason="stale_report")
@@ -1717,13 +1742,14 @@ class AgentQuotaService:
                     )
         return issues
 
-    def tile_lines(self, owner: str, *, now: float | None = None) -> dict:
+    def tile_lines(self, owner: str, *, now: float | None = None, settings=None) -> dict:
         from dataclasses import asdict
 
         from omnigent.server.session_choice import TileLimits, tile_line
 
         now = time.time() if now is None else now
-        settings = read_collab_settings(self.preferences, owner).session_choice
+        if settings is None:
+            settings = read_collab_settings(self.preferences, owner).session_choice
         readings = self.pool_readings(QuotaContext(owner, None), now=now)
         floors = self.preferences.choice_floor_off(owner) if self.preferences else {}
         return {
@@ -1898,9 +1924,7 @@ class AgentQuotaService:
         fresh = freshness == "fresh"
         product = product if isinstance(product, str) else None
         deciding = (
-            settings.quota_periods.get(product)
-            or settings.quota_period_default
-            or record.get("pinned_window")
+            settings.quota_period(product) or record.get("pinned_window")
             if product
             else record.get("pinned_window")
         )
@@ -2206,17 +2230,28 @@ class AgentQuotaService:
         return quota_line(quotas, tiers, now=now) or ""
 
     def session_choice_line(self, conversation: Conversation) -> str:
+        from omnigent.runner.routing import routing_host_id
         from omnigent.server.session_choice import (
             active_on,
+            choice_document,
+            choice_revision,
             floor_off_active,
             generated_line,
             ordered_links,
+            rule_limits,
         )
 
         text = ""
         try:
             context = self.context(conversation)
-            settings = read_collab_settings(self.preferences, context.owner_id).session_choice
+            collab = read_collab_settings(self.preferences, context.owner_id)
+            if collab.session_choice_error is not None:
+                return "Session choice configuration unavailable."
+            settings = collab.session_choice
+            host = routing_host_id(conversation, self.conversations)
+            context = replace(context, host_id=host)
+            if host is None and settings.schema_version == 2 and settings.enabled:
+                return "Scoped limits unavailable: host identity unresolved."
             if not active_on(settings, context.host_id or ""):
                 return ""
             text = generated_line(settings)
@@ -2251,6 +2286,45 @@ class AgentQuotaService:
                 if entry is not None and floor_off_active(entry, reading, now):
                     (use_up if entry.until == "manual" else released).append(pool)
             parts = [text]
+            if settings.schema_version == 2 and conversation.agent_id is not None:
+                from omnigent.server.routes._sessions.helpers import _resolve_llm_model
+
+                model = (
+                    conversation.reported_model
+                    or conversation.model_override
+                    or _resolve_llm_model(
+                        conversation,
+                        agent_store=self.agent_store,
+                        agent_cache=self.agent_cache,
+                    )
+                )
+                if model is None and any(
+                    rule.agent == conversation.agent_id and rule.model is not None
+                    for rule in settings.limit_rules
+                ):
+                    parts.append("Scoped limits unavailable: model identity unresolved.")
+                else:
+                    _, fields = rule_limits(
+                        settings, conversation.agent_id, context.host_id, model
+                    )
+                    details = {
+                        name: field.payload() for name, field in fields.items() if field.defined
+                    }
+                    parts.append(
+                        "Scoped limits: "
+                        + json.dumps(
+                            {
+                                "revision": choice_revision(choice_document(settings)),
+                                "agent": conversation.agent_id,
+                                "host": context.host_id,
+                                "model": model,
+                                "fields": details,
+                                "legacyPoolLimitsRemain": bool(settings.limits),
+                            },
+                            separators=(",", ":"),
+                        )
+                        + "."
+                    )
             if quota:
                 parts.append("Quota: " + "; ".join(quota) + ".")
             if use_up:

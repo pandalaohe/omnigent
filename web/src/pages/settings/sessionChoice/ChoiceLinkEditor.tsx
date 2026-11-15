@@ -4,8 +4,9 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useHostModelOptions, type Host } from "@/hooks/useHosts";
 import type { UsageAccountView } from "@/pages/usageBoard/usageBoardData";
-import type { ChoiceLink } from "./sessionChoiceData";
-import { agentReady, guessMeter, type ChoiceAgent } from "./sessionChoiceEdits";
+import type { ChoiceLink, ChoiceLimit } from "./sessionChoiceData";
+import { guessMeter, type ChoiceAgent } from "./sessionChoiceEdits";
+import { canonicalNativeHarness } from "@/lib/nativeHarnessModes";
 
 export const CHOICE_SELECT =
   "h-8 min-w-0 rounded-md border border-input bg-background px-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
@@ -15,6 +16,7 @@ export function ChoiceLinkEditor({
   agents,
   host,
   meters,
+  limits,
   onChange,
   onRemove,
   removable,
@@ -25,6 +27,7 @@ export function ChoiceLinkEditor({
   agents: ChoiceAgent[];
   host: Host | undefined;
   meters: UsageAccountView[];
+  limits?: Record<string, ChoiceLimit>;
   onChange: (link: ChoiceLink) => void;
   onRemove: () => void;
   removable: boolean;
@@ -33,6 +36,16 @@ export function ChoiceLinkEditor({
 }) {
   const listId = useId();
   const agent = agents.find((a) => a.id === link.agent);
+  const usableAgents = agents.filter(
+    (item) =>
+      item.harness &&
+      host?.configured_harnesses?.[canonicalNativeHarness(item.harness.replaceAll("_", "-"))] ===
+        true,
+  );
+  const agentLabel = (item: ChoiceAgent) =>
+    agents.filter((other) => other.display_name === item.display_name).length > 1
+      ? `${item.display_name} · ${item.harness ?? item.name} · ${item.name === item.display_name || agents.some((other) => other.id !== item.id && other.name === item.name && other.harness === item.harness) ? item.id : item.name}`
+      : item.display_name;
   const catalog = useHostModelOptions(
     host?.host_id ?? null,
     agent?.harness ?? "",
@@ -46,6 +59,7 @@ export function ChoiceLinkEditor({
   function changeIdentity(patch: Partial<ChoiceLink>) {
     const next = { ...link, ...patch };
     if (!meterPicked) next.meter = guessMeter(next, agents, meters);
+    if (next.meter) delete next.maxRunning;
     onChange(next);
   }
   return (
@@ -62,11 +76,14 @@ export function ChoiceLinkEditor({
             <option value="" disabled>
               Choose an agent
             </option>
-            {link.agent && !agent && <option value={link.agent}>{link.agent} (unavailable)</option>}
-            {agents.map((a) => (
+            {link.agent && !usableAgents.some((item) => item.id === link.agent) && (
+              <option value={link.agent} disabled hidden>
+                {agent ? agentLabel(agent) : link.agent} (saved; not ready)
+              </option>
+            )}
+            {usableAgents.map((a) => (
               <option key={a.id} value={a.id}>
-                {a.display_name}
-                {agentReady(a, host) ? "" : " (unavailable on this host)"}
+                {agentLabel(a)}
               </option>
             ))}
           </select>
@@ -126,7 +143,7 @@ export function ChoiceLinkEditor({
       )}
       <div className="flex items-end gap-2">
         <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">
-          Meter
+          Meter · quota counter
           <select
             aria-label="Link meter"
             className={CHOICE_SELECT}
@@ -169,6 +186,20 @@ export function ChoiceLinkEditor({
           </label>
         )}
       </div>
+      <p className="text-xs text-muted-foreground">
+        The quota counter this link spends from, used by Limits, warning/stop lines and quota
+        display; it is separate from provider, model and effort.
+      </p>
+      {link.meter && (
+        <p className="text-xs text-muted-foreground" role="note">
+          Meter max running:{" "}
+          {limits ? (limits[link.meter]?.maxRunning ?? "No pool limit") : "See Limits"}. Agent rules
+          may also apply.{" "}
+          <a className="underline" href="#session-choice-limits">
+            Edit Limits
+          </a>
+        </p>
+      )}
     </div>
   );
 }

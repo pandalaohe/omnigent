@@ -53,6 +53,9 @@ export function renameWorkType(
   }
   for (const limit of Object.values(next.limits))
     limit.reserveExempt = limit.reserveExempt?.map((w) => (w === oldId ? id : w));
+  for (const rule of next.limitRules ?? [])
+    if (rule.reserveExempt)
+      rule.reserveExempt = rule.reserveExempt.map((w) => (w === oldId ? id : w));
   return next;
 }
 
@@ -67,6 +70,8 @@ export function removeWorkType(document: SessionChoiceDocument, id: string): Ses
   for (const types of Object.values(next.hosts)) Reflect.deleteProperty(types, id);
   for (const limit of Object.values(next.limits))
     limit.reserveExempt = limit.reserveExempt?.filter((w) => w !== id);
+  for (const rule of next.limitRules ?? [])
+    if (rule.reserveExempt) rule.reserveExempt = rule.reserveExempt.filter((w) => w !== id);
   if (!next.workTypes.length) {
     next.enabled = false;
     next.defaultWorkType = null;
@@ -135,6 +140,40 @@ export function guessMeter(
   if (link.model?.includes("/") || link.model?.includes(":")) return null;
   const product = agents.find((a) => a.id === link.agent)?.product;
   return meters.find((m) => m.product === product && product != null)?.id ?? null;
+}
+
+export function choiceDocumentLinks(document: SessionChoiceDocument): ChoiceLink[] {
+  return [
+    ...document.presets.flatMap((preset) => preset.links),
+    ...Object.values(document.hosts).flatMap((types) =>
+      Object.values(types)
+        .flat(2)
+        .flatMap((row) => row.links),
+    ),
+  ];
+}
+
+export function referencedChoicePools(
+  document: SessionChoiceDocument,
+  agents: ChoiceAgent[],
+  products: Record<string, string | null>,
+): { pools: Set<string>; complete: boolean } {
+  const pools = new Set<string>();
+  let complete = true;
+  for (const link of choiceDocumentLinks(document)) {
+    if (link.meter) {
+      pools.add(link.meter);
+      continue;
+    }
+    const harness = agents.find((agent) => agent.id === link.agent)?.harness;
+    const key = harness ? canonicalNativeHarness(harness.replaceAll("_", "-")) : null;
+    if (!key || !Object.hasOwn(products, key)) {
+      complete = false;
+      continue;
+    }
+    pools.add(`${products[key] ?? link.agent}:${link.model ?? ""}`);
+  }
+  return { pools, complete };
 }
 
 export function copyStrategy(
