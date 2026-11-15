@@ -1002,7 +1002,7 @@ async def test_relay_policy_evaluate_proxies_to_server_client(
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
 
-    bridge_dir = _prep("relay-policy-test", workspace=tmp_path)
+    bridge_dir = _prep("conv_relay_test", bridge_id="relay-policy-test", workspace=tmp_path)
     session_id = "conv_relay_test"
 
     captured: dict[str, object] = {}
@@ -1069,7 +1069,7 @@ async def test_relay_policy_evaluate_rejects_wrong_token(
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
 
-    bridge_dir = _prep("relay-policy-auth-test", workspace=tmp_path)
+    bridge_dir = _prep("conv_auth_test", bridge_id="relay-policy-auth-test", workspace=tmp_path)
 
     class _NeverCalledClient:
         async def post(self, *a: object, **kw: object) -> object:
@@ -1123,7 +1123,7 @@ async def test_relay_policy_evaluate_surfaces_upstream_error_in_502_body(
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
 
-    bridge_dir = _prep("relay-policy-error-test", workspace=tmp_path)
+    bridge_dir = _prep("conv_err_test", bridge_id="relay-policy-error-test", workspace=tmp_path)
 
     class _RaisingServerClient:
         """Fake server_client whose policy POST fails like a lapsed token."""
@@ -1190,7 +1190,7 @@ async def test_relay_policy_evaluate_truncates_long_upstream_error(
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
 
-    bridge_dir = _prep("relay-policy-trunc-test", workspace=tmp_path)
+    bridge_dir = _prep("conv_trunc_test", bridge_id="relay-policy-trunc-test", workspace=tmp_path)
 
     class _LongRaisingServerClient:
         """Fake server_client whose policy POST fails with a very long reason."""
@@ -1624,7 +1624,7 @@ async def test_native_revision_refreshes_relay_before_turn_without_reset(
         )
     session_id = f"conv_{uuid.uuid4().hex[:12]}"
     bridge_id = f"bridge_{uuid.uuid4().hex[:12]}"
-    bridge_dir = prepare_bridge_dir(bridge_id, workspace=tmp_path)
+    bridge_dir = prepare_bridge_dir(session_id, bridge_id=bridge_id, workspace=tmp_path)
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.bridge.bridge_dir_for_bridge_id", lambda _: bridge_dir
     )
@@ -1755,7 +1755,7 @@ async def test_comment_relay_retains_bridge_on_label_lookup_failure(
     """A failed label read during a spec refresh cannot retire the live relay."""
     session_id = f"conv_{uuid.uuid4().hex[:12]}"
     bridge_id = f"bridge_{uuid.uuid4().hex[:12]}"
-    bridge_dir = prepare_bridge_dir(bridge_id, workspace=tmp_path)
+    bridge_dir = prepare_bridge_dir(session_id, bridge_id=bridge_id, workspace=tmp_path)
     relay_file = bridge_dir / _TOOL_RELAY_FILE
 
     class ServerClient(_SwitchableServerClient):
@@ -1892,8 +1892,8 @@ async def test_agent_switch_moves_relay_to_new_bridge_dir(tmp_path: Path) -> Non
     session_id = f"conv_{uuid.uuid4().hex[:12]}"
     dir_a = bridge_dir_for_bridge_id(bridge_a)
     dir_b = bridge_dir_for_bridge_id(bridge_b)
-    prepare_bridge_dir(bridge_a, workspace=tmp_path)
-    prepare_bridge_dir(bridge_b, workspace=tmp_path)
+    prepare_bridge_dir(session_id, bridge_id=bridge_a, workspace=tmp_path)
+    prepare_bridge_dir(session_id, bridge_id=bridge_b, workspace=tmp_path)
 
     try:
         transport = httpx.ASGITransport(app=app)

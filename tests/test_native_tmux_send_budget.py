@@ -1,12 +1,7 @@
-"""The per-command tmux send budget must be uniform across native bridges.
+"""Native bridges must cover the established tmux stall budget.
 
-Every native harness bridge shells out to ``tmux`` for keystroke delivery
-with a flat per-command subprocess timeout. A bridge whose budget is shorter
-than its siblings' dies first under the same machine load: parallel worker
-boots on a large worktree can starve a healthy tmux server past 5s, and the
-first dispatch send then fails the worker on infra (or is silently lost,
-stranding the supervisor). The identical operation must get the identical
-budget everywhere, and that budget must cover a realistic boot-load stall.
+A bridge may allow a longer control wait, but a shorter budget would reject
+work under load that the other native harnesses survive.
 """
 
 from __future__ import annotations
@@ -40,15 +35,10 @@ _REFERENCE_BUDGET_S = cursor_native_bridge._TMUX_SEND_TIMEOUT_S
 
 
 @pytest.mark.parametrize("name", sorted(_BRIDGES))
-def test_tmux_send_budget_is_uniform_across_bridges(name: str) -> None:
-    """Every bridge gives a tmux command the same send budget.
-
-    A shorter budget on one bridge means that harness's workers die on the
-    same load its siblings survive — the asymmetry that killed claude-native
-    workers at 5.0s while cursor-native rode out the identical stall at 10s.
-    """
+def test_tmux_send_budget_covers_reference_across_bridges(name: str) -> None:
+    """A longer harness control budget must still cover the shared stall."""
     budget = _BRIDGES[name]._TMUX_SEND_TIMEOUT_S
-    assert budget == _REFERENCE_BUDGET_S, (
+    assert budget >= _REFERENCE_BUDGET_S, (
         f"{name}_native_bridge gives a tmux command {budget}s while its "
         f"siblings give {_REFERENCE_BUDGET_S}s — under the same server stall "
         "this bridge's workers fail first"

@@ -406,6 +406,7 @@ _AGY_ENABLED_TOOLS = [
     "sys_session_unarchive",
     "sys_session_update",
     "sys_standing_approval",
+    "sys_standing_approval_read",
     "sys_standing_pass",
     "sys_terminal_close",
     "sys_terminal_launch",

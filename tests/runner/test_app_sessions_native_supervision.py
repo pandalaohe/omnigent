@@ -1065,13 +1065,17 @@ async def test_antigravity_progress_does_not_spend_the_parent_wake(
     loop = asyncio.get_running_loop()
     blocked = False
     clock, reads, working = [0.0], 0, True
-    deadline_ticks = iter([1.0, 2.0, 3.0, 119.0, 120.0])
+    deadline_ticks = iter([1.0, 2.0, 3.0, 599.0, 600.0])
+    observation_recovered = False
+    observations: list[float] = []
     progressed = asyncio.Event()
     monkeypatch.setattr(reader, "monotonic", lambda: clock[0], raising=False)
 
     def summaries(_port: int, **kwargs: Any) -> dict[str, Any]:
         nonlocal blocked
-        if fault == "summary" or (fault in {"working", "unfinished"} and working):
+        if (fault == "summary" and not observation_recovered) or (
+            fault in {"working", "unfinished"} and working
+        ):
             raise httpx.ReadTimeout("summary unavailable")
         if fault == "slow_error" and not blocked:
             blocked = True
@@ -1091,7 +1095,7 @@ async def test_antigravity_progress_does_not_spend_the_parent_wake(
 
     def steps(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
         nonlocal blocked, reads
-        if fault in {"trajectory", "helper"}:
+        if fault in {"trajectory", "helper"} and not observation_recovered:
             raise httpx.ReadTimeout("trajectory unavailable")
         if fault == "late_helper":
             reads += 1
@@ -1115,12 +1119,11 @@ async def test_antigravity_progress_does_not_spend_the_parent_wake(
     async def tick(_seconds: float) -> None:
         await ready.wait()
         clock[0] = (
-            next(deadline_ticks, 121.0)
+            next(deadline_ticks, 601.0)
             if fault in {"summary", "trajectory", "helper"}
             else clock[0] + 40.0
         )
-        if fault == "helper" and clock[0] > 120:
-            raise AssertionError("registered helper never posted its bounded failure")
+
         await asyncio.sleep(0)
 
     bridge_dir = tmp_path / "bridge"
@@ -1152,7 +1155,7 @@ async def test_antigravity_progress_does_not_spend_the_parent_wake(
         async with _runner_client(app) as client:
 
             async def post_reader_event(**kwargs: Any) -> httpx.Response:
-                nonlocal latest_text
+                nonlocal latest_text, observation_recovered
                 payload = kwargs["payload"]
                 data = payload["data"]
                 if payload["type"] == "external_conversation_item":
@@ -1161,6 +1164,12 @@ async def test_antigravity_progress_does_not_spend_the_parent_wake(
                         latest_text = "".join(block.get("text", "") for block in item["content"])
                         messages.append(latest_text)
                 if payload["type"] == "external_session_status":
+                    if data.get("observation_status") == "observation_unconfirmed":
+                        assert data["status"] == "running"
+                        assert inbox.empty() and not server.wake_posts
+                        observations.append(clock[0])
+                        observation_recovered = True
+                        snapshot[:] = [user, final]
                     if data["status"] in {"idle", "failed"}:
                         closed_at.append(clock[0])
                     response = await client.post(
@@ -1279,11 +1288,10 @@ async def test_antigravity_progress_does_not_spend_the_parent_wake(
             assert reads >= 3, "helper retired before its turn appeared"
         delivered = inbox.get_nowait()
         if fault in {"summary", "trajectory", "helper"}:
-            assert delivered["status"] == "failed"
-            assert closed_at == [120], "unconfirmed close must wait for 120 seconds without work"
-            if fault != "helper":
-                assert "READY" in delivered["output"]
-            assert "confirm" in delivered["output"].lower()
+            assert observations == [600]
+            assert delivered["status"] == "completed"
+            assert delivered["output"] == "READY"
+            assert closed_at == [601]
         elif fault != "slow_error":
             expected = "READY B" if fault == "continuation" else "READY"
             assert delivered["output"] == expected

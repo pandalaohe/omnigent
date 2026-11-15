@@ -1156,7 +1156,7 @@ def test_bridge_startup_timeout_round_trips_and_is_cleared(bridge_dir: Path) -> 
     assert read_bridge_startup_timeout(bridge_dir) is None
 
 
-@pytest.mark.parametrize("timeout", [0.0, -1.0, 120.1, float("inf"), float("nan")])
+@pytest.mark.parametrize("timeout", [0.0, -1.0, 180.1, float("inf"), float("nan")])
 def test_bridge_startup_timeout_rejects_unbounded_values(
     bridge_dir: Path,
     timeout: float,
@@ -1166,7 +1166,7 @@ def test_bridge_startup_timeout_rejects_unbounded_values(
         write_bridge_startup_timeout(bridge_dir, timeout)
 
 
-@pytest.mark.parametrize("value", [True, "120", 120.1, 10**1000, None])
+@pytest.mark.parametrize("value", [True, "120", 180.1, 10**1000, None])
 def test_bridge_startup_timeout_ignores_malformed_file_values(
     bridge_dir: Path,
     value: object,

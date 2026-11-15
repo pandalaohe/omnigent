@@ -339,6 +339,7 @@ async def test_clear_session_start_stops_when_the_successor_is_rejected(
     assert requests == [
         ("GET", "/v1/sessions/conv_old"),
         ("POST", "/v1/sessions/conv_old/successor"),
+        ("POST", "/v1/sessions/conv_old/events"),
     ]
     assert read_active_session_id(bridge_dir) == "conv_old"
     assert "Claude /clear rotation failed" in caplog.text

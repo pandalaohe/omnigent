@@ -113,13 +113,14 @@ def _failure_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord
 @pytest.mark.parametrize(
     ("error", "configured_timeout", "login_required", "timeout_s", "reason", "cause"),
     [
-        (TimeoutError(), None, False, 30.0, "timeout", "startup timed out after 30s"),
+        (TimeoutError(), None, False, 180.0, "timeout", "startup timed out after 180s"),
+        (TimeoutError(), 30.0, False, 30.0, "timeout", "startup timed out after 30s"),
         (TimeoutError(), 120.0, False, 120.0, "timeout", "startup timed out after 120s"),
         (
             RuntimeError("event stream ended"),
             None,
             False,
-            30.0,
+            180.0,
             "event_stream_ended",
             "event stream ended before a thread was created",
         ),
@@ -154,6 +155,16 @@ async def test_startup_failure_is_visible_at_error_and_belongs_to_child(
             login_required=login_required,
         )
 
+    forwarder.wait_for_thread_started.assert_called_once_with(
+        startup.event_client,
+        **(
+            {"timeout": None}
+            if login_required
+            else {"timeout": configured_timeout}
+            if configured_timeout is not None
+            else {}
+        ),
+    )
     records = _failure_records(caplog)
     assert len(records) == 1
     record = records[0]
@@ -759,7 +770,7 @@ async def test_diagnostics_error_preserves_original_failure_and_cleanup(
     assert "helper-secret" not in str(row)
     error_text = read_bridge_startup_error(startup.bridge_dir)
     assert error_text is not None
-    assert "startup timed out after 30s: TimeoutError" in error_text
+    assert "startup timed out after 180s: TimeoutError" in error_text
     assert startup.close_order == ["client", "app_server", "subagent", "turn"]
     assert startup.session_id not in orchestration._AUTO_CODEX_APP_SERVERS
 

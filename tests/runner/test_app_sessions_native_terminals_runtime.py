@@ -3798,7 +3798,8 @@ async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
         )
         relay_checks = []
 
-        def relay_post(relay, path, payload):
+        def relay_post(relay, path, payload, *, timeout_s):
+            assert timeout_s > 0
             assert path == "/permission-tiers/state"
             relay_checks.append(path)
             return {

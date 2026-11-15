@@ -49,9 +49,9 @@ def test_build_omnigent_mcp_server_points_serve_mcp_at_bridge_dir() -> None:
     # Relay tools keep their names and are individually permission-gated.
     assert entry["codemode"] is False
     assert "enabled" not in entry
-    # Milliseconds: must exceed the bridge's outer relay hop (330 s) so the
+    # Milliseconds: must exceed the bridge's outer relay hop (350 s) so the
     # relay's clean timeout error beats opencode's client-side kill.
-    assert entry["timeout"] == {"execution": 360_000}
+    assert entry["timeout"] == {"execution": 380_000}
     cmd = entry["command"]
     # Launches the SHARED serve-mcp relay, pointed at THIS bridge dir.
     assert cmd[-3:] == ["serve-mcp", "--bridge-dir", "/tmp/bridge-xyz"]

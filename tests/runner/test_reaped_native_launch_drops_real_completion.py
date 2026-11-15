@@ -1,8 +1,8 @@
-"""A launch-timeout failure is provisional; a later real result must reach the parent.
+"""An unconfirmed launch stays tracked; a later real result must reach the parent.
 
-The launch-liveness reaper fails a dispatch that never acknowledged its start,
-but that ``failed`` is only a guess: a steered claude-native child relays no
-running edge while it works. These tests drive the runner's real HTTP routes
+The launch-liveness reaper reports a dispatch whose start is unconfirmed.
+A steered claude-native child relays no running edge while it works.
+These tests drive the runner's real HTTP routes
 and the production ``sys_read_inbox`` drain, so the child's genuine completion
 replaces the guess even after the parent has already read it, reaches the
 inbox, wakes the parent, and only then finalizes the dispatch's cleanup.
@@ -62,7 +62,11 @@ class _WakeRecordingServerClient(NullServerClient):
         return await super().patch(url, **kwargs)
 
     def wakes(self) -> list[str]:
-        return [notice for notice in self.notices if "finished (" in notice]
+        return [
+            notice
+            for notice in self.notices
+            if "finished (" in notice or "launch unconfirmed" in notice
+        ]
 
 
 async def _wait_until(condition: Callable[[], bool], message: str, timeout: float = 5.0) -> None:
@@ -85,7 +89,7 @@ def _turn_frames(response_id: str) -> list[str]:
 async def test_reaped_native_launch_must_not_discard_childs_real_completion() -> None:
     """A launch-reaped dispatch must still deliver the child's later completion.
 
-    The reaper's ``failed`` is a guess with no terminal edge behind it (the
+    The reaper's observation has no terminal edge behind it (the
     child may still be running); a genuine ``completed`` edge that arrives
     afterwards must replace it, be delivered, and wake the parent, or the
     parent never learns the work actually finished.
@@ -110,18 +114,18 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion() ->
 
     try:
         # The steered native turn relays no running edge, so the entry is still
-        # "launching" when the budget elapses: the reaper fails it, delivers
-        # that guess to the parent inbox and wakes the parent.
+        # "launching" when the budget elapses: the reaper reports uncertainty
+        # to the parent inbox and wakes the parent.
         reaped = subagent_work.reap_stalled_subagent_launches(
             now=entry.created_at + 200.0,
             timeout_s=180.0,
             mark_terminal=app.state.mark_subagent_terminal_and_wake,
         )
         assert reaped == [entry]
-        assert entry.status == "failed"
+        assert entry.status == "launch_unconfirmed"
         await _wait_until(
-            lambda: any("finished (failed)" in notice for notice in server_client.wakes()),
-            "the reaper's failure never woke the parent",
+            lambda: any("launch unconfirmed" in notice for notice in server_client.wakes()),
+            "the unconfirmed launch never woke the parent",
         )
         # The parent reads the notice through the production drain, exactly as
         # its wake turn would.
@@ -132,7 +136,7 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion() ->
             conversation_id=parent_id,
             session_inbox=inbox,
         )
-        assert "no start acknowledgment" in notice, notice
+        assert "Launch is unconfirmed" in notice, notice
         assert inbox.empty()
         # That failure is only the reaper's guess, so draining it must not
         # finalize the dispatch: the entry stays registered (still flagged) and
@@ -159,7 +163,7 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion() ->
                     "agent_id": uuid.uuid4().hex,
                     "model": "test-agent",
                     "harness": "openai-agents",
-                    "content": [{"type": "input_text", "text": "sub-agent finished (failed)"}],
+                    "content": [{"type": "input_text", "text": "sub-agent launch unconfirmed"}],
                 },
             )
             assert resp.status_code == 202, resp.text
@@ -315,7 +319,7 @@ async def test_bare_native_idle_does_not_respend_the_reapers_guess(
 
     Claude's forwarder stamps ``turn_completed`` on a finished turn, so a bare
     ``idle`` only retries delivery of an outcome still awaiting it. Re-reporting
-    the recorded launch-timeout ``failed`` as the child's own terminal edge
+    the recorded ``launch_unconfirmed`` observation as the child's own terminal edge
     would spend the provisional flag (and, once drained, re-deliver the guess),
     dropping the genuine completion that follows -- whether the parent already
     read the guess or its inbox was missing when the reaper fired.
@@ -350,13 +354,13 @@ async def test_bare_native_idle_does_not_respend_the_reapers_guess(
                 timeout_s=180.0,
                 mark_terminal=app.state.mark_subagent_terminal_and_wake,
             ) == [entry]
-            assert entry.status == "failed" and entry.launch_timed_out
+            assert entry.status == "launch_unconfirmed" and entry.launch_timed_out
             if inbox_present_at_reap:
                 # The parent is woken, reads the notice through the production
                 # drain, and its wake turn goes idle again.
                 await _wait_until(
-                    lambda: any("finished (failed)" in n for n in server_client.wakes()),
-                    "the reaper's failure never woke the parent",
+                    lambda: any("launch unconfirmed" in n for n in server_client.wakes()),
+                    "the unconfirmed launch never woke the parent",
                 )
                 notice = await execute_tool(
                     tool_name="sys_read_inbox",
@@ -365,7 +369,7 @@ async def test_bare_native_idle_does_not_respend_the_reapers_guess(
                     conversation_id=parent_id,
                     session_inbox=inbox,
                 )
-                assert "no start acknowledgment" in notice, notice
+                assert "Launch is unconfirmed" in notice, notice
                 assert subagent_work.get_subagent_work(child_id) is entry
                 resp = await client.post(
                     f"/v1/sessions/{parent_id}/events",
@@ -375,7 +379,9 @@ async def test_bare_native_idle_does_not_respend_the_reapers_guess(
                         "agent_id": uuid.uuid4().hex,
                         "model": "test-agent",
                         "harness": "openai-agents",
-                        "content": [{"type": "input_text", "text": "sub-agent finished (failed)"}],
+                        "content": [
+                            {"type": "input_text", "text": "sub-agent launch unconfirmed"}
+                        ],
                     },
                 )
                 assert resp.status_code == 202, resp.text
@@ -387,7 +393,7 @@ async def test_bare_native_idle_does_not_respend_the_reapers_guess(
                 assert not entry.delivered and not server_client.wakes()
 
             # The steered follow-up records the child's harness as claude-native;
-            # its clean end acknowledges nothing for an already-settled entry.
+            # its clean end acknowledges the previously unconfirmed launch.
             resp = await client.post(
                 f"/v1/sessions/{child_id}/events",
                 json={
@@ -405,7 +411,8 @@ async def test_bare_native_idle_does_not_respend_the_reapers_guess(
                 lambda: child_id not in app.state.active_turns,
                 "the steered native turn never ended",
             )
-            assert entry.status == "failed"
+            assert entry.status == "running"
+            assert not entry.launch_timed_out
             wakes_before = len(server_client.wakes())
 
             # The pane goes quiet mid-turn: the PTY watcher's bare idle.
@@ -424,9 +431,7 @@ async def test_bare_native_idle_does_not_respend_the_reapers_guess(
                 # forwarder is told to try again later.
                 assert resp.status_code in (204, 503), resp.text
                 assert not entry.delivered
-            assert entry.status == "failed" and entry.launch_timed_out, (
-                "a bare quiescence idle spent the provisional launch-timeout flag"
-            )
+            assert entry.status == "running" and not entry.launch_timed_out
             assert len(server_client.wakes()) == wakes_before
             if not inbox_present_at_reap:
                 # The parent (re)initializes before the child finishes.

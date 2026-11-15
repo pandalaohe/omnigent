@@ -109,7 +109,8 @@ def test_native_support_node_consumers(tmp_path):
         [node, "--test", str(script), str(script.with_name("scoped_client.test.cjs"))],
         capture_output=True,
         text=True,
-        timeout=45,
+        # Includes the real 65-second queued control deadline and cold-start probes.
+        timeout=120,
         env={
             **os.environ,
             "HOME": str(tmp_path),

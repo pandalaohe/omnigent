@@ -868,9 +868,15 @@ class AcpExecutor(Executor):
             self._pending.pop(req_id, None)
             # asyncio.TimeoutError carries no message, so a caller reporting it
             # by str() would surface a blank failure. Name the stalled call.
+            reported_timeout = (
+                self._config.init_timeout_s
+                if self._initialization_deadline is not None
+                else timeout
+            )
             raise TimeoutError(
                 f"ACP agent {self._config.name!r} did not answer {method} "
-                f"within {timeout:g}s (command: {self._config.command!r})"
+                f"within {reported_timeout:g}s "
+                f"(command: {self._config.command!r})"
             ) from exc
         finally:
             self._pending.pop(req_id, None)
