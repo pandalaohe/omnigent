@@ -90,7 +90,7 @@ import {
   MOD_KEY,
 } from "@/components/KeyboardShortcut";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
+import { downloadWorkspaceFile, fetchFileContent, useFileContent } from "@/hooks/useFileContent";
 import { isVideoFile } from "@/lib/video";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { mintArtifactLink } from "@/hooks/useArtifactLink";
@@ -112,7 +112,7 @@ import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
-import { copyText } from "@/lib/clipboard";
+import { FilePathBar } from "./FilePathBar";
 import { absoluteWorkspacePath } from "@/lib/composerContext";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
@@ -1913,32 +1913,22 @@ function FileViewerBody({
               </KeyboardShortcutTooltip>
             </div>
           )}
-          {/* Always show the file path/name in the toolbar, in every view. */}
-          <TooltipProvider>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  aria-label={`Copy file path: ${path}`}
-                  className="min-w-0 cursor-pointer truncate rounded text-left font-mono text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  onClick={() => {
-                    const absolutePath = absoluteWorkspacePath(path, workspaceRoot);
-                    if (absolutePath === null) {
-                      toast.error("Workspace path unavailable");
-                      return;
-                    }
-                    void copyText(absolutePath).then(
-                      () => toast.success("File path copied"),
-                      () => toast.error("Failed to copy file path"),
-                    );
-                  }}
-                >
-                  {path}
-                </button>
-              </TooltipTrigger>
-              <TooltipContent>Copy file path</TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
+          <FilePathBar
+            key={`${conversationId}:${path}`}
+            path={path}
+            absolutePath={absoluteWorkspacePath(path, workspaceRoot) ?? path}
+            validate={async (destination, signal) => {
+              const result = await fetchFileContent(conversationId, destination, signal);
+              if (result.object !== "session.environment.filesystem.file_content") {
+                throw new Error("This is a folder. Enter a file path.");
+              }
+            }}
+            onNavigate={
+              onNavigateTo
+                ? (destination) => guardDirty(() => onNavigateTo(destination))
+                : undefined
+            }
+          />
         </div>
         <div
           className="relative flex min-w-0 items-center justify-end gap-1"

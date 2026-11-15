@@ -1,58 +1,60 @@
-import { type ReactNode, useEffect, useRef } from "react";
+import { type ReactNode, useLayoutEffect, useRef } from "react";
 
-/**
- * Scrolls the tab strip just far enough to show `tab`. Unlike `scrollIntoView`, it
- * moves no other scroller: the rail slides in from past the window's right edge,
- * so revealing a tab there would shift the whole page sideways.
- */
-export function scrollTabIntoView(tab: HTMLElement | null): void {
-  const viewport = tab?.closest<HTMLElement>("[data-workspace-tabs-viewport]");
-  if (!tab || !viewport) return;
-  const left = viewport.getBoundingClientRect().left + viewport.clientLeft;
-  const right = left + viewport.clientWidth;
-  const box = tab.getBoundingClientRect();
-  if (box.left < left) {
-    // A tab wider than the strip whose end already shows keeps its close button in view.
-    if (box.right <= right && box.width > viewport.clientWidth) return;
-    viewport.scrollLeft -= left - box.left;
-  } else if (box.right > right) {
-    // A tab wider than the strip keeps its start in view.
-    viewport.scrollLeft += Math.min(box.right - right, box.left - left);
-  }
+/** Recompute visibility when a tab is selected, without moving any scroller. */
+export function revealWorkspaceTab(tab: HTMLElement | null): void {
+  tab?.closest("[data-workspace-tabs-viewport]")?.dispatchEvent(new Event("workspace-tab-reveal"));
 }
 
-/** Scroll open tabs horizontally with a hidden scrollbar. */
+/** Reserve 64px per visible tab for its icon, padding and close button. */
+export function workspaceTabLayout(width: number, count: number, activeIndex: number) {
+  const capacity = Math.max(1, Math.floor((width + 2) / 66));
+  const visibleCount = Math.min(count, capacity);
+  const visible = Array.from({ length: visibleCount }, (_, index) => index);
+  if (activeIndex >= visibleCount && visibleCount > 0) visible[visibleCount - 1] = activeIndex;
+  return {
+    visible,
+    width: visibleCount
+      ? Math.max(0, Math.min(240, (width - (visibleCount - 1) * 2) / visibleCount))
+      : 0,
+  };
+}
+
+/** Fit tabs to the strip; excess tabs remain available in the panel picker. */
 export function WorkspaceTabsScroller({ children }: { children: ReactNode }) {
   const viewportRef = useRef<HTMLDivElement>(null);
-  const contentRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const viewport = viewportRef.current;
-    const content = contentRef.current;
-    if (!viewport || !content) return;
-    const wheel = (event: WheelEvent) => {
-      if (viewport.scrollWidth <= viewport.clientWidth) return;
-      // Leave native horizontal gestures alone. Ctrl-wheel must be non-passive
-      // to scroll tabs instead of zooming the page.
-      if (event.deltaX && !event.ctrlKey) return;
-      const delta = event.deltaX || event.deltaY;
-      if (!delta) return;
-      event.preventDefault();
-      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? viewport.clientWidth : 1;
-      viewport.scrollLeft += delta * unit;
-    };
-    // Keep the active tab in view as the rail or tab list resizes.
-    const observer = new ResizeObserver(() => {
-      scrollTabIntoView(
-        content.querySelector<HTMLElement>('[aria-current="true"], [aria-selected="true"]'),
+    if (!viewport) return;
+    const layout = () => {
+      // Closed rails have no measurable slot until they become visible.
+      if (viewport.clientWidth === 0) return;
+      const tabs = Array.from(viewport.querySelectorAll<HTMLElement>("[data-workspace-tab]"));
+      const activeIndex = tabs.findIndex(
+        (tab) =>
+          tab.matches('[aria-current="true"]') || !!tab.querySelector('[aria-selected="true"]'),
       );
-    });
+      const result = workspaceTabLayout(viewport.clientWidth, tabs.length, activeIndex);
+      tabs.forEach((tab, index) => {
+        tab.style.display = result.visible.includes(index) ? "flex" : "none";
+        tab.style.width = `${result.width}px`;
+      });
+    };
+    const observer = new ResizeObserver(layout);
+    const mutation = new MutationObserver(layout);
     observer.observe(viewport);
-    observer.observe(content);
-    viewport.addEventListener("wheel", wheel, { passive: false });
+    mutation.observe(viewport, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["aria-selected", "aria-current"],
+    });
+    viewport.addEventListener("workspace-tab-reveal", layout);
+    layout();
     return () => {
       observer.disconnect();
-      viewport.removeEventListener("wheel", wheel);
+      mutation.disconnect();
+      viewport.removeEventListener("workspace-tab-reveal", layout);
     };
   }, []);
 
@@ -60,11 +62,9 @@ export function WorkspaceTabsScroller({ children }: { children: ReactNode }) {
     <div
       ref={viewportRef}
       data-workspace-tabs-viewport
-      className="no-drag min-w-0 flex-1 overflow-x-auto overflow-y-hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+      className="no-drag flex min-w-0 flex-1 items-center gap-0.5 overflow-hidden"
     >
-      <div ref={contentRef} className="flex w-max items-center gap-0.5">
-        {children}
-      </div>
+      {children}
     </div>
   );
 }
