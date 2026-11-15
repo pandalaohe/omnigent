@@ -1,11 +1,12 @@
 import { useEffect, useRef } from "react";
-import { useLocation, useNavigate } from "@/lib/routing";
-import { supportsBrowser } from "@/lib/nativeBridge";
+import { useLocation, useNavigate, Link } from "@/lib/routing";
+import { supportsBrowser, browserSettingsBridge } from "@/lib/nativeBridge";
 import { HistoryTab } from "./HistoryTab";
 import { BookmarksTab } from "./BookmarksTab";
 import { ExtensionsTab } from "./ExtensionsTab";
 import { SignInTab } from "./SignInTab";
 import { AccessTab } from "./AccessTab";
+import { browserPlacesBridge } from "@/lib/browserPlacesBridge";
 
 const tabs = [
   ["history", "History"],
@@ -23,7 +24,25 @@ export function BrowserSection() {
   useEffect(() => {
     activeRef.current?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
   }, [active]);
-  if (!supportsBrowser()) return <p>Browser settings are in the desktop app</p>;
+  if (!supportsBrowser())
+    return (
+      <div>
+        <p>Browser settings are in the desktop app</p>
+        <p className="mt-2 text-sm text-muted-foreground">
+          Bookmarks, history, sign-ins and extensions are kept on the desktop that uses them.
+        </p>
+      </div>
+    );
+  const places = browserPlacesBridge(),
+    settings = browserSettingsBridge();
+  const needsUpdate =
+    !["remove-history", "clear-since", "retention", "update-in-place"].every((feature) =>
+      places?.browserPlacesFeatures?.includes(feature),
+    ) ||
+    !settings?.browserRememberedList ||
+    !settings.browserRememberedForget ||
+    !settings.browserLocalNetworkList ||
+    !settings.browserLocalNetworkSet;
   function select(tab: string) {
     const params = new URLSearchParams(location.search);
     params.set("tab", tab);
@@ -31,6 +50,14 @@ export function BrowserSection() {
   }
   return (
     <div className="space-y-6">
+      {needsUpdate && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-info/30 bg-info/10 p-3 text-sm">
+          <p>Some options need a newer desktop app</p>
+          <Link className="underline" to="/settings/updates">
+            Check for updates
+          </Link>
+        </div>
+      )}
       <div
         role="tablist"
         aria-label="Browser settings"

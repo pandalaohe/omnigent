@@ -314,3 +314,13 @@ it("opens Settings pages with user policy while chat links retain agent policy",
     ),
   );
 });
+
+it("opens Settings in a new tab and keeps failure details out of its toast", async () => {
+  writeSessionWorkspaceState(CONV, { openBrowsers: ["existing"] });
+  hasView.mockResolvedValue({ exists: true, url: URL_ });
+  openOrNavigate.mockResolvedValue({ ok: false, error: "/opt/work/private/browser-data.json" });
+  await openUrlInSessionBrowser(CONV, URL_);
+  expect(openOrNavigate).toHaveBeenCalledOnce();
+  expect(String(vi.mocked(showToast).mock.calls[0][0])).not.toContain("/opt/work");
+  expect(window.open).toHaveBeenCalledWith(URL_, "_blank", "noopener,noreferrer");
+});

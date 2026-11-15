@@ -193,7 +193,9 @@ export function AccessTab() {
         </p>
         {changes > 0 && (
           <div className="mt-4 flex flex-wrap items-center gap-3 border-t pt-4">
-            <span className="flex-1 text-sm">{changes} unsaved changes</span>
+            <span className="flex-1 text-sm">
+              {changes} unsaved {changes === 1 ? "change" : "changes"}
+            </span>
             <Button
               variant="outline"
               disabled={busy}

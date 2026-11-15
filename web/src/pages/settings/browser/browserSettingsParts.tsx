@@ -27,6 +27,10 @@ import { getSettingsReturnPath } from "@/shell/settingsNav";
 import { useNavigate } from "@/lib/routing";
 import { openUrlInSessionBrowser } from "@/lib/openLinkInApp";
 
+export function pageCount(count: number) {
+  return `${count} ${count === 1 ? "page" : "pages"}`;
+}
+
 export function ScopeChip({ server = false }: { server?: boolean }) {
   const Icon = server ? ServerIcon : MonitorIcon;
   return (
@@ -55,10 +59,15 @@ export function BrowserGroup({
   children: ReactNode;
 }) {
   return (
-    <SettingsGroup title={title} className={wide ? "max-w-none" : undefined}>
-      <div className="mb-4 flex justify-end">
-        <ScopeChip server={server} />
-      </div>
+    <SettingsGroup
+      title={
+        <span className="flex flex-wrap items-center justify-between gap-2">
+          {title}
+          <ScopeChip server={server} />
+        </span>
+      }
+      className={wide ? "max-w-none" : undefined}
+    >
       {children}
     </SettingsGroup>
   );
@@ -81,6 +90,7 @@ export function Confirm({
   onClose,
   onConfirm,
   busy = false,
+  disabled = false,
   children,
 }: {
   title: string;
@@ -90,6 +100,7 @@ export function Confirm({
   onClose: () => void;
   onConfirm: () => void;
   busy?: boolean;
+  disabled?: boolean;
   children?: ReactNode;
 }) {
   return (
@@ -107,7 +118,7 @@ export function Confirm({
           <Button variant="outline" disabled={busy} onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="destructive" disabled={busy} onClick={onConfirm}>
+          <Button variant="destructive" disabled={busy || disabled} onClick={onConfirm}>
             {action}
           </Button>
         </DialogFooter>
@@ -149,7 +160,7 @@ export function SearchPages({
         )}
       </InputGroup>
       <span className="text-xs text-muted-foreground">
-        {query ? `${count} of ${total}` : total} pages
+        {query ? `${count} of ${total}` : total} {total === 1 ? "page" : "pages"}
       </span>
     </div>
   );
@@ -252,7 +263,11 @@ export function usePlaces() {
     try {
       const result = await bridge.browserPlaces(args);
       if (!result.ok) {
-        setMessage(result.error ?? "Could not save changes.");
+        setMessage(
+          result.stale
+            ? "History changed. Review the new count and confirm again."
+            : (result.error ?? "Could not save changes."),
+        );
         return result;
       }
       await refresh();

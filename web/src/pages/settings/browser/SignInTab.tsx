@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
-import { useNavigate } from "@/lib/routing";
+import { useNavigate, useLocation } from "@/lib/routing";
 import { SettingsLabel } from "@/components/SettingsLabel";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -11,12 +11,14 @@ import { BrowserGroup, Confirm, UpdateReason } from "./browserSettingsParts";
 export function SignInTab() {
   const bridge = useMemo(browserLoginBridge, []),
     settings = useMemo(browserSettingsBridge, []),
-    navigate = useNavigate();
+    navigate = useNavigate(),
+    location = useLocation();
   const [enabled, setEnabled] = useState(false),
     [busy, setBusy] = useState(false),
     [ready, setReady] = useState(false),
     [confirm, setConfirm] = useState(false),
     [status, setStatus] = useState(""),
+    [localStatus, setLocalStatus] = useState(""),
     [sites, setSites] = useState<{ origin: string; id: string; label: string }[]>([]),
     [local, setLocal] = useState<{ origin: string; allowed: boolean }[]>([]),
     [bitwarden, setBitwarden] = useState<boolean | null>(null);
@@ -48,9 +50,9 @@ export function SignInTab() {
       ?.browserLocalNetworkList?.()
       .then((result) => {
         if (result.ok) setLocal(result.sites ?? []);
-        else setStatus(result.error ?? "Could not read local network choices.");
+        else setLocalStatus(result.error ?? "Could not read local network choices.");
       })
-      .catch(() => setStatus("Could not read local network choices."));
+      .catch(() => setLocalStatus("Could not read local network choices."));
   }, [bridge, settings]);
   async function change(next: boolean) {
     if (!bridge) return;
@@ -90,16 +92,16 @@ export function SignInTab() {
       const result = await settings.browserLocalNetworkSet({ origin, allowed });
       if (result.ok) {
         setLocal(result.sites ?? []);
-        setStatus("Saved");
+        setLocalStatus("Saved");
         if (allowed === null) toast(`Forgot the choice for ${origin}. It will ask again.`);
       } else
-        setStatus(
+        setLocalStatus(
           result.cancelled
             ? "Change cancelled."
             : (result.error ?? "Could not update local network choices."),
         );
     } catch {
-      setStatus("Could not update local network choices.");
+      setLocalStatus("Could not update local network choices.");
     } finally {
       setBusy(false);
     }
@@ -144,7 +146,14 @@ export function SignInTab() {
             <p className="text-sm text-muted-foreground">
               Add the Bitwarden extension to fill saved logins.
             </p>
-            <Button variant="outline" onClick={() => navigate("?tab=extensions")}>
+            <Button
+              variant="outline"
+              onClick={() => {
+                const params = new URLSearchParams(location.search);
+                params.set("tab", "extensions");
+                navigate(`${location.pathname}?${params}${location.hash}`);
+              }}
+            >
               Go to Extensions
             </Button>
           </div>
@@ -225,6 +234,9 @@ export function SignInTab() {
             </div>
           ))
         )}
+        <p role="status" className="mt-3 text-sm">
+          {localStatus}
+        </p>
       </BrowserGroup>
       <Confirm
         title="Sign out of all sites?"

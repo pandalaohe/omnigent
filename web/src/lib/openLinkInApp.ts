@@ -52,7 +52,7 @@ async function openInApp(conversationId: string, url: string, agent = true): Pro
     const tabs = (readSessionWorkspaceState(conversationId).openBrowsers ?? []).filter(
       (tabId) => tabId !== AGENT_BROWSER_TAB_ID,
     );
-    if (bridge.browserHasView && tabs.length > 0) {
+    if (agent && bridge.browserHasView && tabs.length > 0) {
       const probes = await Promise.allSettled(
         tabs.map(async (tabId) => {
           const view = await bridge.browserHasView!(browserViewId(conversationId, tabId));
@@ -92,8 +92,10 @@ async function openInApp(conversationId: string, url: string, agent = true): Pro
   // desktop shell's window-open handler sends it to the OS browser anyway.
   window.open(url, "_blank", "noopener,noreferrer");
   showToast(
-    `Couldn't open this link in the in-app browser (${error?.trim() || "unknown error"}). ` +
-      "It opened in your default browser instead.",
+    agent
+      ? `Couldn't open this link in the in-app browser (${error?.trim() || "unknown error"}). ` +
+          "It opened in your default browser instead."
+      : "Couldn't open this page in the in-app browser. It opened in your default browser instead.",
   );
   if (newViewId) {
     try {

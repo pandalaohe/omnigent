@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { toast } from "sonner";
 import { CopyIcon, StarIcon, TrashIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -22,11 +23,14 @@ import {
   useOpenPage,
   undoToast,
   copyPage,
+  pageCount,
 } from "./browserSettingsParts";
 
 export function HistoryTab() {
   const places = usePlaces(),
     open = useOpenPage();
+  const [retentionMessage, setRetentionMessage] = useState(""),
+    [previewing, setPreviewing] = useState(false);
   const [query, setQuery] = useState(""),
     [visible, setVisible] = useState(50),
     [clear, setClear] = useState(false),
@@ -53,7 +57,8 @@ export function HistoryTab() {
     groups.set(date, [...(groups.get(date) ?? []), row]);
   }
   const now = new Date(),
-    today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime(),
+    yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1).getTime();
   const since =
     range === "hour"
       ? Date.now() - 3600000
@@ -68,28 +73,63 @@ export function HistoryTab() {
   async function remove(rows: BrowserPlace[]) {
     const result = await places.run({ action: "remove-history", urls: rows.map((row) => row.url) });
     if (result.ok && Array.isArray(result.removed))
-      undoToast(`Removed ${result.removed.length} pages.`, async () => {
+      undoToast(`Removed ${pageCount(result.removed.length)}.`, async () => {
         if (!(await places.run({ action: "restore-history", rows: result.removed })).ok)
           throw Error();
       });
   }
-  async function saveLimits(next: { days: number; entries: number }, expectedRemoves: number) {
-    const result = await places.run({ action: "retention", ...next, expectedRemoves });
-    if (result.stale) setPending({ ...next, removes: result.removes ?? 0 });
-    else if (result.ok) {
-      setLimits(next);
-      setPending(null);
+  async function toggleBookmark(row: BrowserPlace) {
+    const saved = places.bookmarks.find((value) => value.url === row.url);
+    if (!saved) {
+      await places.run({ action: "update", url: row.url, title: row.title });
+      return;
     }
+    const index = places.bookmarks.indexOf(saved),
+      inplace = places.has("update-in-place");
+    if ((await places.run({ action: "update", url: row.url, remove: true })).ok)
+      undoToast("Bookmark removed.", async () => {
+        const result = await places.run({
+          action: "update",
+          url: saved.url,
+          title: saved.title,
+          ...(inplace ? { index } : {}),
+        });
+        if (!result.ok) throw Error();
+        if (!inplace) toast("Restored at the top. Update the desktop app to keep its place.");
+      });
+  }
+  async function saveLimits(next: { days: number; entries: number }, expectedRemoves: number) {
+    const { days, entries } = next;
+    const result = await places.run({ action: "retention", days, entries, expectedRemoves });
+    if (result.stale) {
+      setPending({ days, entries, removes: result.removes ?? 0 });
+      setRetentionMessage("History changed. Review the new count and confirm again.");
+    } else if (result.ok) {
+      setLimits({ days, entries });
+      setPending(null);
+      setRetentionMessage("Saved");
+    } else setRetentionMessage("Could not save history settings.");
   }
   async function preview(next: { days: number; entries: number }) {
-    const result = await places.bridge?.browserPlaces({
-      action: "retention",
-      ...next,
-      preview: true,
-    });
-    if (!result?.ok) return;
-    if (result.removes) setPending({ ...next, removes: result.removes });
-    else await saveLimits(next, 0);
+    setPreviewing(true);
+    setRetentionMessage("");
+    try {
+      const result = await places.bridge?.browserPlaces({
+        action: "retention",
+        ...next,
+        preview: true,
+      });
+      if (!result?.ok) {
+        setRetentionMessage("Could not preview history settings.");
+        return;
+      }
+      if (result.removes) setPending({ ...next, removes: result.removes });
+      else await saveLimits(next, 0);
+    } catch {
+      setRetentionMessage("Could not preview history settings.");
+    } finally {
+      setPreviewing(false);
+    }
   }
   return (
     <>
@@ -119,7 +159,7 @@ export function HistoryTab() {
             label =
               date.getTime() === today
                 ? "Today"
-                : date.getTime() === today - 86400000
+                : date.getTime() === yesterday
                   ? "Yesterday"
                   : date.toLocaleDateString(undefined, {
                       weekday: "long",
@@ -129,11 +169,19 @@ export function HistoryTab() {
           return (
             <div key={day}>
               <div className="flex items-center gap-2 border-t py-3">
-                <h3 className="text-sm font-medium">{label}</h3>
+                <h3 className="text-sm font-medium">
+                  <span className="md:hidden">{label}</span>
+                  <span className="hidden md:inline">
+                    {label === "Today" || label === "Yesterday"
+                      ? `${label} – ${date.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}`
+                      : label}
+                  </span>
+                </h3>
                 <span className="rounded bg-muted px-2 text-xs text-muted-foreground">
                   {
-                    filtered.filter((row) => new Date(row.visitedAt ?? 0).toDateString() === day)
-                      .length
+                    places.history.filter(
+                      (row) => new Date(row.visitedAt ?? 0).toDateString() === day,
+                    ).length
                   }
                 </span>
                 {removal && (
@@ -144,7 +192,7 @@ export function HistoryTab() {
                     disabled={places.busy}
                     onClick={() =>
                       void remove(
-                        filtered.filter(
+                        places.history.filter(
                           (row) => new Date(row.visitedAt ?? 0).toDateString() === day,
                         ),
                       )
@@ -187,13 +235,7 @@ export function HistoryTab() {
                           />
                         ),
                         disabled: places.busy,
-                        run: () =>
-                          void places.run({
-                            action: "update",
-                            url: row.url,
-                            title: row.title,
-                            remove: places.bookmarks.some((saved) => saved.url === row.url),
-                          }),
+                        run: () => void toggleBookmark(row),
                       },
                       {
                         label: "Copy link",
@@ -248,7 +290,7 @@ export function HistoryTab() {
               <span className="text-sm">{key === "days" ? "Keep pages for" : "Keep at most"}</span>
               <Select
                 value={String(limits[key])}
-                disabled={!retention || places.busy}
+                disabled={!retention || places.busy || previewing}
                 onValueChange={(value) => void preview({ ...limits, [key]: Number(value) })}
               >
                 <SelectTrigger
@@ -274,13 +316,17 @@ export function HistoryTab() {
           );
         })}
         {!retention && <UpdateReason verb="change history limits" />}
+        <p role="status" className="text-sm">
+          {retentionMessage}
+        </p>
       </BrowserGroup>
       <Confirm
         title="Clear browsing data"
-        description={`Removes ${clears} pages from history. Bookmarks, sign-ins and extensions are kept.`}
-        action={`Clear ${clears} pages`}
+        description={`Removes ${pageCount(clears)} from history. Bookmarks, sign-ins and extensions are kept.`}
+        action={`Clear ${pageCount(clears)}`}
         open={clear}
-        busy={places.busy || clears === 0}
+        busy={places.busy}
+        disabled={clears === 0}
         onClose={() => setClear(false)}
         onConfirm={() => {
           void places
@@ -308,8 +354,8 @@ export function HistoryTab() {
       </Confirm>
       <Confirm
         title="Shorten history retention?"
-        description={`Removes ${pending?.removes ?? 0} pages permanently. Bookmarks are kept.`}
-        action={`Remove ${pending?.removes ?? 0} pages`}
+        description={`Removes ${pageCount(pending?.removes ?? 0)} permanently. Bookmarks are kept.`}
+        action={`Remove ${pageCount(pending?.removes ?? 0)}`}
         open={!!pending}
         busy={places.busy}
         onClose={() => setPending(null)}

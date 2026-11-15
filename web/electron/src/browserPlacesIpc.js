@@ -31,7 +31,12 @@ function registerBrowserPlacesIpc({
     const stamp = (value) => Number.isInteger(value) && value >= 0;
     const array = (value) => Array.isArray(value) && value.length > 0 && value.length <= 100000;
     const invalid = () => ({ ok: false, error: "Invalid request." });
-    if (!args || typeof args !== "object" || Array.isArray(args)) return invalid();
+    if (
+      !args ||
+      typeof args !== "object" ||
+      (Object.getPrototypeOf(args) !== Object.prototype && Object.getPrototypeOf(args) !== null)
+    )
+      return invalid();
     if (
       args.action === "update" &&
       (!validUrl(args.url) ||
