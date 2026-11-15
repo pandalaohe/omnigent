@@ -778,7 +778,12 @@ class _PreferencesReader(Protocol):
     def get(self, user_id: str) -> dict[str, Any] | None: ...
 
 
-async def load_master(user_id: str | None, store: _PreferencesReader | None) -> dict:
+async def load_master(
+    user_id: str | None,
+    store: _PreferencesReader | None,
+    *,
+    warnings: list[str] | None = None,
+) -> dict:
     """Read one owner's ``calling_defaults`` master table, defaulting on gaps.
 
     Fail-safe like the approval-timeout reader: a missing store, a store
@@ -794,6 +799,14 @@ async def load_master(user_id: str | None, store: _PreferencesReader | None) -> 
     """
     if store is None:
         return {}
+
+    def unavailable(reason: str) -> dict:
+        if warnings is not None:
+            warnings.append(
+                f"calling defaults unavailable ({reason}); used project or built-in defaults"
+            )
+        return {}
+
     if user_id is None:
         # Lazy so this pure module stays importable without the server stack.
         from omnigent.server.auth import RESERVED_USER_LOCAL
@@ -803,15 +816,16 @@ async def load_master(user_id: str | None, store: _PreferencesReader | None) -> 
         envelope = await asyncio.to_thread(store.get, user_id)
     except Exception:
         _logger.warning("Failed to read calling_defaults preferences", exc_info=True)
-        return {}
+        return unavailable("storage_unavailable")
     if not isinstance(envelope, dict):
-        return {}
+        return {} if envelope is None else unavailable("invalid_preferences")
     settings = envelope.get("settings")
     if not isinstance(settings, dict):
-        return {}
+        return {} if settings is None else unavailable("invalid_settings")
     value = settings.get("calling_defaults")
     if not isinstance(value, dict):
         if value is not None:
             _logger.warning("Ignoring malformed calling_defaults preferences")
+            return unavailable("invalid_calling_defaults")
         return {}
     return value

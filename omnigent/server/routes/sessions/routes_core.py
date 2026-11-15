@@ -3143,6 +3143,7 @@ def register_core_routes(
         # The lead Agent's saved speed is an explicit launch value. Seed it
         # before resolving project defaults so an inherited tier cannot be
         # rejected against the catalog or overwrite the saved spec.
+        calling_warnings: list[str] = []
         spec = await asyncio.to_thread(
             validate_agent_bundle,
             bundle_bytes,
@@ -3427,6 +3428,7 @@ def register_core_routes(
                 explicit_fields=explicit_fields,
                 path_label="POST /v1/sessions (bundle)",
                 parent_session_id=parsed_metadata.parent_session_id,
+                warnings=calling_warnings,
             )
             updates = {}
             if "model_override" not in explicit_fields and resolution.model is not None:
@@ -3508,7 +3510,9 @@ def register_core_routes(
             member_hosts=member_hosts,
             project_config=member_project_config,
             master=await load_master(
-                user_id, getattr(request.app.state, "user_preferences_store", None)
+                user_id,
+                getattr(request.app.state, "user_preferences_store", None),
+                warnings=calling_warnings,
             ),
         )
         if member_labels:
@@ -3843,6 +3847,7 @@ def register_core_routes(
             result.warnings = await session_prompt_warnings(
                 request, created_conversation, spec_harness(spec)
             )
+        result.warnings.extend(calling_warnings)
         return result
 
     # ── GET /sessions/projects ────────────────────────────────────

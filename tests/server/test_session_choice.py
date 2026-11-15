@@ -1192,7 +1192,7 @@ def test_availability_ability_pin_family_and_type_resolution():
     above = ChoiceRequest(OWNER, "host-a", caller_product="agent-1", caller_model="model-1")
     assert pick(settings, request=above).skipped[0].why == "above_caller"
     unavailable = replace(above, caller_product=None, models={"agent-0": frozenset({"other"})})
-    assert pick(settings, request=unavailable).pool == "pool-1"
+    assert pick(settings, request=unavailable).pool == "pool-0"
     family = replace(above, caller_product=None, differ_family="model-0")
     assert pick(settings, request=family).skipped[0].why == "same_family"
     assert pick(settings, request=ChoiceRequest(OWNER, "host-a", pin="p1")).pool == "pool-1"
@@ -1387,6 +1387,8 @@ def test_codex_pin_attribution_survives_plain_reports_and_stale_meter(route, poo
     ],
 )
 def test_catalog_pin_alias_is_limited_to_codex_relay_routes(product, model):
+    # A picker catalog miss is unknown, not a refusal: only a real launch failure
+    # excludes a model. A relay alias is likewise not proven absent by the plain id.
     raw = table((1,)).model_dump(mode="json", by_alias=True)
     raw["hosts"]["host-a"]["work"][0][0]["links"][0]["model"] = model
     result = pick(
@@ -1398,8 +1400,9 @@ def test_catalog_pin_alias_is_limited_to_codex_relay_routes(product, model):
             models={"agent-0": frozenset({"gpt-example"})},
         ),
     )
-    assert result.outcome == "ask"
-    assert result.skipped[0].why == "model_not_in_catalog"
+    assert result.outcome == "pick"
+    assert result.link.model == model
+    assert result.skipped == ()
 
 
 @pytest.mark.parametrize(

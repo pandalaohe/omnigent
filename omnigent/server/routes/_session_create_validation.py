@@ -168,6 +168,7 @@ async def resolve_create_calling(
     explicit_fields: set[str],
     path_label: str,
     parent_session_id: str | None = None,
+    warnings: list[str] | None = None,
 ) -> CallingResolution:
     """Resolve one create's agent / model / effort from a request's stores.
 
@@ -205,6 +206,7 @@ async def resolve_create_calling(
         agent_cache=getattr(state, "agent_cache", None),
         preferences_store=getattr(state, "user_preferences_store", None),
         catalog_store=getattr(state, "host_model_catalog_cache_store", None),
+        warnings=warnings,
     )
 
 
@@ -222,6 +224,7 @@ async def resolve_create_calling_stores(
     agent_cache: AgentCache | None = None,
     preferences_store: Any | None = None,
     catalog_store: HostModelCatalogCacheStore | None = None,
+    warnings: list[str] | None = None,
 ) -> CallingResolution:
     """Resolve one create's agent / model / effort through the shared chain.
 
@@ -282,7 +285,7 @@ async def resolve_create_calling_stores(
             return None
         return _create_resolved_harness(agent, None, agent_cache)
 
-    master = await load_master(user_id, preferences_store)
+    master = await load_master(user_id, preferences_store, warnings=warnings)
     records = (
         await asyncio.to_thread(catalog_store.list, [host_id]) if host_id and catalog_store else []
     )
@@ -362,6 +365,7 @@ async def resolve_project_session_create(
     parent_project: Project | None = None,
     parent_host_id: str | None = None,
     calling_path_label: str = "POST /v1/sessions",
+    warnings: list[str] | None = None,
 ) -> ProjectCreateResolution:
     """Apply opt-in project defaults before any create-side validation.
 
@@ -461,6 +465,7 @@ async def resolve_project_session_create(
             explicit_fields=explicit_fields,
             path_label=calling_path_label,
             parent_session_id=getattr(body, "parent_session_id", None),
+            warnings=warnings,
         )
         if "agent_id" not in fields_set and resolution.agent_id is not None:
             updates["agent_id"] = resolution.agent_id

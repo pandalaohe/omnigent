@@ -18,7 +18,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
 import httpx
@@ -14946,6 +14946,7 @@ async def _create_session_from_existing_agent_impl(
                                 body.workspace,
                                 exc_info=True,
                             )
+    calling_warnings: list[str] = []
     project_resolution = await resolve_project_session_create(
         body=body,
         user_id=user_id,
@@ -14962,6 +14963,7 @@ async def _create_session_from_existing_agent_impl(
         parent_project=parent_project,
         parent_host_id=parent_host_id,
         calling_path_label=calling_path_label,
+        warnings=calling_warnings,
     )
     body = project_resolution.body
     project_id = project_resolution.project_id
@@ -15955,6 +15957,10 @@ async def _create_session_from_existing_agent_impl(
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
     if choice_admission is not None:
+        choice_admission.choice = replace(
+            choice_admission.choice,
+            warnings=(*choice_admission.choice.warnings, *calling_warnings),
+        )
         initial_labels.update(
             choice_admission.labels(time.time(), host_load_held=host_load_hold is not None)
         )
@@ -16446,6 +16452,7 @@ async def _create_session_from_existing_agent_impl(
     response.warnings = await session_prompt_warnings(
         request, conv, session_acp_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
     )
+    response.warnings.extend(calling_warnings)
     return response, conv
 
 

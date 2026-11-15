@@ -7432,6 +7432,7 @@ function NewChatLandingContent({
           metadata,
           serverOwnsInitialInput ? files : [],
         );
+        for (const warning of bundled.warnings ?? []) showToast(warning);
         data = { id: bundled.id };
         // Register create_session for the custom-agent (bundled) path too —
         // otherwise both sandbox and computer bundled creates emit nothing. Split
@@ -7648,7 +7649,9 @@ function NewChatLandingContent({
           const created = (await response.json()) as {
             id: string;
             labels?: Record<string, string>;
+            warnings?: string[];
           };
+          for (const warning of created.warnings ?? []) showToast(warning);
           // Route the new session's first requests by its chosen host id
           // before any snapshot of it loads. Only seeds: a null here would
           // erase a host the session's snapshot already recorded.

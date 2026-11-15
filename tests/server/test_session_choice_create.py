@@ -243,7 +243,7 @@ async def test_codex_pins_persist_through_create_queue_and_stop_targets(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("harness", ["codex-native", "codex", "pi-native", "pi"])
 @pytest.mark.parametrize("offered", [True, False, "failed"])
-async def test_create_checks_current_host_catalog_before_skipping_model(
+async def test_catalog_miss_does_not_exclude_configured_model(
     choice_env, db_uri, monkeypatch, harness, offered
 ):
     from omnigent.host.frames import CAP_CACHED_MODEL_OPTIONS
@@ -282,12 +282,9 @@ async def test_create_checks_current_host_catalog_before_skipping_model(
 
     response = await create(env)
     assert response.status_code == 201, response.text
-    assert response.json()["agent_id"] == env.agents[0 if available else 1]["id"]
-    assert response.json()["model_override"] == (custom if available else official)
-    if not available:
-        choice = response.json()["session_choice"]
-        assert choice["skipped"][0]["why"] == "model_not_in_catalog"
-        assert any(custom in warning for warning in choice["warnings"])
+    assert response.json()["agent_id"] == env.agents[0]["id"]
+    assert response.json()["model_override"] == custom
+    assert not response.json()["session_choice"]["skipped"]
     assert catalogs.list([HOST])[0]["models"] == rows
     lookup.assert_awaited_once()
     if offered != "failed":
@@ -317,6 +314,27 @@ async def test_create_checks_current_host_catalog_before_skipping_model(
         )
         assert legacy.models[env.agents[0]["id"]] == frozenset({official})
         lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_defaults_read_failure_reaches_existing_choice_warnings(choice_env, monkeypatch):
+    from omnigent.calling_defaults import load_master
+    from omnigent.server.routes import _session_create_validation
+
+    class UnavailablePreferences:
+        def get(self, owner):
+            raise OSError("preferences unavailable")
+
+    async def failing_master(owner, store, **kwargs):
+        return await load_master(owner, UnavailablePreferences(), **kwargs)
+
+    monkeypatch.setattr(_session_create_validation, "load_master", failing_master)
+    response = await create(choice_env)
+    assert response.status_code == 201, response.text
+    warnings = response.json()["session_choice"]["warnings"]
+    assert len(warnings) == 1
+    assert "calling defaults unavailable (storage_unavailable)" in warnings[0]
+    assert "defaults" in warnings[0]
 
 
 @pytest.fixture

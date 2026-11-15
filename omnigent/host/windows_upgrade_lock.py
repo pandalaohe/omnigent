@@ -5,7 +5,9 @@ from __future__ import annotations
 import contextlib
 import importlib
 import json
+import math
 import os
+import time
 from collections.abc import Collection, Iterator
 from pathlib import Path
 from typing import TypedDict
@@ -58,18 +60,41 @@ def owner_guard(path: Path) -> Iterator[None]:
 def _read_owner(path: Path) -> Owner | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    try:
         if (
             not isinstance(value, dict)
             or type(value.get("pid")) is not int
-            or not isinstance(value.get("create_time"), (int, float))
+            or value["pid"] <= 0
+            or type(value.get("create_time")) not in (int, float)
+            or not math.isfinite(value["create_time"])
         ):
             raise ValueError("invalid owner identity")
         return {"pid": value["pid"], "create_time": float(value["create_time"])}
-    except (ValueError, TypeError) as exc:
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, ValueError, TypeError, OverflowError) as exc:
         raise RuntimeError(f"Unreadable upgrade lock: {path}") from exc
+
+
+def _recover_damaged_owner(path: Path) -> Owner:
+    """Replace damaged metadata only after an old, inactive upgrade is proven."""
+    try:
+        if time.time() - path.stat().st_mtime < 1800:
+            raise RuntimeError("lock is less than 30 minutes old")
+        for process in psutil.process_iter():
+            try:
+                if "omnigent.host.windows_upgrade_helper" in process.cmdline():
+                    raise RuntimeError("an upgrade helper is still running")
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                continue
+    except (OSError, psutil.Error, RuntimeError) as exc:
+        raise RuntimeError(
+            f"Cannot recover upgrade lock {path}: {exc}. "
+            "Check running Windows upgrade helpers, process inspection permissions, "
+            "and that the lock is at least 30 minutes old."
+        ) from exc
+    current = process_owner(os.getpid())
+    atomic_write_json(path, dict(current))
+    return current
 
 
 def _owner_live(owner: Owner) -> bool:
@@ -81,7 +106,10 @@ def _owner_live(owner: Owner) -> bool:
 
 def acquire_lock(path: Path, *, handoff_from: Collection[int] = ()) -> Owner:
     with owner_guard(path):
-        owner = _read_owner(path)
+        try:
+            owner = _read_owner(path)
+        except RuntimeError:
+            return _recover_damaged_owner(path)
         if owner is not None:
             if _owner_live(owner):
                 if owner["pid"] not in handoff_from:

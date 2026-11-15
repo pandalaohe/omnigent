@@ -13,6 +13,7 @@ import { AgentCard } from "@/components/AgentCard";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 import { createSession } from "@/lib/sessionsApi";
+import { showToast } from "@/components/ui/toast";
 
 // Title sentinel marking a user-added agent. Mirrors the server's
 // ``_UI_ADDED_AGENT_TITLE_PREFIX`` in omnigent/server/routes/sessions.py:
@@ -88,6 +89,7 @@ export function AddAgentDialog({
         subAgentName: null,
         title,
       });
+      for (const warning of session.warnings ?? []) showToast(warning);
       // Refresh the rail so the new child appears immediately, then jump
       // into it for the first message.
       await queryClient.invalidateQueries({

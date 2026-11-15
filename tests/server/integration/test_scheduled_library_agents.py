@@ -383,6 +383,29 @@ async def test_fire_launches_session_scoped_agent_from_saved_bundle(
     assert [run.status for run in runs] == ["running"]
 
 
+async def test_library_fire_defaults_failure_is_visible_in_session(
+    client, library_server, monkeypatch
+):
+    agent_id = await _create_agent(client)
+    task_id = await _create_library_task(client, agent_id)
+    deps = _fire_deps(library_server)
+
+    def unavailable(owner):
+        raise OSError("preferences unavailable")
+
+    monkeypatch.setattr(deps.preferences_store, "get", unavailable)
+    dispatched = []
+
+    async def dispatch(conv, task):
+        dispatched.append(conv)
+
+    await build_on_fire(deps, launch_dispatch=dispatch)(0, task_id)
+    await _drain()
+    assert len(dispatched) == 1
+    items = library_server.conversations.list_items(dispatched[0].id).data
+    assert any("storage_unavailable" in item.data.model_dump_json() for item in items)
+
+
 @pytest.mark.parametrize(
     ("permission_mode", "expected_args"),
     [

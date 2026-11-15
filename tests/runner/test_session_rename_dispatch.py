@@ -20,6 +20,33 @@ _TITLE_MAX_CHARS: int = SysSessionRenameTool().get_schema()["function"]["paramet
 ]["title"]["maxLength"]
 
 
+@pytest.mark.asyncio
+async def test_large_sibling_set_declares_partial_uniqueness_check():
+    from omnigent.runner.tool_dispatch import _rename_descendant_session_via_rest
+
+    def handle(request):
+        if request.url.path.endswith("/child_sessions"):
+            return httpx.Response(
+                200, json={"data": [{"id": str(i), "title": str(i)} for i in range(1000)]}
+            )
+        if request.method == "GET":
+            return httpx.Response(
+                200, json={"id": "child", "parent_session_id": "parent", "title": "old"}
+            )
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        base_url="http://server", transport=httpx.MockTransport(handle)
+    ) as client:
+        result = json.loads(
+            await _rename_descendant_session_via_rest(
+                "child", "new", caller_id="parent", server_client=client
+            )
+        )
+    assert result["renamed"] is True
+    assert result["uniqueness_check"] == "partial"
+
+
 def _top_level_session_handler(request: httpx.Request) -> httpx.Response | None:
     """Answer the dispatcher's top-level check for a parentless session.
 

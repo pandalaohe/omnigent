@@ -493,6 +493,7 @@ class CallingDefaultsResolveResponse(BaseModel):
     sources: dict[str, str]
     level: dict[str, str] = Field(default_factory=dict)
     problems: list[CallingDefaultsProblem] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class PolicySummary(BaseModel):

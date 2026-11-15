@@ -196,6 +196,7 @@ interface ModelUsageWire {
  * camelCase `Session` type at the parse boundary.
  */
 interface SessionResponseWire {
+  warnings?: string[];
   family?: SessionFamily | null;
   sandbox_profile?: SandboxProfile | null;
   id: string;
@@ -483,6 +484,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
   setSessionParent(wire.id, wire.parent_session_id, wire.labels);
   return {
     id: wire.id,
+    ...(wire.warnings?.length ? { warnings: wire.warnings } : {}),
     permissionTier: wire.permission_tier ?? null,
     permissionTierRevision: wire.permission_tier_revision ?? null,
     permissionTierState: wire.permission_tier_state ?? null,
@@ -1076,7 +1078,7 @@ export async function createBundledSession(
     session_prompt?: string;
   } = {},
   initialFiles: File[] = [],
-): Promise<{ id: string; agentId?: string }> {
+): Promise<{ id: string; agentId?: string; warnings?: string[] }> {
   const form = new FormData();
   form.append("metadata", JSON.stringify(metadata));
   form.append("bundle", bundle);
@@ -1100,8 +1102,13 @@ export async function createBundledSession(
   const body = (await res.json()) as {
     session_id: string;
     agent_id?: string;
+    warnings?: string[];
   };
-  return { id: body.session_id, agentId: body.agent_id };
+  return {
+    id: body.session_id,
+    agentId: body.agent_id,
+    ...(body.warnings?.length ? { warnings: body.warnings } : {}),
+  };
 }
 
 /**

@@ -9234,6 +9234,7 @@ async def test_sys_session_create_spawns_child_and_posts_first_message() -> None
                     "agent_name": "researcher",
                     "status": "idle",
                     "project_id": "project",
+                    "warnings": ["calling defaults unavailable; used built-in defaults"],
                 },
             )
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
@@ -9281,6 +9282,7 @@ async def test_sys_session_create_spawns_child_and_posts_first_message() -> None
     assert handle["agent_id"] == "ag_x"
     assert handle["agent_name"] == "researcher"
     assert handle["project_id"] == "project"
+    assert handle["warnings"] == ["calling defaults unavailable; used built-in defaults"]
 
 
 @pytest.mark.asyncio
@@ -9497,6 +9499,7 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
                     "agent_id": "ag_new",
                     "agent_name": "helper",
                     "project_id": "project",
+                    "warnings": ["calling defaults unavailable; used built-in defaults"],
                 },
             )
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
@@ -9587,6 +9590,7 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     assert handle["agent_id"] == "ag_new"
     assert handle["agent_name"] == "helper"
     assert handle["project_id"] == "project"
+    assert handle["warnings"] == ["calling defaults unavailable; used built-in defaults"]
 
 
 @pytest.mark.asyncio

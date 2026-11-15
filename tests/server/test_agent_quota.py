@@ -1142,7 +1142,8 @@ def test_status_path_never_touches_store_and_hydrate_failure_is_fail_open(db_uri
 
     calls = store.calls
     quota = service.quotas(QuotaContext(RESERVED_USER_LOCAL, HOST))[1]["claude"]
-    assert quota.state == "tight"
+    assert quota.state == "unknown"
+    assert quota.reason == "storage_unavailable"
     assert store.calls == calls + 1
     tile = account(service.overview(RESERVED_USER_LOCAL), "claude")
     assert tile.read_at == report["captured_at"]

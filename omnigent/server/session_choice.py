@@ -972,13 +972,6 @@ def _filter_link(
         return Skipped(link, "unavailable")
     if product == "codex" and link.model is None and link.meter in {"codex-pro", "krill"}:
         return Skipped(link, "model_unavailable")
-    if (
-        link.model
-        and request.models.get(link.agent_id)
-        and link.model not in request.models[link.agent_id]
-        and catalog_model(link.model, product) not in request.models[link.agent_id]
-    ):
-        return Skipped(link, "model_not_in_catalog")
     caller_level = _ability(settings, request.caller_product, request.caller_model, request)
     level = _ability(settings, product, link.model, request)
     if caller_level is not None and level is not None and level < caller_level:
@@ -1034,11 +1027,7 @@ def choose(
                     break
         if survivors and settings.strategy == "drain":
             break
-    warnings = tuple(
-        f"{item.link.agent_id}: {item.link.model} is not in this host's model catalog"
-        for item in skipped
-        if item.why == "model_not_in_catalog"
-    )
+    warnings: tuple[str, ...] = ()
     if survivors and settings.strategy == "balance":
 
         def rank(item):

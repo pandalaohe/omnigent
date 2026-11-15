@@ -1076,7 +1076,7 @@ class AgentQuotaService:
         all_hosts: bool = False,
     ) -> tuple[QuotaTiers, dict[str, AgentQuota]]:
         now = time.time() if now is None else now
-        self._hydrate(context.owner_id)
+        storage_available = self._hydrate(context.owner_id)
         settings = read_collab_settings(self.preferences, context.owner_id)
         tiers = QuotaTiers(
             settings.quota_tight_below_pct,
@@ -1084,6 +1084,12 @@ class AgentQuotaService:
             settings.quota_floor_pct,
         )
         from omnigent.harness_plugins import native_agents
+
+        if not storage_available:
+            return tiers, {
+                agent.key: AgentQuota("unknown", None, None, (), reason="storage_unavailable")
+                for agent in native_agents()
+            }
 
         workspace = current_workspace_id()
         with self._lock:
@@ -2102,25 +2108,25 @@ class AgentQuotaService:
                 merged[field] = deepcopy(stored.get(field))
         return merged
 
-    def _hydrate(self, owner: str, *, required: bool = False) -> None:
+    def _hydrate(self, owner: str, *, required: bool = False) -> bool:
         # A reader loading a snapshot must not expose half-loaded writer authority.
         with self._hydration_lock:
-            self._hydrate_locked(owner, required=required)
+            return self._hydrate_locked(owner, required=required)
 
-    def _hydrate_locked(self, owner: str, *, required: bool) -> None:
+    def _hydrate_locked(self, owner: str, *, required: bool) -> bool:
         if self.snapshot_store is None:
-            return
+            return True
         scope = (current_workspace_id(), owner)
         with self._lock:
             if scope in self._hydrated:
-                return
+                return True
         try:
             rows = self.snapshot_store.read(owner)
         except Exception:
             _logger.warning("Could not hydrate usage readings for %s", owner, exc_info=True)
             if required:
                 raise UsageStorageUnavailableError("Usage account storage unavailable") from None
-            return
+            return False
         with self._lock:
             for storage_key, record in rows.items():
                 if record.get("schema_version") != 1:
@@ -2165,6 +2171,7 @@ class AgentQuotaService:
             for host_id, product in slots:
                 self._rebuild_projection(scope[0], owner, host_id, product)
             self._hydrated.add(scope)
+        return True
 
     @staticmethod
     def _window_signature(record: dict[str, Any]) -> str:

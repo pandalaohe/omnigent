@@ -206,6 +206,20 @@ describe("apiErrorFromResponse", () => {
 });
 
 describe("createSession", () => {
+  it("preserves non-blocking creation warnings", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_warning",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1,
+        warnings: ["calling defaults unavailable; used built-in defaults"],
+      }),
+    );
+    expect((await createSession("agent_xyz")).warnings).toEqual([
+      "calling defaults unavailable; used built-in defaults",
+    ]);
+  });
   it("POSTs agent_id (snake_case) and parses the snake_case response", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
@@ -555,6 +569,20 @@ describe("createSession", () => {
 });
 
 describe("createBundledSession", () => {
+  it("preserves warnings alongside the normalized bundle identifiers", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        session_id: "conv_bundle",
+        agent_id: "ag_bundle",
+        warnings: ["defaults unavailable"],
+      }),
+    );
+    expect(await createBundledSession(new File([], "agent.tar.gz"))).toEqual({
+      id: "conv_bundle",
+      agentId: "ag_bundle",
+      warnings: ["defaults unavailable"],
+    });
+  });
   it("uploads durable first input and its files with the agent bundle", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ session_id: "conv_bundle" }));
     const task = {

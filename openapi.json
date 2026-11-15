@@ -2152,6 +2152,13 @@
             ],
             "description": "Session speed tier, or `None`.",
             "title": "Speed"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Warnings",
+            "type": "array"
           }
         },
         "required": [
