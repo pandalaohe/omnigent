@@ -6,6 +6,7 @@ import {
   addToOtherTypes,
   applyPreset,
   copyStrategy,
+  choiceDocumentLinks,
   referencedChoicePools,
   removePreset,
   removeWorkType,
@@ -68,9 +69,57 @@ describe("policy edits preserve working copies", () => {
         codex: "codex",
         "codex-native": "codex",
         "pi-native": "pi",
-      }),
-    ]).toEqual(["codex:new-model", "shared", "codex:old-model", "pi:", "missing:"]);
+      }).pools,
+    ]).toEqual(["codex:new-model", "shared", "codex:old-model", "pi:"]);
+    expect(choiceDocumentLinks(before).map((link) => link.agent)).toEqual([
+      "native",
+      "other",
+      "native",
+      "other",
+      "sdk",
+      "missing",
+    ]);
     expect(before.limits).toEqual({ pool: { reserveExempt: ["work"] } });
+  });
+
+  it.each(["missing agent", "missing harness", "missing product map"])(
+    "keeps explicit meters but offers no guessed pool with %s",
+    (unknown) => {
+      const policy = {
+        ...structuredClone(EMPTY_CHOICE),
+        presets: [
+          {
+            id: "code",
+            name: "Code",
+            links: [
+              { agent: "native", model: "model-x" },
+              { agent: "missing", meter: "shared" },
+            ],
+          },
+        ],
+      };
+      const references = referencedChoicePools(
+        policy,
+        unknown === "missing agent"
+          ? []
+          : unknown === "missing harness"
+            ? [{ ...agents[0], harness: null }]
+            : agents,
+        unknown === "missing product map" ? {} : { "codex-native": "codex" },
+      );
+      expect([...references.pools]).toEqual(["shared"]);
+      expect(references.complete).toBe(false);
+    },
+  );
+
+  it("uses an agent pool only when its loaded harness explicitly has no product", () => {
+    const policy = {
+      ...structuredClone(EMPTY_CHOICE),
+      presets: [{ id: "code", name: "Code", links: [{ agent: "native", model: "model-x" }] }],
+    };
+    const references = referencedChoicePools(policy, agents, { "codex-native": null });
+    expect([...references.pools]).toEqual(["native:model-x"]);
+    expect(references.complete).toBe(true);
   });
 
   it("renames ids, aliases, defaults, every host and reserve exemptions", () => {

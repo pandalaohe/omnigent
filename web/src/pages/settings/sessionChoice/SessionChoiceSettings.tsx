@@ -25,7 +25,7 @@ import { ChoiceLimitRules } from "./ChoiceLimitRules";
 import { ChoiceConversion } from "./ChoiceConversion";
 import { choiceDocumentForSave, limitRuleErrors } from "./choiceLimitEdits";
 import { refreshChoiceConsumers, useChoicePreviewEpoch } from "./choiceInvalidation";
-import { referencedChoicePools } from "./sessionChoiceEdits";
+import { choiceDocumentLinks, referencedChoicePools } from "./sessionChoiceEdits";
 
 export function SessionChoiceSettings() {
   const info = useServerInfo();
@@ -36,8 +36,20 @@ export function SessionChoiceSettings() {
   const previewEpoch = useChoicePreviewEpoch();
   const document = useSessionChoiceDocument();
   const hosts = useHosts();
-  const agents = useAvailableAgents();
   const [draft, setDraft] = useState<SessionChoiceDocument | null>(null);
+  const unsupportedDocument = Boolean(
+    document.data?.configurationError ||
+    (draft?.schemaVersion !== undefined && ![1, 2].includes(draft.schemaVersion)),
+  );
+  const agents = useAvailableAgents({
+    pinnedAgentIds: [
+      ...new Set(
+        choiceDocumentLinks(!unsupportedDocument && draft ? draft : EMPTY_CHOICE).map(
+          (link) => link.agent,
+        ),
+      ),
+    ],
+  });
   const [host, setHost] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -162,10 +174,7 @@ export function SessionChoiceSettings() {
         </Button>
       </div>
     );
-  if (
-    document.data?.configurationError ||
-    (draft.schemaVersion !== undefined && ![1, 2].includes(draft.schemaVersion))
-  )
+  if (unsupportedDocument)
     return (
       <div role="alert" className="space-y-2 text-sm">
         <p>
@@ -182,9 +191,9 @@ export function SessionChoiceSettings() {
       </div>
     );
   const wireDraft = choiceDocumentForSave(draft, draftBaseline.current);
-  const referencedPools = referencedChoicePools(
+  const { pools: referencedPools, complete: poolReferencesComplete } = referencedChoicePools(
     draft,
-    agents.data ?? [],
+    agents.isPlaceholderData || agents.isPending ? [] : (agents.data ?? []),
     meters.data?.products ?? {},
   );
   return (
@@ -435,7 +444,7 @@ export function SessionChoiceSettings() {
                         <tr key={tile.id} className="border-b border-border/60 align-top">
                           <td className="py-3 pr-3 font-medium">
                             <span className="break-all">{tile.display_name}</span>
-                            {!referencedPools.has(tile.id) && (
+                            {poolReferencesComplete && !referencedPools.has(tile.id) && (
                               <p className="mt-1 text-xs font-normal text-muted-foreground">
                                 Not referenced by current links. Saved limit retained.
                               </p>

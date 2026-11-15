@@ -142,12 +142,8 @@ export function guessMeter(
   return meters.find((m) => m.product === product && product != null)?.id ?? null;
 }
 
-export function referencedChoicePools(
-  document: SessionChoiceDocument,
-  agents: ChoiceAgent[],
-  products: Record<string, string | null>,
-): Set<string> {
-  const links = [
+export function choiceDocumentLinks(document: SessionChoiceDocument): ChoiceLink[] {
+  return [
     ...document.presets.flatMap((preset) => preset.links),
     ...Object.values(document.hosts).flatMap((types) =>
       Object.values(types)
@@ -155,15 +151,29 @@ export function referencedChoicePools(
         .flatMap((row) => row.links),
     ),
   ];
-  return new Set(
-    links.map((link) => {
-      const harness = agents.find((agent) => agent.id === link.agent)?.harness;
-      const product = harness
-        ? products[canonicalNativeHarness(harness.replaceAll("_", "-"))]
-        : null;
-      return link.meter || `${product ?? link.agent}:${link.model ?? ""}`;
-    }),
-  );
+}
+
+export function referencedChoicePools(
+  document: SessionChoiceDocument,
+  agents: ChoiceAgent[],
+  products: Record<string, string | null>,
+): { pools: Set<string>; complete: boolean } {
+  const pools = new Set<string>();
+  let complete = true;
+  for (const link of choiceDocumentLinks(document)) {
+    if (link.meter) {
+      pools.add(link.meter);
+      continue;
+    }
+    const harness = agents.find((agent) => agent.id === link.agent)?.harness;
+    const key = harness ? canonicalNativeHarness(harness.replaceAll("_", "-")) : null;
+    if (!key || !Object.hasOwn(products, key)) {
+      complete = false;
+      continue;
+    }
+    pools.add(`${products[key] ?? link.agent}:${link.model ?? ""}`);
+  }
+  return { pools, complete };
 }
 
 export function copyStrategy(

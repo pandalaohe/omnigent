@@ -16,6 +16,7 @@ import type * as SessionChoiceData from "./sessionChoiceData";
 
 const mocks = vi.hoisted(() => ({
   request: vi.fn(),
+  availableAgents: vi.fn(),
   refetch: vi.fn(),
   metersRefetch: vi.fn(),
   document: { current: undefined as unknown },
@@ -53,9 +54,7 @@ vi.mock("./QuotaPreferencesSettings", () => ({
 }));
 vi.mock("./ChoicePolicySettings", () => ({ ChoicePolicySettings: () => null }));
 vi.mock("@/hooks/useAvailableAgents", () => ({
-  useAvailableAgents: () => ({
-    data: [{ id: "agent-a", name: "agent-a", display_name: "Agent A", harness: "codex" }],
-  }),
+  useAvailableAgents: (options?: { pinnedAgentIds?: string[] }) => mocks.availableAgents(options),
 }));
 vi.mock("@/lib/callingDefaultsApi", () => ({ listCallingDefaultCatalogs: async () => [] }));
 vi.mock("@/hooks/useHosts", () => ({
@@ -71,6 +70,9 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
 }));
 
 beforeEach(() => {
+  mocks.availableAgents.mockImplementation(() => ({
+    data: [{ id: "agent-a", name: "agent-a", display_name: "Agent A", harness: "codex" }],
+  }));
   mocks.lines.current = { tiles: {} };
   mocks.meters.current = { meters: [], running: {}, floors: {} };
   mocks.refetch.mockResolvedValue({});
@@ -787,4 +789,72 @@ it("retains saved unreferenced limits with a note and saves their values unchang
   fireEvent.click(screen.getByRole("button", { name: "Save session choice" }));
   await screen.findByText("Saved session choice.");
   expect(JSON.parse(mocks.request.mock.calls[0][1].body).settings.limits).toEqual(settings.limits);
+});
+
+it.each(["preset", "host"])(
+  "resolves a saved same-name agent from a %s link after catalog loading without guessing pools",
+  async (location) => {
+    const settings = (mocks.document.current as { data: ChoiceEnvelope }).data.settings!;
+    const link = { agent: "agent-old", model: "model-x" };
+    settings.presets[0].links =
+      location === "preset" ? [link] : [{ agent: "agent-b", meter: "shared" }];
+    settings.hosts = {
+      "host-b": {
+        work: [[{ links: location === "host" ? [link] : [{ agent: "agent-b", meter: "shared" }] }]],
+      },
+    };
+    mocks.meters.current.products = { "codex-native": "codex" };
+    const older = { id: "agent-old", name: "code", display_name: "Code", harness: "codex-native" };
+    const newer = { ...older, id: "agent-b" };
+    let loaded = false;
+    mocks.availableAgents.mockImplementation((options?: { pinnedAgentIds?: string[] }) => ({
+      isPlaceholderData: !loaded,
+      data: loaded && options?.pinnedAgentIds?.includes(older.id) ? [newer, older] : [newer],
+    }));
+    const view = mount();
+    fireEvent.click(
+      await screen.findByText("Legacy pool limits and current readings", { selector: "summary" }),
+    );
+    const picker = screen.getByRole("combobox", { name: "Add legacy pool limit" });
+    expect(
+      within(picker).queryByRole("option", { name: "agent-old:model-x" }),
+    ).not.toBeInTheDocument();
+    expect(within(picker).queryByRole("option", { name: "codex:model-x" })).not.toBeInTheDocument();
+    expect(within(picker).getByRole("option", { name: "shared" })).toHaveValue("shared");
+    loaded = true;
+    view.rerender(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <SessionChoiceSettings />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(within(picker).getByRole("option", { name: "codex:model-x" })).toHaveValue(
+      "codex:model-x",
+    );
+    expect(
+      within(picker).queryByRole("option", { name: "agent-old:model-x" }),
+    ).not.toBeInTheDocument();
+    fireEvent.change(picker, { target: { value: "codex:model-x" } });
+    const row = screen
+      .getByRole("spinbutton", { name: "codex:model-x max running" })
+      .closest("tr")!;
+    expect(within(row).queryByText(/Not referenced by current links/)).not.toBeInTheDocument();
+  },
+);
+
+it("keeps saved generated limits neutral while their referenced agent identity is unresolved", async () => {
+  const settings = (mocks.document.current as { data: ChoiceEnvelope }).data.settings!;
+  settings.presets[0].links = [{ agent: "agent-old", model: "model-x" }];
+  settings.hosts = {};
+  settings.limits = { "codex:model-x": { maxRunning: 2 } };
+  mocks.meters.current.products = { "codex-native": "codex" };
+  mocks.availableAgents.mockImplementation(() => ({ isPlaceholderData: true, data: [] }));
+  mount();
+  fireEvent.click(
+    await screen.findByText("Legacy pool limits and current readings", { selector: "summary" }),
+  );
+  const row = screen.getByRole("spinbutton", { name: "codex:model-x max running" }).closest("tr")!;
+  expect(within(row).queryByText(/Not referenced by current links/)).not.toBeInTheDocument();
+  expect(screen.queryByRole("option", { name: "agent-old:model-x" })).not.toBeInTheDocument();
 });
