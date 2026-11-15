@@ -779,17 +779,7 @@ def test_legacy_custom_pin_moves_once_to_configured_branch(
     assert result.exit_code == (
         1 if mode in ("failed", "wrong-commit", "unknown-commit") else 0
     ), result.output
-    if mode in (
-        "explicit",
-        "migrated",
-        "other-repo",
-        "config-pin",
-        "missing-source",
-        "number-source",
-        "bool-source",
-        "list-source",
-        "empty-source",
-    ):
+    if mode == "config-pin":
         assert not ran
         assert "up to date" in result.output
     elif mode == "dry-run":
@@ -805,6 +795,139 @@ def test_legacy_custom_pin_moves_once_to_configured_branch(
             if mode in ("legacy", "same-head")
             else original
         )
+
+
+@pytest.mark.parametrize("windows", [False, True])
+@pytest.mark.parametrize(
+    "source_ref",
+    [None, "channel/custom", "a" * 40, "other-repo", "alias-ip", "default-port", "different-user"],
+)
+def test_configured_sha_pin_recovers_without_receipt(
+    tmp_path, monkeypatch, _wheel_install, windows, source_ref
+):
+    from dataclasses import replace
+
+    source = "git+ssh://git@example.test/opt/repo.git"
+    info = replace(_git_install_info(), vcs_url=source + "@" + "a" * 40)
+    configured = (
+        "git+https://other.test/repo.git@main"
+        if source_ref == "other-repo"
+        else source + (f"@{source_ref}" if source_ref else "")
+    )
+    alternate_repositories = {
+        "alias-ip": "git+ssh://git@192.0.2.1/opt/repo.git",
+        "default-port": "git+ssh://git@example.test:22/opt/repo.git",
+        "different-user": "git+ssh://other@example.test/opt/repo.git",
+    }
+    if source_ref in alternate_repositories:
+        configured = alternate_repositories[source_ref] + "@channel/custom"
+    expected = (
+        source
+        + "@"
+        + (
+            "channel/custom"
+            if source_ref in alternate_repositories
+            else source_ref or "local/host-custom"
+        )
+    )
+    monkeypatch.setattr("omnigent.cli.data_dir", lambda: tmp_path)
+    monkeypatch.setattr("omnigent.cli.IS_WINDOWS", windows)
+    monkeypatch.setattr(
+        "omnigent.cli._load_global_config", lambda: {"custom_host_sources": [configured]}
+    )
+    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", lambda: info)
+    monkeypatch.setattr(
+        "omnigent.update_check._remote_git_head",
+        lambda url: (
+            "b" * 40 if url == expected and source_ref not in ("other-repo", "a" * 40) else None
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: ("0.1.0", "b" * 40)
+    )
+    ran = []
+    monkeypatch.setattr(
+        "omnigent.update_check._run_upgrade_command", lambda cmd, _: ran.append(cmd) or 0
+    )
+    monkeypatch.setattr(
+        "omnigent.host.windows_upgrade_launch.launch",
+        lambda info, target, **_: ran.append((info.vcs_url, target)),
+    )
+    result = CliRunner().invoke(cli, ["up"])
+    if source_ref in ("other-repo", "a" * 40):
+        assert "Restoring branch tracking" not in result.output
+        if windows:
+            assert result.exit_code == 1 and not ran
+        else:
+            assert result.exit_code == 0, result.output
+            assert len(ran) == 1 and info.vcs_url in ran[0]
+    else:
+        assert result.exit_code == 0, result.output
+        assert len(ran) == 1
+        if windows:
+            assert ran == [(expected, "b" * 40)]
+        else:
+            assert expected in ran[0]
+        assert not (tmp_path / "updates/custom-host-rollback.json").exists()
+
+
+@pytest.mark.parametrize("windows", [False, True])
+@pytest.mark.parametrize(
+    "refs",
+    [
+        ("main", "channel/custom"),
+        (None, "local/host-custom"),
+        ("channel/custom", "channel/custom"),
+    ],
+)
+def test_configured_sha_pin_requires_consistent_refs(
+    tmp_path, monkeypatch, _wheel_install, windows, refs
+):
+    from dataclasses import replace
+
+    source = "git+ssh://tenant-a@example.test/opt/repo.git"
+    configured = [
+        "git+ssh://tenant-b@example.test/opt/repo.git" + (f"@{refs[0]}" if refs[0] else ""),
+        source + f"@{refs[1]}",
+    ]
+    info = replace(_git_install_info(), vcs_url=source + "@" + "a" * 40)
+    monkeypatch.setattr("omnigent.cli.data_dir", lambda: tmp_path)
+    monkeypatch.setattr("omnigent.cli.IS_WINDOWS", windows)
+    monkeypatch.setattr(
+        "omnigent.cli._load_global_config", lambda: {"custom_host_sources": configured}
+    )
+    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", lambda: info)
+    heads = {
+        source + "@main": "c" * 40,
+        source + "@channel/custom": "b" * 40,
+        source + "@local/host-custom": "b" * 40,
+    }
+    monkeypatch.setattr("omnigent.update_check._remote_git_head", heads.get)
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: ("0.1.0", "b" * 40)
+    )
+    ran = []
+    monkeypatch.setattr(
+        "omnigent.update_check._run_upgrade_command", lambda cmd, _: ran.append(cmd) or 0
+    )
+    monkeypatch.setattr(
+        "omnigent.host.windows_upgrade_launch.launch",
+        lambda info, target, **_: ran.append((info.vcs_url, target)),
+    )
+    result = CliRunner().invoke(cli, ["up"])
+    if refs[0] == "main":
+        assert result.exit_code == 1, result.output
+        assert "Conflicting custom Host tracking refs" in result.output
+        assert all(entry in result.output for entry in configured)
+        assert not ran
+    else:
+        assert result.exit_code == 0, result.output
+        assert len(ran) == 1
+        expected = source + f"@{refs[1]}"
+        if windows:
+            assert ran == [(expected, "b" * 40)]
+        else:
+            assert expected in ran[0]
 
 
 def test_upgrade_git_install_noop_does_not_claim_update(
