@@ -1,13 +1,11 @@
 import { useEffect, useRef } from "react";
 import { useLocation, useNavigate } from "@/lib/routing";
 import { supportsBrowser } from "@/lib/nativeBridge";
-import { SettingsGroup } from "@/components/SettingsGroup";
 import { HistoryTab } from "./HistoryTab";
 import { BookmarksTab } from "./BookmarksTab";
 import { ExtensionsTab } from "./ExtensionsTab";
 import { SignInTab } from "./SignInTab";
-import { BrowserAccessControl } from "@/components/BrowserAccessControl";
-import { OpenLinksInAppControl } from "./legacyControls";
+import { AccessTab } from "./AccessTab";
 
 const tabs = [
   ["history", "History"],
@@ -82,16 +80,7 @@ export function BrowserSection() {
         {active === "bookmarks" && <BookmarksTab />}
         {active === "signin" && <SignInTab />}
         {active === "extensions" && <ExtensionsTab />}
-        {active === "access" && (
-          <>
-            <SettingsGroup title="Links">
-              <OpenLinksInAppControl />
-            </SettingsGroup>
-            <SettingsGroup title="Internal addresses">
-              <BrowserAccessControl />
-            </SettingsGroup>
-          </>
-        )}
+        {active === "access" && <AccessTab />}
       </div>
     </div>
   );

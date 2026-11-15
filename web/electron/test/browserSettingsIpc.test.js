@@ -108,3 +108,72 @@ test("stale Allow cannot overwrite Block/Forget, or commit after sender navigati
     }),
   );
 });
+
+test("remembered grants are listed by server, narrow only, and preserve unrelated settings", async () => {
+  const handlers = new Map();
+  let settings = {
+    other: "kept",
+    agent_browser_allowlist: {
+      "https://other.example": ["other:80"],
+      "https://example.test": ["localhost:8000", "localhost:9000"],
+      bad: [1],
+      malformed: true,
+    },
+  };
+  registerBrowserSettingsIpc({
+    ipcMain: { handle: (key, fn) => handlers.set(key, fn) },
+    BrowserWindow: {},
+    isTrusted: (event) => event.trusted,
+    loadSettings: () => structuredClone(settings),
+    saveSettings: (next) => {
+      settings = next;
+    },
+    getOrigin: () => "https://example.test",
+  });
+  const call = (action, payload, event = { trusted: true }) =>
+    handlers.get(`omnigent:browser-remembered:${action}`)(event, payload);
+  assert.equal(call("list").servers[0].current, true);
+  assert.equal(call("list").servers.length, 2);
+  assert.equal(
+    call("forget", { origin: "https://example.test", entry: "localhost:8000" }).ok,
+    true,
+  );
+  assert.equal(settings.other, "kept");
+  assert.deepEqual(settings.agent_browser_allowlist["https://example.test"], ["localhost:9000"]);
+  assert.equal(
+    call("forget", { origin: "https://example.test", entry: "localhost:9000" }).ok,
+    true,
+  );
+  assert.equal(Object.hasOwn(settings.agent_browser_allowlist, "https://example.test"), false);
+  assert.equal(call("forget", { origin: "missing", entry: "x" }).error, "Invalid request.");
+  assert.equal(call("forget", null).error, "Invalid request.");
+  assert.equal(call("list", null, { trusted: false }).error, "untrusted sender");
+  assert.equal(handlers.has("omnigent:browser-remembered:restore"), false);
+});
+test("renderer chip grammar agrees with native allowlist parser", async () => {
+  const { validAddressEntry } =
+    await import("../../src/pages/settings/browser/browserAddressEntry.ts");
+  const { parseAllowlistEntry } = require("../src/browserUrlPolicy");
+  for (const value of [
+    "localhost",
+    "localhost:80",
+    "127.0.0.0/8",
+    "0x7f000001/32",
+    "*.example.test",
+    "*.127.0.0.1",
+    "[::1]:8000",
+    "[invalid]",
+    "host:65536",
+    "host:0",
+    "https://example.test",
+    "user:fake@example.test",
+    "host/path",
+    "host:44",
+    "*.example.test:8080",
+    "0/0",
+    "127.0.0.1/33",
+    "",
+    "host.",
+  ])
+    assert.equal(validAddressEntry(value), !!parseAllowlistEntry(value), value);
+});
