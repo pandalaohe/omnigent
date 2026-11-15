@@ -25,8 +25,13 @@ import { isMacPlatform } from "@/lib/hotkeys";
 import { AskUserQuestionForm } from "./blocks/AskUserQuestionForm";
 import { useChatStore } from "@/store/chatStore";
 import { useRef } from "react";
+import * as voiceApi from "@/lib/voiceInputApi";
 import { ComposerMicButton } from "./ComposerMicButton";
 
+vi.mock("@/lib/voiceInputApi", async (original) => ({
+  ...(await original<typeof voiceApi>()),
+  getVoiceInputSettings: vi.fn(),
+}));
 /** Hovers the mic button and returns the tooltip it opens. */
 async function hoverMicTooltip(button: HTMLElement): Promise<HTMLElement> {
   fireEvent.pointerMove(button, { pointerType: "mouse" });
@@ -124,6 +129,7 @@ function resultEvent(transcript: string) {
 }
 
 beforeEach(() => {
+  vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue(voiceApi.defaultVoiceInputSettings);
   installSpeechRecognition();
   installDictationSession();
   punctuationMock = vi.fn(async (text: string) => text);
@@ -1457,4 +1463,52 @@ describe("ComposerMicButton (server dictation)", () => {
     expect(onInterim).not.toHaveBeenCalled();
     expect(onTranscript).not.toHaveBeenCalled();
   });
+});
+
+it("starts a third-party take with built-in recognition unavailable and keeps final metadata", async () => {
+  vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+    ...voiceApi.defaultVoiceInputSettings,
+    speech_source: "third",
+  });
+  const onTranscript = vi.fn();
+  render(
+    <CapabilitiesContext.Provider value={NO_DICTATION_INFO}>
+      <ComposerMicButton onTranscript={onTranscript} />
+    </CapabilitiesContext.Provider>,
+  );
+  await act(async () => {});
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Voice dictation" })));
+  expect(sessionStartMock).toHaveBeenCalledOnce();
+  act(() => sessionEvents?.onFinal("A.", { raw: "a", cleaned: true }));
+  expect(onTranscript).toHaveBeenCalledWith("A.", { raw: "a", cleaned: true, source: "third" });
+});
+
+it("falls back from third-party to browser once, reports lost phrases and avoids a retry loop", async () => {
+  vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+    ...voiceApi.defaultVoiceInputSettings,
+    speech_source: "third",
+  });
+  const onTranscript = vi.fn();
+  const onVoiceStart = vi.fn();
+  render(
+    <CapabilitiesContext.Provider value={NO_DICTATION_INFO}>
+      <ComposerMicButton onTranscript={onTranscript} onVoiceStart={onVoiceStart} />
+    </CapabilitiesContext.Provider>,
+  );
+  await act(async () => {});
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Voice dictation" })));
+  act(() =>
+    sessionEvents?.onError("failed", {
+      code: "third_party_failed",
+      undelivered: { segments: 2, seconds: 1.2 },
+    }),
+  );
+  expect(startSpy).toHaveBeenCalledOnce();
+  expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("2 phrase(s) (~1.2 s)"));
+  act(() => handlers.start?.({}));
+  act(() => handlers.result?.(resultEvent("browser words")));
+  expect(onTranscript).toHaveBeenCalledWith("browser words");
+  expect(onVoiceStart).toHaveBeenCalledOnce();
+  act(() => handlers.error?.({ error: "network" }));
+  expect(sessionStartMock).toHaveBeenCalledOnce();
 });

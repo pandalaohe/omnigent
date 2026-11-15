@@ -104,3 +104,76 @@ it("preserves the original on cleanup failure", async () => {
   expect(field).toHaveValue("some words suffix");
   expect(voice.notice).toBe("Cleanup unavailable; original kept.");
 });
+
+it("does not send one-step text to cleanup a second time", async () => {
+  vi.mocked(api.getVoiceInputSettings).mockResolvedValue({
+    ...api.defaultVoiceInputSettings,
+    model: "test-cleanup",
+    speech_source: "third",
+    speech_method: "chat_audio",
+  });
+  const view = render(<Composer />);
+  await act(async () => {});
+  const field = screen.getByRole("textbox") as HTMLTextAreaElement;
+  act(() => field.focus());
+  field.setSelectionRange(0, 0);
+  act(() => voice.begin());
+  act(() => {
+    voice.record("Clean text.", { cleaned: true, raw: "raw text", source: "third" });
+    dictation.appendFinal("Clean text.");
+  });
+  await act(async () => voice.end());
+  expect(api.cleanupDictation).not.toHaveBeenCalled();
+  expect(view.getByRole("textbox")).toHaveValue("Clean text. suffix");
+});
+it("cleans the browser suffix after one-step recognition fails", async () => {
+  vi.mocked(api.getVoiceInputSettings).mockResolvedValue({
+    ...api.defaultVoiceInputSettings,
+    model: "test-cleanup",
+    speech_source: "third",
+    speech_method: "chat_audio",
+  });
+  render(<Composer />);
+  await act(async () => {});
+  const field = screen.getByRole("textbox") as HTMLTextAreaElement;
+  act(() => field.focus());
+  field.setSelectionRange(0, 0);
+  act(() => voice.begin());
+  act(() => {
+    voice.record("Clean prefix.", { cleaned: true, source: "third" });
+    dictation.appendFinal("Clean prefix.");
+  });
+  act(() => {
+    voice.record("some words");
+    dictation.appendFinal("some words");
+  });
+  await act(async () => voice.end());
+  expect(api.cleanupDictation).toHaveBeenCalledWith("some words", expect.any(AbortSignal));
+  expect(field).toHaveValue("Clean prefix. Some words. suffix");
+});
+
+it("applies one-step output through the native undo seam before the next segment", async () => {
+  render(<Composer />);
+  await act(async () => {});
+  const field = screen.getByRole("textbox") as HTMLTextAreaElement;
+  act(() => field.focus());
+  field.setSelectionRange(0, 0);
+  act(() => voice.begin());
+  act(() => {
+    voice.record("Clean.", { cleaned: true, raw: "raw words", source: "third" });
+    dictation.appendFinal("raw words");
+  });
+  const command = vi.fn(() => true);
+  Object.defineProperty(document, "execCommand", { configurable: true, value: command });
+  act(() => voice.replaceFinal("raw words", "Clean."));
+  expect(command).toHaveBeenCalledWith("insertText", false, "Clean.");
+  expect(field).toHaveValue("Clean. suffix");
+  delete (document as Partial<Document>).execCommand;
+  act(() => {
+    voice.record("some words");
+    dictation.appendFinal("some words");
+  });
+  await act(async () => voice.end());
+  expect(api.cleanupDictation).toHaveBeenCalledWith("some words", expect.any(AbortSignal));
+  expect(field).toHaveValue("Clean. Some words. suffix");
+});

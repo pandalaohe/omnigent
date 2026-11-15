@@ -25,7 +25,7 @@ it("loads and saves vocabulary, cleanup on/off and custom instructions", async (
     target: { value: "off" },
   });
   fireEvent.click(screen.getByText("Cleanup model", { exact: true }));
-  fireEvent.change(screen.getByRole("textbox", { name: "Voice cleanup model" }), {
+  fireEvent.change(screen.getByRole("combobox", { name: "Voice cleanup model" }), {
     target: { value: "openai/test-cleanup" },
   });
   expect(screen.getByRole("textbox", { name: "Voice cleanup instructions" })).toHaveValue(
@@ -66,4 +66,17 @@ it("reports a failed save and preserves the vocabulary draft", async () => {
   );
   expect(screen.getByRole("textbox", { name: "Voice word list" })).toHaveValue("keep my draft");
   expect(screen.getByRole("status")).toHaveTextContent("Save unavailable");
+});
+
+it("edits and restores the complete transcription rules", async () => {
+  render(<VoiceInputSettings />);
+  await act(async () => {});
+  fireEvent.change(screen.getByRole("combobox", { name: "Speech source" }), {
+    target: { value: "third" },
+  });
+  const field = screen.getByRole("textbox", { name: "Transcription instructions" });
+  expect(field).toHaveValue(api.defaultTranscriptionInstructions);
+  fireEvent.change(field, { target: { value: "Custom recognition rules" } });
+  fireEvent.click(screen.getByRole("button", { name: "Restore transcription default" }));
+  expect(field).toHaveValue(api.defaultTranscriptionInstructions);
 });

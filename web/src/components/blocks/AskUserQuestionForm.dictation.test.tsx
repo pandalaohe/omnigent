@@ -172,3 +172,40 @@ it("leaves dictated text unchanged when cleanup is off", async () => {
   expect(voiceApi.cleanupDictation).not.toHaveBeenCalled();
   expect(screen.getByRole("textbox", { name: "Custom answer" })).toHaveValue("raw words");
 });
+
+it("keeps one-step results and cleans only a browser fallback suffix", async () => {
+  vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+    ...defaultVoiceInputSettings,
+    model: "test-cleanup",
+    speech_source: "third",
+    speech_method: "chat_audio",
+  });
+  vi.mocked(voiceApi.cleanupDictation).mockResolvedValue({ text: "Browser tail." });
+  renderCard();
+  await act(async () => {});
+  fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+  act(() =>
+    mic.onTranscript("Clean prefix.", { raw: "raw prefix", cleaned: true, source: "third" }),
+  );
+  act(() => mic.onTranscript("browser tail"));
+  await stop();
+  expect(voiceApi.cleanupDictation).toHaveBeenCalledWith("browser tail", expect.any(AbortSignal));
+  expect(screen.getByRole("textbox", { name: "Custom answer" })).toHaveValue(
+    "Clean prefix. Browser tail.",
+  );
+});
+it("skips separate cleanup when one-step returns raw fallback", async () => {
+  vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+    ...defaultVoiceInputSettings,
+    model: "test-cleanup",
+    speech_source: "third",
+    speech_method: "chat_audio",
+  });
+  renderCard();
+  await act(async () => {});
+  fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+  act(() => mic.onTranscript("original", { cleaned: false, source: "third" }));
+  await stop();
+  expect(voiceApi.cleanupDictation).not.toHaveBeenCalled();
+  expect(screen.getByRole("textbox", { name: "Custom answer" })).toHaveValue("original");
+});

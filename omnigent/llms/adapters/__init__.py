@@ -50,6 +50,7 @@ def _create_adapter(provider: str, **kwargs: Any) -> BaseAdapter:
     # OpenAI-compatible providers — default base URLs only.
     # API keys come from connection_params at call time, not env vars.
     openai_compat_providers = {
+        "openai-compatible": "",
         "openai": "https://api.openai.com/v1",
         "groq": "https://api.groq.com/openai/v1",
         "deepseek": "https://api.deepseek.com/v1",

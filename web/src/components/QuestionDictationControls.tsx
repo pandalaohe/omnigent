@@ -1,3 +1,4 @@
+import { flushSync } from "react-dom";
 import { type RefObject, useEffect, useRef, useState } from "react";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { replaceDictatedText } from "@/lib/replaceDictatedText";
@@ -12,6 +13,7 @@ interface Take {
   after: string;
   replaced: string;
   raw: string;
+  segments: { shown: string; original: string; cleaned: boolean; source?: string }[];
   expected: string;
   revision: number;
 }
@@ -38,6 +40,7 @@ export function QuestionDictationControls({
   const abortRef = useRef<AbortController | null>(null);
   const aliveRef = useRef(true);
   const [mode, setMode] = useState("off");
+  const [oneStep, setOneStep] = useState(false);
   const [notice, setNotice] = useState("");
 
   useEffect(() => {
@@ -45,7 +48,12 @@ export function QuestionDictationControls({
     const refresh = () => {
       void getVoiceInputSettings()
         .then((settings) => {
-          if (aliveRef.current) setMode(settings.model.trim() ? settings.mode : "off");
+          if (aliveRef.current) {
+            setMode(settings.model.trim() ? settings.mode : "off");
+            setOneStep(
+              settings.speech_source === "third" && settings.speech_method === "chat_audio",
+            );
+          }
         })
         .catch(() => {});
     };
@@ -83,17 +91,30 @@ export function QuestionDictationControls({
     const take = takeRef.current;
     if (!take?.raw || !matches(take) || mode === "off") return;
     abortRef.current?.abort();
+    const firstUncleaned = take.segments.findIndex(
+      (segment) => !segment.cleaned && (!oneStep || segment.source !== "third"),
+    );
+    if (firstUncleaned === -1) return;
+    const prefix = take.segments
+      .slice(0, firstUncleaned)
+      .map((segment) => segment.shown)
+      .join(" ");
+    const suffix = take.segments
+      .slice(firstUncleaned)
+      .map((segment) => segment.original)
+      .join(" ");
     const controller = new AbortController();
     abortRef.current = controller;
     setNotice("Cleaning up voice…");
     try {
-      const result = await cleanupDictation(take.raw, controller.signal);
+      const result = await cleanupDictation(suffix, controller.signal);
       if (!aliveRef.current || controller.signal.aborted) return;
       if (!matches(take)) {
         setNotice("Draft changed; original kept.");
         return;
       }
-      if (result.text !== take.raw) apply(take, result.text, true);
+      if (result.text !== suffix)
+        apply(take, [prefix, result.text].filter(Boolean).join(" "), true);
       setNotice("");
     } catch {
       if (aliveRef.current && !controller.signal.aborted)
@@ -118,19 +139,33 @@ export function QuestionDictationControls({
             after: value.slice(end),
             replaced: value.slice(start, end),
             raw: "",
+            segments: [],
             expected: value,
             revision: getRevision(),
           };
         }}
-        onTranscript={(text) => {
+        onTranscript={(text, meta) => {
           const take = takeRef.current;
           if (!aliveRef.current || !take) return;
           if (!matches(take)) {
             setNotice("Draft changed; stop and start a new take to continue.");
             return;
           }
+          take.segments.push({
+            shown: text,
+            original: meta?.raw ?? text,
+            cleaned: meta?.cleaned === true,
+            source: meta?.source,
+          });
+          const previous = take.raw;
           take.raw += (take.raw ? " " : "") + text;
-          take.expected = apply(take, take.raw);
+          if (meta?.cleaned && meta.raw && meta.raw !== text) {
+            flushSync(() => {
+              take.expected = apply(take, [previous, meta.raw].filter(Boolean).join(" "));
+            });
+            take.revision = getRevision();
+            take.expected = apply(take, take.raw, true);
+          } else take.expected = apply(take, take.raw);
           take.revision = getRevision();
         }}
         onVoiceDiscard={() => {

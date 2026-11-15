@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from omnigent.llms import Client
 from omnigent.llms.summarize import extract_summary_text
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.model_connections import ConnectionUnavailable, resolve_connection
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.server.voice_input import CLEANUP_OUTPUT_FORMAT, CLEANUP_RULES, VoiceInputSettings
@@ -50,6 +51,17 @@ def _configured_connection(model: str) -> tuple[str, dict[str, str] | None]:
     return routed_model, _resolve_server_llm_connection(caps.llm)
 
 
+def _cleanup_target(settings: VoiceInputSettings) -> tuple[str, dict[str, str] | None]:
+    if settings.cleanup_connection == "server-llm":
+        return _configured_connection(settings.model.strip())
+    connection = resolve_connection(settings.cleanup_connection)
+    provider = "openai" if connection.wire_api == "responses" else "openai-compatible"
+    return f"{provider}/{settings.model.strip()}", {
+        "base_url": connection.base_url,
+        "api_key": connection.api_key,
+    }
+
+
 def create_voice_input_router(
     store: SqlAlchemyUserPreferencesStore | None,
     auth_provider: AuthProvider | None = None,
@@ -76,9 +88,7 @@ def create_voice_input_router(
         async with slots:
             try:
                 async with asyncio.timeout(settings.timeout):
-                    model, connection = await asyncio.to_thread(
-                        _configured_connection, settings.model.strip()
-                    )
+                    model, connection = await asyncio.to_thread(_cleanup_target, settings)
                     extra: dict[str, Any] = {}
                     if settings.thinking:
                         extra["thinking"] = settings.thinking
@@ -112,6 +122,8 @@ def create_voice_input_router(
                     if not result.complete or not result.text.strip():
                         raise ValueError("Cleanup model reported an incomplete edit")
                     text = result.text
+            except ConnectionUnavailable as exc:
+                raise HTTPException(409, "Selected cleanup provider unavailable") from exc
             except TimeoutError as exc:
                 raise HTTPException(504, "Voice cleanup timed out") from exc
             except Exception as exc:

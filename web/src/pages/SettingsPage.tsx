@@ -103,6 +103,7 @@ import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import { SettingsLabel } from "@/components/SettingsLabel";
 import { SessionTitleInstructionsControl } from "@/components/SessionTitleInstructionsControl";
+import { ModelConnectionsSettings } from "@/components/ModelConnectionsSettings";
 import { VoiceInputSettings } from "@/components/VoiceInputSettings";
 import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
@@ -2564,6 +2565,9 @@ function GeneralSection() {
             <BrowserAccessControl />
           </SettingsGroup>
         )}
+        <SettingsGroup title="Model providers">
+          <ModelConnectionsSettings />
+        </SettingsGroup>
         <SettingsGroup title="语音输入" testId="settings-group-voice-input">
           <VoiceInputSettings />
         </SettingsGroup>

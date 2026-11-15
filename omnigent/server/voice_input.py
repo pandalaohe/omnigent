@@ -12,6 +12,12 @@ class VoiceInputSettings(BaseModel):
     # user's preference writes, and unknown keys stay out of this model.
     model_config = ConfigDict(extra="ignore")
 
+    speech_source: Literal["browser", "server", "third"] = "browser"
+    speech_connection: str = Field(default="", max_length=48)
+    speech_model: str = Field(default="", max_length=200)
+    speech_method: Literal["transcription", "chat_audio"] = "transcription"
+    speech_instructions: str = Field(default="", max_length=4000)
+    cleanup_connection: str = Field(default="server-llm", max_length=48)
     words: str = Field(default="", max_length=8000)
     mode: Literal["automatic", "manual", "off"] = "automatic"
     model: str = Field(default="", max_length=200)
@@ -50,4 +56,10 @@ CLEANUP_OUTPUT_FORMAT = (
     """
 Set complete to true only when the whole segment has been edited without omissions.
 If you cannot finish the whole segment, return complete=false and the original segment."""
+)
+
+
+TRANSCRIPTION_RULES = (
+    "Transcribe the audio verbatim. Preserve names, numbers and uncertainty. "
+    "Use the word list for preferred spellings only when the context is certain."
 )

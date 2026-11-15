@@ -18,6 +18,7 @@ from omnigent.models.model_override import is_databricks_model_id
 # not from environment variables. Providers that require connection_params
 # for their base URL (Bedrock, Vertex, Databricks) have None here.
 PROVIDER_CONFIGS: dict[str, str | None] = {
+    "openai-compatible": None,
     "openai": "https://api.openai.com/v1",
     "anthropic": "https://api.anthropic.com/v1",
     "gemini": "https://generativelanguage.googleapis.com/v1beta",

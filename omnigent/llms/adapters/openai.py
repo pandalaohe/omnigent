@@ -207,13 +207,9 @@ class OpenAICompatibleAdapter(BaseAdapter):
                 headers=headers,
                 json=payload,
             )
-            # Databricks-local divergence (see third_party/sync): surface the
-            # upstream error body, which raise_for_status() omits — essential for
-            # debugging 4xx from the CP serving/gateway route.
+            # Providers may echo credentials or submitted text in error bodies.
             if resp.status_code >= 400:
-                _logger.error(
-                    "LLM request to %s failed %d: %s", url, resp.status_code, resp.text[:2000]
-                )
+                _logger.error("LLM request failed (%d)", resp.status_code)
             resp.raise_for_status()
             result: dict[str, Any] = resp.json()
             return result
@@ -246,11 +242,7 @@ class OpenAICompatibleAdapter(BaseAdapter):
         ):
             if resp.status_code >= 400:
                 await resp.aread()
-                # Databricks-local divergence (see third_party/sync): log the
-                # upstream error body for CP serving/gateway 4xx debugging.
-                _logger.error(
-                    "LLM stream to %s failed %d: %s", url, resp.status_code, resp.text[:2000]
-                )
+                _logger.error("LLM stream failed (%d)", resp.status_code)
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 parsed = _parse_sse_line(line)
@@ -587,12 +579,8 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
             ) as resp,
         ):
             if resp.status_code >= 400:
-                body = await resp.aread()
-                _logger.error(
-                    "OpenAI Responses API %s: %s",
-                    resp.status_code,
-                    body.decode("utf-8", errors="replace")[:2000],
-                )
+                await resp.aread()
+                _logger.error("OpenAI Responses API failed (%d)", resp.status_code)
             resp.raise_for_status()
             async for chunk in resp.aiter_bytes():
                 buf += decoder.decode(chunk)

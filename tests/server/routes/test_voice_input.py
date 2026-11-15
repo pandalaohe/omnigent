@@ -400,3 +400,71 @@ def test_instruction_limit_and_legacy_mode():
     assert VoiceInputSettings(instructions="x" * 4000).instructions == "x" * 4000
     with pytest.raises(ValidationError):
         VoiceInputSettings(instructions="x" * 4001)
+
+
+@pytest.mark.parametrize(
+    "wire_api,prefix", [("chat", "openai-compatible"), ("responses", "openai")]
+)
+def test_external_cleanup_routes_by_api(monkeypatch, wire_api, prefix):
+    from omnigent.server.model_connections import ResolvedConnection
+
+    monkeypatch.setattr(
+        voice_input,
+        "resolve_connection",
+        lambda name: ResolvedConnection("https://provider.example/v1", "fake-key", wire_api),
+    )
+    model, params = voice_input._cleanup_target(
+        VoiceInputSettings(cleanup_connection="example", model="namespace/test-model")
+    )
+    assert model == f"{prefix}/namespace/test-model"
+    assert params == {"base_url": "https://provider.example/v1", "api_key": "fake-key"}
+
+
+async def test_deleted_cleanup_provider_returns_conflict(voice_store, llm, monkeypatch):
+    from omnigent.server.model_connections import ConnectionUnavailable
+
+    def missing(name):
+        raise ConnectionUnavailable("Provider unavailable")
+
+    monkeypatch.setattr(voice_input, "resolve_connection", missing)
+    save_settings(
+        voice_store, {"model": "test-model", "cleanup_connection": "removed"}, user_id=None
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_for(voice_store, llm)), base_url="http://test"
+    ) as client:
+        result = await client.post("/v1/dictation/cleanup", json={"text": "original"})
+    assert result.status_code == 409
+    llm.responses.create.assert_not_called()
+
+
+async def test_external_adapter_redacts_provider_error_body(voice_store, monkeypatch, caplog):
+    from omnigent.llms.adapters import clear_cache
+    from omnigent.server.model_connections import ResolvedConnection
+
+    monkeypatch.setattr(
+        voice_input,
+        "resolve_connection",
+        lambda name: ResolvedConnection("https://provider.example/v1", "fake-credential"),
+    )
+    save_settings(
+        voice_store, {"model": "test-model", "cleanup_connection": "example"}, user_id=None
+    )
+    original = httpx.AsyncClient
+
+    def handle(request):
+        return httpx.Response(401, text="fake-credential should never be logged")
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: original(transport=httpx.MockTransport(handle), **kwargs),
+    )
+    clear_cache()
+    async with original(
+        transport=httpx.ASGITransport(app=app_for(voice_store, voice_input.Client())),
+        base_url="http://test",
+    ) as client:
+        response = await client.post("/v1/dictation/cleanup", json={"text": "original"})
+    assert response.status_code == 503
+    assert "fake-credential" not in caplog.text + response.text

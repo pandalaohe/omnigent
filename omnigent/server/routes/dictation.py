@@ -58,9 +58,10 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import time
 from collections.abc import Callable
-from typing import Final
+from typing import Any, Final
 
 import anyio
 from fastapi import (
@@ -79,6 +80,8 @@ from omnigent.server.auth import AuthProvider
 from omnigent.server.dictation import (
     DictationEngine,
     DictationStreamHandle,
+    DictationTakeError,
+    DictationUpdate,
     PunctuationRestorer,
     get_engine,
     get_punctuation_restorer,
@@ -115,6 +118,8 @@ def create_dictation_router(
     engine_provider: Callable[[], DictationEngine] | None = None,
     punctuation_provider: Callable[[], PunctuationRestorer] | None = None,
     include_punctuation: bool = True,
+    settings_loader=None,
+    hosted_factory=None,
 ) -> APIRouter:
     """Build the router carrying the dictation stream route.
 
@@ -138,6 +143,9 @@ def create_dictation_router(
     resolve_punctuation = punctuation_provider or get_punctuation_restorer
     # Router-scoped so each app (and each test app) gets its own cap.
     slots = asyncio.Semaphore(max_streams())
+    hosted_slots = asyncio.Semaphore(
+        max(1, int(os.environ.get("OMNIGENT_DICTATION_HOSTED_MAX_STREAMS", "4")))
+    )
     punctuation_slots = asyncio.Semaphore(1)
 
     async def restore_dictation_punctuation(
@@ -157,7 +165,7 @@ def create_dictation_router(
             try:
                 restorer = await asyncio.to_thread(resolve_punctuation)
                 return await asyncio.to_thread(restorer.restore, body.text)
-            except Exception as exc:  # noqa: BLE001 - contain model failures as None
+            except Exception as exc:  # noqa: BLE001 - contain initialization failures  # noqa: BLE001 - contain model failures as None
                 _logger.error("dictation punctuation failed (%s)", type(exc).__name__)
                 return None
             finally:
@@ -202,27 +210,58 @@ def create_dictation_router(
             extra=debug_event("dictation_stream", phase="connected"),
         )
 
-        if slots.locked():
+        from omnigent.server.auth import RESERVED_USER_LOCAL
+        from omnigent.server.dictation_hosted import engine_for_settings
+        from omnigent.server.voice_input import VoiceInputSettings
+
+        owner = auth_provider.get_user_id(websocket) if auth_provider else RESERVED_USER_LOCAL
+        try:
+            settings = await asyncio.to_thread(settings_loader, owner) if settings_loader else None
+            settings = settings or VoiceInputSettings()
+        except Exception:  # noqa: BLE001 - redact provider and credential failures
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "message": "Voice settings unavailable",
+                    "code": "third_party_unavailable",
+                }
+            )
+            await websocket.close(code=_WS_CLOSE_INTERNAL_ERROR)
+            return
+        third = settings.speech_source == "third"
+        take_slots = hosted_slots if third else slots
+        if take_slots.locked():
             await websocket.close(
                 code=_WS_CLOSE_TRY_AGAIN_LATER,
                 reason="dictation is at capacity; try again shortly",
             )
             return
 
-        async with slots:
+        async with take_slots:
             # Engine construction loads model weights — seconds on first
             # use. Run it off-loop; later takes reuse the shared engine.
             try:
-                engine = await asyncio.to_thread(resolve_engine)
+                engine = (
+                    await asyncio.to_thread(hosted_factory or engine_for_settings, settings)
+                    if third
+                    else await asyncio.to_thread(resolve_engine)
+                )
                 handle: DictationStreamHandle = await asyncio.to_thread(engine.create_stream)
-            except Exception:
-                _logger.exception(
-                    "dictation engine failed to initialize",
+            except Exception as exc:  # noqa: BLE001 - contain initialization failures
+                _logger.error(
+                    "dictation engine failed to initialize (%s)",
+                    type(exc).__name__,
                     extra=debug_event("dictation_stream", phase="error", stage="engine_init"),
                 )
                 with contextlib.suppress(RuntimeError):
                     await websocket.send_text(
-                        json.dumps({"type": "error", "message": "dictation engine unavailable"})
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "message": "dictation engine unavailable",
+                                "code": "third_party_unavailable" if third else "unavailable",
+                            }
+                        )
                     )
                     await websocket.close(code=_WS_CLOSE_INTERNAL_ERROR)
                 return
@@ -245,7 +284,7 @@ def create_dictation_router(
                 with anyio.CancelScope(shield=True):
                     try:
                         await asyncio.to_thread(handle.close)
-                    except Exception:  # noqa: BLE001 - fall back to a direct close
+                    except Exception:  # noqa: BLE001 - redact provider and credential failures  # noqa: BLE001 - fall back to a direct close
                         # During teardown the loop's thread-pool executor may
                         # already be shutting down, so offloading raises rather
                         # than running close() — which would leak the take.
@@ -275,9 +314,7 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
             if data is not None:
                 update = await asyncio.to_thread(handle.feed_pcm16, data)
                 if update.finalized:
-                    await websocket.send_text(
-                        json.dumps({"type": "final", "text": update.finalized})
-                    )
+                    await websocket.send_text(json.dumps(_update_event("final", update)))
                     last_partial_sent = ""
                     last_partial_at = 0.0
                 now = time.monotonic()
@@ -300,11 +337,32 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
             except ValueError:
                 continue
             if isinstance(control, dict) and control.get("type") == "stop":
-                tail = await asyncio.to_thread(handle.finish)
-                await websocket.send_text(json.dumps({"type": "stopped", "text": tail}))
+                finish_update = getattr(handle, "finish_update", None)
+                if finish_update is not None:
+                    update = await asyncio.to_thread(finish_update)
+                    drain = getattr(handle, "drain_updates", None)
+                    updates = [update] + (await asyncio.to_thread(drain) if drain else [])
+                    for completed in updates[:-1]:
+                        if completed.finalized:
+                            await websocket.send_json(_update_event("final", completed))
+                    event = _update_event("stopped", updates[-1])
+                else:
+                    event = {"type": "stopped", "text": await asyncio.to_thread(handle.finish)}
+                await websocket.send_text(json.dumps(event))
                 await websocket.close()
                 return
             # Unknown control messages are ignored for forward compat.
+    except DictationTakeError as exc:
+        with contextlib.suppress(RuntimeError):
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "message": "Third-party recognition failed",
+                    "code": exc.code,
+                    "undelivered": exc.undelivered,
+                }
+            )
+            await websocket.close(code=_WS_CLOSE_INTERNAL_ERROR)
     except WebSocketDisconnect:
         return
     except Exception:
@@ -315,3 +373,12 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
         with contextlib.suppress(RuntimeError):
             await websocket.send_text(json.dumps({"type": "error", "message": "dictation failed"}))
             await websocket.close(code=_WS_CLOSE_INTERNAL_ERROR)
+
+
+def _update_event(kind: str, update: DictationUpdate) -> dict:
+    event: dict[str, Any] = {"type": kind, "text": update.finalized or ""}
+    if update.finalized_raw is not None:
+        event.update(raw=update.finalized_raw, cleaned=update.finalized_cleaned)
+    if update.undelivered is not None:
+        event["undelivered"] = update.undelivered
+    return event
