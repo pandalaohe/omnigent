@@ -206,7 +206,30 @@ export interface BrowserAccessResult {
   error?: string;
 }
 
-interface ElectronDesktopApi extends NativeShellApi {
+export interface BrowserSettingsResult {
+  ok: boolean;
+  error?: string;
+  cancelled?: boolean;
+  sites?: { origin: string; allowed: boolean }[];
+  servers?: { origin: string; current: boolean; entries: string[] }[];
+}
+export interface BrowserSettingsBridge {
+  browserLocalNetworkList?: () => Promise<BrowserSettingsResult>;
+  browserLocalNetworkSet?: (payload: {
+    origin: string;
+    allowed: boolean | null;
+  }) => Promise<BrowserSettingsResult>;
+  browserRememberedList?: () => Promise<BrowserSettingsResult>;
+  browserRememberedForget?: (payload: {
+    origin: string;
+    entry: string;
+  }) => Promise<BrowserSettingsResult>;
+}
+export function browserSettingsBridge(): BrowserSettingsBridge | undefined {
+  return electronApi();
+}
+
+interface ElectronDesktopApi extends NativeShellApi, BrowserSettingsBridge {
   kind: "electron";
   /** The runner picked during onboarding for this server, returned once. */
   takeOnboardingRunner?: () => Promise<OnboardingRunner | null>;

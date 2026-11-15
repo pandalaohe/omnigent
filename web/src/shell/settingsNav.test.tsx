@@ -702,3 +702,29 @@ describe("custom agent settings availability", () => {
     });
   });
 });
+
+it("shows Browser first in Desktop only with browser support", () => {
+  const groups = settingsNavGroups(
+    false,
+    true,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    true,
+  );
+  expect(groups.find((g) => g.title === "Desktop")?.items[0].id).toBe("browser");
+  expect(
+    settingsNavGroups(false, true)
+      .flatMap((g) => g.items)
+      .some((i) => i.id === "browser"),
+  ).toBe(false);
+  expect(
+    settingsNavGroups(false, false, false, false, false, false, false, false, false, true)
+      .flatMap((g) => g.items)
+      .some((i) => i.id === "browser"),
+  ).toBe(false);
+});

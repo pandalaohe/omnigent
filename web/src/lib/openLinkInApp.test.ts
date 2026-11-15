@@ -2,7 +2,12 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { showToast } from "@/components/ui/toast";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
-import { maybeOpenLinkInApp, onInAppLinkOpen, parseHttpUrl } from "@/lib/openLinkInApp";
+import {
+  maybeOpenLinkInApp,
+  onInAppLinkOpen,
+  parseHttpUrl,
+  openUrlInSessionBrowser,
+} from "@/lib/openLinkInApp";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
@@ -288,4 +293,34 @@ it("resolves the current host for a new link after the session moves", async () 
     ),
   );
   expect(getSessionSlim).toHaveBeenCalledTimes(2);
+});
+
+it("opens Settings pages with user policy while chat links retain agent policy", async () => {
+  await openUrlInSessionBrowser(CONV, URL_);
+  expect(openOrNavigate).toHaveBeenCalledWith(
+    expect.any(String),
+    URL_,
+    undefined,
+    expect.objectContaining({ agent: false }),
+  );
+  openOrNavigate.mockClear();
+  maybeOpenLinkInApp(CONV, "https://example.com/chat");
+  await vi.waitFor(() =>
+    expect(openOrNavigate).toHaveBeenCalledWith(
+      expect.any(String),
+      "https://example.com/chat",
+      undefined,
+      expect.objectContaining({ agent: true }),
+    ),
+  );
+});
+
+it("opens Settings in a new tab and keeps failure details out of its toast", async () => {
+  writeSessionWorkspaceState(CONV, { openBrowsers: ["existing"] });
+  hasView.mockResolvedValue({ exists: true, url: URL_ });
+  openOrNavigate.mockResolvedValue({ ok: false, error: "/opt/work/private/browser-data.json" });
+  await openUrlInSessionBrowser(CONV, URL_);
+  expect(openOrNavigate).toHaveBeenCalledOnce();
+  expect(String(vi.mocked(showToast).mock.calls[0][0])).not.toContain("/opt/work");
+  expect(window.open).toHaveBeenCalledWith(URL_, "_blank", "noopener,noreferrer");
 });

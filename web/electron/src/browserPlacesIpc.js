@@ -1,5 +1,6 @@
 "use strict";
 
+const { placeUrl, PublicPlacesError } = require("./browserPlaces");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 
@@ -25,7 +26,63 @@ function registerBrowserPlacesIpc({
   ipcMain.handle("omnigent:browser-places", async (event, args = {}) => {
     if (!isPinnedOriginSender(event)) return { ok: false, error: "Untrusted sender." };
     const parent = BrowserWindow.fromWebContents(event.sender);
+    const validUrl = (value) =>
+      typeof value === "string" && value.length <= 2048 && placeUrl(value) === value;
+    const stamp = (value) => Number.isInteger(value) && value >= 0;
+    const array = (value) => Array.isArray(value) && value.length > 0 && value.length <= 100000;
+    const invalid = () => ({ ok: false, error: "Invalid request." });
+    if (
+      !args ||
+      typeof args !== "object" ||
+      (Object.getPrototypeOf(args) !== Object.prototype && Object.getPrototypeOf(args) !== null)
+    )
+      return invalid();
+    if (
+      args.action === "update" &&
+      (!validUrl(args.url) ||
+        (args.title !== undefined && typeof args.title !== "string") ||
+        (args.remove !== undefined && typeof args.remove !== "boolean") ||
+        (args.previousUrl !== undefined && !validUrl(args.previousUrl)) ||
+        (args.index !== undefined && !stamp(args.index)))
+    )
+      return invalid();
+    if (args.action === "clear-history" && args.since !== undefined && !stamp(args.since))
+      return invalid();
+    if (args.action === "remove-history" && (!array(args.urls) || !args.urls.every(validUrl)))
+      return invalid();
+    if (
+      args.action === "restore-history" &&
+      (!array(args.rows) ||
+        !args.rows.every(
+          (row) =>
+            row &&
+            validUrl(row.url) &&
+            typeof row.title === "string" &&
+            row.title.length <= 512 &&
+            stamp(row.visitedAt),
+        ))
+    )
+      return invalid();
+    if (
+      args.action === "retention" &&
+      (args.days !== undefined || args.entries !== undefined) &&
+      (!Number.isFinite(args.days) ||
+        !Number.isFinite(args.entries) ||
+        (args.preview !== undefined && typeof args.preview !== "boolean") ||
+        (args.preview !== true && !stamp(args.expectedRemoves)))
+    )
+      return invalid();
     try {
+      if (args.action === "remove-history")
+        return { ok: true, removed: places.removeHistory(args.urls) };
+      if (args.action === "restore-history") {
+        places.restoreHistory(args.rows);
+        return { ok: true };
+      }
+      if (args.action === "retention")
+        return args.days === undefined
+          ? { ok: true, ...places.retention() }
+          : places.setRetention(args);
       if (args.action === "list")
         return { ok: true, bookmarks: places.bookmarks(), history: places.history() };
       if (args.action === "update")
@@ -37,8 +94,7 @@ function registerBrowserPlacesIpc({
           }),
         };
       if (args.action === "clear-history") {
-        places.clearHistory();
-        return { ok: true };
+        return { ok: true, removed: places.clearHistory(args.since) };
       }
       if (args.action === "dismiss") {
         dismiss(parent);
@@ -123,7 +179,15 @@ function registerBrowserPlacesIpc({
       await popup.loadFile(page);
       return { ok: true };
     } catch (error) {
-      return { ok: false, error: error.message };
+      const failure =
+        args.action === "list" || args.action === "suggest"
+          ? "Could not read saved pages."
+          : args.action === "update"
+            ? "Could not save bookmarks."
+            : args.action === "retention"
+              ? "Could not save history settings."
+              : "Could not save browser history.";
+      return { ok: false, error: error instanceof PublicPlacesError ? error.message : failure };
     }
   });
   function choose(state, index) {

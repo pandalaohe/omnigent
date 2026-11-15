@@ -45,7 +45,7 @@ test("places IPC gates senders, selects only bundled rows and cleans up on paren
     bookmarks: () => [],
     history: () => [],
     update: () => {
-      throw new Error("disk full");
+      throw new Error("disk full: /opt/work/private/browser-bookmarks.json");
     },
   };
   const ui = registerBrowserPlacesIpc({
@@ -58,7 +58,24 @@ test("places IPC gates senders, selects only bundled rows and cleans up on paren
   const call = (args, event = { sender: parent.webContents }) =>
     handlers.get("omnigent:browser-places")(event, args);
   assert.equal((await call({ action: "list" }, { sender: {} })).ok, false);
-  assert.equal((await call({ action: "update", title: "New" })).error, "disk full");
+  assert.equal(
+    (await call({ action: "update", url: "https://example.test/", title: "New" })).error,
+    "Could not save bookmarks.",
+  );
+  await Promise.all(
+    [
+      null,
+      [],
+      { action: "update", url: "https://user:fake@example.test/" },
+      { action: "remove-history", urls: [] },
+      {
+        action: "restore-history",
+        rows: [{ url: "https://example.test/", title: "x", visitedAt: Infinity }],
+      },
+      { action: "clear-history", since: NaN },
+      { action: "retention", days: 2, entries: 2, expectedRemoves: -1 },
+    ].map(async (payload) => assert.equal((await call(payload)).error, "Invalid request.")),
+  );
   const request = {
     action: "suggest",
     viewId: "tab",

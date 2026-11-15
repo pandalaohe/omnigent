@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
 interface SettingsGroupProps {
-  title: string;
+  title: ReactNode;
   children: ReactNode;
   className?: string;
   contentClassName?: string;

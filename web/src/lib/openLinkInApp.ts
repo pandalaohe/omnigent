@@ -43,7 +43,7 @@ export function onInAppLinkOpen(
   return () => void listeners.delete(listener);
 }
 
-async function openInApp(conversationId: string, url: string): Promise<void> {
+async function openInApp(conversationId: string, url: string, agent = true): Promise<void> {
   const bridge = (window as unknown as { omnigentDesktop: BrowserBridge }).omnigentDesktop;
   let error: string | undefined;
   let newViewId: string | undefined;
@@ -52,7 +52,7 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
     const tabs = (readSessionWorkspaceState(conversationId).openBrowsers ?? []).filter(
       (tabId) => tabId !== AGENT_BROWSER_TAB_ID,
     );
-    if (bridge.browserHasView && tabs.length > 0) {
+    if (agent && bridge.browserHasView && tabs.length > 0) {
       const probes = await Promise.allSettled(
         tabs.map(async (tabId) => {
           const view = await bridge.browserHasView!(browserViewId(conversationId, tabId));
@@ -75,7 +75,7 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
     // Chat and file content can come from an agent, so their links use the
     // agent policy even when a user clicks them.
     const result = await bridge.browserOpenOrNavigate(newViewId, url, undefined, {
-      agent: true,
+      agent,
       ...navigationHostOptions(hostId),
     });
     if (result?.ok) {
@@ -92,8 +92,10 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
   // desktop shell's window-open handler sends it to the OS browser anyway.
   window.open(url, "_blank", "noopener,noreferrer");
   showToast(
-    `Couldn't open this link in the in-app browser (${error?.trim() || "unknown error"}). ` +
-      "It opened in your default browser instead.",
+    agent
+      ? `Couldn't open this link in the in-app browser (${error?.trim() || "unknown error"}). ` +
+          "It opened in your default browser instead."
+      : "Couldn't open this page in the in-app browser. It opened in your default browser instead.",
   );
   if (newViewId) {
     try {
@@ -102,6 +104,11 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
       console.warn("[openLinkInApp] browserClose failed:", err);
     }
   }
+}
+
+export async function openUrlInSessionBrowser(conversationId: string, href: string): Promise<void> {
+  const url = parseHttpUrl(href);
+  if (url && supportsBrowser()) await openInApp(conversationId, url.href, false);
 }
 
 /** Resolve `href` against the page, or null unless it is an http(s) URL — so a

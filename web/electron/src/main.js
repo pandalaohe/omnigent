@@ -53,6 +53,7 @@ const {
 } = require("./browserPermissions");
 const { createBrowserPlaces } = require("./browserPlaces");
 const { registerBrowserPlacesIpc } = require("./browserPlacesIpc");
+const { registerBrowserSettingsIpc } = require("./browserSettingsIpc");
 const { createBrowserPermissionPrompt } = require("./browserPermissionPrompt");
 const {
   normalizeUrl,
@@ -1849,6 +1850,7 @@ let browserPlacesUi;
 const browserPlaces = createBrowserPlaces({
   directory: () => app.getPath("userData"),
   settings: loadSettings,
+  saveSettings,
 });
 const browserPermissionPrompt = createBrowserPermissionPrompt({
   BrowserWindow,
@@ -5898,7 +5900,7 @@ function registerIpc() {
       await host.load();
       const items = host.loaded();
       if (!items.length)
-        return { ok: false, error: "Add an extension in Settings → General → Browser extensions." };
+        return { ok: false, error: "Add an extension in Settings → Browser → Extensions." };
       const window = BrowserWindow.fromWebContents(event.sender);
       Menu.buildFromTemplate(
         items.map((item) => ({
@@ -5974,7 +5976,7 @@ function registerIpc() {
       return {
         ok: false,
         error:
-          "Add Bitwarden in Settings → General → Browser extensions first. Close and reopen Browser after turning on saved login.",
+          "Add Bitwarden in Settings → Browser → Extensions first. Close and reopen Browser after turning on saved login.",
       };
     try {
       extensions.selectView(entry.view.webContents);
@@ -5983,6 +5985,28 @@ function registerIpc() {
     } catch {
       return { ok: false, error: "Could not open Bitwarden." };
     }
+  });
+  registerBrowserSettingsIpc({
+    ipcMain,
+    BrowserWindow,
+    isTrusted: isPinnedOriginSender,
+    loadSettings,
+    saveSettings,
+    browserPermissionStore,
+    getOrigin: (event) => pinnedOrigin(BrowserWindow.fromWebContents(event.sender)),
+    confirmLocalNetwork: async (win, origin) => {
+      const { response } = await dialog.showMessageBox(win, {
+        type: "warning",
+        buttons: ["Cancel", "Allow"],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+        message: `Allow ${new URL(origin).host} to reach devices on your network?`,
+        detail: "This choice applies to Browser pages on this desktop.",
+        signal: AbortSignal.timeout(25000),
+      });
+      return response === 1;
+    },
   });
   registerBrowserAccessSettings({
     ipcMain,

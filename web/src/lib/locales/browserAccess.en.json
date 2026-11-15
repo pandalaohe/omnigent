@@ -1,5 +1,5 @@
 {
-  "title": "Browser access",
+  "title": "Internal addresses",
   "level": "Ask before opening internal addresses",
   "none": "Never ask",
   "agent": "Ask for agent navigation",
@@ -8,7 +8,7 @@
   "ask": "Always ask",
   "allowed": "Open without asking",
   "scope": "Applies to this desktop app and all connected servers. Metadata and link-local addresses remain blocked.",
-  "formats": "One entry per line: host, host:port, IP, IPv4 CIDR or *.domain.",
+  "formats": "Use host, host:port, IP, IPv4 CIDR or *.domain.",
   "save": "Save browser access",
   "saved": "Browser access saved.",
   "failed": "Could not save browser access.",

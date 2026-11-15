@@ -7,10 +7,16 @@ export interface PlacesResult {
   ok: boolean;
   error?: string;
   empty?: boolean;
+  removed?: BrowserPlace[] | number;
+  removes?: number;
+  stale?: boolean;
+  days?: number;
+  entries?: number;
   bookmarks?: BrowserPlace[];
   history?: BrowserPlace[];
 }
 interface PlacesBridge {
+  browserPlacesFeatures?: string[];
   browserPlaces: (args: Record<string, unknown>) => Promise<PlacesResult>;
   onBrowserPlaceChosen: (callback: (value: { viewId: string; url: string }) => void) => () => void;
 }
