@@ -543,8 +543,10 @@ describe("ComposerMicButton", () => {
           keyboardActive
         />,
       );
-      render(<ComposerMicButton onTranscript={vi.fn()} onVoiceDiscard={vi.fn()} />);
-      fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+      const composer = render(
+        <ComposerMicButton onTranscript={vi.fn()} onVoiceDiscard={vi.fn()} />,
+      );
+      fireEvent.click(composer.getAllByRole("button", { name: "Voice dictation" }).at(-1)!);
       act(() => handlers.start?.({}));
 
       fireEvent.keyDown(document.body, { key: keyName });
@@ -554,6 +556,64 @@ describe("ComposerMicButton", () => {
       expect(onReject).not.toHaveBeenCalled();
     },
   );
+
+  it.each(["Enter", "Escape"])(
+    "owns %s inside its question card without answering",
+    async (key) => {
+      const onSubmit = vi.fn();
+      const onReject = vi.fn();
+      render(
+        <div data-question-card onKeyDown={onSubmit}>
+          <ComposerMicButton questionCard onTranscript={vi.fn()} onVoiceDiscard={onReject} />
+        </div>,
+      );
+      const button = screen.getByRole("button", { name: "Voice dictation" });
+      fireEvent.click(button);
+      act(() => handlers.start?.({}));
+      fireEvent.keyDown(button, { key });
+      expect(stopSpy).toHaveBeenCalledTimes(1);
+      expect(onSubmit).not.toHaveBeenCalled();
+      expect(onReject).toHaveBeenCalledTimes(key === "Escape" ? 1 : 0);
+    },
+  );
+
+  it("delivers the completed take only after queued punctuation", async () => {
+    let resolve!: (text: string) => void;
+    punctuationMock.mockReturnValue(
+      new Promise((done) => {
+        resolve = done;
+      }),
+    );
+    const onVoiceEnd = vi.fn();
+    const onTranscript = vi.fn();
+    render(
+      <CapabilitiesContext.Provider value={PUNCTUATION_INFO}>
+        <ComposerMicButton onTranscript={onTranscript} onVoiceEnd={onVoiceEnd} />
+      </CapabilitiesContext.Provider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => handlers.start?.({}));
+    await act(async () => handlers.result?.(resultEvent("raw")));
+    fireEvent.keyDown(document.body, { key: "Enter" });
+    act(() => handlers.end?.({}));
+    expect(onVoiceEnd).not.toHaveBeenCalled();
+    await act(async () => resolve("raw."));
+    expect(onTranscript).toHaveBeenCalledWith("raw.");
+    expect(onVoiceEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels the prior mic before another one starts", () => {
+    const discard = vi.fn();
+    render(<ComposerMicButton onTranscript={vi.fn()} onVoiceDiscard={discard} />);
+    const firstHandlers = { ...handlers };
+    const first = screen.getByRole("button", { name: "Voice dictation" });
+    fireEvent.click(first);
+    act(() => firstHandlers.start?.({}));
+    const second = render(<ComposerMicButton onTranscript={vi.fn()} />);
+    fireEvent.click(second.getAllByRole("button", { name: "Voice dictation" }).at(-1)!);
+    expect(discard).toHaveBeenCalledTimes(1);
+    expect(stopSpy).toHaveBeenCalledTimes(1);
+  });
 
   describe("restarts a take the browser ends on its own", () => {
     let now: number;

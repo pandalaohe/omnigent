@@ -78,7 +78,13 @@ const WEB_SPEECH_IDLE_LIMIT_MS = 60_000;
 const WEB_SPEECH_QUICK_END_MS = 1_000;
 const WEB_SPEECH_MAX_QUICK_ENDS = 3;
 
+let activeTake: { owner: symbol; cancel: () => void } | null = null;
+
 export interface ComposerMicButtonProps {
+  /** Question-card keys belong to this take while it is active. */
+  questionCard?: boolean;
+  /** Runs after the last final transcript (including punctuation) was delivered. */
+  onVoiceEnd?: () => void;
   onTranscript: (text: string) => void;
   className?: string;
   /**
@@ -126,6 +132,8 @@ export const ComposerMicButton = ({
   onVoiceDiscard,
   onListeningChange,
   inputRef,
+  questionCard = false,
+  onVoiceEnd,
 }: ComposerMicButtonProps) => {
   // Web Speech is primary wherever its constructor exists; a take that dies with
   // "network" falls back to the server for that take only (see handleError).
@@ -169,6 +177,11 @@ export const ComposerMicButton = ({
   onVoiceDiscardRef.current = onVoiceDiscard;
   const onListeningChangeRef = useRef(onListeningChange);
   onListeningChangeRef.current = onListeningChange;
+  const onVoiceEndRef = useRef(onVoiceEnd);
+  onVoiceEndRef.current = onVoiceEnd;
+  const ownerRef = useRef(Symbol("dictation"));
+  const mountedRef = useRef(true);
+  const wasListeningRef = useRef(false);
   useEffect(() => {
     if (!isListening) return;
     onListeningChangeRef.current?.(true);
@@ -263,6 +276,43 @@ export const ComposerMicButton = ({
     restarting: boolean;
     started: boolean;
   } | null>(null);
+
+  const cancelTake = useCallback(() => {
+    discardingRef.current = true;
+    takeGenerationRef.current += 1;
+    punctuationQueueRef.current = Promise.resolve();
+    webSpeechTakeRef.current = null;
+    sessionRef.current?.cancel();
+    sessionRef.current = null;
+    try {
+      recognitionRef.current?.stop();
+    } catch {
+      /* Already stopped. */
+    }
+    onVoiceDiscardRef.current?.();
+    setIsListening(false);
+  }, []);
+
+  useEffect(() => {
+    if (isListening) {
+      wasListeningRef.current = true;
+      return;
+    }
+    if (!wasListeningRef.current) return;
+    wasListeningRef.current = false;
+    const generation = takeGenerationRef.current;
+    void punctuationQueueRef.current.then(() => {
+      if (
+        mountedRef.current &&
+        !discardingRef.current &&
+        generation === takeGenerationRef.current
+      ) {
+        onVoiceEndRef.current?.();
+      }
+      if (generation === takeGenerationRef.current && activeTake?.owner === ownerRef.current)
+        activeTake = null;
+    });
+  }, [isListening]);
 
   // Surface a failure both in the button (tooltip + red tint) and as a toast,
   // so a failed take is an explained error rather than a silent flash back to
@@ -436,15 +486,19 @@ export const ComposerMicButton = ({
 
   // Release the mic if the component unmounts mid-take (e.g. the
   // new-chat dialog closes while dictating).
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    mountedRef.current = true;
+    const owner = ownerRef.current;
+    return () => {
+      mountedRef.current = false;
+      discardingRef.current = true;
+      if (activeTake?.owner === owner) activeTake = null;
       takeGenerationRef.current += 1;
       punctuationQueueRef.current = Promise.resolve();
       sessionRef.current?.cancel();
       sessionRef.current = null;
-    },
-    [],
-  );
+    };
+  }, []);
 
   // Second getUserMedia stream just for visualization — Web Speech API
   // hides its audio buffer. Chrome batches the permission to one prompt.
@@ -522,11 +576,17 @@ export const ComposerMicButton = ({
       serverBusyRef.current = true;
       const session = sessionRef.current;
       if (session) {
+        const generation = takeGenerationRef.current;
         sessionRef.current = null;
         const orderedWithWebTake = serverContinuesWebTakeRef.current;
         serverContinuesWebTakeRef.current = false;
         const tail = (await session.stop()).trim();
-        if (!disabledRef.current) {
+        if (
+          !disabledRef.current &&
+          !discardingRef.current &&
+          generation === takeGenerationRef.current &&
+          mountedRef.current
+        ) {
           // A non-empty tail supersedes the pending interim via
           // onTranscript; an empty one just clears the interim region.
           if (tail) enqueueServerTranscriptRef.current(tail, orderedWithWebTake);
@@ -547,20 +607,27 @@ export const ComposerMicButton = ({
           onVoiceStartRef.current?.();
         }
         serverContinuesWebTakeRef.current = continueTake;
+        const generation = takeGenerationRef.current;
         const next = await DictationSession.start({
           onPartial: (text) => {
             // Drop late partials after an Esc discard — they'd repopulate the
             // composer the parent just reverted.
-            if (!disabledRef.current && !discardingRef.current) {
+            if (
+              generation === takeGenerationRef.current &&
+              !disabledRef.current &&
+              !discardingRef.current
+            ) {
               interimRef.current = text;
               onInterimRef.current?.(text);
             }
           },
           onFinal: (text) => {
+            if (generation !== takeGenerationRef.current || !mountedRef.current) return;
             interimRef.current = "";
             enqueueServerTranscriptRef.current(text, continueTake);
           },
           onError: () => {
+            if (generation !== takeGenerationRef.current || !mountedRef.current) return;
             sessionRef.current = null;
             serverContinuesWebTakeRef.current = false;
             // Preserve anything spoken but not yet finalized: pin the pending
@@ -577,6 +644,17 @@ export const ComposerMicButton = ({
             setIsListening(false);
           },
         });
+        if (
+          !mountedRef.current ||
+          disabledRef.current ||
+          discardingRef.current ||
+          generation !== takeGenerationRef.current
+        ) {
+          next.cancel();
+          setConnecting(false);
+          serverBusyRef.current = false;
+          return;
+        }
         sessionRef.current = next;
         setError(null);
         setIsListening(true);
@@ -613,6 +691,10 @@ export const ComposerMicButton = ({
   }, [inputRef, reportError]);
 
   const toggle = useCallback(() => {
+    if (!isListening && !serverBusyRef.current && !transitionRef.current) {
+      if (activeTake?.owner !== ownerRef.current) activeTake?.cancel();
+      activeTake = { owner: ownerRef.current, cancel: cancelTake };
+    }
     // An active (or starting) server take is owned by the server path,
     // whichever mode started it.
     if (sessionRef.current || serverBusyRef.current) {
@@ -662,6 +744,7 @@ export const ComposerMicButton = ({
     systemDictation,
     startMacDictation,
     toggleServer,
+    cancelTake,
   ]);
 
   // ⌘⌥V toggles dictation from anywhere — same as clicking the button. Enabled
@@ -680,7 +763,7 @@ export const ComposerMicButton = ({
     const handler = (e: globalThis.KeyboardEvent): void => {
       // A focused question card owns Enter and Esc; the take keeps running in
       // the composer while the card decides what the key means.
-      if (isInsideQuestionCard(e.target)) return;
+      if (!questionCard && isInsideQuestionCard(e.target)) return;
       if (e.repeat || e.metaKey || e.ctrlKey || e.altKey) return;
       if (e.key === "Enter" && !e.shiftKey) {
         // Commit: end the take and keep the text. toggle() routes to the right
@@ -715,7 +798,7 @@ export const ComposerMicButton = ({
     };
     window.addEventListener("keydown", handler, true);
     return () => window.removeEventListener("keydown", handler, true);
-  }, [isListening, toggle]);
+  }, [isListening, toggle, questionCard]);
 
   if (!canDictate) return null;
 

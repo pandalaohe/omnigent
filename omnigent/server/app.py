@@ -161,6 +161,7 @@ from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.routes.user_settings import create_user_settings_router
+from omnigent.server.routes.voice_input import create_voice_input_router
 from omnigent.server.runner_session_init import (
     TRANSIENT_REJECTION_STATUSES,
     RunnerSessionInitializer,
@@ -5304,6 +5305,11 @@ def create_app(
             )
 
     if user_settings_store is not None:
+        app.include_router(
+            create_voice_input_router(user_settings_store, auth_provider),
+            prefix="/v1",
+            tags=["settings"],
+        )
         app.include_router(
             create_user_settings_router(user_settings_store, auth_provider),
             prefix="/v1",
