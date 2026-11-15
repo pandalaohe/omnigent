@@ -27,8 +27,10 @@ from omnigent.server.session_choice import (
     SessionChoice,
     TileLimits,
     active_on,
+    catalog_model,
     holds_slot,
     ordered_links,
+    pin_codex_link,
     pool_of,
     pool_of_session,
     quota_reset_at,
@@ -80,6 +82,8 @@ def tile_of_session(session, settings, readings, products, *, agent_store=None, 
     )
     if pool in readings:
         return pool
+    if product == "codex" and pool in {"codex-pro", "krill"}:
+        return None
     if product is None:
         return None
     matches = [key for key, reading in readings.items() if reading.product == product]
@@ -383,6 +387,8 @@ async def context_request(
             not link.model
             or link.agent_id in request.unavailable
             or link.model in request.models.get(link.agent_id, ())
+            or catalog_model(link.model, request.products.get(link.agent_id))
+            in request.models.get(link.agent_id, ())
         ):
             continue
         probe = Conversation(
@@ -814,11 +820,39 @@ async def admit_create(
         if choice.outcome == "ask":
             raise HTTPException(409, {"code": "session_choice_ask", **choice.payload()})
         assert choice.link is not None
+        link = choice.link
+        product = request.products.get(link.agent_id)
+        if product == "codex" and link.model is None and link.meter in {"codex-pro", "krill"}:
+            from omnigent.server.routes._sessions.helpers import _resolve_llm_model
+
+            model = await asyncio.to_thread(
+                _resolve_llm_model,
+                Conversation(
+                    id="",
+                    root_conversation_id="",
+                    created_at=0,
+                    updated_at=0,
+                    agent_id=link.agent_id,
+                ),
+                agent_store=app.state.agent_store,
+                agent_cache=app.state.agent_cache,
+            )
+            if not model:
+                raise HTTPException(
+                    409,
+                    {
+                        "code": "session_choice_ask",
+                        "reason": "Choose a model for this Codex route",
+                    },
+                )
+            link = link.model_copy(update={"model": model})
+        link = pin_codex_link(link, product)
+        choice = replace(choice, link=link)
         updated = body.model_copy(
             update={
-                "agent_id": choice.link.agent_id,
-                "model_override": choice.link.model,
-                "reasoning_effort": choice.link.effort,
+                "agent_id": link.agent_id,
+                "model_override": link.model,
+                "reasoning_effort": link.effort,
             }
         )
         yield CreateChoice(updated, choice, host, stack, owner)
