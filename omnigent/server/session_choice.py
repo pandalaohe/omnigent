@@ -217,8 +217,39 @@ def model_family(text: str) -> str:
     return text
 
 
+def codex_route_pool(model: str | None, product: str | None) -> str | None:
+    if product != "codex" or not isinstance(model, str):
+        return None
+    route, separator, name = model.partition("/")
+    if not separator or not name:
+        return None
+    return {"official": "codex-pro", "krill": "krill", "ccs-krill": "krill"}.get(route)
+
+
+def catalog_model(model: str | None, product: str | None) -> str | None:
+    """Relay pins are accepted for launch but absent from its model catalog."""
+    if product == "codex" and model:
+        route, separator, name = model.partition("/")
+        if separator and name and route in {"official", "krill"}:
+            return name
+    return model
+
+
+def pin_codex_link(link: Link, product: str | None) -> Link:
+    """An explicit route meter pins a plain model; legacy provider IDs stay intact."""
+    if product == "codex" and link.model and "/" not in link.model:
+        route = {"codex-pro": "official", "krill": "krill"}.get(link.meter or "")
+        if route:
+            return link.model_copy(update={"model": f"{route}/{link.model}"})
+    return link
+
+
 def pool_of(link: Link, product: str | None) -> str:
-    return link.meter or f"{product or link.agent_id}:{link.model or ''}"
+    return (
+        codex_route_pool(link.model, product)
+        or link.meter
+        or f"{product or link.agent_id}:{link.model or ''}"
+    )
 
 
 def ordered_links(settings: SessionChoice):
@@ -239,20 +270,30 @@ def pool_of_session(
     model: str | None = None,
     products: Mapping[str, str | None] | None = None,
 ) -> str | None:
-    """A selection label wins; otherwise the first exact product/model link owns it."""
+    """A Codex route pin wins over meters; unpinned sessions keep their saved pool."""
+    record = None
     raw = session.labels.get(CHOICE_LABEL)
     if raw:
         try:
             record = json.loads(raw)
-            if isinstance(record, dict) and isinstance(record.get("pool"), str):
-                return record["pool"]
         except ValueError:
-            pass
+            record = None
     if product is None:
         from omnigent.runtime.instruction_layers import agent_key_for_harness
         from omnigent.server.routes._sessions.helpers import _resolve_harness_impl
 
         product = agent_key_for_harness(_resolve_harness_impl(session))
+    for pinned in (
+        session.model_override,
+        record.get("model") if isinstance(record, dict) else None,
+        model,
+        session.reported_model,
+    ):
+        pool = codex_route_pool(pinned, product)
+        if pool is not None:
+            return pool
+    if isinstance(record, dict) and isinstance(record.get("pool"), str):
+        return record["pool"]
     model = model if model is not None else session.reported_model or session.model_override
     if product is None:
         return None
@@ -420,6 +461,17 @@ class ChoiceRequest:
     independent: bool = False
     preview: bool = False
     named_agent: str | None = None
+    default_models: Mapping[str, str | None] = field(default_factory=dict)
+
+
+def resolved_link(link: Link, request: ChoiceRequest) -> Link:
+    if (
+        link.model is None
+        and request.products.get(link.agent_id) == "codex"
+        and link.meter in {"codex-pro", "krill"}
+    ):
+        return link.model_copy(update={"model": request.default_models.get(link.agent_id)})
+    return link
 
 
 @dataclass(frozen=True)
@@ -506,16 +558,19 @@ def resolve_work_type(
 def _ability(
     settings: SessionChoice, product: str | None, model: str | None, request: ChoiceRequest
 ):
+    def identity(value: str | None) -> str | None:
+        return value.partition("/")[2] if value and codex_route_pool(value, product) else value
+
     levels = {
         preset: index for index, level in enumerate(settings.ability_order) for preset in level
     }
     for preset in settings.presets:
         if preset.id in levels:
-            for link in preset.links:
-                if (
-                    request.products.get(link.agent_id, link.agent_id) == product
-                    and link.model == model
-                ):
+            for configured_link in preset.links:
+                link = resolved_link(configured_link, request)
+                if request.products.get(link.agent_id, link.agent_id) == product and identity(
+                    link.model
+                ) == identity(model):
                     return levels[preset.id]
     return None
 
@@ -531,14 +586,18 @@ def _filter_link(
     cooldowns: Mapping[str, float],
     now: float,
 ) -> Skipped | None:
+    link = resolved_link(link, request)
     product = request.products.get(link.agent_id, link.agent_id)
     pool = pool_of(link, product)
     if link.agent_id in request.unavailable:
         return Skipped(link, "unavailable")
+    if product == "codex" and link.model is None and link.meter in {"codex-pro", "krill"}:
+        return Skipped(link, "model_unavailable")
     if (
         link.model
         and request.models.get(link.agent_id)
         and link.model not in request.models[link.agent_id]
+        and catalog_model(link.model, product) not in request.models[link.agent_id]
     ):
         return Skipped(link, "model_not_in_catalog")
     caller_level = _ability(settings, request.caller_product, request.caller_model, request)
@@ -560,6 +619,8 @@ def _filter_link(
     if line.state == "warn" and work_type.id not in limits.reserve_exempt:
         return Skipped(link, "reserve", line.clears_at)
     cap = limits.max_running if link.meter else link.max_running
+    if codex_route_pool(link.model, product) and limits.max_running is not None:
+        cap = limits.max_running
     if cap is not None and len(running.get(pool, ())) >= cap:
         return Skipped(link, "busy", now, running.get(pool, ()))
     if cooldowns.get(pool, 0) > now:
@@ -590,7 +651,8 @@ def choose(
     survivors: list[tuple[int, int, Row, Link, int]] = []
     for index, tier in enumerate(tiers):
         for position, row in enumerate(tier):
-            for link in row.links:
+            for configured_link in row.links:
+                link = resolved_link(configured_link, request)
                 failure = _filter_link(
                     settings, work, link, request, readings, running, floor_off, cooldowns, now
                 )
@@ -649,7 +711,7 @@ def choose(
         return Choice(
             "pick",
             work.id,
-            link,
+            pin_codex_link(link, request.products.get(link.agent_id, link.agent_id)),
             tier_index + 1,
             pool,
             "First eligible tier, weighted choice",
@@ -670,12 +732,14 @@ def choose(
             index + 1
             for index, rows in enumerate(tiers)
             for row in rows
-            if first.link in row.links
+            if any(first.link == resolved_link(link, request) for link in row.links)
         )
         return Choice(
             "hold",
             work.id,
-            first.link,
+            pin_codex_link(
+                first.link, request.products.get(first.link.agent_id, first.link.agent_id)
+            ),
             tier,
             pool,
             first.why,
@@ -691,7 +755,9 @@ def choose(
         None,
         None,
         None,
-        "No eligible link",
+        "Choose a model for this Codex route"
+        if any(item.why == "model_unavailable" for item in skipped)
+        else "No eligible link",
         tuple(skipped),
         flags,
         warnings,

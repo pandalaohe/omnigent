@@ -739,6 +739,129 @@ def test_exact_attribution_order_label_and_model_families():
 
 
 @pytest.mark.parametrize(
+    "caller_model", ["gpt-small", "official/gpt-small", "krill/gpt-small", "ccs-krill/gpt-small"]
+)
+def test_codex_ability_cap_uses_unpinned_model_identity(caller_model):
+    raw = table().model_dump(mode="json", by_alias=True)
+    raw["abilityOrder"] = [["p0"], ["p1"]]
+    rows = raw["hosts"]["host-a"]["work"][0]
+    for index, model in enumerate(("gpt-large", "gpt-small")):
+        link = {"agent": f"agent-{index}", "model": model, "meter": "codex-pro"}
+        rows[index]["links"] = [link]
+        raw["presets"][index]["links"] = [link]
+    choice = pick(
+        parse_session_choice(raw),
+        request=ChoiceRequest(
+            OWNER,
+            "host-a",
+            products={"agent-0": "codex", "agent-1": "codex"},
+            caller_product="codex",
+            caller_model=caller_model,
+        ),
+    )
+    assert choice.link.model == "official/gpt-small"
+    assert choice.skipped[0].why == "above_caller"
+
+
+def test_codex_route_pins_select_by_tile_with_plain_catalog_models():
+    raw = table().model_dump(mode="json", by_alias=True)
+    rows = raw["hosts"]["host-a"]["work"][0]
+    for row, route in zip(rows, ("official", "krill"), strict=True):
+        row["links"][0] = {"agent": row["links"][0]["agent"], "model": f"{route}/gpt-example"}
+    raw["limits"] = {
+        "codex-pro": {
+            "reserve": {"mode": "total", "window": "7d", "pct": 15, "stopPct": 5},
+            "maxRunning": 1,
+        },
+        "krill": {"maxRunning": 1},
+    }
+    request = ChoiceRequest(
+        OWNER,
+        "host-a",
+        products={"agent-0": "codex", "agent-1": "codex"},
+        models={agent: frozenset({"gpt-example"}) for agent in ("agent-0", "agent-1")},
+    )
+    settings = parse_session_choice(raw)
+    selected = pick(settings, request=request)
+    assert (selected.pool, selected.link.model) == ("codex-pro", "official/gpt-example")
+    assert selected.warnings == ()
+    warned = pick(settings, request=request, readings={"codex-pro": reading(used=90)})
+    assert (warned.pool, warned.link.model) == ("krill", "krill/gpt-example")
+    assert warned.skipped[0].why == "reserve"
+    raw["limits"]["codex-pro"]["reserveExempt"] = ["work"]
+    exempt = parse_session_choice(raw)
+    assert (
+        pick(exempt, request=request, readings={"codex-pro": reading(used=90)}).pool == "codex-pro"
+    )
+    assert pick(exempt, request=request, readings={"codex-pro": reading(used=95)}).pool == "krill"
+    busy = pick(settings, request=request, running={"codex-pro": ("official-child",)})
+    assert busy.pool == "krill" and busy.skipped[0].why == "busy"
+
+
+@pytest.mark.parametrize("route,pool", [("official", "codex-pro"), ("krill", "krill")])
+def test_explicit_codex_route_meter_pins_pick_and_hold(route, pool):
+    raw = table((1,)).model_dump(mode="json", by_alias=True)
+    raw["hosts"]["host-a"]["work"][0][0]["links"][0] = {
+        "agent": "agent-0",
+        "model": "gpt-example",
+        "meter": pool,
+    }
+    raw["limits"] = {pool: {"maxRunning": 1}}
+    settings = parse_session_choice(raw)
+    request = ChoiceRequest(OWNER, "host-a", products={"agent-0": "codex"})
+    for running, outcome in (({}, "pick"), ({pool: ("child",)}, "hold")):
+        choice = pick(settings, request=request, running=running)
+        assert (choice.outcome, choice.pool, choice.link.model) == (
+            outcome,
+            pool,
+            f"{route}/gpt-example",
+        )
+
+
+@pytest.mark.parametrize(
+    "route,pool", [("official", "codex-pro"), ("krill", "krill"), ("ccs-krill", "krill")]
+)
+def test_codex_pin_attribution_survives_plain_reports_and_stale_meter(route, pool):
+    conv = Conversation(
+        id="child",
+        created_at=NOW,
+        updated_at=NOW,
+        root_conversation_id="child",
+        model_override=f"{route}/gpt-example",
+        reported_model="gpt-example",
+        labels={CHOICE_LABEL: '{"pool":"outdated-meter"}'},
+    )
+    assert pool_of_session(conv, parse_session_choice({}), product="codex") == pool
+    conv.labels[CHOICE_LABEL] = f'{{"pool":"outdated-meter","model":"{route}/gpt-example"}}'
+    conv.model_override = None
+    assert pool_of_session(conv, parse_session_choice({}), product="codex") == pool
+
+
+@pytest.mark.parametrize(
+    "product,model",
+    [
+        ("pi", "krill/gpt-example"),
+        ("codex", "other/gpt-example"),
+        ("codex", "ccs-krill/gpt-example"),
+    ],
+)
+def test_catalog_pin_alias_is_limited_to_codex_relay_routes(product, model):
+    raw = table((1,)).model_dump(mode="json", by_alias=True)
+    raw["hosts"]["host-a"]["work"][0][0]["links"][0]["model"] = model
+    result = pick(
+        parse_session_choice(raw),
+        request=ChoiceRequest(
+            OWNER,
+            "host-a",
+            products={"agent-0": product},
+            models={"agent-0": frozenset({"gpt-example"})},
+        ),
+    )
+    assert result.outcome == "ask"
+    assert result.skipped[0].why == "model_not_in_catalog"
+
+
+@pytest.mark.parametrize(
     "status,age,marker,expected",
     [
         ("running", 10, "", True),
