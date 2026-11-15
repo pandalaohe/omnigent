@@ -35,6 +35,7 @@ from omnigent.server.session_choice import (
     pool_of_session,
     quota_reset_at,
     resolve_work_type,
+    resolved_link,
     state_for,
     tile_line,
 )
@@ -382,7 +383,8 @@ async def context_request(
         return request
     records = {row["harness"]: row for row in await asyncio.to_thread(catalogs.list, [host])}
     harnesses = set()
-    for link in ordered_links(settings):
+    for configured_link in ordered_links(settings):
+        link = resolved_link(configured_link, request)
         if (
             not link.model
             or link.agent_id in request.unavailable
@@ -456,6 +458,12 @@ def _context_request(
     cache = getattr(app.state, "agent_cache", None)
     products: dict[str, str | None] = {}
     harnesses: dict[str, str | None] = {}
+    default_models: dict[str, str | None] = {}
+    default_agents = {
+        link.agent_id
+        for link in ordered_links(settings)
+        if link.model is None and link.meter in {"codex-pro", "krill"}
+    }
     unavailable = set()
     host_store = getattr(app.state, "host_store", None)
     host_row = host_store.get_host(host) if host_store is not None else None
@@ -477,6 +485,10 @@ def _context_request(
         harness = _resolve_harness_impl(probe, agent_store=agents, agent_cache=cache, agent=agent)
         harnesses[agent_id] = harness
         products[agent_id] = agent_key_for_harness(harness)
+        if products[agent_id] == "codex" and agent_id in default_agents:
+            default_models[agent_id] = _resolve_llm_model(
+                probe, agent_store=agents, agent_cache=cache
+            )
         if harness_launch_availability(harness, readiness)[0] is False:
             unavailable.add(agent_id)
     catalogs = getattr(app.state, "host_model_catalog_cache_store", None)
@@ -532,6 +544,7 @@ def _context_request(
         independent,
         preview,
         named_agent,
+        default_models,
     )
 
 
@@ -725,7 +738,7 @@ async def admit_create(
                 raise HTTPException(
                     409, {"code": "session_choice_ask", "work_type": work.id}
                 ) from None
-            link = tiers[0][0].links[0]
+            link = resolved_link(tiers[0][0].links[0], request)
             choice = Choice(
                 "pick",
                 work.id,
@@ -768,6 +781,8 @@ async def admit_create(
                 agent_store=app.state.agent_store,
                 agent_cache=app.state.agent_cache,
             )
+            if product == "codex" and model:
+                link = link.model_copy(update={"model": model})
             pool = pool_of_session(
                 probe, settings, product=product, model=model, products=request.products
             )
@@ -823,29 +838,10 @@ async def admit_create(
         link = choice.link
         product = request.products.get(link.agent_id)
         if product == "codex" and link.model is None and link.meter in {"codex-pro", "krill"}:
-            from omnigent.server.routes._sessions.helpers import _resolve_llm_model
-
-            model = await asyncio.to_thread(
-                _resolve_llm_model,
-                Conversation(
-                    id="",
-                    root_conversation_id="",
-                    created_at=0,
-                    updated_at=0,
-                    agent_id=link.agent_id,
-                ),
-                agent_store=app.state.agent_store,
-                agent_cache=app.state.agent_cache,
+            raise HTTPException(
+                409,
+                {"code": "session_choice_ask", "reason": "Choose a model for this Codex route"},
             )
-            if not model:
-                raise HTTPException(
-                    409,
-                    {
-                        "code": "session_choice_ask",
-                        "reason": "Choose a model for this Codex route",
-                    },
-                )
-            link = link.model_copy(update={"model": model})
         link = pin_codex_link(link, product)
         choice = replace(choice, link=link)
         updated = body.model_copy(

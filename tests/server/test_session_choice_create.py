@@ -79,6 +79,69 @@ async def create(env, **changes):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prefix", ["krill", "ccs-krill"])
+@pytest.mark.parametrize("limit", ["busy", "reserve", "stop"])
+async def test_codex_default_route_is_admitted_against_its_actual_tile(
+    choice_env, monkeypatch, prefix, limit
+):
+    from tests.server.test_agent_quota import usage_report
+
+    env = choice_env
+    model = f"{prefix}/gpt-small"
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._resolve_harness_impl",
+        lambda *a, **kw: "codex-native",
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._resolve_llm_model",
+        lambda *a, **kw: model,
+    )
+    link = {"agent": env.agents[0]["id"], "meter": "codex-pro"}
+    env.settings["presets"][0]["links"] = [link]
+    env.settings["hosts"][HOST]["work"] = [[{"links": [link]}]]
+    env.settings["limits"] = {
+        "krill": {
+            "maxRunning": 1,
+            "reserve": {"mode": "total", "window": "7d", "pct": 15, "stopPct": 5},
+        }
+    }
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    if limit == "busy":
+        first = await create(env)
+        assert first.status_code == 201, first.text
+    else:
+        now = time.time()
+        env.app.state.agent_quota_service.report_account(
+            RESERVED_USER_LOCAL,
+            "krill",
+            usage_report(
+                account_product="codex",
+                observed_at=now,
+                windows=[
+                    {
+                        "id": "7d",
+                        "percent_used": 90 if limit == "reserve" else 96,
+                        "window_minutes": 10080,
+                        "resets_at": now + 86400,
+                    }
+                ],
+            ),
+            now=now,
+        )
+    response = await create(env)
+    assert response.status_code == 201, response.text
+    child = response.json()
+    choice = child["session_choice"]
+    assert (choice["outcome"], choice["pool"], choice["reason"]) == ("hold", "krill", limit)
+    assert child["model_override"] == choice["model"] == model
+    assert choice_record(env.store.get_conversation(child["id"]))["pool"] == "krill"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("model_source", ["explicit", "agent-default", "missing"])
 async def test_codex_pins_persist_through_create_queue_and_stop_targets(
     choice_env, db_uri, monkeypatch, model_source

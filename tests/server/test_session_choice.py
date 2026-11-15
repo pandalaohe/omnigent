@@ -738,6 +738,31 @@ def test_exact_attribution_order_label_and_model_families():
     ] == ["claude", "gpt", "kimi", "gemini", "deepseek", "glm-5"]
 
 
+@pytest.mark.parametrize(
+    "caller_model", ["gpt-small", "official/gpt-small", "krill/gpt-small", "ccs-krill/gpt-small"]
+)
+def test_codex_ability_cap_uses_unpinned_model_identity(caller_model):
+    raw = table().model_dump(mode="json", by_alias=True)
+    raw["abilityOrder"] = [["p0"], ["p1"]]
+    rows = raw["hosts"]["host-a"]["work"][0]
+    for index, model in enumerate(("gpt-large", "gpt-small")):
+        link = {"agent": f"agent-{index}", "model": model, "meter": "codex-pro"}
+        rows[index]["links"] = [link]
+        raw["presets"][index]["links"] = [link]
+    choice = pick(
+        parse_session_choice(raw),
+        request=ChoiceRequest(
+            OWNER,
+            "host-a",
+            products={"agent-0": "codex", "agent-1": "codex"},
+            caller_product="codex",
+            caller_model=caller_model,
+        ),
+    )
+    assert choice.link.model == "official/gpt-small"
+    assert choice.skipped[0].why == "above_caller"
+
+
 def test_codex_route_pins_select_by_tile_with_plain_catalog_models():
     raw = table().model_dump(mode="json", by_alias=True)
     rows = raw["hosts"]["host-a"]["work"][0]

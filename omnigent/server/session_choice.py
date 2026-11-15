@@ -461,6 +461,17 @@ class ChoiceRequest:
     independent: bool = False
     preview: bool = False
     named_agent: str | None = None
+    default_models: Mapping[str, str | None] = field(default_factory=dict)
+
+
+def resolved_link(link: Link, request: ChoiceRequest) -> Link:
+    if (
+        link.model is None
+        and request.products.get(link.agent_id) == "codex"
+        and link.meter in {"codex-pro", "krill"}
+    ):
+        return link.model_copy(update={"model": request.default_models.get(link.agent_id)})
+    return link
 
 
 @dataclass(frozen=True)
@@ -547,16 +558,19 @@ def resolve_work_type(
 def _ability(
     settings: SessionChoice, product: str | None, model: str | None, request: ChoiceRequest
 ):
+    def identity(value: str | None) -> str | None:
+        return value.partition("/")[2] if value and codex_route_pool(value, product) else value
+
     levels = {
         preset: index for index, level in enumerate(settings.ability_order) for preset in level
     }
     for preset in settings.presets:
         if preset.id in levels:
-            for link in preset.links:
-                if (
-                    request.products.get(link.agent_id, link.agent_id) == product
-                    and link.model == model
-                ):
+            for configured_link in preset.links:
+                link = resolved_link(configured_link, request)
+                if request.products.get(link.agent_id, link.agent_id) == product and identity(
+                    link.model
+                ) == identity(model):
                     return levels[preset.id]
     return None
 
@@ -572,10 +586,13 @@ def _filter_link(
     cooldowns: Mapping[str, float],
     now: float,
 ) -> Skipped | None:
+    link = resolved_link(link, request)
     product = request.products.get(link.agent_id, link.agent_id)
     pool = pool_of(link, product)
     if link.agent_id in request.unavailable:
         return Skipped(link, "unavailable")
+    if product == "codex" and link.model is None and link.meter in {"codex-pro", "krill"}:
+        return Skipped(link, "model_unavailable")
     if (
         link.model
         and request.models.get(link.agent_id)
@@ -634,7 +651,8 @@ def choose(
     survivors: list[tuple[int, int, Row, Link, int]] = []
     for index, tier in enumerate(tiers):
         for position, row in enumerate(tier):
-            for link in row.links:
+            for configured_link in row.links:
+                link = resolved_link(configured_link, request)
                 failure = _filter_link(
                     settings, work, link, request, readings, running, floor_off, cooldowns, now
                 )
@@ -714,7 +732,7 @@ def choose(
             index + 1
             for index, rows in enumerate(tiers)
             for row in rows
-            if first.link in row.links
+            if any(first.link == resolved_link(link, request) for link in row.links)
         )
         return Choice(
             "hold",
@@ -737,7 +755,9 @@ def choose(
         None,
         None,
         None,
-        "No eligible link",
+        "Choose a model for this Codex route"
+        if any(item.why == "model_unavailable" for item in skipped)
+        else "No eligible link",
         tuple(skipped),
         flags,
         warnings,
