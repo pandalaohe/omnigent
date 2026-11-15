@@ -208,7 +208,8 @@ vi.mock("@/hooks/useComments", () => ({
   useDeleteComment: vi.fn(() => ({ mutate: vi.fn() })),
 }));
 
-vi.mock("@/hooks/useFileContent", () => ({
+vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
+  ...(await importOriginal<typeof fileContentModule>()),
   useFileContent: vi.fn(() => ({ data: { content: "", path: "file1.py" } })),
 }));
 
@@ -280,6 +281,7 @@ import { useFileDiff } from "@/hooks/useFileDiff";
 import { prepareDiffEditor } from "./MonacoDiffViewer";
 import { MAX_PREVIEW_MARKDOWN_BYTES, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
 import { useFileContent } from "@/hooks/useFileContent";
+import type * as fileContentModule from "@/hooks/useFileContent";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
@@ -1587,6 +1589,50 @@ describe("FileViewer comment post settlement", () => {
 });
 
 describe("FileViewer editable file path", () => {
+  it("rejects a successful directory listing and keeps the current file open while editing", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    authenticatedFetchMock.mockResolvedValueOnce(
+      Response.json({ object: "list", data: [], has_more: false }, { status: 200 }),
+    );
+    const onNavigateTo = vi.fn();
+    renderViewer({
+      open: true,
+      path: "docs/current.md",
+      initialSearch: "file=docs%2Fcurrent.md",
+      onNavigateTo,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Edit file path: docs/current.md" }));
+    const input = screen.getByRole("textbox", { name: "File path" });
+    fireEvent.change(input, { target: { value: "docs" } });
+    fireEvent.submit(input.closest("form")!);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("This is a folder");
+    expect(authenticatedFetchMock).toHaveBeenCalledWith(
+      "/v1/sessions/conv_1/resources/environments/default/filesystem/docs",
+      { signal: expect.any(AbortSignal) },
+    );
+    expect(input).toHaveValue("docs");
+    expect(input).toBeEnabled();
+    expect(screen.getByTestId("url-params")).toHaveTextContent("file=docs%2Fcurrent.md");
+    expect(codeViewerRenders).toHaveBeenLastCalledWith(
+      expect.objectContaining({ path: "docs/current.md" }),
+    );
+    expect(onNavigateTo).not.toHaveBeenCalled();
+
+    authenticatedFetchMock.mockResolvedValueOnce(
+      Response.json({
+        object: "session.environment.filesystem.file_content",
+        path: "docs/next.md",
+        content: "# Next",
+        encoding: "utf-8",
+        bytes: 6,
+      }),
+    );
+    fireEvent.change(input, { target: { value: "docs/next.md" } });
+    fireEvent.submit(input.closest("form")!);
+    await waitFor(() => expect(onNavigateTo).toHaveBeenCalledExactlyOnceWith("docs/next.md"));
+  });
+
   it.each(["editor", "preview", "source"] as const)("selects the full path in %s mode", (mode) => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     writeFileViewPreferences({ ...DEFAULT_FILE_VIEW_PREFERENCES, previewableViewMode: mode });

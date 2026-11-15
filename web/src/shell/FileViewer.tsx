@@ -1917,9 +1917,12 @@ function FileViewerBody({
             key={`${conversationId}:${path}`}
             path={path}
             absolutePath={absoluteWorkspacePath(path, workspaceRoot) ?? path}
-            validate={(destination, signal) =>
-              fetchFileContent(conversationId, destination, signal)
-            }
+            validate={async (destination, signal) => {
+              const result = await fetchFileContent(conversationId, destination, signal);
+              if (result.object !== "session.environment.filesystem.file_content") {
+                throw new Error("This is a folder. Enter a file path.");
+              }
+            }}
             onNavigate={
               onNavigateTo
                 ? (destination) => guardDirty(() => onNavigateTo(destination))
