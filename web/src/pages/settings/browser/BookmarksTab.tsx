@@ -180,6 +180,11 @@ export function BookmarksTab() {
       <p role="status" className="text-sm">
         {places.message}
       </p>
+      {places.refreshError && (
+        <p role="alert" className="text-sm text-destructive">
+          {places.refreshError}
+        </p>
+      )}
     </BrowserGroup>
   );
 }

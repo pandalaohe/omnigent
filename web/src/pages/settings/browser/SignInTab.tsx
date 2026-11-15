@@ -76,7 +76,6 @@ export function SignInTab() {
       const result = await bridge.clear();
       if (result.ok) {
         setConfirm(false);
-        setSites([]);
         setStatus("Signed out. Open Browser again to sign in.");
       } else setStatus("Could not sign out.");
     } catch {

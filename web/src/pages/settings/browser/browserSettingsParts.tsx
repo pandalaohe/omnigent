@@ -248,7 +248,8 @@ export function usePlaces() {
   const [history, setHistory] = useState<BrowserPlace[]>([]),
     [bookmarks, setBookmarks] = useState<BrowserPlace[]>([]),
     [busy, setBusy] = useState(false),
-    [message, setMessage] = useState("");
+    [message, setMessage] = useState(""),
+    [refreshError, setRefreshError] = useState("");
   const refresh = useCallback(async () => {
     if (!bridge) return;
     const result = await bridge.browserPlaces({ action: "list" });
@@ -262,6 +263,7 @@ export function usePlaces() {
   async function run(args: Record<string, unknown>): Promise<PlacesResult> {
     if (!bridge) return { ok: false };
     setBusy(true);
+    setRefreshError("");
     try {
       const result = await bridge.browserPlaces(args);
       if (!result.ok) {
@@ -272,8 +274,12 @@ export function usePlaces() {
         );
         return result;
       }
-      await refresh();
       setMessage("Saved");
+      try {
+        await refresh();
+      } catch {
+        setRefreshError("Could not refresh saved pages. Reopen this tab to try again.");
+      }
       return result;
     } catch {
       setMessage("Could not save changes.");
@@ -287,6 +293,7 @@ export function usePlaces() {
     bookmarks,
     busy,
     message,
+    refreshError,
     run,
     bridge,
     has: (feature: string) => bridge?.browserPlacesFeatures?.includes(feature) === true,

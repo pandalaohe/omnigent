@@ -277,6 +277,11 @@ export function HistoryTab() {
         <p role="status" className="text-sm">
           {places.message}
         </p>
+        {places.refreshError && (
+          <p role="alert" className="text-sm text-destructive">
+            {places.refreshError}
+          </p>
+        )}
       </BrowserGroup>
       <BrowserGroup title="Keep history">
         {(["days", "entries"] as const).map((key) => {

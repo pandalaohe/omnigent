@@ -40,6 +40,22 @@ it("saves sign-ins and confirms consequences before clearing", async () => {
   await waitFor(() => expect(bridge.clearBrowserLogin).toHaveBeenCalledOnce());
   expect(await screen.findByText(/Signed out. Open Browser/)).toBeInTheDocument();
 });
+it("keeps autofill approvals and Revoke available after signing out", async () => {
+  const site = { origin: "https://example.test", id: "demo", label: "Demo account" };
+  const bridge = setup({
+    browserFillApprovals: vi.fn().mockResolvedValue({ ok: true, sites: [site] }),
+  });
+  await screen.findByText("https://example.test · Demo account");
+  await waitFor(() => expect(screen.getByRole("button", { name: "Sign out…" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Sign out…" }));
+  fireEvent.click(screen.getByRole("button", { name: "Sign out and clear" }));
+  await screen.findByText(/Signed out. Open Browser/);
+  expect(screen.getByText("https://example.test · Demo account")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Revoke" })).toBeEnabled();
+  fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
+  await waitFor(() => expect(bridge.browserRevokeFillApproval).toHaveBeenCalledWith(site));
+  await screen.findByText(/No sites approved/);
+});
 it("retains switch state on a failed write and revokes saved site approval", async () => {
   const site = { origin: "https://example.test", id: "demo", label: "Demo account" },
     revoke = vi.fn().mockResolvedValue({ ok: true });
