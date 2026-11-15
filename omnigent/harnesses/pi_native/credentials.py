@@ -923,12 +923,15 @@ def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None
         fails, times out, or produces empty output.
     """
     try:
+        process_options = spawn_kwargs()
+        if "creationflags" in process_options:
+            process_options["creationflags"] |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
         process = subprocess.Popen(
             default_shell_argv(auth_command),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
-            **spawn_kwargs(),
+            **process_options,
         )
     except Exception:  # noqa: BLE001
         return None

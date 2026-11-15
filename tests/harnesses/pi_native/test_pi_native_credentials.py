@@ -605,6 +605,29 @@ def test_run_auth_command_uses_the_shell() -> None:
     assert creds._run_auth_command("exit 3") is None
 
 
+@pytest.mark.parametrize("windows", [False, True])
+def test_run_auth_command_preserves_group_and_hides_windows_console(
+    monkeypatch: pytest.MonkeyPatch, windows: bool
+) -> None:
+    process_options = {"creationflags": 0x00000200} if windows else {"start_new_session": True}
+    monkeypatch.setattr(creds, "spawn_kwargs", lambda: process_options.copy())
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    process = Mock(returncode=0)
+    process.communicate.return_value = ("test-only", None)
+    popen = Mock(return_value=process)
+    monkeypatch.setattr(creds.subprocess, "Popen", popen)
+
+    assert creds._run_auth_command("auth-helper", timeout=4.0) == "test-only"
+    options = popen.call_args.kwargs
+    if windows:
+        assert options["creationflags"] == 0x08000200
+        assert "start_new_session" not in options
+    else:
+        assert options["start_new_session"] is True
+        assert "creationflags" not in options
+    process.communicate.assert_called_once_with(timeout=4.0)
+
+
 def test_run_auth_command_undecodable_output_is_a_failed_mint() -> None:
     """Non-UTF-8 output is a failed token mint, not an exception for the caller."""
     assert creds._run_auth_command("printf '\\xff\\xfe'") is None

@@ -13,8 +13,9 @@ from omnigent.harnesses.pi_native import model_scope
 
 
 @pytest.mark.parametrize("bundled", [False, True])
+@pytest.mark.parametrize("creationflags", [0, 0x08000000])
 def test_scope_cache_tracks_settings_catalog_and_cli(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bundled: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bundled: bool, creationflags: int
 ) -> None:
     """The same picker poll is cached; settings, catalog and CLI edits invalidate it."""
     dist = tmp_path / "dist"
@@ -25,9 +26,11 @@ def test_scope_cache_tracks_settings_catalog_and_cli(
     resolver.write_text("resolver-v1")
     monkeypatch.setattr(model_scope, "resolve_cli_binary", lambda _: str(cli))
     monkeypatch.setattr(model_scope.shutil, "which", lambda _: "node")
+    monkeypatch.setattr(model_scope.subprocess, "CREATE_NO_WINDOW", creationflags, raising=False)
     calls = []
 
     def run(*args: object, **kwargs: object) -> SimpleNamespace:
+        assert kwargs["creationflags"] == creationflags
         calls.append((args, kwargs))
         return SimpleNamespace(stdout="[0]")
 

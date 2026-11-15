@@ -4756,6 +4756,31 @@ class HostProcess:
                 elif harness in {"codex", "codex-native"}:
                     cached = await self._probed_codex_model_options("cached")
                     rows = with_source(cached.models) if cached is not None else None
+                elif harness in {"pi", "pi-native"}:
+                    from omnigent.models.model_catalog_store import (
+                        _refresh_in_background,
+                        catalog_is_stale,
+                        read_catalog,
+                    )
+
+                    rows = read_catalog(harness, "host-preview")
+                    if rows is None or catalog_is_stale(harness, "host-preview"):
+                        rows = None
+
+                        async def refresh_pi() -> list[dict[str, object]] | None:
+                            result = await self._handle_model_options(
+                                HostModelOptionsFrame(
+                                    request_id=frame.request_id, harness=harness, refresh="force"
+                                )
+                            )
+                            if result.status != "ok":
+                                _logger.warning(
+                                    "Background %s model catalog refresh failed", harness
+                                )
+                                return None
+                            return result.models
+
+                        _refresh_in_background(harness, "host-preview", refresh_pi)
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,
                     status="ok" if rows is not None else "failed",
@@ -4829,8 +4854,10 @@ class HostProcess:
             # inventory.
             try:
                 from omnigent.harnesses.pi_native.credentials import pi_native_model_options
+                from omnigent.models.model_catalog_store import write_catalog
 
-                pi_models = await asyncio.to_thread(pi_native_model_options)
+                pi_models = with_source(await asyncio.to_thread(pi_native_model_options))
+                write_catalog(harness, "host-preview", pi_models)
             except Exception:
                 _logger.warning("Pi model catalog unavailable", exc_info=True)
                 return HostModelOptionsResultFrame(
@@ -4841,7 +4868,7 @@ class HostProcess:
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
                 status="ok",
-                models=with_source(pi_models),
+                models=pi_models,
             )
 
         if harness == "antigravity-native":
