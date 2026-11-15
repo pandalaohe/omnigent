@@ -8,10 +8,15 @@ from array import array
 import httpx
 import openai
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from omnigent.server import dictation_hosted as hosted
-from omnigent.server.dictation import DictationTakeError
 from omnigent.server.model_connections import ResolvedConnection
+from omnigent.server.routes.dictation import create_dictation_router
+from omnigent.server.voice_input import VoiceInputSettings
+from tests._helpers.polling import poll_until
 
 SPEECH = array("h", [2000, -2000] * 160).tobytes()
 SILENCE = bytes(640)
@@ -141,29 +146,112 @@ def test_one_step_raw_metadata_and_fixed_output(monkeypatch):
         take.close()
 
 
-def test_bounded_queue_reports_lost_audio(monkeypatch):
+def hosted_app(take):
+    class Engine:
+        def create_stream(self):
+            return take
+
+    app = FastAPI()
+    app.include_router(
+        create_dictation_router(
+            settings_loader=lambda owner: VoiceInputSettings(speech_source="third"),
+            hosted_factory=lambda settings: Engine(),
+        ),
+        prefix="/v1",
+    )
+    return app
+
+
+@pytest.mark.parametrize("complete_active", [True, False])
+def test_router_overload_drains_active_or_counts_it_once(monkeypatch, complete_active):
+    monkeypatch.setenv("OMNIGENT_DICTATION_HOSTED_STOP_S", ".2")
     entered = threading.Event()
     release = threading.Event()
 
     def handle(request):
         entered.set()
-        release.wait(timeout=2)
+        release.wait(timeout=5)
         return httpx.Response(200, json={"text": "delivered"})
 
     take = stream(monkeypatch, handle)
     try:
-        take.feed_pcm16(SPEECH * 20 + SILENCE * 30)
-        assert entered.wait(timeout=1)
-        take.feed_pcm16((SPEECH * 20 + SILENCE * 30) * 3)
-        with pytest.raises(DictationTakeError) as raised:
-            take.feed_pcm16(b"")
-        assert raised.value.code == "third_party_overloaded"
-        assert raised.value.undelivered["segments"] == 3
-        release.set()
-        assert take.finish_update().finalized == "delivered"
+        with TestClient(hosted_app(take)) as client:
+            with client.websocket_connect("/v1/dictation/stream") as socket:
+                assert socket.receive_json()["type"] == "ready"
+                socket.send_bytes(SPEECH * 20 + SILENCE * 30)
+                assert entered.wait(timeout=1)
+                socket.send_bytes((SPEECH * 20 + SILENCE * 30) * 3)
+                with take.condition:
+                    assert take.condition.wait_for(lambda: take.fatal is not None, timeout=1)
+                if complete_active:
+                    release.set()
+                    result = socket.receive_json()
+                    assert (result["type"], result["text"]) == ("final", "delivered")
+                    socket.send_bytes(b"")
+                result = socket.receive_json()
+                assert result["type"] == "error"
+                assert result["code"] == "third_party_overloaded"
+                lost = 3 if complete_active else 4
+                assert result["undelivered"] == {"segments": lost, "seconds": float(lost)}
+                # A second flush must not count the timed-out active request twice.
+                assert take.finish_update().undelivered == result["undelivered"]
+                release.set()
+                take.wait_closed()
     finally:
         release.set()
         take.close()
+        take.wait_closed()
+
+
+def test_disconnect_retains_capacity_until_blocked_transport_exits(monkeypatch):
+    monkeypatch.setenv("OMNIGENT_DICTATION_HOSTED_MAX_STREAMS", "1")
+    monkeypatch.setenv("OMNIGENT_DICTATION_HOSTED_STOP_S", ".1")
+    entered = threading.Event()
+    release = threading.Event()
+    close_returned = threading.Event()
+
+    def handle(request):
+        entered.set()
+        release.wait(timeout=10)
+        return httpx.Response(200, json={"text": "late"})
+
+    take = stream(monkeypatch, handle)
+    original_close = take.close
+
+    def close():
+        original_close()
+        close_returned.set()
+
+    monkeypatch.setattr(take, "close", close)
+    try:
+        with TestClient(hosted_app(take)) as client:
+            with client.websocket_connect("/v1/dictation/stream") as socket:
+                assert socket.receive_json()["type"] == "ready"
+                socket.send_bytes(SPEECH * 20 + SILENCE * 30)
+                assert entered.wait(timeout=1)
+            assert close_returned.wait(timeout=1)
+            take.worker.join(timeout=2.1)
+            assert take.worker.is_alive()
+            with client.websocket_connect("/v1/dictation/stream") as blocked:
+                with pytest.raises(WebSocketDisconnect) as raised:
+                    blocked.receive_json()
+                assert raised.value.code == 1013
+            release.set()
+            take.wait_closed()
+
+            def admitted():
+                with client.websocket_connect("/v1/dictation/stream") as retry:
+                    try:
+                        return retry.receive_json()["type"] == "ready"
+                    except WebSocketDisconnect as exc:
+                        assert exc.code == 1013
+                        return False
+
+            poll_until(admitted, timeout_s=2, interval_s=0.01)
+    finally:
+        release.set()
+        take.close()
+        take.wait_closed()
 
 
 def test_stop_deadline_counts_inflight(monkeypatch):

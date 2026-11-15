@@ -147,6 +147,13 @@ def create_dictation_router(
         max(1, int(os.environ.get("OMNIGENT_DICTATION_HOSTED_MAX_STREAMS", "4")))
     )
     punctuation_slots = asyncio.Semaphore(1)
+    closing_tasks: set[asyncio.Task[None]] = set()
+
+    async def release_after_worker(
+        wait_closed: Callable[[], None], take_slots: asyncio.Semaphore
+    ) -> None:
+        await asyncio.to_thread(wait_closed)
+        take_slots.release()
 
     async def restore_dictation_punctuation(
         request: Request,
@@ -237,7 +244,9 @@ def create_dictation_router(
             )
             return
 
-        async with take_slots:
+        await take_slots.acquire()
+        handle: DictationStreamHandle | None = None
+        try:
             # Engine construction loads model weights — seconds on first
             # use. Run it off-loop; later takes reuse the shared engine.
             try:
@@ -246,7 +255,7 @@ def create_dictation_router(
                     if third
                     else await asyncio.to_thread(resolve_engine)
                 )
-                handle: DictationStreamHandle = await asyncio.to_thread(engine.create_stream)
+                handle = await asyncio.to_thread(engine.create_stream)
             except Exception as exc:  # noqa: BLE001 - contain initialization failures
                 _logger.error(
                     "dictation engine failed to initialize (%s)",
@@ -284,7 +293,7 @@ def create_dictation_router(
                 with anyio.CancelScope(shield=True):
                     try:
                         await asyncio.to_thread(handle.close)
-                    except Exception:  # noqa: BLE001 - redact provider and credential failures  # noqa: BLE001 - fall back to a direct close
+                    except Exception:  # noqa: BLE001 - preserve resource cleanup during teardown
                         # During teardown the loop's thread-pool executor may
                         # already be shutting down, so offloading raises rather
                         # than running close() — which would leak the take.
@@ -292,6 +301,15 @@ def create_dictation_router(
                         # engine, so fall back to a direct call on the loop.
                         with contextlib.suppress(Exception):
                             handle.close()
+        finally:
+            wait_closed = getattr(handle, "wait_closed", None)
+            if wait_closed is None:
+                take_slots.release()
+            else:
+                # Socket cleanup stays bounded; a blocked transport retains its slot.
+                task = asyncio.create_task(release_after_worker(wait_closed, take_slots))
+                closing_tasks.add(task)
+                task.add_done_callback(closing_tasks.discard)
 
     return router
 

@@ -125,6 +125,7 @@ class _HostedStream:
         self.voiced = 0
         self.silent = 0
         self.inflight = 0
+        self.inflight_abandoned = False
         self.lost_segments = 0
         self.lost_seconds = 0.0
         self.fatal: str | None = None
@@ -142,11 +143,15 @@ class _HostedStream:
     def _segment(self) -> None:
         if self.voiced >= 15:
             data = bytes(self.audio)
-            if len(self.queue) >= self.queue_size:
+            if self.fatal:
+                self._lost(data)
+            elif len(self.queue) >= self.queue_size:
                 self._lost(data)
                 self.fatal = "third_party_overloaded"
+                self.deadline = time.monotonic() + self.stop_timeout
                 while self.queue:
                     self._lost(self.queue.popleft())
+                self.condition.notify_all()
             else:
                 self.queue.append(data)
                 self.condition.notify_all()
@@ -173,9 +178,7 @@ class _HostedStream:
     def feed_pcm16(self, data: bytes) -> DictationUpdate:
         with self.condition:
             if self.fatal or self.cancelled:
-                if self.results:
-                    return self._update()
-                raise DictationTakeError(self.fatal or "third_party_failed", self._undelivered())
+                return self._drain_fatal()
             self.pending.extend(data)
             while len(self.pending) >= 640:
                 frame = bytes(self.pending[:640])
@@ -200,9 +203,37 @@ class _HostedStream:
                         or len(self.audio) // 640 >= self.max_frames
                     ):
                         self._segment()
-                        if self.fatal:
-                            break
+            if self.fatal:
+                if self.voiced >= 15:
+                    self._lost(bytes(self.audio) + bytes(self.pending))
+                self.audio.clear()
+                self.pending.clear()
+                self.voiced = self.silent = 0
+                return self._drain_fatal()
             return self._update()
+
+    def _abandon_inflight(self) -> None:
+        if self.inflight and not self.inflight_abandoned:
+            self.lost_segments += 1
+            self.lost_seconds += self.inflight / 32000
+            self.inflight_abandoned = True
+
+    def _drain_fatal(self) -> DictationUpdate:
+        if self.results:
+            return self._update()
+        if self.inflight and not self.cancelled:
+            self.deadline = self.deadline or time.monotonic() + self.stop_timeout
+            self.condition.wait_for(
+                lambda: not self.inflight,
+                timeout=max(0, self.deadline - time.monotonic()),
+            )
+            if self.inflight:
+                self._abandon_inflight()
+                self.cancelled = True
+                self.condition.notify_all()
+        if self.results:
+            return self._update()
+        raise DictationTakeError(self.fatal or "third_party_failed", self._undelivered())
 
     def _undelivered(self) -> dict[str, int | float]:
         return {"segments": self.lost_segments, "seconds": round(self.lost_seconds, 2)}
@@ -275,6 +306,7 @@ class _HostedStream:
                     return
                 pcm = self.queue.popleft()
                 self.inflight = len(pcm)
+                self.inflight_abandoned = False
             try:
                 result = None
                 for attempt in range(2):
@@ -313,6 +345,8 @@ class _HostedStream:
                         if self.voiced >= 15:
                             self._lost(bytes(self.audio))
                         self.audio.clear()
+                        self.pending.clear()
+                        self.voiced = self.silent = 0
             finally:
                 with self.condition:
                     self.inflight = 0
@@ -320,7 +354,7 @@ class _HostedStream:
 
     def finish_update(self) -> DictationUpdate:
         with self.condition:
-            self.deadline = time.monotonic() + self.stop_timeout
+            self.deadline = self.deadline or time.monotonic() + self.stop_timeout
             if not self.fatal:
                 self._segment()
             self.stopping = True
@@ -333,9 +367,7 @@ class _HostedStream:
                 for pcm in self.queue:
                     self._lost(pcm)
                 self.queue.clear()
-                if self.inflight:
-                    self.lost_segments += 1
-                    self.lost_seconds += self.inflight / 32000
+                self._abandon_inflight()
                 self.cancelled = True
                 self.condition.notify_all()
             return self._update()
@@ -360,4 +392,8 @@ class _HostedStream:
         try:
             self.client.close()
         finally:
-            self.worker.join(timeout=2)
+            self.worker.join(timeout=min(2, self.stop_timeout))
+
+    def wait_closed(self) -> None:
+        """Retain the router's capacity lease until the synchronous request really exits."""
+        self.worker.join()
