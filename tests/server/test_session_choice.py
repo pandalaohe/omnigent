@@ -16,6 +16,8 @@ from omnigent.server.session_choice import (
     ChoiceRevisionConflict,
     ChoiceState,
     FloorOff,
+    choice_document,
+    choice_revision,
     choose,
     floor_off_active,
     holds_slot,
@@ -23,6 +25,7 @@ from omnigent.server.session_choice import (
     parse_session_choice,
     pool_of_session,
     quota_reset_at,
+    resolve_limit_rules,
 )
 from omnigent.server.user_preferences_store import (
     SqlAlchemyUserPreferencesStore,
@@ -32,6 +35,540 @@ from omnigent.usage.contract import UsageAccountView, UsageWindowView
 from tests.server.test_user_preferences import _preferences_app
 
 OWNER = "owner@example.test"
+
+
+def rules_document(rules):
+    return parse_session_choice({"schemaVersion": 2, "limitRules": rules})
+
+
+@pytest.mark.parametrize("model_first", [False, True])
+def test_rule_fields_use_specificity_then_visible_order(model_first):
+    base = {
+        "id": "base",
+        "agent": "agent-a",
+        "maxRunning": 3,
+        "reserve": {"mode": "total", "window": "weekly", "pct": 20, "stopPct": 5},
+    }
+    host = {
+        "id": "host",
+        "agent": "agent-a",
+        "host": "host-a",
+        "maxRunning": 2,
+        "reserve": {"pct": 10},
+    }
+    model = {
+        "id": "model",
+        "agent": "agent-a",
+        "model": "model-x",
+        "maxRunning": 4,
+        "reserve": {"stopPct": 2},
+    }
+    rules = rules_document([base, *([model, host] if model_first else [host, model])]).limit_rules
+    result = resolve_limit_rules(rules, agent="agent-a", host="host-a", model="model-x")
+    assert result["maxRunning"].value == (4 if model_first else 2)
+    assert result["maxRunning"].source_rule_id == ("model" if model_first else "host")
+    assert result["maxRunning"].scope.model == ("model-x" if model_first else None)
+    assert result["maxRunning"].scope.host == (None if model_first else "host-a")
+    assert result["reserve.pct"].value == 10
+    assert result["reserve.pct"].source_rule_id == "host"
+    assert result["reserve.stopPct"].value == 2
+    assert result["reserve.stopPct"].source_rule_id == "model"
+    assert result["reserve.mode"].value == "total"
+    assert result["reserve.window"].source_rule_id == "base"
+    assert result["reserve.window"].specificity == 1
+    exact = {
+        "id": "exact",
+        "agent": "agent-a",
+        "host": "host-a",
+        "model": "model-x",
+        "maxRunning": None,
+    }
+    exact_rules = rules_document([base, host, model, exact]).limit_rules
+    unlimited = resolve_limit_rules(exact_rules, agent="agent-a", host="host-a", model="model-x")
+    assert unlimited["maxRunning"].payload() == {
+        "defined": True,
+        "value": None,
+        "sourceRuleId": "exact",
+        "specificity": 3,
+        "scope": {"agent": "agent-a", "host": "host-a", "model": "model-x"},
+    }
+
+
+def test_specific_looser_cap_overrides_broad_and_identity_is_exact():
+    rules = rules_document(
+        [
+            {"id": "base", "agent": "agent-a", "maxRunning": 3},
+            {"id": "specific", "agent": "agent-a", "model": "model-x", "maxRunning": 4},
+            {"id": "empty", "agent": "agent-a", "host": "host-a", "model": "model-x"},
+        ]
+    ).limit_rules
+    for host in ("host-a", "other-host"):
+        result = resolve_limit_rules(rules, agent="agent-a", host=host, model="model-x")
+        assert result["maxRunning"].value == 4
+        assert result["maxRunning"].scope.host is None
+    for model in ("Model-x", "model-x-extra", "provider/model-x", None):
+        assert (
+            resolve_limit_rules(rules, agent="agent-a", host="host-a", model=model)[
+                "maxRunning"
+            ].value
+            == 3
+        )
+    missing = resolve_limit_rules(rules, agent="Agent-a", host="host-a", model="model-x")
+    assert missing["maxRunning"].payload() == {
+        "defined": False,
+        "value": None,
+        "sourceRuleId": None,
+        "specificity": None,
+        "scope": None,
+    }
+
+
+def test_patch_roundtrip_preserves_absence_null_zero_empty_and_copies():
+    raw = {
+        "schemaVersion": 2,
+        "workTypes": [{"id": "work", "label": "Work"}],
+        "limitRules": [
+            {
+                "id": "base",
+                "agent": "agent-a",
+                "maxRunning": 3,
+                "reserve": {"mode": "total", "window": "weekly", "pct": 10, "stopPct": 0},
+                "reserveExempt": ["work"],
+            },
+            {
+                "id": "specific",
+                "agent": "agent-a",
+                "host": "host-a",
+                "maxRunning": None,
+                "reserve": None,
+                "reserveExempt": [],
+            },
+            {"id": "empty", "agent": "agent-a", "model": "model-x", "reserve": {}},
+        ],
+    }
+    settings = parse_session_choice(raw)
+    saved = choice_document(settings)
+    assert saved["limitRules"][1]["reserve"] == {"pct": None, "stopPct": None}
+    assert saved["limitRules"][1]["maxRunning"] is None
+    assert saved["limitRules"][1]["reserveExempt"] == []
+    assert saved["limitRules"][0]["reserve"]["stopPct"] == 0
+    assert saved["limitRules"][2] == raw["limitRules"][2]
+    assert choice_document(parse_session_choice(saved)) == saved
+    result = resolve_limit_rules(
+        settings.limit_rules, agent="agent-a", host="host-a", model="model-x"
+    )
+    assert result["reserve.pct"].defined and result["reserve.pct"].value is None
+    assert result["reserve.mode"].source_rule_id == "base"
+    assert result["reserveExempt"].value == ()
+    copied = settings.limit_rules[2].model_copy(update={"max_running": None})
+    saved_copy = choice_document(settings.model_copy(update={"limit_rules": (copied,)}))
+    assert saved_copy["limitRules"][0]["maxRunning"] is None
+    assert "schemaVersion" not in choice_document(parse_session_choice({}))
+    assert "limitRules" not in choice_document(parse_session_choice({"schemaVersion": 1}))
+    assert choice_document(rules_document([]))["limitRules"] == []
+    assert choice_revision(saved) == choice_revision(dict(reversed(list(saved.items()))))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"maxRunning": value} for value in (0, -1, True, 1.5)]
+    + [
+        {"agent": ""},
+        {"host": ""},
+        {"model": "*"},
+        {"reserveExempt": None},
+        {"reserve": {"mode": None}},
+        {"reserve": {"window": None}},
+        {"reserveExempt": ["missing"]},
+    ],
+)
+def test_invalid_rule_patch_is_rejected(change):
+    with pytest.raises(ValidationError):
+        rules_document([{"id": "rule", "agent": "agent-a", **change}])
+
+
+@pytest.mark.parametrize("field", ["pct", "stopPct"])
+@pytest.mark.parametrize("value", [-1, 101, float("inf"), float("-inf"), float("nan"), True, "10"])
+def test_rule_threshold_validation_names_the_invalid_field(field, value):
+    with pytest.raises(ValidationError) as error:
+        rules_document(
+            [
+                {
+                    "id": "rule",
+                    "agent": "agent-a",
+                    "reserve": {"mode": "total", "window": "weekly", field: value},
+                }
+            ]
+        )
+    assert error.value.errors()[0]["loc"] == ("limitRules", 0, "reserve", field)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"limitRules": []},
+        {"schemaVersion": 1, "limitRules": []},
+        {"schemaVersion": 2},
+        {"schemaVersion": 3},
+        {"schemaVersion": True},
+        {"schemaVersion": 2, "limitRules": None},
+        {"schemaVersion": 2, "limitRules": [{"id": "same", "agent": "a"}] * 2},
+    ],
+)
+def test_rule_document_version_and_ids_are_strict(raw):
+    with pytest.raises(ValidationError):
+        parse_session_choice(raw)
+
+
+def test_composed_threshold_validation_includes_unlisted_combinations_and_order():
+    base = {
+        "id": "base",
+        "agent": "agent-a",
+        "reserve": {"mode": "total", "window": "weekly", "pct": 20, "stopPct": 5},
+    }
+    host = {"id": "host", "agent": "agent-a", "host": "host-a", "reserve": {"pct": 2}}
+    model = {"id": "model", "agent": "agent-a", "model": "model-x", "reserve": {"stopPct": 1}}
+    # The listed host/model intersection is valid; the host/other-model cell is not.
+    with pytest.raises(ValidationError) as error:
+        rules_document([base, host, model])
+    assert "reserve.stopPct" in str(error.value)
+    assert "host-a" in str(error.value) and "base" in str(error.value)
+    cancel = {"id": "cancel", "agent": "agent-a", "host": "host-a", "reserve": None}
+    rules_document([cancel, host, base])
+    safe = {"id": "safe", "agent": "agent-a", "host": "host-a", "reserve": {"pct": 10}}
+    rules_document([safe, host, base])
+    with pytest.raises(ValidationError):
+        rules_document([host, safe, base])
+    with pytest.raises(ValidationError, match=r"reserve\.mode"):
+        rules_document([{"id": "orphan", "agent": "agent-a", "reserve": {"pct": 0}}])
+    rules_document([{"id": "cancel", "agent": "agent-a", "reserve": None}])
+
+
+@pytest.mark.parametrize("patch", [None, "old-page", {"sessionChoice": {}, "childCap": 4}])
+def test_saved_v2_roundtrip_namespace_preserves_null_and_rule_order(db_uri, patch):
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    raw = {
+        **document(),
+        "schemaVersion": 2,
+        "limitRules": [
+            {"id": "first", "agent": "agent-a", "maxRunning": None},
+            {"id": "second", "agent": "agent-a", "maxRunning": 3},
+        ],
+    }
+    saved = save(store, raw)
+    store.patch_namespace(OWNER, "session_collab", patch)
+    assert store.session_choice(OWNER)["settings"] == saved["settings"]
+    same = save(store, dict(reversed(list(saved["settings"].items()))))
+    assert same["revision"] == saved["revision"]
+    changed = deepcopy(saved["settings"])
+    changed["limitRules"].reverse()
+    assert save(store, changed)["revision"] != saved["revision"]
+    before = store.session_choice(OWNER)
+    with pytest.raises(ChoiceRevisionConflict):
+        save(store, raw, saved["revision"])
+    assert store.session_choice(OWNER) == before
+
+
+def test_v2_downgrade_rejected_but_undo_keeps_v2_envelope(db_uri):
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    legacy = save(store, document())["settings"]
+    converted = save(store, {**legacy, "schemaVersion": 2, "limitRules": []})
+    with pytest.raises(ChoiceRevisionConflict, match="version"):
+        save(store, legacy, converted["revision"])
+    assert store.session_choice(OWNER)["revision"] == converted["revision"]
+    undo = save(store, {**legacy, "schemaVersion": 2, "limitRules": []})
+    assert undo["settings"]["limits"] == legacy["limits"]
+    assert undo["settings"]["schemaVersion"] == 2
+    assert save(store, None)["settings"] is None
+
+
+def inject_stored_choice(store, raw):
+    import json
+
+    with store._write_session("inject_choice_fixture") as session:
+        store._upsert_row(
+            session,
+            user_id=OWNER,
+            key="settings.session_collab",
+            value=json.dumps({"sessionChoice": raw}),
+        )
+
+
+@pytest.mark.parametrize("version,state", [(2, "invalid"), (99, "unsupported")])
+def test_bad_stored_choice_remains_visible_and_cannot_downgrade(db_uri, version, state):
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    raw = {"schemaVersion": version, "limitRules": [], "enabled": "invalid"}
+    inject_stored_choice(store, raw)
+    result = store.session_choice(OWNER)
+    assert result["settings"] == raw
+    assert result["configurationError"]["state"] == state
+    parsed = read_collab_settings(store, OWNER)
+    assert parsed.session_choice_error["state"] == state
+    assert not parsed.session_choice.enabled
+    with pytest.raises(ChoiceRevisionConflict):
+        save(store, document(), result["revision"])
+    assert store.session_choice(OWNER) == result
+
+
+def test_stop_owner_discovery_includes_scoped_zero_stop_across_workspaces(db_uri):
+    from omnigent.db.db_models import workspace_scope
+
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    for workspace, stop in [(0, 0), (17, 5), (18, None)]:
+        with workspace_scope(workspace):
+            save(
+                store,
+                {
+                    "schemaVersion": 2,
+                    "limitRules": [
+                        {
+                            "id": "stop",
+                            "agent": "agent-a",
+                            "reserve": {"mode": "total", "window": "weekly", "stopPct": stop},
+                        },
+                    ],
+                },
+            )
+    assert {workspace for workspace, owner, _ in store.stop_line_owners() if owner == OWNER} == {
+        0,
+        17,
+    }
+
+
+def conversion_fixture(store):
+    from omnigent.server.user_preferences_store import (
+        ChoiceConversionProof,
+        LegacyChoiceConversionPlan,
+    )
+
+    original = document()
+    original["limits"]["unmapped"] = {"maxRunning": 2}
+    saved = save(store, original)
+    target = deepcopy(saved["settings"])
+    target.update(
+        schemaVersion=2,
+        limitRules=[
+            {
+                "id": "converted",
+                "agent": "agent-a",
+                "model": "model-x",
+                "reserve": {"mode": "daily", "window": "7d", "pct": 5},
+            }
+        ],
+    )
+    del target["limits"]["account-a"]
+    proof = ChoiceConversionProof(
+        source_revision=saved["revision"],
+        mapping_fingerprint="mapping-a",
+        replaced_paths=(("limits", "account-a"),),
+        new_rule_ids=("converted",),
+    )
+    plan = LegacyChoiceConversionPlan(
+        mapping_fingerprint="mapping-a",
+        target=parse_session_choice(target),
+        replaced_paths=proof.replaced_paths,
+        new_rule_ids=proof.new_rule_ids,
+    )
+    return saved, target, proof, plan
+
+
+def test_conversion_proof_and_v2_undo_are_one_revision_transaction(db_uri):
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    before, target, proof, plan = conversion_fixture(store)
+    calls = []
+
+    def fresh(owner, stored):
+        calls.append((owner, stored.schema_version))
+        return plan
+
+    saved = store.replace_session_choice(
+        OWNER, target, before["revision"], conversion_proof=proof, conversion_plan=fresh
+    )
+    assert calls == [(OWNER, 1)]
+    assert saved["settings"]["limits"] == {"unmapped": {"reserveExempt": [], "maxRunning": 2}}
+    assert store.session_choice(OWNER)["settings"] == saved["settings"]
+    # Undo restores legacy content in v2, keeping an independent later rule.
+    later = deepcopy(saved["settings"])
+    later["limitRules"].append({"id": "independent", "agent": "agent-b", "maxRunning": None})
+    saved_later = save(store, later)
+    undo = {**before["settings"], "schemaVersion": 2, "limitRules": [later["limitRules"][-1]]}
+    with pytest.raises(ChoiceRevisionConflict):
+        store.replace_session_choice(OWNER, undo, saved["revision"])
+    restored = store.replace_session_choice(OWNER, undo, saved_later["revision"])
+    assert restored["settings"]["limits"] == before["settings"]["limits"]
+    assert restored["settings"]["limitRules"] == [later["limitRules"][-1]]
+
+
+@pytest.mark.parametrize(
+    "fault", ["missing-provider", "mapping", "source", "paths", "rules", "unmapped", "target"]
+)
+def test_conversion_conflict_does_not_half_clear_legacy(db_uri, fault):
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    before, target, proof, plan = conversion_fixture(store)
+
+    def provider(owner, stored):
+        return plan
+
+    if fault == "missing-provider":
+        provider = None
+    elif fault == "mapping":
+        plan = replace(plan, mapping_fingerprint="changed")
+    elif fault == "source":
+        proof = proof.model_copy(update={"source_revision": "stale"})
+    elif fault == "paths":
+        proof = proof.model_copy(update={"replaced_paths": (("limits", "unmapped"),)})
+    elif fault == "rules":
+        proof = proof.model_copy(update={"new_rule_ids": ("wrong",)})
+    elif fault == "unmapped":
+        del target["limits"]["unmapped"]
+        plan = replace(plan, target=parse_session_choice(target))
+    else:
+        target["limitRules"][0]["reserve"]["pct"] = 6
+    with pytest.raises(ChoiceRevisionConflict):
+        store.replace_session_choice(
+            OWNER, target, before["revision"], conversion_proof=proof, conversion_plan=provider
+        )
+    assert store.session_choice(OWNER)["settings"] == before["settings"]
+    assert store.session_choice(OWNER)["revision"] == before["revision"]
+
+
+@pytest.mark.asyncio
+async def test_api_version_capabilities_diagnostics_and_conversion_guard(db_uri, tmp_path):
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    app = _preferences_app(db_uri, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        headers={"X-Test-User": OWNER},
+    ) as client:
+        url = "/v1/me/session-choice"
+        read = (await client.get(url)).json()
+        assert read["capabilities"]["documentVersions"] == [1, 2]
+        saved = await client.put(
+            url,
+            json={
+                "settings": {"schemaVersion": 2, "limitRules": []},
+                "expected_revision": read["revision"],
+            },
+        )
+        assert saved.status_code == 200, saved.text
+        revision = saved.json()["revision"]
+        refused = await client.put(
+            url, json={"settings": document(), "expected_revision": revision}
+        )
+        assert refused.status_code == 409
+        bad = await client.put(
+            url, json={"settings": {"schemaVersion": 99}, "expected_revision": revision}
+        )
+        assert bad.status_code == 422
+        save(store, None)
+        before, target, proof, _ = conversion_fixture(store)
+        refused = await client.put(
+            url,
+            json={
+                "settings": target,
+                "expected_revision": before["revision"],
+                "conversion_proof": proof.model_dump(mode="json"),
+            },
+        )
+        assert refused.status_code == 409
+        inject_stored_choice(store, {"schemaVersion": 99, "future": "preserve"})
+        read = (await client.get(url)).json()
+        assert read["configurationError"]["state"] == "unsupported"
+        assert read["settings"] == {"schemaVersion": 99, "future": "preserve"}
+
+
+@pytest.mark.asyncio
+async def test_route_passes_proof_only_to_fresh_owner_scoped_server_plan(db_uri):
+    from fastapi import FastAPI
+
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.server.routes.session_choice import create_session_choice_router
+    from tests.server.test_user_preferences import _HeaderAuthProvider
+
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    before, target, proof, plan = conversion_fixture(store)
+    calls = []
+
+    def fresh(owner, stored):
+        calls.append(owner)
+        return plan
+
+    app = FastAPI()
+    app.include_router(
+        create_session_choice_router(store, _HeaderAuthProvider(), conversion_plan=fresh),
+        prefix="/v1",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        body = {
+            "settings": target,
+            "expected_revision": before["revision"],
+            "conversion_proof": proof.model_dump(mode="json"),
+        }
+        # The standalone router has no main-app exception-to-HTTP handler.
+        with pytest.raises(OmnigentError) as error:
+            await client.put("/v1/me/session-choice", json=body)
+        assert error.value.code == ErrorCode.UNAUTHORIZED
+        other = await client.put(
+            "/v1/me/session-choice", json=body, headers={"X-Test-User": "other@example.test"}
+        )
+        assert other.status_code == 409
+        assert calls == []
+        result = await client.put(
+            "/v1/me/session-choice", json=body, headers={"X-Test-User": OWNER}
+        )
+        assert result.status_code == 200, result.text
+        assert calls == [OWNER]
+        assert result.json()["settings"]["limitRules"][0]["id"] == "converted"
+
+
+@pytest.mark.parametrize("location", ["presets", "hosts"])
+def test_conversion_replaces_only_the_proved_link_cap(db_uri, location):
+    from omnigent.server.user_preferences_store import (
+        ChoiceConversionProof,
+        LegacyChoiceConversionPlan,
+    )
+
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    original = document()
+    if location == "presets":
+        link = original["presets"][0]["links"][0]
+        path = ("presets", 0, "links", 0, "maxRunning")
+    else:
+        link = original["hosts"]["host-a"]["implementation"][0][0]["links"][0]
+        path = ("hosts", "host-a", "implementation", 0, 0, "links", 0, "maxRunning")
+    link.pop("meter")
+    link["maxRunning"] = 2
+    before = save(store, original)
+    target = deepcopy(before["settings"])
+    target.update(
+        schemaVersion=2,
+        limitRules=[{"id": "cap", "agent": "agent-a", "model": "model-x", "maxRunning": 2}],
+    )
+    entry = target
+    for segment in path[:-1]:
+        entry = entry[segment]
+    del entry[path[-1]]
+    proof = ChoiceConversionProof(
+        source_revision=before["revision"],
+        mapping_fingerprint="mapping",
+        replaced_paths=(path,),
+        new_rule_ids=("cap",),
+    )
+    plan = LegacyChoiceConversionPlan(
+        "mapping", parse_session_choice(target), proof.replaced_paths, proof.new_rule_ids
+    )
+
+    def fresh(owner, stored):
+        return plan
+
+    saved = store.replace_session_choice(
+        OWNER, target, before["revision"], conversion_proof=proof, conversion_plan=fresh
+    )
+    assert saved["settings"]["limits"] == before["settings"]["limits"]
+    assert saved["settings"]["limitRules"][0]["maxRunning"] == 2
 
 
 def document():
@@ -67,7 +604,8 @@ def test_saved_row_name_is_a_snapshot_and_survives_preset_rename(db_uri):
     assert row["adjusted"] is False
 
 
-def test_revision_is_atomic_and_other_preferences_survive(db_uri):
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_revision_is_atomic_and_other_preferences_survive(db_uri, schema_version):
     store = SqlAlchemyUserPreferencesStore(db_uri)
     store.patch_namespace(OWNER, "session_collab", {"childCap": 3})
     initial = store.session_choice(OWNER)
@@ -78,10 +616,13 @@ def test_revision_is_atomic_and_other_preferences_survive(db_uri):
         except ChoiceRevisionConflict:
             return "conflict"
 
-    other = document()
+    value = document()
+    if schema_version == 2:
+        value.update(schemaVersion=2, limitRules=[])
+    other = deepcopy(value)
     other["strategy"] = "balance"
     with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(attempt, [document(), other]))
+        results = list(pool.map(attempt, [value, other]))
     assert results.count("conflict") == 1
     stored = store.session_choice(OWNER)
     assert stored["revision"] != initial["revision"]

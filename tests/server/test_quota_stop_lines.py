@@ -422,3 +422,161 @@ async def test_floor_approval_passes_through_real_policy_engine(stop_env):
             )
         )
         assert result.action.name == action
+
+
+@pytest.mark.asyncio
+async def test_same_meter_models_use_their_own_stop_rule_and_recheck_before_stop(
+    stop_env, client, monkeypatch
+):
+    import json
+
+    from omnigent.server.session_choice import CHOICE_LABEL
+    from tests.server.helpers import create_test_agent
+
+    env = stop_env
+    agent = await create_test_agent(
+        client,
+        name="scoped-code",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+    env.value.update(
+        schemaVersion=2,
+        limits={},
+        limitRules=[
+            {
+                "id": "base",
+                "agent": agent["id"],
+                "reserve": {"mode": "total", "window": "weekly", "stopPct": 5},
+            },
+            {
+                "id": "exempt-model",
+                "agent": agent["id"],
+                "model": "model-y",
+                "reserve": {"stopPct": None},
+            },
+        ],
+    )
+    for row in [env.value["presets"][0], env.value["hosts"]["host-a"]["implementation"][0][0]]:
+        row["links"][0].update(agent=agent["id"], model="model-x")
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL, env.value, env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"]
+    )
+    sessions = []
+    for index, model in enumerate(("model-x", "model-y")):
+        runner = str(index + 1) * 32
+        row = env.store.create_conversation(
+            agent_id=agent["id"],
+            model_override=model,
+            host_id="a" * 32,
+            workspace="/opt/work/project",
+            runner_id=runner,
+            labels={CHOICE_LABEL: json.dumps({"pool": "account-a"})},
+        )
+        env.store.touch_runner_liveness([runner], int(env.now))
+        env.store.set_session_live_status(row.id, "running")
+        sessions.append(env.store.get_conversation(row.id))
+    assert stopped_line(env.app, sessions[0]).state == "stop"
+    assert stopped_line(env.app, sessions[1]) is None
+    env.prefs.set_choice_floor_off(RESERVED_USER_LOCAL, "account-a", FloorOff(until="manual"))
+    assert stopped_line(env.app, sessions[0]) is None
+    env.prefs.set_choice_floor_off(RESERVED_USER_LOCAL, "account-a", None)
+    post = AsyncMock(return_value={"queued": False})
+    monkeypatch.setattr(env.app.state, "quota_stop_post_event", post)
+    await enforce_stop_lines(env.app)
+    assert [call.args[1] for call in post.await_args_list] == [sessions[0].id]
+    post.reset_mock()
+    original = env.store.list_conversations
+
+    def relax_before_delivery(**kwargs):
+        page = original(**kwargs)
+        env.value["limitRules"][0]["reserve"]["stopPct"] = None
+        env.prefs.replace_session_choice(
+            RESERVED_USER_LOCAL,
+            env.value,
+            env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+        )
+        return page
+
+    monkeypatch.setattr(env.store, "list_conversations", relax_before_delivery)
+    await enforce_stop_lines(env.app)
+    post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_scoped_stop_never_borrows_another_models_only_reading(stop_env, client):
+    from tests.server.helpers import create_test_agent
+
+    env = stop_env
+    agent = await create_test_agent(
+        client,
+        name="exact-stop",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+    env.value.update(
+        schemaVersion=2,
+        limits={},
+        limitRules=[
+            {
+                "id": "base",
+                "agent": agent["id"],
+                "reserve": {"mode": "total", "window": "weekly", "stopPct": 5},
+            }
+        ],
+    )
+    for row in [env.value["presets"][0], env.value["hosts"]["host-a"]["implementation"][0][0]]:
+        row["links"][0].update(agent=agent["id"], model="model-a")
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.value,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    # An exact model-a binding can stop; a manually named model-b has no such meter.
+    bound = replace(env.conv, agent_id=agent["id"], model_override="model-a")
+    named = replace(bound, model_override="model-b")
+    assert stopped_line(env.app, bound).state == "stop"
+    assert stopped_line(env.app, named) is None
+
+
+@pytest.mark.parametrize("patch", ["empty", "parsed_null", "copy_null"])
+def test_unknown_model_does_not_guess_a_scoped_stop_or_ignore_its_cancellation(stop_env, patch):
+    import json
+
+    from omnigent.server.agent_quota import QuotaContext
+    from omnigent.server.session_choice import CHOICE_LABEL
+    from omnigent.server.session_choice_runtime import session_lines
+
+    env = stop_env
+    value = {
+        **env.value,
+        "schemaVersion": 2,
+        "limits": {},
+        "limitRules": [
+            {
+                "id": "base",
+                "agent": "agent-a",
+                "reserve": {"mode": "total", "window": "weekly", "stopPct": 5},
+            },
+            {
+                "id": "cancel",
+                "agent": "agent-a",
+                "model": "model-y",
+                **({} if patch == "empty" else {"reserve": None}),
+            },
+        ],
+    }
+    settings = parse_session_choice(value)
+    if patch == "copy_null":
+        settings = settings.model_copy(
+            update={
+                "limit_rules": (
+                    settings.limit_rules[0],
+                    settings.limit_rules[1].model_copy(update={"reserve": None}),
+                )
+            }
+        )
+    session = replace(
+        env.conv, agent_id="agent-a", labels={CHOICE_LABEL: json.dumps({"pool": "account-a"})}
+    )
+    readings = env.service.pool_readings(QuotaContext(RESERVED_USER_LOCAL, None))
+    _, lines = session_lines(env.app, session, settings, readings, {}, {}, env.now)
+    assert any(line.state == "stop" for _, line in lines) is (patch == "empty")

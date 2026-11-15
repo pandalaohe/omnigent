@@ -65,7 +65,8 @@ class SysSessionChoiceReadTool(_ChoiceTool):
     tool_name = "sys_session_choice_read"
     tool_description = (
         "Read your session choice document and revision: work types, per-host tiers, "
-        "preset fallback chains, limits and ability order."
+        "preset fallback chains, explicit Agent/Host/Model limit rules, legacy pool limits, "
+        "ability order and supported document capabilities."
     )
 
 
@@ -78,6 +79,30 @@ class SysSessionChoiceUpdateTool(_ChoiceTool):
     properties = {
         "settings": {"type": ["object", "null"], "additionalProperties": True},
         "expected_revision": {"type": "string"},
+        "conversion_proof": {
+            "type": "object",
+            "description": (
+                "Optional metadata from a fresh server conversion preview; "
+                "never authorizes a write."
+            ),
+            "properties": {
+                "source_revision": {"type": "string"},
+                "mapping_fingerprint": {"type": "string", "minLength": 1},
+                "replaced_paths": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {"type": "array", "items": {"type": ["string", "integer"]}},
+                },
+                "new_rule_ids": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+            },
+            "required": [
+                "source_revision",
+                "mapping_fingerprint",
+                "replaced_paths",
+                "new_rule_ids",
+            ],
+            "additionalProperties": False,
+        },
     }
     required = ["settings", "expected_revision"]
 

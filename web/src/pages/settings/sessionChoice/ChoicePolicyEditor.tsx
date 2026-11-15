@@ -1,22 +1,8 @@
-import { useState } from "react";
-import {
-  DndContext,
-  DragOverlay,
-  KeyboardSensor,
-  MouseSensor,
-  TouchSensor,
-  closestCorners,
-  useSensor,
-  useSensors,
-  type DragEndEvent,
-} from "@dnd-kit/core";
-import {
-  SortableContext,
-  arrayMove,
-  sortableKeyboardCoordinates,
-  verticalListSortingStrategy,
-} from "@dnd-kit/sortable";
+import { useRef, useState } from "react";
+import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { XIcon } from "lucide-react";
+import { HelpTip } from "@/components/HelpTip";
+import { applyPolicyDrop } from "./choicePolicyDrop";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -37,10 +23,9 @@ import {
   weightOf,
   type ChoiceAgent,
 } from "./sessionChoiceEdits";
-import { ChoiceDraggable, ChoiceDropZone, type ChoiceDragData } from "./ChoiceDrag";
+import { ChoiceDragContext, ChoiceDraggable, ChoiceDropZone, type DropIntent } from "./ChoiceDrag";
 import { CHOICE_SELECT, ChoiceChainEditor } from "./ChoiceLinkEditor";
 
-const rowId = (tier: number, row: number) => `row:${tier}:${row}`;
 const EMPTY_CATALOGS: CallingDefaultsCatalogRow[] = [];
 
 export function ChoicePolicyEditor({
@@ -64,6 +49,8 @@ export function ChoicePolicyEditor({
   const work = document.workTypes.find((w) => w.id === selected) ?? document.workTypes[0];
   const [workLabel, setWorkLabel] = useState<{ id: string; value: string } | null>(null);
   const [presetId, setPresetId] = useState<string | null>(null);
+  const presetEditor = useRef<HTMLDivElement>(null);
+  const [abilityPreset, setAbilityPreset] = useState<string | null>(null);
   const [editRow, setEditRow] = useState<{ tier: number; row: number } | null>(null);
   const [copyHost, setCopyHost] = useState("");
   const [copyWork, setCopyWork] = useState("");
@@ -75,17 +62,39 @@ export function ChoicePolicyEditor({
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [lastAdded, setLastAdded] = useState<{ preset: string; tier: number } | null>(null);
-  const [dragLabel, setDragLabel] = useState("");
+  const [rowIds] = useState(() => new WeakMap<ChoiceRow, string>());
+  const [containerIds] = useState(() => new WeakMap<object, string>());
+  const [addAbilityLevel] = useState<string[]>([]);
+  function containerId(container: object) {
+    if (!containerIds.has(container))
+      containerIds.set(container, `container:${crypto.randomUUID()}`);
+    return containerIds.get(container)!;
+  }
+  function rowId(tier: number, row: number) {
+    const item = tiers[tier][row];
+    if (!rowIds.has(item)) rowIds.set(item, `row:${crypto.randomUUID()}`);
+    return rowIds.get(item)!;
+  }
   const [previewing, setPreviewing] = useState(false);
   const targetHost = hosts.find((h) => h.host_id === host);
   const tiers = work ? (document.hosts[host]?.[work.id] ?? []) : [];
   const preset = document.presets.find((p) => p.id === presetId);
-  const sensors = useSensors(
-    useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 8 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
-  );
   function change(next: SessionChoiceDocument) {
+    const nextTiers = work && next.hosts[host]?.[work.id];
+    nextTiers?.forEach((rows, index) => {
+      const previous = tiers[index];
+      if (!previous) return;
+      if (!containerIds.has(rows)) containerIds.set(rows, containerId(previous));
+      if (rows.length === previous.length)
+        rows.forEach((row, rowIndex) => {
+          const previousId = rowIds.get(previous[rowIndex]);
+          if (!rowIds.has(row) && previousId) rowIds.set(row, previousId);
+        });
+    });
+    next.abilityOrder.forEach((level, index) => {
+      const previous = document.abilityOrder[index];
+      if (previous && !containerIds.has(level)) containerIds.set(level, containerId(previous));
+    });
     setError(null);
     setMessage(null);
     onChange(next);
@@ -111,61 +120,29 @@ export function ChoicePolicyEditor({
       setError(failure instanceof Error ? failure.message : "Could not change this setting.");
     }
   }
-  function dropped(event: DragEndEvent) {
-    setDragLabel("");
-    const from = event.active.data.current as ChoiceDragData | undefined;
-    const to = event.over?.data.current as ChoiceDragData | undefined;
-    if (!from || !to || event.active.id === event.over?.id) return;
+  function dropped(intent: DropIntent) {
     setEditRow(null);
-    if (from.kind === "work" && to.kind === "work") {
-      const order = document.workTypes.map((w) => w.id);
-      change({
-        ...document,
-        workTypes: arrayMove(document.workTypes, order.indexOf(from.work), order.indexOf(to.work)),
-      });
-      return;
-    }
-    if (
-      (from.kind === "preset" || from.kind === "ability") &&
-      (to.kind === "ability-level" || to.kind === "ability")
-    ) {
-      const levels = structuredClone(document.abilityOrder);
-      if (from.kind === "ability")
-        levels[from.level] = levels[from.level].filter((id) => id !== from.preset);
-      while (levels.length <= to.level) levels.push([]);
-      if (!levels.some((level) => level.includes(from.preset))) {
-        const at =
-          to.kind === "ability"
-            ? Math.max(0, levels[to.level].indexOf(to.preset))
-            : levels[to.level].length;
-        levels[to.level].splice(at, 0, from.preset);
+    const next = applyPolicyDrop(document, host, work?.id, intent);
+    if (next === document || JSON.stringify(next) === JSON.stringify(document))
+      return { focus: intent.source.id, message: "Position unchanged." };
+    if (intent.source.data.kind === "work" && work) setSelected(work.id);
+    change(next);
+    let focus = intent.source.id;
+    const from = intent.source.data;
+    const to = intent.target.data;
+    if (from.kind === "preset" && (to.kind === "tier" || to.kind === "row") && work) {
+      const oldRows = new Set(tiers.flat());
+      const added = next.hosts[host][work.id][to.tier].find((row) => !oldRows.has(row));
+      if (added) {
+        const id = `row:${crypto.randomUUID()}`;
+        rowIds.set(added, id);
+        focus = id;
       }
-      change({ ...document, abilityOrder: levels });
-      return;
+      setLastAdded({ preset: from.preset, tier: to.tier });
+    } else if (from.kind === "preset" && (to.kind === "ability" || to.kind === "ability-level")) {
+      focus = `ability:${from.preset}`;
     }
-    if (
-      (from.kind !== "preset" && from.kind !== "row") ||
-      (to.kind !== "tier" && to.kind !== "row")
-    )
-      return;
-    const next = structuredClone(tiers);
-    if (from.kind === "row" && to.kind === "row" && from.tier === to.tier) {
-      next[from.tier] = arrayMove(next[from.tier], from.row, to.row);
-      updateTiers(next);
-      return;
-    }
-    let row: ChoiceRow;
-    if (from.kind === "row") row = next[from.tier].splice(from.row, 1)[0];
-    else {
-      const chosen = document.presets.find((p) => p.id === from.preset);
-      if (!chosen) return;
-      row = { preset: chosen.id, name: chosen.name, links: structuredClone(chosen.links) };
-      setLastAdded({ preset: chosen.id, tier: to.tier });
-    }
-    let at = to.kind === "row" ? to.row : next[to.tier].length;
-    if (from.kind === "row" && from.tier === to.tier && from.row < at) at--;
-    next[to.tier].splice(at, 0, row);
-    updateTiers(next);
+    return { focus, message: `${intent.message}. Not saved yet.` };
   }
   function renamePreset(name: string) {
     if (!preset) return;
@@ -200,18 +177,11 @@ export function ChoicePolicyEditor({
           ))}
         </div>
       )}
-      <DndContext
-        sensors={sensors}
-        collisionDetection={closestCorners}
-        onDragStart={(e) => {
-          setDragLabel(
-            String(e.active.id).startsWith("preset:")
-              ? (document.presets.find((p) => `preset:${p.id}` === e.active.id)?.name ?? "Preset")
-              : "Move row",
-          );
-        }}
-        onDragEnd={dropped}
-        onDragCancel={() => setDragLabel("")}
+      <ChoiceDragContext
+        scope={`${host}:${work?.id}`}
+        reset={document}
+        abilityOrder={document.abilityOrder}
+        onDrop={dropped}
       >
         <div className="grid min-w-0 gap-3 md:grid-cols-[172px_minmax(0,1fr)]">
           <div className="min-w-0 space-y-2">
@@ -451,9 +421,8 @@ export function ChoicePolicyEditor({
                     );
                     return (
                       <ChoiceDropZone
-                        // eslint-disable-next-line react/no-array-index-key -- Tier position is the policy's stored identity.
-                        key={`tier:${tierIndex}`}
-                        id={`tier:${tierIndex}`}
+                        key={containerId(rows)}
+                        id={containerId(rows)}
                         data={{ kind: "tier", tier: tierIndex }}
                         label={`Tier ${tierIndex + 1}`}
                         className="min-h-32 w-64 shrink-0 space-y-2 bg-muted/15"
@@ -564,6 +533,7 @@ export function ChoicePolicyEditor({
                                       agents={agents}
                                       host={targetHost}
                                       meters={meters}
+                                      limits={document.limits}
                                       onChange={(links) =>
                                         updateRow(tierIndex, index, { links, adjusted: true })
                                       }
@@ -701,7 +671,22 @@ export function ChoicePolicyEditor({
             </div>
           </SortableContext>
           {preset && (
-            <div className="max-w-xl space-y-2 rounded-lg border border-border p-3">
+            <div
+              ref={presetEditor}
+              className="max-w-xl space-y-2 rounded-lg border border-border p-3"
+            >
+              {abilityPreset === preset.id && (
+                <p className="text-xs text-muted-foreground" role="note">
+                  This shared preset is used in{" "}
+                  {Object.values(document.hosts)
+                    .flatMap((types) => Object.values(types).flat(2))
+                    .filter((row) => row.preset === preset.id).length +
+                    document.abilityOrder.flat().filter((id) => id === preset.id).length -
+                    1}{" "}
+                  other places. Edits affect the shared preset. Use Apply below to update its
+                  unadjusted tier rows; adjusted rows keep their own links.
+                </p>
+              )}
               <div className="flex items-end gap-2">
                 <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">
                   Preset name
@@ -730,6 +715,7 @@ export function ChoicePolicyEditor({
                 agents={agents}
                 host={targetHost}
                 meters={meters}
+                limits={document.limits}
                 onChange={(links) =>
                   change({
                     ...document,
@@ -756,13 +742,36 @@ export function ChoicePolicyEditor({
           )}
         </div>
         <details className="border-t border-border pt-3">
-          <summary className="cursor-pointer text-sm font-medium">Ability order</summary>
+          <summary className="flex cursor-pointer items-center gap-2 text-sm font-medium">
+            <span>Ability order · Delegation ceiling</span>
+            <HelpTip label="About Ability order">
+              <p>
+                Lower numbers mean higher ability. A caller can delegate to the same or a lower
+                ability level.
+              </p>
+              <p className="mt-2">
+                For example, Codex at Level 2 cannot delegate to Claude at Level 1.
+              </p>
+              <p className="mt-2">
+                If either side has no level mapping, this condition does not block it. Tier order,
+                weights and availability checks still apply.
+              </p>
+              <p className="mt-2">
+                Each entry names a preset. Its Agent and Model links share that preset's ability
+                level. Entries in one level have equal ability; their order is not a preference.
+              </p>
+            </HelpTip>
+          </summary>
+          <div className="mt-1 text-xs text-muted-foreground">
+            {document.abilityOrder.some((level) => level.length)
+              ? "Higher ability has a lower level number"
+              : "No delegation ceiling configured"}
+          </div>
           <div className="mt-2 flex flex-wrap items-start gap-2">
-            {[...document.abilityOrder, []].map((level, index) => (
+            {[...document.abilityOrder, addAbilityLevel].map((level, index) => (
               <ChoiceDropZone
-                // eslint-disable-next-line react/no-array-index-key -- Ability levels are stored by position and have no local state.
-                key={`level:${index}`}
-                id={`level:${index}`}
+                key={containerId(level)}
+                id={containerId(level)}
                 data={{ kind: "ability-level", level: index }}
                 label={`Ability level ${index + 1}`}
                 className="min-h-20 w-52 space-y-1"
@@ -771,17 +780,34 @@ export function ChoicePolicyEditor({
                   Level {index + 1}
                   {index === document.abilityOrder.length ? " · add" : ""}
                 </p>
-                <SortableContext items={level.map((p) => `ability:${index}:${p}`)}>
+                <p className="text-xs text-muted-foreground">
+                  {index === document.abilityOrder.length
+                    ? "Drop a preset here to add a lower ability level."
+                    : `Callers at Level ${index + 1} can delegate to this level or a higher-numbered level.`}
+                </p>
+                <SortableContext items={level.map((p) => `ability:${p}`)}>
                   {level.map((p) => (
                     <ChoiceDraggable
                       key={p}
-                      id={`ability:${index}:${p}`}
+                      id={`ability:${p}`}
                       data={{ kind: "ability", level: index, preset: p }}
                       label={`${p} ability`}
                     >
-                      <span className="min-w-0 flex-1 truncate text-sm">
+                      <button
+                        type="button"
+                        className="min-w-0 flex-1 break-words text-left text-sm"
+                        aria-label={`Edit ${document.presets.find((item) => item.id === p)?.name ?? p} preset from ability order`}
+                        onClick={() => {
+                          setPresetId(p);
+                          setAbilityPreset(p);
+                          requestAnimationFrame(() => {
+                            presetEditor.current?.scrollIntoView?.({ block: "nearest" });
+                            presetEditor.current?.querySelector<HTMLInputElement>("input")?.focus();
+                          });
+                        }}
+                      >
                         {document.presets.find((item) => item.id === p)?.name ?? p}
-                      </span>
+                      </button>
                       <button
                         type="button"
                         aria-label={`Remove ${p} from ability order`}
@@ -803,14 +829,7 @@ export function ChoicePolicyEditor({
             ))}
           </div>
         </details>
-        <DragOverlay>
-          {dragLabel && (
-            <div className="rounded-md border border-primary bg-background px-3 py-2 text-sm shadow-lg">
-              {dragLabel}
-            </div>
-          )}
-        </DragOverlay>
-      </DndContext>
+      </ChoiceDragContext>
       <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
         <span>About {choiceTokenEstimate(document)} tokens at each session start</span>
         {work && (

@@ -325,6 +325,40 @@ def test_product_exception_then_default_then_pinned_then_tightest(service):
     assert service.quotas(context, now=NOW)[1]["opencode"].deciding_window == "5h"
 
 
+def test_agent_model_period_overrides_agent_without_affecting_other_products(service):
+    report = snapshot(used=85)
+    report["windows"].append(
+        {
+            "label": "month",
+            "used_percent": 0,
+            "duration_mins": 43200,
+            "resets_at": NOW + 30 * 86400,
+        }
+    )
+    for product in ("claude", "codex"):
+        service.report(OWNER, None, product, report, now=NOW)
+    service.preferences.patch_namespace(
+        OWNER,
+        "session_collab",
+        {
+            "quotaPeriods": {"codex": "5h"},
+            "quotaPeriodRules": [
+                {"agent": "agent-a", "period": "month"},
+                {"agent": "agent-a", "model": "model-x", "period": "5h"},
+            ],
+        },
+    )
+    from omnigent.server.user_preferences_store import read_collab_settings
+
+    settings = read_collab_settings(service.preferences, OWNER)
+    assert settings.quota_period("codex", "agent-a", "model-x") == "5h"
+    assert settings.quota_period("codex", "agent-a", "model-y") == "month"
+    assert settings.quota_period("codex", "agent-b", "model-x") == "5h"
+    quotas = service.quotas(QuotaContext(OWNER, HOST, "agent-a", "model-y", "codex"), now=NOW)[1]
+    assert quotas["codex"].deciding_window == "month"
+    assert quotas["claude"].deciding_window == "5h"
+
+
 def test_claude_capture_uses_ancestor_owner_and_inherited_host(service, db_uri):
     _make_user(db_uri, OWNER, is_admin=False)
     root = service.conversations.create_conversation(host_id=HOST, workspace="/opt/work/project")

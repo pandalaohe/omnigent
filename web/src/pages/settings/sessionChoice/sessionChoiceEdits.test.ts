@@ -6,6 +6,7 @@ import {
   addToOtherTypes,
   applyPreset,
   copyStrategy,
+  referencedChoicePools,
   removePreset,
   removeWorkType,
   renameWorkType,
@@ -56,6 +57,22 @@ function document(): SessionChoiceDocument {
 }
 
 describe("policy edits preserve working copies", () => {
+  it("derives unique pools from every preset and host link without using legacy limits", () => {
+    const before = document();
+    before.presets[0].links.push({ agent: "other", meter: "shared" });
+    before.hosts.b = {
+      review: [[{ links: [{ agent: "sdk", model: "old-model" }, { agent: "missing" }] }]],
+    };
+    expect([
+      ...referencedChoicePools(before, agents, {
+        codex: "codex",
+        "codex-native": "codex",
+        "pi-native": "pi",
+      }),
+    ]).toEqual(["codex:new-model", "shared", "codex:old-model", "pi:", "missing:"]);
+    expect(before.limits).toEqual({ pool: { reserveExempt: ["work"] } });
+  });
+
   it("renames ids, aliases, defaults, every host and reserve exemptions", () => {
     const before = document();
     const next = renameWorkType(before, "work", "Big Design");

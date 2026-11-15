@@ -53,6 +53,9 @@ export function renameWorkType(
   }
   for (const limit of Object.values(next.limits))
     limit.reserveExempt = limit.reserveExempt?.map((w) => (w === oldId ? id : w));
+  for (const rule of next.limitRules ?? [])
+    if (rule.reserveExempt)
+      rule.reserveExempt = rule.reserveExempt.map((w) => (w === oldId ? id : w));
   return next;
 }
 
@@ -67,6 +70,8 @@ export function removeWorkType(document: SessionChoiceDocument, id: string): Ses
   for (const types of Object.values(next.hosts)) Reflect.deleteProperty(types, id);
   for (const limit of Object.values(next.limits))
     limit.reserveExempt = limit.reserveExempt?.filter((w) => w !== id);
+  for (const rule of next.limitRules ?? [])
+    if (rule.reserveExempt) rule.reserveExempt = rule.reserveExempt.filter((w) => w !== id);
   if (!next.workTypes.length) {
     next.enabled = false;
     next.defaultWorkType = null;
@@ -135,6 +140,30 @@ export function guessMeter(
   if (link.model?.includes("/") || link.model?.includes(":")) return null;
   const product = agents.find((a) => a.id === link.agent)?.product;
   return meters.find((m) => m.product === product && product != null)?.id ?? null;
+}
+
+export function referencedChoicePools(
+  document: SessionChoiceDocument,
+  agents: ChoiceAgent[],
+  products: Record<string, string | null>,
+): Set<string> {
+  const links = [
+    ...document.presets.flatMap((preset) => preset.links),
+    ...Object.values(document.hosts).flatMap((types) =>
+      Object.values(types)
+        .flat(2)
+        .flatMap((row) => row.links),
+    ),
+  ];
+  return new Set(
+    links.map((link) => {
+      const harness = agents.find((agent) => agent.id === link.agent)?.harness;
+      const product = harness
+        ? products[canonicalNativeHarness(harness.replaceAll("_", "-"))]
+        : null;
+      return link.meter || `${product ?? link.agent}:${link.model ?? ""}`;
+    }),
+  );
 }
 
 export function copyStrategy(

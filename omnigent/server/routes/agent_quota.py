@@ -195,17 +195,47 @@ def create_agent_quota_router(
     otlp_receiver = OtlpReceiver(service)
 
     @router.get("/me/usage/lines")
-    async def usage_lines(request: Request, running: bool = False) -> dict[str, Any]:
+    async def usage_lines(
+        request: Request,
+        running: bool = False,
+        host_id: str | None = None,
+        agent_id: str | None = None,
+        model: str | None = None,
+    ) -> dict[str, Any]:
         from omnigent.server.agent_quota import QuotaContext
         from omnigent.server.session_choice_runtime import session_products, stop_targets
-        from omnigent.server.user_preferences_store import read_collab_settings
 
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
-        result = await asyncio.to_thread(service.tile_lines, owner)
+        from omnigent.server.session_choice_preview import read_preview_settings
+
+        settings, saved = await asyncio.to_thread(
+            read_preview_settings, service.preferences, owner
+        )
+        result = await asyncio.to_thread(service.tile_lines, owner, settings=settings)
+        result["savedRevision"] = saved["revision"]
+        result["limitsVaryByCandidate"] = bool(
+            settings.schema_version == 2 and settings.limit_rules
+        )
+        if host_id is not None or agent_id is not None or model is not None:
+            if not host_id or not agent_id:
+                raise HTTPException(422, "host_id and agent_id are required for scoped lines")
+            hosts = getattr(request.app.state, "host_store", None)
+            host = await asyncio.to_thread(hosts.get_host, host_id) if hosts else None
+            if host is None or (auth_provider is not None and host.user_id != owner):
+                raise HTTPException(404, "Host not found")
+            from omnigent.server.session_choice_preview import candidate_preview
+
+            result["scoped"] = await candidate_preview(
+                request.app,
+                owner,
+                host_id,
+                settings,
+                agent_id,
+                model,
+                include_running=running,
+            )
+            result["scoped"]["savedRevision"] = saved["revision"]
         if running:
-            settings = (
-                await asyncio.to_thread(read_collab_settings, service.preferences, owner)
-            ).session_choice
             readings = await asyncio.to_thread(service.pool_readings, QuotaContext(owner, None))
             products = await asyncio.to_thread(session_products, request.app, settings)
             targets = await asyncio.to_thread(

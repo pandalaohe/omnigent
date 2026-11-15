@@ -393,7 +393,10 @@ async def test_create_skips_an_unbindable_agent_before_choosing_next(choice_env,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("default_model", [False, True])
-async def test_named_reason_checks_cap_but_user_can_override(choice_env, default_model):
+@pytest.mark.parametrize("schema_version", [1, 2])
+async def test_named_reason_checks_cap_but_user_can_override(
+    choice_env, default_model, schema_version
+):
     env = choice_env
     if default_model:
         model = env.agents[0]["name"]
@@ -403,6 +406,11 @@ async def test_named_reason_checks_cap_but_user_can_override(choice_env, default
             RESERVED_USER_LOCAL,
             env.settings,
             env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+        )
+    if schema_version == 2:
+        model = env.agents[0]["name"] if default_model else "test-model"
+        save_rules(
+            env, [{"id": "scoped", "agent": env.agents[0]["id"], "model": model, "maxRunning": 1}]
         )
     first = await create(env)
     assert first.status_code == 201, first.text
@@ -416,6 +424,11 @@ async def test_named_reason_checks_cap_but_user_can_override(choice_env, default
     refused = await create(env, **named)
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "agent_busy"
+    if schema_version == 2:
+        detail = refused.json()["detail"]
+        assert detail["savedRevision"] == env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"]
+        assert detail["effectiveLimits"]["maxRunning"]["sourceRuleId"] == "scoped"
+        assert detail["effectiveLimits"]["maxRunning"]["runningCount"] == 1
     allowed = await create(env, **{**named, "user_named": True})
     assert allowed.status_code == 201, allowed.text
 
@@ -605,7 +618,7 @@ async def test_user_named_host_hold_keeps_priority_at_release(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["quota", "running", "choose"])
-async def test_failed_reads_and_selector_keep_projectless_create_usable(
+async def test_failed_reads_preserve_unknown_quota_but_do_not_bypass_caps_or_selector(
     choice_env, monkeypatch, failure
 ):
     env = choice_env
@@ -620,10 +633,14 @@ async def test_failed_reads_and_selector_keep_projectless_create_usable(
     else:
         monkeypatch.setattr(ChoiceState, "select", fail)
     response = await create(env)
-    assert response.status_code == 201, response.text
-    assert response.json()["agent_id"] == env.agents[0]["id"]
     if failure == "choose":
-        assert "choice_failed" in response.json()["session_choice"]["flags"]
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "session_choice_unavailable"
+        return
+    assert response.status_code == 201, response.text
+    assert response.json()["agent_id"] == env.agents[failure == "running"]["id"]
+    if failure == "running":
+        assert response.json()["session_choice"]["skipped"][0]["why"] == "count_unavailable"
 
 
 @pytest.mark.asyncio
@@ -710,6 +727,7 @@ async def test_refusal_and_reserved_labels_leave_no_child(choice_env):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("schema_version", [1, 2])
 @pytest.mark.parametrize(
     "used,user_named,exempt,code",
     [
@@ -721,7 +739,7 @@ async def test_refusal_and_reserved_labels_leave_no_child(choice_env):
         (100, False, False, "agent_stopped"),
     ],
 )
-async def test_named_quota_lines(choice_env, used, user_named, exempt, code):
+async def test_named_quota_lines(choice_env, used, user_named, exempt, code, schema_version):
     from omnigent.usage.contract import UsageReport
 
     env = choice_env
@@ -729,6 +747,20 @@ async def test_named_quota_lines(choice_env, used, user_named, exempt, code):
         "reserve": {"mode": "total", "window": "7d", "pct": 15, "stopPct": 5},
         "reserveExempt": ["work"] if exempt else [],
     }
+    if schema_version == 2:
+        limits = env.settings["limits"].pop("pool-0")
+        env.settings.update(
+            schemaVersion=2,
+            limitRules=[
+                {
+                    "id": "scoped",
+                    "agent": env.agents[0]["id"],
+                    "host": HOST,
+                    "model": "test-model",
+                    **limits,
+                }
+            ],
+        )
     env.prefs.replace_session_choice(
         RESERVED_USER_LOCAL,
         env.settings,
@@ -762,3 +794,530 @@ async def test_named_quota_lines(choice_env, used, user_named, exempt, code):
     assert response.status_code == (409 if code else 201), response.text
     if code:
         assert response.json()["detail"]["code"] == code
+
+
+def save_rules(env, rules):
+    env.settings.update(schemaVersion=2, limitRules=rules, limits={})
+    env.settings["hosts"][HOST]["work"] = env.settings["hosts"][HOST]["work"][:1]
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+
+
+def occupied(env, *, host=HOST, model="test-model", agent=None):
+    return env.store.create_conversation(
+        agent_id=agent or env.agents[0]["id"],
+        host_id=host,
+        workspace="/opt/work/project",
+        model_override=model,
+        labels={SLOT_LABEL: f"admitted@{host}@pool-0@{time.time()}"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_specific_four_overrides_broad_three_and_broad_still_counts_all_hosts(choice_env):
+    env = choice_env
+    agent = env.agents[0]["id"]
+    save_rules(
+        env,
+        [
+            {"id": "base", "agent": agent, "maxRunning": 3},
+            {"id": "model", "agent": agent, "model": "test-model", "maxRunning": 4},
+        ],
+    )
+    for host in (HOST, "2" * 32, "3" * 32):
+        occupied(env, host=host)
+    fourth = await create(env)
+    assert fourth.status_code == 201, fourth.text
+    assert fourth.json()["session_choice"]["outcome"] == "pick"
+    fifth = await create(env)
+    assert fifth.status_code == 201, fifth.text
+    assert fifth.json()["session_choice"]["outcome"] == "hold"
+    assert len(fifth.json()["session_choice"]["skipped"][0]["running"]) == 4
+    broad = await create(
+        env, agent_id=agent, model_override="other-model", choice_reason="Need this model"
+    )
+    assert broad.status_code == 409, broad.text
+    assert broad.json()["detail"]["code"] == "agent_busy"
+    assert len(broad.json()["detail"]["running"]) == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_first", [False, True])
+async def test_equal_specificity_count_uses_field_source_scope(choice_env, model_first):
+    env = choice_env
+    agent = env.agents[0]["id"]
+    host_rule = {"id": "host", "agent": agent, "host": HOST, "maxRunning": 2}
+    model_rule = {"id": "model", "agent": agent, "model": "test-model", "maxRunning": 4}
+    save_rules(env, [model_rule, host_rule] if model_first else [host_rule, model_rule])
+    local = occupied(env)
+    other_model = occupied(env, model="other-model")
+    remote = occupied(env, host="2" * 32)
+    response = await create(env)
+    assert response.status_code == 201, response.text
+    choice = response.json()["session_choice"]
+    assert choice["outcome"] == ("pick" if model_first else "hold")
+    if not model_first:
+        assert set(choice["skipped"][0]["running"]) == {local.id, other_model.id}
+        assert remote.id not in choice["skipped"][0]["running"]
+
+
+@pytest.mark.asyncio
+async def test_two_hosts_race_for_one_owner_scoped_slot(choice_env):
+    from copy import deepcopy
+
+    env = choice_env
+    second_host = "2" * 32
+    save_rules(env, [{"id": "base", "agent": env.agents[0]["id"], "maxRunning": 1}])
+    env.settings["hosts"][second_host] = deepcopy(env.settings["hosts"][HOST])
+    env.app.state.host_store.upsert_on_connect(second_host, "second-host", RESERVED_USER_LOCAL)
+    save_rules(env, env.settings["limitRules"])
+    second_parent = env.store.create_conversation(
+        agent_id=env.agents[0]["id"], host_id=second_host, workspace="/opt/work/project"
+    )
+    results = await asyncio.gather(create(env), create(env, parent_session_id=second_parent.id))
+    assert all(result.status_code == 201 for result in results), [r.text for r in results]
+    assert sorted(r.json()["session_choice"]["outcome"] for r in results) == ["hold", "pick"]
+    assert (
+        sum(holds_slot(env.store.get_conversation(r.json()["id"]), time.time()) for r in results)
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_queued_release_reloads_rule_and_excludes_its_running_identity(choice_env):
+    from omnigent.server.session_choice_runtime import release_choice
+
+    env = choice_env
+    rules = [{"id": "base", "agent": env.agents[0]["id"], "maxRunning": 1}]
+    save_rules(env, rules)
+    occupied(env, host="2" * 32)
+    held = (await create(env)).json()
+    assert held["session_choice"]["outcome"] == "hold"
+    current = env.store.get_conversation(held["id"])
+    assert not await release_choice(env.app, current, HOST)
+    rules[0]["maxRunning"] = 2
+    save_rules(env, rules)
+    env.store.set_runner_id(current.id, "e" * 32)
+    env.store.touch_runner_liveness(["e" * 32], int(time.time()))
+    env.store.set_session_live_status(current.id, "running")
+    assert env.store.compare_and_set_label(
+        current.id,
+        SLOT_LABEL,
+        current.labels[SLOT_LABEL],
+        f"releasing@{HOST}@pool-0@{time.time() - 121}",
+    )
+    current = env.store.get_conversation(current.id)
+    assert holds_slot(current, time.time())
+    assert await release_choice(env.app, current, HOST)
+    released = env.store.get_conversation(current.id)
+    assert released.labels[SLOT_LABEL].startswith("releasing@")
+    receipt = choice_record(released)
+    assert receipt["savedRevision"] == env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"]
+    assert receipt["savedRevision"] != held["session_choice"]["savedRevision"]
+    assert receipt["outcome"] == "pick"
+    cap = receipt["effectiveLimits"]["maxRunning"]
+    assert (cap["value"], cap["sourceRuleId"], cap["runningCount"], cap["reservedCount"]) == (
+        2,
+        "base",
+        1,
+        1,
+    )
+    assert "runningSessionIds" not in cap
+
+
+@pytest.mark.asyncio
+async def test_release_receipt_write_failure_rolls_back_marker_and_racing_retry(choice_env):
+    from sqlalchemy import event
+
+    from omnigent.db.db_models import SqlConversationLabel
+    from omnigent.server.session_choice_runtime import release_choice
+
+    env = choice_env
+    rules = [{"id": "base", "agent": env.agents[0]["id"], "maxRunning": 1}]
+    save_rules(env, rules)
+    occupied(env)
+    held = (await create(env)).json()
+    current = env.store.get_conversation(held["id"])
+    assert held["session_choice"]["outcome"] == "hold"
+    before = dict(current.labels)
+    rules[0]["maxRunning"] = 2
+    save_rules(env, rules)
+    revision = env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"]
+
+    def reject_receipt_write(connection, cursor, statement, parameters, context, executemany):
+        if (
+            statement.lstrip().upper().startswith("INSERT")
+            and SqlConversationLabel.__tablename__ in statement
+            and CHOICE_LABEL in str(parameters)
+        ):
+            raise RuntimeError("Injected receipt write failure")
+
+    engine = env.store._conv_engine
+    event.listen(engine, "before_cursor_execute", reject_receipt_write)
+    try:
+        with pytest.raises(RuntimeError, match="Injected receipt write failure"):
+            await release_choice(env.app, current, HOST)
+    finally:
+        event.remove(engine, "before_cursor_execute", reject_receipt_write)
+    assert env.store.get_conversation(current.id).labels == before
+    results = await asyncio.gather(
+        release_choice(env.app, current, HOST), release_choice(env.app, current, HOST)
+    )
+    assert sum(results) == 1
+    released = env.store.get_conversation(current.id)
+    assert released.labels[SLOT_LABEL].startswith("releasing@")
+    receipt = choice_record(released)
+    assert receipt["savedRevision"] == revision and receipt["outcome"] == "pick"
+    assert receipt["effectiveLimits"]["maxRunning"]["value"] == 2
+
+
+@pytest.mark.asyncio
+async def test_ask_explains_each_blocked_candidate_from_locked_snapshot(choice_env, monkeypatch):
+    env = choice_env
+    first, second = [agent["id"] for agent in env.agents]
+    env.settings.update(
+        schemaVersion=2,
+        limitRules=[
+            {"id": "first-host", "agent": first, "host": HOST, "maxRunning": 1},
+            {"id": "second-model", "agent": second, "model": "test-model", "maxRunning": 2},
+        ],
+        limits={"pool-1": {"maxRunning": 1}},
+    )
+    env.settings["workTypes"][0]["ifFull"] = "ask"
+    saved = env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    occupied(env, agent=first)
+    env.store.create_conversation(
+        agent_id=second,
+        host_id=HOST,
+        workspace="/opt/work/project",
+        model_override="test-model",
+        labels={
+            SLOT_LABEL: f"admitted@{HOST}@pool-1@{time.time()}",
+            CHOICE_LABEL: json.dumps({"pool": "pool-1"}),
+        },
+    )
+    original = env.prefs.session_choice
+    captured = []
+
+    def read_then_save(owner):
+        snapshot = original(owner)
+        if not captured:
+            captured.append(snapshot["revision"])
+            changed = json.loads(json.dumps(env.settings))
+            changed["limitRules"][0].update(id="later", maxRunning=9)
+            env.prefs.replace_session_choice(owner, changed, snapshot["revision"])
+        return snapshot
+
+    monkeypatch.setattr(env.prefs, "session_choice", read_then_save)
+    response = await create(env)
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["outcome"] == "ask" and detail["code"] == "session_choice_ask"
+    assert (
+        detail["savedRevision"] == saved["revision"] != original(RESERVED_USER_LOCAL)["revision"]
+    )
+    assert "agent" not in detail and detail["pool"] is None and detail["tier"] is None
+    assert "effectiveLimits" not in detail and "legacyChecks" not in detail
+    skipped = {item["link"]["agent"]: item for item in detail["skipped"]}
+    assert set(skipped) == {first, second}
+    for agent, source, value, scope in [
+        (first, "first-host", 1, {"agent": first, "host": HOST}),
+        (second, "second-model", 2, {"agent": second, "model": "test-model"}),
+    ]:
+        row = skipped[agent]
+        assert row["why"] == "busy" and row["savedRevision"] == saved["revision"]
+        cap = row["effectiveLimits"]["maxRunning"]
+        assert (cap["sourceRuleId"], cap["value"], cap["scope"]) == (source, value, scope)
+        assert cap["runningCount"] == cap["reservedCount"] == 1
+        assert "runningSessionIds" not in cap
+    assert skipped[first]["legacyChecks"]["limits"] is None
+    assert skipped[second]["legacyChecks"]["limits"]["maxRunning"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["automatic", "choice_reason", "user_named"])
+async def test_admission_receipt_binds_locked_revision_sources_and_legacy(
+    choice_env, monkeypatch, mode
+):
+    env = choice_env
+    agent = env.agents[0]["id"]
+    save_rules(env, [{"id": "base", "agent": agent, "maxRunning": 3}])
+    env.settings["limits"] = {"pool-0": {"maxRunning": 2}}
+    saved = env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    occupied(env)
+    original = env.prefs.session_choice
+    captured = []
+
+    def read_then_save(owner):
+        snapshot = original(owner)
+        if not captured:
+            captured.append(snapshot["revision"])
+            changed = json.loads(json.dumps(env.settings))
+            changed["limitRules"][0].update(id="later", maxRunning=7)
+            env.prefs.replace_session_choice(owner, changed, snapshot["revision"])
+        return snapshot
+
+    monkeypatch.setattr(env.prefs, "session_choice", read_then_save)
+    changes = (
+        {}
+        if mode == "automatic"
+        else {
+            "agent_id": agent,
+            "model_override": "test-model",
+            **(
+                {"user_named": True}
+                if mode == "user_named"
+                else {"choice_reason": "Need this agent"}
+            ),
+        }
+    )
+    response = await create(env, **changes)
+    assert response.status_code == 201, response.text
+    data = response.json()
+    receipt = data["session_choice"]
+    assert receipt["savedRevision"] == saved["revision"]
+    assert captured == [saved["revision"]]
+    assert original(RESERVED_USER_LOCAL)["revision"] != receipt["savedRevision"]
+    cap = receipt["effectiveLimits"]["maxRunning"]
+    assert (cap["value"], cap["sourceRuleId"], cap["runningCount"], cap["reservedCount"]) == (
+        3,
+        "base",
+        1,
+        1,
+    )
+    assert "runningSessionIds" not in cap
+    assert receipt["legacyChecks"]["pool"] == "pool-0"
+    assert receipt["legacyChecks"]["limits"]["maxRunning"] == 2
+    if mode != "automatic":
+        assert receipt["flags"] == [mode]
+    assert choice_record(env.store.get_conversation(data["id"])) == receipt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["invalid", "unsupported", "running", "selector", "prefs"])
+async def test_v2_fault_never_selects_unchecked_first_link(choice_env, monkeypatch, fault):
+    env = choice_env
+    save_rules(env, [{"id": "base", "agent": env.agents[0]["id"], "maxRunning": 1}])
+    if fault in {"invalid", "unsupported"}:
+        value = {
+            **env.settings,
+            "schemaVersion": 99 if fault == "unsupported" else 2,
+            "enabled": "broken",
+        }
+        with env.prefs._write_session("inject_choice_fixture") as session:
+            env.prefs._upsert_row(
+                session,
+                user_id=RESERVED_USER_LOCAL,
+                key="settings.session_collab",
+                value=json.dumps({"sessionChoice": value}),
+            )
+    else:
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("Unavailable input")
+
+        if fault == "prefs":
+            monkeypatch.setattr(env.prefs, "session_choice", fail)
+        elif fault == "running":
+            monkeypatch.setattr("omnigent.server.session_choice_runtime.running_pools", fail)
+        else:
+            monkeypatch.setattr(ChoiceState, "select", fail)
+    response = await create(env)
+    assert response.status_code == 409, response.text
+    if fault == "running":
+        assert response.json()["detail"]["skipped"][0]["why"] == "count_unavailable"
+    else:
+        assert response.json()["detail"]["code"] == (
+            "session_choice_unavailable" if fault == "selector" else "session_choice_configuration"
+        )
+
+
+@pytest.mark.asyncio
+async def test_default_model_snapshot_matches_rule_and_pins_actual_creation(
+    choice_env, monkeypatch
+):
+    env = choice_env
+    agent = env.agents[0]["id"]
+    env.settings["hosts"][HOST]["work"][0][0]["links"][0].pop("model")
+    save_rules(env, [{"id": "model", "agent": agent, "model": "test-model", "maxRunning": 1}])
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._resolve_llm_model", lambda *a, **k: "test-model"
+    )
+    first = await create(env)
+    assert first.status_code == 201, first.text
+    assert first.json()["model_override"] == "test-model"
+    assert choice_record(env.store.get_conversation(first.json()["id"]))["model"] == "test-model"
+    second = await create(env)
+    assert second.status_code == 201, second.text
+    assert second.json()["session_choice"]["outcome"] == "hold"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_agent", [False, True])
+async def test_unresolved_running_model_blocks_only_possibly_matching_scope(
+    choice_env, monkeypatch, same_agent
+):
+    env = choice_env
+    save_rules(
+        env,
+        [{"id": "model", "agent": env.agents[0]["id"], "model": "test-model", "maxRunning": 1}],
+    )
+    occupied(env, model=None, agent=env.agents[0 if same_agent else 1]["id"])
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._resolve_llm_model", lambda *a, **k: None
+    )
+    response = await create(env)
+    assert response.status_code == (409 if same_agent else 201), response.text
+    if same_agent:
+        assert response.json()["detail"]["skipped"][0]["why"] == "count_unavailable"
+    else:
+        assert response.json()["session_choice"]["outcome"] == "pick"
+
+
+@pytest.mark.asyncio
+async def test_running_snapshot_resolves_owner_inheritance_and_skips_other_owners(choice_env):
+    from omnigent.server.session_choice import LimitScope, parse_session_choice
+    from omnigent.server.session_choice_runtime import running_pools
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    env = choice_env
+    permissions = SqlAlchemyPermissionStore(env.store.storage_location)
+    for owner in ("owner@example.test", "other@example.test"):
+        permissions.ensure_user(owner)
+    permissions.grant("owner@example.test", env.parent.id, 4)
+    inherited = env.store.create_conversation(
+        agent_id=env.agents[0]["id"],
+        parent_conversation_id=env.parent.id,
+        kind="sub_agent",
+        model_override="test-model",
+        labels={SLOT_LABEL: f"admitted@{HOST}@pool-0@{time.time()}"},
+    )
+    foreign = occupied(env)
+    permissions.grant("other@example.test", foreign.id, 4)
+    env.app.state.permission_store = permissions
+    snapshot = running_pools(
+        env.app, "owner@example.test", parse_session_choice(env.settings), {}, time.time()
+    )
+    assert snapshot.scoped(LimitScope(agent=env.agents[0]["id"], host=HOST)) == (inherited.id,)
+
+
+@pytest.mark.asyncio
+async def test_empty_model_rule_adds_no_identity_requirement(choice_env, monkeypatch):
+    env = choice_env
+    env.settings["hosts"][HOST]["work"][0][0]["links"][0].pop("model")
+    save_rules(env, [{"id": "empty", "agent": env.agents[0]["id"], "model": "test-model"}])
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._resolve_llm_model", lambda *a, **k: None
+    )
+    response = await create(env)
+    assert response.status_code == 201, response.text
+    assert response.json()["session_choice"]["outcome"] == "pick"
+
+
+@pytest.mark.parametrize("patch", ["empty", "parsed_null", "copy_null"])
+@pytest.mark.parametrize("user_named", [False, True])
+def test_unknown_model_cancellation_is_an_identity_relevant_patch(patch, user_named):
+    from omnigent.server.session_choice import (
+        ChoiceRequest,
+        Link,
+        WorkType,
+        check_candidate_limits,
+        parse_session_choice,
+    )
+
+    settings = parse_session_choice(
+        {
+            "schemaVersion": 2,
+            "limitRules": [
+                {
+                    "id": "base",
+                    "agent": "agent-a",
+                    "reserve": {"mode": "total", "window": "weekly", "stopPct": 5},
+                },
+                {
+                    "id": "cancel",
+                    "agent": "agent-a",
+                    "model": "model-y",
+                    **({} if patch == "empty" else {"reserve": None}),
+                },
+            ],
+        }
+    )
+    if patch == "copy_null":
+        settings = settings.model_copy(
+            update={
+                "limit_rules": (
+                    settings.limit_rules[0],
+                    settings.limit_rules[1].model_copy(update={"reserve": None}),
+                )
+            }
+        )
+    failure = check_candidate_limits(
+        settings,
+        WorkType(id="work", label="Work"),
+        Link(agent="agent-a", meter="account-a"),
+        ChoiceRequest(RESERVED_USER_LOCAL, HOST),
+        {},
+        {},
+        {},
+        time.time(),
+        user_named=user_named,
+    )
+    assert (failure.why if failure else None) == (
+        None if patch == "empty" else "identity_unavailable"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("related", [False, True])
+async def test_owner_read_failure_only_blocks_a_possibly_matching_scope(
+    choice_env, monkeypatch, related
+):
+    from omnigent.server.session_choice import LimitScope, parse_session_choice
+    from omnigent.server.session_choice_runtime import running_pools
+
+    env = choice_env
+    agent = env.agents[0]["id"]
+    save_rules(env, [{"id": "cap", "agent": agent, "maxRunning": 1}])
+    row = occupied(env, agent=agent if related else env.agents[1]["id"])
+
+    # Exercise the real owner resolver's failed branch through its store boundary.
+    def broken_read(*args, **kwargs):
+        raise RuntimeError("owner store unavailable")
+
+    permissions = SimpleNamespace(list_for_sessions=broken_read, list_for_session=broken_read)
+    monkeypatch.setattr(env.app.state, "permission_store", permissions)
+    snapshot = running_pools(
+        env.app, RESERVED_USER_LOCAL, parse_session_choice(env.settings), {}, time.time()
+    )
+    assert snapshot.available
+    assert any(
+        identity.session_id == row.id and not identity.owner_known
+        for identity in snapshot.identities
+    )
+    assert snapshot.scoped(LimitScope(agent=agent)) == (None if related else ())
+    # The selector sees local uncertainty, while a failed whole snapshot stays fail-closed.
+    from omnigent.server.session_choice import ChoiceRequest, ChoiceState, RunningSnapshot
+
+    settings = parse_session_choice(env.settings)
+    context = ChoiceRequest(RESERVED_USER_LOCAL, HOST, preview=True)
+    choice = ChoiceState().select(settings, "work", context, {}, snapshot, {}, now=time.time())
+    assert choice.outcome == ("ask" if related else "pick")
+    if related:
+        assert choice.skipped[0].why == "count_unavailable"
+    failed = ChoiceState().select(
+        settings, "work", context, {}, RunningSnapshot(available=False), {}, now=time.time()
+    )
+    assert failed.outcome == "ask"
+    assert failed.skipped[0].why == "count_unavailable"

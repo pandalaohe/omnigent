@@ -1,11 +1,12 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { usageBoardData } from "@/pages/usageBoard/usageBoardFixtures";
 import { NewChatChoiceNotice } from "./NewChatChoiceNotice";
 import { SessionChoiceCard, sessionChoiceRecord } from "./SessionChoiceCard";
 import { QuotaFloorControl, floorActive } from "./QuotaFloorControl";
 import { ProjectSessionChoiceField } from "./ProjectSessionChoiceField";
+import { useChoicePreviewEpoch } from "./choiceInvalidation";
 
 const mocks = vi.hoisted(() => ({ request: vi.fn() }));
 vi.mock("./sessionChoiceData", () => ({
@@ -148,3 +149,51 @@ it("offers account inheritance, off and a preset pin for a project", () => {
   fireEvent.change(field, { target: { value: "inherit" } });
   expect(change).toHaveBeenLastCalledWith(undefined);
 });
+
+it.each(["success", "refresh fails", "write fails"])(
+  "refreshes every floor consumer after a tile action: %s",
+  async (condition) => {
+    let released = false;
+    const lines = vi.fn(async () => (released ? "Released explanation" : "Original explanation"));
+    function Explanation() {
+      const epoch = useChoicePreviewEpoch();
+      const line = useQuery({ queryKey: ["sessionChoiceLines"], queryFn: lines, retry: false });
+      return (
+        <p>
+          {line.data} · preview {epoch.current}
+        </p>
+      );
+    }
+    mocks.request.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        if (condition === "write fails") throw new Error("Write refused");
+        released = true;
+        return {};
+      }
+      if (path.startsWith("/notice"))
+        return { notice: released ? "Released hint" : "Original hint" };
+      if (released && condition === "refresh fails") throw new Error("Reading unavailable");
+      return {};
+    });
+    mount(
+      <>
+        <Explanation />
+        <NewChatChoiceNotice host="host-a" agent="agent-a" />
+        <QuotaFloorControl tile="plan" label="Plan" />
+      </>,
+    );
+    await screen.findByText("Original explanation · preview 0");
+    await screen.findByText("Original hint");
+    fireEvent.change(await screen.findByLabelText("Plan floor"), { target: { value: "manual" } });
+    if (condition === "write fails") {
+      await screen.findByText("Write refused");
+      expect(screen.getByText("Original explanation · preview 0")).toBeInTheDocument();
+      expect(screen.getByText("Original hint")).toBeInTheDocument();
+      expect(lines).toHaveBeenCalledOnce();
+    } else {
+      await screen.findByText("Released explanation · preview 1");
+      await screen.findByText("Released hint");
+      if (condition === "refresh fails") await screen.findByText("Reading unavailable");
+    }
+  },
+);
