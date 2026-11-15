@@ -15,24 +15,31 @@ beforeEach(() => {
   vi.mocked(api.saveVoiceInputSettings).mockImplementation(async (settings) => settings);
 });
 
-it("loads and saves vocabulary, manual mode and thinking parameters through the shared settings API", async () => {
+it("loads and saves vocabulary, cleanup on/off and custom instructions", async () => {
   render(<VoiceInputSettings />);
   await act(async () => {});
   fireEvent.change(screen.getByRole("textbox", { name: "Voice word list" }), {
     target: { value: "ExampleApp may be heard as example app" },
   });
   fireEvent.change(screen.getByRole("combobox", { name: "Voice cleanup mode" }), {
-    target: { value: "manual" },
+    target: { value: "off" },
   });
   fireEvent.click(screen.getByText("Cleanup model", { exact: true }));
   fireEvent.change(screen.getByRole("textbox", { name: "Voice cleanup model" }), {
     target: { value: "openai/test-cleanup" },
   });
-  fireEvent.change(screen.getByRole("textbox", { name: "Voice thinking parameters" }), {
-    target: {
-      value:
-        '{"reasoning_effort":"low","reasoning":{"effort":"low"},"thinking":{"type":"disabled"}}',
-    },
+  expect(screen.getByRole("textbox", { name: "Voice cleanup instructions" })).toHaveValue(
+    api.defaultCleanupInstructions,
+  );
+  fireEvent.change(screen.getByRole("textbox", { name: "Voice cleanup instructions" }), {
+    target: { value: "Use short sentences." },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Restore default" }));
+  expect(screen.getByRole("textbox", { name: "Voice cleanup instructions" })).toHaveValue(
+    api.defaultCleanupInstructions,
+  );
+  fireEvent.change(screen.getByRole("textbox", { name: "Voice cleanup instructions" }), {
+    target: { value: "Use short sentences." },
   });
   await act(async () =>
     fireEvent.click(screen.getByRole("button", { name: "Save voice settings" })),
@@ -40,11 +47,9 @@ it("loads and saves vocabulary, manual mode and thinking parameters through the 
   expect(api.saveVoiceInputSettings).toHaveBeenCalledWith({
     ...api.defaultVoiceInputSettings,
     words: "ExampleApp may be heard as example app",
-    mode: "manual",
+    mode: "off",
+    instructions: "Use short sentences.",
     model: "openai/test-cleanup",
-    reasoning_effort: "low",
-    reasoning: { effort: "low" },
-    thinking: { type: "disabled" },
   });
   expect(screen.getByRole("status")).toHaveTextContent("Voice settings saved");
 });

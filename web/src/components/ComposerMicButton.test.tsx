@@ -1103,35 +1103,63 @@ describe("ComposerMicButton (server dictation)", () => {
     expect(sessionStartMock).toHaveBeenCalledTimes(1);
   });
 
-  it("preserves pending Web Speech finals in order across a server fallback", async () => {
-    let resolvePending: ((value: string) => void) | undefined;
-    punctuationMock = vi.fn(
-      () =>
-        new Promise<string>((resolve) => {
-          resolvePending = resolve;
-        }),
-    );
-    const onTranscript = vi.fn();
-    const onVoiceStart = vi.fn();
-    render(
-      <CapabilitiesContext.Provider value={PUNCTUATION_INFO}>
-        <ComposerMicButton onTranscript={onTranscript} onVoiceStart={onVoiceStart} />
-      </CapabilitiesContext.Provider>,
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
-    act(() => handlers.start?.({}));
-    act(() => handlers.result?.(resultEvent("浏览器前半句")));
-    await act(async () => Promise.resolve());
+  it.each(["network", "service-not-allowed"])(
+    "ends only after the final segment across a delayed %s fallback",
+    async (error) => {
+      let resolveHandshake!: (session: SessionStub) => void;
+      sessionStartMock = vi.fn((events: DictationSessionEvents) => {
+        sessionEvents = events;
+        return new Promise<SessionStub>((resolve) => {
+          resolveHandshake = resolve;
+        });
+      });
+      sessionStopMock = vi.fn(async () => "最后片段。");
+      let resolvePending: ((value: string) => void) | undefined;
+      punctuationMock = vi.fn(
+        () =>
+          new Promise<string>((resolve) => {
+            resolvePending = resolve;
+          }),
+      );
+      const onTranscript = vi.fn();
+      const onVoiceStart = vi.fn();
+      const onVoiceEnd = vi.fn(() => onTranscript.mock.calls.map(([text]) => text));
+      render(
+        <CapabilitiesContext.Provider value={PUNCTUATION_INFO}>
+          <ComposerMicButton
+            onTranscript={onTranscript}
+            onVoiceStart={onVoiceStart}
+            onVoiceEnd={onVoiceEnd}
+          />
+        </CapabilitiesContext.Provider>,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+      act(() => handlers.start?.({}));
+      act(() => handlers.result?.(resultEvent("浏览器前半句")));
+      await act(async () => Promise.resolve());
 
-    await act(async () => handlers.error?.({ error: "network" }));
-    act(() => sessionEvents?.onFinal("服务器后半句。"));
-    expect(onTranscript).not.toHaveBeenCalled();
+      await act(async () => handlers.error?.({ error }));
+      expect(onTranscript).not.toHaveBeenCalled();
 
-    await act(async () => resolvePending?.("浏览器前半句。"));
+      await act(async () => resolvePending?.("浏览器前半句。"));
+      expect(onVoiceEnd).not.toHaveBeenCalled();
+      act(() => handlers.end?.({}));
+      expect(onVoiceEnd).not.toHaveBeenCalled();
+      await act(async () => resolveHandshake({ stop: sessionStopMock, cancel: sessionCancelMock }));
+      await act(async () => sessionEvents?.onFinal("服务器后半句。"));
 
-    expect(onTranscript.mock.calls).toEqual([["浏览器前半句。"], ["服务器后半句。"]]);
-    expect(onVoiceStart).toHaveBeenCalledTimes(1);
-  });
+      expect(onTranscript.mock.calls).toEqual([["浏览器前半句。"], ["服务器后半句。"]]);
+      expect(onVoiceStart).toHaveBeenCalledTimes(1);
+      expect(onVoiceEnd).not.toHaveBeenCalled();
+      await clickMic();
+      expect(onVoiceEnd).toHaveBeenCalledTimes(1);
+      expect(onVoiceEnd.mock.results[0]?.value).toEqual([
+        "浏览器前半句。",
+        "服务器后半句。",
+        "最后片段。",
+      ]);
+    },
+  );
 
   it("does not restart on the server after Esc discards a Web Speech take", async () => {
     render(

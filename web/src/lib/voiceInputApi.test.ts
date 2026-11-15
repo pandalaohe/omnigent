@@ -31,3 +31,16 @@ it("reads and saves through the existing user-preference namespace API", async (
     expect.objectContaining({ method: "PATCH", body: JSON.stringify({ value: settings }) }),
   );
 });
+
+it("reads legacy manual as on and fills empty instructions with the default", async () => {
+  vi.mocked(authenticatedFetch).mockResolvedValueOnce(
+    new Response(
+      JSON.stringify({
+        preferences: { settings: { voice_input: { mode: "manual", instructions: "" } } },
+      }),
+    ),
+  );
+  const result = await getVoiceInputSettings();
+  expect(result.mode).toBe("automatic");
+  expect(result.instructions).toBe(defaultVoiceInputSettings.instructions);
+});

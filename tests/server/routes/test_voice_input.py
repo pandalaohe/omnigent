@@ -371,3 +371,32 @@ async def test_chat_client_rejects_partial_output(voice_store, monkeypatch, fini
                 "/v1/dictation/cleanup", json={"text": "full original words and negation"}
             )
     assert response.status_code == 503
+
+
+@pytest.mark.parametrize("rules", ["", "   ", "Keep short sentences."])
+async def test_cleanup_uses_saved_rules_and_fixed_format(voice_store, llm, rules):
+    from omnigent.server.voice_input import CLEANUP_OUTPUT_FORMAT, CLEANUP_RULES
+
+    save_settings(
+        voice_store,
+        VoiceInputSettings(model="openai/test-cleanup", instructions=rules).model_dump(),
+        user_id=None,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_for(voice_store, llm)), base_url="http://test"
+    ) as client:
+        response = await client.post("/v1/dictation/cleanup", json={"text": "raw words"})
+    assert response.status_code == 200
+    assert (
+        llm.responses.create.call_args.kwargs["instructions"]
+        == (rules.strip() or CLEANUP_RULES) + "\n" + CLEANUP_OUTPUT_FORMAT
+    )
+
+
+def test_instruction_limit_and_legacy_mode():
+    from pydantic import ValidationError
+
+    assert VoiceInputSettings(mode="manual").mode == "automatic"
+    assert VoiceInputSettings(instructions="x" * 4000).instructions == "x" * 4000
+    with pytest.raises(ValidationError):
+        VoiceInputSettings(instructions="x" * 4001)

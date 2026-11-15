@@ -14,7 +14,7 @@ from omnigent.llms.summarize import extract_summary_text
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
-from omnigent.server.voice_input import CLEANUP_INSTRUCTIONS, VoiceInputSettings
+from omnigent.server.voice_input import CLEANUP_OUTPUT_FORMAT, CLEANUP_RULES, VoiceInputSettings
 
 
 class CleanupRequest(BaseModel):
@@ -87,7 +87,9 @@ def create_voice_input_router(
                         reasoning = {**(reasoning or {}), "effort": settings.reasoning_effort}
                     response = await (llm_client or Client()).responses.create(
                         model=model,
-                        instructions=CLEANUP_INSTRUCTIONS,
+                        instructions=(settings.instructions.strip() or CLEANUP_RULES)
+                        + "\n"
+                        + CLEANUP_OUTPUT_FORMAT,
                         input=[
                             {
                                 "role": "user",

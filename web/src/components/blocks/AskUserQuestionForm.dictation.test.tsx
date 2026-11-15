@@ -67,7 +67,7 @@ async function stop() {
 }
 
 describe("question-card dictated segments", () => {
-  it("replaces only the segment at the cursor and restores it without submitting", async () => {
+  it("replaces only the segment at the cursor with no extra buttons", async () => {
     const { onSubmit, onReject } = renderCard();
     const field = screen.getByRole("textbox", { name: "Custom answer" });
     fireEvent.change(field, { target: { value: "typed prefix | suffix" } });
@@ -80,11 +80,9 @@ describe("question-card dictated segments", () => {
       expect.any(AbortSignal),
     );
     expect(field).toHaveValue("typed prefix Do not deploy /opt/work/app at 12:30.| suffix");
-    expect(screen.getByLabelText("Changed voice text").querySelector("mark")).toHaveTextContent(
-      "Do not deploy",
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Restore original" }));
-    expect(field).toHaveValue("typed prefix don't deploy /opt/work/app at 12:30| suffix");
+    expect(screen.queryByText("Changed voice text")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Restore original" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Clean up voice" })).not.toBeInTheDocument();
     expect(onSubmit).not.toHaveBeenCalled();
     expect(onReject).not.toHaveBeenCalled();
   });
@@ -128,7 +126,7 @@ describe("question-card dictated segments", () => {
     act(() => oldMic.onTranscript("after collapse"));
   });
 
-  it("does not send handwritten text and supports manual or off mode", async () => {
+  it("maps legacy manual mode to automatic without sending handwritten text", async () => {
     vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
       ...defaultVoiceInputSettings,
       model: "openai/test-cleanup",
@@ -140,8 +138,6 @@ describe("question-card dictated segments", () => {
     });
     await dictate("spoken");
     await stop();
-    expect(voiceApi.cleanupDictation).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Clean up voice" }));
     await waitFor(() =>
       expect(voiceApi.cleanupDictation).toHaveBeenCalledWith("spoken", expect.any(AbortSignal)),
     );
@@ -162,4 +158,17 @@ describe("question-card dictated segments", () => {
     expect(field).toHaveValue("selectedraw");
     expect(screen.getByText("Cleanup unavailable; original kept.")).toBeVisible();
   });
+});
+
+it("leaves dictated text unchanged when cleanup is off", async () => {
+  vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+    ...defaultVoiceInputSettings,
+    model: "test-model",
+    mode: "off",
+  });
+  renderCard();
+  await dictate("raw words");
+  await stop();
+  expect(voiceApi.cleanupDictation).not.toHaveBeenCalled();
+  expect(screen.getByRole("textbox", { name: "Custom answer" })).toHaveValue("raw words");
 });

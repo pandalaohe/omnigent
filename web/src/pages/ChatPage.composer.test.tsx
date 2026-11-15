@@ -1,3 +1,4 @@
+import * as voiceApi from "@/lib/voiceInputApi";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { create } from "zustand";
 import { SHIFT_KEY } from "@/components/KeyboardShortcut";
@@ -64,6 +65,15 @@ import {
 import { parseSseStream } from "@/lib/sse";
 import { SidebarDataContext } from "@/hooks/useSidebarData";
 import { TerminalFirstContextProvider } from "@/shell/TerminalFirstContext";
+
+vi.mock("@/lib/voiceInputApi", async (original) => {
+  const api = await original<typeof voiceApi>();
+  return {
+    ...api,
+    getVoiceInputSettings: vi.fn(async () => api.defaultVoiceInputSettings),
+    cleanupDictation: vi.fn(),
+  };
+});
 
 const terminalSidebarData = {
   mine: { data: undefined },
@@ -6496,49 +6506,77 @@ describe("Composer reply quotes", () => {
     expect(tooltipKeys(tooltip)).toEqual(["Esc"]);
   });
 
-  it("preserves dictated and subsequently typed text when the microphone moves to a question", () => {
-    const recognizers: Record<string, (event?: unknown) => void>[] = [];
-    vi.stubGlobal(
-      "SpeechRecognition",
-      class {
-        lang = "en-US";
-        continuous = false;
-        interimResults = false;
-        handlers: Record<string, (event?: unknown) => void> = {};
-        constructor() {
-          recognizers.push(this.handlers);
-        }
-        start() {
-          this.handlers.start?.();
-        }
-        stop() {
-          this.handlers.end?.();
-        }
-        addEventListener(type: string, handler: (event?: unknown) => void) {
-          this.handlers[type] = handler;
-        }
-        removeEventListener() {}
-      },
-    );
-    onTestFinished(() => {
-      vi.unstubAllGlobals();
-    });
-    renderWithTooltips(<Composer {...composerProps()} />);
-    fireEvent.change(textarea(), { target: { value: "typed prefix " } });
-    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
-    act(() =>
-      recognizers[0]?.result?.({
-        resultIndex: 0,
-        results: [{ isFinal: true, 0: { transcript: "dictated words" } }],
-      }),
-    );
-    const dictated = textarea().value;
-    expect(dictated).toContain("dictated words");
-    fireEvent.change(textarea(), { target: { value: dictated + " newer manual edit" } });
-    renderWithTooltips(<ComposerMicButton questionCard onTranscript={vi.fn()} />);
-    fireEvent.click(screen.getAllByRole("button", { name: "Voice dictation" }).at(-1)!);
-    expect(textarea()).toHaveValue(dictated + " newer manual edit");
-  });
+  it.each(["transfer", "cleanup"])(
+    "handles composer dictation %s without extra controls",
+    async (scenario) => {
+      if (scenario === "cleanup") {
+        vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+          ...voiceApi.defaultVoiceInputSettings,
+          model: "test-cleanup",
+        });
+        onTestFinished(() => {
+          vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue(
+            voiceApi.defaultVoiceInputSettings,
+          );
+        });
+        vi.mocked(voiceApi.cleanupDictation).mockResolvedValueOnce({ text: "Dictated words." });
+      }
+      const recognizers: Record<string, (event?: unknown) => void>[] = [];
+      vi.stubGlobal(
+        "SpeechRecognition",
+        class {
+          lang = "en-US";
+          continuous = false;
+          interimResults = false;
+          handlers: Record<string, (event?: unknown) => void> = {};
+          constructor() {
+            recognizers.push(this.handlers);
+          }
+          start() {
+            this.handlers.start?.();
+          }
+          stop() {
+            this.handlers.end?.();
+          }
+          addEventListener(type: string, handler: (event?: unknown) => void) {
+            this.handlers[type] = handler;
+          }
+          removeEventListener() {}
+        },
+      );
+      onTestFinished(() => {
+        vi.unstubAllGlobals();
+      });
+      renderWithTooltips(<Composer {...composerProps()} />);
+      fireEvent.change(textarea(), { target: { value: "typed prefix " } });
+      await act(async () => {});
+      fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+      act(() =>
+        recognizers[0]?.result?.({
+          resultIndex: 0,
+          results: [{ isFinal: true, 0: { transcript: "dictated words" } }],
+        }),
+      );
+      const dictated = textarea().value;
+      expect(dictated).toContain("dictated words");
+      if (scenario === "cleanup") {
+        await act(async () =>
+          fireEvent.click(screen.getByRole("button", { name: "Voice dictation" })),
+        );
+        await waitFor(() => expect(textarea()).toHaveValue("typed prefix Dictated words."));
+        expect(voiceApi.cleanupDictation).toHaveBeenCalledWith(
+          "dictated words",
+          expect.any(AbortSignal),
+        );
+        expect(screen.queryByRole("button", { name: "Clean up voice" })).not.toBeInTheDocument();
+        return;
+      }
+      fireEvent.change(textarea(), { target: { value: dictated + " newer manual edit" } });
+      renderWithTooltips(<ComposerMicButton questionCard onTranscript={vi.fn()} />);
+      fireEvent.click(screen.getAllByRole("button", { name: "Voice dictation" }).at(-1)!);
+      expect(textarea()).toHaveValue(dictated + " newer manual edit");
+    },
+  );
 
   it("drops Esc from the Interrupt tooltip while dictation listens, which takes Esc", async () => {
     const recognizer: { start?: () => void } = {};

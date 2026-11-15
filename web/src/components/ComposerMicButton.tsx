@@ -297,6 +297,8 @@ export const ComposerMicButton = ({
       wasListeningRef.current = true;
       return;
     }
+    // A server fallback handshake pauses listening without ending the take.
+    if (connecting) return;
     if (!wasListeningRef.current) return;
     wasListeningRef.current = false;
     const generation = takeGenerationRef.current;
@@ -311,7 +313,7 @@ export const ComposerMicButton = ({
       if (generation === takeGenerationRef.current && activeTake?.owner === ownerRef.current)
         activeTake = null;
     });
-  }, [isListening]);
+  }, [isListening, connecting]);
 
   // Surface a failure both in the button (tooltip + red tint) and as a toast,
   // so a failed take is an explained error rather than a silent flash back to

@@ -1,6 +1,6 @@
 import { type RefObject, useEffect, useRef, useState } from "react";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
-import { Button } from "@/components/ui/button";
+import { replaceDictatedText } from "@/lib/replaceDictatedText";
 import {
   cleanupDictation,
   getVoiceInputSettings,
@@ -25,26 +25,6 @@ interface Props {
   disabled?: boolean;
 }
 
-function ChangedVoiceText({ original, text }: { original: string; text: string }) {
-  let start = 0;
-  let end = 0;
-  while (start < original.length && start < text.length && original[start] === text[start]) start++;
-  while (
-    end < original.length - start &&
-    end < text.length - start &&
-    original[original.length - end - 1] === text[text.length - end - 1]
-  )
-    end++;
-  return (
-    <span className="min-w-0 break-words text-sm" aria-label="Changed voice text">
-      {text.slice(0, start)}
-      <del className="text-muted-foreground">{original.slice(start, original.length - end)}</del>
-      <mark>{text.slice(start, text.length - end)}</mark>
-      {text.slice(text.length - end)}
-    </span>
-  );
-}
-
 /** Mounted per question: a take and its cleanup can never migrate to another answer. */
 export function QuestionDictationControls({
   inputRef,
@@ -57,17 +37,8 @@ export function QuestionDictationControls({
   const takeRef = useRef<Take | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const aliveRef = useRef(true);
-  const [listening, setListening] = useState(false);
-  const [busy, setBusy] = useState(false);
   const [mode, setMode] = useState("off");
   const [notice, setNotice] = useState("");
-  const [available, setAvailable] = useState(false);
-  const [change, setChange] = useState<{
-    take: Take;
-    text: string;
-    expected: string;
-    revision: number;
-  } | null>(null);
 
   useEffect(() => {
     aliveRef.current = true;
@@ -87,7 +58,21 @@ export function QuestionDictationControls({
     };
   }, []);
 
-  const apply = (take: Take, text: string) => {
+  useEffect(() => {
+    if (!notice || notice === "Cleaning up voice…") return;
+    const timer = window.setTimeout(() => setNotice(""), 4000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  const apply = (take: Take, text: string, undo = false) => {
+    if (undo)
+      replaceDictatedText(
+        inputRef.current,
+        take.expected,
+        take.before.length,
+        take.expected.length - take.after.length,
+        text,
+      );
     const value = take.before + text + take.after;
     onChange(value, take.before.length + text.length);
     return value;
@@ -100,7 +85,6 @@ export function QuestionDictationControls({
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
-    setBusy(true);
     setNotice("Cleaning up voice…");
     try {
       const result = await cleanupDictation(take.raw, controller.signal);
@@ -109,17 +93,11 @@ export function QuestionDictationControls({
         setNotice("Draft changed; original kept.");
         return;
       }
-      if (result.text !== take.raw) {
-        const expected = apply(take, result.text);
-        setChange({ take, text: result.text, expected, revision: getRevision() });
-        setNotice("Voice cleaned up");
-      } else setNotice("Voice text kept");
-      setAvailable(false);
+      if (result.text !== take.raw) apply(take, result.text, true);
+      setNotice("");
     } catch {
       if (aliveRef.current && !controller.signal.aborted)
         setNotice("Cleanup unavailable; original kept.");
-    } finally {
-      if (aliveRef.current && abortRef.current === controller) setBusy(false);
     }
   };
 
@@ -130,12 +108,8 @@ export function QuestionDictationControls({
         questionCard
         disabled={disabled}
         className="!size-11"
-        onListeningChange={setListening}
         onVoiceStart={() => {
           abortRef.current?.abort();
-          setBusy(false);
-          setChange(null);
-          setAvailable(false);
           setNotice("");
           const value = getText();
           const { start, end } = getSelection();
@@ -163,47 +137,12 @@ export function QuestionDictationControls({
           const take = takeRef.current;
           if (aliveRef.current && take && matches(take)) apply(take, take.replaced);
           takeRef.current = null;
-          setAvailable(false);
         }}
         onVoiceEnd={() => {
           if (!aliveRef.current || !takeRef.current?.raw) return;
-          setAvailable(true);
-          if (mode === "automatic") void clean();
+          if (mode !== "off") void clean();
         }}
       />
-      {mode !== "off" && available && !listening && !change && (
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          disabled={busy || disabled}
-          onClick={() => void clean()}
-        >
-          Clean up voice
-        </Button>
-      )}
-      {change && (
-        <>
-          <ChangedVoiceText original={change.take.raw} text={change.text} />
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={disabled}
-            onClick={() => {
-              if (getText() !== change.expected || getRevision() !== change.revision) {
-                setNotice("Draft changed; restore would overwrite your edits.");
-                return;
-              }
-              apply(change.take, change.take.raw);
-              setChange(null);
-              setNotice("Original restored");
-            }}
-          >
-            Restore original
-          </Button>
-        </>
-      )}
       <span role="status" className="text-sm text-muted-foreground">
         {notice}
       </span>
