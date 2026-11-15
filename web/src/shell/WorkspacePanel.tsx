@@ -101,7 +101,7 @@ import {
 } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
-import { scrollTabIntoView, WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
+import { revealWorkspaceTab, WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
 import { FilesPanel } from "./FilesPanel";
 import { ContentSearchPanel } from "./ContentSearchPanel";
 import { FileViewer } from "./FileViewer";
@@ -462,7 +462,7 @@ function NewTabMenu({
 // of the fixed Files/Terminals/Agents tabs. Each tab is a cell with the
 // file's basename and an "x" close button. Clicking the cell activates the
 // tab (opening its viewer); clicking the x closes it. No own scroll container
-// or flex-1: the parent viewport scrolls the open tabs.
+// or flex-1: the parent sizes each tab to fit the available strip.
 // ---------------------------------------------------------------------------
 
 function FileTabsStrip({
@@ -480,24 +480,24 @@ function FileTabsStrip({
   /** Close a tab by path. */
   onCloseFile: (path: string) => void;
 }) {
-  // Scroll the active tab into view when it changes (e.g. a newly opened file
-  // appended past the visible edge).
+  // A newly selected overflow tab replaces the last visible tab.
   const activeTabRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    scrollTabIntoView(activeTabRef.current);
+    revealWorkspaceTab(activeTabRef.current);
   }, [activeFilePath]);
   // Render nothing (not an empty flex row) when there are no files — an empty
   // wrapper would still consume a slot in the parent's gap-0.5 and leave a
   // phantom gap before the next element.
   if (openFiles.length === 0) return null;
   return (
-    <div className="flex items-center gap-0.5">
+    <div className="contents">
       {openFiles.map((path) => {
         const name = path.split("/").pop() ?? path;
         const active = path === activeFilePath;
         return (
           <div
             key={path}
+            data-workspace-tab
             ref={active ? activeTabRef : undefined}
             role="button"
             tabIndex={0}
@@ -513,18 +513,14 @@ function FileTabsStrip({
               }
             }}
             onKeyDown={(e) => {
+              if (e.target !== e.currentTarget) return;
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
                 onFileSelect(path);
               }
             }}
             className={cn(
-              // Match the fixed TabsTrigger pill's box metrics (h-24 / px-8 /
-              // rounded-8 / 13px medium) so file tabs and Files/Terminals tabs
-              // are the same height and the active chip lines up across both
-              // sets. `group/tab` drives the hover-revealed close overlay below.
-              // `overflow-hidden` clips the hover-close gradient overlay to the
-              // pill's rounded corners so its rectangular edges can't poke out.
+              // Share the fixed panel pill metrics; reserve space for the close control.
               "group/tab relative flex h-[24px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-md px-2 text-ui font-medium leading-5 transition-colors",
               active
                 ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
@@ -532,19 +528,12 @@ function FileTabsStrip({
             )}
           >
             <FileIcon className="size-4 shrink-0" />
-            <span className="min-w-0 truncate">{name}</span>
-            {/* Close button: hidden until hover, then revealed over a gradient
-                that fades the truncated filename into the tab's background so
-                the "x" never collides with the text. The overlay only shows on
-                hover, where both active and inactive tabs share the same OPAQUE
-                selection surface — fade to that exact color. (A translucent
-                fade like var(--muted) would stack over the hover background and
-                darken the right edge into a visible gradient patch.) */}
-            <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
+            <span className="min-w-0 flex-1 truncate">{name}</span>
+            <span className="flex shrink-0 items-center">
               <button
                 type="button"
                 aria-label={`Close ${name}`}
-                className="flex size-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                className="flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                 onClick={(e) => {
                   e.stopPropagation();
                   onCloseFile(path);
@@ -596,14 +585,14 @@ function TerminalTabsStrip({
 }) {
   const activeTabRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    scrollTabIntoView(activeTabRef.current);
+    revealWorkspaceTab(activeTabRef.current);
   }, [activeTerminalKey]);
   // Render nothing (not an empty flex row) when there are no shells — an empty
   // wrapper would still consume a slot in the parent's gap-0.5 and leave a
   // phantom gap before the next element (e.g. the trailing "+").
   if (openTerminals.length === 0) return null;
   return (
-    <div className="flex items-center gap-0.5">
+    <div className="contents">
       {openTerminals.map((key) => {
         const name = labelFor(key);
         const active = key === activeTerminalKey;
@@ -611,6 +600,7 @@ function TerminalTabsStrip({
         return (
           <div
             key={key}
+            data-workspace-tab
             ref={active ? activeTabRef : undefined}
             role="button"
             tabIndex={closing ? -1 : 0}
@@ -625,6 +615,7 @@ function TerminalTabsStrip({
               }
             }}
             onKeyDown={(e) => {
+              if (e.target !== e.currentTarget) return;
               if (!closing && (e.key === "Enter" || e.key === " ")) {
                 e.preventDefault();
                 onSelect(key);
@@ -642,13 +633,13 @@ function TerminalTabsStrip({
             )}
           >
             <TerminalIcon className="size-4 shrink-0" />
-            <span className="min-w-0 truncate text-sm">{name}</span>
+            <span className="min-w-0 flex-1 truncate text-sm">{name}</span>
             {canClose && (
-              <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
+              <span className="flex shrink-0 items-center">
                 <button
                   type="button"
                   aria-label={`Close ${name}`}
-                  className="flex size-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                  className="flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                   onClick={(e) => {
                     e.stopPropagation();
                     onClose(key);
@@ -1066,7 +1057,7 @@ function WorkspacePanelImpl({
   };
   const activeBrowserRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    scrollTabIntoView(activeBrowserRef.current);
+    revealWorkspaceTab(activeBrowserRef.current);
   }, [browsers.selected, rightRailTab]);
   const browserSelected =
     rightRailTab === "browser" &&
@@ -1210,7 +1201,7 @@ function WorkspacePanelImpl({
   const clearSideChatToOpen = useChatStore((s) => s.clearSideChatToOpen);
   const activeSideChatRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    scrollTabIntoView(activeSideChatRef.current);
+    revealWorkspaceTab(activeSideChatRef.current);
   }, [sideChats.selected, rightRailTab]);
   // Pending tabs awaiting a real child id, in submit order. Only Codex uses this
   // queue — its child arrives asynchronously via session_created with no id to
@@ -1511,7 +1502,7 @@ function WorkspacePanelImpl({
   const visibleOpenPanels = openPanels.filter((tab) => unpinnedTabs.includes(tab));
   const activePanelRef = useRef<HTMLButtonElement | null>(null);
   useEffect(() => {
-    scrollTabIntoView(activePanelRef.current);
+    revealWorkspaceTab(activePanelRef.current);
   }, [rightRailTab]);
   const showOpenTabs =
     !pending &&
@@ -2022,8 +2013,9 @@ function WorkspacePanelImpl({
                   return (
                     <div
                       key={tab}
+                      data-workspace-tab
                       className={cn(
-                        "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
+                        "flex h-[24px] min-w-0 shrink-0 overflow-hidden items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
                         active
                           ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
                           : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
@@ -2035,7 +2027,7 @@ function WorkspacePanelImpl({
                         role="tab"
                         aria-label={label}
                         aria-selected={active}
-                        className="flex items-center gap-1"
+                        className="flex min-w-0 flex-1 items-center gap-1"
                         onClick={() => selectPermanentTab(tab)}
                         onAuxClick={(event) => {
                           if (event.button === 1) {
@@ -2044,13 +2036,13 @@ function WorkspacePanelImpl({
                           }
                         }}
                       >
-                        <Icon className="size-4" />
-                        {label}
+                        <Icon className="size-4 shrink-0" />
+                        <span className="truncate">{label}</span>
                       </button>
                       <button
                         type="button"
                         aria-label={`Close ${label}`}
-                        className="flex size-4 items-center justify-center rounded hover:bg-muted"
+                        className="flex size-4 shrink-0 items-center justify-center rounded hover:bg-muted"
                         onClick={() => closePanel(tab)}
                       >
                         <XIcon className="size-3" />
@@ -2077,9 +2069,10 @@ function WorkspacePanelImpl({
                   browsers.tabs.map((tabId, index) => (
                     <div
                       key={tabId}
+                      data-workspace-tab
                       ref={browserSelected && browsers.selected === tabId ? activeBrowserRef : null}
                       className={cn(
-                        "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
+                        "flex h-[24px] min-w-0 shrink-0 overflow-hidden items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
                         browserSelected && browsers.selected === tabId
                           ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
                           : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
@@ -2090,7 +2083,7 @@ function WorkspacePanelImpl({
                         role="tab"
                         aria-selected={browserSelected && browsers.selected === tabId}
                         title={browsers.labelFor(tabId, index)}
-                        className="flex min-w-0 items-center gap-1"
+                        className="flex min-w-0 flex-1 items-center gap-1"
                         onAuxClick={(event) => {
                           if (event.button === 1) {
                             event.preventDefault();
@@ -2108,7 +2101,7 @@ function WorkspacePanelImpl({
                       <button
                         type="button"
                         aria-label={`Close ${browsers.labelFor(tabId, index)}`}
-                        className="flex size-4 items-center justify-center rounded hover:bg-muted"
+                        className="flex size-4 shrink-0 items-center justify-center rounded hover:bg-muted"
                         onClick={() => void closeBrowserTab(tabId)}
                       >
                         <XIcon className="size-3" />
@@ -2123,9 +2116,10 @@ function WorkspacePanelImpl({
                   return (
                     <div
                       key={childId}
+                      data-workspace-tab
                       ref={active ? activeSideChatRef : null}
                       className={cn(
-                        "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
+                        "flex h-[24px] min-w-0 shrink-0 overflow-hidden items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
                         active
                           ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
                           : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
@@ -2135,7 +2129,7 @@ function WorkspacePanelImpl({
                         type="button"
                         role="tab"
                         aria-selected={active}
-                        className="flex items-center gap-1"
+                        className="flex min-w-0 flex-1 items-center gap-1"
                         onAuxClick={(event) => {
                           if (event.button === 1) {
                             event.preventDefault();
@@ -2148,12 +2142,14 @@ function WorkspacePanelImpl({
                         }}
                       >
                         <TabIcon className="size-4 shrink-0" />
-                        <span className="max-w-[16ch] truncate">{label}</span>
+                        <span className="truncate" title={label}>
+                          {label}
+                        </span>
                       </button>
                       <button
                         type="button"
                         aria-label={`Close ${label}`}
-                        className="flex size-4 items-center justify-center rounded hover:bg-muted"
+                        className="flex size-4 shrink-0 items-center justify-center rounded hover:bg-muted"
                         onClick={() => closeSideChat(childId)}
                       >
                         <XIcon className="size-3" />
@@ -2167,7 +2163,7 @@ function WorkspacePanelImpl({
           {/* With no open tabs, "+" sits right after the nav tabs. */}
           {!pending && !showOpenTabs && newTabMenu("start")}
           {/* The picker and fullscreen toggle form the trailing control group,
-            pinned right outside the scrolling viewport; "+" joins it once tabs exist. */}
+            pinned right outside the tab viewport; "+" joins it once tabs exist. */}
           <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
             {showOpenTabs && newTabMenu("end")}
             {panelOptions.length > 0 && (

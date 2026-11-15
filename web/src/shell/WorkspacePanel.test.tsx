@@ -1360,7 +1360,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     (maximized) => {
       renderWorkspace({ openFiles: ["src/App.tsx", "docs/README.md"], maximized });
       const toolbar = screen.getByRole("toolbar", { name: "Workspace tabs" });
-      const viewport = toolbar.querySelector(".overflow-x-auto");
+      const viewport = toolbar.querySelector("[data-workspace-tabs-viewport]");
       expect(viewport).not.toBeNull();
       expect(viewport).toHaveClass("no-drag");
       expect(viewport).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
@@ -1701,6 +1701,28 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
 });
 
 describe("WorkspacePanel browser tab", () => {
+  it("shares the available width between file and browser tabs with visible close controls", async () => {
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(252);
+    writeSessionWorkspaceState("conv_ws", { openBrowsers: ["docs"], selectedBrowserId: "docs" });
+    Object.assign(window, {
+      omnigentDesktop: {
+        browserHasView: vi.fn().mockResolvedValue({ exists: true, url: "https://example.com" }),
+      },
+    });
+    renderWorkspace({ openFiles: ["src/App.tsx"], showBrowserTab: true });
+    await screen.findByRole("tab", { name: "example.com" });
+    const viewport = screen
+      .getByRole("toolbar", { name: "Workspace tabs" })
+      .querySelector("[data-workspace-tabs-viewport]")!;
+    const tabs = viewport.querySelectorAll<HTMLElement>("[data-workspace-tab]");
+    expect(tabs).toHaveLength(2);
+    for (const tab of tabs) {
+      expect(tab.style.display).toBe("flex");
+      expect(tab.style.width).toBe("125px");
+      expect(tab.querySelector('button[aria-label^="Close "]')).not.toBeNull();
+    }
+  });
+
   it("closes the selected browser with its close button", async () => {
     const title = "Documentation: a complete guide to configuring your workspace and browser";
     const firstView = browserViewId("conv_ws", "docs");

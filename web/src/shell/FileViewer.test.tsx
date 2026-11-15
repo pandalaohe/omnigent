@@ -20,7 +20,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
-import { copyText } from "@/lib/clipboard";
 import type { Comment } from "@/hooks/useComments";
 import { isFilePositionPending } from "./filePositionState";
 
@@ -1587,97 +1586,21 @@ describe("FileViewer comment post settlement", () => {
   });
 });
 
-describe("FileViewer clickable file path", () => {
-  beforeEach(() => {
+describe("FileViewer editable file path", () => {
+  it.each(["editor", "preview", "source"] as const)("selects the full path in %s mode", (mode) => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
-    vi.mocked(copyText).mockReset().mockResolvedValue(undefined);
-  });
-
-  it.each(["editor", "preview", "source"] as const)(
-    "copies the complete displayed path from Markdown %s mode",
-    async (mode) => {
-      writeFileViewPreferences({ ...DEFAULT_FILE_VIEW_PREFERENCES, previewableViewMode: mode });
-      const path = "/home/user/work notes/design-review/compat-doc-full.md";
-      renderViewer({ open: true, path });
-      const pathButton = screen.getByRole("button", { name: `Copy file path: ${path}` });
-      expect(pathButton).toHaveTextContent(path);
-
-      fireEvent.click(pathButton);
-
-      expect(copyText).toHaveBeenCalledWith(path);
-      await waitFor(() => expect(toast.success).toHaveBeenCalledWith("File path copied"));
-    },
-  );
-
-  it("copies the absolute workspace path after the path prop changes", () => {
-    const context = localDesktopContext();
-    const { rerender } = render(
-      <FileViewerContext.Provider value={context}>
-        {viewerTree({ open: true, path: "src/first.py" })}
-      </FileViewerContext.Provider>,
-    );
-    rerender(
-      <FileViewerContext.Provider value={context}>
-        {viewerTree({ open: true, path: "src/second.py" })}
-      </FileViewerContext.Provider>,
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "Copy file path: src/second.py" }));
-
-    expect(copyText).toHaveBeenCalledWith("/repo/src/second.py");
-  });
-
-  it.each([
-    ["/", "notes.md", "/notes.md"],
-    ["C:\\work\\", "docs\\notes.md", "C:\\work\\docs\\notes.md"],
-    ["/repo", "/tmp/notes.md", "/tmp/notes.md"],
-  ])("copies the host path for root %s and file %s", (root, path, expectedPath) => {
-    const context = localDesktopContext();
-    context.workspaceRoot = root;
-    render(
-      <FileViewerContext.Provider value={context}>
-        {viewerTree({ open: true, path })}
-      </FileViewerContext.Provider>,
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: `Copy file path: ${path}` }));
-
-    expect(copyText).toHaveBeenCalledWith(expectedPath);
-  });
-
-  it("does not claim to copy a relative path while the workspace root is unknown", () => {
-    renderViewer({ open: true, path: "src/file.py" });
-
-    fireEvent.click(screen.getByRole("button", { name: "Copy file path: src/file.py" }));
-
-    expect(copyText).not.toHaveBeenCalled();
-    expect(toast.error).toHaveBeenCalledWith("Workspace path unavailable");
-  });
-
-  it("keeps the path clickable when the mobile toolbar collapses", () => {
-    vi.mocked(useIsMobileViewport).mockReturnValue(true);
-    installCollapsedToolbar();
+    writeFileViewPreferences({ ...DEFAULT_FILE_VIEW_PREFERENCES, previewableViewMode: mode });
     const context = localDesktopContext();
     render(
       <FileViewerContext.Provider value={context}>
-        {viewerTree({ open: true, path: "notes.md" })}
+        {viewerTree({ open: true, path: "docs/notes.md" })}
       </FileViewerContext.Provider>,
     );
-    expect(screen.getByRole("button", { name: "More actions" })).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Copy file path: notes.md" }));
-
-    expect(copyText).toHaveBeenCalledWith("/repo/notes.md");
-  });
-
-  it("reports a clipboard failure without claiming the path was copied", async () => {
-    vi.mocked(copyText).mockRejectedValue(new Error("Clipboard unavailable"));
-    renderViewer({ open: true, path: "/repo/file1.py" });
-
-    fireEvent.click(screen.getByRole("button", { name: "Copy file path: /repo/file1.py" }));
-
-    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Failed to copy file path"));
-    expect(toast.success).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Edit file path: docs/notes.md" }));
+    const input = screen.getByRole("textbox", { name: "File path" }) as HTMLInputElement;
+    expect(input.value).toBe("/repo/docs/notes.md");
+    expect(input.selectionStart).toBe(0);
+    expect(input.selectionEnd).toBe(input.value.length);
   });
 });
 

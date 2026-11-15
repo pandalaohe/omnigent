@@ -1,70 +1,46 @@
+import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-
-import { scrollTabIntoView } from "./WorkspaceTabsScroller";
-
-function rect(left: number, width: number): DOMRect {
-  return { left, right: left + width, width, top: 0, bottom: 20, height: 20 } as DOMRect;
-}
-
-/** A 200px-wide tab strip at x=100 holding one 50px tab at `tabLeft`. */
-function strip(tabLeft: number, tabWidth = 50) {
-  const page = document.createElement("div");
-  const viewport = document.createElement("div");
-  viewport.setAttribute("data-workspace-tabs-viewport", "");
-  const tab = document.createElement("div");
-  viewport.append(tab);
-  page.append(viewport);
-  document.body.append(page);
-  let scrollLeft = 40;
-  Object.defineProperty(viewport, "scrollLeft", {
-    get: () => scrollLeft,
-    set: (value: number) => (scrollLeft = value),
-  });
-  Object.defineProperty(viewport, "clientWidth", { value: 200 });
-  viewport.getBoundingClientRect = () => rect(100, 200);
-  tab.getBoundingClientRect = () => rect(tabLeft, tabWidth);
-  return { page, viewport, tab };
-}
+import { WorkspaceTabsScroller, workspaceTabLayout } from "./WorkspaceTabsScroller";
 
 afterEach(() => {
-  document.body.innerHTML = "";
+  cleanup();
   vi.restoreAllMocks();
 });
 
-describe("scrollTabIntoView", () => {
-  it("scrolls only the strip to show a tab past its right edge", () => {
-    const { viewport, tab } = strip(280);
-    const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
-    scrollTabIntoView(tab);
-    expect(viewport.scrollLeft).toBe(70);
-    expect(scrollIntoView).not.toHaveBeenCalled();
+describe("workspaceTabLayout", () => {
+  it.each([2, 12])("fits %i tabs into a narrow strip with usable close controls", (count) => {
+    const layout = workspaceTabLayout(252, count, count - 1);
+    expect(layout.visible).toContain(count - 1);
+    expect(layout.width).toBeGreaterThanOrEqual(64);
+    expect(
+      layout.width * layout.visible.length + (layout.visible.length - 1) * 2,
+    ).toBeLessThanOrEqual(252);
+    expect(layout.visible.length).toBe(count === 2 ? 2 : 3);
   });
-
-  it("scrolls back to show a tab before its left edge", () => {
-    const { viewport, tab } = strip(80);
-    scrollTabIntoView(tab);
-    expect(viewport.scrollLeft).toBe(20);
+  it("caps wide tabs and handles an empty strip", () => {
+    expect(workspaceTabLayout(900, 2, 0).width).toBe(240);
+    expect(workspaceTabLayout(0, 0, -1)).toEqual({ width: 0, visible: [] });
   });
-
-  it("keeps the start of a tab wider than the strip in view", () => {
-    const { viewport, tab } = strip(150, 300);
-    scrollTabIntoView(tab);
-    expect(viewport.scrollLeft).toBe(90);
-  });
-
-  it("leaves a tab wider than the strip alone while its end is in view", () => {
-    const { viewport, tab } = strip(50, 250);
-    scrollTabIntoView(tab);
-    expect(viewport.scrollLeft).toBe(40);
-  });
-
-  it("leaves a visible tab, and a tab outside a strip, alone", () => {
-    const { viewport, tab, page } = strip(150);
-    scrollTabIntoView(tab);
-    expect(viewport.scrollLeft).toBe(40);
-    const loose = document.createElement("div");
-    page.append(loose);
-    expect(() => scrollTabIntoView(loose)).not.toThrow();
-    scrollTabIntoView(null);
+  it("reveals a selected overflow tab and responds to removal without scrolling", async () => {
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(132);
+    const tabs = (selected: number) =>
+      Array.from({ length: 12 }, (_, index) => (
+        <div key={index} data-workspace-tab aria-current={index === selected}>
+          <button type="button">Close {index}</button>
+        </div>
+      ));
+    const { container, rerender } = render(
+      <WorkspaceTabsScroller>{tabs(0)}</WorkspaceTabsScroller>,
+    );
+    expect(container.querySelectorAll('[style*="display: flex"]')).toHaveLength(2);
+    rerender(<WorkspaceTabsScroller>{tabs(11)}</WorkspaceTabsScroller>);
+    await act(async () => {});
+    expect(
+      (container.querySelectorAll("[data-workspace-tab]")[11] as HTMLElement).style.display,
+    ).toBe("flex");
+    expect(container.firstElementChild?.scrollLeft).toBe(0);
+    rerender(<WorkspaceTabsScroller>{tabs(11).slice(0, 1)}</WorkspaceTabsScroller>);
+    await act(async () => {});
+    expect(container.querySelectorAll('[style*="display: flex"]')).toHaveLength(1);
   });
 });
