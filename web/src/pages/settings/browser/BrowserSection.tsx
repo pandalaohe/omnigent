@@ -18,15 +18,24 @@ const tabs = [
 export function BrowserSection() {
   const location = useLocation(),
     navigate = useNavigate(),
+    tabsRef = useRef<HTMLDivElement>(null),
     activeRef = useRef<HTMLButtonElement>(null);
   const requested = new URLSearchParams(location.search).get("tab");
   const active = tabs.some(([id]) => id === requested) ? requested : "history";
   useEffect(() => {
-    activeRef.current?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    const list = tabsRef.current,
+      tab = activeRef.current;
+    if (!list || !tab || !list.clientWidth) return;
+    const bounds = list.getBoundingClientRect(),
+      selected = tab.getBoundingClientRect();
+    if (selected.left < bounds.left + 4) list.scrollLeft += selected.left - bounds.left - 4;
+    else if (selected.right > bounds.right - 4)
+      list.scrollLeft += selected.right - bounds.right + 4;
   }, [active]);
   if (!supportsBrowser())
     return (
       <div>
+        <h1 className="mb-6 text-2xl font-medium">Browser</h1>
         <p>Browser settings are in the desktop app</p>
         <p className="mt-2 text-sm text-muted-foreground">
           Bookmarks, history, sign-ins and extensions are kept on the desktop that uses them.
@@ -50,6 +59,7 @@ export function BrowserSection() {
   }
   return (
     <div className="space-y-6">
+      <h1 className="text-2xl font-medium">Browser</h1>
       {needsUpdate && (
         <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-info/30 bg-info/10 p-3 text-sm">
           <p>Some options need a newer desktop app</p>
@@ -59,6 +69,7 @@ export function BrowserSection() {
         </div>
       )}
       <div
+        ref={tabsRef}
         role="tablist"
         aria-label="Browser settings"
         className="flex w-fit max-w-full gap-1 overflow-x-auto rounded-lg bg-muted p-1"
@@ -89,7 +100,7 @@ export function BrowserSection() {
               if (n >= 0) {
                 event.preventDefault();
                 select(tabs[n][0]);
-                document.getElementById(`tab-${tabs[n][0]}`)?.focus();
+                document.getElementById(`tab-${tabs[n][0]}`)?.focus({ preventScroll: true });
               }
             }}
           >

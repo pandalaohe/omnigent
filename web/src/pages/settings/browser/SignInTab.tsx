@@ -136,9 +136,11 @@ export function SignInTab() {
             Sign out…
           </Button>
         </div>
-        <p role="status" className="mt-3 text-sm">
-          {status}
-        </p>
+        {status && (
+          <p role="status" className="mt-3 text-sm">
+            {status}
+          </p>
+        )}
       </BrowserGroup>
       <BrowserGroup title="Saved login autofill" server>
         {bitwarden === false && (
@@ -161,7 +163,7 @@ export function SignInTab() {
         {!bridge?.fillApprovals || !bridge.revokeFillApproval ? (
           <UpdateReason verb="manage saved login approvals" />
         ) : (
-          <>
+          <div className="divide-y">
             {!sites.length && (
               <p className="text-sm text-muted-foreground">
                 No sites approved. A session asks the first time it fills a saved login.
@@ -170,7 +172,7 @@ export function SignInTab() {
             {sites.map((site) => (
               <div
                 key={`${site.origin}:${site.id}`}
-                className="flex items-center justify-between gap-3 border-t py-3"
+                className="flex items-center justify-between gap-3 py-3 first:pt-0 last:pb-0"
               >
                 <span className="min-w-0 break-all text-sm">
                   {site.origin} · {site.label}
@@ -200,7 +202,7 @@ export function SignInTab() {
                 </Button>
               </div>
             ))}
-          </>
+          </div>
         )}
       </BrowserGroup>
       <BrowserGroup title="Local network access">
@@ -211,32 +213,40 @@ export function SignInTab() {
             No saved choices. Sites will ask before reaching your local network.
           </p>
         ) : (
-          local.map((site) => (
-            <div
-              key={site.origin}
-              className="flex flex-wrap items-center justify-between gap-3 border-t py-3"
-            >
-              <span className="min-w-0 break-all text-sm">{site.origin}</span>
-              <fieldset disabled={busy} className="flex items-center gap-2">
-                <Segmented
-                  label={`Local network for ${site.origin}`}
-                  value={site.allowed ? "allow" : "block"}
-                  options={[
-                    { value: "allow", label: "Allow" },
-                    { value: "block", label: "Block" },
-                  ]}
-                  onChange={(value) => void choice(site.origin, value === "allow")}
-                />
-                <Button variant="outline" size="sm" onClick={() => void choice(site.origin, null)}>
-                  Forget
-                </Button>
-              </fieldset>
-            </div>
-          ))
+          <div className="divide-y">
+            {local.map((site) => (
+              <div
+                key={site.origin}
+                className="flex flex-wrap items-center justify-between gap-3 py-3 first:pt-0 last:pb-0"
+              >
+                <span className="min-w-0 break-all text-sm">{site.origin}</span>
+                <fieldset disabled={busy} className="flex items-center gap-2">
+                  <Segmented
+                    label={`Local network for ${site.origin}`}
+                    value={site.allowed ? "allow" : "block"}
+                    options={[
+                      { value: "allow", label: "Allow" },
+                      { value: "block", label: "Block" },
+                    ]}
+                    onChange={(value) => void choice(site.origin, value === "allow")}
+                  />
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void choice(site.origin, null)}
+                  >
+                    Forget
+                  </Button>
+                </fieldset>
+              </div>
+            ))}
+          </div>
         )}
-        <p role="status" className="mt-3 text-sm">
-          {localStatus}
-        </p>
+        {localStatus && (
+          <p role="status" className="mt-3 text-sm">
+            {localStatus}
+          </p>
+        )}
       </BrowserGroup>
       <Confirm
         title="Sign out of all sites?"

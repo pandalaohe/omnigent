@@ -491,11 +491,7 @@ export function SettingsPage() {
     >
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
-      {section === "browser" && (
-        <Section title="Browser">
-          <BrowserSection />
-        </Section>
-      )}
+      {section === "browser" && <BrowserSection />}
       {section === "agents" && <SettingsAgentsSection />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}

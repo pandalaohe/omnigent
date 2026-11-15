@@ -43,7 +43,9 @@ export function ScopeChip({ server = false }: { server?: boolean }) {
       className="inline-flex items-center gap-1 rounded-md bg-muted px-2 py-1 text-xs font-normal text-muted-foreground"
     >
       <Icon className="size-3" />
-      {server ? `This server · ${window.location.host}` : "This desktop"}
+      {server
+        ? `This server${window.location.host ? ` · ${window.location.host}` : ""}`
+        : "This desktop"}
     </span>
   );
 }
@@ -140,8 +142,8 @@ export function SearchPages({
   kind: string;
 }) {
   return (
-    <div className="flex min-w-0 flex-1 flex-wrap items-center gap-3">
-      <InputGroup className="min-w-40 max-w-sm">
+    <div className="flex min-w-0 basis-full flex-wrap items-center gap-3 md:min-w-64 md:flex-1 md:basis-auto">
+      <InputGroup className="min-w-0 max-w-sm">
         <InputGroupAddon>
           <SearchIcon />
         </InputGroupAddon>

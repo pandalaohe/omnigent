@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
+import userEvent from "@testing-library/user-event";
 import { BookmarksTab } from "./BookmarksTab";
 
 const notices = vi.hoisted(() => ({
@@ -91,4 +92,32 @@ it("validates URL and duplicates and preserves Name/URL edits until Save", async
   expect(screen.getByRole("alert")).toHaveTextContent("Already bookmarked");
   fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
   expect(call).toHaveBeenCalledTimes(1);
+});
+
+it("adds a bookmark through Save and closes the editor after refreshing the list", async () => {
+  const user = userEvent.setup();
+  let rows = [{ url: "https://example.test/", title: "Example" }];
+  const call = vi.fn(async (args: Record<string, unknown>) => {
+    if (args.action === "update") {
+      rows = [{ url: String(args.url), title: String(args.title) }, ...rows];
+      return { ok: true };
+    }
+    return { ok: true, bookmarks: [...rows], history: [] };
+  });
+  Object.assign(window, {
+    omnigentDesktop: { browserPlaces: call, onBrowserPlaceChosen: () => () => {} },
+  });
+  render(
+    <MemoryRouter>
+      <BookmarksTab />
+    </MemoryRouter>,
+  );
+  await screen.findByText("Example");
+  await user.click(screen.getByRole("button", { name: "Add bookmark" }));
+  await user.type(screen.getByLabelText("Name"), "New example");
+  await user.type(screen.getByLabelText("URL"), "https://new.example.test/");
+  await user.click(screen.getByRole("button", { name: "Save bookmark" }));
+  expect(await screen.findByText("New example", { exact: true })).toBeVisible();
+  expect(screen.queryByLabelText("Name")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("URL")).not.toBeInTheDocument();
 });

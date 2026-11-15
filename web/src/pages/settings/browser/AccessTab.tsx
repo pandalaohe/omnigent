@@ -119,6 +119,7 @@ export function AccessTab() {
             />
             <Segmented
               label="Ask before opening"
+              className="flex-wrap [&>button]:shrink-0 [&>button]:whitespace-nowrap [&>button]:wrap-normal"
               value={access?.level ?? "agent"}
               onChange={(level) => {
                 if (access) setAccess({ ...access, level });
