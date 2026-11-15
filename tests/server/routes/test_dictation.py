@@ -401,3 +401,83 @@ def test_stream_capacity_cap(monkeypatch: pytest.MonkeyPatch) -> None:
                 with pytest.raises(WebSocketDisconnect) as excinfo:
                     second.receive_text()
                 assert excinfo.value.code == 1013
+
+
+def test_third_party_take_uses_owner_settings_and_tail_metadata():
+    from omnigent.server.dictation import DictationUpdate
+    from omnigent.server.voice_input import VoiceInputSettings
+
+    owners = []
+
+    class Handle:
+        def feed_pcm16(self, data):
+            return DictationUpdate(
+                partial="", finalized="A.", finalized_raw="a", finalized_cleaned=True
+            )
+
+        def finish_update(self):
+            return DictationUpdate(
+                partial="",
+                finalized="B.",
+                finalized_raw="b",
+                finalized_cleaned=True,
+                undelivered={"segments": 1, "seconds": 0.4},
+            )
+
+        def close(self):
+            self.closed = True
+
+    handle = Handle()
+
+    class Engine:
+        def create_stream(self):
+            return handle
+
+    def load(owner):
+        owners.append(owner)
+        return VoiceInputSettings(
+            speech_source="third", speech_model="test-model", speech_connection="example"
+        )
+
+    def build(settings):
+        assert settings.speech_connection == "example"
+        return Engine()
+
+    with TestClient(_fake_app(settings_loader=load, hosted_factory=build)) as client:
+        with client.websocket_connect("/v1/dictation/stream") as ws:
+            assert ws.receive_json()["type"] == "ready"
+            ws.send_bytes(b"audio")
+            assert ws.receive_json() == {
+                "type": "final",
+                "text": "A.",
+                "raw": "a",
+                "cleaned": True,
+            }
+            ws.send_json({"type": "stop"})
+            assert ws.receive_json() == {
+                "type": "stopped",
+                "text": "B.",
+                "raw": "b",
+                "cleaned": True,
+                "undelivered": {"segments": 1, "seconds": 0.4},
+            }
+    assert owners == ["local"]
+    assert handle.closed
+
+
+def test_deleted_third_party_connection_has_typed_error():
+    from omnigent.server.voice_input import VoiceInputSettings
+
+    def unavailable(settings):
+        raise ValueError("private provider body")
+
+    with TestClient(
+        _fake_app(
+            settings_loader=lambda owner: VoiceInputSettings(speech_source="third"),
+            hosted_factory=unavailable,
+        )
+    ) as client:
+        with client.websocket_connect("/v1/dictation/stream") as ws:
+            result = ws.receive_json()
+            assert result["code"] == "third_party_unavailable"
+            assert "private" not in json.dumps(result)

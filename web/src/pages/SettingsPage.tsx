@@ -100,6 +100,8 @@ import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import { SettingsLabel } from "@/components/SettingsLabel";
 import { SessionTitleInstructionsControl } from "@/components/SessionTitleInstructionsControl";
+import { ModelConnectionsSettings } from "@/components/ModelConnectionsSettings";
+import { VoiceInputSettings } from "@/components/VoiceInputSettings";
 import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
 import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
@@ -2333,6 +2335,12 @@ function GeneralSection() {
         </SettingsGroup>
         <SettingsGroup title="Links" testId="settings-group-links">
           <ArtifactSharingSettings />
+        </SettingsGroup>
+        <SettingsGroup title="Model providers">
+          <ModelConnectionsSettings />
+        </SettingsGroup>
+        <SettingsGroup title="语音输入" testId="settings-group-voice-input">
+          <VoiceInputSettings />
         </SettingsGroup>
         <SettingsGroup title="Sessions" testId="settings-group-sessions" className="max-w-none">
           <BackgroundSessionTitlesControl />

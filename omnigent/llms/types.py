@@ -125,11 +125,14 @@ class Response:
     :param model: The model identifier that produced the response,
         e.g. ``"claude-sonnet-4-20250514"``.
     :param usage: Token usage information, or ``None`` if unavailable.
+    :param status: Provider completion status; ``None`` when completion is unknown.
     """
 
     output: list[MessageOutput | FunctionCallOutput | NativeToolOutput]
     model: str
     usage: Usage | None = None
+    # None means the provider did not establish a complete response.
+    status: str | None = None
 
 
 # ── Streaming event types ─────────────────────────────────

@@ -131,7 +131,7 @@ def test_keyring_and_file_failure_does_not_expose_backend_details(
         expected_error = json.JSONDecodeError
     else:
 
-        def read_file() -> dict[str, str]:
+        def read_file(*, home: str | None = None) -> dict[str, str]:
             raise PermissionError("file unreadable")
 
         monkeypatch.setattr(secrets, "_read_secrets_file", read_file)

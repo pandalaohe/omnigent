@@ -142,6 +142,16 @@ class DictationUpdate:
 
     partial: str
     finalized: str | None = None
+    finalized_raw: str | None = None
+    finalized_cleaned: bool = False
+    undelivered: dict[str, int | float] | None = None
+
+
+class DictationTakeError(Exception):
+    def __init__(self, code: str, undelivered: dict[str, int | float]):
+        super().__init__("Third-party recognition failed")
+        self.code = code
+        self.undelivered = undelivered
 
 
 class DictationStreamHandle(Protocol):
@@ -819,6 +829,38 @@ class _FakeStream:
 # Built-in engines register themselves at import. The sherpa factory is
 # lazy (weights load on first take), so importing this module costs no
 # model RAM.
+def _build_hosted() -> DictationEngine:
+    from omnigent.server.dictation_hosted import engine_for_settings
+    from omnigent.server.voice_input import VoiceInputSettings
+
+    return engine_for_settings(
+        VoiceInputSettings.model_validate(
+            {
+                "speech_source": "third",
+                "speech_connection": os.environ.get("OMNIGENT_DICTATION_HOSTED_CONNECTION", ""),
+                "speech_model": os.environ.get("OMNIGENT_DICTATION_HOSTED_MODEL", ""),
+                "speech_method": os.environ.get(
+                    "OMNIGENT_DICTATION_HOSTED_METHOD", "transcription"
+                ),
+            }
+        )
+    )
+
+
+def _hosted_available() -> tuple[bool, str]:
+    from omnigent.server.model_connections import resolve_connection
+
+    if not os.environ.get("OMNIGENT_DICTATION_HOSTED_MODEL", "").strip():
+        return False, "model_missing"
+    try:
+        resolve_connection(os.environ.get("OMNIGENT_DICTATION_HOSTED_CONNECTION", ""))
+    except Exception:  # noqa: BLE001 - availability must not expose credential failures
+        return False, "connection_unavailable"
+    return True, ""
+
+
+register_engine("hosted", _build_hosted, available=_hosted_available)
+
 register_engine(
     ENGINE_SHERPA,
     lambda: SherpaDictationEngine(

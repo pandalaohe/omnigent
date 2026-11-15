@@ -1,3 +1,4 @@
+import { flushSync } from "react-dom";
 import { Input } from "@/components/ui/input";
 import {
   listCallingDefaultCatalogs,
@@ -340,6 +341,7 @@ import {
   useWorkspaceFileSearch,
   type WorkspaceFile,
 } from "@/hooks/useWorkspaceChangedFiles";
+import { useComposerVoiceCleanup } from "@/hooks/useComposerVoiceCleanup";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
@@ -3133,9 +3135,6 @@ function ComposerImpl(
     tailTextareaRef.current = element;
     if (element && !textareaRef.current?.isConnected) textareaRef.current = element;
   }, []);
-  // Declared after textareaRef so dictation can place the caret after the
-  // text it inserts (and insert at the caret rather than the draft's end).
-  const dictation = useDictationInsert(value, setValue, textareaRef);
   // Highlight overlay mirroring the textarea; scroll-synced so the tinted
   // `/skill` token stays aligned once the draft grows past the visible rows.
   const backdropRef = useRef<HTMLDivElement>(null);
@@ -3213,6 +3212,13 @@ function ComposerImpl(
   // tabs and coming back restores the draft. The shared draft store also lets
   // the sidebar surface which sessions have unfinished composer content.
   const conversationId = useChatStore((s) => s.conversationId);
+  const voiceCleanup = useComposerVoiceCleanup(
+    value,
+    setValue,
+    textareaRef,
+    `${conversationId}:${activeTextId}`,
+  );
+  const dictation = useDictationInsert(value, voiceCleanup.produce, textareaRef);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const boundAgentId = useChatStore((s) => s.boundAgentId);
@@ -3654,8 +3660,6 @@ function ComposerImpl(
   // the input, which would delete the draft. Only save when the user
   // has actually changed the value since the last restore.
   const dirtyRef = useRef(false);
-  // Composer text captured when voice dictation starts, so Esc can revert to it.
-  const voiceSnapshotRef = useRef("");
   // While dictation listens, Esc cancels the take instead of interrupting the turn.
   const [dictating, setDictating] = useState(false);
   // On mobile, programmatic focus immediately summons the software keyboard.
@@ -5101,6 +5105,7 @@ function ComposerImpl(
   };
 
   const handleTextChange = (id: string | null, e: ChangeEvent<HTMLTextAreaElement>) => {
+    voiceCleanup.invalidate();
     slashCompletion.onSelectionChange(e.target);
     editText(id, e.target.value);
     dirtyRef.current = true;
@@ -5731,16 +5736,18 @@ function ComposerImpl(
                 className="size-8 md:size-7"
                 enableHotkey
                 disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
-                onVoiceStart={() => {
-                  voiceSnapshotRef.current = value;
-                }}
-                onVoiceDiscard={() => {
-                  setValue(voiceSnapshotRef.current);
-                }}
+                onVoiceStart={voiceCleanup.begin}
+                onVoiceDiscard={voiceCleanup.discard}
+                onVoiceEnd={() => void voiceCleanup.end()}
                 onListeningChange={setDictating}
                 inputRef={textareaRef}
-                onTranscript={(text) => {
-                  dictation.appendFinal(text);
+                onTranscript={(text, meta) => {
+                  voiceCleanup.record(text, meta);
+                  if (meta?.cleaned && meta.raw && meta.raw !== text) {
+                    const raw = meta.raw;
+                    flushSync(() => dictation.appendFinal(raw));
+                    voiceCleanup.replaceFinal(raw, text);
+                  } else dictation.appendFinal(text);
                   dirtyRef.current = true;
                   // Dictation is a user-driven edit — exit prompt-recall mode
                   // so ArrowUp/ArrowDown don't clobber the dictated text.
@@ -5753,6 +5760,11 @@ function ComposerImpl(
                   resetCursor();
                 }}
               />
+              {voiceCleanup.notice && (
+                <span role="status" className="text-sm text-muted-foreground">
+                  {voiceCleanup.notice}
+                </span>
+              )}
               <TooltipProvider>
                 <Tooltip>
                   <TooltipTrigger asChild>

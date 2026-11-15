@@ -156,6 +156,7 @@ UserPreferenceNamespace = Literal[
     "sound_alerts",
     "worktree_defaults",
     "builtin_agent_prompts",
+    "voice_input",
 ]
 
 

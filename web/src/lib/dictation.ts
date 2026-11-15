@@ -44,20 +44,36 @@ function buildDictationUrl(): string {
 }
 
 /** A transcript event pushed by the server over the dictation stream. */
+export interface Undelivered {
+  segments: number;
+  seconds: number;
+}
+export interface FinalMeta {
+  raw?: string;
+  cleaned?: boolean;
+}
+export interface ErrorMeta {
+  code?: string;
+  undelivered?: Undelivered;
+}
+export interface DictationTail extends FinalMeta {
+  text: string;
+  undelivered?: Undelivered;
+}
 export type DictationEvent =
   | { type: "ready" }
   | { type: "partial"; text: string }
-  | { type: "final"; text: string }
-  | { type: "stopped"; text: string }
-  | { type: "error"; message: string };
+  | ({ type: "final"; text: string } & FinalMeta)
+  | ({ type: "stopped" } & DictationTail)
+  | ({ type: "error"; message: string } & ErrorMeta);
 
 export interface DictationSessionEvents {
   /** Revisable in-progress utterance (server-throttled to ~6 Hz). */
   onPartial: (text: string) => void;
   /** An utterance completed by a pause; append it and clear the partial. */
-  onFinal: (text: string) => void;
+  onFinal: (text: string, meta?: FinalMeta) => void;
   /** Fatal error after start. The session has already cleaned itself up. */
-  onError: (message: string) => void;
+  onError: (message: string, meta?: ErrorMeta) => void;
 }
 
 /**
@@ -114,16 +130,34 @@ export function parseDictationEvent(raw: string): DictationEvent | null {
     return null;
   }
   if (typeof data !== "object" || data === null) return null;
-  const frame = data as { type?: unknown; text?: unknown; message?: unknown };
+  const frame = data as Record<string, unknown>;
+  const meta: FinalMeta & ErrorMeta = {};
+  if (typeof frame.raw === "string") meta.raw = frame.raw;
+  if (typeof frame.cleaned === "boolean") meta.cleaned = frame.cleaned;
+  if (typeof frame.code === "string") meta.code = frame.code;
+  if (typeof frame.undelivered === "object" && frame.undelivered !== null) {
+    const loss = frame.undelivered as Undelivered;
+    if (
+      Number.isFinite(loss.segments) &&
+      Number.isFinite(loss.seconds) &&
+      loss.segments >= 0 &&
+      loss.seconds >= 0
+    )
+      meta.undelivered = loss;
+  }
   switch (frame.type) {
     case "ready":
       return { type: "ready" };
     case "partial":
     case "final":
     case "stopped":
-      return typeof frame.text === "string" ? { type: frame.type, text: frame.text } : null;
+      return typeof frame.text === "string"
+        ? { type: frame.type, text: frame.text, ...meta }
+        : null;
     case "error":
-      return typeof frame.message === "string" ? { type: "error", message: frame.message } : null;
+      return typeof frame.message === "string"
+        ? { type: "error", message: frame.message, ...meta }
+        : null;
     default:
       return null;
   }
@@ -229,7 +263,7 @@ export class DictationSession {
   private readonly mediaStream: MediaStream;
   private readonly audioContext: AudioContext;
   private readonly workletNode: AudioWorkletNode;
-  private stopResolve: ((tail: string) => void) | null = null;
+  private stopResolve: ((tail: DictationTail) => void) | null = null;
   private flushResolve: (() => void) | null = null;
   private closed = false;
 
@@ -260,14 +294,14 @@ export class DictationSession {
       const event = parseDictationEvent(msg.data);
       if (event === null) return;
       if (event.type === "partial") this.events.onPartial(event.text);
-      else if (event.type === "final") this.events.onFinal(event.text);
-      else if (event.type === "stopped") this.resolveStop(event.text);
-      else if (event.type === "error") this.fail(event.message);
+      else if (event.type === "final") this.events.onFinal(event.text, event);
+      else if (event.type === "stopped") this.resolveStop(event);
+      else if (event.type === "error") this.fail(event.message, event);
     };
     ws.onclose = () => {
       // A close during stop() is the normal end of a take; any other
       // close means the server went away mid-dictation.
-      if (this.stopResolve !== null) this.resolveStop("");
+      if (this.stopResolve !== null) this.resolveStop({ text: "" });
       else if (!this.closed) this.fail("Dictation connection closed");
     };
   }
@@ -335,18 +369,18 @@ export class DictationSession {
    * make it to the recognizer), release the mic, ask the server to flush,
    * and resolve with the flushed tail utterance ("" on timeout/close).
    */
-  async stop(): Promise<string> {
-    if (this.closed) return "";
+  async stop(): Promise<DictationTail> {
+    if (this.closed) return { text: "" };
     await this.flushWorklet();
     this.teardownAudio();
     if (this.ws.readyState !== WebSocket.OPEN) {
       this.closed = true;
-      return "";
+      return { text: "" };
     }
-    return new Promise<string>((resolve) => {
+    return new Promise<DictationTail>((resolve) => {
       this.stopResolve = resolve;
       this.ws.send(JSON.stringify({ type: "stop" }));
-      setTimeout(() => this.resolveStop(""), STOP_TIMEOUT_MS);
+      setTimeout(() => this.resolveStop({ text: "" }), STOP_TIMEOUT_MS);
     });
   }
 
@@ -371,7 +405,7 @@ export class DictationSession {
     });
   }
 
-  private resolveStop(tail: string): void {
+  private resolveStop(tail: DictationTail): void {
     this.closed = true;
     const resolve = this.stopResolve;
     this.stopResolve = null;
@@ -379,11 +413,11 @@ export class DictationSession {
     resolve?.(tail);
   }
 
-  private fail(message: string): void {
+  private fail(message: string, meta?: ErrorMeta): void {
     this.closed = true;
     this.teardownAudio();
     this.ws.close();
-    this.events.onError(message);
+    this.events.onError(message, meta);
   }
 
   private teardownAudio(): void {

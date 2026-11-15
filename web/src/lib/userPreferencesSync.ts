@@ -20,7 +20,8 @@ export type UserPreferenceNamespace =
   | "runner_log_warnings"
   | "sidebar_layout"
   | "sound_alerts"
-  | "worktree_defaults";
+  | "worktree_defaults"
+  | "voice_input";
 
 export interface UserPreferencesEnvelope {
   version: 1;
@@ -120,6 +121,10 @@ const CATEGORY_CONFIG: Record<UserPreferenceNamespace, { storageKey: string; eve
     worktree_defaults: {
       storageKey: "omnigent:worktree-defaults",
       eventName: "omnigent:worktree-defaults-changed",
+    },
+    voice_input: {
+      storageKey: "omnigent:voice-input",
+      eventName: "omnigent:voice-input-changed",
     },
   };
 

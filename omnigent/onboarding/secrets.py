@@ -35,6 +35,8 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
+import threading
 
 import keyring
 import keyring.errors
@@ -58,6 +60,7 @@ _DISABLE_KEYRING_ENV = "OMNIGENT_DISABLE_KEYRING"
 # Backend identifiers returned by :func:`active_backend`.
 KEYRING_BACKEND = "keyring"
 FILE_BACKEND = "file"
+_MUTATION_LOCK = threading.Lock()
 
 
 def _keyring_disabled() -> bool:
@@ -118,16 +121,16 @@ def _config_home() -> str:
     return os.path.join(os.path.expanduser("~"), ".omnigent")
 
 
-def _secrets_path() -> str:
+def _secrets_path(*, home: str | None = None) -> str:
     """Return the path to the file-backend secrets file.
 
     :returns: Path to ``secrets.json`` under the config home, e.g.
         ``"/home/u/.omnigent/secrets.json"``.
     """
-    return os.path.join(_config_home(), "secrets.json")
+    return os.path.join(home or _config_home(), "secrets.json")
 
 
-def _read_secrets_file() -> dict[str, str]:
+def _read_secrets_file(*, home: str | None = None) -> dict[str, str]:
     """Read the file-backend secrets mapping.
 
     :returns: The ``{name: secret}`` mapping, e.g.
@@ -136,7 +139,7 @@ def _read_secrets_file() -> dict[str, str]:
     :raises json.JSONDecodeError: If the file exists but is not valid JSON
         (we fail loud rather than silently discarding stored secrets).
     """
-    path = _secrets_path()
+    path = _secrets_path(home=home)
     if not os.path.exists(path):
         return {}
     with open(path, encoding="utf-8") as f:
@@ -144,7 +147,7 @@ def _read_secrets_file() -> dict[str, str]:
     return data
 
 
-def _write_secrets_file(secrets: dict[str, str]) -> None:
+def _write_secrets_file(secrets: dict[str, str], *, home: str | None = None) -> None:
     """Write the file-backend secrets mapping with ``0600`` permissions.
 
     Creates the config home directory if absent, writes the JSON mapping,
@@ -154,19 +157,21 @@ def _write_secrets_file(secrets: dict[str, str]) -> None:
     :param secrets: The full ``{name: secret}`` mapping to persist, e.g.
         ``{"anthropic": "sk-ant-...", "openrouter": "sk-or-..."}``.
     """
-    path = _secrets_path()
+    path = _secrets_path(home=home)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    # Create the file 0600 from the start via os.open(O_CREAT, 0o600) rather than
-    # a plain open()+chmod-after: the latter briefly leaves a freshly-created
-    # secrets file group/world-readable until the chmod lands. The trailing chmod
-    # still tightens an already-existing file a prior run may have created wider.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(secrets, f, indent=2)
-    os.chmod(path, 0o600)
+    fd, temporary = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".secrets-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(secrets, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
-def store_secret(name: str, value: str) -> None:
+def store_secret(name: str, value: str, *, home: str | None = None) -> None:
     """Store *value* under *name*, using the active backend.
 
     Tries the OS keychain when enabled; on a :class:`keyring.errors.KeyringError`
@@ -185,12 +190,13 @@ def store_secret(name: str, value: str) -> None:
             # Keyring is importable but the backend can't store right now
             # (locked, headless, no backend) — fall through to the file.
             pass
-    secrets = _read_secrets_file()
-    secrets[name] = value
-    _write_secrets_file(secrets)
+    with _MUTATION_LOCK:
+        secrets = _read_secrets_file(home=home)
+        secrets[name] = value
+        _write_secrets_file(secrets, home=home)
 
 
-def load_secret(name: str) -> str | None:
+def load_secret(name: str, *, home: str | None = None) -> str | None:
     """Return the secret stored under *name*, or ``None`` if absent.
 
     Tries the OS keychain when enabled; on a :class:`keyring.errors.KeyringError`
@@ -209,7 +215,7 @@ def load_secret(name: str) -> str | None:
             return stored
         except _KEYRING_ERRORS as exc:
             keyring_error_name = type(exc).__name__
-    stored = _read_secrets_file().get(name)
+    stored = _read_secrets_file(home=home).get(name)
     if stored is None and keyring_error_name is not None:
         raise OmnigentError(
             f"could not read secret {name!r} from the OS keyring "
@@ -222,7 +228,7 @@ def load_secret(name: str) -> str | None:
     return stored
 
 
-def delete_secret(name: str) -> None:
+def delete_secret(name: str, *, home: str | None = None) -> None:
     """Delete the secret stored under *name*, if present.
 
     Tries the OS keychain when enabled; on a :class:`keyring.errors.KeyringError`
@@ -238,7 +244,8 @@ def delete_secret(name: str) -> None:
             return
         except _KEYRING_ERRORS:
             pass
-    secrets = _read_secrets_file()
-    if name in secrets:
-        del secrets[name]
-        _write_secrets_file(secrets)
+    with _MUTATION_LOCK:
+        secrets = _read_secrets_file(home=home)
+        if name in secrets:
+            del secrets[name]
+            _write_secrets_file(secrets, home=home)

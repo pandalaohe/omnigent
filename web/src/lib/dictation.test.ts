@@ -71,3 +71,27 @@ describe("restoreDictationPunctuation", () => {
     await expect(restoreDictationPunctuation("你好世界")).rejects.toThrow("did not contain text");
   });
 });
+
+it("preserves cleaned tail and typed loss metadata", () => {
+  expect(
+    parseDictationEvent(
+      '{"type":"stopped","text":"A.","raw":"a","cleaned":true,"undelivered":{"segments":1,"seconds":0.4}}',
+    ),
+  ).toEqual({
+    type: "stopped",
+    text: "A.",
+    raw: "a",
+    cleaned: true,
+    undelivered: { segments: 1, seconds: 0.4 },
+  });
+  expect(
+    parseDictationEvent(
+      '{"type":"error","message":"failed","code":"third_party_failed","undelivered":{"segments":2,"seconds":1}}',
+    ),
+  ).toEqual({
+    type: "error",
+    message: "failed",
+    code: "third_party_failed",
+    undelivered: { segments: 2, seconds: 1 },
+  });
+});

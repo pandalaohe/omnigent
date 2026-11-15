@@ -89,7 +89,7 @@ function splice(
 
 export function useDictationInsert(
   draft: string,
-  setDraft: (next: string) => void,
+  setDraft: (next: string, region?: { start: number; text: string }) => void,
   textareaRef?: RefObject<HTMLTextAreaElement | null>,
 ): {
   /** Pin a final utterance, replacing any pending interim region. */
@@ -192,7 +192,7 @@ export function useDictationInsert(
       draftRef.current = spliced.next;
       producedRef.current = settled;
       wantCaretRef.current = spliced.caret;
-      setDraft(spliced.next);
+      setDraft(spliced.next, spliced.region);
     },
     [setDraft, textareaRef],
   );

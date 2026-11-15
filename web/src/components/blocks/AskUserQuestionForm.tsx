@@ -24,6 +24,7 @@ import {
 import { isKeyOwningOverlayOpen } from "@/lib/hotkeys";
 import { Button } from "@/components/ui/button";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
+import { QuestionDictationControls } from "@/components/QuestionDictationControls";
 import { leaveQuestionCard, useQuestionCardTarget } from "@/hooks/useQuestionCardHotkeys";
 import { classifyAttachment, validateAttachments } from "@/lib/attachments";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -249,6 +250,7 @@ export function AskUserQuestionForm({
   const mountedRef = useRef(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const customInputRef = useRef<HTMLTextAreaElement>(null);
+  const editRevisionRef = useRef<Record<string, number>>({});
   const caretRef = useRef<Record<string, { start: number; end: number }>>({});
   const pendingCaretRef = useRef<{ key: string; offset: number } | null>(null);
 
@@ -283,6 +285,7 @@ export function AskUserQuestionForm({
   }, [customInputs, current]);
 
   const commitCustomText = (key: string, text: string, caret: number) => {
+    editRevisionRef.current[key] = (editRevisionRef.current[key] ?? 0) + 1;
     const next = { ...customInputsRef.current, [key]: text };
     customInputsRef.current = next;
     setCustomInputs(next);
@@ -456,6 +459,7 @@ export function AskUserQuestionForm({
   const handleCustomInput = (key: string, e: ChangeEvent<HTMLTextAreaElement>) => {
     if (submittingRef.current) return;
     const text = e.target.value;
+    editRevisionRef.current[key] = (editRevisionRef.current[key] ?? 0) + 1;
     customInputsRef.current = { ...customInputsRef.current, [key]: text };
     setCustomInputs(customInputsRef.current);
     caretRef.current[key] = {
@@ -1047,6 +1051,42 @@ export function AskUserQuestionForm({
                   className="mobile-touch-target mobile-app:min-w-0 mobile-app:py-3 field-sizing-content flex-1 resize-none bg-transparent text-ui placeholder:text-muted-foreground focus:outline-none"
                 />
               </div>
+              <div className="flex flex-wrap items-center gap-2 pl-6">
+                {!current.isSecret && (
+                  <QuestionDictationControls
+                    key={currentKey}
+                    inputRef={customInputRef}
+                    getText={() => customInputsRef.current[currentKey] ?? ""}
+                    getRevision={() => editRevisionRef.current[currentKey] ?? 0}
+                    getSelection={() =>
+                      caretRef.current[currentKey] ?? {
+                        start: customRowValue.length,
+                        end: customRowValue.length,
+                      }
+                    }
+                    onChange={(text, caret) => {
+                      if (submittingRef.current) return;
+                      commitCustomText(currentKey, text, caret);
+                      setCustomSelected((prev) => ({ ...prev, [currentKey]: true }));
+                      if (!current.multiSelect)
+                        setSelections((prev) => ({ ...prev, [currentKey]: "" }));
+                    }}
+                    disabled={submitting}
+                  />
+                )}
+                {asyncTarget && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="min-h-11"
+                    onClick={() => fileInputRef.current?.click()}
+                  >
+                    <ImagePlusIcon className="mr-1 size-3.5" />
+                    Add image
+                  </Button>
+                )}
+              </div>
               {asyncTarget && (
                 <div className="flex flex-col gap-2 pl-6">
                   <input
@@ -1061,16 +1101,6 @@ export function AskUserQuestionForm({
                       event.currentTarget.value = "";
                     }}
                   />
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    className="self-start"
-                    onClick={() => fileInputRef.current?.click()}
-                  >
-                    <ImagePlusIcon className="mr-1 size-3.5" />
-                    Add image
-                  </Button>
                   <ComposerAttachments
                     files={images[currentKey] ?? []}
                     onRemove={(index) => {

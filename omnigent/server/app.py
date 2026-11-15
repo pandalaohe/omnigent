@@ -135,6 +135,7 @@ from omnigent.server.routes.extensions import create_extensions_router
 from omnigent.server.routes.global_instructions import create_global_instructions_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
+from omnigent.server.routes.model_connections import create_model_connections_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.preferences import create_preferences_router
 from omnigent.server.routes.project_collaboration import (
@@ -161,6 +162,7 @@ from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.routes.user_settings import create_user_settings_router
+from omnigent.server.routes.voice_input import create_voice_input_router
 from omnigent.server.runner_session_init import (
     TRANSIENT_REJECTION_STATUSES,
     RunnerSessionInitializer,
@@ -5141,11 +5143,20 @@ def create_app(
         prefix="/v1",
         tags=["sandbox inference"],
     )
+
     # Server-side speech-to-text behind the composer mic button
     # (designs/server-dictation.md). Availability is probed lazily, so
     # registering unconditionally is free for servers without the extra.
+    def load_voice_settings(owner):
+        from omnigent.server.voice_input import VoiceInputSettings
+
+        envelope = user_preferences_store.get(owner) if user_preferences_store else None
+        return VoiceInputSettings.model_validate(
+            (envelope or {}).get("settings", {}).get("voice_input", {})
+        )
+
     app.include_router(
-        create_dictation_router(auth_provider=auth_provider),
+        create_dictation_router(auth_provider=auth_provider, settings_loader=load_voice_settings),
         prefix="/v1",
         tags=["dictation"],
     )
@@ -5344,6 +5355,16 @@ def create_app(
                 tags=["projects"],
             )
 
+    app.include_router(
+        create_model_connections_router(auth_provider, permission_store),
+        prefix="/v1",
+        tags=["model connections"],
+    )
+    app.include_router(
+        create_voice_input_router(user_preferences_store, auth_provider),
+        prefix="/v1",
+        tags=["dictation"],
+    )
     if user_settings_store is not None:
         app.include_router(
             create_user_settings_router(user_settings_store, auth_provider),
