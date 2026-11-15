@@ -33,6 +33,7 @@ from omnigent.server.session_choice import (
     catalog_model,
     check_candidate_limits,
     choice_revision,
+    codex_route_pool,
     holds_slot,
     ordered_links,
     parse_session_choice,
@@ -81,19 +82,33 @@ def choice_settings_snapshot(app, owner):
 
 def session_identity(app, session):
     from omnigent.runner.routing import routing_host_id
-    from omnigent.server.routes._sessions.helpers import _resolve_llm_model
+    from omnigent.server.routes._sessions.helpers import _resolve_harness_impl, _resolve_llm_model
 
-    return RunningIdentity(
-        session.id,
-        session.agent_id,
-        routing_host_id(session, app.state.conversation_store),
+    model = (
         session.reported_model
         or session.model_override
         or _resolve_llm_model(
             session,
             agent_store=getattr(app.state, "agent_store", None),
             agent_cache=getattr(app.state, "agent_cache", None),
-        ),
+        )
+    )
+    if session.model_override and model and "/" not in model:
+        product = agent_key_for_harness(
+            _resolve_harness_impl(
+                session,
+                agent_store=getattr(app.state, "agent_store", None),
+                agent_cache=getattr(app.state, "agent_cache", None),
+            )
+        )
+        if codex_route_pool(session.model_override, product):
+            # A bare runner report changes the model name, not the launch route.
+            model = f"{session.model_override.partition('/')[0]}/{model}"
+    return RunningIdentity(
+        session.id,
+        session.agent_id,
+        routing_host_id(session, app.state.conversation_store),
+        model,
     )
 
 
@@ -1007,6 +1022,7 @@ async def admit_create(
                 )
             if not link.meter and cap:
                 link = link.model_copy(update={"max_running": cap})
+            link = resolved_link(link, request)
             work, _ = resolve_work_type(settings, body.work_type)
             failure = check_candidate_limits(
                 settings,

@@ -742,6 +742,7 @@ def rule_limits(settings: SessionChoice, agent: str, host: str | None, model: st
 
 def candidate_lines(settings, link, request, readings, floor_off, now):
     """Legacy pool constraints remain independent of resolved rule overrides."""
+    link = _candidate_link(settings, link, request)
     pool = pool_of(link, request.products.get(link.agent_id, link.agent_id))
     limits = [settings.limits.get(pool, TileLimits())]
     if settings.schema_version == 2:
@@ -754,6 +755,7 @@ def candidate_lines(settings, link, request, readings, floor_off, now):
 def check_candidate_limits(
     settings, work_type, link, request, readings, running, floor_off, now, *, user_named=False
 ) -> Skipped | None:
+    link = _candidate_link(settings, link, request)
     if (
         settings.schema_version == 2
         and link.model is None
@@ -820,8 +822,8 @@ def _candidate_link(settings: SessionChoice, link: Link, request: ChoiceRequest)
     """One offered link as the selector scores it: route pins first, then schema-2 defaults."""
     link = resolved_link(link, request)
     if settings.schema_version == 2 and link.model is None:
-        return link.model_copy(update={"model": request.effective_models.get(link.agent_id)})
-    return link
+        link = link.model_copy(update={"model": request.effective_models.get(link.agent_id)})
+    return resolved_link(link, request)
 
 
 def _effective_model(settings: SessionChoice, link: Link, request: ChoiceRequest) -> str | None:
@@ -837,8 +839,8 @@ def resolved_link(link: Link, request: ChoiceRequest) -> Link:
         and request.products.get(link.agent_id) == "codex"
         and link.meter in {"codex-pro", "krill"}
     ):
-        return link.model_copy(update={"model": request.default_models.get(link.agent_id)})
-    return link
+        link = link.model_copy(update={"model": request.default_models.get(link.agent_id)})
+    return pin_codex_link(link, request.products.get(link.agent_id))
 
 
 @dataclass(frozen=True)

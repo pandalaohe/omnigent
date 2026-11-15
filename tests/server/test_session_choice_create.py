@@ -997,6 +997,112 @@ def occupied(env, *, host=HOST, model="test-model", agent=None):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pool,route", [("codex-pro", "official"), ("krill", "krill")])
+@pytest.mark.parametrize("limit", ["cap", "stop"])
+async def test_scoped_codex_limits_use_launch_pin(
+    choice_env, db_uri, monkeypatch, pool, route, limit
+):
+    from dataclasses import replace
+
+    from omnigent.server.session_choice import parse_session_choice
+    from omnigent.server.session_choice_preview import candidate_preview
+    from omnigent.server.session_choice_runtime import (
+        release_choice,
+        session_identity,
+        stopped_line,
+    )
+    from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
+    from tests.server.test_agent_quota import usage_report
+
+    env = choice_env
+    agent = env.agents[0]["id"]
+    model = f"{route}/gpt-example"
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._resolve_harness_impl",
+        lambda *a, **kw: "codex-native",
+    )
+    catalogs = HostModelCatalogCacheStore(db_uri)
+    catalogs.upsert(HOST, "codex-native", [{"id": "gpt-example"}], int(time.time()))
+    env.app.state.host_model_catalog_cache_store = catalogs
+    link = {"agent": agent, "model": "gpt-example", "meter": pool}
+    env.settings["presets"][0]["links"] = [link]
+    env.settings["hosts"][HOST]["work"] = [[{"links": [link]}]]
+    rule = {"id": "launch", "agent": agent, "model": model, "maxRunning": 1}
+    if limit == "stop":
+        rule["reserve"] = {"mode": "total", "window": "7d", "stopPct": 5}
+    # Plain scopes are exact IDs, not aliases for launches pinned to a route.
+    save_rules(
+        env, [{"id": "plain", "agent": agent, "model": "gpt-example", "maxRunning": 9}, rule]
+    )
+    first_response = await create(env)
+    assert first_response.status_code == 201, first_response.text
+    first = first_response.json()
+    receipt = first["session_choice"]
+    assert first["model_override"] == receipt["model"] == model
+    cap = receipt["effectiveLimits"]["maxRunning"]
+    assert (receipt["outcome"], cap["sourceRuleId"], cap["runningCount"]) == ("pick", "launch", 0)
+    preview = await candidate_preview(
+        env.app,
+        RESERVED_USER_LOCAL,
+        HOST,
+        parse_session_choice(env.settings),
+        agent,
+        "gpt-example",
+    )
+    assert preview["candidate"]["model"] == model
+    assert preview["configuredInTiers"]
+    assert preview["effectiveLimits"]["maxRunning"]["sourceRuleId"] == "launch"
+    assert preview["check"]["reason"] == "busy"
+    second_response = await create(env)
+    assert second_response.status_code == 201, second_response.text
+    second = second_response.json()
+    assert second["session_choice"]["outcome"] == "hold"
+    assert second["session_choice"]["skipped"][0]["running"] == [first["id"]]
+    current = env.store.get_conversation(first["id"])
+    reported = replace(current, reported_model="gpt-example")
+    assert session_identity(env.app, reported).model == model
+    # Exercise the same report through the persisted snapshot and queue boundary.
+    env.store.update_conversation(first["id"], reported_model="gpt-example")
+    held = env.store.get_conversation(second["id"])
+    assert not await release_choice(env.app, held, HOST)
+    if limit == "stop":
+        now = time.time()
+        env.app.state.agent_quota_service.report_account(
+            RESERVED_USER_LOCAL,
+            pool,
+            usage_report(
+                account_product="codex",
+                observed_at=now,
+                windows=[
+                    {
+                        "id": "7d",
+                        "percent_used": 96,
+                        "window_minutes": 10080,
+                        "resets_at": now + 86400,
+                    }
+                ],
+            ),
+            now=now,
+        )
+        line = stopped_line(env.app, reported)
+        assert line is not None and line.state == "stop"
+        stopped = await create(env)
+        assert stopped.status_code == 201, stopped.text
+        choice = stopped.json()["session_choice"]
+        assert (choice["outcome"], choice["reason"], choice["model"]) == ("hold", "stop", model)
+        assert choice["effectiveLimits"]["reserve.stopPct"]["sourceRuleId"] == "launch"
+        assert not await release_choice(env.app, held, HOST)
+    else:
+        env.store.set_session_live_status(first["id"], "idle")
+        assert await release_choice(env.app, held, HOST)
+        released = choice_record(env.store.get_conversation(second["id"]))
+        assert released is not None
+        assert released["model"] == model
+        assert released["effectiveLimits"]["maxRunning"]["sourceRuleId"] == "launch"
+        assert released["effectiveLimits"]["maxRunning"]["runningCount"] == 0
+
+
+@pytest.mark.asyncio
 async def test_specific_four_overrides_broad_three_and_broad_still_counts_all_hosts(choice_env):
     env = choice_env
     agent = env.agents[0]["id"]

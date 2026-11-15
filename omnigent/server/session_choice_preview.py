@@ -16,6 +16,7 @@ from omnigent.server.session_choice import (
     RunningSnapshot,
     SessionChoice,
     WorkType,
+    _candidate_link,
     _filter_link,
     active_on,
     candidate_lines,
@@ -225,7 +226,12 @@ async def candidate_preview(
         and (link.model or context.effective_models.get(agent_id)) == resolved
     ]
     # A request never supplies its own pool. Follow the first exact runtime link.
-    link = (links[0] if links else Link(agent=agent_id)).model_copy(update={"model": resolved})
+    link = _candidate_link(
+        settings,
+        (links[0] if links else Link(agent=agent_id)).model_copy(update={"model": resolved}),
+        context,
+    )
+    resolved = link.model
     now = time.time()
     readings, running, floors = await asyncio.to_thread(inputs, app, settings, context, now)
     work, flags = (
@@ -270,7 +276,7 @@ async def candidate_preview(
         "policyActive": active_on(settings, host),
         "configuredInTiers": any(
             item.agent_id == agent_id
-            and (item.model or context.effective_models.get(agent_id)) == resolved
+            and _candidate_link(settings, item, context).model == resolved
             for tiers in settings.hosts.get(host, {}).values()
             for tier in tiers
             for row in tier
