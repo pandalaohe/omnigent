@@ -1,4 +1,11 @@
 import { useEffect, useState } from "react";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import {
   listModelConnections,
@@ -72,11 +79,12 @@ export function ModelConnectionsSettings() {
           key={row.name}
           className="flex flex-wrap items-center justify-between gap-2 rounded border border-border p-3"
         >
-          <div className="min-w-0">
-            <div className="text-ui font-medium">{row.display_name}</div>
-            <div className="break-all text-sm text-muted-foreground">
-              {row.base_url} · {row.editable ? row.wire_api : "From configuration file"} ·{" "}
-              {row.key_set ? "Key configured" : "Key unavailable"}
+          <div className="min-w-0 basis-full sm:flex-1">
+            <div className="break-words text-ui font-medium">{row.display_name}</div>
+            <div className="break-words text-sm text-muted-foreground">
+              <span className="[overflow-wrap:anywhere]">{row.base_url}</span> ·{" "}
+              {row.editable ? row.wire_api : "From configuration file"}
+              <span className="block">{row.key_set ? "Key configured" : "Key unavailable"}</span>
             </div>
           </div>
           {admin && row.editable && (
@@ -184,33 +192,43 @@ export function ModelConnectionsSettings() {
               onChange={(e) => setDraft({ ...draft, base_url: e.target.value })}
             />
           </label>
-          <label className="flex flex-wrap items-center gap-2 text-ui">
-            API type
-            <select
-              className={fieldClass}
+          <div className="grid min-w-0 grid-cols-[7rem_minmax(0,1fr)] items-center gap-3 text-ui">
+            <label htmlFor="model-provider-api-type">API type</label>
+            <Select
               value={draft.wire_api}
-              onChange={(e) =>
-                setDraft({ ...draft, wire_api: e.target.value as ConnectionDraft["wire_api"] })
+              disabled={busy}
+              onValueChange={(selectedValue) =>
+                setDraft({ ...draft, wire_api: selectedValue as ConnectionDraft["wire_api"] })
               }
             >
-              <option value="chat">OpenAI-compatible chat</option>
-              <option value="responses">OpenAI Responses</option>
-            </select>
-          </label>
-          <label className="flex flex-wrap items-center gap-2 text-ui">
-            Key source
-            <select
-              className={fieldClass}
+              <SelectTrigger id="model-provider-api-type" className="w-full min-w-0 max-w-64">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent position="popper" align="start">
+                <SelectItem value="chat">OpenAI-compatible chat</SelectItem>
+                <SelectItem value="responses">OpenAI Responses</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="grid min-w-0 grid-cols-[7rem_minmax(0,1fr)] items-center gap-3 text-ui">
+            <label htmlFor="model-provider-key-source">Key source</label>
+            <Select
               value={keySource}
-              onChange={(e) => {
-                setKeySource(e.target.value);
+              disabled={busy}
+              onValueChange={(selectedValue) => {
+                setKeySource(selectedValue);
                 setKey("");
               }}
             >
-              <option value="stored">Stored key</option>
-              <option value="env">Environment variable</option>
-            </select>
-          </label>
+              <SelectTrigger id="model-provider-key-source" className="w-full min-w-0 max-w-64">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent position="popper" align="start">
+                <SelectItem value="stored">Stored key</SelectItem>
+                <SelectItem value="env">Environment variable</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
           <label className="flex flex-col gap-1 text-ui">
             {keySource === "env" ? "Environment variable name" : "API key"}
             <input
