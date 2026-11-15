@@ -4,9 +4,10 @@ import { supportsBrowser } from "@/lib/nativeBridge";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import { HistoryTab } from "./HistoryTab";
 import { BookmarksTab } from "./BookmarksTab";
-import { BrowserExtensionsControl } from "@/components/BrowserExtensionsControl";
+import { ExtensionsTab } from "./ExtensionsTab";
+import { SignInTab } from "./SignInTab";
 import { BrowserAccessControl } from "@/components/BrowserAccessControl";
-import { BrowserLoginControl, OpenLinksInAppControl } from "./legacyControls";
+import { OpenLinksInAppControl } from "./legacyControls";
 
 const tabs = [
   ["history", "History"],
@@ -79,16 +80,8 @@ export function BrowserSection() {
       >
         {active === "history" && <HistoryTab />}
         {active === "bookmarks" && <BookmarksTab />}
-        {active === "signin" && (
-          <SettingsGroup title="Stay signed in">
-            <BrowserLoginControl />
-          </SettingsGroup>
-        )}
-        {active === "extensions" && (
-          <SettingsGroup title="Extensions">
-            <BrowserExtensionsControl />
-          </SettingsGroup>
-        )}
+        {active === "signin" && <SignInTab />}
+        {active === "extensions" && <ExtensionsTab />}
         {active === "access" && (
           <>
             <SettingsGroup title="Links">

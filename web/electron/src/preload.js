@@ -368,6 +368,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   setColorScheme: (scheme) => ipcRenderer.send("omnigent:set-color-scheme", scheme),
 
+  browserLocalNetworkList: () => ipcRenderer.invoke("omnigent:browser-local-network:list"),
+  browserLocalNetworkSet: (payload) =>
+    ipcRenderer.invoke("omnigent:browser-local-network:set", payload),
   browserPlacesFeatures: ["remove-history", "clear-since", "retention", "update-in-place"],
   browserPlaces: (args) => ipcRenderer.invoke("omnigent:browser-places", args),
   onBrowserPlaceChosen: (callback) => {

@@ -241,4 +241,4 @@ function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
   };
 }
 
-module.exports = { registerBrowserPermissions, createBrowserPermissionStore };
+module.exports = { registerBrowserPermissions, createBrowserPermissionStore, permissionOrigin };
