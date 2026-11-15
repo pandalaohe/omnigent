@@ -14,6 +14,7 @@ import {
   DownloadIcon,
   FileTextIcon,
   GitBranchIcon,
+  GlobeIcon,
   KeyboardIcon,
   PaletteIcon,
   PlugIcon,
@@ -30,7 +31,7 @@ import { Button } from "@/components/ui/button";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
-import { isElectronShell } from "@/lib/nativeBridge";
+import { isElectronShell, supportsBrowser } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
@@ -52,7 +53,8 @@ export type SettingsSectionId =
   | "sharing"
   | "archived"
   | "cli"
-  | "updates";
+  | "updates"
+  | "browser";
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
@@ -73,6 +75,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "archived",
   "cli",
   "updates",
+  "browser",
 ];
 
 interface SettingsNavItem {
@@ -107,6 +110,7 @@ export function settingsNavGroups(
   mcpEnabled = false,
   apiKeysAvailable = false,
   nestedAgentsEnabled = false,
+  browserSupported = false,
 ): SettingsNavGroup[] {
   const harnesses: SettingsNavItem = {
     id: "agents",
@@ -158,6 +162,9 @@ export function settingsNavGroups(
     groups.push({
       title: "Desktop",
       items: [
+        ...(browserSupported
+          ? [{ id: "browser" as const, label: "Browser", icon: GlobeIcon }]
+          : []),
         { id: "cli", label: "Local CLI", icon: TerminalIcon },
         { id: "updates", label: "Updates", icon: DownloadIcon },
       ],
@@ -300,6 +307,9 @@ export function settingsLegacyDestination(
 // mounted across the settings transition, so the value captured on the last
 // non-settings render survives into settings.
 let settingsReturnPath = "/";
+export function getSettingsReturnPath() {
+  return settingsReturnPath;
+}
 
 /**
  * Record the current location as the settings return target whenever the user
@@ -345,6 +355,7 @@ export function SettingsSidebarBody({
     mcpEnabled,
     info !== "loading" && info.api_keys_available === true,
     info !== "loading" && info.sibling_sessions === true,
+    supportsBrowser(),
   );
 
   return (

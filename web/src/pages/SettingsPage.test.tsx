@@ -574,13 +574,14 @@ describe("SettingsPage", () => {
     const revoke = vi.fn().mockResolvedValue({ ok: true });
     (window as unknown as Record<string, unknown>).omnigentDesktop = {
       kind: "electron",
+      browserOpenOrNavigate: vi.fn(),
       getBrowserLoginSetting: vi.fn().mockResolvedValue({ ok: true, enabled: true }),
       setBrowserLoginSetting: vi.fn(),
       clearBrowserLogin: vi.fn(),
       browserFillApprovals: vi.fn().mockResolvedValue({ ok: true, sites: [site] }),
       browserRevokeFillApproval: revoke,
     };
-    renderPage("/settings");
+    renderPage("/settings/browser?tab=signin");
     expect(await screen.findByText(/https:\/\/example.test · Demo account/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
     await waitFor(() => expect(revoke).toHaveBeenCalledWith(site));
@@ -594,6 +595,7 @@ describe("SettingsPage", () => {
     const browserExtensionsAdd = vi.fn().mockResolvedValue({ ok: true });
     (window as unknown as Record<string, unknown>).omnigentDesktop = {
       kind: "electron",
+      browserOpenOrNavigate: vi.fn(),
       getBrowserLoginSetting,
       setBrowserLoginSetting,
       clearBrowserLogin,
@@ -602,7 +604,7 @@ describe("SettingsPage", () => {
       browserExtensionsEnable: vi.fn(),
       browserExtensionsRemove: vi.fn(),
     };
-    renderPage("/settings");
+    renderPage("/settings/browser?tab=signin");
     const toggle = await screen.findByRole("switch", { name: "Keep in-app browser login" });
     await waitFor(() => expect(toggle).not.toBeDisabled());
     expect(toggle).not.toBeChecked();
@@ -626,11 +628,12 @@ describe("SettingsPage", () => {
   it("keeps the browser login switch unchanged when saving fails", async () => {
     (window as unknown as Record<string, unknown>).omnigentDesktop = {
       kind: "electron",
+      browserOpenOrNavigate: vi.fn(),
       getBrowserLoginSetting: vi.fn().mockResolvedValue({ ok: true, enabled: false }),
       setBrowserLoginSetting: vi.fn().mockResolvedValue({ ok: false, error: "Save failed" }),
       clearBrowserLogin: vi.fn(),
     };
-    renderPage("/settings");
+    renderPage("/settings/browser?tab=signin");
     const toggle = await screen.findByRole("switch", { name: "Keep in-app browser login" });
     await waitFor(() => expect(toggle).not.toBeDisabled());
     fireEvent.click(toggle);
