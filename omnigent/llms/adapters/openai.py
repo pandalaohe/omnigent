@@ -407,7 +407,15 @@ def _parse_responses_response(data: dict[str, Any]) -> Response:
             "Response missing required 'model' field",
             code=ErrorCode.INTERNAL_ERROR,
         )
-    return Response(output=output, model=model, usage=usage)
+    return Response(
+        output=output,
+        model=model,
+        usage=usage,
+        status="incomplete"
+        if data.get("incomplete_details")
+        or any(item.get("status") in ("incomplete", "failed") for item in data.get("output", []))
+        else data.get("status"),
+    )
 
 
 def _parse_responses_event(

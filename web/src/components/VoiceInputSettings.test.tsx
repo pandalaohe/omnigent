@@ -31,7 +31,7 @@ it("loads and saves vocabulary, manual mode and thinking parameters through the 
   fireEvent.change(screen.getByRole("textbox", { name: "Voice thinking parameters" }), {
     target: {
       value:
-        '{"reasoning_effort":"low","reasoning":{"effort":"none"},"thinking":{"type":"disabled"}}',
+        '{"reasoning_effort":"low","reasoning":{"effort":"low"},"thinking":{"type":"disabled"}}',
     },
   });
   await act(async () =>
@@ -43,7 +43,7 @@ it("loads and saves vocabulary, manual mode and thinking parameters through the 
     mode: "manual",
     model: "openai/test-cleanup",
     reasoning_effort: "low",
-    reasoning: { effort: "none" },
+    reasoning: { effort: "low" },
     thinking: { type: "disabled" },
   });
   expect(screen.getByRole("status")).toHaveTextContent("Voice settings saved");

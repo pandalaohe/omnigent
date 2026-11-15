@@ -1,5 +1,11 @@
 import { authenticatedFetch } from "./identity";
 import { apiErrorFromResponse } from "./sessionsApi";
+import {
+  refreshUserPreferencesFromServer,
+  type UserPreferencesEnvelope,
+} from "./userPreferencesSync";
+
+export const VOICE_INPUT_CHANGED_EVENT = "omnigent:voice-input-changed";
 
 export interface VoiceInputSettings {
   words: string;
@@ -27,16 +33,23 @@ async function voiceRequest<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export function getVoiceInputSettings(): Promise<VoiceInputSettings> {
-  return voiceRequest("/v1/settings/voice-input");
+export async function getVoiceInputSettings(): Promise<VoiceInputSettings> {
+  const body = await voiceRequest<{ preferences?: UserPreferencesEnvelope | null }>("/v1/me", {
+    cache: "no-store",
+  });
+  return { ...defaultVoiceInputSettings, ...(body.preferences?.settings.voice_input ?? {}) };
 }
 
-export function saveVoiceInputSettings(settings: VoiceInputSettings): Promise<VoiceInputSettings> {
-  return voiceRequest("/v1/settings/voice-input", {
-    method: "PUT",
+export async function saveVoiceInputSettings(
+  settings: VoiceInputSettings,
+): Promise<VoiceInputSettings> {
+  const envelope = await voiceRequest<UserPreferencesEnvelope>("/v1/me/preferences/voice_input", {
+    method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(settings),
+    body: JSON.stringify({ value: settings }),
   });
+  await refreshUserPreferencesFromServer();
+  return { ...defaultVoiceInputSettings, ...(envelope.settings.voice_input ?? {}) };
 }
 
 export function cleanupDictation(text: string, signal: AbortSignal): Promise<{ text: string }> {

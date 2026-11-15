@@ -611,7 +611,7 @@ describe("ComposerMicButton", () => {
     act(() => firstHandlers.start?.({}));
     const second = render(<ComposerMicButton onTranscript={vi.fn()} />);
     fireEvent.click(second.getAllByRole("button", { name: "Voice dictation" }).at(-1)!);
-    expect(discard).toHaveBeenCalledTimes(1);
+    expect(discard).not.toHaveBeenCalled();
     expect(stopSpy).toHaveBeenCalledTimes(1);
   });
 
@@ -1312,6 +1312,24 @@ describe("ComposerMicButton (server dictation)", () => {
           "false",
         );
         expect(showToastMock).not.toHaveBeenCalled();
+      },
+      { startSystemDictation },
+    );
+  });
+
+  it("excludes unobservable macOS system dictation from question-card lifecycle", async () => {
+    const startSystemDictation = vi.fn(async () => true);
+    await inElectronShell(
+      async () => {
+        const inputRef = { current: document.createElement("textarea") };
+        render(
+          <CapabilitiesContext.Provider value={NO_DICTATION_INFO}>
+            <ComposerMicButton questionCard inputRef={inputRef} onTranscript={vi.fn()} />
+          </CapabilitiesContext.Provider>,
+        );
+        expect(screen.queryByRole("button", { name: "Voice dictation" })).toBeNull();
+        expect(screen.getByText(/system dictation.*keyboard.*cleanup/i)).toBeVisible();
+        expect(startSystemDictation).not.toHaveBeenCalled();
       },
       { startSystemDictation },
     );

@@ -11,10 +11,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.llms import Client
 from omnigent.llms.summarize import extract_summary_text
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.server.voice_input import CLEANUP_INSTRUCTIONS, VoiceInputSettings
-from omnigent.stores.user_settings_store import UserSettingsStore
 
 
 class CleanupRequest(BaseModel):
@@ -22,6 +22,14 @@ class CleanupRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     text: str = Field(min_length=1, max_length=12000)
+
+
+class CleanupResult(BaseModel):
+    """The model must explicitly attest that it edited the whole segment."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    complete: bool
+    text: str = Field(min_length=1, max_length=24000)
 
 
 def _configured_connection(model: str) -> tuple[str, dict[str, str] | None]:
@@ -43,7 +51,7 @@ def _configured_connection(model: str) -> tuple[str, dict[str, str] | None]:
 
 
 def create_voice_input_router(
-    store: UserSettingsStore,
+    store: SqlAlchemyUserPreferencesStore | None,
     auth_provider: AuthProvider | None = None,
     *,
     llm_client: Any | None = None,
@@ -52,26 +60,14 @@ def create_voice_input_router(
     router = APIRouter()
     slots = asyncio.Semaphore(4)
 
-    @router.get("/settings/voice-input", response_model=VoiceInputSettings)
-    async def read_settings(request: Request) -> VoiceInputSettings:
-        owner = require_user(request, auth_provider)
-        value = await asyncio.to_thread(store.get_voice_input, user_id=owner)
-        return VoiceInputSettings.model_validate(value)
-
-    @router.put("/settings/voice-input", response_model=VoiceInputSettings)
-    async def save_settings(request: Request, body: VoiceInputSettings) -> VoiceInputSettings:
-        owner = require_user(request, auth_provider)
-        try:
-            await asyncio.to_thread(store.save_voice_input, body.model_dump(), user_id=owner)
-        except ValueError as exc:
-            raise HTTPException(422, "Voice input settings are too large") from exc
-        return body
-
     @router.post("/dictation/cleanup")
     async def cleanup(request: Request, body: CleanupRequest) -> dict[str, str]:
-        owner = require_user(request, auth_provider)
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        if store is None:
+            raise HTTPException(503, "Voice preferences unavailable")
+        envelope = await asyncio.to_thread(store.get, owner)
         settings = VoiceInputSettings.model_validate(
-            await asyncio.to_thread(store.get_voice_input, user_id=owner)
+            (envelope or {}).get("settings", {}).get("voice_input", {})
         )
         if not settings.model.strip() or settings.mode == "off":
             raise HTTPException(409, "Voice cleanup is off")
@@ -86,8 +82,9 @@ def create_voice_input_router(
                     extra: dict[str, Any] = {}
                     if settings.thinking:
                         extra["thinking"] = settings.thinking
+                    reasoning = settings.reasoning
                     if settings.reasoning_effort:
-                        extra["reasoning_effort"] = settings.reasoning_effort
+                        reasoning = {**(reasoning or {}), "effort": settings.reasoning_effort}
                     response = await (llm_client or Client()).responses.create(
                         model=model,
                         instructions=CLEANUP_INSTRUCTIONS,
@@ -104,12 +101,15 @@ def create_voice_input_router(
                         connection_params=connection,
                         timeout=settings.timeout,
                         max_output_tokens=4096,
-                        reasoning=settings.reasoning,
+                        reasoning=reasoning,
                         **extra,
                     )
-                    text = extract_summary_text(response).strip()
-                    if not text or len(text) > 24000:
-                        raise ValueError("Invalid cleanup output")
+                    if getattr(response, "status", None) != "completed":
+                        raise ValueError("Cleanup response did not complete")
+                    result = CleanupResult.model_validate_json(extract_summary_text(response))
+                    if not result.complete or not result.text.strip():
+                        raise ValueError("Cleanup model reported an incomplete edit")
+                    text = result.text
             except TimeoutError as exc:
                 raise HTTPException(504, "Voice cleanup timed out") from exc
             except Exception as exc:

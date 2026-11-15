@@ -1,7 +1,11 @@
 import { type RefObject, useEffect, useRef, useState } from "react";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { Button } from "@/components/ui/button";
-import { cleanupDictation, getVoiceInputSettings } from "@/lib/voiceInputApi";
+import {
+  cleanupDictation,
+  getVoiceInputSettings,
+  VOICE_INPUT_CHANGED_EVENT,
+} from "@/lib/voiceInputApi";
 
 interface Take {
   before: string;
@@ -67,13 +71,18 @@ export function QuestionDictationControls({
 
   useEffect(() => {
     aliveRef.current = true;
-    void getVoiceInputSettings()
-      .then((settings) => {
-        if (aliveRef.current) setMode(settings.model.trim() ? settings.mode : "off");
-      })
-      .catch(() => {});
+    const refresh = () => {
+      void getVoiceInputSettings()
+        .then((settings) => {
+          if (aliveRef.current) setMode(settings.model.trim() ? settings.mode : "off");
+        })
+        .catch(() => {});
+    };
+    refresh();
+    window.addEventListener(VOICE_INPUT_CHANGED_EVENT, refresh);
     return () => {
       aliveRef.current = false;
+      window.removeEventListener(VOICE_INPUT_CHANGED_EVENT, refresh);
       abortRef.current?.abort();
     };
   }, []);

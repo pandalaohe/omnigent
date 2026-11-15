@@ -1275,3 +1275,35 @@ describe("user preference synchronization", () => {
     expect(localStorage.getItem("omnigent:context-indicator-mode")).toBeNull();
   });
 });
+
+it("hydrates the voice namespace and refreshes it from another device", async () => {
+  const changed = vi.fn();
+  window.addEventListener("omnigent:voice-input-changed", changed);
+  const fetcher = vi.fn().mockResolvedValue(
+    new Response(
+      JSON.stringify({
+        user_id: "alice",
+        preferences: {
+          version: 1,
+          settings: { voice_input: { words: "updated words", mode: "manual" } },
+        },
+      }),
+      { status: 200 },
+    ),
+  );
+  await initializeUserPreferencesSync(
+    { version: 1, settings: { voice_input: { words: "initial words" } } },
+    fetcher,
+    "alice",
+  );
+  expect(JSON.parse(localStorage.getItem("omnigent:voice-input")!)).toEqual({
+    words: "initial words",
+  });
+  await refreshUserPreferencesFromServer();
+  expect(JSON.parse(localStorage.getItem("omnigent:voice-input")!)).toEqual({
+    words: "updated words",
+    mode: "manual",
+  });
+  expect(changed).toHaveBeenCalled();
+  window.removeEventListener("omnigent:voice-input-changed", changed);
+});

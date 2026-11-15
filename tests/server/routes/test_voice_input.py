@@ -12,8 +12,12 @@ from fastapi import FastAPI
 from omnigent.errors import OmnigentError
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.routes import voice_input
+from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.server.voice_input import VoiceInputSettings
-from omnigent.stores.user_settings_store import UserSettingsStore
+
+
+def save_settings(store, settings, *, user_id):
+    store.patch_namespace(user_id or "local", "voice_input", settings)
 
 
 def test_gateway_alias_uses_configured_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -36,10 +40,10 @@ def test_gateway_alias_uses_configured_adapter(monkeypatch: pytest.MonkeyPatch) 
 
 
 async def test_default_six_second_timeout_is_forwarded(
-    voice_store: UserSettingsStore, llm: SimpleNamespace
+    voice_store: SqlAlchemyUserPreferencesStore, llm: SimpleNamespace
 ) -> None:
-    voice_store.save_voice_input(
-        VoiceInputSettings(model="openai/test-cleanup").model_dump(), user_id=None
+    save_settings(
+        voice_store, VoiceInputSettings(model="openai/test-cleanup").model_dump(), user_id=None
     )
     llm.responses.create.side_effect = TimeoutError()
     async with httpx.AsyncClient(
@@ -53,14 +57,23 @@ async def test_default_six_second_timeout_is_forwarded(
 
 
 @pytest.fixture()
-def voice_store(db_uri: str) -> UserSettingsStore:
-    return UserSettingsStore(db_uri)
+def voice_store(db_uri: str) -> SqlAlchemyUserPreferencesStore:
+    return SqlAlchemyUserPreferencesStore(db_uri)
 
 
 @pytest.fixture()
 def llm(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     response = SimpleNamespace(
-        output=[SimpleNamespace(content=[SimpleNamespace(text="Do not deploy at 12:30.")])]
+        output=[
+            SimpleNamespace(
+                content=[
+                    SimpleNamespace(
+                        text=json.dumps({"complete": True, "text": "Do not deploy at 12:30."})
+                    )
+                ]
+            )
+        ],
+        status="completed",
     )
     create = AsyncMock(return_value=response)
     monkeypatch.setattr(
@@ -71,7 +84,9 @@ def llm(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     return SimpleNamespace(responses=SimpleNamespace(create=create))
 
 
-def app_for(store: UserSettingsStore, llm: SimpleNamespace, *, auth: bool = False) -> FastAPI:
+def app_for(
+    store: SqlAlchemyUserPreferencesStore, llm: SimpleNamespace, *, auth: bool = False
+) -> FastAPI:
     app = FastAPI()
     app.include_router(
         voice_input.create_voice_input_router(
@@ -85,13 +100,14 @@ def app_for(store: UserSettingsStore, llm: SimpleNamespace, *, auth: bool = Fals
 
 
 async def test_only_segment_and_saved_list_are_sent(
-    voice_store: UserSettingsStore, llm: SimpleNamespace
+    voice_store: SqlAlchemyUserPreferencesStore, llm: SimpleNamespace
 ) -> None:
-    voice_store.save_voice_input(
+    save_settings(
+        voice_store,
         VoiceInputSettings(
             words="ExampleApp may be heard as example app",
             model="openai/test-cleanup",
-            reasoning={"effort": "none"},
+            reasoning={"effort": "low"},
             thinking={"type": "disabled"},
             timeout=3,
             reasoning_effort="low",
@@ -113,17 +129,17 @@ async def test_only_segment_and_saved_list_are_sent(
     }
     assert len(call["input"]) == 1
     assert call["timeout"] == 3
-    assert call["reasoning"] == {"effort": "none"}
-    assert call["reasoning_effort"] == "low"
+    assert call["reasoning"] == {"effort": "low"}
+    assert "reasoning_effort" not in call
     assert call["thinking"] == {"type": "disabled"}
     assert call["connection_params"] == {"base_url": "https://provider.example/v1"}
 
 
 @pytest.mark.parametrize("settings", [{}, {"model": "openai/test-cleanup", "mode": "off"}])
 async def test_unconfigured_or_off_refuses(
-    voice_store: UserSettingsStore, llm: SimpleNamespace, settings: dict
+    voice_store: SqlAlchemyUserPreferencesStore, llm: SimpleNamespace, settings: dict
 ) -> None:
-    voice_store.save_voice_input(VoiceInputSettings(**settings).model_dump(), user_id=None)
+    save_settings(voice_store, VoiceInputSettings(**settings).model_dump(), user_id=None)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app_for(voice_store, llm)), base_url="http://test"
     ) as client:
@@ -136,10 +152,13 @@ async def test_unconfigured_or_off_refuses(
     "failure,status", [(TimeoutError(), 504), (RuntimeError("provider failed"), 503)]
 )
 async def test_failure_keeps_text_client_side(
-    voice_store: UserSettingsStore, llm: SimpleNamespace, failure: Exception, status: int
+    voice_store: SqlAlchemyUserPreferencesStore,
+    llm: SimpleNamespace,
+    failure: Exception,
+    status: int,
 ) -> None:
-    voice_store.save_voice_input(
-        VoiceInputSettings(model="openai/test-cleanup").model_dump(), user_id=None
+    save_settings(
+        voice_store, VoiceInputSettings(model="openai/test-cleanup").model_dump(), user_id=None
     )
     llm.responses.create.side_effect = failure
     async with httpx.AsyncClient(
@@ -151,10 +170,12 @@ async def test_failure_keeps_text_client_side(
 
 
 async def test_wall_timeout_cancels_the_call(
-    voice_store: UserSettingsStore, llm: SimpleNamespace
+    voice_store: SqlAlchemyUserPreferencesStore, llm: SimpleNamespace
 ) -> None:
-    voice_store.save_voice_input(
-        VoiceInputSettings(model="openai/test-cleanup", timeout=1).model_dump(), user_id=None
+    save_settings(
+        voice_store,
+        VoiceInputSettings(model="openai/test-cleanup", timeout=1).model_dump(),
+        user_id=None,
     )
     cancelled = asyncio.Event()
 
@@ -174,30 +195,18 @@ async def test_wall_timeout_cancels_the_call(
 
 
 async def test_settings_are_authenticated_and_user_scoped(
-    voice_store: UserSettingsStore, llm: SimpleNamespace
+    voice_store: SqlAlchemyUserPreferencesStore, llm: SimpleNamespace
 ) -> None:
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app_for(voice_store, llm, auth=True)),
         base_url="http://test",
     ) as client:
         with pytest.raises(OmnigentError, match="Authentication required"):
-            await client.get("/v1/settings/voice-input")
-        with pytest.raises(OmnigentError, match="Authentication required"):
             await client.post("/v1/dictation/cleanup", json={"text": "raw"})
-        alice = {"X-Forwarded-Email": "alice@example.com"}
-        bob = {"X-Forwarded-Email": "bob@example.com"}
-        saved = await client.put(
-            "/v1/settings/voice-input", headers=alice, json={"words": "personal term"}
-        )
-        assert saved.status_code == 200
-        assert (await client.get("/v1/settings/voice-input", headers=alice)).json()[
-            "words"
-        ] == "personal term"
-        assert (await client.get("/v1/settings/voice-input", headers=bob)).json()["words"] == ""
 
 
 async def test_rejects_surrounding_draft_and_bad_settings(
-    voice_store: UserSettingsStore, llm: SimpleNamespace
+    voice_store: SqlAlchemyUserPreferencesStore, llm: SimpleNamespace
 ) -> None:
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app_for(voice_store, llm)), base_url="http://test"
@@ -205,10 +214,144 @@ async def test_rejects_surrounding_draft_and_bad_settings(
         assert (
             await client.post("/v1/dictation/cleanup", json={"text": "raw", "draft": "typed"})
         ).status_code == 422
-        assert (
-            await client.put("/v1/settings/voice-input", json={"words": "x" * 8001})
-        ).status_code == 422
-        assert (
-            await client.put("/v1/settings/voice-input", json={"timeout": 0})
-        ).status_code == 422
     llm.responses.create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "completion",
+    [
+        {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}},
+        {},
+        {"status": "completed", "incomplete_details": {"reason": "max_output_tokens"}},
+    ],
+)
+async def test_rejects_nonempty_incomplete_actual_client(voice_store, monkeypatch, completion):
+    import respx
+
+    from omnigent.llms import Client
+
+    save_settings(
+        voice_store, VoiceInputSettings(model="openai/test-cleanup").model_dump(), user_id=None
+    )
+    monkeypatch.setattr(
+        voice_input,
+        "_configured_connection",
+        lambda model: (model, {"base_url": "https://provider.example/v1"}),
+    )
+    raw = {
+        "model": "test-cleanup",
+        "output": [
+            {
+                "type": "message",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": json.dumps({"complete": True, "text": "partial words"}),
+                    }
+                ],
+            }
+        ],
+        **completion,
+    }
+    with respx.mock:
+        respx.post("https://provider.example/v1/responses").mock(
+            return_value=httpx.Response(200, json=raw)
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app_for(voice_store, Client())),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/v1/dictation/cleanup", json={"text": "full original words and negation"}
+            )
+    assert response.status_code == 503
+
+
+@pytest.mark.parametrize("provider", ["openai", "groq"])
+@pytest.mark.parametrize("complete", [True, False])
+async def test_actual_client_payload_and_model_completion(
+    voice_store, monkeypatch, provider, complete
+):
+    import respx
+
+    from omnigent.llms import Client
+
+    save_settings(
+        voice_store,
+        VoiceInputSettings(model=f"{provider}/test-cleanup", reasoning_effort="low").model_dump(),
+        user_id=None,
+    )
+    monkeypatch.setattr(
+        voice_input,
+        "_configured_connection",
+        lambda model: (model, {"base_url": "https://provider.example/v1"}),
+    )
+    text = json.dumps({"complete": complete, "text": "all original words kept"})
+    raw = (
+        {
+            "model": "test-cleanup",
+            "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}],
+        }
+        if provider == "openai"
+        else {
+            "model": "test-cleanup",
+            "choices": [{"finish_reason": "stop", "message": {"content": text}}],
+        }
+    )
+    path = "responses" if provider == "openai" else "chat/completions"
+    with respx.mock:
+        upstream = respx.post(f"https://provider.example/v1/{path}").mock(
+            return_value=httpx.Response(200, json=raw)
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app_for(voice_store, Client())),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/v1/dictation/cleanup", json={"text": "all original words kept"}
+            )
+    assert response.status_code == (200 if complete else 503)
+    sent = json.loads(upstream.calls[0].request.content)
+    if provider == "openai":
+        assert sent["reasoning"] == {"effort": "low"}
+        assert "reasoning_effort" not in sent
+    else:
+        assert sent["reasoning_effort"] == "low"
+
+
+@pytest.mark.parametrize("finish", ["length", None, "content_filter"])
+async def test_chat_client_rejects_partial_output(voice_store, monkeypatch, finish):
+    import respx
+
+    from omnigent.llms import Client
+
+    save_settings(
+        voice_store, VoiceInputSettings(model="groq/test-cleanup").model_dump(), user_id=None
+    )
+    monkeypatch.setattr(
+        voice_input,
+        "_configured_connection",
+        lambda model: (model, {"base_url": "https://provider.example/v1"}),
+    )
+    raw = {
+        "model": "test-cleanup",
+        "choices": [
+            {
+                "finish_reason": finish,
+                "message": {"content": json.dumps({"complete": True, "text": "partial words"})},
+            }
+        ],
+    }
+    with respx.mock:
+        respx.post("https://provider.example/v1/chat/completions").mock(
+            return_value=httpx.Response(200, json=raw)
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app_for(voice_store, Client())),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/v1/dictation/cleanup", json={"text": "full original words and negation"}
+            )
+    assert response.status_code == 503

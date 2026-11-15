@@ -7,7 +7,6 @@ Account deletion already removes a user's ``preferences`` rows.
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 from collections.abc import Callable
@@ -81,45 +80,6 @@ class UserSettingsStore:
         return normalize_session_title_instructions(
             value, source="saved session title instructions"
         )
-
-    def get_voice_input(self, *, user_id: str | None) -> dict[str, Any]:
-        """Read a caller's voice preferences without exposing other settings."""
-        from omnigent.server.voice_input import VoiceInputSettings
-
-        owner = RESERVED_USER_LOCAL if user_id is None else user_id
-        with self._session("read_voice_input") as session:
-            raw = session.scalar(
-                select(type_coerce(SqlPreference.value, LargeBinary)).where(
-                    SqlPreference.workspace_id == current_workspace_id(),
-                    SqlPreference.user_id == owner,
-                    SqlPreference.key == "voice_input",
-                )
-            )
-        if raw is not None:
-            try:
-                value = decode(raw, max_decoded_bytes=64000)
-                if value is not None:
-                    return VoiceInputSettings.model_validate_json(value).model_dump()
-            except (ValueError, zstandard.ZstdError):
-                _logger.warning("Stored voice input settings are unreadable")
-        return VoiceInputSettings().model_dump()
-
-    def save_voice_input(self, value: dict[str, Any], *, user_id: str | None) -> dict[str, Any]:
-        """Validate and atomically save voice preferences in the existing settings table."""
-        from omnigent.server.voice_input import VoiceInputSettings
-
-        settings = VoiceInputSettings.model_validate(value).model_dump()
-        encoded = json.dumps(settings, ensure_ascii=False)
-        if len(encoded.encode()) > 60000:
-            raise ValueError("Voice input settings are too large")
-        owner = RESERVED_USER_LOCAL if user_id is None else user_id
-
-        def write(session: Session) -> None:
-            require_active_account(session, user_id)
-            upsert_preference_row(session, user_id=owner, key="voice_input", value=encoded)
-
-        run_write_transaction(self._session_immediate, "save_voice_input", write)
-        return settings
 
     def save_session_title_instructions(
         self, instructions: str | None, *, user_id: str | None

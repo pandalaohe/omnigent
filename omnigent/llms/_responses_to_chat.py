@@ -242,6 +242,7 @@ def chat_response_to_response(
         output=output,
         model=chat_dict["model"],
         usage=usage,
+        status="completed" if choice.get("finish_reason") == "stop" else None,
     )
 
 

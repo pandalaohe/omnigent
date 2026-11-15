@@ -74,6 +74,7 @@ USER_PREFERENCE_NAMESPACES = frozenset(
         "sound_alerts",
         "worktree_defaults",
         "builtin_agent_prompts",
+        "voice_input",
     }
 )
 
@@ -1743,6 +1744,13 @@ def validate_preferences_envelope(envelope: Any) -> PreferencesEnvelope:
         _validate_worktree_archive(settings[WORKTREE_ARCHIVE_NAMESPACE])
     if CHILD_IDLE_NAMESPACE in settings:
         parse_child_idle_settings(settings[CHILD_IDLE_NAMESPACE])
+    if "voice_input" in settings:
+        from omnigent.server.voice_input import VoiceInputSettings
+
+        try:
+            VoiceInputSettings.model_validate(settings["voice_input"])
+        except ValueError as exc:
+            raise UserPreferencesValidationError("Invalid voice input settings") from exc
     from omnigent.server.builtin_agent_prompts import NAMESPACE, validate_prompt_preferences
 
     if NAMESPACE in settings:

@@ -3577,3 +3577,44 @@ def test_usage_context_round_trips_every_saved_level(db_uri: str) -> None:
     store.patch_namespace("alice@example.com", "usage_context", value)
 
     assert store.get("alice@example.com")["settings"]["usage_context"] == value
+
+
+async def test_voice_namespace_persistence_validation_and_isolation(db_uri, tmp_path):
+    app = _preferences_app(db_uri, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        alice = {"X-Test-User": "alice@example.test"}
+        bob = {"X-Test-User": "bob@example.test"}
+        path = "/v1/me/preferences/voice_input"
+        assert (await client.patch(path, json={"value": {"words": "private"}})).status_code == 401
+        saved = await client.patch(
+            path,
+            headers=alice,
+            json={
+                "value": {
+                    "words": "ExampleApp",
+                    "model": "openai/test-cleanup",
+                    "reasoning_effort": "low",
+                }
+            },
+        )
+        assert saved.status_code == 200
+        assert (await client.get("/v1/me", headers=alice)).json()["preferences"]["settings"][
+            "voice_input"
+        ]["words"] == "ExampleApp"
+        assert "voice_input" not in (
+            (await client.get("/v1/me", headers=bob)).json().get("preferences") or {}
+        ).get("settings", {})
+        for value in [
+            {"words": "x" * 8001},
+            {"timeout": 0},
+            {"unexpected": True},
+            {"reasoning": {"effort": "none"}, "reasoning_effort": "low"},
+        ]:
+            assert (
+                await client.patch(path, headers=alice, json={"value": value})
+            ).status_code == 422
+        assert (await client.get("/v1/me", headers=alice)).json()["preferences"]["settings"][
+            "voice_input"
+        ]["words"] == "ExampleApp"

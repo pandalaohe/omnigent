@@ -289,7 +289,6 @@ export const ComposerMicButton = ({
     } catch {
       /* Already stopped. */
     }
-    onVoiceDiscardRef.current?.();
     setIsListening(false);
   }, []);
 
@@ -691,6 +690,12 @@ export const ComposerMicButton = ({
   }, [inputRef, reportError]);
 
   const toggle = useCallback(() => {
+    if (systemDictation && !serverAvailable) {
+      activeTake?.cancel();
+      activeTake = null;
+      if (!questionCard) startMacDictation();
+      return;
+    }
     if (!isListening && !serverBusyRef.current && !transitionRef.current) {
       if (activeTake?.owner !== ownerRef.current) activeTake?.cancel();
       activeTake = { owner: ownerRef.current, cancel: cancelTake };
@@ -745,6 +750,7 @@ export const ComposerMicButton = ({
     startMacDictation,
     toggleServer,
     cancelTake,
+    questionCard,
   ]);
 
   // ⌘⌥V toggles dictation from anywhere — same as clicking the button. Enabled
@@ -800,6 +806,13 @@ export const ComposerMicButton = ({
     return () => window.removeEventListener("keydown", handler, true);
   }, [isListening, toggle, questionCard]);
 
+  if (questionCard && systemDictation) {
+    return (
+      <span role="note" className="text-sm text-muted-foreground">
+        Use system dictation from your keyboard; automatic cleanup is unavailable for this input.
+      </span>
+    );
+  }
   if (!canDictate) return null;
 
   // Stable accessible name with aria-pressed signals toggle state to

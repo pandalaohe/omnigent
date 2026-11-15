@@ -5304,12 +5304,12 @@ def create_app(
                 tags=["projects"],
             )
 
+    app.include_router(
+        create_voice_input_router(user_preferences_store, auth_provider),
+        prefix="/v1",
+        tags=["dictation"],
+    )
     if user_settings_store is not None:
-        app.include_router(
-            create_voice_input_router(user_settings_store, auth_provider),
-            prefix="/v1",
-            tags=["settings"],
-        )
         app.include_router(
             create_user_settings_router(user_settings_store, auth_provider),
             prefix="/v1",

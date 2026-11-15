@@ -1,3 +1,4 @@
+import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { create } from "zustand";
 import { SHIFT_KEY } from "@/components/KeyboardShortcut";
 import type { SkillSummary, SkillsStatus } from "@/lib/types";
@@ -6493,6 +6494,50 @@ describe("Composer reply quotes", () => {
     const tooltip = await screen.findByRole("tooltip");
     expect(tooltip).toHaveTextContent("Interrupt");
     expect(tooltipKeys(tooltip)).toEqual(["Esc"]);
+  });
+
+  it("preserves dictated and subsequently typed text when the microphone moves to a question", () => {
+    const recognizers: Record<string, (event?: unknown) => void>[] = [];
+    vi.stubGlobal(
+      "SpeechRecognition",
+      class {
+        lang = "en-US";
+        continuous = false;
+        interimResults = false;
+        handlers: Record<string, (event?: unknown) => void> = {};
+        constructor() {
+          recognizers.push(this.handlers);
+        }
+        start() {
+          this.handlers.start?.();
+        }
+        stop() {
+          this.handlers.end?.();
+        }
+        addEventListener(type: string, handler: (event?: unknown) => void) {
+          this.handlers[type] = handler;
+        }
+        removeEventListener() {}
+      },
+    );
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "typed prefix " } });
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() =>
+      recognizers[0]?.result?.({
+        resultIndex: 0,
+        results: [{ isFinal: true, 0: { transcript: "dictated words" } }],
+      }),
+    );
+    const dictated = textarea().value;
+    expect(dictated).toContain("dictated words");
+    fireEvent.change(textarea(), { target: { value: dictated + " newer manual edit" } });
+    renderWithTooltips(<ComposerMicButton questionCard onTranscript={vi.fn()} />);
+    fireEvent.click(screen.getAllByRole("button", { name: "Voice dictation" }).at(-1)!);
+    expect(textarea()).toHaveValue(dictated + " newer manual edit");
   });
 
   it("drops Esc from the Interrupt tooltip while dictation listens, which takes Esc", async () => {
