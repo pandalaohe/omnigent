@@ -2652,6 +2652,55 @@
         "title": "ChildSessionSummary",
         "type": "object"
       },
+      "ChoiceConversionProof": {
+        "additionalProperties": false,
+        "properties": {
+          "mapping_fingerprint": {
+            "minLength": 1,
+            "title": "Mapping Fingerprint",
+            "type": "string"
+          },
+          "new_rule_ids": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "New Rule Ids",
+            "type": "array"
+          },
+          "replaced_paths": {
+            "items": {
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "format": "int64",
+                    "type": "integer"
+                  }
+                ]
+              },
+              "type": "array"
+            },
+            "minItems": 1,
+            "title": "Replaced Paths",
+            "type": "array"
+          },
+          "source_revision": {
+            "title": "Source Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_revision",
+          "mapping_fingerprint",
+          "replaced_paths",
+          "new_rule_ids"
+        ],
+        "title": "ChoiceConversionProof",
+        "type": "object"
+      },
       "ChoicePreview": {
         "additionalProperties": false,
         "properties": {
@@ -2665,6 +2714,21 @@
               }
             ],
             "title": "Caller Id"
+          },
+          "candidate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PreviewCandidate"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "conversion": {
+            "default": false,
+            "title": "Conversion",
+            "type": "boolean"
           },
           "differ_from": {
             "anyOf": [
@@ -2686,7 +2750,22 @@
             "type": "array"
           },
           "host_id": {
+            "minLength": 1,
             "title": "Host Id",
+            "type": "string"
+          },
+          "include_running": {
+            "default": false,
+            "title": "Include Running",
+            "type": "boolean"
+          },
+          "mode": {
+            "default": "selection",
+            "enum": [
+              "selection",
+              "candidate"
+            ],
+            "title": "Mode",
             "type": "string"
           },
           "pin": {
@@ -2699,6 +2778,18 @@
               }
             ],
             "title": "Pin"
+          },
+          "settings": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Settings"
           },
           "work_type": {
             "anyOf": [
@@ -2716,6 +2807,23 @@
           "host_id"
         ],
         "title": "ChoicePreview",
+        "type": "object"
+      },
+      "CleanupRequest": {
+        "additionalProperties": false,
+        "description": "Only a completed dictated segment, never the surrounding draft.",
+        "properties": {
+          "text": {
+            "maxLength": 12000,
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "CleanupRequest",
         "type": "object"
       },
       "ClearCodexGoalResponse": {
@@ -8292,6 +8400,33 @@
         "title": "PresenceViewer",
         "type": "object"
       },
+      "PreviewCandidate": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "minLength": 1,
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          }
+        },
+        "required": [
+          "agent_id"
+        ],
+        "title": "PreviewCandidate",
+        "type": "object"
+      },
       "PriceEstimate": {
         "additionalProperties": false,
         "properties": {
@@ -11156,6 +11291,16 @@
       "SessionChoiceUpdate": {
         "additionalProperties": false,
         "properties": {
+          "conversion_proof": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChoiceConversionProof"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "expected_revision": {
             "title": "Expected Revision",
             "type": "string"
@@ -19713,7 +19858,8 @@
                 "sidebar_layout",
                 "sound_alerts",
                 "worktree_defaults",
-                "builtin_agent_prompts"
+                "builtin_agent_prompts",
+                "voice_input"
               ]
             },
             "title": "Settings",
@@ -21348,6 +21494,51 @@
         "summary": "Get Custom Agent Contents",
         "tags": [
           "custom-agents"
+        ]
+      }
+    },
+    "/v1/dictation/cleanup": {
+      "post": {
+        "operationId": "cleanup_v1_dictation_cleanup_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CleanupRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Cleanup V1 Dictation Cleanup Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cleanup",
+        "tags": [
+          "dictation"
         ]
       }
     },
@@ -24557,6 +24748,7 @@
                         "sidebar_layout",
                         "sound_alerts",
                         "usage_context",
+                        "voice_input",
                         "worktree_archive",
                         "worktree_defaults",
                         "worktree_location"
@@ -24730,7 +24922,8 @@
                 "sidebar_layout",
                 "sound_alerts",
                 "worktree_defaults",
-                "builtin_agent_prompts"
+                "builtin_agent_prompts",
+                "voice_input"
               ],
               "title": "Namespace",
               "type": "string"
@@ -25673,6 +25866,38 @@
                 }
               ],
               "title": "Source"
+            }
+          },
+          {
+            "in": "query",
+            "name": "uid",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Uid"
+            }
+          },
+          {
+            "in": "query",
+            "name": "changed_after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Changed After"
             }
           },
           {
@@ -29989,6 +30214,54 @@
               "title": "Running",
               "type": "boolean"
             }
+          },
+          {
+            "in": "query",
+            "name": "host_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Host Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "model",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Model"
+            }
           }
         ],
         "responses": {
@@ -30787,6 +31060,117 @@
           }
         },
         "summary": "Speed"
+      }
+    },
+    "/v1/model-connections": {
+      "get": {
+        "operationId": "listing_v1_model_connections_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Listing",
+        "tags": [
+          "model connections"
+        ]
+      }
+    },
+    "/v1/model-connections/test": {
+      "post": {
+        "operationId": "probe_v1_model_connections_test_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Probe",
+        "tags": [
+          "model connections"
+        ]
+      }
+    },
+    "/v1/model-connections/{name}": {
+      "delete": {
+        "operationId": "delete_v1_model_connections__name__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete",
+        "tags": [
+          "model connections"
+        ]
+      },
+      "put": {
+        "operationId": "put_v1_model_connections__name__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put",
+        "tags": [
+          "model connections"
+        ]
       }
     },
     "/v1/policies": {
