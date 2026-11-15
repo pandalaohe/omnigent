@@ -8,7 +8,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 class VoiceInputSettings(BaseModel):
     """User-scoped text preferences; credentials stay in the server LLM config."""
 
-    model_config = ConfigDict(extra="forbid")
+    # Tolerate keys written by a newer build: a rollback must not brick the
+    # user's preference writes, and unknown keys stay out of this model.
+    model_config = ConfigDict(extra="ignore")
 
     words: str = Field(default="", max_length=8000)
     mode: Literal["automatic", "manual", "off"] = "automatic"

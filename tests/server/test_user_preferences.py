@@ -3609,12 +3609,18 @@ async def test_voice_namespace_persistence_validation_and_isolation(db_uri, tmp_
         for value in [
             {"words": "x" * 8001},
             {"timeout": 0},
-            {"unexpected": True},
             {"reasoning": {"effort": "none"}, "reasoning_effort": "low"},
         ]:
             assert (
                 await client.patch(path, headers=alice, json={"value": value})
             ).status_code == 422
+        # A key written by a newer build must not brick this user's writes.
+        tolerated = await client.patch(
+            path,
+            headers=alice,
+            json={"value": {"words": "ExampleApp", "recognition_source": "hosted"}},
+        )
+        assert tolerated.status_code == 200
         assert (await client.get("/v1/me", headers=alice)).json()["preferences"]["settings"][
             "voice_input"
         ]["words"] == "ExampleApp"

@@ -135,6 +135,22 @@ async def test_only_segment_and_saved_list_are_sent(
     assert call["connection_params"] == {"base_url": "https://provider.example/v1"}
 
 
+def test_settings_ignore_keys_written_by_a_newer_build(
+    voice_store: SqlAlchemyUserPreferencesStore,
+) -> None:
+    """A rollback must read settings a newer build stored, not reject the user."""
+    stored = {
+        "words": "ExampleApp",
+        "model": "openai/test-cleanup",
+        "recognition_source": "hosted",
+    }
+    settings = VoiceInputSettings.model_validate(stored)
+    assert settings.words == "ExampleApp"
+    assert "recognition_source" not in settings.model_dump()
+    saved = voice_store.patch_namespace("local", "voice_input", stored)
+    assert saved["settings"]["voice_input"] == stored
+
+
 @pytest.mark.parametrize("settings", [{}, {"model": "openai/test-cleanup", "mode": "off"}])
 async def test_unconfigured_or_off_refuses(
     voice_store: SqlAlchemyUserPreferencesStore, llm: SimpleNamespace, settings: dict
