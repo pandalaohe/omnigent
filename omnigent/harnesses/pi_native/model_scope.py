@@ -103,6 +103,7 @@ def _scoped_indices(
         text=True,
         timeout=3,
         check=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     indices = json.loads(result.stdout)
     if not isinstance(indices, list) or any(

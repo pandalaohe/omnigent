@@ -830,6 +830,100 @@ async def test_handle_model_options_serves_the_pi_harness(
     )
 
 
+@pytest.mark.parametrize("harness", ["pi", "pi-native"])
+@pytest.mark.parametrize("rows", [[], [{"id": "gateway/kimi-model"}]])
+async def test_selection_reads_stored_pi_inventory_without_probing(
+    harness: str, rows: list[dict[str, object]]
+) -> None:
+    from omnigent.models.model_catalog_store import write_catalog
+
+    write_catalog(harness, "host-preview", rows)
+    host = _make_host_process()
+
+    with (
+        patch("subprocess.Popen", side_effect=AssertionError("must not spawn")),
+        patch("asyncio.create_subprocess_exec", side_effect=AssertionError("must not spawn")),
+        patch("httpx.Client.send", side_effect=AssertionError("must not request")),
+        patch("httpx.AsyncClient.send", side_effect=AssertionError("must not request")),
+    ):
+        request = HostModelOptionsFrame(request_id="selection", harness=harness, refresh="cached")
+        result = await host._handle_model_options(request)
+        assert result.status == "ok"
+        assert result.models == rows
+
+
+@pytest.mark.parametrize("harness", ["pi", "pi-native"])
+@pytest.mark.parametrize("stale", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+async def test_selection_refreshes_missing_pi_catalog_once(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    harness: str,
+    stale: bool,
+    fails: bool,
+) -> None:
+    from omnigent.harnesses.pi_native import credentials
+    from omnigent.models import model_catalog_store as store
+
+    rows = [{"id": "gateway/kimi-model"}]
+    if stale:
+        store.write_catalog(harness, "host-preview", [{"id": "old-model"}])
+        path = store.catalog_path(harness, "host-preview")
+        stamp = time.time() - store.CATALOG_STALE_AFTER_S - 1
+        os.utime(path, (stamp, stamp))
+    probe = Mock(side_effect=RuntimeError("unavailable")) if fails else Mock(return_value=rows)
+    monkeypatch.setattr(credentials, "pi_native_model_options", probe)
+    monkeypatch.setattr(
+        "omnigent.host.connect._model_configuration_source_for_harness", lambda harness: None
+    )
+    host = _make_host_process()
+    request = HostModelOptionsFrame(request_id="selection", harness=harness, refresh="cached")
+    first = await host._handle_model_options(request)
+    task = store._inflight[(harness, "host-preview")]
+    second = await host._handle_model_options(request)
+    assert first.status == second.status == "failed"
+    assert first.models == second.models == []
+    assert store._inflight[(harness, "host-preview")] is task
+    probe.assert_not_called()
+    await task
+    probe.assert_called_once()
+    if fails:
+        assert "refresh failed" in caplog.text
+        assert store.read_catalog(harness, "host-preview") == (
+            [{"id": "old-model"}] if stale else None
+        )
+    else:
+        assert store.read_catalog(harness, "host-preview") == rows
+        assert not store.catalog_is_stale(harness, "host-preview")
+        assert (await host._handle_model_options(request)).models == rows
+
+
+@pytest.mark.parametrize("harness", ["pi", "pi-native"])
+async def test_pi_catalog_stores_the_enabled_models_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    from omnigent.harnesses.pi_native import credentials
+    from omnigent.models.model_catalog_store import read_catalog
+    from tests._helpers.pi_native import seed_pi_own_login_catalog
+
+    seed_pi_own_login_catalog(tmp_path, "gateway", ["kimi-model", "other-model"])
+    (tmp_path / "settings.json").write_text(json.dumps({"enabledModels": ["gateway/kimi-model"]}))
+    monkeypatch.setattr(credentials, "global_pi_agent_dir", lambda: tmp_path)
+    monkeypatch.setattr(credentials, "resolve_pi_native_provider", lambda: None)
+    scope = Mock(side_effect=lambda patterns, models: models[:1])
+    monkeypatch.setattr(credentials, "scope_models", scope)
+    monkeypatch.setattr(
+        "omnigent.host.connect._model_configuration_source_for_harness", lambda harness: None
+    )
+    result = await _make_host_process()._handle_model_options(
+        HostModelOptionsFrame(request_id="refresh", harness=harness)
+    )
+    assert result.status == "ok"
+    assert [row["id"] for row in result.models] == ["gateway/kimi-model"]
+    assert scope.call_args.args[0] == ["gateway/kimi-model"]
+    assert read_catalog(harness, "host-preview") == result.models
+
+
 @pytest.mark.parametrize("harness", ["devin-native", "native-devin", "devin"])
 async def test_handle_model_options_missing_devin_is_quiet(
     monkeypatch: pytest.MonkeyPatch,
