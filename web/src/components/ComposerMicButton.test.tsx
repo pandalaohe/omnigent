@@ -24,13 +24,17 @@ import type { DictationSessionEvents } from "@/lib/dictation";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { AskUserQuestionForm } from "./blocks/AskUserQuestionForm";
 import { useChatStore } from "@/store/chatStore";
-import { useRef } from "react";
+import { useRef, useState } from "react";
+import { QuestionDictationControls } from "./QuestionDictationControls";
+import { useComposerVoiceCleanup } from "@/hooks/useComposerVoiceCleanup";
+import { useDictationInsert } from "@/hooks/useDictationInsert";
 import * as voiceApi from "@/lib/voiceInputApi";
 import { ComposerMicButton } from "./ComposerMicButton";
 
 vi.mock("@/lib/voiceInputApi", async (original) => ({
   ...(await original<typeof voiceApi>()),
   getVoiceInputSettings: vi.fn(),
+  cleanupDictation: vi.fn(),
 }));
 /** Hovers the mic button and returns the tooltip it opens. */
 async function hoverMicTooltip(button: HTMLElement): Promise<HTMLElement> {
@@ -126,6 +130,11 @@ function resultEvent(transcript: string) {
     resultIndex: 0,
     results: { length: 1, 0: { length: 1, isFinal: true, 0: { transcript } } },
   };
+}
+
+async function finishBrowserTake() {
+  fireEvent.keyDown(document.body, { key: "Enter" });
+  await act(async () => handlers.end?.({}));
 }
 
 beforeEach(() => {
@@ -236,13 +245,15 @@ describe("ComposerMicButton", () => {
     expect(stopSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("delivers the trimmed final transcript via onTranscript", () => {
+  it("delivers the trimmed final transcript via onTranscript after stop", async () => {
     const onTranscript = vi.fn();
     render(<ComposerMicButton onTranscript={onTranscript} />);
     fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
     act(() => handlers.start?.({}));
 
     act(() => handlers.result?.(resultEvent("  hello world  ")));
+    expect(onTranscript).not.toHaveBeenCalled();
+    await finishBrowserTake();
     expect(onTranscript).toHaveBeenCalledWith("hello world");
   });
 
@@ -260,6 +271,7 @@ describe("ComposerMicButton", () => {
     await act(async () => handlers.result?.(resultEvent("你好世界今天怎么样")));
 
     expect(punctuationMock).toHaveBeenCalledWith("你好世界今天怎么样");
+    await finishBrowserTake();
     expect(onTranscript).toHaveBeenCalledWith("你好，世界！今天怎么样？");
   });
 
@@ -292,7 +304,9 @@ describe("ComposerMicButton", () => {
     await act(async () => resolveFirst?.("第一句。"));
 
     expect(punctuationMock).toHaveBeenNthCalledWith(2, "第二句");
-    expect(onTranscript.mock.calls).toEqual([["第一句。"], ["第二句。"]]);
+    expect(onTranscript).not.toHaveBeenCalled();
+    await finishBrowserTake();
+    expect(onTranscript.mock.calls).toEqual([["第一句。 第二句。"]]);
   });
 
   it("inserts the recognized words when punctuation restoration fails", async () => {
@@ -309,6 +323,7 @@ describe("ComposerMicButton", () => {
     act(() => handlers.start?.({}));
 
     await act(async () => handlers.result?.(resultEvent("保留原文")));
+    await finishBrowserTake();
 
     expect(onTranscript).toHaveBeenCalledWith("保留原文");
   });
@@ -640,7 +655,7 @@ describe("ComposerMicButton", () => {
       return { ...view, button };
     }
 
-    it("restarts after a pause and keeps listening as one take", () => {
+    it("restarts after a pause and keeps listening as one take", async () => {
       const onTranscript = vi.fn();
       const onVoiceStart = vi.fn();
       const { button } = startTake({ onTranscript, onVoiceStart });
@@ -658,10 +673,12 @@ describe("ComposerMicButton", () => {
       now += 2_000;
       act(() => handlers.result?.(resultEvent("second phrase")));
 
-      expect(onTranscript.mock.calls).toEqual([["first phrase"], ["second phrase"]]);
+      expect(onTranscript).not.toHaveBeenCalled();
       // A restart continues the take, so the Esc snapshot is taken only once.
       expect(onVoiceStart).toHaveBeenCalledTimes(1);
       expect(button).toHaveAttribute("aria-pressed", "true");
+      await finishBrowserTake();
+      expect(onTranscript.mock.calls).toEqual([["first phrase second phrase"]]);
     });
 
     it("restarts through a no-speech timeout without surfacing an error", async () => {
@@ -988,17 +1005,19 @@ describe("ComposerMicButton (server dictation)", () => {
     expect(button).toHaveAttribute("aria-pressed", "true");
   });
 
-  it("routes partials to onInterim and finals to onTranscript", async () => {
+  it("buffers partials and finals until the whole take ends", async () => {
     const onTranscript = vi.fn();
     const onInterim = vi.fn();
     renderServerMode({ onTranscript, onInterim });
     await clickMic();
 
     act(() => sessionEvents?.onPartial("hello wor"));
-    expect(onInterim).toHaveBeenCalledWith("hello wor");
+    expect(onInterim).not.toHaveBeenCalled();
     expect(onTranscript).not.toHaveBeenCalled();
 
     act(() => sessionEvents?.onFinal("Hello, world."));
+    expect(onTranscript).not.toHaveBeenCalled();
+    await clickMic();
     expect(onTranscript).toHaveBeenCalledWith("Hello, world.");
   });
 
@@ -1045,7 +1064,7 @@ describe("ComposerMicButton (server dictation)", () => {
     renderServerMode({ onInterim });
     await clickMic();
 
-    act(() => sessionEvents?.onError("dictation failed"));
+    await act(async () => sessionEvents?.onError("dictation failed"));
     const button = screen.getByRole("button", { name: "Voice dictation" });
     expect(button).toHaveAttribute("aria-pressed", "false");
     expect(await hoverMicTooltip(button)).toHaveTextContent(
@@ -1066,7 +1085,7 @@ describe("ComposerMicButton (server dictation)", () => {
     act(() => sessionEvents?.onPartial("half a sentence"));
     onInterim.mockClear();
 
-    act(() => sessionEvents?.onError("dictation failed"));
+    await act(async () => sessionEvents?.onError("dictation failed"));
     // The partial is pinned as a final rather than blanked, so the words survive.
     expect(onTranscript).toHaveBeenCalledWith("half a sentence");
     expect(onInterim).not.toHaveBeenCalledWith("");
@@ -1093,7 +1112,7 @@ describe("ComposerMicButton (server dictation)", () => {
     expect(button).toHaveAttribute("aria-pressed", "true");
     expect(await hoverMicTooltip(button)).toHaveTextContent("Voice dictation");
     act(() => sessionEvents?.onPartial("via server"));
-    expect(onInterim).toHaveBeenCalledWith("via server");
+    expect(onInterim).not.toHaveBeenCalled();
 
     // Stale events from the dead recognizer must not clobber the live
     // server take's state (Chrome fires "end" after a failed start).
@@ -1154,15 +1173,13 @@ describe("ComposerMicButton (server dictation)", () => {
       await act(async () => resolveHandshake({ stop: sessionStopMock, cancel: sessionCancelMock }));
       await act(async () => sessionEvents?.onFinal("服务器后半句。"));
 
-      expect(onTranscript.mock.calls).toEqual([["浏览器前半句。"], ["服务器后半句。"]]);
+      expect(onTranscript).not.toHaveBeenCalled();
       expect(onVoiceStart).toHaveBeenCalledTimes(1);
       expect(onVoiceEnd).not.toHaveBeenCalled();
       await clickMic();
       expect(onVoiceEnd).toHaveBeenCalledTimes(1);
       expect(onVoiceEnd.mock.results[0]?.value).toEqual([
-        "浏览器前半句。",
-        "服务器后半句。",
-        "最后片段。",
+        "浏览器前半句。 服务器后半句。 最后片段。",
       ]);
     },
   );
@@ -1480,8 +1497,109 @@ it("starts a third-party take with built-in recognition unavailable and keeps fi
   await act(async () => fireEvent.click(screen.getByRole("button", { name: "Voice dictation" })));
   expect(sessionStartMock).toHaveBeenCalledOnce();
   act(() => sessionEvents?.onFinal("A.", { raw: "a", cleaned: true }));
-  expect(onTranscript).toHaveBeenCalledWith("A.", { raw: "a", cleaned: true, source: "third" });
+  expect(onTranscript).not.toHaveBeenCalled();
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Voice dictation" })));
+  expect(onTranscript).toHaveBeenCalledWith("A.", {
+    raw: "a",
+    cleaned: true,
+    cleanupHandled: true,
+  });
 });
+
+it.each([false, true])(
+  "cleans the entire take on the shared mic path (question card: %s)",
+  async (questionCard) => {
+    vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+      ...voiceApi.defaultVoiceInputSettings,
+      model: "cleanup-model",
+    });
+    vi.mocked(voiceApi.cleanupDictation).mockResolvedValue({ text: "Whole take, including tail." });
+    const onTranscript = vi.fn();
+    const onVoiceEnd = vi.fn();
+    render(
+      <ComposerMicButton
+        questionCard={questionCard}
+        onTranscript={onTranscript}
+        onVoiceEnd={onVoiceEnd}
+      />,
+    );
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => handlers.start?.({}));
+    act(() => handlers.result?.(resultEvent("whole take")));
+    expect(onTranscript).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    // Web Speech may return its last words after stop(), before end.
+    act(() => handlers.result?.(resultEvent("including tail")));
+    await act(async () => handlers.end?.({}));
+    expect(voiceApi.cleanupDictation).toHaveBeenCalledWith(
+      "whole take including tail",
+      expect.any(AbortSignal),
+    );
+    expect(onTranscript).toHaveBeenCalledExactlyOnceWith("Whole take, including tail.", {
+      raw: "whole take including tail",
+      cleaned: true,
+      cleanupHandled: true,
+    });
+    expect(onVoiceEnd).toHaveBeenCalledOnce();
+  },
+);
+
+it("keeps the complete original on cleanup failure without asking insertion adapters to retry", async () => {
+  vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+    ...voiceApi.defaultVoiceInputSettings,
+    model: "cleanup-model",
+  });
+  vi.mocked(voiceApi.cleanupDictation).mockRejectedValue(new Error("unavailable"));
+  const onTranscript = vi.fn();
+  render(<ComposerMicButton onTranscript={onTranscript} />);
+  await act(async () => {});
+  fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+  act(() => handlers.start?.({}));
+  act(() => handlers.result?.(resultEvent("keep all words")));
+  await finishBrowserTake();
+  expect(onTranscript).toHaveBeenCalledExactlyOnceWith("keep all words", {
+    raw: "keep all words",
+    cleaned: false,
+    cleanupHandled: true,
+  });
+  expect(showToastMock).toHaveBeenCalledWith("Cleanup unavailable; original kept.");
+});
+
+it.each(["unmount", "discard", "new take"])(
+  "rejects late whole-take cleanup after %s",
+  async (change) => {
+    vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+      ...voiceApi.defaultVoiceInputSettings,
+      model: "cleanup-model",
+    });
+    let resolve!: (value: { text: string }) => void;
+    vi.mocked(voiceApi.cleanupDictation).mockReturnValue(
+      new Promise((done) => {
+        resolve = done;
+      }),
+    );
+    const onTranscript = vi.fn();
+    const view = render(<ComposerMicButton onTranscript={onTranscript} />);
+    await act(async () => {});
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+    fireEvent.click(button);
+    act(() => handlers.start?.({}));
+    act(() => handlers.result?.(resultEvent("old take")));
+    if (change === "discard") {
+      fireEvent.keyDown(window, { key: "Escape" });
+      await act(async () => handlers.end?.({}));
+      expect(voiceApi.cleanupDictation).not.toHaveBeenCalled();
+      return;
+    }
+    await finishBrowserTake();
+    expect(voiceApi.cleanupDictation).toHaveBeenCalledOnce();
+    if (change === "unmount") view.unmount();
+    else fireEvent.click(button);
+    await act(async () => resolve({ text: "late cleanup" }));
+    expect(onTranscript).not.toHaveBeenCalled();
+  },
+);
 
 it("falls back from third-party to browser once, reports lost phrases and avoids a retry loop", async () => {
   vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
@@ -1507,8 +1625,184 @@ it("falls back from third-party to browser once, reports lost phrases and avoids
   expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("2 phrase(s) (~1.2 s)"));
   act(() => handlers.start?.({}));
   act(() => handlers.result?.(resultEvent("browser words")));
-  expect(onTranscript).toHaveBeenCalledWith("browser words");
+  expect(onTranscript).not.toHaveBeenCalled();
   expect(onVoiceStart).toHaveBeenCalledOnce();
-  act(() => handlers.error?.({ error: "network" }));
+  await act(async () => handlers.error?.({ error: "network" }));
+  expect(onTranscript).toHaveBeenCalledWith("browser words");
   expect(sessionStartMock).toHaveBeenCalledOnce();
 });
+
+it.each([false, true])("preserves one-step ownership with browser suffix: %s", async (fallback) => {
+  vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+    ...voiceApi.defaultVoiceInputSettings,
+    speech_source: "third",
+    speech_method: "chat_audio",
+    model: "cleanup-model",
+  });
+  vi.mocked(voiceApi.cleanupDictation).mockResolvedValue({ text: "Browser suffix." });
+  const onTranscript = vi.fn();
+  render(<ComposerMicButton onTranscript={onTranscript} />);
+  await act(async () => {});
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Voice dictation" })));
+  act(() =>
+    sessionEvents?.onFinal(fallback ? "Accepted prefix." : "raw fallback", {
+      raw: "raw fallback",
+      cleaned: fallback,
+    }),
+  );
+  if (fallback) {
+    act(() => sessionEvents?.onError("failed", { code: "third_party_failed" }));
+    act(() => handlers.start?.({}));
+    act(() => handlers.result?.(resultEvent("browser suffix")));
+    await finishBrowserTake();
+    expect(voiceApi.cleanupDictation).toHaveBeenCalledExactlyOnceWith(
+      "browser suffix",
+      expect.any(AbortSignal),
+    );
+    expect(onTranscript).toHaveBeenCalledWith(
+      "Accepted prefix. Browser suffix.",
+      expect.objectContaining({ cleanupHandled: true }),
+    );
+  } else {
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Voice dictation" })));
+    expect(voiceApi.cleanupDictation).not.toHaveBeenCalled();
+    expect(onTranscript).toHaveBeenCalledWith(
+      "raw fallback",
+      expect.objectContaining({ cleanupHandled: true }),
+    );
+  }
+});
+
+function QuestionVoiceAnswer() {
+  const [text, setText] = useState("");
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const revision = useRef(0);
+  return (
+    <>
+      <textarea
+        aria-label="Answer"
+        ref={inputRef}
+        value={text}
+        onChange={(e) => {
+          revision.current++;
+          setText(e.target.value);
+        }}
+      />
+      <QuestionDictationControls
+        inputRef={inputRef}
+        getText={() => text}
+        getRevision={() => revision.current}
+        getSelection={() => ({
+          start: inputRef.current?.selectionStart ?? 0,
+          end: inputRef.current?.selectionEnd ?? 0,
+        })}
+        onChange={(value) => {
+          revision.current++;
+          setText(value);
+        }}
+      />
+    </>
+  );
+}
+
+it.each(["edit", "failure", "success"])(
+  "preserves the real question take during cleanup: %s",
+  async (scenario) => {
+    vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+      ...voiceApi.defaultVoiceInputSettings,
+      model: "cleanup-model",
+    });
+    let resolve!: (value: { text: string }) => void;
+    let reject!: (reason: Error) => void;
+    vi.mocked(voiceApi.cleanupDictation).mockReturnValue(
+      new Promise((yes, no) => {
+        resolve = yes;
+        reject = no;
+      }),
+    );
+    render(<QuestionVoiceAnswer />);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => handlers.start?.({}));
+    act(() => handlers.result?.(resultEvent("spoken original")));
+    await finishBrowserTake();
+    const answer = screen.getByRole("textbox", { name: "Answer" });
+    if (scenario !== "success")
+      fireEvent.change(answer, {
+        target: { value: (answer as HTMLTextAreaElement).value + " typed" },
+      });
+    await act(async () => {
+      if (scenario === "failure") reject(new Error("unavailable"));
+      else resolve({ text: "Edited voice." });
+    });
+    expect(answer).toHaveValue(scenario === "success" ? "Edited voice." : "spoken original typed");
+    expect(voiceApi.cleanupDictation).toHaveBeenCalledOnce();
+  },
+);
+
+function RegionVoiceComposer() {
+  const [region, setRegion] = useState(0);
+  const [values, setValues] = useState(["", ""]);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const voice = useComposerVoiceCleanup(
+    values[region],
+    (value) => setValues((current) => current.map((v, i) => (i === region ? value : v))),
+    inputRef,
+    String(region),
+  );
+  const dictation = useDictationInsert(values[region], voice.produce, inputRef);
+  return (
+    <>
+      {["first", "second"].map((id, i) => (
+        <textarea
+          key={id}
+          aria-label={`Region ${i}`}
+          value={values[i]}
+          readOnly
+          ref={(node) => {
+            if (i === region) inputRef.current = node;
+          }}
+          onFocus={() => setRegion(i)}
+        />
+      ))}
+      <ComposerMicButton
+        inputRef={inputRef}
+        onVoiceStart={voice.begin}
+        onVoiceEnd={() => void voice.end()}
+        onCleanup={voice.replaceFinal}
+        onTranscript={(text, meta) => {
+          voice.record(text, meta);
+          dictation.appendFinal(text);
+        }}
+      />
+    </>
+  );
+}
+
+it.each([false, true])(
+  "keeps cleanup bound to its composer region (switch: %s)",
+  async (switchRegion) => {
+    vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+      ...voiceApi.defaultVoiceInputSettings,
+      model: "cleanup-model",
+    });
+    let resolve!: (value: { text: string }) => void;
+    vi.mocked(voiceApi.cleanupDictation).mockReturnValue(
+      new Promise((done) => {
+        resolve = done;
+      }),
+    );
+    render(<RegionVoiceComposer />);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => handlers.start?.({}));
+    act(() => handlers.result?.(resultEvent("region original")));
+    await finishBrowserTake();
+    if (switchRegion) fireEvent.focus(screen.getByRole("textbox", { name: "Region 1" }));
+    await act(async () => resolve({ text: "Cleaned region." }));
+    expect(screen.getByRole("textbox", { name: "Region 0" })).toHaveValue(
+      switchRegion ? "region original" : "Cleaned region.",
+    );
+    expect(screen.getByRole("textbox", { name: "Region 1" })).toHaveValue("");
+  },
+);

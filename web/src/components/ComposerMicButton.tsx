@@ -6,13 +6,18 @@ import { showToast } from "@/components/ui/toast";
 import { isInsideQuestionCard } from "@/hooks/useQuestionCardHotkeys";
 import { useVoiceDictationHotkey, VOICE_DICTATION_KEYS } from "@/hooks/useVoiceDictationHotkey";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { getVoiceInputSettings, VOICE_INPUT_CHANGED_EVENT } from "@/lib/voiceInputApi";
+import {
+  cleanupDictation,
+  getVoiceInputSettings,
+  VOICE_INPUT_CHANGED_EVENT,
+} from "@/lib/voiceInputApi";
 import type { FinalMeta } from "@/lib/dictation";
 import { DictationBusyError, DictationSession, restoreDictationPunctuation } from "@/lib/dictation";
 import { isElectronShell, startSystemDictation, supportsSystemDictation } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { Loader2Icon, MicIcon, SquareIcon } from "lucide-react";
 import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 
 // Local-only types; speech-input.tsx already augments Window globally.
 interface SpeechRecognitionLike {
@@ -85,21 +90,16 @@ let activeTake: { owner: symbol; cancel: () => void } | null = null;
 export interface ComposerMicButtonProps {
   /** Question-card keys belong to this take while it is active. */
   questionCard?: boolean;
-  /** Runs after the last final transcript (including punctuation) was delivered. */
+  /** Runs after the complete take (including cleanup) was delivered. */
   onVoiceEnd?: () => void;
+  /** Guarded replacement of an original already inserted when listening ended. */
+  onCleanup?: (original: string, text: string) => void;
   onTranscript: (
     text: string,
     meta?: FinalMeta & { source?: "browser" | "server" | "third" },
   ) => void;
   className?: string;
-  /**
-   * Streaming partial transcripts (server dictation only): called with the
-   * revisable in-progress utterance as it forms, and with "" when the take
-   * ends without finalizing it. Utterances that do finalize arrive via
-   * onTranscript, which supersedes the pending interim. When absent, the
-   * server path still works but only finals are inserted — the same
-   * behavior the Web Speech path has always had.
-   */
+  /** Clears an older interim insertion on stop; live partials stay buffered. */
   onInterim?: (text: string) => void;
   disabled?: boolean;
   lang?: string;
@@ -139,6 +139,7 @@ export const ComposerMicButton = ({
   inputRef,
   questionCard = false,
   onVoiceEnd,
+  onCleanup,
 }: ComposerMicButtonProps) => {
   // Web Speech is primary wherever its constructor exists; a take that dies with
   // "network" falls back to the server for that take only (see handleError).
@@ -149,12 +150,19 @@ export const ComposerMicButton = ({
   const [systemDictationBridge] = useState(supportsSystemDictation);
   const serverInfo = useServerInfo();
   const [speechSource, setSpeechSource] = useState("browser");
+  const cleanupEnabledRef = useRef(false);
+  const oneStepRef = useRef(false);
   useEffect(() => {
     let alive = true;
     const refresh = () => {
       void getVoiceInputSettings()
         .then((settings) => {
-          if (alive) setSpeechSource(settings.speech_source ?? "browser");
+          if (alive) {
+            setSpeechSource(settings.speech_source ?? "browser");
+            cleanupEnabledRef.current = settings.mode !== "off" && !!settings.model.trim();
+            oneStepRef.current =
+              settings.speech_source === "third" && settings.speech_method === "chat_audio";
+          }
         })
         .catch(() => {});
     };
@@ -194,6 +202,14 @@ export const ComposerMicButton = ({
   // Refs so handlers aren't re-attached on every parent re-render.
   const onTranscriptRef = useRef(onTranscript);
   onTranscriptRef.current = onTranscript;
+  const segmentsRef = useRef<{ text: string; meta?: FinalMeta; excluded: boolean }[]>([]);
+  const serverOneStepRef = useRef(false);
+  const cleanupAbortRef = useRef<AbortController | null>(null);
+  const bufferTranscript = useCallback((text: string, meta?: FinalMeta, excluded = false) => {
+    segmentsRef.current.push({ text, meta, excluded });
+  }, []);
+  const onCleanupRef = useRef(onCleanup);
+  onCleanupRef.current = onCleanup;
   const onInterimRef = useRef(onInterim);
   onInterimRef.current = onInterim;
   // Synced refs so the mount-time listeners call the latest callbacks.
@@ -235,7 +251,7 @@ export const ComposerMicButton = ({
     const takeGeneration = takeGenerationRef.current;
     if (!punctuationAvailableRef.current) {
       if (!disabledRef.current && !discardingRef.current) {
-        onTranscriptRef.current(transcript);
+        bufferTranscript(transcript);
       }
       return;
     }
@@ -252,7 +268,7 @@ export const ComposerMicButton = ({
         !disabledRef.current &&
         !discardingRef.current
       ) {
-        onTranscriptRef.current(displayText);
+        bufferTranscript(displayText);
       }
     };
     punctuationQueueRef.current = punctuationQueueRef.current.then(deliver, deliver);
@@ -264,15 +280,14 @@ export const ComposerMicButton = ({
     const transcript = text.trim();
     if (!transcript) return;
     const takeGeneration = takeGenerationRef.current;
+    const excluded = serverOneStepRef.current;
     const deliver = () => {
       if (
         takeGeneration === takeGenerationRef.current &&
         !disabledRef.current &&
         !discardingRef.current
       ) {
-        if (thirdSelected) onTranscriptRef.current(transcript, { ...meta, source: "third" });
-        else if (meta) onTranscriptRef.current(transcript, meta);
-        else onTranscriptRef.current(transcript);
+        bufferTranscript(transcript, meta, excluded);
       }
     };
     if (ordered) {
@@ -311,6 +326,8 @@ export const ComposerMicButton = ({
     discardingRef.current = true;
     takeGenerationRef.current += 1;
     punctuationQueueRef.current = Promise.resolve();
+    segmentsRef.current = [];
+    cleanupAbortRef.current?.abort();
     webSpeechTakeRef.current = null;
     sessionRef.current?.cancel();
     sessionRef.current = null;
@@ -332,18 +349,76 @@ export const ComposerMicButton = ({
     if (!wasListeningRef.current) return;
     wasListeningRef.current = false;
     const generation = takeGenerationRef.current;
-    void punctuationQueueRef.current.then(() => {
+    void punctuationQueueRef.current.then(async () => {
       if (
         mountedRef.current &&
         !discardingRef.current &&
         generation === takeGenerationRef.current
       ) {
+        const segments = segmentsRef.current;
+        segmentsRef.current = [];
+        const text = segments.map((segment) => segment.text).join(" ");
+        const raw = segments.map((segment) => segment.meta?.raw ?? segment.text).join(" ");
+        let output = text;
+        let cleaned = segments.length > 0 && segments.every((segment) => segment.meta?.cleaned);
+        const first = segments.findIndex((segment) => !segment.excluded && !segment.meta?.cleaned);
+        const replace = onCleanupRef.current;
+        const inserted = !!text && !!replace && cleanupEnabledRef.current && first !== -1;
+        if (inserted)
+          flushSync(() =>
+            onTranscriptRef.current(text, { raw, cleaned: false, cleanupHandled: true }),
+          );
+        if (text && cleanupEnabledRef.current && first !== -1) {
+          const prefix = segments
+            .slice(0, first)
+            .map((segment) => segment.text)
+            .join(" ");
+          const suffix = segments
+            .slice(first)
+            .map((segment) => segment.meta?.raw ?? segment.text)
+            .join(" ");
+          const controller = new AbortController();
+          cleanupAbortRef.current = controller;
+          const field = inputRef?.current;
+          const before = field?.value;
+          let edited = false;
+          const onEdit = () => {
+            edited = true;
+          };
+          field?.addEventListener("input", onEdit);
+          try {
+            const result = await cleanupDictation(suffix, controller.signal);
+            if (!edited && field?.value === before) {
+              output = [prefix, result.text].filter(Boolean).join(" ");
+              cleaned = true;
+            }
+          } catch {
+            if (!controller.signal.aborted) showToast("Cleanup unavailable; original kept.");
+          } finally {
+            field?.removeEventListener("input", onEdit);
+          }
+        }
+        if (
+          !mountedRef.current ||
+          discardingRef.current ||
+          disabledRef.current ||
+          generation !== takeGenerationRef.current
+        )
+          return;
+        if (inserted) {
+          if (output !== text) onCleanupRef.current?.(text, output);
+        } else if (output) {
+          // Cleanup is owned here for every mic; insertion adapters must not retry it.
+          if (cleaned || cleanupEnabledRef.current)
+            onTranscriptRef.current(output, { raw, cleaned, cleanupHandled: true });
+          else onTranscriptRef.current(output);
+        }
         onVoiceEndRef.current?.();
       }
       if (generation === takeGenerationRef.current && activeTake?.owner === ownerRef.current)
         activeTake = null;
     });
-  }, [isListening, connecting]);
+  }, [isListening, connecting, inputRef]);
 
   // Surface a failure both in the button (tooltip + red tint) and as a toast,
   // so a failed take is an explained error rather than a silent flash back to
@@ -386,6 +461,8 @@ export const ComposerMicButton = ({
       discardingRef.current = false;
       takeGenerationRef.current += 1;
       punctuationQueueRef.current = Promise.resolve();
+      segmentsRef.current = [];
+      cleanupAbortRef.current?.abort();
       setError(null);
       setIsListening(true);
       // Snapshot point: let the parent record the text so Esc can revert to it.
@@ -499,6 +576,8 @@ export const ComposerMicButton = ({
     if (!disabled) return;
     takeGenerationRef.current += 1;
     punctuationQueueRef.current = Promise.resolve();
+    cleanupAbortRef.current?.abort();
+    segmentsRef.current = [];
     if (!isListening) return;
     if (sessionRef.current) {
       sessionRef.current.cancel();
@@ -527,6 +606,8 @@ export const ComposerMicButton = ({
       if (activeTake?.owner === owner) activeTake = null;
       takeGenerationRef.current += 1;
       punctuationQueueRef.current = Promise.resolve();
+      segmentsRef.current = [];
+      cleanupAbortRef.current?.abort();
       sessionRef.current?.cancel();
       sessionRef.current = null;
     };
@@ -647,9 +728,12 @@ export const ComposerMicButton = ({
           // Snapshot point: let the parent record the text so Esc can revert to it.
           takeGenerationRef.current += 1;
           punctuationQueueRef.current = Promise.resolve();
+          segmentsRef.current = [];
+          cleanupAbortRef.current?.abort();
           onVoiceStartRef.current?.();
         }
         serverContinuesWebTakeRef.current = continueTake;
+        serverOneStepRef.current = oneStepRef.current;
         const generation = takeGenerationRef.current;
         const next = await DictationSession.start({
           onPartial: (text) => {
@@ -661,7 +745,6 @@ export const ComposerMicButton = ({
               !discardingRef.current
             ) {
               interimRef.current = text;
-              onInterimRef.current?.(text);
             }
           },
           onFinal: (text, meta) => {
@@ -679,7 +762,7 @@ export const ComposerMicButton = ({
             const pending = interimRef.current.trim();
             interimRef.current = "";
             if (pending && !disabledRef.current && !discardingRef.current) {
-              onTranscriptRef.current(pending);
+              bufferTranscript(pending, undefined, serverOneStepRef.current);
             } else {
               onInterimRef.current?.("");
             }
@@ -782,7 +865,7 @@ export const ComposerMicButton = ({
       setConnecting(false);
       serverBusyRef.current = false;
     },
-    [reportError, thirdSelected, electron],
+    [reportError, thirdSelected, electron, bufferTranscript],
   );
   toggleServerRef.current = toggleServer;
 
@@ -846,6 +929,8 @@ export const ComposerMicButton = ({
         };
         takeGenerationRef.current += 1;
         punctuationQueueRef.current = Promise.resolve();
+        cleanupAbortRef.current?.abort();
+        segmentsRef.current = [];
         recognition.start();
       }
     } catch {

@@ -141,7 +141,7 @@ class _HostedStream:
         self.lost_seconds += len(audio) / 32000
 
     def _segment(self) -> None:
-        if self.voiced >= 15:
+        if self.voiced > 0:
             data = bytes(self.audio)
             if self.fatal:
                 self._lost(data)
@@ -204,7 +204,7 @@ class _HostedStream:
                     ):
                         self._segment()
             if self.fatal:
-                if self.voiced >= 15:
+                if self.voiced > 0:
                     self._lost(bytes(self.audio) + bytes(self.pending))
                 self.audio.clear()
                 self.pending.clear()
@@ -342,7 +342,7 @@ class _HostedStream:
                         self.fatal = self.fatal or "third_party_failed"
                         while self.queue:
                             self._lost(self.queue.popleft())
-                        if self.voiced >= 15:
+                        if self.voiced > 0:
                             self._lost(bytes(self.audio))
                         self.audio.clear()
                         self.pending.clear()
@@ -356,6 +356,16 @@ class _HostedStream:
         with self.condition:
             self.deadline = self.deadline or time.monotonic() + self.stop_timeout
             if not self.fatal:
+                # The worklet flush can end between 20 ms frames.
+                remainder = bytes(self.pending[: len(self.pending) // 2 * 2])
+                self.pending.clear()
+                if remainder:
+                    samples = array("h", remainder)
+                    rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+                    if rms >= max(300, 3 * min(self.noise)):
+                        self.voiced += 1
+                    if self.audio or self.voiced:
+                        self.audio.extend(remainder)
                 self._segment()
             self.stopping = True
             self.condition.notify_all()
