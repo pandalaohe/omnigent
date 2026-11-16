@@ -6479,9 +6479,11 @@ def register_events_routes(
         if conv is None or not _has_bound_runner_authority(request, conv):
             raise HTTPException(403, "Bound receiver authority required")
         assert conv.runner_id is not None
-        if body.boundary in {"native_accept", "native_refuse"}:
-            # Reconcile the same observed native outcome; closing its reservation
-            # would discard proof that the native input was already consumed.
+        if body.boundary in {"native_accept", "native_refuse"} or (
+            not close and body.boundary == "native_reserve"
+        ):
+            # Reconcile the exact outcome or reservation through the admission
+            # fences; a read-only lookup cannot revalidate its owner.
             return await service.admit_execution(session_id, body, runner_id=conv.runner_id)
         return await asyncio.to_thread(
             service.journal.resolve_execution,

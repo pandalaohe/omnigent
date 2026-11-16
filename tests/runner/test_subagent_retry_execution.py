@@ -50,7 +50,51 @@ async def _receiver(journal, production_http):
                 return InputExecutionReceipt.model_validate(response.json())
             return await service.admit_execution(journal.child, claim, runner_id=receiver)
 
-        yield post
+        async def resolve(claim, *, close):
+            response = await client.post(
+                f"/sessions/{journal.child}/input-admission/resolve",
+                params={"close": str(close).lower()},
+                json=claim.model_dump(mode="json"),
+                headers={RUNNER_TUNNEL_TOKEN_HEADER: token},
+            )
+            response.raise_for_status()
+            return InputExecutionReceipt.model_validate(response.json())
+
+        yield post, resolve
+
+
+@pytest.mark.asyncio
+async def test_native_reservation_lost_ack_queries_without_closing(db_uri):
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from tests.stores.test_subagent_retry_execution import _prepared
+    from tests.stores.test_subagent_retry_store import _journal
+
+    journal = _journal(db_uri, SqlAlchemyConversationStore(db_uri))
+    journal.conversations.update_conversation(journal.child, harness_override="codex-native")
+    chain, claim = _prepared(journal)
+    claim = claim.model_copy(update={"boundary": "native_reserve"})
+    async with _receiver(journal, True) as (receive, resolve):
+        original = await receive(claim)
+        assert original.state == "reserved"
+        recovered = await resolve(claim, close=False)
+        assert recovered.state == "reserved"
+        assert recovered.receipt == original.receipt
+        conflict = await resolve(claim.model_copy(update={"turn_id": "foreign-turn"}), close=False)
+        assert conflict.state == "refused" and conflict.reason == "input_identity_conflict"
+        assert claim.retry is not None
+        foreign_guard = claim.retry.model_copy(
+            update={
+                "owner": claim.retry.owner.model_copy(
+                    update={"epoch": claim.retry.owner.epoch + 1}
+                )
+            }
+        )
+        revoked = await resolve(claim.model_copy(update={"retry": foreign_guard}), close=False)
+        assert revoked.state == "refused"
+        closed = await resolve(claim, close=True)
+        assert closed.state == "refused"
+        assert (await resolve(claim, close=False)).state == "refused"
+    assert journal.store.get_chain(chain.chain_id).accepted_attempts == 0
 
 
 @pytest.mark.asyncio
@@ -122,7 +166,7 @@ async def test_native_definite_refusal_finalizes_once_without_attempt(
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", Refusing
     )
-    async with _receiver(journal, production_http) as receive:
+    async with _receiver(journal, production_http) as (receive, _resolve):
 
         async def reserve():
             result = await receive(claim.model_copy(update={"boundary": "native_reserve"}))
@@ -227,7 +271,7 @@ async def test_human_buffered_during_retry_admission_executes_on_own_turn(
         serving = asyncio.create_task(server.serve(sockets=[sock]))
         try:
             await poll_until_async(lambda: server.started, timeout_s=5)
-            async with _receiver(journal, production_http) as receive:
+            async with _receiver(journal, production_http) as (receive, _resolve):
 
                 class Server(NullServerClient):
                     async def post(self, url, **kwargs):
