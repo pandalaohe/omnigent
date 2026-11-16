@@ -204,11 +204,13 @@ function Choice({
 function ProviderEditor({
   provider,
   onSaved,
+  onRefreshed,
   onRemoved,
   onBack,
 }: {
   provider?: ModelConnection;
   onSaved: (row: ModelConnection) => void;
+  onRefreshed: (row: ModelConnection) => void;
   onRemoved: () => void;
   onBack: () => void;
 }) {
@@ -460,12 +462,15 @@ function ProviderEditor({
                     setModels((rows) =>
                       rows.map((row) => ({
                         ...row,
+                        used_by: result.models.find((saved) => saved.key === row.key)?.used_by,
                         status:
                           result.models.find(
                             (saved) => saved.key === row.key && saved.model_id === row.model_id,
                           )?.status ?? "unchecked",
                       })),
                     );
+                    setLocks({});
+                    onRefreshed(result);
                     setNotice("Model catalogue refreshed");
                   })
                 }
@@ -772,6 +777,22 @@ export function ModelProvidersSection() {
             key={create ? "create" : provider?.name}
             provider={create ? undefined : provider}
             onBack={back}
+            onRefreshed={(fresh) => {
+              setConnections((rows) =>
+                rows.map((row) =>
+                  row.name === fresh.name
+                    ? {
+                        ...row,
+                        used_by: fresh.used_by,
+                        models: row.models.map((model) => ({
+                          ...model,
+                          used_by: fresh.models.find((saved) => saved.key === model.key)?.used_by,
+                        })),
+                      }
+                    : row,
+                ),
+              );
+            }}
             onSaved={(saved) => {
               setConnections((rows) => [...rows.filter((row) => row.name !== saved.name), saved]);
               navigate(`/settings/model-providers/${encodeURIComponent(saved.name)}`);

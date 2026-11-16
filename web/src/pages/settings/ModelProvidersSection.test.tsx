@@ -111,15 +111,55 @@ it("counts unsaved rows toward the 50-row cap", async () => {
 }, 15000);
 
 it("preserves draft rows across refresh, then discards them", async () => {
+  vi.mocked(api.refreshModelCatalog).mockResolvedValue({
+    ...row,
+    used_by: 0,
+    models: row.models.map((model) => ({ ...model, used_by: undefined })),
+  });
   await page();
   fireEvent.change(screen.getByLabelText("Display name free"), { target: { value: "Draft name" } });
   await act(async () =>
     fireEvent.click(screen.getByRole("button", { name: "Refresh model catalogue" })),
   );
   expect(screen.getByLabelText("Display name free")).toHaveValue("Draft name");
+  expect(screen.getByRole("button", { name: "Remove provider" })).toBeEnabled();
+  expect(screen.getAllByRole("button", { name: "Remove model" })).toHaveLength(2);
+  expect(screen.queryByRole("button", { name: "Used by 2 users" })).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Discard" }));
   expect(screen.getByLabelText("Display name free")).toHaveValue("Unused");
   expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+  expect(screen.getAllByRole("button", { name: "Remove model" })).toHaveLength(2);
+});
+
+it("refreshes new usage by stable key while preserving requested-id edits and row removals", async () => {
+  const unused = {
+    ...row,
+    used_by: 0,
+    models: row.models.map((model) => ({ ...model, used_by: undefined })),
+  };
+  vi.mocked(api.listModelConnections).mockResolvedValue({
+    connections: [unused],
+    can_manage: true,
+  });
+  await page();
+  const user = userEvent.setup();
+  const requested = screen.getByRole("combobox", { name: "Requested model speech" });
+  await user.clear(requested);
+  await user.type(requested, "draft-id{Enter}");
+  fireEvent.click(
+    within(screen.getByLabelText("Display name free").closest("tr")!).getByRole("button", {
+      name: "Remove model",
+    }),
+  );
+  await act(async () =>
+    fireEvent.click(screen.getByRole("button", { name: "Refresh model catalogue" })),
+  );
+  expect(requested).toHaveValue("draft-id");
+  expect(screen.queryByLabelText("Display name free")).toBeNull();
+  expect(screen.getByRole("button", { name: "Used by 2 users" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Remove provider" })).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "In use" }));
+  expect(screen.getByLabelText("Display name speech")).toBeVisible();
 });
 
 it("restores the saved key source when discarding an edit", async () => {
@@ -150,6 +190,15 @@ it("saves stable keys and restores a concurrently referenced removed row with a 
   );
   expect(screen.getByLabelText("Display name free")).toHaveValue("Unused");
   expect(screen.getByRole("button", { name: /In use: Cleanup, 1 users/ })).toBeDisabled();
+  await act(async () =>
+    fireEvent.click(screen.getByRole("button", { name: "Refresh model catalogue" })),
+  );
+  expect(screen.queryByRole("button", { name: /In use: Cleanup/ })).toBeNull();
+  expect(
+    within(screen.getByLabelText("Display name free").closest("tr")!).getByRole("button", {
+      name: "Remove model",
+    }),
+  ).toBeEnabled();
 });
 
 it("requires confirmation before deleting an unused provider and stored key", async () => {
