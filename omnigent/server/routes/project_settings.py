@@ -629,12 +629,9 @@ def create_project_settings_router(
                 raise _invalid(
                     "project.model", "sync this host's model catalog before selecting a model"
                 )
-            if (
-                models[selected_host]
-                .resolve(harness, next_config["model"], "project_legacy")
-                .row_id
-                is None
-            ):
+            if models[selected_host].resolve(
+                harness, next_config["model"], "project_legacy"
+            ).outcome not in {"exact", "renamed", "pinned"}:
                 raise _invalid("project.model", "model is not offered by the selected host")
         if body.host and body.host.harnesses:
             for harness, patch in body.host.harnesses.items():
@@ -675,12 +672,9 @@ def create_project_settings_router(
                             raise _invalid(
                                 path, "sync this host's model catalog before selecting a model"
                             )
-                        if (
-                            models[body.host.host_id]
-                            .resolve(harness, value, "project_host")
-                            .row_id
-                            is None
-                        ):
+                        if models[body.host.host_id].resolve(
+                            harness, value, "project_host"
+                        ).outcome not in {"exact", "renamed", "pinned"}:
                             raise _invalid(path, "model is not offered by this host")
                     elif field == "effort":
                         if resolved.model and (
