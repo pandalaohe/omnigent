@@ -1508,6 +1508,10 @@ def _package_spec(*, version: str | None = None, extras: Collection[str] = ()) -
     return spec
 
 
+# Refresh only omnigent so unchanged dependencies can reuse cached downloads.
+_UV_REINSTALL_PACKAGE = f"--reinstall-package {_DIST_NAME}"
+
+
 def _build_upgrade_suggestion(
     info: _InstalledWheelInfo,
     *,
@@ -1557,7 +1561,8 @@ def _build_upgrade_suggestion(
         if installer == "uv":
             return _UpgradeSuggestion(
                 command=(
-                    f"uv tool install --reinstall{_uv_python_pin()} {vcs_url_with_extras}{pre}"
+                    f"uv tool install {_UV_REINSTALL_PACKAGE}{_uv_python_pin()} "
+                    f"{vcs_url_with_extras}{pre}"
                 ),
                 runnable=True,
             )
@@ -1601,7 +1606,10 @@ def _build_upgrade_suggestion(
             # version), not extras. Reinstall with the full PEP 508 spec
             # to preserve the extras the user originally requested.
             return _UpgradeSuggestion(
-                command=(f"uv tool install --reinstall{_uv_python_pin()} {registry_spec}{pre}"),
+                command=(
+                    f"uv tool install {_UV_REINSTALL_PACKAGE}{_uv_python_pin()} "
+                    f"{registry_spec}{pre}"
+                ),
                 runnable=True,
             )
         return _UpgradeSuggestion(command=f"uv tool upgrade {_DIST_NAME}{pre}", runnable=True)
