@@ -287,6 +287,8 @@ def test_shell_reconciliation_does_not_clear_a_newer_submission_or_session(
     assert observed is not None
     newer = replace(observed, **{changed_field: "newer_value"})
     write_bridge_state(tmp_path, newer)
+    if changed_field == "thread_id":
+        newer = replace(newer, active_turn_revision=observed.active_turn_revision + 1)
 
     codex_native_bridge.reconcile_shell_command_state(tmp_path, observed, None)
 
@@ -763,9 +765,9 @@ def test_active_turn_update_requires_storage_only_when_state_changes(
         pytest.param(None, None, 0, 5, id="same-owner-clear"),
         pytest.param(None, "turn_b", 9, 9, id="same-owner-newer-start-revision"),
         pytest.param("session_id", "turn_b", 0, 0, id="new-session-reset"),
-        pytest.param("thread_id", "turn_b", 0, 0, id="new-thread-reset"),
-        pytest.param("socket_path", "turn_b", 0, 0, id="new-socket-reset"),
-        pytest.param("codex_home", "turn_b", 0, 0, id="new-home-reset"),
+        pytest.param("thread_id", "turn_b", 0, 5, id="new-thread-advances"),
+        pytest.param("socket_path", "turn_b", 0, 5, id="new-socket-advances"),
+        pytest.param("codex_home", "turn_b", 0, 5, id="new-home-advances"),
     ],
 )
 def test_full_state_publication_preserves_revision_for_the_same_owner(

@@ -10733,6 +10733,8 @@ async def _post_status(
     native_generation: int | None = None,
     turn_completed: bool = False,
     turn_outcome: str | None = None,
+    native_turn_generation: int | None = None,
+    is_current: Callable[[], bool] | None = None,
 ) -> bool:
     """
     Publish a native Codex status edge.
@@ -10763,6 +10765,8 @@ async def _post_status(
         data["turn_outcome"] = turn_outcome
     if native_generation is not None:
         data["native_generation"] = native_generation
+    if native_turn_generation is not None:
+        data["native_turn_generation"] = native_turn_generation
     if turn_id is not None and turn_id != response_id:
         data["turn_id"] = turn_id
     if input_id is not None:
@@ -10788,6 +10792,7 @@ async def _post_status(
         # Terminal outcomes survive outages; transient status edges use bounded retries.
         max_attempts=None if status in {"idle", "failed"} else _POST_MAX_ATTEMPTS,
         timeout=_DURABLE_ITEM_POST_TIMEOUT_SECONDS,
+        **({"is_current": is_current} if is_current is not None else {}),
     )
     _log_failed_session_event_post("external_session_status", response)
     return response is not None and response.status_code < 400
@@ -10819,16 +10824,21 @@ async def _post_turn_status_edge(
     """
     if edge is None:
         return
-    if bridge_dir is not None and edge.bridge_revision is not None:
+
+    def is_current() -> bool:
+        if bridge_dir is None or edge.bridge_revision is None:
+            return True
         current = read_bridge_state(bridge_dir)
-        if (
-            current is None
-            or current.thread_id != edge.bridge_thread_id
-            or current.active_turn_revision != edge.bridge_revision
-            or current.last_terminal_turn_id != edge.turn_id
-            or current.last_terminal_outcome != edge.terminal_outcome
-        ):
-            return
+        return (
+            current is not None
+            and current.thread_id == edge.bridge_thread_id
+            and current.active_turn_revision == edge.bridge_revision
+            and current.last_terminal_turn_id == edge.turn_id
+            and current.last_terminal_outcome == edge.terminal_outcome
+        )
+
+    if not is_current():
+        return
     _logger.info(
         "Codex forwarder publishing turn status: source=%s turn_id=%s status=%s",
         edge.source,
@@ -10897,6 +10907,8 @@ async def _post_turn_status_edge(
             ),
             recovered=recovered,
             native_generation=native_generation,
+            native_turn_generation=edge.bridge_revision,
+            is_current=is_current,
             turn_completed=(
                 edge.status == "idle"
                 and edge.turn_id is not None
@@ -11848,6 +11860,7 @@ class _PostResult:
     may_have_been_delivered: bool = False
     transport_error: str | None = None
     rejection_reason: str | None = None
+    superseded: bool = False
 
 
 async def _post_session_event(
@@ -11858,6 +11871,7 @@ async def _post_session_event(
     data: _JsonObject,
     max_attempts: int | None = _POST_MAX_ATTEMPTS,
     timeout: float | None = None,
+    is_current: Callable[[], bool] | None = None,
 ) -> httpx.Response | None:
     """
     Post one Omnigent session event, tracking forward-sync health (#1120).
@@ -11883,6 +11897,7 @@ async def _post_session_event(
         data=data,
         max_attempts=max_attempts,
         timeout=timeout,
+        **({"is_current": is_current} if is_current is not None else {}),
     )
     return result.response
 
@@ -11895,6 +11910,7 @@ async def _post_session_event_result(
     data: _JsonObject,
     max_attempts: int | None = _POST_MAX_ATTEMPTS,
     timeout: float | None = None,
+    is_current: Callable[[], bool] | None = None,
 ) -> _PostResult:
     """
     Post one Omnigent session event and classify its outcome, tracking health.
@@ -11926,6 +11942,7 @@ async def _post_session_event_result(
             data=data,
             max_attempts=max_attempts,
             timeout=timeout,
+            **({"is_current": is_current} if is_current is not None else {}),
         )
     except DatabricksAuthError as exc:
         # An earlier retry may have reached the server before credentials failed.
@@ -11942,6 +11959,8 @@ async def _post_session_event_result(
                 reason="credential resolution failed before acknowledgement",
             )
         raise
+    if result.superseded:
+        return result
     response = result.response
     if response is not None and response.status_code < 400:
         _note_forward_success()
@@ -11993,6 +12012,7 @@ async def _post_session_event_inner(
     data: _JsonObject,
     max_attempts: int | None = _POST_MAX_ATTEMPTS,
     timeout: float | None = None,
+    is_current: Callable[[], bool] | None = None,
 ) -> _PostResult:
     """
     Post one Omnigent session event with bounded transient retries.
@@ -12049,6 +12069,8 @@ async def _post_session_event_inner(
         return _PostResult(response=None, rejection_reason=reason)
     attempt = 0
     while max_attempts is None or attempt < max_attempts:
+        if is_current is not None and not is_current():
+            return _PostResult(response=None, superseded=True)
         attempt += 1
         try:
             if timeout is None:

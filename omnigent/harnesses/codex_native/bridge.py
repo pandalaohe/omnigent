@@ -1486,17 +1486,15 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
                 last_terminal_outcome=previous.last_terminal_outcome,
             )
         current = previous
-        if current is not None and (
-            current.session_id == state.session_id
-            and current.thread_id == state.thread_id
-            and current.socket_path == state.socket_path
-            and current.codex_home == state.codex_home
-        ):
+        if current is not None and current.session_id == state.session_id:
             state = replace(
                 state,
                 active_turn_revision=max(
                     current.active_turn_revision
-                    + int(state.active_turn_id != current.active_turn_id),
+                    + int(
+                        (state.thread_id, state.active_turn_id)
+                        != (current.thread_id, current.active_turn_id)
+                    ),
                     state.active_turn_revision,
                 ),
             )
