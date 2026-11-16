@@ -2548,6 +2548,40 @@ def clear_active_turn_id_if_matches(
         return True
 
 
+def record_resumed_terminal(
+    bridge_dir: Path,
+    observed: CodexNativeBridgeState,
+    turn_ids: list[str],
+    outcome: str,
+) -> CodexNativeBridgeState | None:
+    """Bind a resume terminal only if its history includes the latest known boundary."""
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is None or state != observed or not turn_ids:
+            return None
+        turn_id = turn_ids[-1]
+        if state.active_turn_id not in {None, turn_id}:
+            return None
+        if (
+            state.active_turn_id is None
+            and state.last_terminal_turn_id is not None
+            and state.last_terminal_turn_id not in turn_ids
+        ):
+            return None
+        if state.active_turn_id is None and state.last_terminal_turn_id == turn_id:
+            return state if state.last_terminal_outcome == outcome else None
+        updated = replace(
+            state,
+            active_turn_id=None,
+            active_shell_turn_id=None,
+            active_turn_revision=state.active_turn_revision + 1,
+            last_terminal_turn_id=turn_id,
+            last_terminal_outcome=outcome,
+        )
+        _write_bridge_state_unlocked(bridge_dir, updated)
+        return updated
+
+
 def set_helper_stop_pending(bridge_dir: Path, pending: bool) -> None:
     """Keep revocation outstanding across runner and forwarder reconnects."""
     with _bridge_state_lock(bridge_dir):
