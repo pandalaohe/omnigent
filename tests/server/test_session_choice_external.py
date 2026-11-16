@@ -66,6 +66,26 @@ def save_external(env, **changes):
     return rule
 
 
+def bind_session_to_agent(env, agent_id, labels=None):
+    """Move the fixture onto a running session bound to *agent_id* on ``HOST``.
+
+    A conversation's agent and host are fixed at creation, so the fixture's
+    unbound session is retired and replaced by an equivalent running one.
+    """
+    env.store.set_session_live_status(env.conv.id, "idle")
+    conv = env.store.create_conversation(
+        agent_id=agent_id,
+        host_id=HOST,
+        workspace="/opt/work/omnigent/fork/session-choice",
+        labels=dict(labels or {}),
+    )
+    env.store.set_runner_id(conv.id, "a" * 32)
+    env.store.touch_runner_liveness(["a" * 32], int(env.now))
+    env.store.set_session_live_status(conv.id, "running")
+    env.conv = env.store.get_conversation(conv.id)
+    return env.conv
+
+
 # Native forwarder passes turn.error.message through to terminal output.
 # These status/stream envelopes follow forwarder/test_turn_errors.py and Codex's HTTP diagnostic.
 @pytest.fixture(
@@ -161,6 +181,7 @@ async def test_failed_child_excludes_only_its_host_and_preserves_real_expiry(
     quota_runner, wrapped_refusal, monkeypatch
 ):
     from omnigent.harnesses.codex_native.forwarder import _terminal_error_from_turn
+    from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
     from omnigent.server.session_choice_preview import candidate_preview
 
     env = quota_runner
@@ -186,7 +207,8 @@ async def test_failed_child_excludes_only_its_host_and_preserves_real_expiry(
     choice = next_child.json()["session_choice"]
     assert choice["pool"] == "pool-1"
     assert (choice["skipped"][0]["why"], choice["skipped"][0]["until"]) == ("excluded", now + 600)
-    assert env.store.get_conversation(first["id"]).last_task_error is not None
+    failed_child = env.store.get_conversation(first["id"])
+    assert _last_task_error_from_labels(failed_child.labels) is not None
     for user_named in (False, True):
         named = await create(
             env,
@@ -416,11 +438,8 @@ async def test_external_stop_exemption_shared_paths_and_running_attribution(
     env.value.update(externalAdmission=[rule], schemaVersion=schema)
     if schema == 2:
         env.value["limitRules"] = []
-    env.store.update_conversation(
-        env.conv.id,
-        agent_id=agent["id"],
-        host_id=HOST,
-        labels={CHOICE_LABEL: json.dumps({"pool": "account-a"})},
+    bind_session_to_agent(
+        env, agent["id"], labels={CHOICE_LABEL: json.dumps({"pool": "account-a"})}
     )
     env.prefs.replace_session_choice(
         RESERVED_USER_LOCAL, env.value, env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"]
@@ -461,7 +480,7 @@ async def test_native_hook_and_event_start_use_external_exemption(stop_env, clie
         name="external-gate",
         executor={"type": "omnigent", "config": {"harness": "codex-native"}},
     )
-    env.store.update_conversation(env.conv.id, agent_id=agent["id"], host_id=HOST)
+    bind_session_to_agent(env, agent["id"])
     env.value["externalAdmission"] = [{**RULE, "agent": agent["id"]}]
     env.prefs.replace_session_choice(
         RESERVED_USER_LOCAL, env.value, env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"]
