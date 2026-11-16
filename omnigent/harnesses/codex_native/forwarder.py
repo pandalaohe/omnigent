@@ -10675,6 +10675,7 @@ async def _post_status(
     input_id: str | None = None,
     recovered: bool = False,
     native_generation: int | None = None,
+    turn_completed: bool = False,
 ) -> bool:
     """
     Publish a native Codex status edge.
@@ -10699,6 +10700,8 @@ async def _post_status(
     :returns: None.
     """
     data: _JsonObject = {"status": status}
+    if turn_completed:
+        data["turn_completed"] = True
     if native_generation is not None:
         data["native_generation"] = native_generation
     if turn_id is not None and turn_id != response_id:
@@ -10825,6 +10828,11 @@ async def _post_turn_status_edge(
             ),
             recovered=recovered,
             native_generation=native_generation,
+            turn_completed=(
+                edge.status == "idle"
+                and edge.turn_id is not None
+                and edge.source in {"turn/completed", "turn/completed:recovered"}
+            ),
         )
         if delivered and forwarder_state is not None and edge.status == "failed":
             forwarder_state.turn_failure_surfaced = True

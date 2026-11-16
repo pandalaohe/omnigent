@@ -7650,10 +7650,12 @@ async def test_publish_status_keeps_failed_sticky_against_trailing_idle(
 
 
 @pytest.mark.parametrize("turn_completed", [True, None], ids=["confirmed", "quiescence"])
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
 async def test_confirmed_turn_completion_clears_earlier_native_failure(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     turn_completed: bool | None,
+    harness: str,
 ) -> None:
     """
     A later turn's confirmed ``idle`` clears an earlier native turn failure.
@@ -7671,7 +7673,7 @@ async def test_confirmed_turn_completion_clears_earlier_native_failure(
     )
     agent = await create_test_agent(
         client,
-        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+        executor={"type": "omnigent", "config": {"harness": harness}},
     )
     session = await _create_session(client, agent["id"])
     session_id = session["id"]
