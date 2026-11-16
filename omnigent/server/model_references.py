@@ -619,7 +619,11 @@ def check_model_references_sync(app: Any, owner: str, *, user_id: str | None) ->
                 if not _applies(ref, record):
                     continue
                 result = resolve_catalog_model(
-                    ref.model, usable_catalog(record), groups, record["harness"]
+                    ref.model,
+                    usable_catalog(record),
+                    groups,
+                    record["harness"],
+                    allow_substitution=True,
                 )
                 if result.outcome not in {"substituted", "missing"}:
                     continue
@@ -716,7 +720,11 @@ def replace_model_references_sync(
                 if not any(
                     _applies(ref, record)
                     and resolve_catalog_model(
-                        target, usable_catalog(record), groups, record["harness"]
+                        target,
+                        usable_catalog(record),
+                        groups,
+                        record["harness"],
+                        allow_substitution=True,
                     ).outcome
                     in {"exact", "pinned"}
                     for record in records

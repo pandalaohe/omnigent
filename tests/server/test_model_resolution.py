@@ -27,11 +27,11 @@ def test_usable_catalog_includes_both_advertised_identifiers():
     ) == frozenset({"p/x", "x", "p/y"})
 
 
-def test_adapter_preserves_relay_route_and_reverses_on_an_uncut_host():
+def test_launch_preserves_qualified_model_and_accepts_explicit_provider_rename():
     groups = provider_groups([("old", "krill")])
     context = ResolutionContext("host-a", {"codex-native": {"models": [{"id": "x"}]}}, groups)
     result = context.resolve("codex-native", "old/x", "explicit")
-    assert (result.model, result.row_id, result.outcome) == ("krill/x", "x", "pinned")
+    assert (result.model, result.row_id, result.outcome) == ("old/x", None, "missing")
     context.records = {"codex-native": {"models": [{"id": "old/x"}, {"id": "x"}]}}
     reverse = context.resolve("codex-native", "krill/x", "resume")
     assert (reverse.model, reverse.row_id, reverse.outcome) == ("old/x", "old/x", "renamed")

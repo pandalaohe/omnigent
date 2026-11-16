@@ -1284,7 +1284,7 @@ def test_exact_attribution_order_label_and_model_families():
 @pytest.mark.parametrize(
     "caller_model", ["gpt-small", "official/gpt-small", "krill/gpt-small", "ccs-krill/gpt-small"]
 )
-def test_codex_ability_cap_uses_unpinned_model_identity(caller_model):
+def test_codex_ability_cap_compares_route_pins_by_plain_model(caller_model):
     raw = table().model_dump(mode="json", by_alias=True)
     raw["abilityOrder"] = [["p0"], ["p1"]]
     rows = raw["hosts"]["host-a"]["work"][0]
@@ -1302,7 +1302,8 @@ def test_codex_ability_cap_uses_unpinned_model_identity(caller_model):
             caller_model=caller_model,
         ),
     )
-    assert choice.link.model == "official/gpt-small"
+    assert choice.link.model == "gpt-small"
+    assert choice.pool == "codex-pro"
     assert choice.skipped[0].why == "above_caller"
 
 
@@ -1318,11 +1319,13 @@ def test_codex_route_pins_select_by_tile_with_plain_catalog_models():
         },
         "krill": {"maxRunning": 1},
     }
+    # A router that offers route pins lists the pinned ids themselves.
+    pinned = frozenset({"gpt-example", "official/gpt-example", "krill/gpt-example"})
     request = ChoiceRequest(
         OWNER,
         "host-a",
         products={"agent-0": "codex", "agent-1": "codex"},
-        models={agent: frozenset({"gpt-example"}) for agent in ("agent-0", "agent-1")},
+        models=dict.fromkeys(("agent-0", "agent-1"), pinned),
     )
     settings = parse_session_choice(raw)
     selected = pick(settings, request=request)
@@ -1341,13 +1344,37 @@ def test_codex_route_pins_select_by_tile_with_plain_catalog_models():
     assert busy.pool == "krill" and busy.skipped[0].why == "busy"
 
 
-@pytest.mark.parametrize("route,pool", [("official", "codex-pro"), ("krill", "krill")])
-def test_explicit_codex_route_meter_pins_pick_and_hold(route, pool):
+@pytest.mark.parametrize("meter", ["codex-pro", "krill"])
+def test_codex_meter_keeps_the_link_model_as_written(meter):
     raw = table((1,)).model_dump(mode="json", by_alias=True)
     raw["hosts"]["host-a"]["work"][0][0]["links"][0] = {
         "agent": "agent-0",
-        "model": "gpt-example",
-        "meter": pool,
+        "model": "gpt-6.1-sol",
+        "meter": meter,
+    }
+    raw["limits"] = {meter: {"maxRunning": 1}}
+    settings = parse_session_choice(raw)
+    request = ChoiceRequest(
+        OWNER,
+        "host-a",
+        products={"agent-0": "codex"},
+        models={"agent-0": frozenset({"official/gpt-6.1-sol"})},
+    )
+    for running, outcome in (({}, "pick"), ({meter: ("child",)}, "hold")):
+        choice = pick(settings, request=request, running=running)
+        assert (choice.outcome, choice.pool, choice.link.model) == (
+            outcome,
+            meter,
+            "gpt-6.1-sol",
+        )
+
+
+@pytest.mark.parametrize("route,pool", [("official", "codex-pro"), ("krill", "krill")])
+def test_explicit_codex_route_pin_keeps_its_launch_model(route, pool):
+    raw = table((1,)).model_dump(mode="json", by_alias=True)
+    raw["hosts"]["host-a"]["work"][0][0]["links"][0] = {
+        "agent": "agent-0",
+        "model": f"{route}/gpt-6.1-sol",
     }
     raw["limits"] = {pool: {"maxRunning": 1}}
     settings = parse_session_choice(raw)
@@ -1357,7 +1384,7 @@ def test_explicit_codex_route_meter_pins_pick_and_hold(route, pool):
         assert (choice.outcome, choice.pool, choice.link.model) == (
             outcome,
             pool,
-            f"{route}/gpt-example",
+            f"{route}/gpt-6.1-sol",
         )
 
 
@@ -1386,10 +1413,12 @@ def test_codex_pin_attribution_survives_plain_reports_and_stale_meter(route, poo
         ("pi", "krill/gpt-example"),
         ("codex", "other/gpt-example"),
         ("codex", "ccs-krill/gpt-example"),
+        ("codex", "official/gpt-example"),
     ],
 )
-def test_unique_model_substitution_is_not_limited_to_relay_routes(product, model):
-    # A unique identical model suffix can substitute even without a provider alias.
+def test_catalog_has_no_alias_for_a_configured_link_model(product, model):
+    # A catalog miss is unknown, not a refusal: only a real launch failure excludes a
+    # model. A route pin is likewise launched as written, never as its bare id.
     raw = table((1,)).model_dump(mode="json", by_alias=True)
     raw["hosts"]["host-a"]["work"][0][0]["links"][0]["model"] = model
     result = pick(
@@ -1402,8 +1431,8 @@ def test_unique_model_substitution_is_not_limited_to_relay_routes(product, model
         ),
     )
     assert result.outcome == "pick"
-    assert result.link.model == "gpt-example"
-    assert result.notes[0]["outcome"] == "substituted"
+    assert result.link.model == model
+    assert result.notes[0]["outcome"] == "missing"
     assert result.notes[0]["saved"] == model
     assert result.warnings
     assert result.skipped == ()

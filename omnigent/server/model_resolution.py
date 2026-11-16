@@ -59,18 +59,20 @@ def read_provider_groups(store: Any, owner: str) -> ProviderGroups:
 
 
 def resolve_catalog_model(
-    saved: str, catalog: frozenset[str] | None, groups: ProviderGroups, harness: str | None
+    saved: str,
+    catalog: frozenset[str] | None,
+    groups: ProviderGroups,
+    harness: str | None,
+    *,
+    allow_substitution: bool = False,
 ) -> ModelResolution:
-    from omnigent.runtime.instruction_layers import agent_key_for_harness
-    from omnigent.server.session_choice import catalog_model
-
-    product = agent_key_for_harness(harness)
-
-    def accepts(value: str) -> str | None:
-        row = catalog_model(value, product)
-        return row if row != value else None
-
-    return resolve_saved_model(saved, catalog, groups, accepts=accepts)
+    del harness
+    return resolve_saved_model(
+        saved,
+        catalog,
+        groups,
+        allow_substitution=allow_substitution,
+    )
 
 
 @dataclass(frozen=True)

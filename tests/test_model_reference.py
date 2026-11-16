@@ -81,6 +81,20 @@ def test_pin_callback_cannot_validate_a_row_absent_from_the_catalog():
     assert result.outcome == "missing" and result.model == "relay/x"
 
 
+@pytest.mark.parametrize(
+    "saved,catalog,candidates",
+    [("relay/x", {"x"}, ("x",)), ("x", {"relay/x"}, ("relay/x",))],
+)
+def test_substitution_can_be_disabled_for_launches(saved, catalog, candidates):
+    result = resolve_saved_model(saved, catalog, {}, allow_substitution=False)
+    assert (result.outcome, result.model, result.row_id, result.candidates) == (
+        "missing",
+        saved,
+        None,
+        candidates,
+    )
+
+
 def test_full_suffix_equality_does_not_merge_different_models():
     result = resolve_saved_model("old/family/x", {"p/x", "p/family/x"}, {})
     assert result.model == "p/family/x" and result.outcome == "substituted"

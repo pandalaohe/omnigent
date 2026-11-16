@@ -97,6 +97,7 @@ def resolve_saved_model(
     groups: ProviderGroups,
     *,
     accepts: Callable[[str], str | None] | None = None,
+    allow_substitution: bool = True,
 ) -> ModelResolution:
     """Prefer listed equivalents and route pins before a unique suffix match.
 
@@ -118,6 +119,6 @@ def resolve_saved_model(
                 return ModelResolution(model, equivalent, row_id, "pinned")
     name = split_model_id(model)[1]
     candidates = tuple(sorted({value for value in catalog if split_model_id(value)[1] == name}))
-    if len(candidates) == 1:
+    if len(candidates) == 1 and allow_substitution:
         return ModelResolution(model, candidates[0], candidates[0], "substituted")
     return ModelResolution(model, model, None, "missing", candidates)

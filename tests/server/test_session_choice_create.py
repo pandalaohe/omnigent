@@ -143,7 +143,7 @@ async def test_codex_default_route_is_admitted_against_its_actual_tile(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_source", ["explicit", "agent-default", "missing"])
-async def test_codex_pins_persist_through_create_queue_and_stop_targets(
+async def test_codex_meter_sessions_persist_through_create_queue_and_stop_targets(
     choice_env, db_uri, monkeypatch, model_source
 ):
     from dataclasses import replace
@@ -185,7 +185,7 @@ async def test_codex_pins_persist_through_create_queue_and_stop_targets(
         "omnigent.server.routes._sessions.helpers._resolve_llm_model",
         lambda *a, **kw: None if model_source == "missing" else "gpt-example",
     )
-    for model in ("official/gpt-example", "krill/gpt-example", "official/gpt-example"):
+    for _ in range(3):
         response = await create(env)
         if model_source == "missing":
             assert response.status_code == 409, response.text
@@ -193,8 +193,8 @@ async def test_codex_pins_persist_through_create_queue_and_stop_targets(
             return
         assert response.status_code == 201, response.text
         child = response.json()
-        assert child["model_override"] == child["session_choice"]["model"] == model
-        assert choice_record(env.store.get_conversation(child["id"]))["model"] == model
+        assert child["model_override"] == child["session_choice"]["model"] == "gpt-example"
+        assert choice_record(env.store.get_conversation(child["id"]))["model"] == "gpt-example"
         children.append(child)
     official, krill, held = children
     assert held["session_choice"]["outcome"] == "hold"
@@ -238,6 +238,88 @@ async def test_codex_pins_persist_through_create_queue_and_stop_targets(
     assert stop_targets(
         env.app, RESERVED_USER_LOCAL, settings, readings, {}, {"codex-pro"}, now
     ) == {"codex-pro": (held["id"],)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["codex-native", "codex"])
+async def test_plain_codex_model_launches_as_written_and_keeps_its_pool(
+    choice_env, db_uri, monkeypatch, harness
+):
+    from omnigent.server.agent_quota import QuotaContext
+    from omnigent.server.session_choice import parse_session_choice
+    from omnigent.server.session_choice_runtime import stopped_line, tile_of_session
+    from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
+    from tests.server.test_agent_quota import usage_report
+
+    env = choice_env
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._resolve_harness_impl", lambda *a, **kw: harness
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._resolve_llm_model",
+        lambda *a, **kw: "gpt-6.1-sol",
+    )
+    catalogs = HostModelCatalogCacheStore(db_uri)
+    catalogs.upsert(HOST, harness, [{"id": "gpt-6.1-sol"}], time.time())
+    env.app.state.host_model_catalog_cache_store = catalogs
+    for index, pool in enumerate(("codex-pro", "krill")):
+        link = {"agent": env.agents[index]["id"], "model": "gpt-6.1-sol", "meter": pool}
+        env.settings["presets"][index]["links"] = [link]
+        env.settings["hosts"][HOST]["work"][index][0]["links"] = [link]
+    env.settings["limits"] = {
+        "codex-pro": {
+            "maxRunning": 1,
+            "reserve": {"mode": "total", "window": "7d", "pct": 15, "stopPct": 5},
+        },
+        "krill": {"maxRunning": 1},
+    }
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    response = await create(env)
+    assert response.status_code == 201, response.text
+    child = response.json()
+    assert child["model_override"] == child["session_choice"]["model"] == "gpt-6.1-sol"
+    assert (child["session_choice"]["outcome"], child["session_choice"]["pool"]) == (
+        "pick",
+        "codex-pro",
+    )
+    record = choice_record(env.store.get_conversation(child["id"]))
+    assert (record["pool"], record["model"]) == ("codex-pro", "gpt-6.1-sol")
+    named = await create(
+        env, agent_id=env.agents[1]["id"], user_named=True, model_override="gpt-6.1-sol"
+    )
+    assert named.status_code == 201, named.text
+    assert named.json()["model_override"] == named.json()["session_choice"]["model"]
+    assert named.json()["session_choice"]["pool"] == "krill"
+
+    settings = parse_session_choice(env.settings)
+    conv = env.store.get_conversation(child["id"])
+    now = time.time()
+    env.app.state.agent_quota_service.report_account(
+        RESERVED_USER_LOCAL,
+        "codex-pro",
+        usage_report(
+            account_product="codex",
+            observed_at=now,
+            windows=[
+                {
+                    "id": "7d",
+                    "percent_used": 96,
+                    "window_minutes": 10080,
+                    "resets_at": now + 86400,
+                }
+            ],
+        ),
+        now=now,
+    )
+    readings = env.app.state.agent_quota_service.pool_readings(
+        QuotaContext(RESERVED_USER_LOCAL, None)
+    )
+    assert tile_of_session(conv, settings, readings, {}) == "codex-pro"
+    assert stopped_line(env.app, conv).state == "stop"
 
 
 @pytest.mark.asyncio
@@ -317,7 +399,7 @@ async def test_catalog_miss_does_not_exclude_configured_model(
 
 
 @pytest.mark.asyncio
-async def test_unique_provider_substitution_reaches_create_with_visible_note(
+async def test_catalog_miss_preserves_configured_provider_model_with_visible_note(
     choice_env, db_uri, monkeypatch
 ):
     from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
@@ -339,9 +421,9 @@ async def test_unique_provider_substitution_reaches_create_with_visible_note(
     response = await create(env)
     assert response.status_code == 201, response.text
     body = response.json()
-    assert body["model_override"] == "new/example-model"
+    assert body["model_override"] == "old/example-model"
     assert body["notes"][0]["saved"] == "old/example-model"
-    assert body["notes"][0]["outcome"] == "substituted"
+    assert body["notes"][0]["outcome"] == "missing"
     assert body["session_choice"]["warnings"] and not body["session_choice"]["skipped"]
 
 
@@ -1028,13 +1110,11 @@ def occupied(env, *, host=HOST, model="test-model", agent=None):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("pool,route", [("codex-pro", "official"), ("krill", "krill")])
 @pytest.mark.parametrize("limit", ["cap", "stop"])
-async def test_scoped_codex_limits_use_launch_pin(
+async def test_scoped_codex_limits_follow_an_explicit_route_pin(
     choice_env, db_uri, monkeypatch, pool, route, limit
 ):
     from dataclasses import replace
 
-    from omnigent.server.session_choice import parse_session_choice
-    from omnigent.server.session_choice_preview import candidate_preview
     from omnigent.server.session_choice_runtime import (
         release_choice,
         session_identity,
@@ -1051,15 +1131,16 @@ async def test_scoped_codex_limits_use_launch_pin(
         lambda *a, **kw: "codex-native",
     )
     catalogs = HostModelCatalogCacheStore(db_uri)
-    catalogs.upsert(HOST, "codex-native", [{"id": "gpt-example"}], int(time.time()))
     env.app.state.host_model_catalog_cache_store = catalogs
-    link = {"agent": agent, "model": "gpt-example", "meter": pool}
+    link = {"agent": agent, "model": model}
     env.settings["presets"][0]["links"] = [link]
     env.settings["hosts"][HOST]["work"] = [[{"links": [link]}]]
+    catalogs.upsert(HOST, "codex-native", [{"id": "gpt-example"}, {"id": model}], int(time.time()))
     rule = {"id": "launch", "agent": agent, "model": model, "maxRunning": 1}
     if limit == "stop":
         rule["reserve"] = {"mode": "total", "window": "7d", "stopPct": 5}
-    # Plain scopes are exact IDs, not aliases for launches pinned to a route.
+    # Plain scopes are exact IDs, not aliases for launches pinned to a route, and the
+    # router lists the pinned id itself so a pinned link validates from the host list.
     save_rules(
         env, [{"id": "plain", "agent": agent, "model": "gpt-example", "maxRunning": 9}, rule]
     )
@@ -1070,18 +1151,6 @@ async def test_scoped_codex_limits_use_launch_pin(
     assert first["model_override"] == receipt["model"] == model
     cap = receipt["effectiveLimits"]["maxRunning"]
     assert (receipt["outcome"], cap["sourceRuleId"], cap["runningCount"]) == ("pick", "launch", 0)
-    preview = await candidate_preview(
-        env.app,
-        RESERVED_USER_LOCAL,
-        HOST,
-        parse_session_choice(env.settings),
-        agent,
-        "gpt-example",
-    )
-    assert preview["candidate"]["model"] == model
-    assert preview["configuredInTiers"]
-    assert preview["effectiveLimits"]["maxRunning"]["sourceRuleId"] == "launch"
-    assert preview["check"]["reason"] == "busy"
     second_response = await create(env)
     assert second_response.status_code == 201, second_response.text
     second = second_response.json()
@@ -1127,6 +1196,117 @@ async def test_scoped_codex_limits_use_launch_pin(
         released = choice_record(env.store.get_conversation(second["id"]))
         assert released is not None
         assert released["model"] == model
+        assert released["effectiveLimits"]["maxRunning"]["sourceRuleId"] == "launch"
+        assert released["effectiveLimits"]["maxRunning"]["runningCount"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pool", ["codex-pro", "krill"])
+@pytest.mark.parametrize("limit", ["cap", "stop"])
+async def test_scoped_codex_limits_follow_a_plain_launch_model(
+    choice_env, db_uri, monkeypatch, pool, limit
+):
+    from dataclasses import replace
+
+    from omnigent.server.session_choice import parse_session_choice
+    from omnigent.server.session_choice_preview import candidate_preview
+    from omnigent.server.session_choice_runtime import (
+        release_choice,
+        session_identity,
+        stopped_line,
+    )
+    from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
+    from tests.server.test_agent_quota import usage_report
+
+    env = choice_env
+    agent = env.agents[0]["id"]
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._resolve_harness_impl",
+        lambda *a, **kw: "codex-native",
+    )
+    catalogs = HostModelCatalogCacheStore(db_uri)
+    catalogs.upsert(HOST, "codex-native", [{"id": "gpt-example"}], int(time.time()))
+    env.app.state.host_model_catalog_cache_store = catalogs
+    link = {"agent": agent, "model": "gpt-example", "meter": pool}
+    env.settings["presets"][0]["links"] = [link]
+    env.settings["hosts"][HOST]["work"] = [[{"links": [link]}]]
+    rule = {"id": "launch", "agent": agent, "model": "gpt-example", "maxRunning": 1}
+    if limit == "stop":
+        rule["reserve"] = {"mode": "total", "window": "7d", "stopPct": 5}
+    # A route-pinned scope is an exact ID, not an alias for a plain launch.
+    save_rules(env, [{"id": "pinned", "agent": agent, "model": "official/gpt-example"}, rule])
+    first_response = await create(env)
+    assert first_response.status_code == 201, first_response.text
+    first = first_response.json()
+    receipt = first["session_choice"]
+    assert first["model_override"] == receipt["model"] == "gpt-example"
+    cap = receipt["effectiveLimits"]["maxRunning"]
+    assert (receipt["outcome"], receipt["pool"], cap["sourceRuleId"]) == (
+        "pick",
+        pool,
+        "launch",
+    )
+    preview = await candidate_preview(
+        env.app,
+        RESERVED_USER_LOCAL,
+        HOST,
+        parse_session_choice(env.settings),
+        agent,
+        "gpt-example",
+    )
+    assert preview["candidate"]["model"] == "gpt-example"
+    assert preview["configuredInTiers"]
+    assert preview["effectiveLimits"]["maxRunning"]["sourceRuleId"] == "launch"
+    assert preview["check"]["reason"] == "busy"
+    second_response = await create(env)
+    assert second_response.status_code == 201, second_response.text
+    second = second_response.json()
+    assert second["session_choice"]["outcome"] == "hold"
+    assert second["session_choice"]["skipped"][0]["running"] == [first["id"]]
+    current = env.store.get_conversation(first["id"])
+    reported = replace(current, reported_model="gpt-example")
+    assert session_identity(env.app, reported).model == "gpt-example"
+    # Exercise the same report through the persisted snapshot and queue boundary.
+    env.store.update_conversation(first["id"], reported_model="gpt-example")
+    held = env.store.get_conversation(second["id"])
+    assert not await release_choice(env.app, held, HOST)
+    if limit == "stop":
+        now = time.time()
+        env.app.state.agent_quota_service.report_account(
+            RESERVED_USER_LOCAL,
+            pool,
+            usage_report(
+                account_product="codex",
+                observed_at=now,
+                windows=[
+                    {
+                        "id": "7d",
+                        "percent_used": 96,
+                        "window_minutes": 10080,
+                        "resets_at": now + 86400,
+                    }
+                ],
+            ),
+            now=now,
+        )
+        line = stopped_line(env.app, reported)
+        assert line is not None and line.state == "stop"
+        stopped = await create(env)
+        assert stopped.status_code == 201, stopped.text
+        choice = stopped.json()["session_choice"]
+        assert (choice["outcome"], choice["reason"], choice["model"]) == (
+            "hold",
+            "stop",
+            "gpt-example",
+        )
+        assert choice["effectiveLimits"]["reserve.stopPct"]["sourceRuleId"] == "launch"
+        assert not await release_choice(env.app, held, HOST)
+    else:
+        env.store.set_session_live_status(first["id"], "idle")
+        assert await release_choice(env.app, held, HOST)
+        released = choice_record(env.store.get_conversation(second["id"]))
+        assert released is not None
+        assert released["model"] == "gpt-example"
         assert released["effectiveLimits"]["maxRunning"]["sourceRuleId"] == "launch"
         assert released["effectiveLimits"]["maxRunning"]["runningCount"] == 0
 
