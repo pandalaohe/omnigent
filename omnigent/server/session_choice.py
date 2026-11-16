@@ -1217,7 +1217,6 @@ def choose(
                     break
         if survivors and settings.strategy == "drain":
             break
-    warnings: tuple[str, ...] = ()
 
     def candidate_view(link: Link) -> tuple[AgentQuota | None, UsageAccountView | None]:
         """The candidate's deciding-period quota and the shared pool reading."""
