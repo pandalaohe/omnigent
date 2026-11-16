@@ -8039,6 +8039,7 @@ async def _launch_runner_on_host_impl(
             conversation_store,
             host_registry,
             host_conn,
+            runner_router=router,
             caller=caller,
             request_id=request_id,
         )
@@ -8057,6 +8058,7 @@ async def _launch_runner_on_host_locked(
     host_registry: HostRegistry,
     host_conn: HostConnection,
     *,
+    runner_router: RunnerRouter | None = None,
     caller: str = "recovery",
     request_id: str | None = None,
 ) -> _HostLaunchAttempt:
@@ -8074,11 +8076,27 @@ async def _launch_runner_on_host_locked(
     binding_token = secrets.token_urlsafe(32)
     new_runner_id = token_bound_runner_id(binding_token)
 
-    bound_conv = await asyncio.to_thread(
-        conversation_store.replace_runner_id,
-        conv.id,
-        new_runner_id,
-    )
+    def replace_binding() -> Conversation:
+        return conversation_store.replace_runner_id(conv.id, new_runner_id, expected_binding=conv)
+
+    # Preparation above can yield while the old generation connects. Fence
+    # the write itself against connection admission, after every slow await.
+    if superseded_runner_id and runner_router is not None:
+        bound_conv = await asyncio.to_thread(
+            runner_router.run_if_runner_offline, superseded_runner_id, replace_binding
+        )
+        if bound_conv is None:
+            _log_runner_allocation(
+                conv.id,
+                caller=caller,
+                request_id=request_id,
+                old_runner_id=superseded_runner_id,
+                new_runner_id=superseded_runner_id,
+                action="reuse",
+            )
+            return _HostLaunchAttempt(runner_id=superseded_runner_id, acknowledged=True)
+    else:
+        bound_conv = await asyncio.to_thread(replace_binding)
     if bound_conv.runner_last_seen is not None:
         # The new token has not reached the host, so this stamp can only
         # belong to the previous runner. Clear it before launching.

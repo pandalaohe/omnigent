@@ -10,6 +10,7 @@ tunnel.
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -193,6 +194,10 @@ class RunnerRouter:
         self._agent_cache = agent_cache
         self._clients: dict[str, httpx.AsyncClient] = {}
         self._lock = threading.RLock()
+
+    def run_if_runner_offline[T](self, runner_id: str, operation: Callable[[], T]) -> T | None:
+        """Fence a binding write against admission of the old runner's connection."""
+        return self._registry.run_if_disconnected(runner_id, operation)
 
     def client_for_conversation(self, *, conversation_id: str, harness: str) -> RoutedRunner:
         """

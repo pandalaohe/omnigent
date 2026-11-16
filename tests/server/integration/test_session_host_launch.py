@@ -2963,14 +2963,16 @@ async def test_unbound_host_session_relaunch_names_no_superseded_runner(
     assert launch_frame.superseded_runner_ids == ()
 
 
-@pytest.mark.parametrize("connect_after_grace", [False, True])
+@pytest.mark.parametrize(
+    "connection_phase", ["pending_spawn", "before_allocate", "during_prepare", "during_replace"]
+)
 async def test_first_message_during_host_spawn_does_not_launch_replacement(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    connect_after_grace: bool,
+    connection_phase: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Drive real host status and server recovery while the initial spawn is paused."""
@@ -2988,6 +2990,11 @@ async def test_first_message_during_host_spawn_does_not_launch_replacement(
     status_started = asyncio.Event()
     replacement_seen = asyncio.Event()
     allocation_started = asyncio.Event()
+    preparation_started = asyncio.Event()
+    release_preparation = asyncio.Event()
+    replacement_started = asyncio.Event()
+    release_replacement = threading.Event()
+    connection_attempted = asyncio.Event()
     release_allocation = asyncio.Event()
     release_spawn = threading.Event()
     launch_frames: list[HostLaunchRunnerFrame] = []
@@ -3065,10 +3072,29 @@ async def test_first_message_during_host_spawn_does_not_launch_replacement(
 
     async def _allocate(*args: Any, **kwargs: Any) -> Any:
         allocation_started.set()
-        await release_allocation.wait()
+        if connection_phase == "before_allocate":
+            await release_allocation.wait()
         return await launch(*args, **kwargs)
 
-    if connect_after_grace:
+    admit_launch = app.state.host_registry.admit_launch
+
+    async def _admit(*args: Any, **kwargs: Any) -> Any:
+        if connection_phase == "during_prepare" and launch_frames:
+            preparation_started.set()
+            await release_preparation.wait()
+        return await admit_launch(*args, **kwargs)
+
+    replace_runner = SqlAlchemyConversationStore.replace_runner_id
+
+    def _replace(store: SqlAlchemyConversationStore, *args: Any, **kwargs: Any) -> Any:
+        if connection_phase == "during_replace" and not release_replacement.is_set():
+            loop.call_soon_threadsafe(replacement_started.set)
+            assert release_replacement.wait(budget(5.0)), "binding write was not released"
+        return replace_runner(store, *args, **kwargs)
+
+    monkeypatch.setattr(app.state.host_registry, "admit_launch", _admit)
+    monkeypatch.setattr(SqlAlchemyConversationStore, "replace_runner_id", _replace)
+    if connection_phase != "pending_spawn":
         monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.03)
         monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _allocate)
 
@@ -3091,6 +3117,7 @@ async def test_first_message_during_host_spawn_does_not_launch_replacement(
         )
     )
     post: asyncio.Task[httpx.Response] | None = None
+    registration: asyncio.Task[Any] | None = None
     try:
         await asyncio.wait_for(spawning.wait(), budget(10.0))
         initial = launch_frames[0]
@@ -3116,20 +3143,53 @@ async def test_first_message_during_host_spawn_does_not_launch_replacement(
         release_spawn.set()
         response = await asyncio.wait_for(create, budget(5.0))
         assert response.status_code == 201, response.text
-        if connect_after_grace:
+
+        async def connect() -> Any:
+            connection_attempted.set()
+            return await app.state.tunnel_registry.register_async(
+                runner_id, _NoopRunnerWS(), _runner_hello()
+            )
+
+        if connection_phase == "before_allocate":
             await asyncio.wait_for(allocation_started.wait(), budget(5.0))
+        elif connection_phase == "during_prepare":
+            await asyncio.wait_for(preparation_started.wait(), budget(5.0))
+        elif connection_phase == "during_replace":
+            await asyncio.wait_for(replacement_started.wait(), budget(5.0))
         else:
             await _wait_for_runner_connect_waiter(app, runner_id)
-        app.state.tunnel_registry.register(runner_id, _NoopRunnerWS(), _runner_hello())
+        registration = asyncio.create_task(connect())
+        if connection_phase == "during_replace":
+            await asyncio.wait_for(connection_attempted.wait(), budget(5.0))
+            assert not registration.done(), "connection overtook the binding commit"
+            assert (await client.get("/health")).status_code == 200
+            release_replacement.set()
+        await asyncio.wait_for(registration, budget(5.0))
         release_allocation.set()
+        release_preparation.set()
         response = await asyncio.wait_for(post, budget(5.0))
         assert response.status_code < 300, response.text
         conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
-        assert conv is not None and conv.runner_id == runner_id
-        assert len(launch_frames) == len(spawned) == 1
-        assert stop_frames == []
+        assert conv is not None
+        if connection_phase == "during_replace":
+            assert conv.runner_id != runner_id
+            await asyncio.to_thread(spawned[0].wait, timeout=budget(5.0))
+            await host._drain_runner_stop_tasks()
+            assert len(launch_frames) == len(spawned) == 2
+            assert list(host._runners) == [conv.runner_id]
+            assert spawned[0].poll() is not None and spawned[1].poll() is None
+            stopped = await host._handle_stop(
+                HostStopRunnerFrame(request_id="cleanup", runner_id=conv.runner_id)
+            )
+            assert stopped.status == "stopped"
+            assert not host._runners
+            assert all(proc.poll() is not None for proc in spawned)
+        else:
+            assert conv.runner_id == runner_id
+            assert len(launch_frames) == len(spawned) == 1
+            assert stop_frames == []
         assert forwarded.count(f"/v1/sessions/{session_id}/events") == 1
-        if connect_after_grace:
+        if connection_phase in {"before_allocate", "during_prepare"}:
             reused = [
                 record.attributes
                 for record in caplog.records
@@ -3169,11 +3229,14 @@ async def test_first_message_during_host_spawn_does_not_launch_replacement(
     finally:
         release_spawn.set()
         release_allocation.set()
-        for task in (create, post, serve):
+        release_preparation.set()
+        release_replacement.set()
+        for task in (create, post, serve, registration):
             if task is not None:
                 task.cancel()
         await asyncio.gather(
-            *(t for t in (create, post, serve) if t is not None), return_exceptions=True
+            *(t for t in (create, post, serve, registration) if t is not None),
+            return_exceptions=True,
         )
         await asyncio.gather(*host._frame_tasks, return_exceptions=True)
         await host._drain_runner_stop_tasks()
@@ -4718,9 +4781,11 @@ async def test_relaunch_recovers_only_a_rejected_enqueue(
     real_replace = store.replace_runner_id
     bound_runner_ids: list[str] = []
 
-    def record_binding(session_id: str, runner_id: str) -> Conversation:
+    def record_binding(
+        session_id: str, runner_id: str, *, expected_binding: Conversation | None = None
+    ) -> Conversation:
         bound_runner_ids.append(runner_id)
-        return real_replace(session_id, runner_id)
+        return real_replace(session_id, runner_id, expected_binding=expected_binding)
 
     async def replace_during_admission(conn: HostConnection, session_id: str) -> None:
         admissions.append(conn)

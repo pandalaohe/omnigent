@@ -93,6 +93,32 @@ def test_get_returns_none_for_unknown() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("write_fails", [False, True])
+async def test_offline_binding_write_releases_connection_on_success_or_failure(
+    write_fails: bool,
+) -> None:
+    reg = TunnelRegistry()
+    writes: list[str] = []
+
+    def write() -> str:
+        writes.append("binding")
+        if write_fails:
+            raise RuntimeError("binding write failed")
+        return "replacement"
+
+    if write_fails:
+        with pytest.raises(RuntimeError, match="binding write failed"):
+            await asyncio.to_thread(reg.run_if_disconnected, "r1", write)
+    else:
+        assert await asyncio.to_thread(reg.run_if_disconnected, "r1", write) == "replacement"
+
+    session = await asyncio.wait_for(reg.register_async("r1", _NoopWS(), _hello()), budget(1.0))
+    assert reg.get("r1") is session
+    assert await asyncio.to_thread(reg.run_if_disconnected, "r1", write) is None
+    assert writes == ["binding"]
+
+
+@pytest.mark.asyncio
 async def test_wait_for_runner_returns_existing_session_immediately() -> None:
     """Registered runners resolve without creating waiter state."""
     reg = TunnelRegistry()

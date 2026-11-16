@@ -319,6 +319,7 @@ class TunnelRegistry:
         self._on_work_dispatched = on_work_dispatched
         self._lock = threading.RLock()
         self._lifecycle_locks: WeakValueDictionary[str, RLockType] = WeakValueDictionary()
+        self._binding_updates: dict[str, threading.Event] = {}
 
     def note_work_dispatched(self, runner_id: str) -> None:
         """Report that a session event was just sent to *runner_id*; never raises.
@@ -362,8 +363,34 @@ class TunnelRegistry:
         self, runner_id: str, ws: WebSocketLike, hello: HelloFrame, *, owner: str | None = None
     ) -> RunnerSession:
         """Wait for this runner's inventory commit without blocking its route loop."""
-        async with self._lifecycle_update(runner_id):
-            return self.register(runner_id, ws, hello, owner=owner)
+        while True:
+            async with self._lifecycle_update(runner_id):
+                with self._lock:
+                    updating = runner_id in self._binding_updates
+                if not updating:
+                    return self.register(runner_id, ws, hello, owner=owner)
+            await asyncio.sleep(0.01)
+
+    def run_if_disconnected[T](self, runner_id: str, operation: Callable[[], T]) -> T | None:
+        """Run a worker-thread binding write before another connection is admitted."""
+        while True:
+            with self._lifecycle_lock(runner_id), self._lock:
+                if runner_id in self._sessions:
+                    return None
+                pending = self._binding_updates.get(runner_id)
+                if pending is None:
+                    pending = threading.Event()
+                    self._binding_updates[runner_id] = pending
+                    break
+            pending.wait()
+        try:
+            # No lifecycle lock spans DB work: inventory commits acquire DB
+            # locks first. The reservation delays only connection admission.
+            return operation()
+        finally:
+            with self._lifecycle_lock(runner_id), self._lock:
+                self._binding_updates.pop(runner_id, None)
+                pending.set()
 
     async def deregister_async(
         self, runner_id: str, session: RunnerSession | None = None, *, retire: bool = True
@@ -416,6 +443,8 @@ class TunnelRegistry:
             last_frame_monotonic=time.monotonic(),
         )
         with self._lifecycle_lock(runner_id), self._lock:
+            if runner_id in self._binding_updates:
+                raise ConnectionError("runner binding update in progress; retry registration")
             previous = self._latest_sessions.get(runner_id)
             if previous is not None:
                 previous.superseded = True
