@@ -131,6 +131,7 @@ def _multi_user_app(
         ),
         prefix="/v1",
     )
+    app.state.conversation_store = conversation_store
     return app
 
 

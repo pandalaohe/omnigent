@@ -890,12 +890,12 @@ async def test_default_agent_unready_harness_refused(
     assert "harness 'codex' is False" in message
 
 
-async def test_fresh_catalog_missing_default_model_refused(
+async def test_fresh_catalog_missing_default_model_warns_and_tries_unknown(
     calling_app: FastAPI,
     calling_client: httpx.AsyncClient,
     calling_seams: None,
 ) -> None:
-    """Scenario 11: a fresh catalog that lacks the default model refuses it."""
+    """A fresh catalog miss keeps the saved model and warns before launch."""
     calling_app.state.host_store.upsert_on_connect(HOST_WORKSTATION, "workstation", ALICE)
     calling_app.state.host_model_catalog_cache_store.upsert(
         HOST_WORKSTATION,
@@ -916,22 +916,26 @@ async def test_fresh_catalog_missing_default_model_refused(
         json={"project_id": project_id, "host_id": HOST_WORKSTATION, "workspace": "/work"},
         headers=_headers(),
     )
-    assert response.status_code == 400, response.text
-    message = response.json()["error"]["message"]
-    assert "Default model 'gpt-6-sol'" in message
-    assert "project 'project-alice@example.com' host settings" in message
-    assert f"host '{HOST_WORKSTATION}'" in message
-    assert "codex" in message
-    assert "last sync" in message
-    assert "Sync models" in message
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["model_override"] == "gpt-6-sol"
+    assert body["reasoning_effort"] == "high"
+    assert body["warnings"] == [
+        "gpt-6-sol is not in this host's model catalog; trying it as unknown. "
+        "Review Settings › Model references."
+    ]
+    assert {(note["setting"], note["outcome"]) for note in body["notes"]} == {
+        ("project_host", "missing"),
+        ("session", "missing"),
+    }
 
 
-async def test_fresh_catalog_missing_legacy_all_hosts_model_refused(
+async def test_fresh_catalog_missing_legacy_all_hosts_model_warns_and_tries_unknown(
     calling_app: FastAPI,
     calling_client: httpx.AsyncClient,
     calling_seams: None,
 ) -> None:
-    """The legacy All hosts row model is refused when the fresh catalog lacks it."""
+    """A legacy All hosts catalog miss keeps the saved model and warns."""
     calling_app.state.host_store.upsert_on_connect(HOST_WORKSTATION, "workstation", ALICE)
     calling_app.state.host_model_catalog_cache_store.upsert(
         HOST_WORKSTATION, "codex", [{"id": "gpt-5.5"}], 1700000000
@@ -945,12 +949,17 @@ async def test_fresh_catalog_missing_legacy_all_hosts_model_refused(
         json={"project_id": project_id, "host_id": HOST_WORKSTATION, "workspace": "/work"},
         headers=_headers(),
     )
-    assert response.status_code == 400, response.text
-    message = response.json()["error"]["message"]
-    assert "Default model 'gpt-6-sol'" in message
-    assert "All hosts row" in message
-    assert "is not offered by host" in message
-    assert "Sync models" in message
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["model_override"] == "gpt-6-sol"
+    assert body["warnings"] == [
+        "gpt-6-sol is not in this host's model catalog; trying it as unknown. "
+        "Review Settings › Model references."
+    ]
+    assert {(note["setting"], note["outcome"]) for note in body["notes"]} == {
+        ("project_legacy", "missing"),
+        ("session", "missing"),
+    }
 
 
 async def test_stale_catalog_does_not_block(
