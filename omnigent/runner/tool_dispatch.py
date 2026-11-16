@@ -2006,17 +2006,20 @@ async def _post_child_message_event(
             **({"created_by": actor} if actor is not None else {}),
         }
 
-    resp = await server_client.post(
-        f"{_session_url(session_id)}/events",
-        json=_payload(created_by),
-        headers={AGENT_SESSION_HEADER: "agent"},
-        # This message is gated at the recipient's REQUEST phase, which can
-        # PARK on a human ASK (e.g. session_cost_budget) up to the policy's
-        # ``ask_timeout``. A 30s read budget severed that park → fail-closed
-        # /retry → duplicate cards. Wait for the real verdict (one-day read
-        # budget, fast connect); a non-parking eval still returns immediately.
-        timeout=_ASK_GATE_DELIVERY_TIMEOUT,
-    )
+    async def post(actor: str | None) -> httpx.Response:
+        try:
+            return await server_client.post(
+                f"{_session_url(session_id)}/events",
+                json=_payload(actor),
+                headers={AGENT_SESSION_HEADER: "agent"},
+                # REQUEST policy may park for a human verdict; keep its existing
+                # transport lifetime rather than timing out and resending.
+                timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+            )
+        except httpx.TransportError as exc:
+            raise _ChildMessageDeliveryUnknown(session_id, input_id) from exc
+
+    resp = await post(created_by)
     if created_by is None or resp.status_code != 403:
         return resp
 
@@ -2024,12 +2027,7 @@ async def _post_child_message_event(
         "Child message POST attribution rejected for session=%s; retrying without actor",
         session_id,
     )
-    return await server_client.post(
-        f"{_session_url(session_id)}/events",
-        json=_payload(None),
-        headers={AGENT_SESSION_HEADER: "agent"},
-        timeout=_ASK_GATE_DELIVERY_TIMEOUT,
-    )
+    return await post(None)
 
 
 async def _send_to_in_flight_child(
@@ -4415,6 +4413,8 @@ async def _execute_subagent_tool(
             content=message_content,
             created_by=dispatch_created_by,
         )
+    except _ChildMessageDeliveryUnknown as exc:
+        return exc.handle()
     except httpx.HTTPError as exc:
         teardown_warning = await _teardown_failed_child(
             server_client,
@@ -5403,13 +5403,17 @@ async def _post_created_child_message(
     :returns: ``None`` on success; a short error description otherwise.
     """
     content: list[_JsonObject] = [{"type": "input_text", "text": message}]
+    input_id = uuid.uuid4().hex
     try:
         resp = await _post_child_message_event(
             server_client,
             child_session_id,
             content=content,
             created_by=None,
+            input_id=input_id,
         )
+    except _ChildMessageDeliveryUnknown:
+        raise
     except httpx.TimeoutException:
         raise
     except httpx.HTTPError as exc:
@@ -5424,7 +5428,10 @@ async def _post_created_child_message(
                     child_session_id,
                     content=content,
                     created_by=None,
+                    input_id=input_id,
                 )
+            except _ChildMessageDeliveryUnknown:
+                raise
             except httpx.TimeoutException:
                 raise
             except httpx.HTTPError as exc:
@@ -6012,14 +6019,25 @@ async def _complete_created_session(
                 registered_by="sys_session_create",
             )
             registration_error = await clear_registration_barrier()
-            post_error = (
-                registration_error
-                if registration_error is not None
-                else await _post_created_child_message(
-                    server_client, child_id, message, remote=remote
+            delivery_unknown = None
+            try:
+                post_error = (
+                    registration_error
+                    if registration_error is not None
+                    else await _post_created_child_message(
+                        server_client, child_id, message, remote=remote
+                    )
                 )
-            )
-            if post_error is not None:
+            except _ChildMessageDeliveryUnknown as exc:
+                delivery_unknown = exc
+                post_error = None
+            if delivery_unknown is not None:
+                initial_message = {
+                    "status": "pending",
+                    "error": "delivery_unknown",
+                    "input_id": delivery_unknown.input_id,
+                }
+            elif post_error is not None:
                 from omnigent.entities.subagent_terminal import TerminalEnvelope
 
                 _subagent_work.mark_subagent_work_terminal(

@@ -4039,10 +4039,12 @@ def test_subagent_read_tools_are_runner_local() -> None:
     ],
 )
 @pytest.mark.parametrize("runner_features", [None, "-peer_session_messaging"])
+@pytest.mark.parametrize("lost_response", [False, True])
 async def test_sys_session_send_reuses_existing_child_session(
     monkeypatch: pytest.MonkeyPatch,
     subagent_args: str | dict[str, str],
     runner_features: str | None,
+    lost_response: bool,
 ) -> None:
     """
     Re-sending to the same ``(agent, title)`` continues the existing child.
@@ -4110,6 +4112,8 @@ async def test_sys_session_send_reuses_existing_child_session(
             return httpx.Response(200, json={"ok": True})
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_existing/events":
             event_posts.append(json.loads(request.content))
+            if lost_response:
+                raise httpx.ReadTimeout("accepted message response lost", request=request)
             return httpx.Response(200, json={"ok": True})
         return httpx.Response(404, json={"error": str(request.url)})
 
@@ -4140,7 +4144,10 @@ async def test_sys_session_send_reuses_existing_child_session(
     payload = json.loads(output)
     assert create_posts == 0, "continuation must not create a duplicate child session"
     assert payload["conversation_id"] == "conv_existing"
-    assert payload["status"] == "launching"
+    assert payload["status"] == ("delivery_unknown" if lost_response else "launching")
+    assert len(event_posts) == 1
+    if lost_response:
+        assert payload["input_id"] == event_posts[0]["data"]["stable_id"]
     assert "continued ok" not in payload["message"]
     assert event_posts[0]["created_by"] == "bob@example.com"
     assert event_posts[0]["data"]["content"][0]["text"] == "continue"
@@ -17603,10 +17610,11 @@ async def test_sys_cancel_task_on_paneless_subagent_mirror_never_reports_cancell
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
-    [None, "message-post"],
+    [None, "message-post", "lost-response"],
     ids=[
         "message-sent",
         "message-failed",
+        "response-lost",
     ],
 )
 async def test_sys_session_create_first_message_delivery_failures(failure: str | None) -> None:
@@ -17661,6 +17669,8 @@ async def test_sys_session_create_first_message_delivery_failures(failure: str |
             return httpx.Response(200, json={"ok": True})
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
             posted.append(json.loads(request.content))
+            if failure == "lost-response":
+                raise httpx.ReadTimeout("accepted first input response lost", request=request)
             if failure == "message-post":
                 return httpx.Response(500, json={"error": "events unavailable"})
             return httpx.Response(202, json={"queued": True})
@@ -17695,6 +17705,13 @@ async def test_sys_session_create_first_message_delivery_failures(failure: str |
     )
     handle = json.loads(output)
     assert handle["conversation_id"] == "conv_child", output
+    if failure == "lost-response":
+        assert handle["initial_message"]["status"] == "pending"
+        assert handle["initial_message"]["error"] == "delivery_unknown"
+        assert handle["initial_message"]["input_id"] == posted[0]["data"]["stable_id"]
+        assert entry is not None and entry.status == "launching"
+        assert "Do not create a replacement" in handle["initial_message"]["guidance"]
+        return
     if failure is not None:
         assert handle["initial_message"]["status"] in {"failed", "pending"}, output
         assert "Do not create a replacement" in handle["initial_message"]["guidance"]
@@ -17720,6 +17737,7 @@ async def test_created_child_readiness_survives_old_budget(
 
     clock = [1000.0]
     posts = 0
+    input_ids = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         nonlocal posts
@@ -17727,6 +17745,7 @@ async def test_created_child_readiness_survives_old_budget(
             clock[0] += 121
             return httpx.Response(200, json={"runner_online": True})
         posts += 1
+        input_ids.append(json.loads(request.content)["data"]["stable_id"])
         if posts == 1:
             return httpx.Response(503)
         return httpx.Response(202, json={"queued": True})
@@ -17746,6 +17765,7 @@ async def test_created_child_readiness_survives_old_budget(
                 is None
             )
         assert posts == 2
+        assert len(set(input_ids)) == 1
         assert clock[0] == 1121.0
     finally:
         tool_dispatch._SESSION_START_DEADLINE.reset(token)
