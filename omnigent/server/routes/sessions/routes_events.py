@@ -3852,10 +3852,21 @@ def register_events_routes(
                 enabled=background_session_titles_enabled(request.headers),
             )
             if item_id is not None and not replayed and body.data.get("item_type") == "error":
-                from omnigent.server.session_choice_runtime import record_quota_exhaustion
+                from omnigent.server.session_choice_runtime import (
+                    observe_external_admission,
+                    record_quota_exhaustion,
+                )
 
                 error_data = body.data["item_data"]
                 if error_data.get("level") != "info":
+                    await observe_external_admission(
+                        request.app,
+                        conv,
+                        error_data["message"],
+                        actor=user_id,
+                        from_runner=_has_bound_runner_authority(request, conv),
+                        response_id=body.data.get("response_id"),
+                    )
                     await record_quota_exhaustion(
                         request.app,
                         conv,
@@ -4340,6 +4351,19 @@ def register_events_routes(
             # Surface the failure reason a native forwarder carries so a
             # top-level session sees it on its own status edge and persisted
             # last_task_error, not only the sub-agent parent-inbox path.
+            if not replayed and status in {"failed", "idle", "completed", "stopped", "killed"}:
+                from omnigent.server.session_choice_runtime import observe_external_admission
+
+                failure = body.data.get("failure_detail") or body.data.get("output")
+                await observe_external_admission(
+                    request.app,
+                    conv,
+                    failure if isinstance(failure, str) else None,
+                    actor=user_id,
+                    from_runner=_has_bound_runner_authority(request, conv),
+                    response_id=response_id,
+                    status=status,
+                )
             output = data.get("output")
             status_error: ErrorDetail | None = None
             if status == "failed" and isinstance(output, str) and output.strip():

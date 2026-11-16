@@ -49,6 +49,12 @@ from omnigent.server.session_choice import (
     state_for,
     tile_line,
 )
+from omnigent.server.session_choice_external import (
+    ExternalRefusal,
+    external_admission_for,
+    refusal_until,
+    route_states,
+)
 
 CHOICE_PROTOCOL_HEADER = "x-omnigent-session-choice"
 _logger = logging.getLogger(__name__)
@@ -116,10 +122,18 @@ def session_identity(app, session):
 
 
 def session_lines(app, session, settings, readings, products, floors, now):
+    from omnigent.runner.routing import routing_host_id
     from omnigent.server.session_collab import collab_owner_for
 
     owner = collab_owner_for(session, app.state.conversation_store, app.state.permission_store)
     groups = read_provider_groups(getattr(app.state, "user_preferences_store", None), owner)
+    host = (
+        routing_host_id(session, app.state.conversation_store)
+        if settings.external_admission
+        else None
+    )
+    if external_admission_for(settings, host, session.agent_id) is not None:
+        return None, ()
     floors = canonical_pool_values(floors, groups)
     tile = tile_of_session(
         session,
@@ -129,6 +143,7 @@ def session_lines(app, session, settings, readings, products, floors, now):
         agent_store=getattr(app.state, "agent_store", None),
         agent_cache=getattr(app.state, "agent_cache", None),
         groups=groups,
+        host=host,
     )
     if tile is None:
         return None, ()
@@ -218,10 +233,24 @@ def session_products(app, settings):
 
 
 def tile_of_session(
-    session, settings, readings, products, *, agent_store=None, agent_cache=None, groups=None
+    session,
+    settings,
+    readings,
+    products,
+    *,
+    agent_store=None,
+    agent_cache=None,
+    groups=None,
+    host=None,
+    enforcing=True,
 ):
     from omnigent.server.routes._sessions.helpers import _resolve_harness_impl, _resolve_llm_model
 
+    if (
+        enforcing
+        and external_admission_for(settings, host or session.host_id, session.agent_id) is not None
+    ):
+        return None
     product = agent_key_for_harness(
         _resolve_harness_impl(session, agent_store=agent_store, agent_cache=agent_cache)
     )
@@ -266,6 +295,7 @@ def tile_of_session(
 
 
 def stop_targets(app, owner, settings, readings, products, tiles, now, *, stopping=False):
+    from omnigent.runner.routing import routing_host_id
     from omnigent.server.session_collab import collab_owner_for
 
     store = app.state.conversation_store
@@ -302,6 +332,8 @@ def stop_targets(app, owner, settings, readings, products, tiles, now, *, stoppi
                     agent_store=getattr(app.state, "agent_store", None),
                     agent_cache=getattr(app.state, "agent_cache", None),
                     groups=groups,
+                    host=routing_host_id(session, store) if settings.external_admission else None,
+                    enforcing=stopping,
                 )
             if tile in result:
                 result[tile].append(session.id)
@@ -509,6 +541,116 @@ async def record_quota_exhaustion(
     state.quota_rejections.add(identity)
     key = (owner, pool)
     state.exhausted[key] = max(state.exhausted.get(key, 0), until)
+
+
+async def observe_external_admission(
+    app: Any,
+    session: Conversation,
+    message: str | None,
+    *,
+    actor: str | None,
+    from_runner: bool,
+    response_id: str | None,
+    status: str | None = None,
+) -> None:
+    """Stage error details; only an authenticated failed child turn excludes its link."""
+    from omnigent.runner.routing import routing_host_id
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.session_collab import collab_owner_for
+
+    if session.parent_conversation_id is None:
+        return
+    owner = await asyncio.to_thread(
+        collab_owner_for, session, app.state.conversation_store, app.state.permission_store
+    )
+    if not from_runner and (actor or RESERVED_USER_LOCAL) != owner:
+        return
+    settings = await asyncio.to_thread(
+        _read,
+        app,
+        owner,
+        "external admission",
+        lambda: choice_settings(app, owner),
+        SessionChoice(),
+    )
+    host = await asyncio.to_thread(routing_host_id, session, app.state.conversation_store)
+    rule = external_admission_for(settings, host, session.agent_id)
+    if rule is None:
+        return
+    now = time.time()
+    choice_state = state_for(app)
+    state = choice_state.external_admission
+    state.prune(now)
+    key = (session.id, response_id or "")
+    pending = state.pending.get(key) if response_id else None
+    if status is not None and status != "failed":
+        state.pending.pop(key, None)
+        return
+    identity = (
+        session.id,
+        "external:" + (response_id or hashlib.sha256((message or "").encode()).hexdigest()),
+    )
+    if identity in choice_state.quota_rejections:
+        return
+    until = refusal_until(message, rule, now) if message is not None else None
+    scope = (owner, rule.host, rule.agent)
+    if pending is not None and (pending.rule != rule or pending.scope != scope):
+        pending = None
+    if pending is None and until is not None:
+        groups = await asyncio.to_thread(
+            read_provider_groups, app.state.user_preferences_store, owner
+        )
+        readings, floors = await asyncio.to_thread(
+            external_route_inputs, app, owner, rule.host, now
+        )
+        states = (
+            route_states(rule, settings, readings, floors, now, groups)
+            if readings is not None and floors is not None
+            else None
+        )
+        pending = ExternalRefusal(scope, rule, until, states)
+    if identity in choice_state.quota_rejections:
+        return
+    if status is None:
+        if response_id and pending is not None:
+            state.pending.setdefault(key, pending)
+        return
+    state.pending.pop(key, None)
+    if pending is not None:
+        state.exclusions[scope] = pending
+        # Retain the receipt after expiry so redelivery cannot restart the window.
+        choice_state.quota_rejections.add(identity)
+
+
+def external_route_inputs(app, owner, host, now):
+    service = getattr(app.state, "agent_quota_service", None)
+    prefs = getattr(app.state, "user_preferences_store", None)
+    readings = _read(
+        app,
+        owner,
+        "external route quota",
+        lambda: service.pool_readings(QuotaContext(owner, host), now=now) if service else {},
+        None,
+    )
+    floors = _read(
+        app,
+        owner,
+        "external route floors",
+        lambda: prefs.choice_floor_off(owner) if prefs else {},
+        None,
+    )
+    return readings, floors
+
+
+def external_link_exclusions(app, settings, request, now):
+    state = state_for(app).external_admission
+    state.prune(now)
+    readings, floors = (
+        external_route_inputs(app, request.owner, request.host, now)
+        if any(scope[:2] == (request.owner, request.host) for scope in state.exclusions)
+        else (None, None)
+    )
+    return state.active(settings, request, readings, floors, now)
 
 
 def _read(app: Any, owner: str, name: str, operation: Any, default: Any):
@@ -739,7 +881,7 @@ def _context_request(
                 _resolve_harness_impl(target, agent_store=agents, agent_cache=cache)
             )
             differ_family = model_family(model or product or "")
-    return ChoiceRequest(
+    request = ChoiceRequest(
         owner,
         host,
         products,
@@ -758,6 +900,9 @@ def _context_request(
         quota_tiers=quota_tiers,
         quota_periods=quota_periods,
         provider_groups=groups,
+    )
+    return replace(
+        request, link_exclusions=external_link_exclusions(app, settings, request, time.time())
     )
 
 
@@ -1123,6 +1268,7 @@ async def admit_create(
                     "exhausted": "agent_exhausted",
                     "reserve": "agent_reserved",
                     "busy": "agent_busy",
+                    "excluded": "agent_excluded",
                 }.get(failure.why, failure.why)
                 raise HTTPException(
                     409,
