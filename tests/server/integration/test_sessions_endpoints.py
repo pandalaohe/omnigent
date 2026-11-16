@@ -7968,8 +7968,9 @@ async def test_codex_parked_success_cannot_erase_new_failure(
 
 @pytest.mark.parametrize("outcome", ["failed", "interrupted", "completed"])
 @pytest.mark.parametrize("missed_start", [False, True])
+@pytest.mark.parametrize("status_shape", ["string", "type", "status"])
 async def test_codex_resume_terminal_keeps_generation_fence(
-    client, tmp_path, monkeypatch, outcome, missed_start
+    client, tmp_path, monkeypatch, outcome, missed_start, status_shape
 ):
     from omnigent.harnesses.codex_native import forwarder as fwd
     from omnigent.harnesses.codex_native.bridge import (
@@ -8018,7 +8019,10 @@ async def test_codex_resume_terminal_keeps_generation_fence(
     current = read_bridge_state(tmp_path)
     assert current is not None
     write_bridge_state(tmp_path, replace(current, socket_path=str(tmp_path / "new.sock")))
-    b = {"id": "B", "status": outcome}
+    b = {
+        "id": "B",
+        "status": outcome if status_shape == "string" else {status_shape: outcome},
+    }
     if outcome == "failed":
         b["error"] = {"message": "recovered failure"}
     await fwd._post_resume_turn_status(
