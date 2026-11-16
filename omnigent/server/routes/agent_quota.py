@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 import zlib
@@ -18,6 +19,7 @@ from google.protobuf.json_format import ParseError
 from google.protobuf.message import DecodeError
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, ValidationError
 from sqlalchemy.exc import SQLAlchemyError, StatementError
+from starlette.requests import ClientDisconnect
 
 from omnigent.harness_plugins import native_agents
 from omnigent.quota_pace import accept_snapshot
@@ -53,6 +55,7 @@ _Period = Annotated[
     str, Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 ]
 _ACCOUNT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
+_logger = logging.getLogger(__name__)
 _OTLP_CONTENT = {
     "application/x-protobuf": {"schema": {"type": "string", "format": "binary"}},
     "application/json": {"schema": {"type": "object"}},
@@ -75,10 +78,14 @@ async def _usage_report_body(request: Request) -> tuple[Any, dict[str, Any] | No
     if media not in {"application/json", "application/cloudevents+json"}:
         raise HTTPException(415, "Expected JSON or a structured CloudEvent")
     data = bytearray()
-    async for chunk in request.stream():
-        if len(data) + len(chunk) > 1024 * 1024:
-            raise HTTPException(413, "Usage report is too large")
-        data.extend(chunk)
+    try:
+        async for chunk in request.stream():
+            if len(data) + len(chunk) > 1024 * 1024:
+                raise HTTPException(413, "Usage report is too large")
+            data.extend(chunk)
+    except ClientDisconnect:
+        _logger.warning("Usage upload disconnected after %d bytes", len(data))
+        raise HTTPException(499, "Usage upload disconnected") from None
     payload = json.loads(data)
     event = None
     if media == "application/cloudevents+json":
