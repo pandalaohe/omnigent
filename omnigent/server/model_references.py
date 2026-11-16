@@ -590,7 +590,7 @@ def check_model_references_sync(app: Any, owner: str, *, user_id: str | None) ->
         for ref in entity.references:
             if ref.manual:
                 if split_model_id(ref.model)[0] in groups or (
-                    ref.kind in {"manual_auth", "manual_cost_policy"}
+                    ref.kind in {"manual_auth", "manual_cost_policy", "manual_llm"}
                     and any(name in ref.model for name in groups)
                 ):
                     rows.append(

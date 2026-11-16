@@ -29,6 +29,7 @@ from omnigent.models.model_reference import (
     ProviderGroups,
     canonical_model,
     canonical_pool,
+    canonical_pool_values,
     resolve_saved_model,
 )
 
@@ -477,7 +478,7 @@ def pin_codex_link(link: Link, product: str | None) -> Link:
 def pool_of(link: Link, product: str | None, groups: ProviderGroups | None = None) -> str:
     return (
         codex_route_pool(link.model, product)
-        or link.meter
+        or (canonical_pool(link.meter, groups or {}) if link.meter else None)
         or f"{product or link.agent_id}:{canonical_model(link.model or '', groups or {})}"
     )
 
@@ -488,15 +489,8 @@ def pool_limits(
     pool = pool_of(link, product, groups)
     saved = link._model_resolution.saved if link._model_resolution else link.model
     raw_pool = pool_of(link.model_copy(update={"model": saved}), product)
-    if raw_pool in settings.limits:
-        return settings.limits[raw_pool]
-    return next(
-        (
-            settings.limits[key]
-            for key in sorted(settings.limits)
-            if canonical_pool(key, groups) == pool
-        ),
-        TileLimits(),
+    return canonical_pool_values(settings.limits, groups, preferred=raw_pool).get(
+        pool, TileLimits()
     )
 
 

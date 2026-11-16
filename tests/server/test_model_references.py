@@ -326,6 +326,38 @@ async def test_alias_edit_checks_its_revision_before_writing(references_env):
     assert env.prefs.get(OWNER)["settings"][ALIASES_NAMESPACE] == {"pairs": [["old", "new"]]}
 
 
+async def test_bare_gateway_model_tokens_are_listed_for_manual_review(references_env):
+    from tests._helpers.session import bundle_files
+
+    env = references_env
+    env.prefs.patch_namespace(OWNER, ALIASES_NAMESPACE, {"pairs": [["old", "new"]]})
+    bundle = bundle_files(
+        {
+            "config.yaml": (
+                b"spec_version: 1\nname: gateway-models\n"
+                b"llm:\n  model: old-model\n  fallback_models: [old-backup, unrelated]\n"
+                b"executor:\n  type: omnigent\n  model: new/x\n  config: {harness: codex}\n"
+            )
+        }
+    )
+    agent_id = uuid4().hex
+    location = bundle_location(agent_id, bundle)
+    env.app.state.artifact_store.put(location, bundle)
+    env.app.state.agent_store.create_user_agent(agent_id, "gateway-models", location, OWNER)
+    response = await env.client.get(URL)
+    assert response.status_code == 200, response.text
+    rows = [row for row in response.json()["rows"] if row["entity_id"] == agent_id]
+    assert {row["saved"] for row in rows} == {"old-model", "old-backup"}
+    assert all(row["manual"] and row["kind"] == "manual_llm" for row in rows)
+    replaced = await env.client.post(
+        URL + "/replace", json={"mode": "provider", "from": "old", "to": "new"}
+    )
+    assert replaced.status_code == 200, replaced.text
+    saved = env.app.state.agent_store.get(agent_id)
+    assert saved.bundle_location == location
+    assert env.app.state.artifact_store.get(location) == bundle
+
+
 async def test_legacy_and_explicit_create_values_resolve_and_missing_is_unknown(references_env):
     from omnigent.server.routes._session_create_validation import resolve_create_calling_stores
 

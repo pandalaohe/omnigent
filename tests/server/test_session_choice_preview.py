@@ -111,6 +111,38 @@ async def test_legacy_notice_keeps_quota_warning_across_provider_rename(preview_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("collision", [False, True])
+async def test_selection_preview_uses_saved_alias_limit(preview_env, collision):
+    env = preview_env
+    env.app.state.user_preferences_store.patch_namespace(
+        OWNER, "model_provider_aliases", {"pairs": [["old", "new"]]}
+    )
+    env.catalogs.upsert(HOST, "codex-native", [{"id": "new/model-x"}], int(time.time()))
+    link = {"agent": env.agent, "model": "old/model-x"}
+    limits = {"codex:old/model-x": {"maxRunning": 1}}
+    if collision:
+        limits["codex:new/model-x"] = {"maxRunning": 2}
+    response = await env.client.post(
+        URL + "/preview",
+        json={
+            "host_id": HOST,
+            "settings": {
+                "enabled": True,
+                "workTypes": [{"id": "work", "label": "Work"}],
+                "presets": [{"id": "one", "name": "One", "links": [link]}],
+                "hosts": {HOST: {"work": [[{"links": [link]}]]}},
+                "limits": limits,
+            },
+            "work_type": "work",
+        },
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["pool"] == "codex:new/model-x"
+    assert result["legacyChecks"]["limits"]["maxRunning"] == 1
+
+
+@pytest.mark.asyncio
 async def test_candidate_outside_tiers_explains_draft_and_preserves_saved_state(preview_env):
     env = preview_env
     state = state_for(env.app)

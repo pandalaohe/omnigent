@@ -4,6 +4,7 @@ import pytest
 
 from omnigent.models.model_reference import (
     canonical_model,
+    canonical_pool_values,
     equivalent_ids,
     provider_groups,
     resolve_saved_model,
@@ -27,6 +28,17 @@ def test_transitive_bidirectional_groups_and_canonical_identity():
     assert canonical_model("new/x/y", groups) == "middle/x/y"
     assert canonical_model("other/x", groups) == "other/x"
     assert equivalent_ids("plain", groups) == ("plain",)
+
+
+def test_pool_collisions_prefer_the_saved_key_then_the_first_raw_key():
+    groups = provider_groups([("old", "new")])
+    values = {"pi:old/x": 1, "pi:new/x": 2, "other": 3}
+    assert canonical_pool_values(values, groups) == {"pi:new/x": 2, "other": 3}
+    assert canonical_pool_values(values, groups, preferred="pi:old/x") == {
+        "pi:new/x": 1,
+        "other": 3,
+    }
+    assert values == {"pi:old/x": 1, "pi:new/x": 2, "other": 3}
 
 
 @pytest.mark.parametrize(

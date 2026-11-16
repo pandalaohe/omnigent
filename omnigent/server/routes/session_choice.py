@@ -195,13 +195,13 @@ def create_session_choice_router(
     async def preview(request: Request, body: ChoicePreview) -> dict[str, Any]:
         from omnigent.server.session_choice_preview import (
             candidate_preview,
-            explain_limits,
             read_preview_settings,
         )
         from omnigent.server.session_choice_runtime import (
             authorize_agents,
             context_request,
             inputs,
+            limit_receipt,
         )
         from omnigent.server.session_collab import collab_owner_for
 
@@ -288,20 +288,18 @@ def create_session_choice_router(
         )
         result: dict[str, Any] = {**choice.payload(), "mode": "selection", **metadata}
         if choice.link is not None:
-            result["legacyChecks"] = {
-                "pool": choice.pool,
-                "limits": settings.limits.get(choice.pool) if choice.pool is not None else None,
-                "linkMaxRunning": choice.link.max_running,
-            }
-            result["effectiveLimits"] = await asyncio.to_thread(
-                explain_limits,
-                settings,
-                choice.link,
-                choice_request,
-                running,
-                include_running=body.include_running,
-                load_sessions=request.app.state.conversation_store.get_conversations,
-                now=now,
+            result.update(
+                await asyncio.to_thread(
+                    limit_receipt,
+                    request.app,
+                    settings,
+                    saved["revision"],
+                    choice.link,
+                    choice_request,
+                    running,
+                    now,
+                    include_running=body.include_running,
+                )
             )
         if not body.include_running:
             for skipped in result["skipped"]:

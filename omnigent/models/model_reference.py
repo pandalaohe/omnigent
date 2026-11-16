@@ -79,6 +79,18 @@ def canonical_pool(pool: str, groups: ProviderGroups) -> str:
     return f"{product}:{canonical_model(model, groups)}" if separator else pool
 
 
+def canonical_pool_values[T](
+    values: Mapping[str, T], groups: ProviderGroups, *, preferred: str | None = None
+) -> dict[str, T]:
+    """Read one value per pool: the saved key wins, else the first raw key."""
+    result = {}
+    for key in sorted(values):
+        result.setdefault(canonical_pool(key, groups), values[key])
+    if preferred is not None and preferred in values:
+        result[canonical_pool(preferred, groups)] = values[preferred]
+    return result
+
+
 def resolve_saved_model(
     model: str,
     catalog: Collection[str] | None,

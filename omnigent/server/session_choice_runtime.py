@@ -15,7 +15,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from omnigent.entities import Conversation
-from omnigent.models.model_reference import canonical_model, canonical_pool
+from omnigent.models.model_reference import canonical_model, canonical_pool, canonical_pool_values
 from omnigent.runtime.instruction_layers import agent_key_for_harness
 from omnigent.server.agent_quota import QuotaContext
 from omnigent.server.model_resolution import read_provider_groups, usable_catalog
@@ -119,6 +119,7 @@ def session_lines(app, session, settings, readings, products, floors, now):
 
     owner = collab_owner_for(session, app.state.conversation_store, app.state.permission_store)
     groups = read_provider_groups(getattr(app.state, "user_preferences_store", None), owner)
+    floors = canonical_pool_values(floors, groups)
     tile = tile_of_session(
         session,
         settings,
@@ -171,7 +172,11 @@ def session_lines(app, session, settings, readings, products, floors, now):
             agent_cache=getattr(app.state, "agent_cache", None),
             groups=groups,
         )
-        legacy_limits = settings.limits.get(legacy_tile)
+        legacy_limits = (
+            canonical_pool_values(settings.limits, groups).get(legacy_tile)
+            if legacy_tile is not None
+            else None
+        )
         legacy_lines = (
             (
                 (
@@ -181,7 +186,7 @@ def session_lines(app, session, settings, readings, products, floors, now):
                     ),
                 ),
             )
-            if legacy_limits is not None
+            if legacy_tile is not None and legacy_limits is not None
             else ()
         )
         if any(line.state == "stop" for _, line in legacy_lines):
@@ -421,10 +426,13 @@ async def enforce_stop_lines(app):
                     app.state.agent_quota_service.pool_readings, QuotaContext(owner, None), now=now
                 )
                 floors = await asyncio.to_thread(prefs.choice_floor_off, owner)
+                groups = await asyncio.to_thread(read_provider_groups, prefs, owner)
+                limits = canonical_pool_values(settings.limits, groups)
+                floors = canonical_pool_values(floors, groups)
                 stopped = {
                     tile
-                    for tile, limits in settings.limits.items()
-                    if tile_line(limits, readings.get(tile), floors.get(tile), now).state == "stop"
+                    for tile, cap in limits.items()
+                    if tile_line(cap, readings.get(tile), floors.get(tile), now).state == "stop"
                 }
                 if settings.schema_version == 2:
                     stopped.update(readings)
@@ -856,14 +864,11 @@ def inputs(app: Any, settings: SessionChoice, request: ChoiceRequest, now: float
         else {}
     )
     readings = state_for(app).quota_readings(request.owner, readings, now, request.provider_groups)
-    floors = {
-        canonical_pool(key, request.provider_groups): value
-        for key, value in sorted(floors.items(), reverse=True)
-    }
+    floors = canonical_pool_values(floors, request.provider_groups)
     return readings, running, floors
 
 
-def limit_receipt(app, settings, revision, link, request, running, now):
+def limit_receipt(app, settings, revision, link, request, running, now, *, include_running=False):
     from omnigent.server.session_choice_preview import explain_limits
 
     pool = pool_of(link, request.products.get(link.agent_id), request.provider_groups)
@@ -879,6 +884,7 @@ def limit_receipt(app, settings, revision, link, request, running, now):
             link,
             request,
             running,
+            include_running=include_running,
             now=now,
             load_sessions=app.state.conversation_store.get_conversations,
         ),
@@ -1045,9 +1051,17 @@ async def admit_create(
                 request = replace(request, products={**request.products, body.agent_id: product})
                 if pool is None:
                     pool = pool_of(link, product, request.provider_groups)
-            if pool is not None and any(item.meter == pool for item in ordered_links(settings)):
-                link = link.model_copy(update={"meter": pool})
-            cap = settings.limits[pool].max_running if pool in settings.limits else None
+            meter = next(
+                (
+                    item.meter
+                    for item in ordered_links(settings)
+                    if item.meter and canonical_pool(item.meter, request.provider_groups) == pool
+                ),
+                None,
+            )
+            if meter is not None:
+                link = link.model_copy(update={"meter": meter})
+            cap = pool_limits(settings, link, product, request.provider_groups).max_running
             if pool and not cap:
                 cap = next(
                     (

@@ -35,7 +35,7 @@ from omnigent.harness_availability import HARNESS_NEEDS_AUTH, reported_harness_a
 from omnigent.harness_capabilities import IntegrationMode
 from omnigent.harness_plugins import capability_for_harness
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
-from omnigent.server.model_resolution import resolve_catalog_model, usable_catalog
+from omnigent.server.model_resolution import ResolutionContext, read_provider_groups
 from omnigent.server.project_host_agents import resolve_project_host_template
 from omnigent.server.project_placement import default_host, host_roots
 from omnigent.server.routes._auth_helpers import require_user
@@ -304,13 +304,34 @@ def create_project_settings_router(
         project: Any,
         *,
         warnings: list[str],
-    ) -> tuple[dict[str, Any], dict[tuple[str, str], dict[str, Any]], list[Any], dict]:
+    ) -> tuple[
+        dict[str, Any],
+        dict[tuple[str, str], dict[str, Any]],
+        list[Any],
+        dict,
+        dict[str, ResolutionContext],
+    ]:
         owner = project.user_id or RESERVED_USER_LOCAL
         hosts = await asyncio.to_thread(host_store.list_hosts, owner)
         host_map = {host.host_id: host for host in hosts}
         catalogs = await asyncio.to_thread(catalog_store.list, list(host_map))
         master = await load_master(owner, user_preferences_store, warnings=warnings)
-        return host_map, {(row["host_id"], row["harness"]): row for row in catalogs}, hosts, master
+        groups = await asyncio.to_thread(read_provider_groups, user_preferences_store, owner)
+        models = {
+            host_id: ResolutionContext(
+                host_id,
+                {row["harness"]: row for row in catalogs if row["host_id"] == host_id},
+                groups,
+            )
+            for host_id in host_map
+        }
+        return (
+            host_map,
+            {(row["host_id"], row["harness"]): row for row in catalogs},
+            hosts,
+            master,
+            models,
+        )
 
     def agent_lookup(
         agent_id: str | None, owner: str, state: Any
@@ -348,7 +369,7 @@ def create_project_settings_router(
         harness_filter: str | None = None,
     ) -> dict[str, Any]:
         warnings: list[str] = []
-        host_map, catalog_map, hosts, master = await context(project, warnings=warnings)
+        host_map, catalog_map, hosts, master, models = await context(project, warnings=warnings)
         owner = project.user_id or RESERVED_USER_LOCAL
         agent_choices: list[dict[str, Any]] = []
         if agent_store is not None:
@@ -410,6 +431,12 @@ def create_project_settings_router(
                     master=master,
                     host_id=host.host_id,
                     agent_harness=agent_harness,
+                    model_resolver=models[host.host_id].resolve,
+                )
+                row_model = (
+                    resolution.model_resolution.row_id
+                    if resolution.model_resolution is not None
+                    else resolution.model
                 )
                 catalog = catalog_map.get((host.host_id, harness))
                 agent_name = agent_lookup(resolution.agent_id, owner, request.app.state)[1]
@@ -448,14 +475,14 @@ def create_project_settings_router(
                             "models": catalog["models"] if catalog is not None else [],
                             "efforts": sorted(
                                 (
-                                    _catalog_efforts(catalog["models"], resolution.model)
+                                    _catalog_efforts(catalog["models"], row_model)
                                     if catalog and isinstance(catalog.get("models"), list)
                                     else None
                                 )
                                 or efforts_for_harness(harness)
                                 or ()
                             ),
-                            "speed": _available_speed(harness, resolution.model, catalog),
+                            "speed": _available_speed(harness, row_model, catalog),
                             "permission": sorted(mode_values(harness, "permission", "default")),
                         },
                     }
@@ -508,7 +535,7 @@ def create_project_settings_router(
             )
         next_config, named = _apply_patch(project.config, body)
         warnings: list[str] = []
-        host_map, catalog_map, _hosts, master = await context(project, warnings=warnings)
+        host_map, catalog_map, _hosts, master, models = await context(project, warnings=warnings)
         owner = project.user_id or RESERVED_USER_LOCAL
         entry_change = body.host is not None and "workspace" in body.host.model_fields_set
         entry_host_id = body.host.host_id if body.host else None
@@ -602,9 +629,12 @@ def create_project_settings_router(
                 raise _invalid(
                     "project.model", "sync this host's model catalog before selecting a model"
                 )
-            if resolve_catalog_model(
-                next_config["model"], usable_catalog(catalog), {}, harness
-            ).outcome not in {"exact", "pinned"}:
+            if (
+                models[selected_host]
+                .resolve(harness, next_config["model"], "project_legacy")
+                .row_id
+                is None
+            ):
                 raise _invalid("project.model", "model is not offered by the selected host")
         if body.host and body.host.harnesses:
             for harness, patch in body.host.harnesses.items():
@@ -628,6 +658,12 @@ def create_project_settings_router(
                     master=master,
                     host_id=body.host.host_id,
                     agent_harness=agent_harness,
+                    model_resolver=models[body.host.host_id].resolve,
+                )
+                row_model = (
+                    resolved.model_resolution.row_id
+                    if resolved.model_resolution is not None
+                    else resolved.model
                 )
                 for field in supplied:
                     value = getattr(patch, field)
@@ -639,9 +675,12 @@ def create_project_settings_router(
                             raise _invalid(
                                 path, "sync this host's model catalog before selecting a model"
                             )
-                        if resolve_catalog_model(
-                            value, usable_catalog(catalog), {}, harness
-                        ).outcome not in {"exact", "pinned"}:
+                        if (
+                            models[body.host.host_id]
+                            .resolve(harness, value, "project_host")
+                            .row_id
+                            is None
+                        ):
                             raise _invalid(path, "model is not offered by this host")
                     elif field == "effort":
                         if resolved.model and (
@@ -653,11 +692,7 @@ def create_project_settings_router(
                         offered = (
                             _catalog_efforts(
                                 catalog["models"],
-                                resolve_catalog_model(
-                                    resolved.model, usable_catalog(catalog), {}, harness
-                                ).row_id
-                                if resolved.model
-                                else None,
+                                row_model,
                             )
                             if catalog
                             else None
@@ -667,7 +702,7 @@ def create_project_settings_router(
                     elif not valid_mode(value, harness, field, "default"):
                         raise _invalid(path, "mode is unavailable for this harness")
                     elif field == "speed" and value not in _available_speed(
-                        harness, resolved.model, catalog
+                        harness, row_model, catalog
                     ):
                         raise _invalid(path, "speed is unavailable for the selected model")
 
@@ -679,6 +714,7 @@ def create_project_settings_router(
                 master=master,
                 host_id=host_id,
                 agent_harness=lambda agent_id: agent_lookup(agent_id, owner, request.app.state)[0],
+                model_resolver=models[host_id].resolve,
             )
 
         # Clearing a model or editing All hosts can change several inherited rows.
@@ -694,6 +730,11 @@ def create_project_settings_router(
                     else None
                 )
                 catalog = catalog_map.get((host_id, harness))
+                row_model = (
+                    current.model_resolution.row_id
+                    if current.model_resolution is not None
+                    else current.model
+                )
                 for field in ("effort", "speed"):
                     value = getattr(current, field)
                     if value is None or (
@@ -704,16 +745,12 @@ def create_project_settings_router(
                         continue
                     if field == "effort":
                         offered = (
-                            (
-                                _catalog_efforts(catalog["models"], current.model)
-                                if catalog
-                                else None
-                            )
+                            (_catalog_efforts(catalog["models"], row_model) if catalog else None)
                             or efforts_for_harness(harness)
                             or ()
                         )
                     else:
-                        offered = _available_speed(harness, current.model, catalog)
+                        offered = _available_speed(harness, row_model, catalog)
                     if value not in offered:
                         raise _invalid(
                             f"calling_defaults.{host_id}.{harness}.{field}",
