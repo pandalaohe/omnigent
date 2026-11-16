@@ -6,6 +6,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
+import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { HelpTip } from "@/components/HelpTip";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { useHosts } from "@/hooks/useHosts";
@@ -186,22 +187,40 @@ function FolderFactsLine({
       )}
       {onUseRemote && chosenRemote && (
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          {facts.remotes.length > 1 && (
-            <select
-              className="rounded-md border bg-transparent px-2 py-1 text-sm outline-none disabled:cursor-not-allowed disabled:opacity-50"
-              data-testid={`${testId}-remote-select`}
-              aria-label="Remote to use"
-              value={chosenRemote.name}
-              onChange={(event) => setChosenRemoteName(event.target.value)}
-              disabled={disabled}
-            >
-              {facts.remotes.map((candidate) => (
-                <option key={candidate.name} value={candidate.name}>
-                  {candidate.name}
-                </option>
-              ))}
-            </select>
-          )}
+          {facts.remotes.length > 1 &&
+            (facts.remotes.length > COMBOBOX_OPTION_THRESHOLD ? (
+              <fieldset disabled={disabled} className="contents">
+                <div data-testid={`${testId}-remote-select`}>
+                  <Combobox
+                    mode="select"
+                    options={facts.remotes.map((candidate) => ({
+                      key: candidate.name,
+                      label: candidate.name,
+                      description: candidate.url,
+                    }))}
+                    value={chosenRemote.name}
+                    onValueChange={setChosenRemoteName}
+                    aria-label="Remote to use"
+                    className="h-auto w-48 rounded-none! bg-transparent p-0"
+                  />
+                </div>
+              </fieldset>
+            ) : (
+              <select
+                className="rounded-md border bg-transparent px-2 py-1 text-sm outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                data-testid={`${testId}-remote-select`}
+                aria-label="Remote to use"
+                value={chosenRemote.name}
+                onChange={(event) => setChosenRemoteName(event.target.value)}
+                disabled={disabled}
+              >
+                {facts.remotes.map((candidate) => (
+                  <option key={candidate.name} value={candidate.name}>
+                    {candidate.name}
+                  </option>
+                ))}
+              </select>
+            ))}
           <Button
             type="button"
             variant="ghost"
@@ -1061,24 +1080,47 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                   <label htmlFor={`${formId}-add-host`} className="block font-medium">
                     Host
                   </label>
-                  <select
-                    id={`${formId}-add-host`}
-                    className={inputClassName}
-                    data-testid="project-code-add-host"
-                    value={effectiveAddHostId}
-                    onChange={(event) => {
-                      setAddHostId(event.target.value);
-                      setAddFolder("");
-                      setAddFactsPath(null);
-                    }}
-                    disabled={pending}
-                  >
-                    {eligibleHosts.map((host) => (
-                      <option key={host.host_id} value={host.host_id}>
-                        {host.name}
-                      </option>
-                    ))}
-                  </select>
+                  {eligibleHosts.length > COMBOBOX_OPTION_THRESHOLD ? (
+                    <fieldset disabled={pending} className="contents">
+                      <div data-testid="project-code-add-host">
+                        <Combobox
+                          mode="select"
+                          options={eligibleHosts.map((host) => ({
+                            key: host.host_id,
+                            label: host.name,
+                            description: host.status === "online" ? undefined : "Offline",
+                          }))}
+                          value={effectiveAddHostId}
+                          onValueChange={(value) => {
+                            setAddHostId(value);
+                            setAddFolder("");
+                            setAddFactsPath(null);
+                          }}
+                          aria-label="Host"
+                          className="h-auto w-full rounded-none! bg-transparent p-0"
+                        />
+                      </div>
+                    </fieldset>
+                  ) : (
+                    <select
+                      id={`${formId}-add-host`}
+                      className={inputClassName}
+                      data-testid="project-code-add-host"
+                      value={effectiveAddHostId}
+                      onChange={(event) => {
+                        setAddHostId(event.target.value);
+                        setAddFolder("");
+                        setAddFactsPath(null);
+                      }}
+                      disabled={pending}
+                    >
+                      {eligibleHosts.map((host) => (
+                        <option key={host.host_id} value={host.host_id}>
+                          {host.name}
+                        </option>
+                      ))}
+                    </select>
+                  )}
                 </div>
                 <div className="space-y-1">
                   <label htmlFor={`${formId}-add-folder`} className="block font-medium">
@@ -1162,29 +1204,59 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
                           records its URL; it does not change Git remotes or configure pushing.
                         </HelpTip>
                       </label>
-                      <select
-                        id={`${formId}-add-remote`}
-                        className={inputClassName}
-                        data-testid="project-code-add-remote"
-                        value={addRemote?.name ?? ""}
-                        onChange={(event) => {
-                          const name = event.target.value;
-                          setAddRemoteName(name);
-                          if (!addNameEdited && addFacts.state === "ok") {
-                            const selected = addFacts.facts.remotes.find(
-                              (remote) => remote.name === name,
-                            );
-                            setAddName(repositoryNameFromUrl(selected?.url ?? "", addFolder));
-                          }
-                        }}
-                        disabled={pending || addFacts.facts.remotes.length === 0}
-                      >
-                        {addFacts.facts.remotes.map((remote) => (
-                          <option key={remote.name} value={remote.name}>
-                            {remote.name}
-                          </option>
-                        ))}
-                      </select>
+                      {addFacts.facts.remotes.length > COMBOBOX_OPTION_THRESHOLD ? (
+                        <fieldset
+                          disabled={pending || addFacts.facts.remotes.length === 0}
+                          className="contents"
+                        >
+                          <div data-testid="project-code-add-remote">
+                            <Combobox
+                              mode="select"
+                              options={addFacts.facts.remotes.map((remote) => ({
+                                key: remote.name,
+                                label: remote.name,
+                                description: remote.url,
+                              }))}
+                              value={addRemote?.name ?? ""}
+                              onValueChange={(name) => {
+                                setAddRemoteName(name);
+                                if (!addNameEdited && addFacts.state === "ok") {
+                                  const selected = addFacts.facts.remotes.find(
+                                    (remote) => remote.name === name,
+                                  );
+                                  setAddName(repositoryNameFromUrl(selected?.url ?? "", addFolder));
+                                }
+                              }}
+                              aria-label="Git remote"
+                              className="h-auto w-full rounded-none! bg-transparent p-0"
+                            />
+                          </div>
+                        </fieldset>
+                      ) : (
+                        <select
+                          id={`${formId}-add-remote`}
+                          className={inputClassName}
+                          data-testid="project-code-add-remote"
+                          value={addRemote?.name ?? ""}
+                          onChange={(event) => {
+                            const name = event.target.value;
+                            setAddRemoteName(name);
+                            if (!addNameEdited && addFacts.state === "ok") {
+                              const selected = addFacts.facts.remotes.find(
+                                (remote) => remote.name === name,
+                              );
+                              setAddName(repositoryNameFromUrl(selected?.url ?? "", addFolder));
+                            }
+                          }}
+                          disabled={pending || addFacts.facts.remotes.length === 0}
+                        >
+                          {addFacts.facts.remotes.map((remote) => (
+                            <option key={remote.name} value={remote.name}>
+                              {remote.name}
+                            </option>
+                          ))}
+                        </select>
+                      )}
                       {addFacts.facts.remotes.length === 0 && (
                         <p className="text-sm text-muted-foreground">
                           This folder has no git remotes.
@@ -1375,26 +1447,50 @@ export function ProjectCodeSection({ projectId }: { projectId: string }) {
         {addableHosts.length > 0 && (
           <label className="block space-y-1 text-sm">
             <span className="block font-medium">Add a host</span>
-            <select
-              className={inputClassName}
-              data-testid="project-code-add-host-picker"
-              value=""
-              onChange={(event) => {
-                const hostId = event.target.value;
-                if (hostId) {
-                  setExtraHostIds((current) =>
-                    current.includes(hostId) ? current : [...current, hostId],
-                  );
-                }
-              }}
-            >
-              <option value="">Add a host…</option>
-              {addableHosts.map((host) => (
-                <option key={host.host_id} value={host.host_id}>
-                  {host.name}
-                </option>
-              ))}
-            </select>
+            {addableHosts.length > COMBOBOX_OPTION_THRESHOLD ? (
+              <div data-testid="project-code-add-host-picker">
+                <Combobox
+                  mode="select"
+                  options={addableHosts.map((host) => ({
+                    key: host.host_id,
+                    label: host.name,
+                    description: host.status === "online" ? undefined : "Offline",
+                  }))}
+                  value=""
+                  onValueChange={(hostId) => {
+                    if (hostId) {
+                      setExtraHostIds((current) =>
+                        current.includes(hostId) ? current : [...current, hostId],
+                      );
+                    }
+                  }}
+                  placeholder="Add a host…"
+                  aria-label="Add a host"
+                  className="h-auto w-full rounded-none! bg-transparent p-0"
+                />
+              </div>
+            ) : (
+              <select
+                className={inputClassName}
+                data-testid="project-code-add-host-picker"
+                value=""
+                onChange={(event) => {
+                  const hostId = event.target.value;
+                  if (hostId) {
+                    setExtraHostIds((current) =>
+                      current.includes(hostId) ? current : [...current, hostId],
+                    );
+                  }
+                }}
+              >
+                <option value="">Add a host…</option>
+                {addableHosts.map((host) => (
+                  <option key={host.host_id} value={host.host_id}>
+                    {host.name}
+                  </option>
+                ))}
+              </select>
+            )}
           </label>
         )}
       </section>

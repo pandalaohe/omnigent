@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ExceptionList } from "@/components/ExceptionList";
 import { HelpTip } from "@/components/HelpTip";
 import { Button } from "@/components/ui/button";
+import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
 import { useAgentRegistry, type RegistryItem } from "@/hooks/useAgentRegistry";
 import { useSessionCollabPreferences } from "@/hooks/useSessionCollabPreferences";
@@ -305,24 +306,45 @@ export function QuotaPreferencesSettings() {
                 <div key={row.draftId} className="flex flex-wrap items-end gap-2">
                   <label className="grid gap-1 text-sm">
                     Agent
-                    <select
-                      aria-label={`Exception ${index + 1} agent`}
-                      className="h-9 max-w-full rounded border border-input bg-background px-2"
-                      value={row.agent}
-                      onChange={(event) => patch({ agent: event.target.value, model: undefined })}
-                    >
-                      <option value="" disabled>
-                        Choose an agent
-                      </option>
-                      {row.agent && !agent && (
-                        <option value={row.agent}>{row.agent} (unavailable)</option>
-                      )}
-                      {agents.data?.map((item) => (
-                        <option key={item.id} value={item.id}>
-                          {item.display_name}
+                    {(agents.data?.length ?? 0) > COMBOBOX_OPTION_THRESHOLD ? (
+                      <Combobox
+                        mode="select"
+                        options={[
+                          ...(row.agent && !agent
+                            ? [{ key: row.agent, label: `${row.agent} (unavailable)` }]
+                            : []),
+                          ...(agents.data ?? []).map((item) => ({
+                            key: item.id,
+                            label: item.display_name,
+                            description: item.name,
+                          })),
+                        ]}
+                        value={row.agent}
+                        onValueChange={(value) => patch({ agent: value, model: undefined })}
+                        placeholder="Choose an agent"
+                        aria-label={`Exception ${index + 1} agent`}
+                        className="h-auto max-w-full rounded-none! bg-transparent p-0"
+                      />
+                    ) : (
+                      <select
+                        aria-label={`Exception ${index + 1} agent`}
+                        className="h-9 max-w-full rounded border border-input bg-background px-2"
+                        value={row.agent}
+                        onChange={(event) => patch({ agent: event.target.value, model: undefined })}
+                      >
+                        <option value="" disabled>
+                          Choose an agent
                         </option>
-                      ))}
-                    </select>
+                        {row.agent && !agent && (
+                          <option value={row.agent}>{row.agent} (unavailable)</option>
+                        )}
+                        {agents.data?.map((item) => (
+                          <option key={item.id} value={item.id}>
+                            {item.display_name}
+                          </option>
+                        ))}
+                      </select>
+                    )}
                   </label>
                   <label className="grid gap-1 text-sm">
                     Model (optional)

@@ -4,6 +4,7 @@ import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable"
 import { ChoiceDragContext, ChoiceDraggable } from "./ChoiceDrag";
 import { insertAtAnchor } from "./choiceDrop";
 import { Button } from "@/components/ui/button";
+import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
@@ -91,6 +92,8 @@ function RuleFields({
   const agents = useAvailableAgents();
   const hosts = useHosts();
   const agent = agents.data?.find((item) => item.id === rule.agent);
+  const agentOptions = agents.data ?? [];
+  const hostOptions = hosts.data ?? [];
   const models = [
     ...new Set(
       catalogs
@@ -126,47 +129,96 @@ function RuleFields({
       <div className="grid gap-3 sm:grid-cols-3">
         <label className="grid min-w-0 gap-1 text-sm">
           Agent
-          <select
-            className={CHOICE_SELECT}
-            value={rule.agent}
-            onChange={(e) => onChange({ ...rule, agent: e.target.value })}
-          >
-            <option value="" disabled>
-              Choose an agent
-            </option>
-            {rule.agent && !agent && <option value={rule.agent}>{rule.agent} (unavailable)</option>}
-            {agents.data?.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.display_name}
+          {agentOptions.length > COMBOBOX_OPTION_THRESHOLD ? (
+            <Combobox
+              mode="select"
+              options={[
+                ...(rule.agent && !agent
+                  ? [{ key: rule.agent, label: `${rule.agent} (unavailable)` }]
+                  : []),
+                ...agentOptions.map((item) => ({
+                  key: item.id,
+                  label: item.display_name,
+                  description: item.name,
+                })),
+              ]}
+              value={rule.agent}
+              onValueChange={(value) => onChange({ ...rule, agent: value })}
+              placeholder="Choose an agent"
+              aria-label="Rule agent"
+              className="h-auto w-full rounded-none! bg-transparent p-0"
+            />
+          ) : (
+            <select
+              className={CHOICE_SELECT}
+              value={rule.agent}
+              onChange={(e) => onChange({ ...rule, agent: e.target.value })}
+            >
+              <option value="" disabled>
+                Choose an agent
               </option>
-            ))}
-          </select>
+              {rule.agent && !agent && (
+                <option value={rule.agent}>{rule.agent} (unavailable)</option>
+              )}
+              {agentOptions.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.display_name}
+                </option>
+              ))}
+            </select>
+          )}
           <span className="break-words text-muted-foreground">
             {agent?.display_name ?? rule.agent}
           </span>
         </label>
         <label className="grid min-w-0 gap-1 text-sm">
           Host
-          <select
-            className={CHOICE_SELECT}
-            value={rule.host ?? ""}
-            onChange={(e) => {
-              const next = { ...rule };
-              if (e.target.value) next.host = e.target.value;
-              else Reflect.deleteProperty(next, "host");
-              onChange(next);
-            }}
-          >
-            <option value="">All hosts</option>
-            {rule.host && !hosts.data?.some((item) => item.host_id === rule.host) && (
-              <option value={rule.host}>{rule.host} (unavailable)</option>
-            )}
-            {hosts.data?.map((item) => (
-              <option key={item.host_id} value={item.host_id}>
-                {item.name}
-              </option>
-            ))}
-          </select>
+          {hostOptions.length > COMBOBOX_OPTION_THRESHOLD ? (
+            <Combobox
+              mode="select"
+              options={[
+                { key: "__all__", label: "All hosts" },
+                ...(rule.host && !hostOptions.some((item) => item.host_id === rule.host)
+                  ? [{ key: rule.host, label: `${rule.host} (unavailable)` }]
+                  : []),
+                ...hostOptions.map((item) => ({
+                  key: item.host_id,
+                  label: item.name,
+                  description: item.status === "online" ? undefined : "Offline",
+                })),
+              ]}
+              value={rule.host ?? "__all__"}
+              onValueChange={(value) => {
+                const next = { ...rule };
+                if (value !== "__all__") next.host = value;
+                else Reflect.deleteProperty(next, "host");
+                onChange(next);
+              }}
+              aria-label="Rule host"
+              className="h-auto w-full rounded-none! bg-transparent p-0"
+            />
+          ) : (
+            <select
+              className={CHOICE_SELECT}
+              value={rule.host ?? ""}
+              onChange={(e) => {
+                const next = { ...rule };
+                if (e.target.value) next.host = e.target.value;
+                else Reflect.deleteProperty(next, "host");
+                onChange(next);
+              }}
+            >
+              <option value="">All hosts</option>
+              {rule.host && !hostOptions.some((item) => item.host_id === rule.host) && (
+                <option value={rule.host}>{rule.host} (unavailable)</option>
+              )}
+              {hostOptions.map((item) => (
+                <option key={item.host_id} value={item.host_id}>
+                  {item.name}
+                </option>
+              ))}
+            </select>
+          )}
           <span className="break-words text-muted-foreground">
             {hosts.data?.find((item) => item.host_id === rule.host)?.name ??
               rule.host ??

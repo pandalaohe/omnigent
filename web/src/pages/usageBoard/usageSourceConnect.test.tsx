@@ -8,6 +8,7 @@ import { usageBoardData } from "./usageBoardFixtures";
 import { CONNECT_SOURCES, buildConnectCommand, connectCommandPayload } from "./usageBoardConnect";
 import { sumUsage } from "./usageAmountData";
 import { sampleTotals, usageActivityFixture } from "./usageActivityFixtures";
+import { t } from "./usageText";
 
 afterEach(cleanup);
 
@@ -15,7 +16,8 @@ describe("source connection", () => {
   it("selects each source and shows its supported route or native instructions", () => {
     render(<UsageSourceConnect />);
     for (const source of CONNECT_SOURCES) {
-      fireEvent.change(screen.getByRole("combobox"), { target: { value: source } });
+      fireEvent.change(screen.getByRole("combobox"), { target: { value: t(source) } });
+      fireEvent.click(screen.getByRole("option", { name: t(source) }));
       if (source === "subscription")
         expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
       else {

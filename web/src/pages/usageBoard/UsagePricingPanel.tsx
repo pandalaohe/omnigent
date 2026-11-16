@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation } from "@/lib/routing";
 import { boardPath } from "@/lib/boardFrame";
 import { Button } from "@/components/ui/button";
+import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
 import type { UsageAccountView } from "./usageBoardData";
 import { usageJson } from "./usagePriceSourceData";
@@ -356,21 +357,39 @@ function PricingEditor({
       cards.length > 0 ? (
         <div className="usage-pricing-card-list">
           <Field label="Purchased card">
-            <select
-              value={card?.id ?? ""}
-              title={card ? `${card.name} · ${card.starts_on}` : "No saved cards"}
-              onChange={(event) => setSelected(event.target.value)}
-            >
-              {!cards.length ? (
-                <option value="">No saved cards</option>
-              ) : (
-                cards.map((item) => (
-                  <option value={item.id} key={item.id} title={`${item.name} · ${item.starts_on}`}>
-                    {item.name} · {item.starts_on}
-                  </option>
-                ))
-              )}
-            </select>
+            {cards.length > COMBOBOX_OPTION_THRESHOLD ? (
+              <Combobox
+                mode="select"
+                options={cards.map((item) => ({
+                  key: item.id,
+                  label: `${item.name} · ${item.starts_on}`,
+                }))}
+                value={card?.id ?? ""}
+                onValueChange={setSelected}
+                aria-label="Purchased card"
+                className="h-auto w-full rounded-none! bg-transparent p-0"
+              />
+            ) : (
+              <select
+                value={card?.id ?? ""}
+                title={card ? `${card.name} · ${card.starts_on}` : "No saved cards"}
+                onChange={(event) => setSelected(event.target.value)}
+              >
+                {!cards.length ? (
+                  <option value="">No saved cards</option>
+                ) : (
+                  cards.map((item) => (
+                    <option
+                      value={item.id}
+                      key={item.id}
+                      title={`${item.name} · ${item.starts_on}`}
+                    >
+                      {item.name} · {item.starts_on}
+                    </option>
+                  ))
+                )}
+              </select>
+            )}
           </Field>
           <Button variant="outline" size="sm" onClick={() => newCard()}>
             Add card
@@ -400,24 +419,42 @@ function PricingEditor({
               />
             </Field>
             <Field label="Account or pool" error={errors[prefix + "target_id"]}>
-              <select
-                value={target}
-                title={targets.find((item) => item.key === target)?.label ?? target}
-                onChange={(event) => {
-                  const [kind, id, parent] = JSON.parse(event.target.value) as [
-                    PricingCard["target_kind"],
-                    string,
-                    string | null,
-                  ];
-                  editCard({ target_kind: kind, target_id: id, parent_account_id: parent });
-                }}
-              >
-                {targets.map((item) => (
-                  <option value={item.key} key={item.key} title={item.label}>
-                    {item.label}
-                  </option>
-                ))}
-              </select>
+              {targets.length > COMBOBOX_OPTION_THRESHOLD ? (
+                <Combobox
+                  mode="select"
+                  options={targets}
+                  value={target}
+                  onValueChange={(value) => {
+                    const [kind, id, parent] = JSON.parse(value) as [
+                      PricingCard["target_kind"],
+                      string,
+                      string | null,
+                    ];
+                    editCard({ target_kind: kind, target_id: id, parent_account_id: parent });
+                  }}
+                  aria-label="Account or pool"
+                  className="h-auto w-full rounded-none! bg-transparent p-0"
+                />
+              ) : (
+                <select
+                  value={target}
+                  title={targets.find((item) => item.key === target)?.label ?? target}
+                  onChange={(event) => {
+                    const [kind, id, parent] = JSON.parse(event.target.value) as [
+                      PricingCard["target_kind"],
+                      string,
+                      string | null,
+                    ];
+                    editCard({ target_kind: kind, target_id: id, parent_account_id: parent });
+                  }}
+                >
+                  {targets.map((item) => (
+                    <option value={item.key} key={item.key} title={item.label}>
+                      {item.label}
+                    </option>
+                  ))}
+                </select>
+              )}
             </Field>
           </div>
           <div className="usage-pricing-two">
@@ -726,13 +763,27 @@ function AccountPriceTable({
       <h3 className="usage-card-title">Account model prices · USD / 1M</h3>
       {!accountId ? (
         <Field label="Price account">
-          <select value={parent} onChange={(event) => setSelectedAccount(event.target.value)}>
-            {accounts.map((account) => (
-              <option key={account.id} value={account.id}>
-                {account.display_name}
-              </option>
-            ))}
-          </select>
+          {accounts.length > COMBOBOX_OPTION_THRESHOLD ? (
+            <Combobox
+              mode="select"
+              options={accounts.map((account) => ({
+                key: account.id,
+                label: account.display_name,
+              }))}
+              value={parent}
+              onValueChange={setSelectedAccount}
+              aria-label="Price account"
+              className="h-auto w-full rounded-none! bg-transparent p-0"
+            />
+          ) : (
+            <select value={parent} onChange={(event) => setSelectedAccount(event.target.value)}>
+              {accounts.map((account) => (
+                <option key={account.id} value={account.id}>
+                  {account.display_name}
+                </option>
+              ))}
+            </select>
+          )}
         </Field>
       ) : null}
       <div className="usage-pricing-card-list">

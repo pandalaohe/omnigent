@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { CopyIcon, StarIcon, TrashIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import {
   Select,
   SelectTrigger,
@@ -298,30 +299,56 @@ export function HistoryTab() {
           return (
             <div key={key} className="mb-4 flex flex-wrap items-center justify-between gap-3">
               <span className="text-sm">{key === "days" ? "Keep pages for" : "Keep at most"}</span>
-              <Select
-                value={String(limits[key])}
-                disabled={!retention || places.busy || previewing}
-                onValueChange={(value) => void preview({ ...limits, [key]: Number(value) })}
-              >
-                <SelectTrigger
-                  aria-label={key === "days" ? "Keep pages for" : "Keep at most"}
-                  className="w-40"
+              {options.length > COMBOBOX_OPTION_THRESHOLD ? (
+                <fieldset disabled={!retention || places.busy || previewing} className="contents">
+                  <Combobox
+                    mode="select"
+                    options={[
+                      ...(!options.includes(limits[key])
+                        ? [
+                            {
+                              key: String(limits[key]),
+                              label: `Custom (${limits[key]} ${key === "days" ? "days" : "pages"})`,
+                            },
+                          ]
+                        : []),
+                      ...options.map((value, index) => ({
+                        key: String(value),
+                        label: names[index],
+                      })),
+                    ]}
+                    value={String(limits[key])}
+                    onValueChange={(value) => void preview({ ...limits, [key]: Number(value) })}
+                    aria-label={key === "days" ? "Keep pages for" : "Keep at most"}
+                    className="h-auto w-40 rounded-none! bg-transparent p-0"
+                  />
+                </fieldset>
+              ) : (
+                <Select
+                  value={String(limits[key])}
+                  disabled={!retention || places.busy || previewing}
+                  onValueChange={(value) => void preview({ ...limits, [key]: Number(value) })}
                 >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {!options.includes(limits[key]) && (
-                    <SelectItem value={String(limits[key])}>
-                      Custom ({limits[key]} {key === "days" ? "days" : "pages"})
-                    </SelectItem>
-                  )}
-                  {options.map((value, index) => (
-                    <SelectItem key={value} value={String(value)}>
-                      {names[index]}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+                  <SelectTrigger
+                    aria-label={key === "days" ? "Keep pages for" : "Keep at most"}
+                    className="w-40"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {!options.includes(limits[key]) && (
+                      <SelectItem value={String(limits[key])}>
+                        Custom ({limits[key]} {key === "days" ? "days" : "pages"})
+                      </SelectItem>
+                    )}
+                    {options.map((value, index) => (
+                      <SelectItem key={value} value={String(value)}>
+                        {names[index]}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
             </div>
           );
         })}

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { CopyIcon, PlugIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Combobox } from "@/components/ui/combobox";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   Dialog,
@@ -26,20 +27,17 @@ export function UsageSourceConnect({
     <div className="flex flex-col gap-3">
       <label className="flex flex-wrap items-center gap-2 text-sm">
         {t("sourceType")}
-        <select
-          className="min-h-9 max-w-full rounded-md border border-border bg-background px-2"
+        <Combobox
+          mode="select"
+          options={CONNECT_SOURCES.map((value) => ({ key: value, label: t(value) }))}
           value={source}
-          onChange={(event) => {
-            setSource(event.target.value as ConnectSource);
+          onValueChange={(value) => {
+            setSource(value as ConnectSource);
             setResult(null);
           }}
-        >
-          {CONNECT_SOURCES.map((value) => (
-            <option key={value} value={value}>
-              {t(value)}
-            </option>
-          ))}
-        </select>
+          aria-label={t("sourceType")}
+          className="h-auto w-56 max-w-full rounded-none! bg-transparent p-0"
+        />
       </label>
       <p className="text-xs leading-relaxed text-muted-foreground">{t(`${source}Help`)}</p>
       {source !== "subscription" ? (

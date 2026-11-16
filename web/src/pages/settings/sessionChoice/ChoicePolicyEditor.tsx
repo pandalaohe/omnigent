@@ -4,6 +4,7 @@ import { XIcon } from "lucide-react";
 import { HelpTip } from "@/components/HelpTip";
 import { applyPolicyDrop } from "./choicePolicyDrop";
 import { Button } from "@/components/ui/button";
+import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import type { Host } from "@/hooks/useHosts";
@@ -237,17 +238,31 @@ export function ChoicePolicyEditor({
             {document.workTypes.length > 0 && (
               <label className="flex flex-col gap-1 text-xs">
                 Default work type
-                <select
-                  className={CHOICE_SELECT}
-                  value={document.defaultWorkType ?? document.workTypes[0].id}
-                  onChange={(e) => change({ ...document, defaultWorkType: e.target.value })}
-                >
-                  {document.workTypes.map((w) => (
-                    <option key={w.id} value={w.id}>
-                      {w.label}
-                    </option>
-                  ))}
-                </select>
+                {document.workTypes.length > COMBOBOX_OPTION_THRESHOLD ? (
+                  <Combobox
+                    mode="select"
+                    options={document.workTypes.map((item) => ({
+                      key: item.id,
+                      label: item.label,
+                    }))}
+                    value={document.defaultWorkType ?? document.workTypes[0].id}
+                    onValueChange={(value) => change({ ...document, defaultWorkType: value })}
+                    aria-label="Default work type"
+                    className="h-auto w-full rounded-none! bg-transparent p-0"
+                  />
+                ) : (
+                  <select
+                    className={CHOICE_SELECT}
+                    value={document.defaultWorkType ?? document.workTypes[0].id}
+                    onChange={(e) => change({ ...document, defaultWorkType: e.target.value })}
+                  >
+                    {document.workTypes.map((w) => (
+                      <option key={w.id} value={w.id}>
+                        {w.label}
+                      </option>
+                    ))}
+                  </select>
+                )}
               </label>
             )}
           </div>
@@ -324,31 +339,63 @@ export function ChoicePolicyEditor({
                 </label>
                 <div className="flex flex-wrap items-center gap-1.5 text-xs">
                   <span>Copy</span>
-                  <select
-                    aria-label="Copy from host"
-                    className={CHOICE_SELECT}
-                    value={copyHost || host}
-                    onChange={(e) => setCopyHost(e.target.value)}
-                  >
-                    {hosts.map((h) => (
-                      <option key={h.host_id} value={h.host_id}>
-                        {h.name}
-                      </option>
-                    ))}
-                  </select>
-                  <select
-                    aria-label="Copy from work type"
-                    className={CHOICE_SELECT}
-                    value={copyWork || work.id}
-                    onChange={(e) => setCopyWork(e.target.value)}
-                  >
-                    <option value="*">All work types</option>
-                    {document.workTypes.map((w) => (
-                      <option key={w.id} value={w.id}>
-                        {w.label}
-                      </option>
-                    ))}
-                  </select>
+                  {hosts.length > COMBOBOX_OPTION_THRESHOLD ? (
+                    <Combobox
+                      mode="select"
+                      options={hosts.map((item) => ({
+                        key: item.host_id,
+                        label: item.name,
+                        description: item.status === "online" ? undefined : "Offline",
+                      }))}
+                      value={copyHost || host}
+                      onValueChange={setCopyHost}
+                      aria-label="Copy from host"
+                      className="h-auto w-44 rounded-none! bg-transparent p-0"
+                    />
+                  ) : (
+                    <select
+                      aria-label="Copy from host"
+                      className={CHOICE_SELECT}
+                      value={copyHost || host}
+                      onChange={(e) => setCopyHost(e.target.value)}
+                    >
+                      {hosts.map((h) => (
+                        <option key={h.host_id} value={h.host_id}>
+                          {h.name}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  {document.workTypes.length > COMBOBOX_OPTION_THRESHOLD ? (
+                    <Combobox
+                      mode="select"
+                      options={[
+                        { key: "*", label: "All work types" },
+                        ...document.workTypes.map((item) => ({
+                          key: item.id,
+                          label: item.label,
+                        })),
+                      ]}
+                      value={copyWork || work.id}
+                      onValueChange={setCopyWork}
+                      aria-label="Copy from work type"
+                      className="h-auto w-44 rounded-none! bg-transparent p-0"
+                    />
+                  ) : (
+                    <select
+                      aria-label="Copy from work type"
+                      className={CHOICE_SELECT}
+                      value={copyWork || work.id}
+                      onChange={(e) => setCopyWork(e.target.value)}
+                    >
+                      <option value="*">All work types</option>
+                      {document.workTypes.map((w) => (
+                        <option key={w.id} value={w.id}>
+                          {w.label}
+                        </option>
+                      ))}
+                    </select>
+                  )}
                   <span>to here</span>
                   <Button
                     variant="outline"

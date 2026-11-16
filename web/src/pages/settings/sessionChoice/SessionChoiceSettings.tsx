@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
+import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { useHosts } from "@/hooks/useHosts";
@@ -26,6 +27,53 @@ import { ChoiceConversion } from "./ChoiceConversion";
 import { choiceDocumentForSave, limitRuleErrors } from "./choiceLimitEdits";
 import { refreshChoiceConsumers, useChoicePreviewEpoch } from "./choiceInvalidation";
 import { choiceDocumentLinks, referencedChoicePools } from "./sessionChoiceEdits";
+
+function ReserveExemptWorkTypes({
+  tileId,
+  workTypes,
+  selected,
+  onToggle,
+}: {
+  tileId: string;
+  workTypes: SessionChoiceDocument["workTypes"];
+  selected: readonly string[];
+  onToggle: (id: string, checked: boolean) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const visible = workTypes.filter((work) =>
+    `${work.label} ${work.id}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()),
+  );
+  return (
+    <div className="mt-1 space-y-1.5">
+      {workTypes.length > COMBOBOX_OPTION_THRESHOLD && (
+        <>
+          <Input
+            aria-label={`Search exempt work types for ${tileId}`}
+            placeholder="Search work types"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+          <p className="text-xs text-muted-foreground">
+            Showing {visible.length} of {workTypes.length}
+          </p>
+        </>
+      )}
+      <div className="flex max-h-48 flex-wrap gap-2 overflow-auto">
+        {visible.map((work) => (
+          <label key={work.id} className="flex items-center gap-1 text-xs">
+            <input
+              type="checkbox"
+              checked={selected.includes(work.id)}
+              onChange={(event) => onToggle(work.id, event.target.checked)}
+            />
+            {work.label}
+          </label>
+        ))}
+      </div>
+      {visible.length === 0 && <p className="text-xs text-muted-foreground">No matches.</p>}
+    </div>
+  );
+}
 
 export function SessionChoiceSettings() {
   const info = useServerInfo();
@@ -196,6 +244,7 @@ export function SessionChoiceSettings() {
     agents.isPlaceholderData || agents.isPending ? [] : (agents.data ?? []),
     meters.data?.products ?? {},
   );
+  const availablePoolIds = [...referencedPools].filter((id) => !Object.hasOwn(draft.limits, id));
   return (
     <section className="space-y-4" aria-label="Session choice settings">
       <fieldset disabled={saving} className="min-w-0 space-y-4">
@@ -219,20 +268,39 @@ export function SessionChoiceSettings() {
           </label>
           <label className="flex items-center gap-2 text-sm">
             Host
-            <select
-              className="h-9 max-w-56 rounded-md border border-input bg-background px-2 text-sm"
-              value={host}
-              onChange={(event) => setHost(event.target.value)}
-            >
-              <option value="" disabled>
-                Choose a host
-              </option>
-              {hostIds.map((id) => (
-                <option key={id} value={id}>
-                  {hosts.data?.find((item) => item.host_id === id)?.name ?? id}
+            {hostIds.length > COMBOBOX_OPTION_THRESHOLD ? (
+              <Combobox
+                mode="select"
+                options={hostIds.map((id) => ({
+                  key: id,
+                  label: hosts.data?.find((item) => item.host_id === id)?.name ?? id,
+                  description:
+                    hosts.data?.find((item) => item.host_id === id)?.status === "offline"
+                      ? "Offline"
+                      : undefined,
+                }))}
+                value={host}
+                onValueChange={setHost}
+                placeholder="Choose a host"
+                aria-label="Host"
+                className="h-auto w-56 max-w-full rounded-none! bg-transparent p-0"
+              />
+            ) : (
+              <select
+                className="h-9 max-w-56 rounded-md border border-input bg-background px-2 text-sm"
+                value={host}
+                onChange={(event) => setHost(event.target.value)}
+              >
+                <option value="" disabled>
+                  Choose a host
                 </option>
-              ))}
-            </select>
+                {hostIds.map((id) => (
+                  <option key={id} value={id}>
+                    {hosts.data?.find((item) => item.host_id === id)?.name ?? id}
+                  </option>
+                ))}
+              </select>
+            )}
           </label>
         </div>
         {!draft.workTypes.length && (
@@ -349,23 +417,39 @@ export function SessionChoiceSettings() {
           </summary>
           <label className="mt-3 flex flex-wrap items-center gap-2 text-sm">
             Add legacy pool limit
-            <select
-              aria-label="Add legacy pool limit"
-              className="h-9 max-w-full rounded border border-input bg-background px-2"
-              value=""
-              onChange={(event) => {
-                if (event.target.value) limit(event.target.value, {});
-              }}
-            >
-              <option value="">Choose a quota counter</option>
-              {[...referencedPools]
-                .filter((id) => !Object.hasOwn(draft.limits, id))
-                .map((id) => (
+            {availablePoolIds.length > COMBOBOX_OPTION_THRESHOLD ? (
+              <Combobox
+                mode="select"
+                options={availablePoolIds.map((id) => ({
+                  key: id,
+                  label: meters.data?.meters.find((tile) => tile.id === id)?.display_name ?? id,
+                  description: id,
+                }))}
+                value=""
+                onValueChange={(value) => {
+                  if (value) limit(value, {});
+                }}
+                placeholder="Choose a quota counter"
+                aria-label="Add legacy pool limit"
+                className="h-auto w-64 max-w-full rounded-none! bg-transparent p-0"
+              />
+            ) : (
+              <select
+                aria-label="Add legacy pool limit"
+                className="h-9 max-w-full rounded border border-input bg-background px-2"
+                value=""
+                onChange={(event) => {
+                  if (event.target.value) limit(event.target.value, {});
+                }}
+              >
+                <option value="">Choose a quota counter</option>
+                {availablePoolIds.map((id) => (
                   <option key={id} value={id}>
                     {meters.data?.meters.find((tile) => tile.id === id)?.display_name ?? id}
                   </option>
                 ))}
-            </select>
+              </select>
+            )}
           </label>
           {!Object.keys(draft.limits).length && (
             <p className="mt-2 text-sm text-muted-foreground">
@@ -508,38 +592,70 @@ export function SessionChoiceSettings() {
                               </select>
                               {reserve && (
                                 <>
-                                  <select
-                                    aria-label={`${tile.display_name} reserve window`}
-                                    className="h-8 min-w-40 max-w-full rounded border border-input bg-background px-1"
-                                    title={reserve.window || "Choose a reported quota window"}
-                                    value={reserve.window}
-                                    onChange={(event) =>
-                                      updateReserve({ window: event.target.value })
-                                    }
-                                  >
-                                    <option value="" disabled>
-                                      Choose a quota window
-                                    </option>
-                                    {windowIds.map((id) => {
-                                      const reported = tile.windows.find((item) => item.id === id);
-                                      const reason = !reported
-                                        ? "Not reported by this meter"
-                                        : reserve.mode === "daily" &&
-                                            (reported.window_minutes ?? 0) < 1440
-                                          ? "Daily needs a window of at least 24 hours"
-                                          : null;
-                                      return (
-                                        <option
-                                          key={id}
-                                          value={id}
-                                          disabled={Boolean(reason)}
-                                          title={reason ?? undefined}
-                                        >
-                                          {id}
-                                        </option>
-                                      );
-                                    })}
-                                  </select>
+                                  {windowIds.length > COMBOBOX_OPTION_THRESHOLD ? (
+                                    <Combobox
+                                      mode="select"
+                                      options={windowIds.map((id) => {
+                                        const reported = tile.windows.find(
+                                          (item) => item.id === id,
+                                        );
+                                        const reason = !reported
+                                          ? "Not reported by this meter"
+                                          : reserve.mode === "daily" &&
+                                              (reported.window_minutes ?? 0) < 1440
+                                            ? "Daily needs a window of at least 24 hours"
+                                            : undefined;
+                                        return {
+                                          key: id,
+                                          label: id,
+                                          description: reason,
+                                          disabled: Boolean(reason),
+                                        };
+                                      })}
+                                      value={reserve.window}
+                                      onValueChange={(windowId) =>
+                                        updateReserve({ window: windowId })
+                                      }
+                                      placeholder="Choose a quota window"
+                                      aria-label={`${tile.display_name} reserve window`}
+                                      className="h-auto min-w-40 max-w-full rounded-none! bg-transparent p-0"
+                                    />
+                                  ) : (
+                                    <select
+                                      aria-label={`${tile.display_name} reserve window`}
+                                      className="h-8 min-w-40 max-w-full rounded border border-input bg-background px-1"
+                                      title={reserve.window || "Choose a reported quota window"}
+                                      value={reserve.window}
+                                      onChange={(event) =>
+                                        updateReserve({ window: event.target.value })
+                                      }
+                                    >
+                                      <option value="" disabled>
+                                        Choose a quota window
+                                      </option>
+                                      {windowIds.map((id) => {
+                                        const reported = tile.windows.find(
+                                          (item) => item.id === id,
+                                        );
+                                        const reason = !reported
+                                          ? "Not reported by this meter"
+                                          : reserve.mode === "daily" &&
+                                              (reported.window_minutes ?? 0) < 1440
+                                            ? "Daily needs a window of at least 24 hours"
+                                            : null;
+                                        return (
+                                          <option
+                                            key={id}
+                                            value={id}
+                                            disabled={Boolean(reason)}
+                                            title={reason ?? undefined}
+                                          >
+                                            {id}
+                                          </option>
+                                        );
+                                      })}
+                                    </select>
+                                  )}
                                   <span className="basis-full break-all text-xs text-muted-foreground">
                                     Window: {reserve.window || "None selected"}. Unavailable options
                                     are disabled: this meter must report the window; Daily needs at
@@ -599,29 +715,18 @@ export function SessionChoiceSettings() {
                                 <summary className="cursor-pointer text-xs text-muted-foreground">
                                   Exempt work types
                                 </summary>
-                                <div className="mt-1 flex flex-wrap gap-2">
-                                  {draft.workTypes.map((work) => (
-                                    <label
-                                      key={work.id}
-                                      className="flex items-center gap-1 text-xs"
-                                    >
-                                      <input
-                                        type="checkbox"
-                                        checked={limits.reserveExempt?.includes(work.id) ?? false}
-                                        onChange={(event) =>
-                                          limit(tile.id, {
-                                            reserveExempt: event.target.checked
-                                              ? [...(limits.reserveExempt ?? []), work.id]
-                                              : limits.reserveExempt?.filter(
-                                                  (id) => id !== work.id,
-                                                ),
-                                          })
-                                        }
-                                      />
-                                      {work.label}
-                                    </label>
-                                  ))}
-                                </div>
+                                <ReserveExemptWorkTypes
+                                  tileId={tile.id}
+                                  workTypes={draft.workTypes}
+                                  selected={limits.reserveExempt ?? []}
+                                  onToggle={(workId, checked) =>
+                                    limit(tile.id, {
+                                      reserveExempt: checked
+                                        ? [...(limits.reserveExempt ?? []), workId]
+                                        : limits.reserveExempt?.filter((id) => id !== workId),
+                                    })
+                                  }
+                                />
                               </details>
                             )}
                           </td>

@@ -17,6 +17,7 @@ import { detailLevel } from "./taskBoardRouteData";
 import type { BoardTask } from "./taskBoardData";
 import { MemoryRouter } from "react-router-dom";
 import { TaskBoardAttention } from "./TaskBoardAttention";
+import { PALETTES } from "@/lib/themePalette";
 
 beforeEach(() => localStorage.clear());
 afterEach(() => {
@@ -50,6 +51,20 @@ it("keeps the opening default separate from the current tab and resets display o
     refresh: 60,
     hiddenSources: [],
   });
+});
+it("uses searchable controls for display pickers above five options", () => {
+  render(
+    <TaskBoardDisplaySettings
+      preferences={boardDefaults}
+      update={vi.fn()}
+      storage="local"
+      sources={[]}
+      accounts={[]}
+    />,
+  );
+  const palette = screen.getByRole("combobox", { name: "Palette" });
+  fireEvent.click(palette);
+  expect(screen.getAllByRole("option")).toHaveLength(PALETTES.length);
 });
 it("explains malformed storage and retains a failed save for this visit", () => {
   localStorage.setItem(BOARD_PREFERENCES_KEY, "{");

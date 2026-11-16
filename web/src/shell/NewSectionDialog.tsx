@@ -5,6 +5,7 @@
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { Combobox } from "@/components/ui/combobox";
 import {
   Dialog,
   DialogContent,
@@ -124,18 +125,19 @@ export function NewSectionDialog({
             {kind === "recent" && (
               <label className="flex flex-col gap-1 text-ui">
                 Sessions shown
-                <select
-                  data-testid="new-section-count"
-                  className="h-8 rounded-lg border border-input bg-transparent px-2 text-ui"
-                  value={count}
-                  onChange={(event) => setCount(Number(event.target.value))}
-                >
-                  {RECENT_COUNT_OPTIONS.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
+                <div data-testid="new-section-count">
+                  <Combobox
+                    mode="select"
+                    options={RECENT_COUNT_OPTIONS.map((option) => ({
+                      key: String(option),
+                      label: String(option),
+                    }))}
+                    value={String(count)}
+                    onValueChange={(value) => setCount(Number(value))}
+                    aria-label="Sessions shown"
+                    className="h-auto w-full rounded-none! bg-transparent p-0"
+                  />
+                </div>
               </label>
             )}
           </div>

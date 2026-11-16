@@ -8,6 +8,7 @@ import { Link } from "@/lib/routing";
 import { LayeredEditor, LayeredEditorAction } from "@/components/LayeredEditor";
 import { LayeredOwn, LayeredTable } from "@/components/LayeredTable";
 import { Button } from "@/components/ui/button";
+import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -168,6 +169,24 @@ function AgentLayerEditor({
   const valid =
     !value ||
     (field === "model" ? !/\s/.test(value) : options.some((option) => option.value === value));
+  const selectOptions = [
+    {
+      key: "__inherit__",
+      label: `Use inherited${
+        inherited
+          ? ` (${options.find((option) => option.value === inherited)?.label ?? inherited})`
+          : ""
+      }`,
+    },
+    ...(value && !options.some((option) => option.value === value)
+      ? [{ key: value, label: `Unavailable (${value})`, disabled: true }]
+      : []),
+    ...options.map((option) => ({
+      key: option.value,
+      label: option.label,
+      description: option.description,
+    })),
+  ];
   return (
     <LayeredEditor
       trigger={trigger}
@@ -244,6 +263,15 @@ function AgentLayerEditor({
             value={value}
             placeholder={inherited || "Agent's default"}
             onChange={(event) => setValue(event.target.value.trim())}
+          />
+        ) : options.length > COMBOBOX_OPTION_THRESHOLD ? (
+          <Combobox
+            mode="select"
+            options={selectOptions}
+            value={value || "__inherit__"}
+            onValueChange={(next) => setValue(next === "__inherit__" ? "" : next)}
+            aria-label={FIELDS.find((item) => item.value === field)?.label ?? field}
+            className="h-auto rounded-none! bg-transparent p-0"
           />
         ) : (
           <Select

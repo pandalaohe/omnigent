@@ -3,6 +3,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { CompactMembership } from "@/components/CompactMembership";
+import { COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { Segmented } from "@/components/ui/segmented";
 import { resolveMulti, suggestMode, summarizeMulti, type MultiValue } from "@/lib/multiSelection";
 
@@ -60,7 +61,8 @@ export function SelectionList(props: Props) {
     except: props.mode === "multi" && props.value.mode === "except" ? props.value.ids : [],
   }));
   const showSearch =
-    props.searchThreshold === 0 || props.items.length > (props.searchThreshold ?? 8);
+    props.searchThreshold === 0 ||
+    props.items.length > (props.searchThreshold ?? COMBOBOX_OPTION_THRESHOLD);
   useEffect(() => {
     if (showSearch) searchRef.current?.focus();
   }, [showSearch]);

@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   defaultTerminalButtons,
+  MOBILE_ASSISTANT_ACTION_DEFINITIONS,
   readMobileAssistantPreferences,
   writeMobileAssistantPreferences,
 } from "@/lib/mobileAssistantPreferences";
@@ -19,6 +20,12 @@ import {
 import { collectLocalUserPreferences } from "@/lib/userPreferencesSync";
 
 vi.mock("sonner", () => ({ toast: vi.fn() }));
+
+function pickCombobox(label: string, query: string, option: string | RegExp) {
+  const input = screen.getByRole("combobox", { name: label });
+  fireEvent.change(input, { target: { value: query } });
+  fireEvent.click(screen.getByRole("option", { name: option }));
+}
 
 describe("MobileAssistantSettings", () => {
   beforeEach(() => {
@@ -207,7 +214,7 @@ describe("MobileAssistantSettings", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add button" }));
     fireEvent.change(screen.getByLabelText("Button label"), { target: { value: "Open" } });
     fireEvent.click(screen.getByRole("radio", { name: "Key combination" }));
-    fireEvent.change(screen.getByLabelText("Key"), { target: { value: "KeyT" } });
+    pickCombobox("Key", "T", "T");
     fireEvent.click(screen.getByRole("button", { name: "Ctrl" }));
     fireEvent.click(screen.getByRole("button", { name: "Save button" }));
 
@@ -221,11 +228,15 @@ describe("MobileAssistantSettings", () => {
     render(<MobileAssistantSettings />);
 
     fireEvent.click(screen.getByRole("button", { name: "Add button" }));
-    const select = screen.getByLabelText("Action from keyboard shortcuts");
-    const values = Array.from(select.querySelectorAll("option"), (option) => option.value);
+    fireEvent.click(screen.getByRole("combobox", { name: "Action from keyboard shortcuts" }));
+    const options = screen.getAllByRole("option").map((option) => option.textContent ?? "");
 
-    expect(values).not.toContain("recentSessions");
-    expect(values).toContain("newSession");
+    expect(options.some((option) => option.startsWith("Recent sessions"))).toBe(false);
+    expect(
+      options.some((option) =>
+        option.startsWith(MOBILE_ASSISTANT_ACTION_DEFINITIONS.newSession.label),
+      ),
+    ).toBe(true);
     expect(
       screen.getByText("Switch recent sessions is keyboard-only: it needs a held key."),
     ).toBeTruthy();
@@ -235,12 +246,15 @@ describe("MobileAssistantSettings", () => {
     render(<MobileAssistantSettings />);
 
     fireEvent.click(screen.getByRole("button", { name: "Add button" }));
-    const select = screen.getByLabelText("Action from keyboard shortcuts");
-    const values = Array.from(select.querySelectorAll("option"), (option) => option.value);
+    fireEvent.click(screen.getByRole("combobox", { name: "Action from keyboard shortcuts" }));
+    const options = screen.getAllByRole("option").map((option) => option.textContent ?? "");
 
-    expect(values).not.toContain("focusQuestionCard");
-    expect(values).not.toContain("questionCardNextOrSubmit");
-    expect(values).toContain("newSession");
+    expect(options.some((option) => option.toLowerCase().includes("question"))).toBe(false);
+    expect(
+      options.some((option) =>
+        option.startsWith(MOBILE_ASSISTANT_ACTION_DEFINITIONS.newSession.label),
+      ),
+    ).toBe(true);
   });
 
   it("shows the real circular order preview and persists icon and repeat", () => {
@@ -249,7 +263,7 @@ describe("MobileAssistantSettings", () => {
     expect(screen.getByTestId("mobile-assistant-circle-preview")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Edit ↑" }));
     fireEvent.click(screen.getByRole("radio", { name: "Icon" }));
-    fireEvent.change(screen.getByLabelText("Button icon"), { target: { value: "arrow-up" } });
+    pickCombobox("Button icon", "Arrow up", "Arrow up");
     expect(screen.getByLabelText("Repeat while held")).toHaveAttribute("aria-checked", "true");
     fireEvent.click(screen.getByRole("button", { name: "Save button" }));
 
@@ -280,7 +294,7 @@ describe("MobileAssistantSettings", () => {
     expect(screen.getByText(/Top row · 1 page/)).toBeTruthy();
     expect(screen.getByText(/Bottom row · 2 pages/)).toBeTruthy();
     fireEvent.click(screen.getAllByRole("button", { name: "Add key" }).at(-1)!);
-    fireEvent.change(screen.getByLabelText("More keys"), { target: { value: "KeyR" } });
+    pickCombobox("More keys", "R", /^R\s*Letters/);
     fireEvent.click(screen.getByRole("button", { name: "Ctrl" }));
     fireEvent.click(screen.getByRole("button", { name: "Shift" }));
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
@@ -329,7 +343,7 @@ describe("MobileAssistantSettings", () => {
     fireEvent.click(screen.getByRole("button", { name: "Ctrl" }));
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
     expect(screen.getByText(/Not supported in terminals/)).toBeVisible();
-    fireEvent.change(screen.getByLabelText("More keys"), { target: { value: "KeyR" } });
+    pickCombobox("More keys", "R", /^R\s*Letters/);
     fireEvent.click(screen.getByRole("button", { name: "Shift" }));
     expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
     expect(screen.queryByText(/Not supported in terminals/)).toBeNull();

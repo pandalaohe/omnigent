@@ -11,6 +11,7 @@ import {
   layoutMobileAssistantActions,
 } from "@/components/MobileFloatingAssistant";
 import { Button } from "@/components/ui/button";
+import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import {
   Dialog,
   DialogContent,
@@ -188,25 +189,22 @@ function KeyChordPicker({
   onChange: (next: ShortcutChord) => void;
   terminal?: boolean;
 }) {
+  const keyOptions = KEY_CHOICES.map(([code, label]) => ({ key: code, label }));
+  if (!keyOptions.some((option) => option.key === chord.code)) {
+    keyOptions.unshift({ key: chord.code, label: chord.code });
+  }
   return (
     <div className="grid gap-2">
       <label className="grid gap-1 text-ui">
         Key
-        <select
-          aria-label="Key"
-          className="min-h-11 rounded-md border border-input bg-background px-2"
+        <Combobox
+          mode="select"
+          options={keyOptions}
           value={chord.code}
-          onChange={(event) => onChange({ ...chord, code: event.target.value })}
-        >
-          {!KEY_CHOICES.some(([code]) => code === chord.code) && (
-            <option value={chord.code}>{chord.code}</option>
-          )}
-          {KEY_CHOICES.map(([code, label]) => (
-            <option key={code} value={code}>
-              {label}
-            </option>
-          ))}
-        </select>
+          onValueChange={(code) => onChange({ ...chord, code })}
+          aria-label="Key"
+          className="h-auto w-full rounded-none! bg-transparent p-0"
+        />
       </label>
       <div
         className="flex flex-wrap gap-1 phone:gap-x-3 phone:gap-y-4"
@@ -595,24 +593,42 @@ export function MobileAssistantSettings() {
                   {draft.display === "icon" ? (
                     <label className="grid gap-1.5 text-ui">
                       Button icon
-                      <select
-                        aria-label="Button icon"
-                        value={draft.icon}
-                        onChange={(event) =>
-                          setDraft((current) =>
-                            current
-                              ? { ...current, icon: event.target.value as MobileAssistantIcon }
-                              : current,
-                          )
-                        }
-                        className="h-8 rounded-lg border border-input bg-background px-2.5 text-ui phone:min-h-11"
-                      >
-                        {MOBILE_ASSISTANT_ICONS.map((icon) => (
-                          <option key={icon.id} value={icon.id}>
-                            {icon.label}
-                          </option>
-                        ))}
-                      </select>
+                      {MOBILE_ASSISTANT_ICONS.length > COMBOBOX_OPTION_THRESHOLD ? (
+                        <Combobox
+                          mode="select"
+                          options={MOBILE_ASSISTANT_ICONS.map((icon) => ({
+                            key: icon.id,
+                            label: icon.label,
+                          }))}
+                          value={draft.icon}
+                          onValueChange={(icon) =>
+                            setDraft((current) =>
+                              current ? { ...current, icon: icon as MobileAssistantIcon } : current,
+                            )
+                          }
+                          aria-label="Button icon"
+                          className="h-auto w-full rounded-none! bg-transparent p-0"
+                        />
+                      ) : (
+                        <select
+                          aria-label="Button icon"
+                          value={draft.icon}
+                          onChange={(event) =>
+                            setDraft((current) =>
+                              current
+                                ? { ...current, icon: event.target.value as MobileAssistantIcon }
+                                : current,
+                            )
+                          }
+                          className="h-8 rounded-lg border border-input bg-background px-2.5 text-ui phone:min-h-11"
+                        >
+                          {MOBILE_ASSISTANT_ICONS.map((icon) => (
+                            <option key={icon.id} value={icon.id}>
+                              {icon.label}
+                            </option>
+                          ))}
+                        </select>
+                      )}
                     </label>
                   ) : null}
                   <div className="grid gap-1.5 text-ui">
@@ -635,26 +651,50 @@ export function MobileAssistantSettings() {
                     <div className="grid gap-1.5 text-ui">
                       <label className="grid gap-1.5 text-ui">
                         Action from keyboard shortcuts
-                        <select
-                          value={draft.actionId}
-                          onChange={(event) =>
-                            setDraft((current) =>
-                              current
-                                ? {
-                                    ...current,
-                                    actionId: event.target.value as MobileAssistantActionId,
-                                  }
-                                : current,
-                            )
-                          }
-                          className="h-8 rounded-lg border border-input bg-background px-2.5 text-ui phone:min-h-11"
-                        >
-                          {MOBILE_ASSISTANT_CHAT_ACTION_IDS.map((actionId) => (
-                            <option key={actionId} value={actionId}>
-                              {MOBILE_ASSISTANT_ACTION_DEFINITIONS[actionId].label}
-                            </option>
-                          ))}
-                        </select>
+                        {MOBILE_ASSISTANT_CHAT_ACTION_IDS.length > COMBOBOX_OPTION_THRESHOLD ? (
+                          <Combobox
+                            mode="select"
+                            options={MOBILE_ASSISTANT_CHAT_ACTION_IDS.map((actionId) => ({
+                              key: actionId,
+                              label: MOBILE_ASSISTANT_ACTION_DEFINITIONS[actionId].label,
+                              description: MOBILE_ASSISTANT_ACTION_DEFINITIONS[actionId].note,
+                            }))}
+                            value={draft.actionId}
+                            onValueChange={(actionId) =>
+                              setDraft((current) =>
+                                current
+                                  ? {
+                                      ...current,
+                                      actionId: actionId as MobileAssistantActionId,
+                                    }
+                                  : current,
+                              )
+                            }
+                            aria-label="Action from keyboard shortcuts"
+                            className="h-auto w-full rounded-none! bg-transparent p-0"
+                          />
+                        ) : (
+                          <select
+                            value={draft.actionId}
+                            onChange={(event) =>
+                              setDraft((current) =>
+                                current
+                                  ? {
+                                      ...current,
+                                      actionId: event.target.value as MobileAssistantActionId,
+                                    }
+                                  : current,
+                              )
+                            }
+                            className="h-8 rounded-lg border border-input bg-background px-2.5 text-ui phone:min-h-11"
+                          >
+                            {MOBILE_ASSISTANT_CHAT_ACTION_IDS.map((actionId) => (
+                              <option key={actionId} value={actionId}>
+                                {MOBILE_ASSISTANT_ACTION_DEFINITIONS[actionId].label}
+                              </option>
+                            ))}
+                          </select>
+                        )}
                       </label>
                       {bindingDescription({ kind: "shortcut", actionId: draft.actionId }) ? (
                         <span className="text-sm text-muted-foreground">

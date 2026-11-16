@@ -175,7 +175,7 @@ it("reports a failed preview beside the retention controls without changing limi
   fireEvent.keyDown(screen.getByRole("combobox", { name: "Keep pages for" }), { key: "ArrowDown" });
   fireEvent.click(await screen.findByRole("option", { name: "1 week" }));
   expect(await screen.findByText("Could not preview history settings.")).toBeInTheDocument();
-  expect(screen.getByRole("combobox", { name: "Keep pages for" })).toHaveTextContent("3 months");
+  expect(screen.getByRole("combobox", { name: "Keep pages for" })).toHaveValue("3 months");
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 });
 

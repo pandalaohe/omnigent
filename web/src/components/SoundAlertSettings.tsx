@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -113,6 +114,14 @@ export function SoundAlertSettings() {
     updateDevice({ systemSounds: nextSystemSounds });
     updateLevel(level, { sound: value as BuiltinSoundId });
   };
+  const soundOptions = [
+    ...BUILTIN_SOUNDS.map((sound) => ({ key: sound.id, label: sound.label })),
+    ...systemSounds.map((name) => ({
+      key: `${SYSTEM_SOUND_PREFIX}${name}`,
+      label: name,
+      description: "System sound",
+    })),
+  ];
 
   return (
     <div className="flex flex-col gap-3" data-testid="sound-alert-settings">
@@ -176,35 +185,51 @@ export function SoundAlertSettings() {
               onCheckedChange={(enabled) => updateLevel(level, { enabled })}
             />
             <div className="flex items-center gap-2">
-              <Select
-                value={soundValue(level)}
-                onValueChange={(value) => chooseSound(level, value)}
-              >
-                <SelectTrigger
-                  aria-label={`${LEVEL_LABELS[level]} sound`}
-                  data-testid={`sound-alert-sound-${level}`}
-                  className="w-32"
+              {soundOptions.length > COMBOBOX_OPTION_THRESHOLD ? (
+                <div data-testid={`sound-alert-sound-${level}`} className="w-32">
+                  <Combobox
+                    mode="select"
+                    options={soundOptions}
+                    value={soundValue(level)}
+                    onValueChange={(value) => chooseSound(level, value)}
+                    aria-label={`${LEVEL_LABELS[level]} sound`}
+                    className="h-auto w-full rounded-none! bg-transparent p-0"
+                  />
+                </div>
+              ) : (
+                <Select
+                  value={soundValue(level)}
+                  onValueChange={(value) => chooseSound(level, value)}
                 >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {BUILTIN_SOUNDS.map((sound) => (
-                    <SelectItem key={sound.id} value={sound.id}>
-                      {sound.label}
-                    </SelectItem>
-                  ))}
-                  {systemSounds.length > 0 && (
-                    <SelectGroup>
-                      <SelectLabel>System sounds</SelectLabel>
-                      {systemSounds.map((name) => (
-                        <SelectItem key={`system:${name}`} value={`${SYSTEM_SOUND_PREFIX}${name}`}>
-                          {name}
-                        </SelectItem>
-                      ))}
-                    </SelectGroup>
-                  )}
-                </SelectContent>
-              </Select>
+                  <SelectTrigger
+                    aria-label={`${LEVEL_LABELS[level]} sound`}
+                    data-testid={`sound-alert-sound-${level}`}
+                    className="w-32"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {BUILTIN_SOUNDS.map((sound) => (
+                      <SelectItem key={sound.id} value={sound.id}>
+                        {sound.label}
+                      </SelectItem>
+                    ))}
+                    {systemSounds.length > 0 && (
+                      <SelectGroup>
+                        <SelectLabel>System sounds</SelectLabel>
+                        {systemSounds.map((name) => (
+                          <SelectItem
+                            key={`system:${name}`}
+                            value={`${SYSTEM_SOUND_PREFIX}${name}`}
+                          >
+                            {name}
+                          </SelectItem>
+                        ))}
+                      </SelectGroup>
+                    )}
+                  </SelectContent>
+                </Select>
+              )}
               <Button
                 type="button"
                 variant="outline"
