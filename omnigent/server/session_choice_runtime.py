@@ -16,6 +16,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from omnigent.entities import Conversation
+from omnigent.quota_pace import QuotaTiers
 from omnigent.runtime.instruction_layers import agent_key_for_harness
 from omnigent.server.agent_quota import QuotaContext
 from omnigent.server.session_choice import (
@@ -506,7 +507,7 @@ def _read(app: Any, owner: str, name: str, operation: Any, default: Any):
             failures = app.state.session_choice_read_failures = set()
         if (owner, name) not in failures:
             failures.add((owner, name))
-            _logger.warning("Session choice %s read failed for %s", name, owner, exc_info=True)
+            _logger.error("Session choice %s read failed for %s", name, owner, exc_info=True)
         return default
 
 
@@ -623,11 +624,7 @@ def _context_request(
     products: dict[str, str | None] = {}
     harnesses: dict[str, str | None] = {}
     default_models: dict[str, str | None] = {}
-    default_agents = {
-        link.agent_id
-        for link in ordered_links(settings)
-        if link.model is None and link.meter in {"codex-pro", "krill"}
-    }
+    default_agents = {link.agent_id for link in ordered_links(settings) if link.model is None}
     unavailable = set()
     host_store = getattr(app.state, "host_store", None)
     host_row = host_store.get_host(host) if host_store is not None else None
@@ -651,7 +648,7 @@ def _context_request(
         harness = _resolve_harness_impl(probe, agent_store=agents, agent_cache=cache, agent=agent)
         harnesses[agent_id] = harness
         products[agent_id] = agent_key_for_harness(harness)
-        if products[agent_id] == "codex" and agent_id in default_agents:
+        if agent_id in default_agents:
             default_models[agent_id] = _resolve_llm_model(
                 probe, agent_store=agents, agent_cache=cache
             )
@@ -690,6 +687,7 @@ def _context_request(
                 or _resolve_llm_model(probe, agent_store=agents, agent_cache=cache)
                 or (defaults[0] if len(defaults) == 1 else None)
             )
+    quota_tiers, quota_periods = _quota_candidate_periods(app, owner)
     caller_harness = _resolve_harness_impl(caller, agent_store=agents, agent_cache=cache)
     caller_model = (
         (
@@ -736,7 +734,34 @@ def _context_request(
         named_agent,
         default_models,
         effective_models,
+        quota_tiers=quota_tiers,
+        quota_periods=quota_periods,
     )
+
+
+def _quota_candidate_periods(
+    app: Any,
+    owner: str,
+) -> tuple[QuotaTiers, dict[tuple[str, str | None], str]]:
+    """Snapshot exact exception keys, including candidates outside configured tiers."""
+    from omnigent.server.user_preferences_store import read_collab_settings
+
+    prefs = getattr(app.state, "user_preferences_store", None)
+    if prefs is None:
+        return QuotaTiers(), {}
+    collab = _read(app, owner, "quota periods", lambda: read_collab_settings(prefs, owner), None)
+    if collab is None:
+        return QuotaTiers(), {}
+    periods: dict[tuple[str, str | None], str] = {}
+    for rule in collab.quota_period_rules:
+        # Equal-specificity duplicates follow the existing resolver's first-row rule.
+        periods.setdefault((rule["agent"], rule.get("model")), rule["period"])
+    tiers = QuotaTiers(
+        collab.quota_tight_below_pct,
+        collab.quota_low_below_pct,
+        collab.quota_floor_pct,
+    )
+    return tiers, periods
 
 
 async def authorize_agents(app: Any, request: ChoiceRequest) -> ChoiceRequest:

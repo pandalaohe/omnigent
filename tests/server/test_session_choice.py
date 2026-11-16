@@ -16,6 +16,8 @@ from omnigent.server.session_choice import (
     ChoiceRevisionConflict,
     ChoiceState,
     FloorOff,
+    Link,
+    candidate_quota,
     choice_document,
     choice_revision,
     choose,
@@ -1567,3 +1569,203 @@ def test_value_window_line_equality(used, state):
         }
     )
     assert tile_line(limits, quota, None, NOW).state == state
+
+
+SHARED_LINKS = (
+    {"agent": "agent-0", "model": "model-0", "meter": "pool-0"},
+    {"agent": "agent-1", "model": "model-1", "meter": "pool-0"},
+)
+
+
+def shared_pool(*links, strategy="balance", **changes):
+    """One balance tier whose links all report into the same pool."""
+    raw = table(tuple(1 for _ in links), strategy=strategy, **changes).model_dump(
+        mode="json", by_alias=True
+    )
+    for row, link in zip(raw["hosts"]["host-a"]["work"][0], links, strict=True):
+        row["links"] = [dict(link)]
+        row["weight"] = 1
+    return parse_session_choice(raw)
+
+
+def windowed(*windows, pool="pool-0", state="ok", pace=70, freshness="fresh"):
+    """A pool reading whose windows carry their own pace evidence."""
+    quota = reading(pool, state=state, pace=pace, freshness=freshness)
+    quota.windows = [
+        UsageWindowView(
+            id=name,
+            kind="other",
+            label=name,
+            percent_used=used,
+            remaining_pct=None if days_left <= 0 else 100 - used,
+            window_minutes=minutes,
+            resets_at=NOW + days_left * 86400,
+            state=window_state,
+            past_reset=days_left <= 0,
+        )
+        for name, used, minutes, days_left, window_state in windows
+    ]
+    quota.read_at = NOW
+    return quota
+
+
+def period_request(**changes):
+    return ChoiceRequest(OWNER, "host-a", **changes)
+
+
+@pytest.mark.parametrize("same_agent", [False, True])
+def test_deciding_period_exception_flips_the_balance_rank(same_agent):
+    links = [dict(link) for link in SHARED_LINKS]
+    if same_agent:
+        links[1]["agent"] = links[0]["agent"]
+    settings = shared_pool(*links)
+    quotas = {"pool-0": windowed(("7d", 40, 10080, 4, "ok"), ("5h", 90, 300, 4, "low"))}
+    assert pick(settings, readings=quotas).link.model == "model-0"
+    for exception in ({("agent-0", "model-0"): "5h"}, {("agent-0", None): "5h"}):
+        picked = pick(settings, readings=quotas, request=period_request(quota_periods=exception))
+        if same_agent and ("agent-0", None) in exception:
+            # An agent-wide exception affects both models equally.
+            assert picked.link.model == "model-0"
+        else:
+            assert (picked.link.model, picked.pool) == ("model-1", "pool-0")
+    overrides = {("agent-0", None): "5h", ("agent-0", "model-0"): "7d"}
+    picked = pick(settings, readings=quotas, request=period_request(quota_periods=overrides))
+    assert picked.link.model == "model-0"
+    assert quotas["pool-0"].state == "ok"
+
+
+def test_period_exception_only_moves_its_own_agent_and_model():
+    settings = shared_pool(*SHARED_LINKS)
+    quotas = {"pool-0": windowed(("7d", 40, 10080, 4, "ok"), ("5h", 90, 300, 4, "low"))}
+    for exception in ({("agent-0", "model-9"): "5h"}, {("agent-8", "model-0"): "5h"}):
+        picked = pick(settings, readings=quotas, request=period_request(quota_periods=exception))
+        assert picked.link.agent_id == "agent-0"
+
+
+@pytest.mark.parametrize("route,pool", [("official", "codex-pro"), ("krill", "krill")])
+def test_route_pin_candidate_matches_only_the_exact_model_period(route, pool):
+    settings = shared_pool(
+        {"agent": "agent-0", "model": f"{route}/gpt-large"},
+        {"agent": "agent-1", "model": f"{route}/gpt-small"},
+    )
+    quotas = {pool: windowed(("7d", 40, 10080, 4, "ok"), ("5h", 90, 300, 4, "low"), pool=pool)}
+    request = period_request(
+        products={"agent-0": "codex", "agent-1": "codex"},
+        models={"agent-0": frozenset({"gpt-large"}), "agent-1": frozenset({"gpt-small"})},
+    )
+    assert pick(settings, readings=quotas, request=request).link.model == f"{route}/gpt-large"
+    for other_model in ("gpt-large", "other/gpt-large"):
+        unmatched = replace(request, quota_periods={("agent-0", other_model): "5h"})
+        assert (
+            pick(settings, readings=quotas, request=unmatched).link.model == f"{route}/gpt-large"
+        )
+    demoted = replace(request, quota_periods={("agent-0", f"{route}/gpt-large"): "5h"})
+    picked = pick(settings, readings=quotas, request=demoted)
+    assert (picked.pool, picked.link.model) == (pool, f"{route}/gpt-small")
+
+
+@pytest.mark.parametrize("period", ["5h", "codex-primary", "relay-primary"])
+def test_period_exception_matches_native_labels_and_preserves_bucket_ids(db_uri, period):
+    from omnigent.server.agent_quota import QuotaContext
+    from tests.server.test_agent_quota import service_with_store, usage_report
+
+    service = service_with_store(db_uri)
+    service.report_account(OWNER, "codex-pro", usage_report(account_product="codex"), now=NOW)
+    service.report(
+        OWNER,
+        "host-a",
+        "codex",
+        {
+            "captured_at": NOW + 1,
+            "limits": [
+                {
+                    "limit_id": bucket,
+                    "windows": [
+                        {
+                            "kind": "primary",
+                            "used_percent": used,
+                            "window_duration_mins": 300,
+                            "resets_at": NOW + 1 + 18000,
+                        }
+                    ],
+                }
+                for bucket, used in (("codex", 90), ("relay", 65))
+            ],
+        },
+        now=NOW + 1,
+    )
+    quotas = service.pool_readings(QuotaContext(OWNER, "host-a"), now=NOW + 1)
+    assert [(w.id, w.label) for w in quotas["codex-pro"].windows] == [
+        ("codex-primary", "5h"),
+        ("relay-primary", "5h"),
+    ]
+    # The other pool's tight reading beats low quota, but loses a weighted tie.
+    quotas["other"] = reading("other", state="tight", pace=35)
+    first = {"agent": "agent-0", "model": "official/gpt-large"}
+    second = {"agent": "agent-1", "model": "model-1", "meter": "other"}
+    request = period_request(
+        products={"agent-0": "codex"},
+        quota_periods={("agent-0", "official/gpt-large"): period},
+    )
+    picked = pick(shared_pool(first, second), readings=quotas, request=request, now=NOW + 1)
+    assert picked.link.agent_id == ("agent-0" if period == "relay-primary" else "agent-1")
+    warning = pick(shared_pool(first), readings=quotas, request=request, now=NOW + 1)
+    assert warning.warnings == (
+        () if period == "relay-primary" else ("codex-pro may not last until its reset",)
+    )
+
+
+def test_candidate_period_keeps_the_owners_custom_tiers():
+    from omnigent.quota_pace import QuotaTiers
+
+    settings = shared_pool(*SHARED_LINKS)
+    quotas = {"pool-0": windowed(("7d", 60, 10080, 7, "tight"), state="tight", pace=40)}
+    request = period_request(quota_periods={("agent-0", "model-0"): "7d"})
+    assert pick(settings, readings=quotas, request=request).link.agent_id == "agent-0"
+    custom = replace(request, quota_tiers=QuotaTiers(tight_below_pct=90, low_below_pct=45))
+    assert pick(settings, readings=quotas, request=custom).link.agent_id == "agent-1"
+
+
+def test_low_pace_tie_uses_each_candidates_deciding_window():
+    settings = shared_pool(*SHARED_LINKS)
+    low = windowed(("7d", 85, 10080, 7, "low"), ("5h", 90, 300, 4, "low"), state="low", pace=15)
+    quotas = {"pool-0": low}
+    assert pick(settings, readings=quotas).link.agent_id == "agent-0"
+    exceptions = {("agent-0", "model-0"): "5h", ("agent-1", "model-1"): "7d"}
+    request = period_request(quota_periods=exceptions)
+    assert pick(settings, readings=quotas, request=request).link.agent_id == "agent-1"
+
+
+def test_missing_window_and_stale_evidence_stay_fail_open():
+    settings = shared_pool(*SHARED_LINKS)
+    link = Link.model_validate({"agent": "agent-0", "model": "model-0", "meter": "pool-0"})
+    quotas = {"pool-0": windowed(("7d", 40, 10080, 4, "ok"))}
+    absent = period_request(quota_periods={("agent-0", "model-0"): "30d"})
+    quota = candidate_quota(absent, link, quotas["pool-0"], NOW)
+    assert quota is not None and (quota.state, quota.pace_pct) == ("unknown", None)
+    assert pick(settings, readings=quotas, request=absent).link.agent_id == "agent-0"
+    demote = period_request(quota_periods={("agent-0", "model-0"): "5h"})
+    past_reset = windowed(("7d", 40, 10080, 4, "ok"), ("5h", 90, 300, -1, "low"))
+    assert candidate_quota(demote, link, past_reset, NOW).state == "unknown"
+    stale = windowed(("7d", 40, 10080, 4, "ok"), ("5h", 90, 300, 4, "low"), freshness="old")
+    for readings in ({}, {"pool-0": stale}):
+        assert pick(settings, readings=readings, request=demote).link.agent_id == "agent-0"
+
+
+def test_candidate_period_never_bypasses_an_exhausted_pool_window():
+    settings = shared_pool(*SHARED_LINKS)
+    quotas = {"pool-0": windowed(("7d", 40, 10080, 4, "ok"), ("5h", 100, 300, 4, "exhausted"))}
+    request = period_request(quota_periods={("agent-0", "model-0"): "7d"})
+    held = pick(settings, readings=quotas, request=request)
+    assert (held.outcome, held.reason, held.clears_at) == ("hold", "exhausted", NOW + 4 * 86400)
+    assert [item.why for item in held.skipped] == ["exhausted", "exhausted"]
+
+
+def test_warning_follows_the_picked_candidates_deciding_window():
+    settings = shared_pool({"agent": "agent-0", "model": "model-0", "meter": "pool-0"})
+    quotas = {"pool-0": windowed(("7d", 40, 10080, 4, "ok"), ("5h", 90, 300, 4, "low"))}
+    assert pick(settings, readings=quotas).warnings == ()
+    request = period_request(quota_periods={("agent-0", "model-0"): "5h"})
+    assert pick(settings, readings=quotas, request=request).warnings == (
+        "pool-0 may not last until its reset",
+    )
