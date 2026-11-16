@@ -929,8 +929,17 @@ def _effective_model(settings: SessionChoice, link: Link, request: ChoiceRequest
 
 
 def candidate_period(request: ChoiceRequest, agent: str, model: str | None) -> str | None:
-    """Exact model exceptions precede agent-wide exceptions, without rewriting keys."""
-    return request.quota_periods.get((agent, model), request.quota_periods.get((agent, None)))
+    """Alias-equivalent model exceptions precede the unchanged agent-wide fallback."""
+    if model is not None:
+        identity = canonical_model(model, request.provider_groups)
+        for (rule_agent, rule_model), period in request.quota_periods.items():
+            if (
+                rule_agent == agent
+                and rule_model is not None
+                and canonical_model(rule_model, request.provider_groups) == identity
+            ):
+                return period
+    return request.quota_periods.get((agent, None))
 
 
 def candidate_quota(

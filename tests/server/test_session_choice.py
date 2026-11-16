@@ -1703,6 +1703,34 @@ def test_period_exception_only_moves_its_own_agent_and_model():
         assert picked.link.agent_id == "agent-0"
 
 
+@pytest.mark.parametrize("model_rule", ["old/x", None], ids=["renamed-model", "agent-only"])
+def test_period_exception_survives_provider_rename_in_rank_and_warning(model_rule):
+    from omnigent.models.model_reference import provider_groups
+
+    first = {"agent": "agent-0", "model": "old/x", "meter": "pool-0"}
+    quotas = {"pool-0": windowed(("7d", 40, 10080, 4, "ok"), ("5h", 90, 300, 4, "low"))}
+    exceptions = {("agent-0", model_rule): "5h"}
+    if model_rule is not None:
+        exceptions[("agent-0", None)] = "7d"
+        exceptions[("agent-0", "new/x")] = "7d"
+    else:
+        exceptions[("agent-0", "old/other")] = "7d"
+    saved = dict(exceptions)
+    request = period_request(
+        models={"agent-0": frozenset({"new/x"})},
+        provider_groups=provider_groups([("old", "new")]),
+        quota_periods=exceptions,
+    )
+    settings = shared_pool(first, SHARED_LINKS[1])
+    without_exception = replace(request, quota_periods={})
+    assert pick(settings, readings=quotas, request=without_exception).link.model == "new/x"
+    assert pick(settings, readings=quotas, request=request).link.agent_id == "agent-1"
+    warning = pick(shared_pool(first), readings=quotas, request=request)
+    assert warning.link.model == "new/x"
+    assert warning.warnings == ("pool-0 may not last until its reset",)
+    assert exceptions == saved
+
+
 @pytest.mark.parametrize("route,pool", [("official", "codex-pro"), ("krill", "krill")])
 def test_route_pin_candidate_matches_only_the_exact_model_period(route, pool):
     settings = shared_pool(
