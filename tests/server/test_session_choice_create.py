@@ -1607,3 +1607,63 @@ async def test_owner_read_failure_only_blocks_a_possibly_matching_scope(
     )
     assert failed.outcome == "ask"
     assert failed.skipped[0].why == "count_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_billing_refusal_stops_usage_lines_and_selection_without_reset(quota_runner):
+    from omnigent.usage.contract import UsageReportV2
+
+    env = quota_runner
+    service = env.app.state.agent_quota_service
+    service.usage_enabled = True
+    report = UsageReportV2.model_validate(
+        {
+            "schema_version": 2,
+            "observed_at": time.time(),
+            "status": "available",
+            "windows": [],
+            "balances": [{"id": "credit", "unit": "USD", "remaining": 10}],
+            "source_type": "relay",
+            "source": "sample-feeder",
+        }
+    )
+    service.report_account(RESERVED_USER_LOCAL, "pool-0", report, now=time.time())
+    first = (await create(env)).json()
+    response = await env.client.post(
+        f"/v1/sessions/{first['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {
+                "status": "failed",
+                "output": "HTTP 403 balance billing is disabled for this key",
+                "response_id": "billing-failure",
+            },
+        },
+    )
+    assert response.status_code == 202, response.text
+    env.store.set_session_live_status(first["id"], "idle")
+    lines = await env.client.get("/v1/me/usage/lines")
+    assert lines.status_code == 200, lines.text
+    tile = lines.json()["tiles"]["pool-0"]
+    assert tile["state"] == "stop"
+    assert tile["reason"] == "billing_disabled"
+    assert tile["source"] == f"{first['id']}:billing-failure"
+    assert tile["clears_at"] is None
+    overview = await env.client.get("/v1/me/usage")
+    assert overview.status_code == 200, overview.text
+    account = next(row for row in overview.json()["accounts"] if row["id"] == "pool-0")
+    assert account["state"] == "stopped"
+    assert account["balances"][0]["remaining"] == 10
+    assert account["mark"]["provider_refusal"]["source"] == tile["source"]
+    assert account["source_type"] == "relay"
+    assert account["source"] == "sample-feeder"
+    newer = report.model_copy(update={"observed_at": time.time() + 1})
+    service.report_account(RESERVED_USER_LOCAL, "pool-0", newer, now=time.time())
+    assert (await env.client.get("/v1/me/usage/lines")).json()["tiles"]["pool-0"][
+        "state"
+    ] == "stop"
+    second = await create(env)
+    assert second.status_code == 201, second.text
+    choice = second.json()["session_choice"]
+    assert choice["pool"] == "pool-1"
+    assert choice["skipped"][0]["why"] == "stop"

@@ -552,6 +552,8 @@ class TileLine:
     read_at: float | None = None
     released: bool = False
     clears_at: float | None = None
+    reason: str | None = None
+    source: str | None = None
 
 
 def tile_line(
@@ -562,6 +564,15 @@ def tile_line(
 ) -> TileLine:
     """Evaluate fresh window and balance sections without retaining enforcement state."""
     reserve = limits.reserve
+    health = (reading.mark or {}).get("provider_refusal") if reading is not None else None
+    if reading is not None and reading.state == "stopped" and isinstance(health, dict):
+        return TileLine(
+            "stop",
+            reason=reading.reason,
+            source=health.get("source"),
+            read_at=health.get("observed_at"),
+            clears_at=health.get("resets_at"),
+        )
     result = TileLine(
         "unknown",
         mode=reserve.mode if reserve else None,
@@ -743,6 +754,11 @@ def rule_limits(settings: SessionChoice, agent: str, host: str | None, model: st
 def candidate_lines(settings, link, request, readings, floor_off, now):
     """Legacy pool constraints remain independent of resolved rule overrides."""
     link = _candidate_link(settings, link, request)
+    if isinstance(readings, EffectiveQuotaReadings):
+        route_link = pin_codex_link(link, request.products.get(link.agent_id))
+        readings = readings.for_route(
+            provider_route(request.host, link.agent_id, route_link.model)
+        )
     pool = pool_of(link, request.products.get(link.agent_id, link.agent_id))
     limits = [settings.limits.get(pool, TileLimits())]
     if settings.schema_version == 2:
@@ -1127,6 +1143,35 @@ def choose(
     )
 
 
+@dataclass(frozen=True)
+class ProviderRefusal:
+    reason: str
+    observed_at: float
+    resets_at: float | None
+    session_id: str
+    response_id: str
+
+
+def provider_route(host: str | None, agent: str | None, model: str | None) -> str:
+    """Use the host's provider binding, shared by models on that provider."""
+    provider = codex_route_pool(model, "codex") or (
+        model.partition("/")[0] if model and "/" in model else "default"
+    )
+    return json.dumps([host, agent, provider])
+
+
+class EffectiveQuotaReadings(dict):
+    def __init__(self, readings, state, owner, now):
+        super().__init__(readings)
+        self.state = state
+        self.owner = owner
+        self.raw = readings
+        self.now = now
+
+    def for_route(self, route: str) -> dict:
+        return self.state.quota_readings(self.owner, self.raw, self.now, route=route)
+
+
 class ChoiceState:
     """A workspace's owner-scoped counters and exclusions, discarded at restart."""
 
@@ -1135,15 +1180,24 @@ class ChoiceState:
         self.cooldowns: dict[tuple[str, str], float] = {}
         self.exhausted: dict[tuple[str, str], float] = {}
         self.quota_rejections: set[tuple[str, str]] = set()
+        self.refusals: dict[tuple[str, str, str], ProviderRefusal] = {}
+        self.provider_attempts: dict[tuple[str, str, str], tuple[str, str, float]] = {}
         self.tiers: dict[tuple[str, str, str, int], tuple[Row, ...]] = {}
 
     def quota_readings(
-        self, owner: str, readings: Mapping[str, UsageAccountView], now: float
+        self,
+        owner: str,
+        readings: Mapping[str, UsageAccountView],
+        now: float,
+        *,
+        route: str | None = None,
     ) -> dict[str, UsageAccountView]:
         """Provider rejection wins over a polled balance until its explicit reset."""
         from omnigent.usage.contract import UsageAccountView, UsageWindowView
 
-        result = dict(readings)
+        if isinstance(readings, EffectiveQuotaReadings):
+            readings = readings.raw
+        result = EffectiveQuotaReadings(readings, self, owner, now)
         for (user, pool), until in tuple(self.exhausted.items()):
             if user == owner and until > now:
                 result[pool] = UsageAccountView(
@@ -1163,6 +1217,35 @@ class ChoiceState:
                         )
                     ],
                 )
+        for (user, pool, _route), refusal in tuple(self.refusals.items()):
+            if route is not None and route != _route:
+                continue
+            if user != owner or (refusal.resets_at is not None and refusal.resets_at <= now):
+                continue
+            previous = result.get(pool)
+            previous_health = (previous.mark or {}).get("provider_refusal") if previous else None
+            if (
+                isinstance(previous_health, dict)
+                and previous_health.get("observed_at", 0) > refusal.observed_at
+            ):
+                continue
+            base = previous or UsageAccountView(
+                id=pool, kind="account", display_name=pool, state="unknown", freshness="none"
+            )
+            result[pool] = base.model_copy(
+                update={
+                    "state": "stopped",
+                    "reason": refusal.reason,
+                    "mark": {
+                        **(base.mark or {}),
+                        "provider_refusal": {
+                            "source": f"{refusal.session_id}:{refusal.response_id}",
+                            "observed_at": refusal.observed_at,
+                            "resets_at": refusal.resets_at,
+                        },
+                    },
+                }
+            )
         return result
 
     def saved(self, owner: str, settings: SessionChoice) -> None:

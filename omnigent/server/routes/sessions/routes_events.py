@@ -4415,6 +4415,16 @@ def register_events_routes(
             # A confirmed turn completion after a failure means a later turn
             # succeeded, so the earlier failure must not outlive it.
             turn_completed = status == "idle" and data.get("turn_completed") is True
+            if (turn_completed or status == "running") and not replayed:
+                from omnigent.server.session_choice_runtime import record_provider_recovery
+
+                await record_provider_recovery(
+                    request.app,
+                    conv,
+                    from_runner=_has_bound_runner_authority(request, conv),
+                    response_id=response_id,
+                    started=status == "running",
+                )
             recovered_from_failure = (
                 turn_completed and _session_status_cache.get(session_id) == "failed"
             )

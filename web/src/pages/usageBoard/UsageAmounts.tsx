@@ -358,6 +358,38 @@ export function UsageByModel({
 }
 
 export function UsageErrorMark({ account }: { account: UsageAccountView }) {
+  const refusal = account.mark?.provider_refusal;
+  if (refusal && account.state === "stopped") {
+    return (
+      <UsageTipButton
+        label={`${account.display_name} provider stopped requests`}
+        model={{
+          title: "Provider refused requests",
+          chip: { label: "Stopped", tone: "crit" },
+          rows: [
+            {
+              label: "Reason",
+              value:
+                account.reason === "billing_disabled" ? "Billing is disabled" : "Plan exhausted",
+            },
+            { label: "Source", value: refusal.source },
+            {
+              label: "Observed",
+              value: formatFullDate(refusal.observed_at),
+            },
+            {
+              label: "Reset",
+              value: refusal.resets_at == null ? "Not provided" : formatFullDate(refusal.resets_at),
+            },
+          ],
+        }}
+        className="shrink-0 text-destructive"
+      >
+        <TriangleAlertIcon className="size-4" aria-hidden="true" />
+        <span>Stopped</span>
+      </UsageTipButton>
+    );
+  }
   const mark = account.mark;
   if (!mark || account.freshness !== "fresh") return null;
   return (

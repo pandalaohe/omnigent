@@ -1748,7 +1748,9 @@ class AgentQuotaService:
                     )
         return issues
 
-    def tile_lines(self, owner: str, *, now: float | None = None, settings=None) -> dict:
+    def tile_lines(
+        self, owner: str, *, now: float | None = None, settings=None, choice_state=None
+    ) -> dict:
         from dataclasses import asdict
 
         from omnigent.server.session_choice import TileLimits, tile_line
@@ -1757,6 +1759,8 @@ class AgentQuotaService:
         if settings is None:
             settings = read_collab_settings(self.preferences, owner).session_choice
         readings = self.pool_readings(QuotaContext(owner, None), now=now)
+        if choice_state is not None:
+            readings = choice_state.quota_readings(owner, readings, now)
         floors = self.preferences.choice_floor_off(owner) if self.preferences else {}
         return {
             "schema": 1,

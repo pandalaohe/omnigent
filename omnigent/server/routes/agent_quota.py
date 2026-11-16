@@ -245,7 +245,11 @@ def create_agent_quota_router(
         settings, saved = await asyncio.to_thread(
             read_preview_settings, service.preferences, owner
         )
-        result = await asyncio.to_thread(service.tile_lines, owner, settings=settings)
+        from omnigent.server.session_choice import state_for
+
+        result = await asyncio.to_thread(
+            service.tile_lines, owner, settings=settings, choice_state=state_for(request.app)
+        )
         result["savedRevision"] = saved["revision"]
         result["limitsVaryByCandidate"] = bool(
             settings.schema_version == 2 and settings.limit_rules
@@ -553,6 +557,12 @@ def create_agent_quota_router(
 
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         overview = await asyncio.to_thread(service.overview, owner)
+        from omnigent.server.session_choice import state_for
+
+        effective = state_for(request.app).quota_readings(
+            owner, {account.id: account for account in overview.accounts}, overview.generated_at
+        )
+        overview.accounts = list(effective.values())
         return JSONResponse(
             overview.model_dump(mode="json"), headers={"Cache-Control": "private, no-store"}
         )

@@ -87,6 +87,7 @@ export function UsageTile({
   const free = pricing.data ? accountCostClass(pricing.data, account.id) === "free" : false;
   const stale = isStale(account);
   const empty = neverRead(account);
+  const stopped = Boolean(account.mark?.provider_refusal) && account.state === "stopped";
   const tone = accountTone(account, stale);
   const picks = pickGroups(account, pinnedWindowId);
   const renewDays = renewal ? daysUntil(renewal.at) : null;
@@ -188,7 +189,7 @@ export function UsageTile({
     <article
       className={cn("usage-tile", wideBoxes && "usage-tile-wide")}
       data-span={Math.min(units, 3)}
-      data-tone={!wideBoxes ? displayTone(firstMain) : undefined}
+      data-tone={stopped ? "crit" : !wideBoxes ? displayTone(firstMain) : undefined}
       data-testid="usage-tile"
       data-account={account.id}
       onClick={(event) => {

@@ -1971,11 +1971,21 @@ def _error_payload_message(payload: _JsonObject) -> str:
     :param payload: A ``turn.error`` object or an ``error`` ThreadItem.
     :returns: Non-empty error text.
     """
+    billing = provider_billing_refusal(json.dumps(payload))
+    billing_message = (
+        "Balance billing is disabled."
+        if billing == "billing_disabled"
+        else "Plan exhausted."
+        if billing == "plan_exhausted"
+        else None
+    )
     for key in ("message", "error", "text", "detail"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
+            if billing_message and not provider_billing_refusal(value):
+                return f"{value.strip()}\n\n{billing_message}"
             return value.strip()
-    return "Codex turn ended with an unspecified error."
+    return billing_message or "Codex turn ended with an unspecified error."
 
 
 def _codex_terminal_launch_args_from_settings(payload: _JsonObject) -> list[str] | None:

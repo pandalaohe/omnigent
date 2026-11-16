@@ -2,7 +2,7 @@
 
 import pytest
 
-from omnigent.harnesses.codex_native.forwarder import _classify_codex_error
+from omnigent.harnesses.codex_native.forwarder import _classify_codex_error, _error_payload_message
 from omnigent.runner.launch_failure import classify_native_turn_error
 
 
@@ -26,6 +26,17 @@ def test_structured_provider_code_precedes_generic_auth_variant():
         )
         == "generic"
     )
+
+
+def test_structured_billing_meaning_survives_forwarding_to_the_server():
+    message = _error_payload_message(
+        {
+            "message": "HTTP 403 Forbidden",
+            "error": {"code": "billing_disabled"},
+        }
+    )
+    assert classify_native_turn_error("codex_reauth_required", message) == "budget_exhausted"
+    assert _classify_codex_error({}, message) == "generic"
 
 
 @pytest.mark.parametrize(
