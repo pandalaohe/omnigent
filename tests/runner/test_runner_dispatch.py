@@ -17767,6 +17767,34 @@ async def test_readiness_does_not_reset_expired_chain(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("native", [True, False])
+async def test_unknown_admission_does_not_fail_independent_native_execution(monkeypatch, native):
+    from omnigent.runner import app as runner_app
+
+    monkeypatch.setattr(runner_app, "is_native_harness", lambda _harness: native)
+    app = create_runner_app(
+        process_manager=_RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([])),
+        server_client=NullServerClient(),
+    )
+    queue = asyncio.Queue()
+    app.state.session_event_queues["child"] = queue
+    app.state.begin_turn_slot("child", {"turn_id": "response", "input_id": "input"})
+    app.state.live_response_id["child"] = "response"
+    app.state.on_proxy_stream_end(
+        "child",
+        owner_response_id="response",
+        error={"code": "input_execution_acceptance_unknown", "message": "receipt unavailable"},
+    )
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    assert any(
+        e.get("type") == "session.status" and e.get("status") == "failed" for e in events
+    ) is (not native)
+    app.state.session_event_queues.pop("child", None)
+
+
+@pytest.mark.asyncio
 async def test_child_message_keeps_approval_transport_lifetime(monkeypatch):
     from omnigent.runner import tool_dispatch
 

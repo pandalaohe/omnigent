@@ -513,6 +513,10 @@ def _keep_warm_receipt(attempt_id: str, *, outcome: str, reason: str | None) -> 
     }
 
 
+class _InputExecutionAcceptanceUnknown(RuntimeError):
+    """The receiver cannot prove whether its original admission committed."""
+
+
 class TurnContext:
     """
     Per-turn interaction surface the scaffold hands to ``run_turn``.
@@ -883,10 +887,10 @@ class TurnContext:
             remaining = max(0, deadline - time.time()) if deadline else _INPUT_CLAIM_TIMEOUT_S
             result = await asyncio.wait_for(future, timeout=remaining + 5)
             if result.state == "pending":
-                raise RuntimeError("input_execution_acceptance_unknown")
+                raise _InputExecutionAcceptanceUnknown("input_execution_acceptance_unknown")
             return result.state in {"accepted", "reserved"} and not self.cancelled.is_set()
         except TimeoutError:
-            raise RuntimeError("input_execution_acceptance_unknown") from None
+            raise _InputExecutionAcceptanceUnknown("input_execution_acceptance_unknown") from None
         finally:
             self._pending_input_claims.pop(claim_id, None)
 
@@ -1175,6 +1179,14 @@ class HarnessApp:
             so AP-side retry decisions can act on it.
         """
         from omnigent.server.schemas import ErrorDetail
+
+        if isinstance(exception, _InputExecutionAcceptanceUnknown):
+            return ErrorDetail(
+                code="input_execution_acceptance_unknown",
+                message=(
+                    "Input delivery could not be confirmed; inspect its receipt before resending."
+                ),
+            )
 
         # P2.11: a turn-context desync (the inner generation outlived its turn)
         # carries the stable ``runner_turn_context_desync`` code. Surface it

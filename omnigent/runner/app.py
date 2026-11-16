@@ -7408,6 +7408,11 @@ def create_runner_app(
         was_interrupted = conv_id in _interrupted_sessions
         # Suppress terminal only if desync recovery claimed the token for THIS generation's epoch.
         _suppress_status = _desync_terminalized.get(conv_id) == _turn_bind_epoch.get(conv_id, 0)
+        delivery_unknown = (
+            error is not None
+            and error.get("code") == "input_execution_acceptance_unknown"
+            and _is_native_harness(conv_id)
+        )
         if _suppress_status:
             _desync_terminalized.pop(conv_id, None)
         if was_interrupted or cancelled:
@@ -7419,6 +7424,10 @@ def create_runner_app(
         elif sign_in_hold:
             # Nothing failed: the queued message is sent once the sign-in completes.
             pass
+        elif delivery_unknown:
+            # The native CLI has its own lifecycle stream. A missing admission
+            # receipt cannot terminate that execution or deliver a false failure.
+            _logger.warning("Native input delivery remains unknown for %s", conv_id)
         elif error is not None:
             if not has_buffered or error.get("code") != "databricks_sign_in_pending":
                 # Only a refusal that ended the wait fails the queue behind it too; after
@@ -7499,6 +7508,8 @@ def create_runner_app(
                     status="cancelled",
                     output=None,
                 )
+        elif delivery_unknown:
+            pass
         elif error is not None:
             _mark_subagent_terminal_and_wake(
                 conv_id,

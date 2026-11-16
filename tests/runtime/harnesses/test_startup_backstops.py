@@ -195,8 +195,12 @@ async def test_input_claim_uses_remaining_deadline_and_stops(
         with pytest.raises(asyncio.CancelledError):
             await waiting
     elif outcome == "hang":
-        with pytest.raises(RuntimeError, match="input_execution_acceptance_unknown"):
+        with pytest.raises(RuntimeError, match="input_execution_acceptance_unknown") as caught:
             await waiting
+        assert (
+            _scaffold.HarnessApp()._build_error_detail(caught.value).code
+            == "input_execution_acceptance_unknown"
+        )
     else:
         # custom-lint: disable-next=sleep-then-assert -- inject a reply beyond the old deadline
         await asyncio.sleep(0.2)
