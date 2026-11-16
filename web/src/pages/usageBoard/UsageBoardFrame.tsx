@@ -39,7 +39,7 @@ export function UsageBoardFrame({
   const location = useLocation();
   const analysis = location.pathname.endsWith("/cost");
   return (
-    <div className="usage-board @container">
+    <div className="usage-surface @container">
       <header className="usage-top">
         <h1>
           {typeof title === "string" ? (

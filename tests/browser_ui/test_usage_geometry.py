@@ -38,7 +38,7 @@ def test_usage_geometry_rejects_counterexamples(page: Page, counterexample: str,
         figure = f'<div style="width:40px;height:40px;overflow-y:auto">{figure}</div>'
     if counterexample == "empty":
         figure = ""
-    page.set_content(f"""<div class="usage-board" style="font-size:12px">
+    page.set_content(f"""<div class="usage-surface" style="font-size:12px">
       <div data-testid="usage-tile" style="width:180px;height:180px">{figure}</div>
     </div>""")
     with pytest.raises(AssertionError, match=message):
@@ -53,7 +53,7 @@ def test_usage_geometry_rejects_counterexamples(page: Page, counterexample: str,
 
 
 def test_usage_geometry_accepts_unclipped_glyphs_outside_their_line_box(page: Page):
-    page.set_content("""<div class="usage-board" style="font-size:16px">
+    page.set_content("""<div class="usage-surface" style="font-size:16px">
       <div data-testid="usage-tile" style="width:180px;height:180px;padding:20px">
         <span data-testid="usage-ring" style="display:block;width:92px;height:92px">
           <span data-usage-label>Quota</span>
@@ -72,7 +72,7 @@ def test_usage_geometry_accepts_unclipped_glyphs_outside_their_line_box(page: Pa
 
 
 def test_usage_geometry_accepts_truncated_label_with_full_title(page: Page):
-    page.set_content("""<div class="usage-board" style="font-size:16px">
+    page.set_content("""<div class="usage-surface" style="font-size:16px">
       <div data-testid="usage-tile" style="width:180px;height:180px;padding:20px">
         <span data-usage-label title="Long window name with a meaningful suffix"
           style="display:block;width:60px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
@@ -88,7 +88,7 @@ def test_usage_geometry_restores_scroll_positions(page: Page, small_text: bool):
     page.set_content("""<div style="height:100px;overflow:hidden;margin-top:1000px">
       <div id="scroller" style="height:100px;overflow-y:auto">
         <div style="height:200px"></div>
-        <div class="usage-board" style="font-size:12px">
+        <div class="usage-surface" style="font-size:12px">
           <span data-usage-label style="display:block">Quota</span>
         </div>
       </div>
@@ -107,7 +107,7 @@ def test_usage_geometry_restores_scroll_positions(page: Page, small_text: bool):
 
 
 def test_usage_geometry_accepts_explicit_horizontal_table_scrolling(page: Page):
-    page.set_content("""<div class="usage-board" style="width:180px;font-size:12px">
+    page.set_content("""<div class="usage-surface" style="width:180px;font-size:12px">
       <div class="overflow-x-auto" style="width:100px;overflow-x:auto">
         <table style="width:200px"><tr><td>
           <span data-usage-label style="display:block;width:200px">Quota</span>
@@ -135,7 +135,7 @@ def test_usage_geometry_checks_outer_ancestors(
     page: Page, outer_style: str, horizontal: bool, vertical: bool, record_property
 ):
     page.set_content(f"""<div id="outer" style="{outer_style}">
-      <div class="usage-board" style="font-size:12px;width:180px">
+      <div class="usage-surface" style="font-size:12px;width:180px">
         <div data-testid="usage-tile" style="width:180px;height:180px">
           <span data-testid="usage-ring" style="display:block;width:92px;height:92px">
             <span data-usage-label>Quota</span>

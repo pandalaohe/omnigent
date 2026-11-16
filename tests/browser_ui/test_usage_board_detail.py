@@ -592,7 +592,7 @@ def test_account_detail_keyboard_ranges_and_return(
     page.goto(appearance_url + "/frame/usage/board/plan-1/issues")
     expect(page.get_by_role("region", name="Failures", exact=True)).to_be_visible()
     names_in_view("issues", [LONG_NAMES[key] for key in ["account", "model"]])
-    assert_usage_geometry(page, {".usage-board section": 3})
+    assert_usage_geometry(page, {".usage-surface section": 3})
     page.goto(appearance_url + "/settings/general#usage-settings")
     usage_settings = page.get_by_test_id("settings-group-usage-settings")
     expect(usage_settings).to_be_visible()

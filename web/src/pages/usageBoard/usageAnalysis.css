@@ -85,7 +85,7 @@
   overflow-wrap: anywhere;
   color: var(--usage-ink);
 }
-.usage-board [data-unknown] {
+.usage-surface [data-unknown] {
   color: var(--usage-ink-3);
   font-weight: 400;
   letter-spacing: 0;

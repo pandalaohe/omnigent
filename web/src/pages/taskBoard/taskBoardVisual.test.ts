@@ -18,7 +18,7 @@ it("removes date, task and type affixes and distinguishes otherwise equal file e
   const rows = ["html", "md"].map((ext, i) => ({
     id: `path-${i}`,
     label: "Design",
-    value: `/opt/work/261024_T260101-EX-AG-001_task-placement_design.${ext}`,
+    value: `/opt/work/261024_T260101-EX-AGENT-1_task-placement_design.${ext}`,
   }));
   const files = boardFiles([...rows, { ...rows[0], id: "path-2" }]);
   expect(files).toHaveLength(2);

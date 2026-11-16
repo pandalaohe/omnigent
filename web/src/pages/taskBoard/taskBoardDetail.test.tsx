@@ -397,7 +397,7 @@ it("uses the native tool tuple and live clock instead of the older source tool",
 
 it("shows file short names, deduplicates paths, folds old versions and reports clipboard success or failure", async () => {
   const { TaskSourceDetails } = await import("./TaskSourceDetails");
-  const path = "/opt/work/261024_T260101-EX-AG-001_task-placement-trust-separation_design.html";
+  const path = "/opt/work/261024_T260101-EX-AGENT-1_task-placement-trust-separation_design.html";
   const writeText = vi.fn().mockResolvedValue(undefined);
   Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
   render(
@@ -411,7 +411,7 @@ it("shows file short names, deduplicates paths, folds old versions and reports c
             id: "path-2",
             label: "Design",
             value:
-              "/opt/work/generation-history/v1/261024_T260101-EX-AG-001_task-placement-trust-separation_design.md",
+              "/opt/work/generation-history/v1/261024_T260101-EX-AGENT-1_task-placement-trust-separation_design.md",
           },
           { id: "event_age", label: "Snapshot event age", value: "12345" },
         ],

@@ -365,7 +365,14 @@ describe("browserUrlPolicy — connected address check", () => {
       assert.equal(isAgentConnectionAllowed(url, address, eligible).ok, true, address);
       assert.equal(isAgentConnectionAllowed(url, address).ok, false, address);
     }
-    for (const address of [undefined, "", "10.0.0.5", "192.168.1.10", "93.184.215.14", "fd00::1"]) {
+    for (const address of [
+      undefined,
+      "",
+      ip(10, 0, 0, 5),
+      ip(192, 168, 1, 10),
+      "93.184.215.14",
+      "fd00::1",
+    ]) {
       const verdict = isAgentConnectionAllowed(url, address, eligible);
       assert.equal(verdict.ok, false, String(address));
       assert.match(verdict.error, /did not connect to a loopback address/);
