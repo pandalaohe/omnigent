@@ -302,6 +302,7 @@ export function HistoryTab() {
               {options.length > COMBOBOX_OPTION_THRESHOLD ? (
                 <fieldset disabled={!retention || places.busy || previewing} className="contents">
                   <Combobox
+                    key={`${key}:${limits[key]}:${previewing}`}
                     mode="select"
                     options={[
                       ...(!options.includes(limits[key])

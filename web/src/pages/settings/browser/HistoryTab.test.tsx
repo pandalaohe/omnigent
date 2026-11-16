@@ -67,7 +67,11 @@ it("gates each capability independently on a shell with retention only", async (
   await screen.findByText("Example");
   expect(screen.queryByRole("button", { name: "Remove page" })).not.toBeInTheDocument();
   expect(screen.getByRole("combobox", { name: "Keep pages for" })).not.toBeDisabled();
-  expect(await screen.findByText("Custom (45 days)")).toBeInTheDocument();
+  await waitFor(() =>
+    expect(screen.getByRole("combobox", { name: "Keep pages for" })).toHaveValue(
+      "Custom (45 days)",
+    ),
+  );
   expect(
     call.mock.calls.every(([args]) => ["list", "retention"].includes(args.action as string)),
   ).toBe(true);
@@ -134,7 +138,9 @@ it("refreshes a stale retention count and waits for another confirmation", async
     </MemoryRouter>,
   );
   await screen.findByText("Example");
-  fireEvent.keyDown(screen.getByRole("combobox", { name: "Keep pages for" }), { key: "ArrowDown" });
+  const retention = screen.getByRole("combobox", { name: "Keep pages for" });
+  await waitFor(() => expect(retention).toBeEnabled());
+  fireEvent.change(retention, { target: { value: "1 week" } });
   fireEvent.click(await screen.findByRole("option", { name: "1 week" }));
   await screen.findByRole("button", { name: "Remove 2 pages" });
   expect(saves).toBe(0);
@@ -172,7 +178,9 @@ it("reports a failed preview beside the retention controls without changing limi
       <HistoryTab />
     </MemoryRouter>,
   );
-  fireEvent.keyDown(screen.getByRole("combobox", { name: "Keep pages for" }), { key: "ArrowDown" });
+  const retention = screen.getByRole("combobox", { name: "Keep pages for" });
+  await waitFor(() => expect(retention).toBeEnabled());
+  fireEvent.change(retention, { target: { value: "1 week" } });
   fireEvent.click(await screen.findByRole("option", { name: "1 week" }));
   expect(await screen.findByText("Could not preview history settings.")).toBeInTheDocument();
   expect(screen.getByRole("combobox", { name: "Keep pages for" })).toHaveValue("3 months");

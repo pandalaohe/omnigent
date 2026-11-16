@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import userEvent from "@testing-library/user-event";
 
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
@@ -155,8 +156,31 @@ function entry(hostId: string, workspace: string) {
 }
 
 async function pickOption(triggerTestId: string, optionName: string) {
-  fireEvent.click(screen.getByTestId(triggerTestId));
-  fireEvent.click(await screen.findByRole("option", { name: optionName }));
+  const target = screen.getByTestId(triggerTestId);
+  const trigger = target.matches('[role="combobox"]')
+    ? target
+    : (target.querySelector<HTMLElement>('[role="combobox"]') ?? target);
+  if (trigger instanceof HTMLInputElement) {
+    const user = userEvent.setup();
+    await user.click(trigger);
+    await user.clear(trigger);
+    fireEvent.change(trigger, { target: { value: optionName } });
+    await user.click(await screen.findByRole("option", { name: optionName }));
+    await waitFor(() => {
+      expect(trigger).toHaveAttribute("aria-expanded", "false");
+      expect(trigger).toHaveValue(optionName);
+    });
+  } else {
+    fireEvent.click(trigger);
+    fireEvent.click(await screen.findByRole("option", { name: optionName }));
+  }
+}
+
+function expectPickerLabel(triggerTestId: string, label: string) {
+  const target = screen.getByTestId(triggerTestId);
+  const input = target.querySelector<HTMLInputElement>('input[role="combobox"]');
+  if (input) expect(input).toHaveValue(label);
+  else expect(target).toHaveTextContent(label);
 }
 
 async function openHarnessAction(testId: string) {
@@ -2347,13 +2371,11 @@ describe("ProjectSettingsDialog", () => {
     renderDialog();
     await screen.findByTestId("project-settings-host-model-h1");
     for (const field of ["model", "effort", "speed", "permission"]) {
-      expect(screen.getByTestId(`project-settings-host-${field}-h1`)).toHaveTextContent("Default");
+      expectPickerLabel(`project-settings-host-${field}-h1`, "Default");
     }
     fireEvent.click(screen.getByTestId("project-settings-host-other-toggle-h1"));
     for (const field of ["model", "effort", "speed", "permission"]) {
-      expect(
-        screen.getByTestId(`project-settings-host-other-${field}-h1-claude-native`),
-      ).toHaveTextContent("Default");
+      expectPickerLabel(`project-settings-host-other-${field}-h1-claude-native`, "Default");
     }
   });
 

@@ -452,6 +452,8 @@ it("activates artifact copy by keyboard and hides placeholder path actions", asy
   );
   expect(container.querySelectorAll(".tb-file")).toHaveLength(1);
   await user.tab();
+  expect(screen.getByRole("textbox", { name: "Search files" })).toHaveFocus();
+  await user.tab();
   expect(document.activeElement).toBe(screen.getByTitle(path));
   await user.keyboard("{Enter}");
   await screen.findByText("Copied");

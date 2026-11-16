@@ -228,15 +228,17 @@ describe("MobileAssistantSettings", () => {
     render(<MobileAssistantSettings />);
 
     fireEvent.click(screen.getByRole("button", { name: "Add button" }));
-    fireEvent.click(screen.getByRole("combobox", { name: "Action from keyboard shortcuts" }));
-    const options = screen.getAllByRole("option").map((option) => option.textContent ?? "");
-
-    expect(options.some((option) => option.startsWith("Recent sessions"))).toBe(false);
+    const picker = screen.getByRole("combobox", { name: "Action from keyboard shortcuts" });
+    fireEvent.change(picker, { target: { value: "Recent sessions" } });
+    expect(screen.queryByRole("option", { name: /recent sessions/i })).toBeNull();
+    fireEvent.change(picker, {
+      target: { value: MOBILE_ASSISTANT_ACTION_DEFINITIONS.newSession.label },
+    });
     expect(
-      options.some((option) =>
-        option.startsWith(MOBILE_ASSISTANT_ACTION_DEFINITIONS.newSession.label),
-      ),
-    ).toBe(true);
+      screen.getByRole("option", {
+        name: MOBILE_ASSISTANT_ACTION_DEFINITIONS.newSession.label,
+      }),
+    ).toBeInTheDocument();
     expect(
       screen.getByText("Switch recent sessions is keyboard-only: it needs a held key."),
     ).toBeTruthy();
@@ -246,15 +248,17 @@ describe("MobileAssistantSettings", () => {
     render(<MobileAssistantSettings />);
 
     fireEvent.click(screen.getByRole("button", { name: "Add button" }));
-    fireEvent.click(screen.getByRole("combobox", { name: "Action from keyboard shortcuts" }));
-    const options = screen.getAllByRole("option").map((option) => option.textContent ?? "");
-
-    expect(options.some((option) => option.toLowerCase().includes("question"))).toBe(false);
+    const picker = screen.getByRole("combobox", { name: "Action from keyboard shortcuts" });
+    fireEvent.change(picker, { target: { value: "question" } });
+    expect(screen.queryByRole("option", { name: /question/i })).toBeNull();
+    fireEvent.change(picker, {
+      target: { value: MOBILE_ASSISTANT_ACTION_DEFINITIONS.newSession.label },
+    });
     expect(
-      options.some((option) =>
-        option.startsWith(MOBILE_ASSISTANT_ACTION_DEFINITIONS.newSession.label),
-      ),
-    ).toBe(true);
+      screen.getByRole("option", {
+        name: MOBILE_ASSISTANT_ACTION_DEFINITIONS.newSession.label,
+      }),
+    ).toBeInTheDocument();
   });
 
   it("shows the real circular order preview and persists icon and repeat", () => {

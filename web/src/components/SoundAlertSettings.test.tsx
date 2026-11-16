@@ -184,7 +184,9 @@ describe("SoundAlertSettings", () => {
     );
     render(<SoundAlertSettings />);
 
-    const sound = within(screen.getByTestId("sound-alert-sound-done")).getByRole("combobox");
+    const sound = await within(screen.getByTestId("sound-alert-settings")).findByRole("combobox", {
+      name: "Done (unread dot) sound",
+    });
     fireEvent.click(sound);
     expect(await screen.findByRole("option", { name: /Glass.*System sound/ })).toBeVisible();
     expect(sound).toHaveValue("Glass");

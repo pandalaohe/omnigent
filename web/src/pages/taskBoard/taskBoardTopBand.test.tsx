@@ -64,7 +64,8 @@ it("uses searchable controls for display pickers above five options", () => {
   );
   const palette = screen.getByRole("combobox", { name: "Palette" });
   fireEvent.click(palette);
-  expect(screen.getAllByRole("option")).toHaveLength(PALETTES.length);
+  fireEvent.change(palette, { target: { value: "" } });
+  expect(within(screen.getByRole("listbox")).getAllByRole("option")).toHaveLength(PALETTES.length);
 });
 it("explains malformed storage and retains a failed save for this visit", () => {
   localStorage.setItem(BOARD_PREFERENCES_KEY, "{");

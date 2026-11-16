@@ -442,17 +442,18 @@ describe("AgentsSettings", () => {
     expect(
       within(dialog).getByText("Built-in · save your own starting prompt"),
     ).toBeInTheDocument();
-    const rows = within(dialog).getAllByTestId("builtin-member-row");
-    expect(rows).toHaveLength(3);
-    expect(within(rows[0]).getByText("polly")).toBeInTheDocument();
-    expect(within(rows[0]).getByText("Lead")).toBeInTheDocument();
-    expect(within(rows[0]).getByText("Claude SDK · opus")).toBeInTheDocument();
-    expect(within(rows[1]).getByText("codex")).toBeInTheDocument();
-    expect(within(rows[1]).getByText("Codex · Default · high")).toBeInTheDocument();
-    expect(within(rows[1]).queryByText("Lead")).not.toBeInTheDocument();
     expect(
       within(dialog).getByText("Duplicate Polly to change its members and other settings."),
     ).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Members: 3" }));
+    const details = screen.getByRole("textbox", { name: "Search Members" }).parentElement!;
+    const rows = within(details).getAllByText(/^(polly|codex|reviewer) ·/);
+    expect(rows.map((row) => row.textContent)).toEqual([
+      "polly · Lead · Claude SDK · opus",
+      "codex · Codex · Default · high",
+      "reviewer · Claude SDK · sonnet",
+    ]);
+    expect(within(details).queryByRole("button", { name: /^Remove / })).toBeNull();
   });
 
   it("duplicates a built-in into an editable copy and opens the editor on it", async () => {
@@ -506,8 +507,16 @@ describe("AgentsSettings", () => {
 
     expect(screen.getByText("Claude SDK · opus · high")).toBeInTheDocument();
     expect(screen.getByText("One member")).toBeInTheDocument();
-    expect(screen.getByText("3 members · Crew (Lead), architect, reviewer")).toBeInTheDocument();
+    expect(screen.queryByText("3 members · Crew (Lead), architect, reviewer")).toBeNull();
     expect(screen.getByText("Three members")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Members: 3" }));
+    const details = screen.getByRole("textbox", { name: "Search Members" }).parentElement!;
+    const rows = within(details).getAllByText(/^(Crew|architect|reviewer) ·/);
+    expect(rows.map((row) => row.textContent)).toEqual([
+      "Crew · Lead · Claude SDK · opus",
+      "architect · Claude SDK · opus",
+      "reviewer · Codex · Default",
+    ]);
   });
 
   it("pins and unpins Agents, materializing the Polly + Debby default", () => {
