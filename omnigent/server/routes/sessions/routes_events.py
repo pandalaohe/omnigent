@@ -5337,6 +5337,11 @@ def register_events_routes(
                         conversation_store,
                         _host_reg,
                         _host_conn,
+                        runner_router=runner_router,
+                        caller="post_event",
+                        request_id=getattr(
+                            getattr(request, "state", None), "audit_request_id", None
+                        ),
                     )
                     host_error_code = _classify_launch_refusal(
                         launch_attempt.error_code,
