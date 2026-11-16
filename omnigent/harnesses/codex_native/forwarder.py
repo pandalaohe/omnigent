@@ -4440,11 +4440,12 @@ def _resume_turn_status_edge_for_latest_turn(
         if status == "running":
             update_active_turn_id(bridge_dir, turn_id)
         else:
+            vendor_status = _turn_status_from_params({"turn": turn})
             outcome = (
                 "failed"
                 if status == "failed"
                 else "cancelled"
-                if turn.get("status") in {"interrupted", "cancelled", "canceled"}
+                if vendor_status in {"interrupted", "cancelled", "canceled"}
                 else "completed"
             )
             turn_ids = [
