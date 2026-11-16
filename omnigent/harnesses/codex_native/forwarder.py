@@ -67,6 +67,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_model,
     read_mcp_startup,
     record_child_usage_baseline,
+    record_resumed_terminal,
     record_retry_source,
     resolve_codex_auto_compact_token_limit,
     settle_pending_mcp_startup,
@@ -4443,15 +4444,38 @@ def _resume_turn_status_edge_for_latest_turn(
         status = _omnigent_status_from_resume_turn(turn)
         if status is None:
             return None
-        update_active_turn_id(bridge_dir, turn_id if status == "running" else None)
         # Parity with the live path — surface ``turn.error`` (if any) that
         # forced this resume turn to ``failed``.
         error = _terminal_error_from_turn({"turn": turn})
+        outcome = None
+        revision = None
+        if status == "running":
+            update_active_turn_id(bridge_dir, turn_id)
+        else:
+            outcome = (
+                "failed"
+                if status == "failed"
+                else "cancelled"
+                if turn.get("status") in {"interrupted", "cancelled", "canceled"}
+                else "completed"
+            )
+            turn_ids = [
+                value
+                for item in turns
+                if isinstance(item, dict) and (value := _turn_id_from_payload(item)) is not None
+            ]
+            current = record_resumed_terminal(bridge_dir, state, turn_ids, outcome)
+            if current is None:
+                return None
+            revision = current.active_turn_revision
         return _CodexTurnStatusEdge(
             status=status,
             turn_id=turn_id,
             source="thread/resume:turn-error" if error is not None else "thread/resume",
             error=error,
+            terminal_outcome=outcome,
+            bridge_revision=revision,
+            bridge_thread_id=thread_id if revision is not None else None,
         )
     return None
 

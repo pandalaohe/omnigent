@@ -799,6 +799,19 @@ def test_full_state_publication_preserves_revision_for_the_same_owner(
     )
 
 
+def test_resumed_terminal_does_not_replace_concurrently_started_turn(bridge_dir: Path) -> None:
+    _seed_active_turn(bridge_dir, "turn_a")
+    observed = read_bridge_state(bridge_dir)
+    assert observed is not None
+    update_active_turn_id(bridge_dir, "turn_b")
+    current = read_bridge_state(bridge_dir)
+    assert (
+        codex_native_bridge.record_resumed_terminal(bridge_dir, observed, ["turn_a"], "failed")
+        is None
+    )
+    assert read_bridge_state(bridge_dir) == current
+
+
 @pytest.mark.parametrize(
     ("sent_turn_id", "forwarder_events", "acknowledged_turn_id", "recorded", "active_after"),
     [
