@@ -1636,7 +1636,10 @@ async def test_owner_billing_report_cannot_stop_provider(quota_runner):
 
 
 @pytest.mark.asyncio
-async def test_codex_success_keeps_route_healthy_after_delayed_old_failure(quota_runner, tmp_path):
+@pytest.mark.parametrize("delivery", ["live", "resume"])
+async def test_codex_success_keeps_route_healthy_after_delayed_old_failure(
+    quota_runner, tmp_path, delivery
+):
     from omnigent.harnesses.codex_native import bridge
     from omnigent.harnesses.codex_native import forwarder as fwd
     from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
@@ -1679,6 +1682,31 @@ async def test_codex_success_keeps_route_healthy_after_delayed_old_failure(quota
     await fail("failure", 2)
     assert state.refusals
     await start("success", 3)
+    if delivery == "resume":
+        assert await fwd._post_status(
+            env.client,
+            sid,
+            "idle",
+            response_id="codex_delayed",
+            input_id="input-delayed",
+            recovered=True,
+            turn_completed=True,
+            native_turn_generation=1,
+        )
+        assert state.refusals
+        assert await fwd._post_status(
+            env.client,
+            sid,
+            "idle",
+            response_id="codex_unaccepted",
+            input_id="unaccepted-input",
+            recovered=True,
+            turn_completed=True,
+            native_turn_generation=4,
+            native_generation=999,
+        )
+        assert state.refusals
+        assert env.app.state.subagent_retry_admission.journal.get_input("unaccepted-input") is None
     bridge.write_bridge_state(
         tmp_path,
         bridge.CodexNativeBridgeState(
@@ -1688,16 +1716,26 @@ async def test_codex_success_keeps_route_healthy_after_delayed_old_failure(quota
             codex_home=str(tmp_path / "home"),
             active_turn_id="success",
             active_turn_revision=5,
+            input_id="input-success",
+            input_turn_id="success",
         ),
     )
-    edge = fwd._terminal_turn_status_edge(
-        tmp_path, "turn/completed", {"turn": {"id": "success", "status": "completed"}}
-    )
-    assert edge is not None
-    # Use the actual Codex lifecycle producer, including its confirmed-success flag.
-    await fwd._post_turn_status_edge(
-        env.client, sid, edge, input_id="input-success", bridge_dir=tmp_path
-    )
+    if delivery == "resume":
+        await fwd._post_resume_turn_status(
+            env.client,
+            session_id=sid,
+            bridge_dir=tmp_path,
+            thread_id="thread",
+            turns=[{"id": "success", "status": "completed", "items": []}],
+        )
+    else:
+        edge = fwd._terminal_turn_status_edge(
+            tmp_path, "turn/completed", {"turn": {"id": "success", "status": "completed"}}
+        )
+        assert edge is not None
+        await fwd._post_turn_status_edge(
+            env.client, sid, edge, input_id="input-success", bridge_dir=tmp_path
+        )
     assert not state.refusals
     await fail("delayed", 1)
     assert not state.refusals

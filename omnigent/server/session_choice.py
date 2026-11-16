@@ -1181,7 +1181,7 @@ class ChoiceState:
         self.exhausted: dict[tuple[str, str], float] = {}
         self.quota_rejections: set[tuple[str, str]] = set()
         self.refusals: dict[tuple[str, str, str], ProviderRefusal] = {}
-        self.provider_attempts: dict[tuple[str, str, str, str, str, int], float] = {}
+        self.provider_attempts: dict[tuple[str, str, str, str], tuple[str, int, float]] = {}
         self.provider_recoveries: dict[tuple[str, str, str], float] = {}
         self.tiers: dict[tuple[str, str, str, int], tuple[Row, ...]] = {}
 

@@ -116,6 +116,46 @@ async def test_record_and_recover_requires_owner_route_account_and_new_turn(monk
         app, session, from_runner=True, input_generation=3, response_id="success"
     )
     assert key not in state.refusals
+
+    # Routine successful turns replace correlation, rather than retaining every turn.
+    for generation in range(4, 104):
+        await record_provider_recovery(
+            app,
+            session,
+            from_runner=True,
+            input_generation=generation,
+            response_id=f"success-{generation}",
+            started=True,
+        )
+        await record_provider_recovery(
+            app,
+            session,
+            from_runner=True,
+            input_generation=generation,
+            response_id=f"success-{generation}",
+        )
+    assert len(state.provider_attempts) == 1
+    latest = dict(state.provider_attempts)
+    for generation, turn in [(1, "older-success"), (103, "success-103")]:
+        await record_provider_recovery(
+            app,
+            session,
+            from_runner=True,
+            input_generation=generation,
+            response_id=turn,
+            started=True,
+        )
+        await record_quota_exhaustion(
+            app,
+            session,
+            message,
+            actor="owner",
+            from_runner=True,
+            response_id=turn,
+            input_generation=generation,
+        )
+        assert key not in state.refusals
+    assert state.provider_attempts == latest
     assert other_key in state.refusals
     # First delivery of an older failure must not undo the later recovery.
     await record_quota_exhaustion(

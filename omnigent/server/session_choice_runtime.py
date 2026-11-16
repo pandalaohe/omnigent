@@ -513,8 +513,12 @@ async def record_quota_exhaustion(
             return
         route = provider_route(current.host, current.agent, current.model)
         key = (owner, pool, route)
-        attempt = state.provider_attempts.get((*key, session.id, response_id, input_generation))
-        if attempt is None or attempt <= state.provider_recoveries.get(key, float("-inf")):
+        attempt = state.provider_attempts.get((*key, session.id))
+        if (
+            attempt is None
+            or attempt[:2] != (response_id, input_generation)
+            or attempt[2] <= state.provider_recoveries.get(key, float("-inf"))
+        ):
             return
         state.quota_rejections.add(identity)
         state.refusals[key] = ProviderRefusal(reason, now, until, session.id, identity[1])
@@ -550,18 +554,24 @@ async def record_provider_recovery(
         return
     state = state_for(app)
     key = (owner, pool, route)
-    execution = (*key, session.id, response_id, input_generation)
-    if started:
-        state.provider_attempts.setdefault(execution, time.time())
-        return
+    execution = (*key, session.id)
     attempt = state.provider_attempts.get(execution)
-    if attempt is None:
+    if started:
+        # Keep one generation watermark per session/route, including after success.
+        # Duplicate or superseded running reports must not acquire a newer timestamp.
+        if attempt is None or input_generation > attempt[1]:
+            state.provider_attempts[execution] = (response_id, input_generation, time.time())
         return
-    state.provider_recoveries[key] = max(state.provider_recoveries.get(key, attempt), attempt)
+    if attempt is None or attempt[:2] != (response_id, input_generation):
+        return
+    started_at = attempt[2]
+    state.provider_recoveries[key] = max(
+        state.provider_recoveries.get(key, started_at), started_at
+    )
     for key, refusal in tuple(state.refusals.items()):
         if (
             key == (owner, pool, route)
-            and attempt > refusal.observed_at
+            and started_at > refusal.observed_at
             and (refusal.session_id != session.id or refusal.response_id != response_id)
         ):
             state.refusals.pop(key, None)

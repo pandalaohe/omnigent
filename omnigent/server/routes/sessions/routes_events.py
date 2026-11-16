@@ -4284,7 +4284,6 @@ def register_events_routes(
                 and native_identity.turn_id
                 and native_identity.input_id
                 and data.get("event_kind") != "dispatch_failed"
-                and data.get("recovered") is not True
             ):
                 stored = await asyncio.to_thread(
                     service.journal.get_input, native_identity.input_id
@@ -4296,7 +4295,20 @@ def register_events_routes(
                     else None
                 )
                 observed = None
-                if stored is not None and stored.state in {"reserved", "accepted"}:
+                receipt = None
+                if data.get("recovered") is True:
+                    # Resume can attest an existing execution, never admit or rebind one.
+                    if (
+                        status == "idle"
+                        and data.get("turn_completed") is True
+                        and stored is not None
+                        and stored.state == "accepted"
+                        and stored.target_id == session_id
+                        and stored.turn_id == native_identity.turn_id
+                        and native_terminal_generation(conv, data) is not None
+                    ):
+                        receipt = stored
+                elif stored is not None and stored.state in {"reserved", "accepted"}:
                     observed = await asyncio.to_thread(
                         service.journal.bind_native_turn,
                         session_id,
@@ -4316,9 +4328,10 @@ def register_events_routes(
                         runner_id=conv.runner_id,
                     )
                 if observed is not None and observed.accepted and observed.receipt is not None:
-                    data["input_generation"] = observed.receipt.input_generation
-                    control = await asyncio.to_thread(service.journal.get_control, session_id)
                     receipt = observed.receipt
+                if receipt is not None:
+                    data["input_generation"] = receipt.input_generation
+                    control = await asyncio.to_thread(service.journal.get_control, session_id)
                     # Historical receipts remain useful for transcript reconciliation,
                     # but only the currently accepted execution can change route health.
                     if (
