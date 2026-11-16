@@ -17,7 +17,7 @@ fire-time launch.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from omnigent.errors import ErrorCode, OmnigentError
@@ -159,6 +159,8 @@ async def launch_library_agent(
     launch: LibraryAgentLaunch,
     project_config: dict | None = None,
     master: dict | None = None,
+    preferences_store: Any = None,
+    catalog_store: Any = None,
 ) -> CreatedSessionResponse:
     """Create a session-scoped copy of an owner's saved Agent bundle.
 
@@ -190,6 +192,23 @@ async def launch_library_agent(
         agent_id=agent_id,
     )
     harness = library_agent_lead_harness(spec)
+    from omnigent.server.model_resolution import (
+        notes_from_labels,
+        resolution_context,
+        resolution_labels,
+    )
+
+    model_context = await resolution_context(
+        host=launch.host_id,
+        owner=library_agent_owner_id(owner),
+        preferences=preferences_store,
+        catalogs=catalog_store,
+    )
+    saved_model = launch.model_override or spec.executor.model
+    if saved_model:
+        evidence = model_context.resolve(harness, saved_model, "library_agent")
+        if evidence.model != saved_model:
+            launch = replace(launch, model_override=evidence.model)
     permission_mode = launch.permission_mode
     launch_args: list[str] | None = None
     labels = library_agent_presentation_labels(spec=spec, host_bound=launch.host_id is not None)
@@ -232,8 +251,14 @@ async def launch_library_agent(
             ),
             project_config=project_config,
             master=master,
+            model_groups=model_context.groups,
         )
     )
+    notes = notes_from_labels(labels)
+    for note in model_context.notes:
+        if note.payload() not in notes:
+            notes.append(note.payload())
+    labels.update(resolution_labels(notes))
 
     metadata = SessionCreateMetadata(
         title=launch.title,
@@ -268,4 +293,6 @@ async def launch_library_agent(
             result.session_id,
             model_override=launch.model_override,
         )
+    result.notes = notes
+    result.warnings.extend(model_context.warnings())
     return result

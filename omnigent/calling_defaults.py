@@ -21,6 +21,7 @@ from typing import Any, Protocol
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import is_harness_availability
+from omnigent.models.model_reference import ModelResolution
 from omnigent.permission_tiers import normalize_permission_tier
 from omnigent.session_default_modes import (
     mode_for_concept,
@@ -83,6 +84,8 @@ class CallingResolution:
     speed: str | None = None
     permission: str | None = None
     level: dict[str, str] = field(default_factory=dict)
+    model_resolution: ModelResolution | None = None
+    notes: tuple[dict[str, str], ...] = ()
 
 
 def _setting(value: object) -> str | None:
@@ -198,6 +201,7 @@ def resolve_calling(
     host_id: str | None,
     agent_harness: Callable[[str], str | None],
     permission_options: Callable[[str | None, str], Sequence[Mapping[str, str]]] | None = None,
+    model_resolver: Callable[[str | None, str, str], ModelResolution] | None = None,
 ) -> CallingResolution:
     """Resolve agent / harness / model / effort for one create.
 
@@ -302,6 +306,20 @@ def resolve_calling(
     ):
         raise OmnigentError("invalid explicit speed for harness", code=ErrorCode.INVALID_INPUT)
     permission, permission_source = resolve("permission", "permission", mode_harness)
+    evidence = model_resolver(harness, model, model_source) if model and model_resolver else None
+    notes = ()
+    if evidence is not None:
+        model = evidence.model
+        if evidence.model != evidence.saved or evidence.outcome == "missing":
+            notes = (
+                {
+                    "setting": model_source,
+                    "saved": evidence.saved,
+                    "model": evidence.model,
+                    "outcome": evidence.outcome,
+                    "host": host_id or "",
+                },
+            )
     return CallingResolution(
         agent_id=agent_id,
         harness=harness,
@@ -317,6 +335,8 @@ def resolve_calling(
             "permission": permission_source,
         },
         level=levels,
+        model_resolution=evidence,
+        notes=notes,
     )
 
 
@@ -481,6 +501,8 @@ def check_offered(
     sources: dict[str, str],
     host_id: str,
     project_name: str | None = None,
+    row_id: str | None = None,
+    allow_unknown_model: bool = False,
 ) -> list[dict]:
     """Report default-sourced model / effort values a fresh catalog lacks.
 
@@ -511,17 +533,19 @@ def check_offered(
         return []
     problems: list[dict] = []
     model_source = sources.get("model", "none")
+    lookup_model = row_id or model
     if (
         model is not None
         and model_source not in _EXPLICIT_SOURCES
-        and model not in _catalog_model_ids(rows)
+        and not allow_unknown_model
+        and lookup_model not in _catalog_model_ids(rows)
     ):
         problems.append(
             _offered_problem("model", model, model_source, harness, host_id, project_name, catalog)
         )
     effort_source = sources.get("effort", "none")
     if effort is not None and effort_source not in _EXPLICIT_SOURCES:
-        offered = _catalog_efforts(rows, model)
+        offered = _catalog_efforts(rows, lookup_model)
         if offered is None:
             offered = efforts_for_harness(harness)
         if offered and effort not in offered:
@@ -537,7 +561,8 @@ def check_offered(
                 (
                     row
                     for row in rows
-                    if model is not None and (row.get("id") == model or row.get("model") == model)
+                    if lookup_model is not None
+                    and (row.get("id") == lookup_model or row.get("model") == lookup_model)
                 ),
                 None,
             )
@@ -661,13 +686,17 @@ def check_calling_defaults(
     problems.extend(
         check_offered(
             harness=resolution.harness or "",
-            model=resolution.model,
+            model=resolution.model
+            or (resolution.model_resolution.model if resolution.model_resolution else None),
             effort=resolution.effort,
             speed=resolution.speed,
             catalog=catalog,
             sources=sources,
             host_id=host_id,
             project_name=project_name,
+            row_id=resolution.model_resolution.row_id if resolution.model_resolution else None,
+            allow_unknown_model=resolution.model_resolution is not None
+            and resolution.model_resolution.outcome == "missing",
         )
     )
     return problems

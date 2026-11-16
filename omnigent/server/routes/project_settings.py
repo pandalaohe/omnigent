@@ -22,7 +22,6 @@ from pydantic import (
 from omnigent.calling_defaults import (
     CallingResolution,
     _catalog_efforts,
-    _catalog_model_ids,
     check_calling_defaults,
     load_master,
     model_option_harnesses,
@@ -36,6 +35,7 @@ from omnigent.harness_availability import HARNESS_NEEDS_AUTH, reported_harness_a
 from omnigent.harness_capabilities import IntegrationMode
 from omnigent.harness_plugins import capability_for_harness
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.model_resolution import resolve_catalog_model, usable_catalog
 from omnigent.server.project_host_agents import resolve_project_host_template
 from omnigent.server.project_placement import default_host, host_roots
 from omnigent.server.routes._auth_helpers import require_user
@@ -602,7 +602,9 @@ def create_project_settings_router(
                 raise _invalid(
                     "project.model", "sync this host's model catalog before selecting a model"
                 )
-            if next_config["model"] not in _catalog_model_ids(catalog["models"]):
+            if resolve_catalog_model(
+                next_config["model"], usable_catalog(catalog), {}, harness
+            ).outcome not in {"exact", "pinned"}:
                 raise _invalid("project.model", "model is not offered by the selected host")
         if body.host and body.host.harnesses:
             for harness, patch in body.host.harnesses.items():
@@ -637,7 +639,9 @@ def create_project_settings_router(
                             raise _invalid(
                                 path, "sync this host's model catalog before selecting a model"
                             )
-                        if value not in _catalog_model_ids(catalog["models"]):
+                        if resolve_catalog_model(
+                            value, usable_catalog(catalog), {}, harness
+                        ).outcome not in {"exact", "pinned"}:
                             raise _invalid(path, "model is not offered by this host")
                     elif field == "effort":
                         if resolved.model and (
@@ -647,7 +651,14 @@ def create_project_settings_router(
                                 path, "sync this host's model catalog to validate effort"
                             )
                         offered = (
-                            _catalog_efforts(catalog["models"], resolved.model)
+                            _catalog_efforts(
+                                catalog["models"],
+                                resolve_catalog_model(
+                                    resolved.model, usable_catalog(catalog), {}, harness
+                                ).row_id
+                                if resolved.model
+                                else None,
+                            )
                             if catalog
                             else None
                         )

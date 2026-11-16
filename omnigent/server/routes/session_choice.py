@@ -319,7 +319,7 @@ def create_session_choice_router(
         request: Request, host_id: str, agent_id: str, model: str | None = None
     ) -> dict[str, Any]:
         from omnigent.entities import Conversation
-        from omnigent.server.session_choice import pool_of_session
+        from omnigent.server.session_choice import Link, pool_limits, pool_of_session
         from omnigent.server.session_choice_preview import read_preview_settings
         from omnigent.server.session_choice_runtime import context_request, inputs
 
@@ -366,14 +366,26 @@ def create_session_choice_router(
             model_override=model,
         )
         pool = await asyncio.to_thread(
-            pool_of_session, session, settings, products=context.products
+            pool_of_session,
+            session,
+            settings,
+            product=context.products.get(agent_id),
+            products=context.products,
+            groups=context.provider_groups,
         )
+        if pool is None:
+            return {"notice": None}
         now = time.time()
         readings, _, floors = await asyncio.to_thread(inputs, request.app, settings, context, now)
-        reading = readings.get(pool) if pool is not None else None
+        reading = readings.get(pool)
         if reading is None or reading.freshness != "fresh":
             return {"notice": None}
-        limits = settings.limits.get(pool) if pool is not None else None
+        limits = pool_limits(
+            settings,
+            Link(agent=agent_id, model=model, meter=pool),
+            context.products.get(agent_id),
+            context.provider_groups,
+        )
         reserve = limits.reserve if limits else None
         window = next(
             (

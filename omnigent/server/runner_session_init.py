@@ -16,6 +16,7 @@ import httpx
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import Conversation
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory, ErrorCode, ErrorImpact
+from omnigent.member_snapshot import MEMBER_LABEL_PREFIX
 from omnigent.runner.session_init_protocol import (
     ProjectCodeLocation,
     RunnerArchiveState,
@@ -144,6 +145,8 @@ _SessionInitKey = tuple[
     bool,
     StartupAttemptRef | None,
     str | None,
+    str | None,
+    tuple[tuple[str, str], ...],
 ]
 _BODY_SNIPPET_MAX = 500
 
@@ -212,6 +215,7 @@ class RunnerSessionInitializer:
         session_choice_resolver: Callable[[Conversation], str] | None = None,
         standing_approval_resolver: Callable[[Conversation], str] | None = None,
         instructions_override_resolver: Callable[[Conversation], str | None] | None = None,
+        model_resolution_resolver: Callable[[Conversation], Awaitable[Conversation]] | None = None,
         conversation_store: ConversationStore | None = None,
         file_store: FileStore | None = None,
         agent_store: AgentStore | None = None,
@@ -229,6 +233,7 @@ class RunnerSessionInitializer:
         self._session_choice_resolver = session_choice_resolver
         self._standing_approval_resolver = standing_approval_resolver
         self._instructions_override_resolver = instructions_override_resolver
+        self._model_resolution_resolver = model_resolution_resolver
         build_info = _read_build_info()
         self._diagnostic_context = {
             "server_version": server_version,
@@ -444,6 +449,14 @@ class RunnerSessionInitializer:
                     conversation.worktree or conversation.workspace,
                     *startup_control,
                     conversation.labels.get(RECOVERY_INPUT_LABEL),
+                    conversation.model_override,
+                    tuple(
+                        sorted(
+                            (key, value)
+                            for key, value in conversation.labels.items()
+                            if key.startswith(MEMBER_LABEL_PREFIX)
+                        )
+                    ),
                 )
             ):
                 continue
@@ -485,6 +498,9 @@ class RunnerSessionInitializer:
         conversation = await self._migrate_legacy_permission_state(
             conversation, store_slots=store_slots
         )
+        if self._model_resolution_resolver is not None:
+            async with store_slots or nullcontext():
+                conversation = await self._model_resolution_resolver(conversation)
         if RECOVERY_INPUT_LABEL in conversation.labels:
             suppress_recovery_turn = True
             resume_interrupted_turn = False
@@ -528,6 +544,14 @@ class RunnerSessionInitializer:
             conversation.worktree or conversation.workspace,
             *startup_control,
             conversation.labels.get(RECOVERY_INPUT_LABEL),
+            conversation.model_override,
+            tuple(
+                sorted(
+                    (key, value)
+                    for key, value in conversation.labels.items()
+                    if key.startswith(MEMBER_LABEL_PREFIX)
+                )
+            ),
         )
         task = self._tasks.get(key)
         if (

@@ -6064,6 +6064,7 @@ async def _complete_created_session(
             **({"startup": data["startup"]} if "startup" in data else {}),
             **({"session_choice": data["session_choice"]} if data.get("session_choice") else {}),
             **({"warnings": data["warnings"]} if data.get("warnings") else {}),
+            **({"notes": data["notes"]} if data.get("notes") else {}),
         }
     )
 
@@ -6602,6 +6603,7 @@ async def _execute_session_create_impl(
             "title": data.get("title") or args.get("title"),
             **({"session_choice": data["session_choice"]} if data.get("session_choice") else {}),
             **({"warnings": data["warnings"]} if data.get("warnings") else {}),
+            **({"notes": data["notes"]} if data.get("notes") else {}),
         }
         initial_message = data.get("initial_message")
         if placement_mode == "same_host" and args.get("message"):
@@ -6934,6 +6936,7 @@ async def _session_create_from_config_path(
             "status": "created",
             "project_id": data.get("project_id"),
             "warnings": data.get("warnings", []),
+            "notes": data.get("notes", []),
         },
         server_client=server_client,
         conversation_id=conversation_id,

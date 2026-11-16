@@ -634,6 +634,29 @@ def test_preference_namespace_literal_covers_store_allowlist() -> None:
     assert not missing, f"Store namespaces missing from the HTTP contract: {sorted(missing)}"
 
 
+def test_namespace_transform_serializes_and_validates_provider_aliases(db_uri):
+    from omnigent.models.model_reference import ALIASES_NAMESPACE
+
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    owner = "owner@example.test"
+    store.patch_namespace(owner, "usage_context", {"visible": True})
+    store.transform_namespace(owner, ALIASES_NAMESPACE, lambda _: {"pairs": [["old", "new"]]})
+    with pytest.raises(UserPreferencesValidationError):
+        store.transform_namespace(
+            owner, ALIASES_NAMESPACE, lambda _: {"pairs": [["old", "bad/provider"]]}
+        )
+    current = store.get(owner)["settings"]
+    assert current[ALIASES_NAMESPACE] == {"pairs": [["old", "new"]]}
+    assert current["usage_context"] == {"visible": True}
+
+    def fail(_):
+        raise RuntimeError("stop")
+
+    with pytest.raises(RuntimeError):
+        store.transform_namespace(owner, "calling_defaults", fail)
+    assert "calling_defaults" not in store.get(owner)["settings"]
+
+
 @pytest.mark.parametrize(
     ("namespace", "value"),
     [

@@ -434,10 +434,10 @@ async def test_resolve_a_named_member_with_an_explicit_harness(
     assert body["effort"] == "high"
 
 
-async def test_resolve_project_default_flags_a_missing_model_and_stale_skips(
+async def test_resolve_project_default_keeps_catalog_miss_unknown_and_warns(
     client: httpx.AsyncClient, stores: _Stores
 ) -> None:
-    """Scenarios 11 + 13: a fresh catalog refuses the model; a stale one does not."""
+    """A catalog miss warns and keeps the saved model; an errored catalog is unknown."""
     stores.host_store.upsert_on_connect(HOST_A, "box-a", "local")
     project = (
         await client.post(
@@ -463,12 +463,10 @@ async def test_resolve_project_default_flags_a_missing_model_and_stale_skips(
     body = (await client.get("/v1/calling-defaults/resolve", params=params)).json()
     assert body["model"] == "gpt-6-sol"
     assert body["sources"]["model"] == "project_host"
-    (problem,) = body["problems"]
-    assert problem["field"] == "model"
-    assert problem["setting"] == "project_host"
-    assert "project 'P' host settings" in problem["message"]
-    assert f"host {HOST_A!r}" in problem["message"]
-    assert "last sync" in problem["message"]
+    assert body["problems"] == []
+    assert body["notes"][0]["outcome"] == "missing"
+    assert body["notes"][0]["saved"] == "gpt-6-sol"
+    assert any("trying it as unknown" in warning for warning in body["warnings"])
 
     # Once the pair is stale, the offered check is skipped entirely.
     stores.cache.mark_error(HOST_A, "codex", "unsupported")

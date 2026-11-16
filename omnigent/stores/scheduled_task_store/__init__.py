@@ -231,6 +231,19 @@ class ScheduledTaskStore(ABC):
         """
         ...
 
+    def replace_model_if_matches(
+        self,
+        scheduled_task_id: str,
+        *,
+        user_id: str | None,
+        expected_model: str,
+        model: str,
+    ) -> bool:
+        """Replace an owned task's model only if the observed value still matches."""
+        raise NotImplementedError(
+            "Scheduled task store does not support conditional model updates"
+        )
+
     @abstractmethod
     def update(
         self,

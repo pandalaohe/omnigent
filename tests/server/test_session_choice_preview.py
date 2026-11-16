@@ -73,6 +73,44 @@ async def preview_env(db_uri, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_legacy_notice_keeps_quota_warning_across_provider_rename(preview_env, monkeypatch):
+    from omnigent.models.model_reference import ALIASES_NAMESPACE
+    from tests.server.test_session_choice import reading
+
+    env = preview_env
+    prefs = env.app.state.user_preferences_store
+    prefs.patch_namespace(OWNER, ALIASES_NAMESPACE, {"pairs": [["old", "new"]]})
+    link = {"agent": env.agent, "model": "old/model-x"}
+    settings = {
+        "enabled": True,
+        "workTypes": [{"id": "work", "label": "Work"}],
+        "presets": [{"id": "one", "name": "One", "links": [link]}],
+        "hosts": {HOST: {"work": [[{"links": [link]}]]}},
+        "limits": {
+            "codex:old/model-x": {
+                "reserve": {"mode": "total", "window": "7d", "pct": 15, "stopPct": 5}
+            }
+        },
+    }
+    prefs.replace_session_choice(OWNER, settings, env.saved["revision"])
+    quota = reading("codex:new/model-x", used=96)
+    quota.windows[0].resets_at = time.time() + 86400
+    monkeypatch.setattr(
+        env.app.state.agent_quota_service,
+        "pool_readings",
+        lambda *args, **kwargs: {"codex:new/model-x": quota},
+    )
+    query = {"host_id": HOST, "agent_id": env.agent, "model": "new/model-x"}
+    response = await env.client.get(URL + "/notice", params=query)
+    assert response.status_code == 200, response.text
+    assert response.json()["notice"] and response.json()["pool"] == "codex:new/model-x"
+    assert response.json()["remaining_pct"] == 4
+    assert (
+        await env.client.get(URL + "/notice", params={**query, "model": "unconfigured"})
+    ).json() == {"notice": None}
+
+
+@pytest.mark.asyncio
 async def test_candidate_outside_tiers_explains_draft_and_preserves_saved_state(preview_env):
     env = preview_env
     state = state_for(env.app)
@@ -156,7 +194,7 @@ async def test_candidate_errors_and_owner_boundaries(preview_env):
         ({"caller_id": "missing"}, 404),
         ({"host_id": "2" * 32}, 404),
         ({"candidate": {"agent_id": "missing", "model": "model-x"}}, 404),
-        ({"candidate": {"agent_id": env.agent, "model": "not-in-catalog"}}, 422),
+        ({"candidate": {"agent_id": env.agent, "model": "not-in-catalog"}}, 200),
     ]:
         response = await env.client.post(URL + "/preview", json={**env.body, **change})
         assert response.status_code == status, (change, response.text)

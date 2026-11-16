@@ -139,6 +139,7 @@ import { KeepWarmSettings } from "@/components/KeepWarmSettings";
 import { SettingRow } from "@/components/SettingsFields";
 import { ChildSessionsPanel } from "@/pages/instructions/ChildSessionsPanel";
 import { SessionChoiceSettings } from "@/pages/settings/sessionChoice/SessionChoiceSettings";
+import { ModelReferenceNotice } from "@/pages/settings/ModelReferenceNotice";
 import { MobileAssistantSettings } from "@/components/MobileAssistantSettings";
 import { HostColorsSettings, SessionCollabSettings } from "@/components/SessionCollabSettings";
 import { SoundAlertSettings } from "@/components/SoundAlertSettings";
@@ -2338,6 +2339,9 @@ function GeneralSection() {
         </SettingsGroup>
         <SettingsGroup title="Model providers">
           <ModelConnectionsSettings />
+          <div className="mt-4 border-t border-border pt-4">
+            <ModelReferenceNotice />
+          </div>
         </SettingsGroup>
         <SettingsGroup title="语音输入" testId="settings-group-voice-input">
           <VoiceInputSettings />

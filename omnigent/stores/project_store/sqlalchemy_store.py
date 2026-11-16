@@ -6,7 +6,8 @@ import builtins
 import json
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from copy import deepcopy
 from typing import Any, Literal
 
 import zstandard
@@ -683,6 +684,38 @@ class SqlAlchemyProjectStore(ProjectStore):
         return run_write_transaction(
             self._session_immediate, "patch_project_calling_defaults", write
         )
+
+    def transform_config(
+        self,
+        project_id: str,
+        *,
+        user_id: str | None,
+        expected_revision: str,
+        transform: Callable[[dict[str, Any]], dict[str, Any]],
+    ) -> Project | None:
+        """Compare and transform the current config without losing sibling edits."""
+
+        def write(session: Session) -> Project | None:
+            require_active_account(session, user_id)
+            row = session.get(
+                SqlProject, (current_workspace_id(), project_id), with_for_update=True
+            )
+            if row is None or row.user_id != user_id:
+                return None
+            config = _decode_config(row.config)
+            if project_config_revision(config) != expected_revision:
+                raise OmnigentError(
+                    "Project settings changed; reload before replacing models",
+                    code=ErrorCode.CONFLICT,
+                )
+            updated = transform(deepcopy(config))
+            if "calling_defaults" in updated:
+                validate_project_calling_defaults(updated["calling_defaults"])
+            row.config = _encode_config(updated)
+            row.updated_at = now_epoch()
+            return _to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "transform_project_config", write)
 
     def delete(self, project_id: str, *, user_id: str | None) -> bool:
         """Delete an owned project. Idempotent; returns ``False`` if not found."""

@@ -102,7 +102,6 @@ from omnigent.member_snapshot import (
     MEMBER_LOCK_LABEL_KEY,
     MEMBER_UNAVAILABLE_HARNESS_NOT_CONFIGURED,
     MEMBER_UNAVAILABLE_HOST_OFFLINE,
-    MEMBER_UNAVAILABLE_MODEL_MISSING,
     encode_member_entry,
     member_label_key,
 )
@@ -13399,6 +13398,7 @@ async def _member_snapshot_labels(
     member_hosts: Mapping[str, str] | None = None,
     project_config: dict | None = None,
     master: dict | None = None,
+    model_groups: Mapping[str, frozenset[str]] | None = None,
 ) -> dict[str, str]:
     """
     Resolve one session's member-snapshot labels, or ``{}`` for a 1-member agent.
@@ -13566,6 +13566,9 @@ async def _member_snapshot_labels(
         catalogs = dict(zip(needed, results, strict=True))
 
     labels: dict[str, str] = {}
+    from omnigent.server.model_resolution import ResolutionContext
+
+    model_notes = []
     for role, entry, reason in prepared:
         harness = entry["harness"]
         host = entry["host"]
@@ -13579,8 +13582,13 @@ async def _member_snapshot_labels(
                     entry["model"] = (
                         _member_model_id(default_row) if default_row is not None else None
                     )
-                elif model not in {_member_model_id(row) for row in rows}:
-                    reason = MEMBER_UNAVAILABLE_MODEL_MISSING
+                else:
+                    context = ResolutionContext(
+                        host, {harness: {"models": rows}}, model_groups or {}
+                    )
+                    evidence = context.resolve(harness, model, f"member:{role}")
+                    entry["model"] = evidence.model
+                    model_notes.extend(note.payload() for note in context.notes)
         if reason is not None:
             entry["unavailable"] = reason
         key = member_label_key(role)
@@ -13600,6 +13608,10 @@ async def _member_snapshot_labels(
             )
         labels[key] = value
     labels[MEMBER_LOCK_LABEL_KEY] = "true" if locked else "false"
+    if model_notes:
+        from omnigent.server.model_resolution import resolution_labels
+
+        labels.update(resolution_labels(model_notes))
     return labels
 
 

@@ -663,7 +663,7 @@ async def test_unreported_harness_is_not_unavailable(
 
 
 @pytest.mark.asyncio
-async def test_explicit_model_missing_from_catalog_is_unavailable(
+async def test_explicit_model_missing_from_catalog_is_tried_as_unknown(
     member_server: _MemberServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _arm_host(member_server.hosts)
@@ -677,7 +677,8 @@ async def test_explicit_model_missing_from_catalog_is_unavailable(
 
     entries, _ = await _member_labels_after_create(member_server, joint_bundle())
 
-    assert entries["researcher"]["unavailable"] == "model_missing"
+    assert "unavailable" not in entries["researcher"]
+    assert entries["researcher"]["model"]
 
 
 @pytest.mark.asyncio

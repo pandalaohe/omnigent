@@ -37,6 +37,42 @@ def store(db_uri: str) -> SqlAlchemyProjectStore:
     return SqlAlchemyProjectStore(db_uri)
 
 
+def test_model_repair_transform_checks_revision_and_keeps_siblings(store):
+    from omnigent.stores.project_store import project_config_revision
+
+    owner = "owner@example.test"
+    original = store.create(
+        _uid("model-repair"), "Repair", owner, config={"model": "old/x", "custom": "kept"}
+    )
+    revision = project_config_revision(original.config)
+    assert (
+        store.transform_config(
+            original.id,
+            user_id="other@example.test",
+            expected_revision=revision,
+            transform=lambda config: {**config, "model": "new/x"},
+        )
+        is None
+    )
+    store.update(original.id, user_id=owner, config={"model": "old/x", "custom": "newer"})
+    with pytest.raises(OmnigentError) as error:
+        store.transform_config(
+            original.id,
+            user_id=owner,
+            expected_revision=revision,
+            transform=lambda config: {**config, "model": "new/x"},
+        )
+    assert error.value.code == ErrorCode.CONFLICT
+    current = store.get(original.id, user_id=owner)
+    repaired = store.transform_config(
+        original.id,
+        user_id=owner,
+        expected_revision=project_config_revision(current.config),
+        transform=lambda config: {**config, "model": "new/x"},
+    )
+    assert repaired.config == {"model": "new/x", "custom": "newer"}
+
+
 @pytest.mark.parametrize("choice", ["on", True, {"pin": ""}, {"pin": "code", "other": 1}])
 def test_config_rejects_malformed_project_choice(store, choice):
     with pytest.raises(OmnigentError, match="session_choice"):

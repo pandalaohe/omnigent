@@ -14,6 +14,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     SerializationInfo,
     SerializerFunctionWrapHandler,
     StrictBool,
@@ -22,6 +23,14 @@ from pydantic import (
     model_validator,
 )
 from pydantic.alias_generators import to_camel
+
+from omnigent.models.model_reference import (
+    ModelResolution,
+    ProviderGroups,
+    canonical_model,
+    canonical_pool,
+    resolve_saved_model,
+)
 
 if TYPE_CHECKING:
     from omnigent.entities import Conversation
@@ -67,6 +76,7 @@ class _DocumentModel(BaseModel):
 
 
 class Link(_DocumentModel):
+    _model_resolution: ModelResolution | None = PrivateAttr(default=None)
     agent_id: Annotated[StrictStr, Field(alias="agent", min_length=1)]
     model: StrictStr | None = None
     effort: StrictStr | None = None
@@ -199,7 +209,12 @@ class ResolvedLimitField:
 
 
 def resolve_limit_rules(
-    rules: Sequence[LimitRule], *, agent: str, host: str | None, model: str | None
+    rules: Sequence[LimitRule],
+    *,
+    agent: str,
+    host: str | None,
+    model: str | None,
+    groups: ProviderGroups | None = None,
 ) -> dict[str, ResolvedLimitField]:
     """Resolve each field independently; stable sorting preserves visible tie order."""
     resolved = {
@@ -214,7 +229,20 @@ def resolve_limit_rules(
         )
     }
     matching = sorted(
-        (rule for rule in rules if rule.matches(agent=agent, host=host, model=model)),
+        (
+            rule
+            for rule in rules
+            if rule.matches(
+                agent=agent,
+                host=host,
+                model=rule.model
+                if rule.model is not None
+                and model is not None
+                and canonical_model(rule.model, groups or {})
+                == canonical_model(model, groups or {})
+                else model,
+            )
+        ),
         key=lambda rule: -rule.specificity,
     )
     for rule in matching:
@@ -446,11 +474,29 @@ def pin_codex_link(link: Link, product: str | None) -> Link:
     return link
 
 
-def pool_of(link: Link, product: str | None) -> str:
+def pool_of(link: Link, product: str | None, groups: ProviderGroups | None = None) -> str:
     return (
         codex_route_pool(link.model, product)
         or link.meter
-        or f"{product or link.agent_id}:{link.model or ''}"
+        or f"{product or link.agent_id}:{canonical_model(link.model or '', groups or {})}"
+    )
+
+
+def pool_limits(
+    settings: SessionChoice, link: Link, product: str | None, groups: ProviderGroups
+) -> TileLimits:
+    pool = pool_of(link, product, groups)
+    saved = link._model_resolution.saved if link._model_resolution else link.model
+    raw_pool = pool_of(link.model_copy(update={"model": saved}), product)
+    if raw_pool in settings.limits:
+        return settings.limits[raw_pool]
+    return next(
+        (
+            settings.limits[key]
+            for key in sorted(settings.limits)
+            if canonical_pool(key, groups) == pool
+        ),
+        TileLimits(),
     )
 
 
@@ -471,6 +517,7 @@ def pool_of_session(
     product: str | None = None,
     model: str | None = None,
     products: Mapping[str, str | None] | None = None,
+    groups: ProviderGroups | None = None,
 ) -> str | None:
     """A Codex route pin wins over meters; unpinned sessions keep their saved pool."""
     record = None
@@ -495,7 +542,7 @@ def pool_of_session(
         if pool is not None:
             return pool
     if isinstance(record, dict) and isinstance(record.get("pool"), str):
-        return record["pool"]
+        return canonical_pool(record["pool"], groups or {})
     model = model if model is not None else session.reported_model or session.model_override
     if product is None:
         return None
@@ -505,8 +552,11 @@ def pool_of_session(
             from omnigent.runtime.instruction_layers import agent_key_for_harness
 
             link_product = agent_key_for_harness(link.agent_id)
-        if link_product == product and link.model == model:
-            return pool_of(link, product)
+        if link_product == product and (
+            canonical_model(link.model or "", groups or {})
+            == canonical_model(model or "", groups or {})
+        ):
+            return pool_of(link, product, groups)
     return None
 
 
@@ -665,6 +715,7 @@ class ChoiceRequest:
     named_agent: str | None = None
     default_models: Mapping[str, str | None] = field(default_factory=dict)
     effective_models: Mapping[str, str | None] = field(default_factory=dict)
+    provider_groups: ProviderGroups = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -701,7 +752,9 @@ class RunningSnapshot(Mapping[str, tuple[str, ...]]):
             identities=tuple(row for row in self.identities if row.session_id != session_id),
         )
 
-    def scoped(self, scope: LimitScope) -> tuple[str, ...] | None:
+    def scoped(
+        self, scope: LimitScope, groups: ProviderGroups | None = None
+    ) -> tuple[str, ...] | None:
         if not self.available:
             return None
         ids = set()
@@ -709,7 +762,10 @@ class RunningSnapshot(Mapping[str, tuple[str, ...]]):
             dimensions = (
                 (scope.agent, row.agent),
                 (scope.host, row.host),
-                (scope.model, row.model),
+                (
+                    canonical_model(scope.model, groups or {}) if scope.model else None,
+                    canonical_model(row.model, groups or {}) if row.model else None,
+                ),
             )
             if any(
                 want is not None and got is not None and want != got for want, got in dimensions
@@ -723,8 +779,16 @@ class RunningSnapshot(Mapping[str, tuple[str, ...]]):
         return tuple(sorted(ids))
 
 
-def rule_limits(settings: SessionChoice, agent: str, host: str | None, model: str | None):
-    fields = resolve_limit_rules(settings.limit_rules, agent=agent, host=host, model=model)
+def rule_limits(
+    settings: SessionChoice,
+    agent: str,
+    host: str | None,
+    model: str | None,
+    groups: ProviderGroups | None = None,
+):
+    fields = resolve_limit_rules(
+        settings.limit_rules, agent=agent, host=host, model=model, groups=groups
+    )
     reserve = {
         name: fields[f"reserve.{name}"].value for name in ("mode", "window", "pct", "stopPct")
     }
@@ -743,10 +807,23 @@ def rule_limits(settings: SessionChoice, agent: str, host: str | None, model: st
 def candidate_lines(settings, link, request, readings, floor_off, now):
     """Legacy pool constraints remain independent of resolved rule overrides."""
     link = _candidate_link(settings, link, request)
-    pool = pool_of(link, request.products.get(link.agent_id, link.agent_id))
-    limits = [settings.limits.get(pool, TileLimits())]
+    pool = pool_of(
+        link, request.products.get(link.agent_id, link.agent_id), request.provider_groups
+    )
+    limits = [
+        pool_limits(
+            settings,
+            link,
+            request.products.get(link.agent_id, link.agent_id),
+            request.provider_groups,
+        )
+    ]
     if settings.schema_version == 2:
-        limits.append(rule_limits(settings, link.agent_id, request.host, link.model)[0])
+        limits.append(
+            rule_limits(
+                settings, link.agent_id, request.host, link.model, request.provider_groups
+            )[0]
+        )
     return tuple(
         (cap, tile_line(cap, readings.get(pool), floor_off.get(pool), now)) for cap in limits
     )
@@ -793,24 +870,44 @@ def check_candidate_limits(
             ):
                 return Skipped(link, reason, line.clears_at)
     product = request.products.get(link.agent_id, link.agent_id)
-    pool = pool_of(link, product)
-    legacy = settings.limits.get(pool, TileLimits())
+    pool = pool_of(link, product, request.provider_groups)
+    legacy = pool_limits(settings, link, product, request.provider_groups)
     cap = legacy.max_running if link.meter else link.max_running
     if codex_route_pool(link.model, product) and legacy.max_running is not None:
         cap = legacy.max_running
     if cap is not None:
         if isinstance(running, RunningSnapshot) and (
             not running.available
-            or any(not row.owner_known and row.pool in {None, pool} for row in running.identities)
+            or any(
+                not row.owner_known
+                and (row.pool is None or canonical_pool(row.pool, request.provider_groups) == pool)
+                for row in running.identities
+            )
         ):
             return Skipped(link, "count_unavailable")
-        if len(running.get(pool, ())) >= cap:
-            return Skipped(link, "busy", now, running.get(pool, ()))
+        ids = tuple(
+            sorted(
+                {
+                    sid
+                    for key, values in running.items()
+                    if canonical_pool(key, request.provider_groups) == pool
+                    for sid in values
+                }
+            )
+        )
+        if len(ids) >= cap:
+            return Skipped(link, "busy", now, ids)
     if settings.schema_version == 2:
-        limits, fields = rule_limits(settings, link.agent_id, request.host, link.model)
+        limits, fields = rule_limits(
+            settings, link.agent_id, request.host, link.model, request.provider_groups
+        )
         scope = fields["maxRunning"].scope
         if limits.max_running is not None and scope is not None:
-            ids = running.scoped(scope) if isinstance(running, RunningSnapshot) else None
+            ids = (
+                running.scoped(scope, request.provider_groups)
+                if isinstance(running, RunningSnapshot)
+                else None
+            )
             if ids is None:
                 return Skipped(link, "count_unavailable")
             if len(ids) >= limits.max_running:
@@ -840,7 +937,34 @@ def resolved_link(link: Link, request: ChoiceRequest) -> Link:
         and link.meter in {"codex-pro", "krill"}
     ):
         link = link.model_copy(update={"model": request.default_models.get(link.agent_id)})
-    return pin_codex_link(link, request.products.get(link.agent_id))
+    link = pin_codex_link(link, request.products.get(link.agent_id))
+    if link.model is not None:
+        catalog = request.models.get(link.agent_id)
+        result = resolve_saved_model(
+            link.model,
+            catalog,
+            request.provider_groups,
+            accepts=lambda value: catalog_model(value, request.products.get(link.agent_id)),
+        )
+        if link._model_resolution is None:
+            link = link.model_copy(update={"model": result.model})
+            object.__setattr__(link, "_model_resolution", result)
+    return link
+
+
+def model_notes(link: Link, request: ChoiceRequest) -> tuple[dict[str, str], ...]:
+    result = link._model_resolution
+    if result is None or (result.model == result.saved and result.outcome != "missing"):
+        return ()
+    return (
+        {
+            "setting": "session_choice",
+            "saved": result.saved,
+            "model": result.model,
+            "outcome": result.outcome,
+            "host": request.host,
+        },
+    )
 
 
 @dataclass(frozen=True)
@@ -875,6 +999,7 @@ class Choice:
     saved_revision: str | None = None
     effective_limits: dict[str, Any] | None = None
     legacy_checks: dict[str, Any] | None = None
+    notes: tuple[dict[str, str], ...] = ()
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -891,6 +1016,7 @@ class Choice:
             "skipped": [item.payload() for item in self.skipped],
             "flags": list(self.flags),
             "warnings": list(self.warnings),
+            "notes": list(self.notes),
             "clears_at": self.clears_at,
             "work_types": list(self.work_types),
             **(
@@ -940,7 +1066,8 @@ def _ability(
     settings: SessionChoice, product: str | None, model: str | None, request: ChoiceRequest
 ):
     def identity(value: str | None) -> str | None:
-        return value.partition("/")[2] if value and codex_route_pool(value, product) else value
+        value = value.partition("/")[2] if value and codex_route_pool(value, product) else value
+        return canonical_model(value, request.provider_groups) if value else value
 
     levels = {
         preset: index for index, level in enumerate(settings.ability_order) for preset in level
@@ -969,7 +1096,7 @@ def _filter_link(
 ) -> Skipped | None:
     link = resolved_link(link, request)
     product = request.products.get(link.agent_id, link.agent_id)
-    pool = pool_of(link, product)
+    pool = pool_of(link, product, request.provider_groups)
     if link.agent_id in request.unavailable:
         return Skipped(link, "unavailable")
     if product == "codex" and link.model is None and link.meter in {"codex-pro", "krill"}:
@@ -983,15 +1110,23 @@ def _filter_link(
         and model_family(link.model or product or link.agent_id) == request.differ_family
     ):
         return Skipped(link, "same_family")
-    if pool in request.exclude:
+    if pool in {canonical_pool(value, request.provider_groups) for value in request.exclude}:
         return Skipped(link, "excluded", now + 600)
     failure = check_candidate_limits(
         settings, work_type, link, request, readings, running, floor_off, now
     )
     if failure is not None:
         return failure
-    if cooldowns.get(pool, 0) > now:
-        return Skipped(link, "cooldown", cooldowns[pool])
+    until = max(
+        (
+            value
+            for key, value in cooldowns.items()
+            if canonical_pool(key, request.provider_groups) == pool
+        ),
+        default=0,
+    )
+    if until > now:
+        return Skipped(link, "cooldown", until)
     return None
 
 
@@ -1016,9 +1151,23 @@ def choose(
         tiers = ((Row(preset=preset.id, links=preset.links),),) if preset else ()
     skipped: list[Skipped] = []
     survivors: list[tuple[int, int, Row, Link, int]] = []
+    warnings: tuple[str, ...] = ()
     for index, tier in enumerate(tiers):
         for position, row in enumerate(tier):
             for link in (_candidate_link(settings, item, request) for item in row.links):
+                evidence = link._model_resolution
+                if evidence and evidence.outcome in {"substituted", "missing"}:
+                    from omnigent.server.model_resolution import ResolutionNote
+
+                    warning = ResolutionNote(
+                        "session_choice",
+                        evidence.saved,
+                        evidence.model,
+                        evidence.outcome,
+                        request.host,
+                    ).warning()
+                    if warning not in warnings:
+                        warnings += (warning,)
                 failure = _filter_link(
                     settings, work, link, request, readings, running, floor_off, cooldowns, now
                 )
@@ -1029,12 +1178,15 @@ def choose(
                     break
         if survivors and settings.strategy == "drain":
             break
-    warnings: tuple[str, ...] = ()
     if survivors and settings.strategy == "balance":
 
         def rank(item):
             reading = readings.get(
-                pool_of(item[3], request.products.get(item[3].agent_id, item[3].agent_id))
+                pool_of(
+                    item[3],
+                    request.products.get(item[3].agent_id, item[3].agent_id),
+                    request.provider_groups,
+                )
             )
             state = reading.state if reading and reading.freshness == "fresh" else "unknown"
             return {"ok": 0, "unknown": 0, "tight": 1, "low": 2}.get(state, 0)
@@ -1045,7 +1197,11 @@ def choose(
 
             def pace(item):
                 reading = readings[
-                    pool_of(item[3], request.products.get(item[3].agent_id, item[3].agent_id))
+                    pool_of(
+                        item[3],
+                        request.products.get(item[3].agent_id, item[3].agent_id),
+                        request.provider_groups,
+                    )
                 ]
                 return reading.pace_pct if reading.pace_pct is not None else 0
 
@@ -1065,7 +1221,9 @@ def choose(
                 counters[key] = credit
             counters[picked[1]] -= sum(item[2] for item in weighted)
         link = picked[3]
-        pool = pool_of(link, request.products.get(link.agent_id, link.agent_id))
+        pool = pool_of(
+            link, request.products.get(link.agent_id, link.agent_id), request.provider_groups
+        )
         reading = readings.get(pool)
         warnings += (
             (f"{pool} may not last until its reset",) if reading and reading.state == "low" else ()
@@ -1080,6 +1238,7 @@ def choose(
             tuple(skipped),
             flags,
             warnings,
+            notes=model_notes(link, request),
             work_types=tuple(w.id for w in settings.work_types),
         )
     holdable = [
@@ -1089,7 +1248,11 @@ def choose(
     ]
     if holdable and work.if_full == "queue" and not request.independent:
         first = min(holdable, key=lambda item: (item.why != "busy", item.until or now))
-        pool = pool_of(first.link, request.products.get(first.link.agent_id, first.link.agent_id))
+        pool = pool_of(
+            first.link,
+            request.products.get(first.link.agent_id, first.link.agent_id),
+            request.provider_groups,
+        )
         tier = next(
             index + 1
             for index, rows in enumerate(tiers)
@@ -1108,6 +1271,7 @@ def choose(
             tuple(skipped),
             flags,
             warnings,
+            notes=model_notes(first.link, request),
             clears_at=first.until,
             work_types=tuple(w.id for w in settings.work_types),
         )
@@ -1138,13 +1302,24 @@ class ChoiceState:
         self.tiers: dict[tuple[str, str, str, int], tuple[Row, ...]] = {}
 
     def quota_readings(
-        self, owner: str, readings: Mapping[str, UsageAccountView], now: float
+        self,
+        owner: str,
+        readings: Mapping[str, UsageAccountView],
+        now: float,
+        groups: ProviderGroups | None = None,
     ) -> dict[str, UsageAccountView]:
         """Provider rejection wins over a polled balance until its explicit reset."""
         from omnigent.usage.contract import UsageAccountView, UsageWindowView
 
-        result = dict(readings)
-        for (user, pool), until in tuple(self.exhausted.items()):
+        result = {
+            canonical_pool(key, groups or {}): value
+            for key, value in sorted(readings.items(), reverse=True)
+        }
+        exhausted: dict[tuple[str, str], float] = {}
+        for (user, key), until in tuple(self.exhausted.items()):
+            identity = (user, canonical_pool(key, groups or {}))
+            exhausted[identity] = max(exhausted.get(identity, 0), until)
+        for (user, pool), until in exhausted.items():
             if user == owner and until > now:
                 result[pool] = UsageAccountView(
                     id=pool,
@@ -1192,7 +1367,7 @@ class ChoiceState:
         *,
         now: float,
     ) -> Choice:
-        readings = self.quota_readings(request.owner, readings, now)
+        readings = self.quota_readings(request.owner, readings, now, request.provider_groups)
         counters = self.counters
         if request.preview:
             preview_state = ChoiceState()
@@ -1205,7 +1380,9 @@ class ChoiceState:
             self.cooldowns = {key: until for key, until in self.cooldowns.items() if until > now}
             self.exhausted = {key: until for key, until in self.exhausted.items() if until > now}
             for pool in request.exclude:
-                self.cooldowns[(request.owner, pool)] = now + 600
+                self.cooldowns[(request.owner, canonical_pool(pool, request.provider_groups))] = (
+                    now + 600
+                )
         cooldowns = {
             pool: until
             for (owner, pool), until in self.cooldowns.items()

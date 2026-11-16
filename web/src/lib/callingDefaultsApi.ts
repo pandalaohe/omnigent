@@ -6,6 +6,7 @@
 import { authenticatedFetch } from "./identity";
 import { apiErrorFromResponse } from "./sessionsApi";
 import type { NativeModelOption } from "./types";
+import type { ModelResolutionNote } from "./modelReference";
 
 /** One cached `(host, harness)` model catalog plus its staleness. */
 export interface CallingDefaultsCatalogRow {
@@ -31,6 +32,7 @@ export interface CallingDefaultsProblem {
 
 /** One create's resolved calling triple, with per-field sources and problems. */
 export interface CallingDefaultsResolution {
+  notes?: ModelResolutionNote[];
   agent_id: string | null;
   harness: string | null;
   model: string | null;

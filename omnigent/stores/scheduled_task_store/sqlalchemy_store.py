@@ -720,6 +720,36 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         return run_write_transaction(self._session_immediate, "update_task", write)
 
+    def replace_model_if_matches(
+        self,
+        scheduled_task_id: str,
+        *,
+        user_id: str | None,
+        expected_model: str,
+        model: str,
+    ) -> bool:
+        """Replace only an owned task's still-matching model under its row lock."""
+
+        def write(session: Session) -> bool:
+            row = session.get(
+                SqlScheduledTask, (current_workspace_id(), scheduled_task_id), with_for_update=True
+            )
+            if (
+                row is None
+                or row.user_id != user_id
+                or decode_scheduled_task_state(row.state) == "deleted"
+                or row.model_override != expected_model
+            ):
+                return False
+            require_active_account(session, user_id, generation=row.account_generation)
+            row.model_override = model
+            row.updated_at = now_epoch()
+            return True
+
+        return run_write_transaction(
+            self._session_immediate, "replace_scheduled_task_model", write
+        )
+
     def clear_project_id(self, scheduled_task_id: str, project_id: str) -> bool:
         """Clear the task's project only while it is still *project_id*."""
 

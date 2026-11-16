@@ -23,6 +23,7 @@ from omnigent.server.session_choice import (
     choice_revision,
     ordered_links,
     parse_session_choice,
+    pool_limits,
     pool_of,
     resolve_work_type,
     rule_limits,
@@ -61,11 +62,13 @@ def explain_limits(
     now=None,
     load_sessions=None,
 ):
-    _, fields = rule_limits(settings, link.agent_id, context.host, link.model)
+    _, fields = rule_limits(
+        settings, link.agent_id, context.host, link.model, context.provider_groups
+    )
     result = {name: field.payload() for name, field in fields.items()}
     source = fields["maxRunning"]
     ids = (
-        running.scoped(source.scope)
+        running.scoped(source.scope, context.provider_groups)
         if source.scope is not None and isinstance(running, RunningSnapshot)
         else None
     )
@@ -135,7 +138,9 @@ async def validate_known_windows(app, owner, settings):
             }
             for model in models:
                 resolved = model or context.effective_models.get(agent)
-                limits, fields = rule_limits(settings, agent, host.host_id, resolved)
+                limits, fields = rule_limits(
+                    settings, agent, host.host_id, resolved, context.provider_groups
+                )
                 reserve = limits.reserve
                 if reserve is None or reserve.mode != "daily":
                     continue
@@ -148,7 +153,9 @@ async def validate_known_windows(app, owner, settings):
                     ),
                     Link(agent=agent, model=resolved),
                 ).model_copy(update={"model": resolved})
-                reading = readings.get(pool_of(link, context.products.get(agent)))
+                reading = readings.get(
+                    pool_of(link, context.products.get(agent), context.provider_groups)
+                )
                 window = (
                     next((w for w in reading.windows if w.id == reserve.window), None)
                     if reading
@@ -211,13 +218,8 @@ async def candidate_preview(
         preview=True,
         additional_agents=(agent_id,),
     )
-    catalog = context.models.get(agent_id)
-    if model is not None and catalog is not None and model not in catalog:
-        raise HTTPException(422, {"code": "model_not_in_catalog"})
     resolved = model or context.effective_models.get(agent_id)
-    if resolved is None or catalog is None:
-        raise HTTPException(409, {"code": "candidate_unresolved"})
-    if resolved not in catalog:
+    if resolved is None:
         raise HTTPException(409, {"code": "candidate_unresolved"})
     links = [
         link
@@ -254,11 +256,14 @@ async def candidate_preview(
     host_row = await asyncio.to_thread(app.state.host_store.get_host, host)
     offline = host_row is None or not host_is_live(host_row)
     lines = candidate_lines(settings, link, context, readings, floors, now)
-    unknown = any(line.state == "unknown" for _, line in lines)
-    _, fields = rule_limits(settings, agent_id, host, resolved)
+    unknown = any(line.state == "unknown" for _, line in lines) or (
+        link._model_resolution is not None
+        and link._model_resolution.outcome in {"missing", "unverified"}
+    )
+    _, fields = rule_limits(settings, agent_id, host, resolved, context.provider_groups)
     scope = fields["maxRunning"].scope
     scoped_ids = (
-        running.scoped(scope)
+        running.scoped(scope, context.provider_groups)
         if isinstance(running, RunningSnapshot) and scope is not None
         else None
     )
@@ -292,8 +297,10 @@ async def candidate_preview(
             now=now,
         ),
         "legacyChecks": {
-            "pool": pool_of(link, context.products.get(agent_id)),
-            "limits": settings.limits.get(pool_of(link, context.products.get(agent_id))),
+            "pool": pool_of(link, context.products.get(agent_id), context.provider_groups),
+            "limits": pool_limits(
+                settings, link, context.products.get(agent_id), context.provider_groups
+            ),
             "linkMaxRunning": link.max_running,
         },
         "lines": [asdict(line) for _, line in lines],

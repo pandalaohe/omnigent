@@ -60,6 +60,7 @@ import { ReceiveAnnotationsButton } from "@/components/ReceiveAnnotationsButton"
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AutoRotationChip } from "@/components/AutoRotationChip";
 import { StandingApprovalChip } from "@/components/StandingApprovalChip";
+import { ModelResolutionChip } from "@/components/ModelResolutionChip";
 import { SessionChoiceCard } from "@/pages/settings/sessionChoice/SessionChoiceCard";
 import { isEditorLevel } from "@/lib/permissionsApi";
 import { MobileHeaderButton, MobileHeaderButtonGroup } from "./MobileHeaderButton";
@@ -731,6 +732,7 @@ export function ChatHeader({
       </div>
 
       <MobileHeaderButtonGroup className="flex shrink-0 items-center gap-2 max-md:empty:hidden max-md:ml-2 max-md:gap-0">
+        {!pending && conversationId && <ModelResolutionChip sessionId={conversationId} />}
         {isMobile && !settingsMode && (
           <MobileHeaderControlsSlot sessionId={conversationId ?? null} />
         )}

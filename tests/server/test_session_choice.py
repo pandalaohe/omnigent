@@ -947,7 +947,7 @@ def pick(
         name,
         request or ChoiceRequest(OWNER, "host-a"),
         readings or {},
-        running or {},
+        running if running is not None else {},
         floors or {},
         {},
         counters if counters is not None else {},
@@ -1386,9 +1386,8 @@ def test_codex_pin_attribution_survives_plain_reports_and_stale_meter(route, poo
         ("codex", "ccs-krill/gpt-example"),
     ],
 )
-def test_catalog_pin_alias_is_limited_to_codex_relay_routes(product, model):
-    # A picker catalog miss is unknown, not a refusal: only a real launch failure
-    # excludes a model. A relay alias is likewise not proven absent by the plain id.
+def test_unique_model_substitution_is_not_limited_to_relay_routes(product, model):
+    # A unique identical model suffix can substitute even without a provider alias.
     raw = table((1,)).model_dump(mode="json", by_alias=True)
     raw["hosts"]["host-a"]["work"][0][0]["links"][0]["model"] = model
     result = pick(
@@ -1401,8 +1400,70 @@ def test_catalog_pin_alias_is_limited_to_codex_relay_routes(product, model):
         ),
     )
     assert result.outcome == "pick"
-    assert result.link.model == model
+    assert result.link.model == "gpt-example"
+    assert result.notes[0]["outcome"] == "substituted"
+    assert result.notes[0]["saved"] == model
+    assert result.warnings
     assert result.skipped == ()
+
+
+def test_provider_rename_keeps_selection_limits_running_and_cooldown_identity():
+    from omnigent.models.model_reference import provider_groups
+    from omnigent.server.session_choice import RunningIdentity, RunningSnapshot
+
+    raw = table((1,)).model_dump(mode="json", by_alias=True)
+    link = {"agent": "agent-0", "model": "old/x", "maxRunning": 1}
+    raw["hosts"]["host-a"]["work"][0][0]["links"] = [link]
+    raw["presets"][0]["links"] = [link]
+    raw["limits"] = {"pi:old/x": {"maxRunning": 1}}
+    request = ChoiceRequest(
+        OWNER,
+        "host-a",
+        products={"agent-0": "pi"},
+        models={"agent-0": frozenset({"new/x"})},
+        provider_groups=provider_groups([("old", "new")]),
+    )
+    settings = parse_session_choice(raw)
+    result = pick(settings, request=request)
+    assert result.link.model == "new/x" and result.pool == "pi:new/x"
+    assert result.notes[0]["saved"] == "old/x"
+    busy = pick(settings, request=request, running={"pi:old/x": ("running",)})
+    assert busy.outcome == "hold" and busy.reason == "busy"
+    excluded = pick(settings, request=replace(request, exclude=("pi:old/x",)))
+    assert excluded.outcome == "ask" and excluded.skipped[0].why == "excluded"
+
+    scoped = parse_session_choice(
+        {
+            **raw,
+            "schemaVersion": 2,
+            "limitRules": [
+                {"id": "model-cap", "agent": "agent-0", "model": "old/x", "maxRunning": 1}
+            ],
+        }
+    )
+    running = RunningSnapshot({}, (RunningIdentity("other", "agent-0", "host-a", "new/x"),))
+    assert pick(scoped, request=request, running=running).reason == "busy"
+    state = ChoiceState()
+    state.cooldowns[(OWNER, "pi:old/x")] = NOW + 30
+    cooled = state.select(settings, "work", request, {}, {}, {}, now=NOW)
+    assert cooled.outcome == "hold" and cooled.reason == "cooldown"
+    state.exhausted[(OWNER, "pi:old/x")] = NOW + 40
+    exhausted = state.quota_readings(
+        OWNER, {"pi:new/x": reading("pi:new/x")}, NOW, request.provider_groups
+    )
+    assert exhausted["pi:new/x"].state == "exhausted"
+
+
+def test_ambiguous_catalog_miss_tries_the_saved_link_without_exclusion():
+    raw = table((1,)).model_dump(mode="json", by_alias=True)
+    raw["hosts"]["host-a"]["work"][0][0]["links"][0]["model"] = "old/x"
+    result = pick(
+        parse_session_choice(raw),
+        request=ChoiceRequest(OWNER, "host-a", models={"agent-0": frozenset({"a/x", "b/x"})}),
+    )
+    assert result.outcome == "pick" and result.link.model == "old/x"
+    assert result.skipped == () and result.notes[0]["outcome"] == "missing"
+    assert any("trying it as unknown" in warning for warning in result.warnings)
 
 
 @pytest.mark.parametrize(

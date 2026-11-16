@@ -16434,6 +16434,9 @@ async def _create_session_from_existing_agent_impl(
     # ``allow_host_fill=False``: the create route's host launch (and its
     # revocation admission) runs after this response, so the response must
     # not start a host fill.
+    from omnigent.server.model_resolution import notes_from_labels, resolve_app_session_model
+
+    conv = await resolve_app_session_model(request.app, conv)
     response = await _get_session_snapshot(
         conversation_store,
         conv.id,
@@ -16453,6 +16456,7 @@ async def _create_session_from_existing_agent_impl(
         request, conv, session_acp_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
     )
     response.warnings.extend(calling_warnings)
+    response.notes = notes_from_labels(conv.labels)
     return response, conv
 
 

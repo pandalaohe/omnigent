@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -16,8 +15,10 @@ from typing import Any
 from fastapi import HTTPException
 
 from omnigent.entities import Conversation
+from omnigent.models.model_reference import canonical_model, canonical_pool
 from omnigent.runtime.instruction_layers import agent_key_for_harness
 from omnigent.server.agent_quota import QuotaContext
+from omnigent.server.model_resolution import read_provider_groups, usable_catalog
 from omnigent.server.session_choice import (
     CHOICE_LABEL,
     SLOT_LABEL,
@@ -38,6 +39,7 @@ from omnigent.server.session_choice import (
     ordered_links,
     parse_session_choice,
     pin_codex_link,
+    pool_limits,
     pool_of,
     pool_of_session,
     quota_reset_at,
@@ -113,6 +115,10 @@ def session_identity(app, session):
 
 
 def session_lines(app, session, settings, readings, products, floors, now):
+    from omnigent.server.session_collab import collab_owner_for
+
+    owner = collab_owner_for(session, app.state.conversation_store, app.state.permission_store)
+    groups = read_provider_groups(getattr(app.state, "user_preferences_store", None), owner)
     tile = tile_of_session(
         session,
         settings,
@@ -120,6 +126,7 @@ def session_lines(app, session, settings, readings, products, floors, now):
         products,
         agent_store=getattr(app.state, "agent_store", None),
         agent_cache=getattr(app.state, "agent_cache", None),
+        groups=groups,
     )
     if tile is None:
         return None, ()
@@ -127,7 +134,11 @@ def session_lines(app, session, settings, readings, products, floors, now):
     if any(
         rule.agent == identity.agent
         and (rule.host is None or identity.host is None or rule.host == identity.host)
-        and (rule.model is None or identity.model is None or rule.model == identity.model)
+        and (
+            rule.model is None
+            or identity.model is None
+            or canonical_model(rule.model, groups) == canonical_model(identity.model, groups)
+        )
         and (
             (
                 rule.reserve is not None
@@ -147,7 +158,7 @@ def session_lines(app, session, settings, readings, products, floors, now):
     link = Link.model_validate(
         {"agent": identity.agent or "unknown", "model": identity.model, "meter": tile}
     )
-    request = ChoiceRequest("", identity.host or "", products)
+    request = ChoiceRequest("", identity.host or "", products, provider_groups=groups)
     lines = candidate_lines(settings, link, request, readings, floors, now)
     if settings.schema_version == 2:
         legacy = settings.model_copy(update={"schema_version": 1})
@@ -158,6 +169,7 @@ def session_lines(app, session, settings, readings, products, floors, now):
             products,
             agent_store=getattr(app.state, "agent_store", None),
             agent_cache=getattr(app.state, "agent_cache", None),
+            groups=groups,
         )
         legacy_limits = settings.limits.get(legacy_tile)
         legacy_lines = (
@@ -199,7 +211,9 @@ def session_products(app, settings):
     }
 
 
-def tile_of_session(session, settings, readings, products, *, agent_store=None, agent_cache=None):
+def tile_of_session(
+    session, settings, readings, products, *, agent_store=None, agent_cache=None, groups=None
+):
     from omnigent.server.routes._sessions.helpers import _resolve_harness_impl, _resolve_llm_model
 
     product = agent_key_for_harness(
@@ -208,7 +222,7 @@ def tile_of_session(session, settings, readings, products, *, agent_store=None, 
     if settings.schema_version == 2:
         record = choice_record(session)
         if record and isinstance(record.get("pool"), str) and record["pool"]:
-            return record["pool"]
+            return canonical_pool(record["pool"], groups or {})
         model = (
             session.reported_model
             or session.model_override
@@ -218,11 +232,13 @@ def tile_of_session(session, settings, readings, products, *, agent_store=None, 
             (
                 link
                 for link in ordered_links(settings)
-                if link.agent_id == session.agent_id and link.model == model
+                if link.agent_id == session.agent_id
+                and canonical_model(link.model or "", groups or {})
+                == canonical_model(model or "", groups or {})
             ),
             Link(agent=session.agent_id or "unknown", model=model),
         )
-        return pool_of(link, product)
+        return pool_of(link, product, groups)
     pool = pool_of_session(
         session,
         settings,
@@ -231,6 +247,7 @@ def tile_of_session(session, settings, readings, products, *, agent_store=None, 
         or session.model_override
         or _resolve_llm_model(session, agent_store=agent_store, agent_cache=agent_cache),
         products=products,
+        groups=groups,
     )
     if pool in readings:
         return pool
@@ -246,6 +263,7 @@ def stop_targets(app, owner, settings, readings, products, tiles, now, *, stoppi
     from omnigent.server.session_collab import collab_owner_for
 
     store = app.state.conversation_store
+    groups = read_provider_groups(getattr(app.state, "user_preferences_store", None), owner)
     result = {tile: [] for tile in tiles}
     after = None
     while True:
@@ -277,6 +295,7 @@ def stop_targets(app, owner, settings, readings, products, tiles, now, *, stoppi
                     products,
                     agent_store=getattr(app.state, "agent_store", None),
                     agent_cache=getattr(app.state, "agent_cache", None),
+                    groups=groups,
                 )
             if tile in result:
                 result[tile].append(session.id)
@@ -433,33 +452,20 @@ def choice_labels(choice: Choice) -> dict[str, str]:
 
 
 def _payload_labels(payload: dict[str, Any]) -> dict[str, str]:
-    from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
+    from omnigent.server.json_labels import encode_json_labels
+    from omnigent.server.model_resolution import resolution_labels
 
-    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    if len(text) <= LABEL_VALUE_MAX_LEN:
-        return {CHOICE_LABEL: text}
-    chunks = [
-        text[index : index + LABEL_VALUE_MAX_LEN]
-        for index in range(0, len(text), LABEL_VALUE_MAX_LEN)
-    ]
     return {
-        CHOICE_LABEL: json.dumps({"chunks": len(chunks), "pool": payload.get("pool")}),
-        **{f"{CHOICE_LABEL}.{index}": chunk for index, chunk in enumerate(chunks)},
+        **encode_json_labels(CHOICE_LABEL, payload, metadata={"pool": payload.get("pool")}),
+        **resolution_labels(payload.get("notes", [])),
     }
 
 
 def choice_record(session: Conversation) -> dict[str, Any] | None:
-    try:
-        record = json.loads(session.labels.get(CHOICE_LABEL, "null"))
-        if isinstance(record, dict) and "chunks" in record:
-            record = json.loads(
-                "".join(
-                    session.labels[f"{CHOICE_LABEL}.{index}"] for index in range(record["chunks"])
-                )
-            )
-        return record if isinstance(record, dict) else None
-    except (ValueError, KeyError, TypeError):
-        return None
+    from omnigent.server.json_labels import decode_json_labels
+
+    record = decode_json_labels(session.labels, CHOICE_LABEL)
+    return record if isinstance(record, dict) else None
 
 
 async def record_quota_exhaustion(
@@ -546,11 +552,12 @@ async def context_request(
     harnesses = set()
     for configured_link in ordered_links(settings):
         link = resolved_link(configured_link, request)
+        saved_model = link._model_resolution.saved if link._model_resolution else link.model
         if (
-            not link.model
+            not saved_model
             or link.agent_id in request.unavailable
-            or link.model in request.models.get(link.agent_id, ())
-            or catalog_model(link.model, request.products.get(link.agent_id))
+            or saved_model in request.models.get(link.agent_id, ())
+            or catalog_model(saved_model, request.products.get(link.agent_id))
             in request.models.get(link.agent_id, ())
         ):
             continue
@@ -658,14 +665,18 @@ def _context_request(
         if harness_launch_availability(harness, readiness)[0] is False:
             unavailable.add(agent_id)
     catalogs = getattr(app.state, "host_model_catalog_cache_store", None)
-    catalog = {row["harness"]: row["models"] for row in catalogs.list([host])} if catalogs else {}
-    models = {
-        agent: frozenset(
-            entry["id"] for entry in catalog[harness] if isinstance(entry.get("id"), str)
-        )
-        for agent, harness in harnesses.items()
-        if harness in catalog
+    records = {row["harness"]: row for row in catalogs.list([host])} if catalogs else {}
+    catalog = {
+        harness: row["models"]
+        for harness, row in records.items()
+        if usable_catalog(row) is not None
     }
+    models = {
+        agent: ids
+        for agent, harness in harnesses.items()
+        if (ids := usable_catalog(records.get(harness or ""))) is not None
+    }
+    groups = read_provider_groups(getattr(app.state, "user_preferences_store", None), owner)
     effective_models = {}
     if settings.schema_version == 2:
         from omnigent.calling_defaults import resolve_calling
@@ -683,7 +694,9 @@ def _context_request(
                 id="", created_at=0, updated_at=0, root_conversation_id="", agent_id=agent
             )
             defaults = [
-                entry["id"] for entry in catalog.get(harness, ()) if entry.get("isDefault") is True
+                entry.get("id") or entry.get("model")
+                for entry in catalog.get(harness, ())
+                if entry.get("isDefault") is True and (entry.get("id") or entry.get("model"))
             ]
             effective_models[agent] = (
                 resolution.model
@@ -736,6 +749,7 @@ def _context_request(
         named_agent,
         default_models,
         effective_models,
+        groups,
     )
 
 
@@ -762,7 +776,9 @@ async def authorize_agents(app: Any, request: ChoiceRequest) -> ChoiceRequest:
     return replace(request, unavailable=frozenset(unavailable))
 
 
-def running_pools(app: Any, owner: str, settings: SessionChoice, products: Any, now: float):
+def running_pools(
+    app: Any, owner: str, settings: SessionChoice, products: Any, now: float, groups=None
+):
     from omnigent.server.routes._sessions.helpers import _resolve_harness_impl
     from omnigent.server.session_collab import collab_owners_for
 
@@ -791,7 +807,12 @@ def running_pools(app: Any, owner: str, settings: SessionChoice, products: Any, 
                 )
             )
             pool = pool_of_session(
-                session, settings, product=product, model=identity.model, products=products
+                session,
+                settings,
+                product=product,
+                model=identity.model,
+                products=products,
+                groups=groups,
             )
             identities[session.id] = replace(
                 identity, owner_known=resolved_owner is not None, pool=pool
@@ -823,7 +844,9 @@ def inputs(app: Any, settings: SessionChoice, request: ChoiceRequest, now: float
         app,
         request.owner,
         "running",
-        lambda: running_pools(app, request.owner, settings, request.products, now),
+        lambda: running_pools(
+            app, request.owner, settings, request.products, now, request.provider_groups
+        ),
         RunningSnapshot(available=False),
     )
     prefs = getattr(app.state, "user_preferences_store", None)
@@ -832,14 +855,23 @@ def inputs(app: Any, settings: SessionChoice, request: ChoiceRequest, now: float
         if prefs
         else {}
     )
-    return state_for(app).quota_readings(request.owner, readings, now), running, floors
+    readings = state_for(app).quota_readings(request.owner, readings, now, request.provider_groups)
+    floors = {
+        canonical_pool(key, request.provider_groups): value
+        for key, value in sorted(floors.items(), reverse=True)
+    }
+    return readings, running, floors
 
 
 def limit_receipt(app, settings, revision, link, request, running, now):
     from omnigent.server.session_choice_preview import explain_limits
 
-    pool = pool_of(link, request.products.get(link.agent_id))
-    legacy = settings.limits.get(pool)
+    pool = pool_of(link, request.products.get(link.agent_id), request.provider_groups)
+    legacy = (
+        pool_limits(settings, link, request.products.get(link.agent_id), request.provider_groups)
+        if any(canonical_pool(key, request.provider_groups) == pool for key in settings.limits)
+        else None
+    )
     return {
         "savedRevision": revision,
         "effectiveLimits": explain_limits(
@@ -1001,13 +1033,18 @@ async def admit_create(
             if product == "codex" and model:
                 link = link.model_copy(update={"model": model})
             pool = pool_of_session(
-                probe, settings, product=product, model=model, products=request.products
+                probe,
+                settings,
+                product=product,
+                model=model,
+                products=request.products,
+                groups=request.provider_groups,
             )
             if settings.schema_version == 2:
                 link = link.model_copy(update={"model": model})
                 request = replace(request, products={**request.products, body.agent_id: product})
                 if pool is None:
-                    pool = pool_of(link, product)
+                    pool = pool_of(link, product, request.provider_groups)
             if pool is not None and any(item.meter == pool for item in ordered_links(settings)):
                 link = link.model_copy(update={"meter": pool})
             cap = settings.limits[pool].max_running if pool in settings.limits else None
@@ -1016,7 +1053,10 @@ async def admit_create(
                     (
                         item.max_running
                         for item in ordered_links(settings)
-                        if pool_of(item, request.products.get(item.agent_id)) == pool
+                        if pool_of(
+                            item, request.products.get(item.agent_id), request.provider_groups
+                        )
+                        == pool
                     ),
                     None,
                 )
