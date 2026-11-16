@@ -23,6 +23,8 @@ from pydantic import (
 )
 from pydantic.alias_generators import to_camel
 
+from omnigent.quota_pace import AgentQuota, QuotaTiers, Window, agent_quota
+
 if TYPE_CHECKING:
     from omnigent.entities import Conversation
     from omnigent.usage.contract import UsageAccountView
@@ -665,6 +667,9 @@ class ChoiceRequest:
     named_agent: str | None = None
     default_models: Mapping[str, str | None] = field(default_factory=dict)
     effective_models: Mapping[str, str | None] = field(default_factory=dict)
+    quota_tiers: QuotaTiers = field(default_factory=QuotaTiers)
+    # Model identities include route prefixes; None selects all models of an agent.
+    quota_periods: Mapping[tuple[str, str | None], str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -831,6 +836,37 @@ def _effective_model(settings: SessionChoice, link: Link, request: ChoiceRequest
     if settings.schema_version == 2:
         return link.model or request.effective_models.get(link.agent_id)
     return link.model
+
+
+def candidate_period(request: ChoiceRequest, agent: str, model: str | None) -> str | None:
+    """Exact model exceptions precede agent-wide exceptions, without rewriting keys."""
+    return request.quota_periods.get((agent, model), request.quota_periods.get((agent, None)))
+
+
+def candidate_quota(
+    request: ChoiceRequest,
+    link: Link,
+    reading: UsageAccountView | None,
+    now: float,
+) -> AgentQuota | None:
+    """Project fresh pool windows through an exception without changing the shared view."""
+    period = candidate_period(request, link.agent_id, link.model)
+    if period is None or reading is None or reading.freshness != "fresh":
+        return None
+    windows = []
+    for window in reading.windows:
+        if window.percent_used is None or window.window_minutes is None or window.past_reset:
+            continue
+        windows.append(
+            Window(
+                window.id,
+                window.percent_used,
+                window.window_minutes * 60.0,
+                window.resets_at,
+                now,
+            )
+        )
+    return agent_quota(windows, request.quota_tiers, now, deciding_period=period)
 
 
 def resolved_link(link: Link, request: ChoiceRequest) -> Link:
@@ -1030,24 +1066,37 @@ def choose(
         if survivors and settings.strategy == "drain":
             break
     warnings: tuple[str, ...] = ()
+
+    def candidate_view(link: Link) -> tuple[AgentQuota | None, UsageAccountView | None]:
+        """The candidate's deciding-period quota and the shared pool reading."""
+        reading = readings.get(pool_of(link, request.products.get(link.agent_id, link.agent_id)))
+        return candidate_quota(request, link, reading, now), reading
+
     if survivors and settings.strategy == "balance":
+        # Exhaustion, stop and reserve lines stay on the raw pool windows; here a
+        # candidate only contributes the state of its own deciding window.
+        ranks = {"ok": 0, "unknown": 0, "tight": 1, "low": 2}
 
         def rank(item):
-            reading = readings.get(
-                pool_of(item[3], request.products.get(item[3].agent_id, item[3].agent_id))
-            )
-            state = reading.state if reading and reading.freshness == "fresh" else "unknown"
-            return {"ok": 0, "unknown": 0, "tight": 1, "low": 2}.get(state, 0)
+            quota, reading = candidate_view(item[3])
+            if quota is not None:
+                state = quota.state
+            elif reading is not None and reading.freshness == "fresh":
+                state = reading.state
+            else:
+                state = "unknown"
+            return ranks.get(state, 0)
 
         best = min(rank(item) for item in survivors)
         survivors = [item for item in survivors if rank(item) == best]
         if best == 2:
 
             def pace(item):
-                reading = readings[
-                    pool_of(item[3], request.products.get(item[3].agent_id, item[3].agent_id))
-                ]
-                return reading.pace_pct if reading.pace_pct is not None else 0
+                quota, reading = candidate_view(item[3])
+                value = quota.pace_pct if quota is not None else None
+                if value is None and reading is not None:
+                    value = reading.pace_pct
+                return value if value is not None else 0
 
             highest = max(pace(item) for item in survivors)
             survivors = [item for item in survivors if pace(item) == highest]
@@ -1066,10 +1115,12 @@ def choose(
             counters[picked[1]] -= sum(item[2] for item in weighted)
         link = picked[3]
         pool = pool_of(link, request.products.get(link.agent_id, link.agent_id))
-        reading = readings.get(pool)
-        warnings += (
-            (f"{pool} may not last until its reset",) if reading and reading.state == "low" else ()
-        )
+        quota, reading = candidate_view(link)
+        if quota is not None:
+            state = quota.state
+        else:
+            state = reading.state if reading is not None else None
+        warnings += (f"{pool} may not last until its reset",) if state == "low" else ()
         return Choice(
             "pick",
             work.id,

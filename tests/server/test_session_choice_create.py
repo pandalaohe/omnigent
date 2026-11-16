@@ -1607,3 +1607,91 @@ async def test_owner_read_failure_only_blocks_a_possibly_matching_scope(
     )
     assert failed.outcome == "ask"
     assert failed.skipped[0].why == "count_unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "route,pool_id", [(None, "pool-0"), ("official", "codex-pro"), ("krill", "krill")]
+)
+async def test_persisted_period_rule_reaches_create_choice(
+    choice_env, monkeypatch, route, pool_id
+):
+    from omnigent.server.session_choice import state_for
+    from omnigent.usage.contract import UsageAccountView, UsageWindowView
+
+    env = choice_env
+    now = time.time()
+    if route:
+        monkeypatch.setattr(
+            "omnigent.server.routes._sessions.helpers._resolve_harness_impl",
+            lambda *a, **kw: "codex-native",
+        )
+    links = [
+        {"agent": agent["id"], "model": f"{route}/{model}" if route else model, "meter": pool_id}
+        for agent, model in zip(env.agents, ("model-a", "model-b"), strict=True)
+    ]
+    env.settings["strategy"] = "balance"
+    env.settings["limits"] = {}
+    for index, link in enumerate(links):
+        env.settings["presets"][index]["links"] = [link]
+    env.settings["hosts"][HOST]["work"] = [
+        [
+            {"preset": "p0", "links": [links[0]], "weight": 1},
+            {"preset": "p1", "links": [links[1]], "weight": 1},
+        ],
+    ]
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    reset = now + 4 * 86400
+    pool = UsageAccountView(
+        id=pool_id,
+        kind="account",
+        display_name="Pool",
+        state="ok",
+        pace_pct=70,
+        freshness="fresh",
+        read_at=now,
+        deciding_window="7d",
+        windows=[
+            UsageWindowView(
+                id="7d",
+                kind="weekly",
+                label="7d",
+                percent_used=40,
+                remaining_pct=60,
+                window_minutes=10080,
+                resets_at=reset,
+                state="ok",
+            ),
+            UsageWindowView(
+                id="5h",
+                kind="session",
+                label="5h",
+                percent_used=90,
+                remaining_pct=10,
+                window_minutes=300,
+                resets_at=reset,
+                state="low",
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        env.app.state.agent_quota_service,
+        "pool_readings",
+        lambda *args, **kwargs: {pool_id: pool},
+    )
+    plain = await create(env)
+    assert plain.status_code == 201, plain.text
+    assert plain.json()["agent_id"] == env.agents[0]["id"]
+
+    state_for(env.app).counters.clear()
+    rule = {"agent": env.agents[0]["id"], "model": links[0]["model"], "period": "5h"}
+    env.prefs.patch_namespace(RESERVED_USER_LOCAL, "session_collab", {"quotaPeriodRules": [rule]})
+    scoped = await create(env)
+    assert scoped.status_code == 201, scoped.text
+    assert scoped.json()["agent_id"] == env.agents[1]["id"]
+    assert scoped.json()["model_override"] == links[1]["model"]
+    assert scoped.json()["session_choice"]["pool"] == pool_id
