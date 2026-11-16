@@ -1988,9 +1988,12 @@ async def _post_child_message_event(
     *,
     content: list[_JsonObject],
     created_by: str | None,
+    input_id: str | None = None,
 ) -> httpx.Response:
     """Post a child message, retrying once without best-effort attribution."""
     from omnigent.server.session_collab import AGENT_SESSION_HEADER
+
+    input_id = input_id or uuid.uuid4().hex
 
     def _payload(actor: str | None) -> _JsonObject:
         return {
@@ -1998,6 +2001,7 @@ async def _post_child_message_event(
             "data": {
                 "role": "user",
                 "content": content,
+                "stable_id": input_id,
             },
             **({"created_by": actor} if actor is not None else {}),
         }
@@ -2114,6 +2118,8 @@ async def _send_to_in_flight_child(
             content=[{"type": "input_text", "text": message}],
             created_by=created_by,
         )
+    except _ChildMessageDeliveryUnknown as exc:
+        return exc.handle()
     except httpx.HTTPError as exc:
         return (
             f"Error: failed to steer in-flight sub-agent {agent!r} title {title!r}: "
@@ -4831,6 +4837,8 @@ async def _send_to_descendant_session(
             content=[{"type": "input_text", "text": message}],
             created_by=created_by,
         )
+    except _ChildMessageDeliveryUnknown as exc:
+        return exc.handle()
     except httpx.HTTPError as exc:
         return (
             f"Error: sys_session_send failed to send message to descendant "
@@ -5074,6 +5082,8 @@ async def _send_to_existing_session(
             content=[{"type": "input_text", "text": message}],
             created_by=created_by,
         )
+    except _ChildMessageDeliveryUnknown as exc:
+        return exc.handle()
     except httpx.HTTPError as exc:
         await _teardown_failed_child(server_client, target_session_id, created_child=False)
         return f"Error: failed to send message to child: {type(exc).__name__}: {exc}"
@@ -5424,6 +5434,30 @@ async def _post_created_child_message(
     return f"{resp.status_code} {resp.text}"
 
 
+class _ChildMessageDeliveryUnknown(httpx.HTTPError):
+    """A lost response retains the original input identity for inspection."""
+
+    def __init__(self, session_id: str, input_id: str) -> None:
+        super().__init__("Child message delivery is unknown")
+        self.session_id = session_id
+        self.input_id = input_id
+
+    def handle(self) -> str:
+        return json.dumps(
+            {
+                "status": "delivery_unknown",
+                "conversation_id": self.session_id,
+                "handle_id": self.session_id,
+                "input_id": self.input_id,
+                "message": (
+                    "The send response was lost; execution may have started. "
+                    "Inspect this session with sys_session_get_info and sys_session_get_history "
+                    "for the input_id. Do not automatically resend or create a replacement."
+                ),
+            }
+        )
+
+
 async def _post_child_message_recovering(
     server_client: httpx.AsyncClient,
     session_id: str,
@@ -5446,17 +5480,27 @@ async def _post_child_message_recovering(
     :param created_by: Human actor that sent the message, if known.
     :returns: The accepted repost, or the last refused/error response.
     """
-    resp = await _post_child_message_event(
-        server_client, session_id, content=content, created_by=created_by
-    )
+    input_id = uuid.uuid4().hex
+
+    async def post() -> httpx.Response:
+        try:
+            return await _post_child_message_event(
+                server_client,
+                session_id,
+                content=content,
+                created_by=created_by,
+                input_id=input_id,
+            )
+        except httpx.TransportError as exc:
+            raise _ChildMessageDeliveryUnknown(session_id, input_id) from exc
+
+    resp = await post()
     if _message_post_accepted(resp) or not _message_post_needs_runner_wait(resp):
         return resp
     if await _wait_for_runner_online(
         server_client, session_id, timeout_s=_BY_ID_CHILD_READY_TIMEOUT_S
     ):
-        return await _post_child_message_event(
-            server_client, session_id, content=content, created_by=created_by
-        )
+        return await post()
     retry = await server_client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "retry_session", "data": {}},
@@ -5464,9 +5508,7 @@ async def _post_child_message_recovering(
     )
     if retry.status_code >= 400:
         return retry
-    return await _post_child_message_event(
-        server_client, session_id, content=content, created_by=created_by
-    )
+    return await post()
 
 
 # The created session exists, and a transport error can hide whether its

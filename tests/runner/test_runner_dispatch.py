@@ -17795,6 +17795,35 @@ async def test_unknown_admission_does_not_fail_independent_native_execution(monk
 
 
 @pytest.mark.asyncio
+async def test_child_send_lost_response_returns_identity_without_resend_or_teardown():
+    from omnigent.runner import tool_dispatch
+
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        raise httpx.ReadTimeout("response lost after acceptance", request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await tool_dispatch._send_to_descendant_session(
+                "child",
+                "work",
+                server_client=client,
+                snap_data={"parent_session_id": "parent", "title": "worker"},
+                created_by=None,
+            )
+        )
+    assert result["status"] == "delivery_unknown"
+    assert result["conversation_id"] == "child"
+    assert len(requests) == 1
+    assert result["input_id"] == json.loads(requests[0].content)["data"]["stable_id"]
+    assert result["handle_id"] == "child"
+
+
+@pytest.mark.asyncio
 async def test_child_message_keeps_approval_transport_lifetime(monkeypatch):
     from omnigent.runner import tool_dispatch
 
