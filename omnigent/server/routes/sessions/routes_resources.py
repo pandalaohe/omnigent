@@ -115,6 +115,7 @@ from omnigent.server.routes._sessions.orchestration import (
 from omnigent.server.routes._terminal_access import (
     require_terminal_browser_session,
     require_terminal_host_owner,
+    require_terminal_human_control,
 )
 from omnigent.server.schemas import (
     CopiedFile,
@@ -1782,6 +1783,10 @@ def register_resources_routes(
         """
         from omnigent.runtime import get_runner_direct_attach_resolver
 
+        try:
+            require_terminal_human_control(request, auth_provider)
+        except HTTPException:
+            return
         resolver = get_runner_direct_attach_resolver()
         if resolver is None:
             return
@@ -2295,6 +2300,7 @@ def register_resources_routes(
         :returns: Deletion confirmation object.
         """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        require_terminal_human_control(request, auth_provider)
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}"
         resource = await _proxy_get_to_runner(
             session_id, path, conv, params={"include_stopped": "true"}

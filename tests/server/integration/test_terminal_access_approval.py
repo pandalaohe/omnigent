@@ -9,11 +9,14 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 import pytest_asyncio
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from omnigent.errors import OmnigentError
 from omnigent.host.frames import CAP_TERMINAL_ELEVATED, HostHelloFrame
 from omnigent.inner.datamodel import TerminalEnvSpec
 from omnigent.runner import create_runner_app
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.tool_dispatch import _execute_terminal_tool
 from omnigent.runtime import pending_elicitations, session_stream
 from omnigent.server.accounts_config import AccountsConfig
@@ -499,8 +502,7 @@ async def test_delete_authorizes_and_closes_the_same_registered_instance(
 ):
     env = terminal_access
     env.instance.elevated = False
-    token = env.provider.mint_runner_token(env.owner, 60)
-    env.client.cookies.set(env.config.session_cookie_name, token)
+    env.client.cookies.set(env.config.session_cookie_name, env.browser)
     if replacement:
         successor = make_test_terminal_instance("bash", "admin", env.instance.private_dir)
         successor.elevated = True
@@ -525,6 +527,80 @@ async def test_delete_authorizes_and_closes_the_same_registered_instance(
     else:
         assert env.terminals.get(env.sid, "bash", "admin") is None
         assert not env.instance.private_dir.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tier", ["off", "read"])
+@pytest.mark.parametrize("credential", ["runner", "other_runner", "runner_cookie", "browser"])
+async def test_ordinary_terminal_human_routes_reject_runner_credentials(
+    terminal_access, auth_app, monkeypatch, tier, credential
+):
+    env = terminal_access
+    env.instance.elevated = False
+    env.instance.agent_tier = tier
+    env.store.set_runner_id(env.sid, token_bound_runner_id("this-session-binding"))
+    if credential == "browser":
+        headers = {
+            "Origin": "http://test",
+            "Cookie": f"{env.config.session_cookie_name}={env.browser}",
+        }
+    else:
+        token = env.provider.mint_runner_token(env.owner, 60)
+        assert token
+        headers = {
+            "Origin": "http://test",
+            "Authorization": f"Bearer {token}",
+        }
+        if credential == "other_runner":
+            headers[RUNNER_TUNNEL_TOKEN_HEADER] = "other-session-binding"
+        elif credential == "runner_cookie":
+            headers.pop("Authorization")
+            headers["Cookie"] = f"{env.config.session_cookie_name}={token}"
+    bridge = AsyncMock()
+
+    async def attach(websocket, *args, **kwargs):
+        await bridge(websocket, *args, **kwargs)
+        await websocket.send_bytes(b"browser attach")
+        await websocket.close()
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.terminal_attach.get_runner_ws_factory", lambda: None
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.terminal_attach.get_terminal_registry", lambda: env.terminals
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.terminal_attach.bridge_terminal_to_websocket", attach
+    )
+    path = env.path + "/attach?read_only=false"
+    if credential == "browser":
+        with TestClient(auth_app).websocket_connect(path, headers=headers) as ws:
+            assert ws.receive_bytes() == b"browser attach"
+        bridge.assert_awaited_once()
+    else:
+        with pytest.raises(WebSocketDisconnect) as denied:
+            with TestClient(auth_app).websocket_connect(path, headers=headers) as ws:
+                ws.send_bytes(b"echo denied")
+                ws.receive_bytes()
+        assert denied.value.code == 1008
+        bridge.assert_not_awaited()
+    monkeypatch.setattr(
+        "omnigent.runtime.get_runner_direct_attach_resolver",
+        lambda: lambda sid: SimpleNamespace(port=54321, token="synthetic-loopback-token"),
+    )
+    inventory = await env.client.get(env.path.rsplit("/", 1)[0], headers=headers)
+    assert inventory.status_code == 200, inventory.text
+    metadata = next(
+        item["metadata"]
+        for item in inventory.json()["data"]
+        if item["id"] == "terminal_bash_admin"
+    )
+    assert ("direct_attach_url" in metadata) == (credential == "browser")
+    deleted = await env.client.delete(env.path, headers=headers)
+    assert deleted.status_code == (200 if credential == "browser" else 403), deleted.text
+    if credential != "browser":
+        assert env.terminals.get(env.sid, "bash", "admin") is env.instance
+        assert env.instance.running
 
 
 @pytest.mark.asyncio

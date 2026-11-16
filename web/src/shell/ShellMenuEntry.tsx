@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { ReactNode } from "react";
 import { TerminalIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { showToast } from "@/components/ui/toast";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
@@ -203,7 +204,6 @@ export function ShellMenuEntry({
   onDefaultOpen?: (shell: string) => void;
 }) {
   const [options, setOptions] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const isPhone = useIsPhone();
   const { data: agent } = useSessionAgent(conversationId);
   const create = useCreateTerminal(conversationId);
@@ -219,7 +219,7 @@ export function ShellMenuEntry({
           else
             create.launch(shell, {
               onOpen: (t) => onCreated?.(terminalTabKey(t)),
-              onError: (e) => setError(e.message),
+              onError: (e) => showToast(`Couldn't open a shell: ${e.message}`, { duration: 0 }),
             });
         }}
       >
@@ -279,11 +279,6 @@ export function ShellMenuEntry({
             )}
           </PopoverContent>
         </Popover>
-      )}
-      {error && (
-        <span role="alert" className="text-destructive">
-          {error}
-        </span>
       )}
     </div>
   );

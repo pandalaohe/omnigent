@@ -97,6 +97,7 @@ from omnigent.server.routes._auth_helpers import require_access
 from omnigent.server.routes._terminal_access import (
     require_terminal_browser_session,
     require_terminal_host_owner,
+    require_terminal_human_control,
 )
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
@@ -202,6 +203,12 @@ def create_terminal_attach_router(
             permission_store=permission_store,
             conversation_store=conversation_store,
         )
+        try:
+            require_terminal_human_control(websocket, auth_provider)
+        except HTTPException as exc:
+            raise WebSocketException(
+                code=1008, reason="A browser session is required for terminal attach"
+            ) from exc
         # WebSockets bypass the HTTP middleware that attributes debug-log rows
         # to the request's user; this handler task is per-connection.
         set_current_user_id(user_id)

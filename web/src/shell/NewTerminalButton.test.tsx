@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NewTerminalButton } from "./NewTerminalButton";
 
@@ -9,7 +9,9 @@ const state = vi.hoisted(() => ({
   local: vi.fn(),
   linked: vi.fn(),
   launch: vi.fn(),
+  toast: vi.fn(),
 }));
+vi.mock("@/components/ui/toast", () => ({ showToast: state.toast }));
 vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: () => ({ data: { terminals: state.shells } }),
 }));
@@ -65,11 +67,28 @@ beforeEach(() => {
   state.local.mockReset().mockResolvedValue({ id: "local" });
   state.linked.mockReset().mockResolvedValue({ id: "remote" });
   state.launch.mockReset();
+  state.toast.mockReset();
   localStorage.clear();
 });
 afterEach(cleanup);
 
 describe("unified shell entry", () => {
+  it("reports a delayed default launch failure after the menu unmounts", async () => {
+    let rejectLaunch!: (error: Error) => void;
+    state.launch.mockImplementation((_shell, callbacks) => {
+      rejectLaunch = callbacks.onError;
+    });
+    render(<NewTerminalButton conversationId="session" />);
+    await openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Shell (zsh)" }));
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    act(() => rejectLaunch(new Error("The terminal host went offline")));
+    expect(state.toast).toHaveBeenCalledWith(
+      "Couldn't open a shell: The terminal host went offline",
+      { duration: 0 },
+    );
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
   it("uses the shell selected in Options as the next default", async () => {
     render(<NewTerminalButton conversationId="session" />);
     await options();
