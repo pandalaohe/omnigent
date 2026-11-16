@@ -1094,14 +1094,18 @@ class ExecutorAdapter(HarnessApp):
                 if injection.input_admission_required:
                     _emit_injection_consumed(ctx, injection)
                 continue
-            if injection.input_admission_required and certain:
-                try:
+            try:
+                if injection.input_admission_required and certain:
                     await ctx.claim_input_execution(
                         injection, boundary="injection_accept" if accepted else "injection_refuse"
                     )
-                except RuntimeError:
-                    # A lost settlement keeps the durable reservation fenced.
-                    _logger.warning("in-band injection settlement unresolved", exc_info=True)
+            except RuntimeError:
+                # A lost settlement keeps the durable reservation fenced.
+                _logger.warning("in-band injection settlement unresolved", exc_info=True)
+            finally:
+                # Turn completion may cancel settlement after the executor accepted.
+                if accepted:
+                    _emit_injection_consumed(ctx, injection)
             if not accepted:
                 _logger.warning(
                     "inner executor refused in-band injection "
@@ -1109,8 +1113,6 @@ class ExecutorAdapter(HarnessApp):
                     "not see the steered message until the next turn"
                 )
                 continue
-            # Echo injection_id so the runner drops the buffered copy and doesn't re-deliver it.
-            _emit_injection_consumed(ctx, injection)
 
     async def _stable_tool_executor(
         self,

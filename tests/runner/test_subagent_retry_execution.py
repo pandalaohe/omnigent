@@ -474,9 +474,11 @@ async def test_injection_reservation_releases_only_definite_refusal(db_uri, outc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["accepted", "refused", "ambiguous", "error", "cancelled"])
+@pytest.mark.parametrize(
+    "outcome", ["accepted", "refused", "ambiguous", "error", "cancelled", "settlement_cancel"]
+)
 async def test_live_injection_survives_long_turn_without_duplicate_delivery(
-    db_uri, monkeypatch, outcome
+    db_uri, monkeypatch, outcome, caplog
 ):
     from omnigent.inner.executor import Executor, InjectionDeliveryAmbiguous
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
@@ -488,6 +490,7 @@ async def test_live_injection_survives_long_turn_without_duplicate_delivery(
     journal = _journal(db_uri, SqlAlchemyConversationStore(db_uri))
     main_id, followup_id = uuid4().hex, uuid4().hex
     started, release, continued = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    settling, watcher_done = asyncio.Event(), asyncio.Event()
     executed, delivered, admissions = [], [], []
     wall_time = time.time
 
@@ -500,7 +503,7 @@ async def test_live_injection_survives_long_turn_without_duplicate_delivery(
                 raise RuntimeError("Transport failed after submission")
             if outcome == "cancelled":
                 raise asyncio.CancelledError
-            return outcome == "accepted"
+            return outcome in {"accepted", "settlement_cancel"}
 
     inner = Inner()
 
@@ -517,6 +520,7 @@ async def test_live_injection_survives_long_turn_without_duplicate_delivery(
             finally:
                 watcher.cancel()
                 await asyncio.gather(watcher, return_exceptions=True)
+                watcher_done.set()
 
     harness = Harness(executor_factory=lambda: inner)
     app = harness.build()
@@ -537,6 +541,9 @@ async def test_live_injection_survives_long_turn_without_duplicate_delivery(
                         claim = InputExecutionClaim.model_validate(kwargs["json"])
                         admissions.append(claim)
                         result = await receive(claim)
+                        if outcome == "settlement_cancel" and claim.boundary == "injection_accept":
+                            settling.set()
+                            await asyncio.wait_for(watcher_done.wait(), 5)
                         return httpx.Response(
                             200,
                             json=result.model_dump(),
@@ -576,9 +583,14 @@ async def test_live_injection_survives_long_turn_without_duplicate_delivery(
                                 },
                             )
                             assert sent.status_code == 202
-                            expected = {"accepted": "accepted", "refused": "closed"}.get(
-                                outcome, "reserved"
-                            )
+                            if outcome == "settlement_cancel":
+                                await asyncio.wait_for(settling.wait(), 5)
+                                release.set()
+                            expected = {
+                                "accepted": "accepted",
+                                "settlement_cancel": "accepted",
+                                "refused": "closed",
+                            }.get(outcome, "reserved")
                             await poll_until_async(
                                 lambda: (
                                     (receipt := journal.store.get_input(followup_id)) is not None
@@ -610,7 +622,15 @@ async def test_live_injection_survives_long_turn_without_duplicate_delivery(
         [main_id, followup_id] if outcome == "refused" else [main_id]
     )
     receipt = journal.store.get_input(followup_id)
-    assert receipt.state == ("accepted" if outcome in {"accepted", "refused"} else "reserved")
+    assert receipt.state == (
+        "accepted" if outcome in {"accepted", "refused", "settlement_cancel"} else "reserved"
+    )
+    if outcome == "settlement_cancel":
+        assert not runner.state.session_message_buffers.get(journal.child)
+        assert "Input execution admission refused" not in caplog.text
+        assert not any(
+            claim.input_id == followup_id and claim.boundary == "receiver" for claim in admissions
+        )
     if outcome == "refused":
         assert receipt.turn_id == executed[-1][1] != executed[0][1]
         assert admissions[-1].input_id == followup_id
