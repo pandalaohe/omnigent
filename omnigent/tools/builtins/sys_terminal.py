@@ -337,6 +337,13 @@ _SEND_SCHEMA: dict[str, Any] = {
     "properties": {
         "terminal": {"type": "string"},
         "session": {"type": "string"},
+        "host_id": {
+            "type": "string",
+            "description": (
+                "For a linked terminal, use its host_id and session from sys_terminal_list; "
+                "terminal is ignored."
+            ),
+        },
         "text": {
             "type": "string",
             "description": "Literal text to type (sent via tmux send-keys -l).",
@@ -360,6 +367,13 @@ _READ_SCHEMA: dict[str, Any] = {
     "properties": {
         "terminal": {"type": "string"},
         "session": {"type": "string"},
+        "host_id": {
+            "type": "string",
+            "description": (
+                "For a linked terminal, use its host_id and session from sys_terminal_list; "
+                "terminal is ignored."
+            ),
+        },
         "scrollback": {
             "type": "integer",
             "default": 0,
@@ -384,6 +398,13 @@ _CLOSE_SCHEMA: dict[str, Any] = {
     "properties": {
         "terminal": {"type": "string"},
         "session": {"type": "string"},
+        "host_id": {
+            "type": "string",
+            "description": (
+                "For a linked terminal, use its host_id and session from sys_terminal_list; "
+                "terminal is ignored."
+            ),
+        },
     },
     "required": ["terminal", "session"],
 }
@@ -1222,6 +1243,7 @@ class SysTerminalRequestAccessTool(Tool):
                         "terminal": {"type": "string", "minLength": 1},
                         "session": {"type": "string", "minLength": 1},
                         "instance_id": {"type": "string", "minLength": 1},
+                        "host_id": {"type": "string", "minLength": 1},
                         "reason": {"type": "string", "minLength": 1, "maxLength": 4096},
                         "tier": {
                             "type": "string",

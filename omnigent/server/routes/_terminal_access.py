@@ -33,7 +33,14 @@ def require_terminal_browser_session(
     if user_id == RESERVED_USER_LOCAL:
         return
     try:
-        if browser_action_user(cast(Request, connection), auth_provider, mutating=True) != user_id:
+        if (
+            browser_action_user(
+                cast(Request, connection),
+                auth_provider,
+                mutating=connection.scope.get("method") != "GET",
+            )
+            != user_id
+        ):
             raise HTTPException(403, "browser account does not match")
     except HTTPException as exc:
         raise HTTPException(

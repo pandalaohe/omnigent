@@ -24,6 +24,7 @@ from omnigent.server.host_registry import HostConnection
 from omnigent.server.host_terminals import HostTerminalService
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
+from omnigent.server.routes._terminal_access import require_terminal_browser_session
 from omnigent.server.routes.terminal_attach import _RunnerWSClosed, _shuttle_ws_frames
 from omnigent.stores.host_store import Host
 from omnigent.stores.permission_store import PermissionStore
@@ -40,6 +41,10 @@ def create_host_terminals_router(
 
     async def authorize(connection: Request | WebSocket) -> tuple[Host, HostConnection]:
         user = require_user(connection, auth_provider)
+        try:
+            require_terminal_browser_session(connection, auth_provider)
+        except HTTPException as exc:
+            raise OmnigentError("A trusted browser is required", code=ErrorCode.FORBIDDEN) from exc
         try:
             host = await asyncio.to_thread(
                 resolve_host_owner,
@@ -109,7 +114,7 @@ def create_host_terminals_router(
             runner_id,
             "POST",
             "/v1/host-terminals",
-            payload={"elevated": body.elevated, "session_key": secrets.token_hex(16)},
+            payload={**body.model_dump(exclude_none=True), "session_key": secrets.token_hex(16)},
         )
         return with_attach_path(host.host_id, HostTerminalResource.model_validate(response.json()))
 

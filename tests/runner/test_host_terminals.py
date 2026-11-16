@@ -47,10 +47,23 @@ class _RecordingTerminalRegistry:
         return None
 
     async def launch(
-        self, _key, _name, _session_key, spec, *, elevated=False, linked_session_id=None
+        self,
+        _key,
+        _name,
+        _session_key,
+        spec,
+        *,
+        elevated=False,
+        linked_session_id=None,
+        agent_tier=None,
     ):
         self.specs.append(spec)
-        return SimpleNamespace(elevated=elevated)
+        return SimpleNamespace(
+            elevated=elevated,
+            linked_session_id=linked_session_id,
+            agent_tier=agent_tier or ("off" if elevated else "read_write"),
+            instance_id="test-instance",
+        )
 
     async def shutdown(self) -> None:
         pass
@@ -177,6 +190,36 @@ def test_host_terminal_agent_real_shell_probe(tmp_path: Path) -> None:
         assert client.delete(f"/v1/host-terminals/{key}").status_code == 204
         assert client.post(f"{base}/read", json={"session_id": session_id}).status_code == 404
     print(f"HOST_TERMINAL_AGENT_PROBE=PASS BACKEND={'conpty' if IS_WINDOWS else 'tmux'}")
+
+
+@pytest.mark.parametrize("tier", ["off", "read", "read_write"])
+def test_linked_host_terminal_tier_and_stale_switch(tmp_path: Path, tier: str) -> None:
+    app = create_host_terminal_app(home=tmp_path, shells=["powershell" if IS_WINDOWS else "sh"])
+    with TestClient(app) as client:
+        key = uuid.uuid4().hex
+        body = client.post(
+            "/v1/host-terminals",
+            json={
+                "session_key": key,
+                "linked_session_id": "session",
+                "agent_tier": tier,
+            },
+        ).json()
+        assert body["agent_tier"] == tier
+        assert body["linked_session_id"] == "session"
+        path = f"/v1/host-terminals/{key}"
+        assert (
+            client.patch(
+                path, json={"instance_id": "stale", "agent_tier": "read_write"}
+            ).status_code
+            == 409
+        )
+        for operation in ("read", "send", "close"):
+            response = client.post(path + f"/agent/{operation}", json={"session_id": "session"})
+            allowed = tier == "read_write" or (tier == "read" and operation == "read")
+            assert response.status_code == (200 if allowed else 403), response.text
+        if tier != "read_write":
+            assert client.get("/v1/host-terminals").json()["terminals"][0]["agent_tier"] == tier
 
 
 def test_host_terminal_agent_rejects_unlinked_and_ungranted_admin(tmp_path: Path) -> None:

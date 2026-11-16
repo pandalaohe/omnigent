@@ -86,6 +86,7 @@ from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.claude_usage import claude_usage_enabled, claude_usage_report
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
+    CAP_HOST_TERMINAL_LINKS,
     CAP_HOST_TERMINALS,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
@@ -6593,7 +6594,11 @@ class HostProcess:
             capabilities=[
                 *self._terminal_capabilities(),
                 *(["host_restart"] if supervisor else []),
-                *([CAP_HOST_TERMINALS] if self._host_terminals_supported() else []),
+                *(
+                    [CAP_HOST_TERMINALS, CAP_HOST_TERMINAL_LINKS]
+                    if self._host_terminals_supported()
+                    else []
+                ),
             ],
             supervised=supervisor,
             started_at=self._started_at,
