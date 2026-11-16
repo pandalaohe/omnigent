@@ -1,10 +1,9 @@
-import { boardSourceColors } from "./taskBoardVisual";
 import type { BoardTask } from "./taskBoardData";
 import type { BoardSession } from "./taskBoardNative";
 import { boardSessionRows } from "./taskBoardSessionData";
 import { accountTotals } from "./taskBoardHistoryData";
 import { latestRelease, type SourceCache } from "./taskBoardSnapshotData";
-import { localDay } from "./taskBoardActivityData";
+import { localDay, repositoryCommitTotals } from "./taskBoardActivityData";
 import { t } from "./taskBoardText";
 import { BoardIdentityMark, boardIdentityColor } from "./BoardIdentityMark";
 import {
@@ -12,7 +11,6 @@ import {
   activityTaskName,
   activityTaskKey,
   activityAgentName,
-  activitySourceName,
   activityStamp,
   activityMoney,
 } from "./TaskBoardActivityParts";
@@ -35,7 +33,6 @@ export function TaskBoardToday({
   now,
   onSelect,
   usage,
-  sourceLabels,
 }: {
   tasks: BoardTask[];
   sessions: BoardSession[];
@@ -46,8 +43,6 @@ export function TaskBoardToday({
   sourceLabels?: Record<string, string>;
 }) {
   const today = localDay(now),
-    sourceName = (source: string, task?: BoardTask) =>
-      activitySourceName(source, task, sourceLabels),
     closed = tasks
       .filter((task) => {
         const d = task["omnigent.ai:sourceDisplay"];
@@ -74,25 +69,7 @@ export function TaskBoardToday({
         }),
       ),
   );
-  const sourceColors = boardSourceColors(tasks);
-  const bySource = new Map<string, number>();
-  commits.forEach((c) => bySource.set(c.source, (bySource.get(c.source) ?? 0) + 1));
-  if (!commits.size)
-    closed.forEach((task) => {
-      const source = task["omnigent.ai:source"];
-      bySource.set(source, (bySource.get(source) ?? 0) + 1);
-    });
-  const sources = [...bySource].sort((a, b) => b[1] - a[1]);
-  const topSources =
-    sources.length <= 6
-      ? sources
-      : [
-          ...sources.slice(0, 5),
-          [
-            t("g6.otherCount", { count: activityNumber(sources.length - 5) }),
-            sources.slice(5).reduce((sum, v) => sum + v[1], 0),
-          ] as [string, number],
-        ];
+  const repositoryTotals = repositoryCommitTotals(caches, now);
   const release = latestRelease(caches),
     hosts = [...new Set(Object.values(caches).flatMap((c) => c.display.checkHosts ?? []))].slice(
       0,
@@ -178,7 +155,14 @@ export function TaskBoardToday({
         </h3>
         <div className="td-ship-body">
           <div>
-            <div className="td-stats">
+            <div className="td-stats td-commit-stats">
+              <div>
+                <b>{repositoryTotals.total ?? t("g6.unavailable")}</b>
+                <span title={t("g6.repositoryCommitsHint")}>
+                  {t("g6.repositoryCommits")}
+                  {repositoryTotals.partial ? ` · ${t("g6.partial")}` : ""}
+                </span>
+              </div>
               <div>
                 <b>{activityNumber(closed.length)}</b>
                 <span>{t("today.closed")}</span>
@@ -196,17 +180,22 @@ export function TaskBoardToday({
               </div>
             </div>
             <div className="td-roots">
-              {topSources.map(([source, n]) => (
-                <span key={source}>
-                  <i
-                    style={{
-                      background: sourceColors.get(source),
-                      opacity: 0.22,
-                      width: `${Math.max(4, (n / Math.max(1, commits.size || closed.length)) * 100)}%`,
-                    }}
-                  />
-                  <b>{sourceName(source)}</b>
-                  <em>{activityNumber(n)}</em>
+              {repositoryTotals.rows.map(({ repository, count }) => (
+                <span key={repository}>
+                  {count !== null && (
+                    <i
+                      style={{
+                        background: boardIdentityColor(repository),
+                        opacity: 0.22,
+                        width: `${Math.max(
+                          4,
+                          (count / Math.max(1, repositoryTotals.total ?? 0)) * 100,
+                        )}%`,
+                      }}
+                    />
+                  )}
+                  <b>{repository}</b>
+                  <em>{count ?? t("g6.unavailable")}</em>
                 </span>
               ))}
             </div>

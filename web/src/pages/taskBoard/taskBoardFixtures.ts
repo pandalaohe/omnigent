@@ -1,4 +1,5 @@
 import type { BoardTask, TaskSource } from "./taskBoardData";
+import type { SourceCache } from "./taskBoardSnapshotData";
 import type { BoardSession } from "./taskBoardNative";
 
 /** Neutral source readings shared by component checks and the interactive acceptance page. */
@@ -156,4 +157,45 @@ export function taskBoardFixture(now = Date.now()) {
     },
   ];
   return { tasks, sources, sessions, updated: at(0) };
+}
+
+/** Frozen daily populations; linked membership stays source-scoped. */
+export function dailyRepositoryFixture(timeZone = "Asia/Taipei") {
+  const stamp = "2026-11-03T12:00:00Z";
+  const pin = { sourceGeneration: "example", id: "day", asOf: stamp, phase: "published" as const };
+  const cache: SourceCache = {
+    pin,
+    display: {
+      version: 1,
+      asOf: stamp,
+      timeZone,
+      repositoryDailyCommits: [26, 18, 18, 155, 4, 4].map((totalCommits, i) => ({
+        repository: `Repository ${i + 1}`,
+        date: "2026-11-03",
+        timeZone,
+        totalCommits,
+        refs: ["refs/heads/main"],
+        head: "a".repeat(40),
+        collectedAt: stamp,
+      })),
+    },
+    tasks: [
+      {
+        uid: "example-task",
+        "omnigent.ai:source": "example",
+        "omnigent.ai:sourceDisplay": {
+          version: 1,
+          commits: Array.from({ length: 172 }, (_, i) => ({
+            id: String(i),
+            sha: i.toString(16).padStart(40, "0"),
+            subject: "Example change",
+            at: stamp,
+          })),
+        },
+      },
+    ],
+    history: [],
+    counts: [],
+  };
+  return { cache, now: Date.parse(stamp) };
 }

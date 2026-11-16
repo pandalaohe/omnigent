@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
-import { taskBoardFixture } from "./taskBoardFixtures";
+import { taskBoardFixture, dailyRepositoryFixture } from "./taskBoardFixtures";
 import { TaskBoardActivity } from "./TaskBoardActivity";
 import { TaskBoardSources } from "./TaskBoardSources";
 import type { SourceCache } from "./taskBoardSnapshotData";
@@ -12,15 +12,87 @@ import { TaskSourceDetails } from "./TaskSourceDetails";
 import { activityStamp } from "./TaskBoardActivityParts";
 import type { BoardTask } from "./taskBoardData";
 import { activityTaskName } from "./taskBoardPresentation";
+import { TaskBoardToday } from "./TaskBoardToday";
 import {
   eventMother,
   localDay,
   readBoardHistory,
   readLocalClosedCounts,
   useBoardHistory,
+  repositoryCommitTotals,
 } from "./taskBoardActivityData";
 
 const fetcher = vi.hoisted(() => vi.fn());
+
+it("shows the frozen Taipei 225 repository commits beside 172 linked without assigning links to repositories", () => {
+  const { cache, now } = dailyRepositoryFixture(Intl.DateTimeFormat().resolvedOptions().timeZone);
+  const { container } = render(
+    <TaskBoardToday
+      tasks={cache.tasks}
+      sessions={[]}
+      caches={{ example: cache }}
+      now={now}
+      onSelect={vi.fn()}
+    />,
+  );
+  expect(screen.getByText("225").parentElement?.textContent).toContain("Repository commits");
+  expect(screen.getByText("172").parentElement?.textContent).toContain("Task-linked commits");
+  expect(
+    [...container.querySelectorAll(".td-roots em")]
+      .map((node) => Number(node.textContent))
+      .reduce((a, b) => a + b, 0),
+  ).toBe(225);
+  expect(container.querySelectorAll(".td-roots span")).toHaveLength(6);
+  expect(screen.queryByText(/Partial/)).toBeNull();
+});
+
+it("marks a missing repository/day unavailable and keeps a partial sum, including known zero", () => {
+  const { cache, now } = dailyRepositoryFixture(Intl.DateTimeFormat().resolvedOptions().timeZone);
+  const days = cache.display.repositoryDailyCommits!;
+  days[0].date = "2026-11-02";
+  days[1].totalCommits = 0;
+  const totals = repositoryCommitTotals({ example: cache }, now);
+  expect(totals).toMatchObject({ total: 181, partial: true });
+  expect(totals.rows).toContainEqual({ repository: "Repository 1", count: null });
+  expect(totals.rows).toContainEqual({ repository: "Repository 2", count: 0 });
+  render(
+    <TaskBoardToday
+      tasks={cache.tasks}
+      sessions={[]}
+      caches={{ example: cache }}
+      now={now}
+      onSelect={vi.fn()}
+    />,
+  );
+  expect(screen.getByText("Repository 1").parentElement?.textContent).toContain("Unavailable");
+  expect(screen.getByText("181").parentElement?.textContent).toContain("Partial");
+  expect(screen.getByText("172")).toBeTruthy();
+});
+
+it("deduplicates repeated repositories, withholds conflicting totals and incompatible zones, and retains exact integers", () => {
+  const { cache, now } = dailyRepositoryFixture(Intl.DateTimeFormat().resolvedOptions().timeZone);
+  expect(repositoryCommitTotals({ first: cache, second: cache }, now).total).toBe(225);
+  const other = structuredClone(cache);
+  other.display.repositoryDailyCommits![0].totalCommits = 27;
+  expect(repositoryCommitTotals({ first: cache, second: other }, now)).toMatchObject({
+    total: 199,
+    partial: true,
+  });
+  cache.display.repositoryDailyCommits![0].timeZone = "America/New_York";
+  cache.display.repositoryDailyCommits![1].totalCommits = 12345;
+  const { container } = render(
+    <TaskBoardToday
+      tasks={[]}
+      sessions={[]}
+      caches={{ example: cache }}
+      now={now}
+      onSelect={vi.fn()}
+    />,
+  );
+  expect(container.querySelector(".td-roots")?.textContent).toContain("12345");
+  expect(screen.getByText("Repository 1").parentElement?.textContent).toContain("Unavailable");
+  expect(repositoryCommitTotals({}, now)).toMatchObject({ total: null, partial: true });
+});
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({ usage_board_enabled: false }),
 }));

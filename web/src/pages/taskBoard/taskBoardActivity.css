@@ -1795,6 +1795,24 @@
 .tb-activity-final .td-stats {
   grid-template-columns: auto auto 1fr;
 }
+.tb-activity-final .td-commit-stats {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.tb-activity-final .td-commit-stats b,
+.tb-activity-final .td-roots b {
+  overflow-wrap: anywhere;
+}
+.tb-activity-final .td-roots {
+  max-height: 210px;
+  overflow-y: auto;
+}
+.tb-activity-final .td-roots span {
+  flex-shrink: 0;
+  gap: 12px;
+}
+.tb-activity-final .td-roots em {
+  flex-shrink: 0;
+}
 @container (max-width:620px) {
   .tb-activity-final .h-cols,
   .tb-activity-final .r-names,

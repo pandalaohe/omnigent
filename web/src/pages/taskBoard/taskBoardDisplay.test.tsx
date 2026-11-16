@@ -89,7 +89,8 @@ it("pins every required part before publishing a new complete source", async () 
   expect(result.tasks[0].title).toBe("New");
   expect(result.sourceCaches?.example.pin.id).toBe("second");
   expect(paths.some((url) => url.searchParams.get("part") === "accountDays")).toBe(true);
-  expect(paths.filter((url) => url.pathname.endsWith("display"))).toHaveLength(6);
+  expect(paths.some((url) => url.searchParams.get("part") === "repositoryDailyCommits")).toBe(true);
+  expect(paths.filter((url) => url.pathname.endsWith("display"))).toHaveLength(7);
 });
 
 const session: DisplaySession = {
