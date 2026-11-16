@@ -9,6 +9,7 @@
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MembersPage } from "./MembersPage";
 import type { AccountListEntry } from "@/lib/accountsApi";
@@ -152,6 +153,7 @@ describe("MembersPage table", () => {
 
 describe("MembersPage actions", () => {
   it("resets a user's password and shows the new password once", async () => {
+    const userInput = userEvent.setup();
     vi.mocked(accountsApi.listUsers).mockResolvedValue([user({ id: "bob" })]);
     renderPage();
 
@@ -161,6 +163,8 @@ describe("MembersPage actions", () => {
     await waitFor(() => expect(accountsApi.resetUserPassword).toHaveBeenCalledWith("bob"));
     // The new password renders in a readonly, copyable input.
     expect(await screen.findByDisplayValue("fresh-pw-123")).toBeInTheDocument();
+    await userInput.click(screen.getByRole("button", { name: "Copy" }));
+    expect(await screen.findByRole("button", { name: "Copied" })).toBeVisible();
   });
 
   it("deletes a user through the confirmation dialog and refreshes the list", async () => {

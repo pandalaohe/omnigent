@@ -1,3 +1,4 @@
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useState } from "react";
 import { CopyIcon } from "lucide-react";
 import { MessageResponse } from "@/components/ai-elements/message";
@@ -148,20 +149,28 @@ export function RouteView({
           <Button size="sm" variant="outline" onClick={() => setRendered(!rendered)}>
             {rendered ? "Read raw" : "Read formatted"}
           </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={async () => {
-              try {
-                await copyText(data.text);
-                setCopyState("Copied complete text.");
-              } catch {
-                setCopyState("Could not copy. Select the raw text to copy it manually.");
-              }
-            }}
-          >
-            <CopyIcon /> Copy all
-          </Button>
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  aria-label="Copy all"
+                  size="icon-sm"
+                  variant="outline"
+                  onClick={async () => {
+                    try {
+                      await copyText(data.text);
+                      setCopyState("Copied complete text.");
+                    } catch {
+                      setCopyState("Could not copy. Select the raw text to copy it manually.");
+                    }
+                  }}
+                >
+                  <CopyIcon />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Copy all</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
         </div>
       </div>
       {copyState && (

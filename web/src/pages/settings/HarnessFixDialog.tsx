@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   Dialog,
   DialogContent,
@@ -864,7 +865,7 @@ function DeviceCodeState({
             <code className="min-w-0 flex-1 text-center font-mono text-xl font-semibold tracking-[0.16em]">
               {login.user_code}
             </code>
-            <CopyButton text={login.user_code} label="Copy one-time code" iconOnly />
+            <CopyButton text={login.user_code} label="Copy one-time code" />
           </div>
         </div>
       </div>
@@ -914,31 +915,31 @@ function StepNumber({ children }: { children: React.ReactNode }) {
   );
 }
 
-function CopyButton({
-  text,
-  label,
-  iconOnly = false,
-}: {
-  text: string;
-  label: string;
-  iconOnly?: boolean;
-}) {
+function CopyButton({ text, label }: { text: string; label: string }) {
   const [copied, setCopied] = useState(false);
   return (
-    <Button
-      type="button"
-      variant="outline"
-      size={iconOnly ? "icon-sm" : "sm"}
-      aria-label={label}
-      onClick={() => {
-        void copyText(text)
-          .then(() => setCopied(true))
-          .catch(() => showToast("Couldn't copy — select and copy manually.", { duration: 0 }));
-      }}
-    >
-      {copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
-      {!iconOnly && (copied ? "Copied" : "Copy link")}
-    </Button>
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            type="button"
+            variant="outline"
+            size="icon-sm"
+            aria-label={label}
+            onClick={() => {
+              void copyText(text)
+                .then(() => setCopied(true))
+                .catch(() =>
+                  showToast("Couldn't copy — select and copy manually.", { duration: 0 }),
+                );
+            }}
+          >
+            {copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{copied ? "Copied" : label}</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
 
@@ -1276,22 +1277,30 @@ function CommandRow({ command, label }: { command: string; label: string }) {
   return (
     <div className="flex min-h-9 items-center gap-2 rounded-[10px] border border-border px-3 py-1.5">
       <code className="min-w-0 flex-1 break-all font-mono text-sm text-foreground">{command}</code>
-      <Button
-        variant="ghost"
-        size="sm"
-        onClick={() => {
-          void copyText(command)
-            .then(() => {
-              setCopied(true);
-              showToast("Copied to clipboard.");
-            })
-            .catch(() => showToast("Couldn't copy — select and copy manually.", { duration: 0 }));
-        }}
-        aria-label={label}
-      >
-        {copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
-        {copied ? "Copied" : "Copy"}
-      </Button>
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={() => {
+                void copyText(command)
+                  .then(() => {
+                    setCopied(true);
+                    showToast("Copied to clipboard.");
+                  })
+                  .catch(() =>
+                    showToast("Couldn't copy — select and copy manually.", { duration: 0 }),
+                  );
+              }}
+              aria-label={label}
+            >
+              {copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{copied ? "Copied" : label}</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
     </div>
   );
 }

@@ -35,6 +35,7 @@ import {
   Rows4Icon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Link } from "@/lib/routing";
 import { boardExitProps } from "@/lib/boardFrame";
 import { taskIdentity, type BoardTask, type TaskSource } from "./taskBoardData";
@@ -1602,19 +1603,31 @@ export function TaskBoardRoutes({
             {t("routes.focus")}
             {focus.length > 0 && <em>{focus.length}</em>}
           </button>
-          <button
-            type="button"
-            className="rt-icon"
-            aria-label={t(allExpanded ? "routes.collapseAll" : "routes.expandAll")}
-            onClick={() => {
-              setExpanded({});
-              setAllExpanded(!allExpanded);
-              setOpen(null);
-            }}
-          >
-            {allExpanded ? <ChevronsDownUpIcon size={16} /> : <ChevronsUpDownIcon size={16} />}
-            {t(allExpanded ? "routes.collapseAll" : "routes.expandAll")}
-          </button>
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  className="rt-icon"
+                  aria-label={t(allExpanded ? "routes.collapseAll" : "routes.expandAll")}
+                  onClick={() => {
+                    setExpanded({});
+                    setAllExpanded(!allExpanded);
+                    setOpen(null);
+                  }}
+                >
+                  {allExpanded ? (
+                    <ChevronsDownUpIcon size={16} />
+                  ) : (
+                    <ChevronsUpDownIcon size={16} />
+                  )}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>
+                {t(allExpanded ? "routes.collapseAll" : "routes.expandAll")}
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
           <button
             type="button"
             className="rt-icon"

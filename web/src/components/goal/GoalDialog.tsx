@@ -1,3 +1,4 @@
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useCallback, useEffect, useState } from "react";
 import { CheckIcon, Loader2Icon, PauseCircleIcon, PlayCircleIcon, TargetIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -327,30 +328,50 @@ function GoalActions({
         Delete goal
       </Button>
       {showPause && (
-        <Button
-          type="button"
-          variant="outline"
-          onClick={onPause}
-          disabled={readOnly || busy}
-          loading={statusUpdating === "paused"}
-          data-testid="goal-pause"
-        >
-          <PauseCircleIcon className="size-3.5" />
-          Pause
-        </Button>
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="inline-flex">
+                <Button
+                  aria-label="Pause"
+                  size="icon"
+                  type="button"
+                  variant="outline"
+                  onClick={onPause}
+                  disabled={readOnly || busy}
+                  loading={statusUpdating === "paused"}
+                  data-testid="goal-pause"
+                >
+                  <PauseCircleIcon className="size-3.5" />
+                </Button>
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>Pause</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
       )}
       {showResume && (
-        <Button
-          type="button"
-          variant="outline"
-          onClick={onResume}
-          disabled={readOnly || busy}
-          loading={statusUpdating === "active"}
-          data-testid="goal-resume"
-        >
-          <PlayCircleIcon className="size-3.5" />
-          Resume
-        </Button>
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="inline-flex">
+                <Button
+                  aria-label="Resume"
+                  size="icon"
+                  type="button"
+                  variant="outline"
+                  onClick={onResume}
+                  disabled={readOnly || busy}
+                  loading={statusUpdating === "active"}
+                  data-testid="goal-resume"
+                >
+                  <PlayCircleIcon className="size-3.5" />
+                </Button>
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>Resume</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
       )}
       <Button
         type="button"

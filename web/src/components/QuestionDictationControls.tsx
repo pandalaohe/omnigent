@@ -128,7 +128,7 @@ export function QuestionDictationControls({
         inputRef={inputRef}
         questionCard
         disabled={disabled}
-        className="!size-11"
+        className="!size-7"
         onVoiceStart={() => {
           abortRef.current?.abort();
           setNotice("");

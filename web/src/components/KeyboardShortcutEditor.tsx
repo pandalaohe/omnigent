@@ -1,3 +1,4 @@
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useEffect, useMemo, useState } from "react";
 import { PlusIcon, RotateCcwIcon, Trash2Icon } from "lucide-react";
 
@@ -431,21 +432,29 @@ export function KeyboardShortcutEditor() {
                         }
                         onRecord={() => startRecording({ actionId: definition.id, platform: null })}
                       />
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        aria-label={`Restore default shortcut for ${definition.label}`}
-                        disabled={!isChanged(definition.id)}
-                        onClick={() => {
-                          stopRecording();
-                          resetShortcutPreference(definition.id);
-                          setError(null);
-                        }}
-                      >
-                        <RotateCcwIcon />
-                        Reset
-                      </Button>
+                      <TooltipProvider>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span className="inline-flex">
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon-sm"
+                                aria-label={`Restore default shortcut for ${definition.label}`}
+                                disabled={!isChanged(definition.id)}
+                                onClick={() => {
+                                  stopRecording();
+                                  resetShortcutPreference(definition.id);
+                                  setError(null);
+                                }}
+                              >
+                                <RotateCcwIcon />
+                              </Button>
+                            </span>
+                          </TooltipTrigger>
+                          <TooltipContent>{`Restore default shortcut for ${definition.label}`}</TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
                       <DropdownMenu>
                         <DropdownMenuTrigger asChild>
                           <Button

@@ -1,3 +1,4 @@
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 /**
  * Admin members management page (``/settings/members``; the legacy
  * ``/members`` path redirects here). Rendered as a Settings sub-category.
@@ -24,7 +25,14 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { CopyIcon, KeyRoundIcon, RefreshCwIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
+import {
+  CheckIcon,
+  CopyIcon,
+  KeyRoundIcon,
+  RefreshCwIcon,
+  Trash2Icon,
+  UserPlusIcon,
+} from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
@@ -263,15 +271,23 @@ export function MembersPage() {
                         >
                           <KeyRoundIcon /> Reset
                         </Button>
-                        <Button
-                          variant="ghost"
-                          size="xs"
-                          title="Remove user"
-                          onClick={() => setDeleteCandidate(u.id)}
-                          disabled={pendingAction || u.id === meId}
-                        >
-                          <Trash2Icon /> Remove
-                        </Button>
+                        <TooltipProvider>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                aria-label="Remove user"
+                                variant="ghost"
+                                size="icon-sm"
+                                title="Remove user"
+                                onClick={() => setDeleteCandidate(u.id)}
+                                disabled={pendingAction || u.id === meId}
+                              >
+                                <Trash2Icon />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>Remove user</TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
                       </div>
                     </td>
                   )}
@@ -287,9 +303,21 @@ export function MembersPage() {
       )}
 
       <div className="mt-3 flex items-center justify-end">
-        <Button variant="ghost" size="sm" onClick={() => void refresh()}>
-          <RefreshCwIcon /> Refresh
-        </Button>
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                aria-label="Refresh"
+                variant="ghost"
+                size="icon-sm"
+                onClick={() => void refresh()}
+              >
+                <RefreshCwIcon />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Refresh</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
       </div>
 
       {/* ── Create invite modal ───────────────────────────────────── */}
@@ -461,9 +489,21 @@ function CopyableValue({ value }: { value: string }) {
         className="font-mono text-sm"
         onFocus={(e) => e.currentTarget.select()}
       />
-      <Button variant="outline" size="sm" onClick={() => void onCopy()} aria-label="Copy">
-        <CopyIcon /> {copied ? "Copied" : "Copy"}
-      </Button>
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="outline"
+              size="icon-sm"
+              onClick={() => void onCopy()}
+              aria-label={copied ? "Copied" : "Copy"}
+            >
+              {copied ? <CheckIcon /> : <CopyIcon />}
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{copied ? "Copied" : "Copy"}</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
     </div>
   );
 }

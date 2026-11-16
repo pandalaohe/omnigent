@@ -1,3 +1,4 @@
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 // Question carousel for structured elicitation, with single- or multi-select answers.
 // isOther controls custom input; submit requires an answer to every question.
 //
@@ -1075,16 +1076,22 @@ export function AskUserQuestionForm({
                   />
                 )}
                 {asyncTarget && (
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    className="min-h-11"
-                    onClick={() => fileInputRef.current?.click()}
-                  >
-                    <ImagePlusIcon className="mr-1 size-3.5" />
-                    Add image
-                  </Button>
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          aria-label="Add image"
+                          type="button"
+                          size="icon-sm"
+                          variant="outline"
+                          onClick={() => fileInputRef.current?.click()}
+                        >
+                          <ImagePlusIcon className="size-3.5" />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>Add image</TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
                 )}
               </div>
               {asyncTarget && (
@@ -1156,31 +1163,45 @@ export function AskUserQuestionForm({
           a mouse click leaves focus alone (touch devices would raise the
           keyboard). */}
       <div className="flex flex-wrap items-center gap-2">
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={(event) => goToQuestion(currentIndex - 1, event.detail === 0)}
-          disabled={isFirst || submitting}
-          className="mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal"
-          data-testid="ask-user-question-prev"
-          componentId="question.prev"
-        >
-          <ChevronLeftIcon className="mr-1 size-3.5" />
-          Prev
-        </Button>
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                aria-label="Previous question"
+                size="icon-sm"
+                variant="outline"
+                onClick={(event) => goToQuestion(currentIndex - 1, event.detail === 0)}
+                disabled={isFirst || submitting}
+                className="mobile-touch-target mobile-app:whitespace-normal"
+                data-testid="ask-user-question-prev"
+                componentId="question.prev"
+              >
+                <ChevronLeftIcon className="size-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Previous question</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
         {!isLast && (
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={(event) => goToQuestion(currentIndex + 1, event.detail === 0)}
-            disabled={submitting}
-            className="mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal"
-            data-testid="ask-user-question-next"
-            componentId="question.next"
-          >
-            Next
-            <ChevronRightIcon className="ml-1 size-3.5" />
-          </Button>
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  aria-label="Next question"
+                  size="icon-sm"
+                  variant="outline"
+                  onClick={(event) => goToQuestion(currentIndex + 1, event.detail === 0)}
+                  disabled={submitting}
+                  className="mobile-touch-target mobile-app:whitespace-normal"
+                  data-testid="ask-user-question-next"
+                  componentId="question.next"
+                >
+                  <ChevronRightIcon className="size-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Next question</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
         )}
         {isLast && (
           <Button

@@ -65,6 +65,18 @@ function renderAsyncForm(
 }
 
 describe("async question answer images", () => {
+  it("opens the image picker from the named icon button and explains it on focus", async () => {
+    renderAsyncForm([{ id: "q1", question: "Show the problem" }]);
+    const button = screen.getByRole("button", { name: "Add image" });
+    expect(button.textContent).toBe("");
+    const picker = screen.getByLabelText("Choose answer images");
+    const click = vi.spyOn(picker, "click");
+    fireEvent.click(button);
+    expect(click).toHaveBeenCalledOnce();
+    fireEvent.focus(button);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Add image");
+  });
+
   it("accepts a GIF with blank browser MIME as an answer image", () => {
     renderAsyncForm([{ id: "q1", question: "Show the animation" }], vi.fn(), {
       image_bytes: 1,

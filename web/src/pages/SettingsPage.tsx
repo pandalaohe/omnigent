@@ -857,28 +857,30 @@ function WorkspaceTabsControl() {
               <div key={tab} className="flex items-center gap-3 py-2.5">
                 <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
                 <span className="flex-1 text-ui">{label}</span>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  aria-label={`Pin ${label}`}
-                  aria-pressed={isPinned}
-                  title={`${isPinned ? "Unpin" : "Pin"} ${label}`}
-                  onClick={() => togglePin(tab, !isPinned)}
-                  className={cn(
-                    "min-w-24",
-                    isPinned
-                      ? "bg-primary/8 text-primary hover:bg-primary/12"
-                      : "text-muted-foreground",
-                  )}
-                  componentId={`settings.appearance.pin_workspace_${tab}`}
-                >
-                  <PinIcon
-                    aria-hidden="true"
-                    className={cn("size-3.5", isPinned && "fill-current")}
-                  />
-                  {isPinned ? "Pinned" : "Pin"}
-                </Button>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={`Pin ${label}`}
+                      aria-pressed={isPinned}
+                      onClick={() => togglePin(tab, !isPinned)}
+                      className={cn(
+                        isPinned
+                          ? "bg-primary/8 text-primary hover:bg-primary/12"
+                          : "text-muted-foreground",
+                      )}
+                      componentId={`settings.appearance.pin_workspace_${tab}`}
+                    >
+                      <PinIcon
+                        aria-hidden="true"
+                        className={cn("size-3.5", isPinned && "fill-current")}
+                      />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{`${isPinned ? "Unpin" : "Pin"} ${label}`}</TooltipContent>
+                </Tooltip>
               </div>
             );
           })}

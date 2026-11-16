@@ -279,8 +279,11 @@ describe("HarnessFixDialog", () => {
     ).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Copy login command" }));
     expect(copyText).toHaveBeenCalledWith("claude auth login --claudeai");
-    expect(await screen.findByText("Copied")).toBeVisible();
-    expect(showToast).toHaveBeenCalledWith("Copied to clipboard.");
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith("Copied to clipboard."));
+    const copyButton = screen.getByRole("button", { name: "Copy login command" });
+    fireEvent.blur(copyButton);
+    fireEvent.focus(copyButton);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Copied");
     await user.click(screen.getByRole("button", { name: "Check again" }));
 
     await waitFor(() =>
@@ -452,7 +455,7 @@ describe("HarnessFixDialog", () => {
         duration: 0,
       }),
     );
-    expect(screen.getByRole("button", { name: "Copy omni setup" })).toHaveTextContent("Copy");
+    expect(screen.getByRole("button", { name: "Copy omni setup" })).toHaveTextContent("");
   });
 
   it("falls back to the Codex copy command when device login is unsupported", async () => {
