@@ -19,6 +19,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { CheckIcon, LinkIcon, QrCodeIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   Dialog,
   DialogContent,
@@ -615,15 +616,23 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
   }, [sessionId, rebasePath]);
 
   return (
-    <Button
-      variant="ghost"
-      onClick={handleCopy}
-      className="gap-1.5 text-primary"
-      componentId="diagnostics.permissions.copy_link"
-    >
-      {copied ? <CheckIcon className="size-3.5" /> : <LinkIcon className="size-3.5" />}
-      {copied ? "Copied!" : "Copy link"}
-    </Button>
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label={copied ? "Copied!" : "Copy link"}
+            onClick={handleCopy}
+            className="text-primary"
+            componentId="diagnostics.permissions.copy_link"
+          >
+            {copied ? <CheckIcon className="size-3.5" /> : <LinkIcon className="size-3.5" />}
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{copied ? "Copied!" : "Copy link"}</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
 

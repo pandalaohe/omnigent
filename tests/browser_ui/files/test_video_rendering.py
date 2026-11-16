@@ -441,6 +441,9 @@ def test_remote_recording_playback(
     page.goto(f"{session.contract.base_url}/c/{session.session_id}")
     play = page.get_by_role("button", name="Play video: Remote demo", exact=True)
     expect(play).to_be_visible()
+    expect(play).to_have_text("")
+    play.hover()
+    expect(page.get_by_role("tooltip")).to_have_text("Play recording")
     expect(page.locator('video[aria-label="Remote demo"][src]')).to_have_count(0)
     # Give native preloading time to expose any request triggered by rendering.
     page.wait_for_timeout(300)

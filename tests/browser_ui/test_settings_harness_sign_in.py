@@ -142,6 +142,10 @@ def test_expired_codex_account_recovers_on_selected_machine(
         expect(dialog.get_by_role("link", name="Open sign-in page")).to_have_attribute(
             "href", "https://identity.example.test/device"
         )
+        copy_link = dialog.get_by_role("button", name="Copy sign-in link", exact=True)
+        expect(copy_link).to_have_text("")
+        copy_link.hover()
+        expect(page.get_by_role("tooltip")).to_have_text("Copy sign-in link")
         expect(dialog).to_contain_text("Signing in on Synthetic laptop")
         with page.expect_response(lambda response: response.request.method == "DELETE"):
             dialog.get_by_role("button", name="Cancel", exact=True).click()

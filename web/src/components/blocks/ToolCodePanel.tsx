@@ -10,7 +10,7 @@ import {
   CodeBlockTitle,
 } from "@/components/ai-elements/code-block";
 import { Button } from "@/components/ui/button";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
 /** Diff colors for added and removed line counts, as in the changed-files diffstat. */
@@ -260,21 +260,27 @@ export function OutputSection({
             {isExpanded ? "Showing full output" : "Previewing output"} (
             {formatOutputStats(isExpanded ? preview : collapsedPreview)})
           </span>
-          <Button
-            className="w-fit"
-            onClick={() => setIsExpanded((value) => !value)}
-            size="xs"
-            type="button"
-            variant="outline"
-            componentId="diagnostics.tool.toggle_expanded"
-          >
-            {isExpanded ? (
-              <Minimize2Icon className="size-3" />
-            ) : (
-              <Maximize2Icon className="size-3" />
-            )}
-            {isExpanded ? "Collapse" : "Expand"}
-          </Button>
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  onClick={() => setIsExpanded((value) => !value)}
+                  size="icon-xs"
+                  aria-label={isExpanded ? "Collapse" : "Expand"}
+                  type="button"
+                  variant="outline"
+                  componentId="diagnostics.tool.toggle_expanded"
+                >
+                  {isExpanded ? (
+                    <Minimize2Icon className="size-3" />
+                  ) : (
+                    <Maximize2Icon className="size-3" />
+                  )}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{isExpanded ? "Collapse" : "Expand"}</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
         </div>
       )}
     </div>

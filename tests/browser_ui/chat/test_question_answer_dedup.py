@@ -16,6 +16,7 @@ def test_question_image_icon_and_tooltip(
     page: Page, chat_session_contract: ChatSessionContract, output_path: str, width: int
 ) -> None:
     chat = chat_session_contract
+    chat.harness = "claude-native"
     page.set_viewport_size({"width": width, "height": 900})
     page.goto(chat.url)
     chat.wait_for_stream()
@@ -49,6 +50,20 @@ def test_question_image_icon_and_tooltip(
     output = Path(output_path)
     output.mkdir(parents=True, exist_ok=True)
     page.screenshot(path=str(output / f"image-icon-after-{width}.png"), full_page=True)
+    # Preserve a labelled source reconstruction for the visual comparison report.
+    button.evaluate(
+        """element => {
+            element.style.minHeight = '44px';
+            element.style.width = 'auto';
+            element.style.padding = '0 10px';
+            element.append(document.createTextNode('Add image'));
+        }"""
+    )
+    page.mouse.move(0, 0)
+    expect(page.get_by_role("tooltip")).not_to_be_visible()
+    page.screenshot(
+        path=str(output / f"image-icon-before-reconstructed-{width}.png"), full_page=True
+    )
 
 
 @pytest.mark.parametrize("harness", ["claude-native", "codex-native"])

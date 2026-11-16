@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Iterator
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -14,6 +15,31 @@ from omnigent.server.child_idle import DEFAULT_CHECKIN_INSTRUCTIONS
 from tests.browser_ui.conftest import BrowserContract
 
 _COMPOSER = "Send a message…"
+
+
+@pytest.mark.parametrize("width", [1280, 390])
+def test_workspace_pin_icon_and_tooltip(
+    page: Page, appearance_url: str, output_path: str, width: int
+) -> None:
+    page.set_viewport_size({"width": width, "height": 900})
+    _open_appearance(page, appearance_url)
+    button = page.get_by_role("button", name="Pin Changes", exact=True)
+    expect(button).to_be_visible()
+    expect(button).to_have_text("")
+    button.hover()
+    expect(page.get_by_role("tooltip")).to_have_text("Unpin Changes")
+    output = Path(output_path)
+    output.mkdir(parents=True, exist_ok=True)
+    page.screenshot(path=str(output / f"workspace-pin-after-{width}.png"), full_page=True)
+    button.click()
+    expect(button).to_have_attribute("aria-pressed", "false")
+    page.mouse.move(0, 0)
+    button.hover()
+    expect(page.get_by_role("tooltip")).to_have_text("Pin Changes")
+    page.reload()
+    expect(page.get_by_role("button", name="Pin Changes", exact=True)).to_have_attribute(
+        "aria-pressed", "false"
+    )
 
 
 @pytest.fixture

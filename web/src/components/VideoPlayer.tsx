@@ -324,15 +324,20 @@ function VideoPlayerContent(props: VideoPlayerProps) {
                   <Spinner aria-hidden="true" role="presentation" /> Loading video…
                 </span>
               ) : (
-                <button
-                  type="button"
-                  aria-label={`Play video: ${title}`}
-                  className="flex flex-col items-center gap-3 rounded-lg p-4 hover:bg-accent hover:text-foreground"
-                  onClick={() => setRequested(true)}
-                >
-                  <PlayIcon className="size-10" />
-                  <span>Play recording</span>
-                </button>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-lg"
+                      aria-label={`Play video: ${title}`}
+                      onClick={() => setRequested(true)}
+                    >
+                      <PlayIcon className="size-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Play recording</TooltipContent>
+                </Tooltip>
               )}
             </span>
           )}

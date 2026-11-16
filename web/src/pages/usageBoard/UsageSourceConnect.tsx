@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { CopyIcon, PlugIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   Dialog,
   DialogContent,
@@ -47,22 +48,28 @@ export function UsageSourceConnect({
             {command}
           </pre>
           <div className="flex flex-wrap items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              className="gap-1.5"
-              onClick={async () => {
-                try {
-                  await copyText(command);
-                  setResult("copied");
-                } catch {
-                  setResult("copyFailed");
-                }
-              }}
-            >
-              <CopyIcon className="size-3.5 shrink-0" aria-hidden="true" />
-              {t(result === "copied" ? "copied" : "copy")}
-            </Button>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="icon-sm"
+                    aria-label={t("copy")}
+                    onClick={async () => {
+                      try {
+                        await copyText(command);
+                        setResult("copied");
+                      } catch {
+                        setResult("copyFailed");
+                      }
+                    }}
+                  >
+                    <CopyIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>{t(result === "copied" ? "copied" : "copy")}</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
             <span role="status" className="text-xs text-muted-foreground">
               {result ? t(result) : null}
             </span>

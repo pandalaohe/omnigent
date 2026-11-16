@@ -482,9 +482,21 @@ function CopyableValue({ value }: { value: string }) {
         className="font-mono text-sm"
         onFocus={(e) => e.currentTarget.select()}
       />
-      <Button variant="outline" size="sm" onClick={() => void onCopy()} aria-label="Copy">
-        <CopyIcon /> {copied ? "Copied" : "Copy"}
-      </Button>
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="outline"
+              size="icon-sm"
+              onClick={() => void onCopy()}
+              aria-label="Copy"
+            >
+              <CopyIcon />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{copied ? "Copied" : "Copy"}</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
     </div>
   );
 }
