@@ -1,9 +1,20 @@
-import { useState } from "react";
+import { forwardRef, useState, type ComponentPropsWithoutRef } from "react";
 import { UsersIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PickerShell } from "@/components/PickerShell";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+
+// Pass the shell's trigger ref through to the same button the tooltip describes.
+const MembershipTrigger = forwardRef<HTMLButtonElement, ComponentPropsWithoutRef<typeof Button>>(
+  function MembershipTrigger(props, ref) {
+    return (
+      <TooltipTrigger asChild>
+        <Button {...props} ref={ref} />
+      </TooltipTrigger>
+    );
+  },
+);
 
 export function CompactMembership({
   label,
@@ -38,20 +49,16 @@ export function CompactMembership({
         <PickerShell
           title={label}
           trigger={
-            <Button
+            <MembershipTrigger
               type="button"
               size="sm"
               variant="secondary"
               disabled={disabled}
               aria-label={`${label}: ${items.length}`}
             >
-              <TooltipTrigger asChild>
-                <span className="inline-flex items-center gap-1">
-                  <UsersIcon className="size-4" aria-hidden="true" />
-                  <span className="tabular-nums">{items.length}</span>
-                </span>
-              </TooltipTrigger>
-            </Button>
+              <UsersIcon className="size-4" aria-hidden="true" />
+              <span className="tabular-nums">{items.length}</span>
+            </MembershipTrigger>
           }
         >
           <div

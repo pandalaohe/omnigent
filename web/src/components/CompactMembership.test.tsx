@@ -9,6 +9,30 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+it("shows the membership preview and describes the button on keyboard focus", async () => {
+  const user = userEvent.setup();
+  render(
+    <CompactMembership
+      label="Members"
+      items={[
+        { id: "alpha", label: "Alpha" },
+        { id: "beta", label: "Beta" },
+      ]}
+    />,
+  );
+
+  await user.tab();
+  const trigger = screen.getByRole("button", { name: "Members: 2" });
+  expect(trigger).toHaveFocus();
+  const tooltip = await screen.findByRole("tooltip");
+  expect(tooltip.closest('[data-slot="tooltip-content"]')).toBeVisible();
+  expect(tooltip).toHaveTextContent("Members · 2");
+  expect(within(tooltip).getByText("Alpha")).toBeInTheDocument();
+  expect(within(tooltip).getByText("Beta")).toBeInTheDocument();
+  expect(trigger).toHaveAttribute("aria-describedby", tooltip.id);
+  expect(trigger).toHaveAccessibleDescription(/Members · 2\s*Alpha\s*Beta/);
+});
+
 it.each([390, 1280])("keeps membership actions and keyboard dismissal at %ipx", async (width) => {
   const matchMedia = window.matchMedia;
   vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
