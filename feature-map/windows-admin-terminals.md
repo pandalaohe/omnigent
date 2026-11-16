@@ -9,7 +9,7 @@ This is an administrator terminal for the host's Windows account. It runs over
 loopback OpenSSH using an encrypted Ed25519 key. A user types that key's
 passphrase inside the terminal. Processes running as the same Windows user can
 capture an authorized unlock or take over an open terminal; the app's agent
-access switch does not provide an OS process boundary.
+access tier does not provide an OS process boundary.
 
 ## Sub-features
 
@@ -19,8 +19,8 @@ access switch does not provide an OS process boundary.
 
 ## How to get to it (user POV)
 
-Enroll locally with `omni host admin-terminal install`, then open Admin beside
-Shell in a host-bound session or on the standalone host terminals page.
+Enroll locally with `omni host admin-terminal install`, then enable Administrator
+in a session's Shell Options, or open Admin on the standalone host terminals page.
 
 ## Driving it with the repro environment
 
@@ -63,8 +63,8 @@ host administrator before retrying.
    checks that a separate wrong key cannot authenticate. Only success writes
    `host.elevated_terminals: windows_ssh` to the effective host config.
 4. Restart the host using its existing service controls. The app should then
-   offer Admin beside Shell in both a session and the standalone host terminals
-   page. A missing or unencrypted replacement key removes the advertised
+   offer Administrator in session Shell Options and Admin on the standalone host
+   terminals page. A missing or unencrypted replacement key removes the advertised
    capability and refuses new launches.
 
 On a failed shell/token check, the installer separately attempts to clear opt-in

@@ -957,6 +957,11 @@ export interface SessionResourceDeletedEvent {
   sessionId: string;
 }
 
+export interface SessionResourceChangedEvent {
+  type: "session_resource_changed";
+  sessionId: string;
+}
+
 /**
  * `session.child_session.updated` — a child (sub-agent) session's status
  * changed, pushed to the PARENT's stream. Carries the full child summary
@@ -1161,6 +1166,7 @@ export type StreamEvent =
   | SessionSupersededEvent
   | SessionResourceCreatedEvent
   | SessionResourceDeletedEvent
+  | SessionResourceChangedEvent
   | SessionChildSessionUpdatedEvent
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent

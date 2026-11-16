@@ -48,8 +48,14 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(() => undefined),
 }));
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import type * as LinkedTerminals from "./useLinkedTerminals";
 
 const runnerOnlineMock = vi.mocked(useSessionRunnerOnline);
+const linkedState = vi.hoisted(() => ({ data: [] as TerminalInfo[] }));
+vi.mock("./useLinkedTerminals", async (original) => ({
+  ...(await original<typeof LinkedTerminals>()),
+  useLinkedTerminals: () => linkedState,
+}));
 
 function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
   return {
@@ -1040,7 +1046,7 @@ describe("useTerminals — SSE-primary list, poll corrects on edges", () => {
     expect(result.current.terminals).toEqual([TERMINAL]);
   });
 
-  it("clears terminals on a confirmed stop (true → false edge)", async () => {
+  it("clears local terminals on a confirmed stop while linked terminals stay", async () => {
     // The poll's subtractive correction: a running runner's terminal is shown,
     // then the poll confirms the runner went offline. Its PTYs are gone but a
     // stop emits no `session.resource.deleted`, so the SSE list would keep
@@ -1049,13 +1055,15 @@ describe("useTerminals — SSE-primary list, poll corrects on edges", () => {
     // the cold-boot `undefined → false` window (covered by the test above).
     fetchMock.mockResolvedValue(oneTerminal());
     runnerOnlineMock.mockReturnValue(true);
+    const remote: TerminalInfo = { ...TERMINAL, id: "host:remote:terminal", hostId: "remote" };
+    linkedState.data = [remote];
 
     const { result, rerender } = renderHook(() => useTerminals("conv_abc"), {
       wrapper: makeClientWrapper().wrapper,
     });
     await act(async () => void (await vi.advanceTimersByTimeAsync(0)));
     // Online: the seeded terminal is shown.
-    expect(result.current.terminals).toEqual([TERMINAL]);
+    expect(result.current.terminals).toEqual([TERMINAL, remote]);
 
     // Runner stops: the true → false edge clears the now-dead terminal.
     runnerOnlineMock.mockReturnValue(false);
@@ -1064,7 +1072,8 @@ describe("useTerminals — SSE-primary list, poll corrects on edges", () => {
       await vi.runAllTimersAsync();
     });
     await act(async () => void rerender());
-    expect(result.current.terminals).toEqual([]);
+    expect(result.current.terminals).toEqual([remote]);
+    linkedState.data = [];
   });
 
   it("re-reads the endpoint on the → online edge to recover a missed created event", async () => {

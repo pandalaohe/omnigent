@@ -1368,7 +1368,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     },
   );
 
-  it("shows the server refusal when Admin creation fails", async () => {
+  it("shows the server refusal when default shell creation fails", async () => {
     terminalAccess.canCreateElevated = true;
     declaresShell();
     const refusal = "a trusted human browser session is required";
@@ -1383,11 +1383,11 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     renderWorkspace({ showBrowserTab: false });
 
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Admin" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Shell (zsh)" }));
 
-    expect(launch).toHaveBeenCalledWith("zsh", expect.objectContaining({ elevated: true }));
+    expect(launch).toHaveBeenCalledWith("zsh", expect.any(Object));
     await waitFor(() =>
-      expect(toast.error).toHaveBeenCalledWith(`Couldn't open an admin terminal: ${refusal}`),
+      expect(toast.error).toHaveBeenCalledWith(`Couldn't open a shell: ${refusal}`),
     );
   });
 
@@ -1421,7 +1421,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
   it("names the current default in the Shell item and launches it on click when several are declared", async () => {
     // Multiple declared terminals → the "Shell" item names the default inline
     // ("Shell (zsh)") and clicking it launches that default; the OTHER types
-    // live behind a separate "Other shells" chevron.
+    // live in Shell Options.
     useSessionAgentMock.mockReturnValue({
       data: { terminals: ["zsh", "bash", "fish"] },
     } as unknown as ReturnType<typeof useSessionAgent>);
@@ -1498,51 +1498,15 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(launch).not.toHaveBeenCalled();
   });
 
-  it("lists only the OTHER types in the flyout and remembers a pick as the new default (persisted)", async () => {
-    window.localStorage.removeItem("omnigent:preferred-shell");
-    useSessionAgentMock.mockReturnValue({
-      data: { terminals: ["zsh", "bash", "fish"] },
-    } as unknown as ReturnType<typeof useSessionAgent>);
-    const launch = vi.fn();
-    useCreateTerminalMock.mockReturnValue({
-      launch,
-      isPending: false,
-      isError: false,
-    } as unknown as ReturnType<typeof useCreateTerminal>);
-
-    renderWorkspace({ showBrowserTab: false });
-
-    // Open the flyout off the "Shell (zsh)" row (ArrowRight reveals the
-    // submenu). It lists only the non-default types — zsh is already named in
-    // the row itself.
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    const shellItem = await screen.findByRole("menuitem", { name: /shell \(zsh\)/i });
-    shellItem.focus();
-    fireEvent.keyDown(shellItem, { key: "ArrowRight" });
-    expect(await screen.findByText("Other shells")).toBeInTheDocument();
-    expect(screen.queryByRole("menuitem", { name: /^Other shells$/i })).toBeNull();
-    expect(await screen.findByRole("menuitem", { name: /^bash$/i })).toBeInTheDocument();
-    expect(screen.getByRole("menuitem", { name: /^fish$/i })).toBeInTheDocument();
-    expect(screen.queryByRole("menuitem", { name: /^zsh$/i })).toBeNull();
-
-    // Pick "bash": launches it and persists as the preferred type (app-global).
-    fireEvent.click(screen.getByRole("menuitem", { name: /^bash$/i }));
-    expect(launch).toHaveBeenCalledWith("bash", expect.any(Object));
-    expect(window.localStorage.getItem("omnigent:preferred-shell")).toBe("bash");
-
-    // A fresh menu seeds its default from the persisted pick — the row now reads
-    // "Shell (bash)" and launches bash on click.
-    cleanup();
-    launch.mockClear();
+  it("offers shell Options beside the default entry without a second Admin entry", async () => {
     useSessionAgentMock.mockReturnValue({
       data: { terminals: ["zsh", "bash", "fish"] },
     } as unknown as ReturnType<typeof useSessionAgent>);
     renderWorkspace({ showBrowserTab: false });
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    fireEvent.click(await screen.findByRole("menuitem", { name: /shell \(bash\)/i }));
-    expect(launch).toHaveBeenCalledWith("bash", expect.any(Object));
-
-    window.localStorage.removeItem("omnigent:preferred-shell");
+    expect(await screen.findByRole("menuitem", { name: "Shell (zsh)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Shell options" })).toBeEnabled();
+    expect(screen.queryByRole("menuitem", { name: "Admin" })).toBeNull();
   });
 
   it("keeps Shell enabled on a wakeable session — the server reconnects on create", async () => {

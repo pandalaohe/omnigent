@@ -3,9 +3,9 @@
 A session can show a live terminal next to or instead of the chat. There are two
 kinds that look alike but are separate surfaces: the agent terminal, which runs
 the native harness behind the Chat/Terminal switcher, and user shells, which a
-user opens from the workspace rail. Both attach to a terminal on the session's
-host, survive view switches, reconnect after a dropped connection, and must
-reattach when the session moves to another host.
+user opens from the workspace rail. The agent terminal attaches on the session's
+host. Shell Options can select another online host owned by the session owner.
+Terminals survive view switches and reconnect after a dropped connection.
 
 ## Sub-features
 
@@ -16,9 +16,16 @@ reattach when the session moves to another host.
   Automatic recovery runs once when opening Terminal. Leaving it open does not
   revive an idle-reaped pane. Failed recovery stays manual across view switches.
 - `user-shell`: open a shell, type into it, and close it.
+- `linked-host-shell`: Shell Options selects a host, optional administrator mode,
+  and initial agent access. Linked terminals remain visible when the session's
+  runner stops; archiving the session closes them when their host is reachable.
+- `agent-access-tier`: each terminal has Off, Read, or Read & write access for
+  the agent. Ordinary shells default to Read & write; admin shells default to
+  Off. The host owner changes the tier in a browser or answers the agent's
+  tier request. Read permits viewing; sending and closing need Read & write.
 - `sdk-terminal-tools`: an SDK agent without declared terminals can launch the
-  host's reported shells and use existing plain session shells without an access
-  grant. Declared terminals keep their configuration and override restrictions.
+  host's reported shells and use existing plain session shells at their selected
+  access tier. Declared terminals keep their configuration and override restrictions.
 - `admin-terminal`: on an opted-in host, the host owner who is also an app
   admin opens a root terminal. The human uses its relay connection; the session
   agent needs explicit consent for that terminal instance.

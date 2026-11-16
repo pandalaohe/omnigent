@@ -15,9 +15,18 @@ import {
   terminalInfoFromResource,
   terminalResourceId,
   terminalsQueryKey,
+  type AgentTier,
   type TerminalInfo,
 } from "@/lib/terminals";
 import { showToast } from "@/components/ui/toast";
+import {
+  useLinkedTerminals,
+  linkedTerminalsKey,
+  linkedTerminalsPath,
+  linkedTerminalTarget,
+  linkedTerminalInfo,
+  type LinkedTerminal,
+} from "./useLinkedTerminals";
 import { apiErrorFromResponse } from "@/lib/sessionsApi";
 
 export { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
@@ -98,7 +107,8 @@ export function isAgentTerminalKey(terminalKey: string): boolean {
 /** Display label for a terminal, e.g. ``"zsh · u-abc123"``. */
 export function terminalDisplayLabel(terminal: TerminalInfo): string {
   const name = terminal.elevated ? "root" : terminal.name;
-  return terminal.session ? `${name} · ${terminal.session}` : name;
+  const label = terminal.session ? `${name} · ${terminal.session}` : name;
+  return terminal.hostName ? `${label} · ${terminal.hostName}` : label;
 }
 
 export function findAgentTerminal(terminals: TerminalInfo[]): TerminalInfo | null {
@@ -272,6 +282,7 @@ export async function createTerminal(
   terminal: string,
   sessionKeyOrElevated: string | boolean = newTerminalSessionKey(),
   elevated = false,
+  agentTier?: AgentTier,
 ): Promise<TerminalInfo> {
   const sessionKey =
     typeof sessionKeyOrElevated === "string" ? sessionKeyOrElevated : newTerminalSessionKey();
@@ -285,6 +296,7 @@ export async function createTerminal(
         terminal,
         session_key: sessionKey,
         ...(isElevated ? { elevated: true } : {}),
+        ...(agentTier ? { agent_tier: agentTier } : {}),
       }),
     },
   );
@@ -317,6 +329,7 @@ function newTerminalSessionKey(): string {
 }
 
 interface TerminalCreateRequest {
+  agentTier?: AgentTier;
   terminal: string;
   sessionKey?: string;
   elevated?: boolean;
@@ -324,6 +337,7 @@ interface TerminalCreateRequest {
 
 /** Callbacks for {@link useCreateTerminal}'s ``launch``. */
 export interface TerminalLaunchCallbacks {
+  agentTier?: AgentTier;
   elevated?: boolean;
   /** The shell's tab can open; called at once, before the create returns. */
   onOpen?: (info: TerminalInfo) => void;
@@ -378,6 +392,7 @@ export function useCreateTerminal(conversationId: string) {
             request.terminal,
             request.sessionKey ?? newTerminalSessionKey(),
             request.elevated,
+            request.agentTier,
           ),
     // A shell the user closed while its create was in flight stays closed.
     onSuccess: (info) => {
@@ -404,7 +419,12 @@ export function useCreateTerminal(conversationId: string) {
     addToCache(predicted);
     callbacks.onOpen?.(predicted);
     mutation
-      .mutateAsync({ terminal, sessionKey, elevated: callbacks.elevated })
+      .mutateAsync({
+        terminal,
+        sessionKey,
+        elevated: callbacks.elevated,
+        agentTier: callbacks.agentTier,
+      })
       .then((info) => {
         if (isClosedDuringLaunch(predicted.id)) {
           // Closed before the create returned: the DELETE was deferred to now.
@@ -451,23 +471,37 @@ export function useTerminalAgentAccess(conversationId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     onMutate: () => queryClient.cancelQueries({ queryKey: terminalsQueryKey(conversationId) }),
-    mutationFn: async (target: { terminalId: string; instanceId: string; enabled: boolean }) => {
+    mutationFn: async (target: {
+      terminalId: string;
+      instanceId: string;
+      enabled?: boolean;
+      tier?: AgentTier;
+      hostId?: string;
+      hostTerminalId?: string;
+    }) => {
       const response = await authenticatedFetch(
-        `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals/${encodeURIComponent(target.terminalId)}`,
+        target.hostId
+          ? `${linkedTerminalsPath(conversationId)}/${encodeURIComponent(target.hostId)}/${encodeURIComponent(target.hostTerminalId!)}`
+          : `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals/${encodeURIComponent(target.terminalId)}`,
         {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ agent_access: target.enabled, instance_id: target.instanceId }),
+          body: JSON.stringify({
+            ...(target.tier ? { agent_tier: target.tier } : { agent_access: target.enabled }),
+            instance_id: target.instanceId,
+          }),
         },
       );
       if (!response.ok) throw await apiErrorFromResponse(response);
-      const info = terminalInfoFromResource(await response.json());
+      const body = await response.json();
+      const info = target.hostId
+        ? linkedTerminalInfo({ ...body, host_id: target.hostId } as LinkedTerminal)
+        : terminalInfoFromResource(body);
       if (
         !info ||
         info.id !== target.terminalId ||
         info.instanceId !== target.instanceId ||
-        !info.elevated ||
-        info.agentAccess !== target.enabled
+        (target.tier ? info.agentTier !== target.tier : info.agentAccess !== target.enabled)
       ) {
         throw new Error("The terminal instance changed. Refresh and try again.");
       }
@@ -475,14 +509,21 @@ export function useTerminalAgentAccess(conversationId: string) {
     },
     retry: false,
     onSuccess: (info) => {
-      queryClient.setQueryData<TerminalInfo[]>(terminalsQueryKey(conversationId), (current) =>
-        current?.map((terminal) =>
-          terminal.id === info.id && terminal.instanceId === info.instanceId ? info : terminal,
-        ),
+      queryClient.setQueryData<TerminalInfo[]>(
+        info.hostId ? linkedTerminalsKey(conversationId) : terminalsQueryKey(conversationId),
+        (current) =>
+          current?.map((terminal) =>
+            terminal.id === info.id && terminal.instanceId === info.instanceId
+              ? { ...terminal, ...info, hostName: info.hostName ?? terminal.hostName }
+              : terminal,
+          ),
       );
     },
     onSettled: () =>
-      void queryClient.invalidateQueries({ queryKey: terminalsQueryKey(conversationId) }),
+      void Promise.all([
+        queryClient.invalidateQueries({ queryKey: terminalsQueryKey(conversationId) }),
+        queryClient.invalidateQueries({ queryKey: linkedTerminalsKey(conversationId) }),
+      ]),
   });
 }
 
@@ -502,8 +543,11 @@ export function useTerminalAgentAccess(conversationId: string) {
  *     success — the goal state, "no such terminal", already holds).
  */
 export async function deleteTerminal(conversationId: string, terminalId: string): Promise<void> {
+  const target = linkedTerminalTarget(terminalId);
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals/${encodeURIComponent(terminalId)}`,
+    target
+      ? `${linkedTerminalsPath(conversationId)}/${encodeURIComponent(target.hostId)}/${target.terminalId}`
+      : `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals/${encodeURIComponent(terminalId)}`,
     { method: "DELETE" },
   );
   if (!res.ok && res.status !== 404) {
@@ -532,7 +576,9 @@ export function useDeleteTerminal(conversationId: string) {
       await deleteTerminal(conversationId, terminalId);
     },
     onSuccess: (_result, terminalId) => {
-      const key = terminalsQueryKey(conversationId);
+      const key = linkedTerminalTarget(terminalId)
+        ? linkedTerminalsKey(conversationId)
+        : terminalsQueryKey(conversationId);
       const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
       queryClient.setQueryData<TerminalInfo[]>(
         key,
@@ -581,6 +627,7 @@ export function useTerminals(
   // hits `/v1/sessions/temp:*/resources/terminals`, by construction.
   const conversationId = isTempConvId(rawConversationId) ? null : rawConversationId;
   const queryClient = useQueryClient();
+  const linked = useLinkedTerminals(conversationId);
   const reconcileWhilePending = options?.reconcileWhilePending ?? false;
   // The terminal list is SSE-primary: live `session.resource.{created,deleted}`
   // deltas (plus the mount seed) ARE the list, so a terminal becomes openable
@@ -678,7 +725,7 @@ export function useTerminals(
   return {
     // SSE-primary: the list is whatever the cache holds (seed + live deltas,
     // corrected on poll edges above). No continuous runner-online mask.
-    terminals: data ?? [],
+    terminals: [...(data ?? []), ...(linked.data ?? [])],
     isLoading,
     isFetching,
     listCompleteAt: conversationId === null ? 0 : (completeTerminalListAt.get(conversationId) ?? 0),

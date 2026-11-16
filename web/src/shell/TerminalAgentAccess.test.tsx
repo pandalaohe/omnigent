@@ -60,6 +60,39 @@ beforeEach(() => {
   vi.mocked(authenticatedFetch).mockReset();
 });
 afterEach(cleanup);
+it("lets an owner lower an ordinary shell to Read without a confirmation", async () => {
+  const terminal: TerminalInfo = { ...root, elevated: false, agentTier: "read_write" };
+  vi.mocked(authenticatedFetch).mockResolvedValue(
+    Response.json({
+      ...resource("instance-a", false),
+      metadata: { ...resource("instance-a", false).metadata, elevated: false, agent_tier: "read" },
+    }),
+  );
+  const view = mount(terminal);
+  expect(screen.queryByRole("switch")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Read" }));
+  await waitFor(() =>
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      "/v1/sessions/session-a/resources/terminals/terminal_shell_key",
+      expect.objectContaining({
+        method: "PATCH",
+        body: '{"agent_tier":"read","instance_id":"instance-a"}',
+      }),
+    ),
+  );
+  expect(screen.queryByRole("dialog")).toBeNull();
+  view.dispose();
+});
+
+it("shows administrator command access inline at Read & write", () => {
+  const view = mount({ ...root, agentTier: "read_write" });
+  expect(
+    screen.getByText("The agent can run administrator commands in this terminal."),
+  ).toBeInTheDocument();
+  expect(screen.queryByRole("dialog")).toBeNull();
+  view.dispose();
+});
+
 it("starts off and sends the exact instance only after explicit confirmation", async () => {
   vi.mocked(authenticatedFetch).mockResolvedValue(Response.json(resource("instance-a", true)));
   const view = mount();

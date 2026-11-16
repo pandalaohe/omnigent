@@ -10398,6 +10398,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         activeResponse: null,
       });
       return;
+    case "session_resource_changed":
+      void queryClient?.invalidateQueries({
+        queryKey: ["conversation", event.sessionId, "host-terminals"],
+      });
+      return;
     case "session_resource_created":
       if (event.resource.type === "terminal") {
         applyTerminalCreated(event.resource as unknown as Record<string, unknown>);
