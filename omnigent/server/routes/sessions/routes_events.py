@@ -4321,16 +4321,21 @@ def register_events_routes(
                     receipt = observed.receipt
                     # Historical receipts remain useful for transcript reconciliation,
                     # but only the currently accepted execution can change route health.
-                    if control is not None and (
-                        receipt.target_id,
-                        receipt.input_id,
-                        receipt.turn_id,
-                        receipt.input_generation,
-                    ) == (
-                        session_id,
-                        control.input_id,
-                        control.turn_id,
-                        control.generation,
+                    if (
+                        (status == "running" or native_terminal_generation_is_current(conv, data))
+                        and control is not None
+                        and (
+                            receipt.target_id,
+                            receipt.input_id,
+                            receipt.turn_id,
+                            receipt.input_generation,
+                        )
+                        == (
+                            session_id,
+                            control.input_id,
+                            control.turn_id,
+                            control.generation,
+                        )
                     ):
                         provider_input_generation = receipt.input_generation
             # Forward only the same bounded, typed display detail that the

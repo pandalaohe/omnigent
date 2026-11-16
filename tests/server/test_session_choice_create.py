@@ -1636,7 +1636,8 @@ async def test_owner_billing_report_cannot_stop_provider(quota_runner):
 
 
 @pytest.mark.asyncio
-async def test_codex_success_keeps_route_healthy_after_delayed_old_failure(quota_runner):
+async def test_codex_success_keeps_route_healthy_after_delayed_old_failure(quota_runner, tmp_path):
+    from omnigent.harnesses.codex_native import bridge
     from omnigent.harnesses.codex_native import forwarder as fwd
     from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
     from omnigent.server.session_choice import state_for
@@ -1669,6 +1670,7 @@ async def test_codex_success_keeps_route_healthy_after_delayed_old_failure(quota
             input_id=f"input-{turn}",
             native_generation=generation,
             output="HTTP 403 balance billing is disabled for this key",
+            native_turn_generation=generation,
         )
 
     # This older execution's failure has not yet reached the server.
@@ -1677,12 +1679,25 @@ async def test_codex_success_keeps_route_healthy_after_delayed_old_failure(quota
     await fail("failure", 2)
     assert state.refusals
     await start("success", 3)
+    bridge.write_bridge_state(
+        tmp_path,
+        bridge.CodexNativeBridgeState(
+            session_id=sid,
+            socket_path="/opt/work/app.sock",
+            thread_id="thread",
+            codex_home=str(tmp_path / "home"),
+            active_turn_id="success",
+            active_turn_revision=5,
+        ),
+    )
     edge = fwd._terminal_turn_status_edge(
-        None, "turn/completed", {"turn": {"id": "success", "status": "completed"}}
+        tmp_path, "turn/completed", {"turn": {"id": "success", "status": "completed"}}
     )
     assert edge is not None
     # Use the actual Codex lifecycle producer, including its confirmed-success flag.
-    await fwd._post_turn_status_edge(env.client, sid, edge, input_id="input-success")
+    await fwd._post_turn_status_edge(
+        env.client, sid, edge, input_id="input-success", bridge_dir=tmp_path
+    )
     assert not state.refusals
     await fail("delayed", 1)
     assert not state.refusals
