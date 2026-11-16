@@ -20,6 +20,7 @@ interface ComboboxProps {
   options: readonly ComboboxOption[];
   value: string;
   onValueChange: (value: string) => void;
+  onOpenChange?: (open: boolean) => void;
   onPick?: (option: ComboboxOption) => void;
   placeholder?: string;
   "aria-label": string;
@@ -52,6 +53,7 @@ export function Combobox({
   options,
   value,
   onValueChange,
+  onOpenChange,
   onPick,
   placeholder,
   "aria-label": label,
@@ -64,6 +66,13 @@ export function Combobox({
     mode === "editable" ? value : (options.find((o) => o.key === value)?.label ?? "");
   const [typed, setTyped] = useState(selectedLabel);
   const [open, setOpen] = useState(autoOpen);
+  const reportedOpen = useRef(false);
+  useEffect(() => {
+    if (reportedOpen.current !== open) {
+      reportedOpen.current = open;
+      onOpenChange?.(open);
+    }
+  }, [open, onOpenChange]);
   const [active, setActive] = useState("");
   const [activeId, setActiveId] = useState<string>();
   const input = useRef<HTMLInputElement>(null);

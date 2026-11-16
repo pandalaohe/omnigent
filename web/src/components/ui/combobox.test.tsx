@@ -15,6 +15,7 @@ const options: ComboboxOption[] = [
 function setup(mode: "select" | "editable", initial = "", choices = options) {
   const change = vi.fn();
   const pick = vi.fn();
+  const openChange = vi.fn();
   function Example() {
     const [value, setValue] = useState(initial);
     return (
@@ -29,14 +30,63 @@ function setup(mode: "select" | "editable", initial = "", choices = options) {
             setValue(next);
           }}
           onPick={pick}
+          onOpenChange={openChange}
         />
         <button type="button">Outside</button>
       </>
     );
   }
   render(<Example />);
-  return { input: screen.getByRole("combobox"), change, pick, user: userEvent.setup() };
+  return { input: screen.getByRole("combobox"), change, pick, openChange, user: userEvent.setup() };
 }
+
+it.each(["select", "editable"] as const)(
+  "reports each open/close transition in %s mode",
+  async (mode) => {
+    const { input, user, openChange } = setup(mode);
+    expect(openChange).not.toHaveBeenCalled();
+    await user.click(input);
+    await user.click(input);
+    await user.keyboard("{Escape}");
+    await user.keyboard("{ArrowDown}{Escape}{ArrowUp}");
+    await user.click(screen.getByRole("button", { name: "Outside" }));
+    await user.click(input);
+    await user.click(screen.getByRole("option", { name: /Alpha/ }));
+    await user.clear(input);
+    await user.type(input, "draft");
+    await user.tab();
+    expect(openChange.mock.calls).toEqual([
+      [true],
+      [false],
+      [true],
+      [false],
+      [true],
+      [false],
+      [true],
+      [false],
+      [true],
+      [false],
+    ]);
+  },
+);
+
+it("reports an initially auto-opened list", async () => {
+  const openChange = vi.fn();
+  render(
+    <Combobox
+      mode="select"
+      options={options}
+      value=""
+      aria-label="Model"
+      autoOpen
+      onValueChange={vi.fn()}
+      onOpenChange={openChange}
+    />,
+  );
+  expect(openChange.mock.calls).toEqual([[true]]);
+  await userEvent.keyboard("{Escape}");
+  expect(openChange.mock.calls).toEqual([[true], [false]]);
+});
 
 it("owns open and closed ARIA, and selects through the portal without moving input focus", async () => {
   const { input, user, change, pick } = setup("select");
