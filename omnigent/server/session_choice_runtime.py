@@ -30,14 +30,12 @@ from omnigent.server.session_choice import (
     WorkType,
     active_on,
     candidate_lines,
-    catalog_model,
     check_candidate_limits,
     choice_revision,
     codex_route_pool,
     holds_slot,
     ordered_links,
     parse_session_choice,
-    pin_codex_link,
     pool_of,
     pool_of_session,
     quota_reset_at,
@@ -550,8 +548,6 @@ async def context_request(
             not link.model
             or link.agent_id in request.unavailable
             or link.model in request.models.get(link.agent_id, ())
-            or catalog_model(link.model, request.products.get(link.agent_id))
-            in request.models.get(link.agent_id, ())
         ):
             continue
         probe = Conversation(
@@ -1086,7 +1082,6 @@ async def admit_create(
                 409,
                 {"code": "session_choice_ask", "reason": "Choose a model for this Codex route"},
             )
-        link = pin_codex_link(link, product)
         choice = replace(choice, link=link)
         receipt = await asyncio.to_thread(
             limit_receipt, app, settings, revision, link, request, running, now

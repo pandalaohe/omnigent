@@ -428,24 +428,6 @@ def codex_route_pool(model: str | None, product: str | None) -> str | None:
     return {"official": "codex-pro", "krill": "krill", "ccs-krill": "krill"}.get(route)
 
 
-def catalog_model(model: str | None, product: str | None) -> str | None:
-    """Relay pins are accepted for launch but absent from its model catalog."""
-    if product == "codex" and model:
-        route, separator, name = model.partition("/")
-        if separator and name and route in {"official", "krill"}:
-            return name
-    return model
-
-
-def pin_codex_link(link: Link, product: str | None) -> Link:
-    """An explicit route meter pins a plain model; legacy provider IDs stay intact."""
-    if product == "codex" and link.model and "/" not in link.model:
-        route = {"codex-pro": "official", "krill": "krill"}.get(link.meter or "")
-        if route:
-            return link.model_copy(update={"model": f"{route}/{link.model}"})
-    return link
-
-
 def pool_of(link: Link, product: str | None) -> str:
     return (
         codex_route_pool(link.model, product)
@@ -499,6 +481,7 @@ def pool_of_session(
     model = model if model is not None else session.reported_model or session.model_override
     if product is None:
         return None
+    matches = []
     for link in ordered_links(settings):
         link_product = (products or {}).get(link.agent_id)
         if link_product is None:
@@ -506,8 +489,12 @@ def pool_of_session(
 
             link_product = agent_key_for_harness(link.agent_id)
         if link_product == product and link.model == model:
-            return pool_of(link, product)
-    return None
+            matches.append(link)
+    # Several agents can share one plain model, so the session's own link decides the pool.
+    own = next((link for link in matches if link.agent_id == session.agent_id), None)
+    if own is not None:
+        return pool_of(own, product)
+    return pool_of(matches[0], product) if matches else None
 
 
 def reserve_now(mode: str, pct: float, resets_at: float, now: float) -> float:
@@ -840,7 +827,7 @@ def resolved_link(link: Link, request: ChoiceRequest) -> Link:
         and link.meter in {"codex-pro", "krill"}
     ):
         link = link.model_copy(update={"model": request.default_models.get(link.agent_id)})
-    return pin_codex_link(link, request.products.get(link.agent_id))
+    return link
 
 
 @dataclass(frozen=True)
@@ -1073,7 +1060,7 @@ def choose(
         return Choice(
             "pick",
             work.id,
-            pin_codex_link(link, request.products.get(link.agent_id, link.agent_id)),
+            link,
             tier_index + 1,
             pool,
             "First eligible tier, weighted choice",
@@ -1099,9 +1086,7 @@ def choose(
         return Choice(
             "hold",
             work.id,
-            pin_codex_link(
-                first.link, request.products.get(first.link.agent_id, first.link.agent_id)
-            ),
+            first.link,
             tier,
             pool,
             first.why,
