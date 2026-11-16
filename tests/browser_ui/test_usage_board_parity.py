@@ -182,7 +182,7 @@ def test_usage_ranges_pools_and_navigation(
         regular:box('[data-account="plan-1"]'),wide:box('[data-account="plan-0"]'),
         tilesDisplay:style('.usage-tiles').display,gap:style('.usage-tiles').gap,
         minHeight:style('[data-account="plan-1"]').minHeight,
-        padding:style('.usage-board').paddingLeft,
+        padding:style('.usage-surface').paddingLeft,
         columns:style('.usage-tiles').gridTemplateColumns};
     }""")
     assert geometry["tilesDisplay"] == "grid"

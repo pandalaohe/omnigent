@@ -1,4 +1,4 @@
-"""Count, visibility, clipping and readable text at the usage-board boundary."""
+"""Count, visibility, clipping and readable text at the usage page boundary."""
 
 from playwright.sync_api import Page
 
@@ -18,7 +18,7 @@ USAGE_GEOMETRY = """expected => {
   const describe = el => `${el.tagName}.${el.className?.baseVal ?? el.className}: ` +
     el.textContent?.trim().slice(0, 80);
   // Only the Models table deliberately scrolls horizontally.
-  const horizontalScrollRegions = '.usage-board .overflow-x-auto:has(> table)';
+  const horizontalScrollRegions = '.usage-surface .overflow-x-auto:has(> table)';
   const verticalScroller = style => ['auto', 'scroll'].includes(style.overflowY);
   const horizontalScroller = (el, style) => el.matches(horizontalScrollRegions) &&
     ['auto', 'scroll'].includes(style.overflowX);
@@ -126,7 +126,7 @@ USAGE_GEOMETRY = """expected => {
         !['hidden', 'clip'].includes(style.overflowX))
       failures.push(`unbounded name: ${describe(el)}`);
     const card = el.closest('[data-testid="usage-tile"], [data-usage-window], ' +
-      '[data-testid="usage-tip-card"], .ua-panel, .usage-board');
+      '[data-testid="usage-tip-card"], .ua-panel, .usage-surface');
     if (card && !within(card, box, el))
       failures.push(`name outside card: ${describe(el)}`);
     clipping(el, box);
@@ -210,7 +210,7 @@ USAGE_GEOMETRY = """expected => {
       clipping(circle, painted);
     }
   }
-  const texts = '.usage-board :is(p, b, strong, label, button, a, small, span)';
+  const texts = '.usage-surface :is(p, b, strong, label, button, a, small, span)';
   for (const el of document.querySelectorAll(texts)) {
     if (!visible(el) || el.children.length || !el.textContent.trim() ||
         el.closest('[data-testid="usage-tip-card"]')) continue;
@@ -218,7 +218,7 @@ USAGE_GEOMETRY = """expected => {
     const style = getComputedStyle(el);
     if (parseFloat(style.fontSize) < 10) failures.push(`text below 10px: ${describe(el)}`);
     const card = el.closest('.usage-unit, [data-testid="usage-tile"], ' +
-      '.ua-panel, .ua-kpi, .usage-pricing, .usage-board');
+      '.ua-panel, .ua-kpi, .usage-pricing, .usage-surface');
     const ellipsis = ellipsized(el);
     for (const rect of ellipsis ? [el.getBoundingClientRect()] : textRects(el)) {
       if (card && !within(card, rect, el))

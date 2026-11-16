@@ -2,7 +2,7 @@
    amber and red are quota state; text steps down through three cool greys;
    other categories use one five-colour series set. Type steps follow the app's
    UI size. Numbers use tabular figures. */
-:is(.usage-board, .usage-palette) {
+:is(.usage-surface, .usage-palette) {
   --usage-ink: #0f141c;
   --usage-ink-2: #3a4454;
   --usage-ink-3: #566073;
@@ -33,7 +33,7 @@
   --usage-series-4: #e87ba4;
   --usage-series-5: #4a3aa7;
 }
-.dark :is(.usage-board, .usage-palette) {
+.dark :is(.usage-surface, .usage-palette) {
   --usage-ink: #eaeef4;
   --usage-ink-2: #b6becc;
   --usage-ink-3: #8e97a8;
@@ -61,7 +61,7 @@
   --usage-series-4: #d55181;
   --usage-series-5: #5243cc;
 }
-.usage-board {
+.usage-surface {
   /* Shared app roles follow the board palette inside the board. */
   --foreground: var(--usage-ink);
   --muted-foreground: var(--usage-ink-3);
@@ -98,7 +98,7 @@
   font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased;
 }
-.usage-board :is(button, a, summary):focus-visible {
+.usage-surface :is(button, a, summary):focus-visible {
   outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
@@ -993,7 +993,7 @@
 }
 
 @media (max-width: 599px) {
-  .usage-board {
+  .usage-surface {
     padding: 12px 12px 72px;
   }
   .usage-summary {
