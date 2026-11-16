@@ -18,7 +18,11 @@ import httpx
 import openai
 
 from omnigent.server.dictation import DictationTakeError, DictationUpdate
-from omnigent.server.model_connections import ResolvedConnection, resolve_connection
+from omnigent.server.model_connections import (
+    ResolvedConnection,
+    resolve_connection,
+    resolve_reference,
+)
 from omnigent.server.voice_input import CLEANUP_RULES, TRANSCRIPTION_RULES, VoiceInputSettings
 
 _ONE_STEP_OUTPUT = (
@@ -86,12 +90,80 @@ class HostedTranscriptionEngine:
 def engine_for_settings(settings: VoiceInputSettings) -> HostedTranscriptionEngine:
     return HostedTranscriptionEngine(
         resolve_connection(settings.speech_connection),
-        settings.speech_model,
+        resolve_reference(settings.speech_connection, settings.speech_row, settings.speech_model)[
+            1
+        ],
         settings.speech_method,
         settings.speech_instructions,
         settings.words,
         settings.instructions,
     )
+
+
+def transcribe_once(engine: HostedTranscriptionEngine, pcm: bytes) -> OneStepOutcome:
+    """Run the same bounded provider request used by a live speech segment."""
+    with openai.OpenAI(
+        base_url=engine.connection.base_url,
+        api_key=engine.connection.api_key,
+        max_retries=0,
+        http_client=httpx.Client(follow_redirects=False, timeout=10),
+    ) as client:
+        return _transcribe(engine, client, pcm, 10)
+
+
+def _transcribe(
+    engine: HostedTranscriptionEngine, client: openai.OpenAI, pcm: bytes, timeout: float
+) -> OneStepOutcome:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(pcm)
+    if engine.method == "transcription":
+        response = client.audio.transcriptions.create(
+            model=engine.model,
+            file=("segment.wav", buffer.getvalue(), "audio/wav"),
+            prompt=(engine.instructions + "\nWord list:\n" + engine.dictionary)[:800],
+            response_format="json",
+            timeout=timeout,
+        )
+        if not response.text.strip():
+            raise ValueError("Empty transcription")
+        return OneStepOutcome(response.text)
+    response = client.chat.completions.create(
+        model=engine.model,
+        temperature=0,
+        max_tokens=2048,
+        timeout=timeout,
+        messages=[
+            {
+                "role": "system",
+                "content": engine.instructions
+                + (
+                    "\nTranscribe the audio verbatim into raw, then edit that transcript "
+                    "under the rules below into text.\n"
+                )
+                + engine.cleanup_instructions
+                + "\n"
+                + _ONE_STEP_OUTPUT,
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": base64.b64encode(buffer.getvalue()).decode(),
+                            "format": "wav",
+                        },
+                    },
+                    {"type": "text", "text": json.dumps({"word_list": engine.dictionary})},
+                ],
+            },
+        ],
+    )
+    return parse_one_step(response.choices[0].message.content or "")
 
 
 class _HostedStream:
@@ -239,62 +311,12 @@ class _HostedStream:
         return {"segments": self.lost_segments, "seconds": round(self.lost_seconds, 2)}
 
     def _call(self, pcm: bytes) -> OneStepOutcome:
-        buffer = io.BytesIO()
-        with wave.open(buffer, "wb") as wav:
-            wav.setnchannels(1)
-            wav.setsampwidth(2)
-            wav.setframerate(16000)
-            wav.writeframes(pcm)
-        engine = self.engine
         timeout = (
             min(self.timeout, max(0.01, self.deadline - time.monotonic()))
             if self.deadline
             else self.timeout
         )
-        if engine.method == "transcription":
-            response = self.client.audio.transcriptions.create(
-                model=engine.model,
-                file=("segment.wav", buffer.getvalue(), "audio/wav"),
-                prompt=(engine.instructions + "\nWord list:\n" + engine.dictionary)[:800],
-                response_format="json",
-                timeout=timeout,
-            )
-            if not response.text.strip():
-                raise ValueError("Empty transcription")
-            return OneStepOutcome(response.text)
-        response = self.client.chat.completions.create(
-            model=engine.model,
-            temperature=0,
-            max_tokens=2048,
-            timeout=timeout,
-            messages=[
-                {
-                    "role": "system",
-                    "content": engine.instructions
-                    + (
-                        "\nTranscribe the audio verbatim into raw, then edit that transcript "
-                        "under the rules below into text.\n"
-                    )
-                    + engine.cleanup_instructions
-                    + "\n"
-                    + _ONE_STEP_OUTPUT,
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_audio",
-                            "input_audio": {
-                                "data": base64.b64encode(buffer.getvalue()).decode(),
-                                "format": "wav",
-                            },
-                        },
-                        {"type": "text", "text": json.dumps({"word_list": engine.dictionary})},
-                    ],
-                },
-            ],
-        )
-        return parse_one_step(response.choices[0].message.content or "")
+        return _transcribe(self.engine, self.client, pcm, timeout)
 
     def _run(self) -> None:
         while True:

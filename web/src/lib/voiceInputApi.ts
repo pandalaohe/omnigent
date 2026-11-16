@@ -17,9 +17,11 @@ export interface VoiceInputSettings {
   speech_source: "browser" | "server" | "third";
   speech_connection: string;
   speech_model: string;
+  speech_row: string;
   speech_method: "transcription" | "chat_audio";
   speech_instructions: string;
   cleanup_connection: string;
+  cleanup_row: string;
   instructions: string;
   words: string;
   mode: "automatic" | "manual" | "off";
@@ -34,9 +36,11 @@ export const defaultVoiceInputSettings: VoiceInputSettings = {
   speech_source: "browser",
   speech_connection: "",
   speech_model: "",
+  speech_row: "",
   speech_method: "transcription",
   speech_instructions: defaultTranscriptionInstructions,
   cleanup_connection: "server-llm",
+  cleanup_row: "",
   instructions: defaultCleanupInstructions,
   words: "",
   mode: "automatic",
@@ -84,5 +88,20 @@ export function cleanupDictation(text: string, signal: AbortSignal): Promise<{ t
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text }),
     signal,
+  });
+}
+
+export type VoiceTestKind =
+  "ok" | "wrong_type" | "key_rejected" | "unreachable" | "gone" | "timeout" | "rejected";
+export function testVoiceModel(choice: {
+  slot: "speech" | "cleanup";
+  connection: string;
+  row: string;
+  method?: string;
+}): Promise<{ ok: boolean; kind: VoiceTestKind; text: string; elapsed_ms: number }> {
+  return voiceRequest("/v1/dictation/test", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(choice),
   });
 }

@@ -11,7 +11,9 @@ from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.default_policies import _require_admin
 
 
-def create_model_connections_router(auth_provider=None, permission_store=None) -> APIRouter:
+def create_model_connections_router(
+    auth_provider=None, permission_store=None, user_preferences_store=None
+) -> APIRouter:
     router = APIRouter()
 
     async def admin(request: Request) -> None:
@@ -38,9 +40,11 @@ def create_model_connections_router(auth_provider=None, permission_store=None) -
             # No input, exception text or context: these may contain submitted credentials.
             raise HTTPException(422, "Invalid provider configuration") from None
 
-    async def safe_call(function, *args):
+    async def safe_call(function, *args, **kwargs):
         try:
-            return await asyncio.to_thread(function, *args)
+            return await asyncio.to_thread(function, *args, **kwargs)
+        except connections.ConnectionConflict as exc:
+            raise HTTPException(409, exc.detail) from None
         except Exception:  # noqa: BLE001 - redact provider and credential failures
             raise HTTPException(422, "Provider configuration unavailable") from None
 
@@ -53,7 +57,9 @@ def create_model_connections_router(auth_provider=None, permission_store=None) -
             and await asyncio.to_thread(permission_store.is_admin, owner)
         )
         return {
-            "connections": await asyncio.to_thread(connections.load_connections, admin=is_admin),
+            "connections": await asyncio.to_thread(
+                connections.load_connections, admin=is_admin, store=user_preferences_store
+            ),
             "can_manage": is_admin,
         }
 
@@ -64,15 +70,27 @@ def create_model_connections_router(auth_provider=None, permission_store=None) -
         return await safe_call(connections.probe_connection, name, value)
 
     @router.put("/model-connections/{name}")
-    async def put(name: str, request: Request):
+    async def put(name: str, request: Request, create: bool = False):
         await admin(request)
         _, value = await draft(request)
-        return await safe_call(connections.upsert_connection, name, value)
+        return await safe_call(
+            connections.upsert_connection, name, value, store=user_preferences_store, create=create
+        )
+
+    @router.post("/model-connections/{name}/refresh")
+    async def refresh(name: str, request: Request):
+        await admin(request)
+        return await safe_call(connections.refresh_catalog, name, store=user_preferences_store)
+
+    @router.get("/model-connections/{name}/catalog")
+    async def catalog(name: str, request: Request):
+        await admin(request)
+        return await safe_call(connections.catalog, name)
 
     @router.delete("/model-connections/{name}", status_code=204)
     async def delete(name: str, request: Request):
         await admin(request)
-        await safe_call(connections.delete_connection, name)
+        await safe_call(connections.delete_connection, name, store=user_preferences_store)
         return Response(status_code=204)
 
     return router

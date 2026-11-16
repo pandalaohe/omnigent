@@ -1,0 +1,1 @@
+The sentence "Testing voice input today." was authored for this feature and synthesized locally with the eSpeak JavaScript port (kripken/speak.js, revision 9c6f642f7d78bab51d16b2e8b79cdf205643ec35), speed 160, default US English voice. The WAV contains no recorded speaker or third-party text. Resampled to mono 16 kHz PCM16 for the production transcription request.

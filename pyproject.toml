@@ -482,7 +482,7 @@ include = ["omnigent*"]
 "omnigent.resources.scripts" = ["*.sh"]
 # include UI assets in build, plus the static API-only landing page served
 # at "/" when no web UI bundle is present
-"omnigent.server" = ["static/web-ui/**/*", "static/api_only_landing.html"]
+"omnigent.server" = ["static/web-ui/**/*", "static/api_only_landing.html", "assets/*.wav", "assets/*.txt"]
 
 [tool.pytest.ini_options]
 # auto mode: async tests without @pytest.mark.asyncio() are auto-

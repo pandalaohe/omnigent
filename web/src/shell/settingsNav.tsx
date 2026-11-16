@@ -54,6 +54,7 @@ export type SettingsSectionId =
   | "archived"
   | "cli"
   | "updates"
+  | "model-providers"
   | "browser";
 
 const SECTION_IDS: readonly SettingsSectionId[] = [
@@ -75,6 +76,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "archived",
   "cli",
   "updates",
+  "model-providers",
   "browser",
 ];
 
@@ -176,6 +178,7 @@ export function settingsNavGroups(
     adminItems.push({ id: "admin", label: "General", icon: SettingsIcon });
   }
   if (isAdmin) {
+    adminItems.push({ id: "model-providers", label: "Model providers", icon: PlugIcon });
     // Members (manage other accounts) and Sharing (grant sessions to other
     // users) have no meaning in single-user mode — there are no other users —
     // so drop both from the nav there. Policies stays: global policies apply

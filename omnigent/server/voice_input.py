@@ -15,9 +15,11 @@ class VoiceInputSettings(BaseModel):
     speech_source: Literal["browser", "server", "third"] = "browser"
     speech_connection: str = Field(default="", max_length=48)
     speech_model: str = Field(default="", max_length=200)
+    speech_row: str = Field(default="", max_length=200)
     speech_method: Literal["transcription", "chat_audio"] = "transcription"
     speech_instructions: str = Field(default="", max_length=4000)
     cleanup_connection: str = Field(default="server-llm", max_length=48)
+    cleanup_row: str = Field(default="", max_length=200)
     words: str = Field(default="", max_length=8000)
     mode: Literal["automatic", "manual", "off"] = "automatic"
     model: str = Field(default="", max_length=200)

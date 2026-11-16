@@ -6,10 +6,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
+import openai
 import pytest
 from fastapi import FastAPI
 
 from omnigent.errors import OmnigentError
+from omnigent.server import dictation_hosted, model_connections
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.routes import voice_input
 from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
@@ -97,6 +99,156 @@ def app_for(
         prefix="/v1",
     )
     return app
+
+
+@pytest.fixture()
+def model_provider(tmp_path, monkeypatch):
+    monkeypatch.setattr(model_connections, "resolve_data_dir", lambda: tmp_path)
+    monkeypatch.setenv("EXAMPLE_PROVIDER_KEY", "fake-key")
+    model_connections.upsert_connection(
+        "example",
+        model_connections.ConnectionWrite(
+            base_url="https://provider.example/v1",
+            models={"row": "current-model"},
+            key=model_connections.KeyEnvironment(env="EXAMPLE_PROVIDER_KEY"),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "status,payload,kind",
+    [
+        (200, {"text": "Testing voice input today."}, "ok"),
+        (200, {"text": ""}, "rejected"),
+        (200, {"other": "provider-private-data"}, "rejected"),
+        (401, {"error": "provider-private-data"}, "key_rejected"),
+        (403, {"error": "provider-private-data"}, "key_rejected"),
+        (400, {"error": "provider-private-data"}, "wrong_type"),
+        (404, {"error": "provider-private-data"}, "wrong_type"),
+        (422, {"error": "provider-private-data"}, "wrong_type"),
+        (429, {"error": "provider-private-data"}, "rejected"),
+        (500, {"error": "provider-private-data"}, "rejected"),
+    ],
+)
+async def test_speech_test_calls_unsaved_row_with_production_validation(
+    voice_store,
+    llm,
+    model_provider,
+    monkeypatch,
+    status,
+    payload,
+    kind,
+):
+    calls = []
+    original = openai.OpenAI
+
+    def handle(request):
+        calls.append(request)
+        assert request.url.path == "/v1/audio/transcriptions"
+        assert b"current-model" in request.content and b"RIFF" in request.content
+        return httpx.Response(status, json=payload)
+
+    def create(**options):
+        options.pop("http_client").close()
+        return original(**options, http_client=httpx.Client(transport=httpx.MockTransport(handle)))
+
+    monkeypatch.setattr(dictation_hosted.openai, "OpenAI", create)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_for(voice_store, llm)), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/dictation/test", json={"slot": "speech", "connection": "example", "row": "row"}
+        )
+    assert response.status_code == 200
+    assert response.json()["kind"] == kind
+    assert response.json()["ok"] == (kind == "ok")
+    assert "provider-private-data" not in response.text and "fake-key" not in response.text
+    assert len(calls) == 1
+    assert voice_store.get("local") is None
+
+
+@pytest.mark.parametrize(
+    "failure,kind",
+    [(httpx.ConnectError("private"), "unreachable"), (httpx.ReadTimeout("private"), "timeout")],
+)
+async def test_speech_test_connection_failures(
+    voice_store, llm, model_provider, monkeypatch, failure, kind
+):
+    original = openai.OpenAI
+
+    def fail(request):
+        raise failure
+
+    def create(**options):
+        options.pop("http_client").close()
+        return original(**options, http_client=httpx.Client(transport=httpx.MockTransport(fail)))
+
+    monkeypatch.setattr(dictation_hosted.openai, "OpenAI", create)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_for(voice_store, llm)), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/dictation/test", json={"slot": "speech", "connection": "example", "row": "row"}
+        )
+    assert response.json()["kind"] == kind
+    assert "private" not in response.text
+
+
+@pytest.mark.parametrize(
+    "content,kind",
+    [
+        ('{"complete":true,"text":"Usable."}', "ok"),
+        ('{"complete":false,"text":"Partial"}', "rejected"),
+        ('{"complete":true,"text":" "}', "rejected"),
+        ("private-response", "rejected"),
+    ],
+)
+async def test_cleanup_test_uses_production_json_contract(
+    voice_store, llm, model_provider, content, kind
+):
+    llm.responses.create.return_value.output[0].content[0].text = content
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_for(voice_store, llm)), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/dictation/test", json={"slot": "cleanup", "connection": "example", "row": "row"}
+        )
+    assert response.json()["kind"] == kind
+    assert llm.responses.create.call_args.kwargs["model"] == "openai-compatible/current-model"
+    assert "private-response" not in response.text
+
+
+async def test_cleanup_follows_row_and_missing_row_keeps_legacy(voice_store, llm, model_provider):
+    save_settings(
+        voice_store,
+        VoiceInputSettings(
+            cleanup_connection="example", cleanup_row="row", model="legacy"
+        ).model_dump(),
+        user_id=None,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_for(voice_store, llm)), base_url="http://test"
+    ) as client:
+        assert (
+            await client.post("/v1/dictation/cleanup", json={"text": "raw"})
+        ).status_code == 200
+        assert llm.responses.create.call_args.kwargs["model"] == "openai-compatible/current-model"
+        save_settings(
+            voice_store,
+            VoiceInputSettings(
+                cleanup_connection="example", cleanup_row="missing", model="legacy"
+            ).model_dump(),
+            user_id=None,
+        )
+        assert (
+            await client.post("/v1/dictation/cleanup", json={"text": "raw"})
+        ).status_code == 200
+        assert llm.responses.create.call_args.kwargs["model"] == "openai-compatible/legacy"
+        response = await client.post(
+            "/v1/dictation/test",
+            json={"slot": "cleanup", "connection": "example", "row": "missing"},
+        )
+        assert response.json()["kind"] == "gone"
 
 
 async def test_only_segment_and_saved_list_are_sent(

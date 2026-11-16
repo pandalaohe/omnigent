@@ -3,8 +3,10 @@ import {
   listModelConnections,
   MODEL_CONNECTIONS_CHANGED,
   type ModelConnection,
+  type ModelRow,
 } from "@/lib/modelConnectionsApi";
 import { Button } from "@/components/ui/button";
+import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { Textarea } from "@/components/ui/textarea";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -20,6 +22,7 @@ import {
   defaultTranscriptionInstructions,
   getVoiceInputSettings,
   saveVoiceInputSettings,
+  testVoiceModel,
 } from "@/lib/voiceInputApi";
 
 const rowClass = "grid min-w-0 grid-cols-[7rem_minmax(0,1fr)] items-center gap-x-3 gap-y-2 text-ui";
@@ -44,28 +47,45 @@ function SettingsSelect({
   return (
     <div className={rowClass}>
       <label htmlFor={id}>{label}</label>
-      <Select
-        value={value || "__empty"}
-        onValueChange={(selectedValue) =>
-          onChange(selectedValue === "__empty" ? "" : selectedValue)
-        }
-        disabled={disabled}
-      >
-        <SelectTrigger id={id} aria-label={name} className={controlClass}>
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent position="popper" align="start">
-          {options.map((option) => (
-            <SelectItem
-              key={option.value || "__empty"}
-              value={option.value || "__empty"}
-              disabled={option.disabled}
-            >
-              {option.label}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
+      {options.length > COMBOBOX_OPTION_THRESHOLD ? (
+        <fieldset disabled={disabled} className={controlClass}>
+          <Combobox
+            mode="select"
+            options={options.map((option) => ({
+              key: option.value || "__empty",
+              label: option.label,
+              disabled: option.disabled,
+            }))}
+            value={value || "__empty"}
+            aria-label={name}
+            className={controlClass}
+            onValueChange={(next) => onChange(next === "__empty" ? "" : next)}
+          />
+        </fieldset>
+      ) : (
+        <Select
+          value={value || "__empty"}
+          onValueChange={(selectedValue) =>
+            onChange(selectedValue === "__empty" ? "" : selectedValue)
+          }
+          disabled={disabled}
+        >
+          <SelectTrigger id={id} aria-label={name} className={controlClass}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent position="popper" align="start">
+            {options.map((option) => (
+              <SelectItem
+                key={option.value || "__empty"}
+                value={option.value || "__empty"}
+                disabled={option.disabled}
+              >
+                {option.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      )}
     </div>
   );
 }
@@ -74,51 +94,51 @@ function ModelPicker({
   label,
   name,
   value,
+  rowKey,
   models,
   onChange,
   disabled,
+  previous,
 }: {
   label: string;
   name: string;
   value: string;
-  models: string[];
-  onChange: (value: string) => void;
+  rowKey: string;
+  models: ModelRow[];
+  previous?: Record<string, string[]>;
+  onChange: (value: string, key: string) => void;
   disabled: boolean;
 }) {
-  const [custom, setCustom] = useState(false);
-  const known = [...new Set(models)];
-  const index = known.indexOf(value);
-  const useCustom = custom || (!!value && index === -1);
+  const selected = rowKey
+    ? models.find((row) => row.key === rowKey)
+    : (models.find((row) => row.model_id === value) ??
+      models.find((row) => previous?.[row.key]?.includes(value)));
   return (
     <div className="flex min-w-0 flex-col gap-2">
       <SettingsSelect
         label={label}
         name={name}
         disabled={disabled}
-        value={useCustom ? "custom" : index >= 0 ? `model-${index}` : "none"}
+        value={selected?.key ?? "none"}
         options={[
           { value: "none", label: "Select model" },
-          ...known.map((model, i) => ({ value: `model-${i}`, label: model })),
-          { value: "custom", label: "Custom model ID…" },
+          ...models.map((row) => ({ value: row.key, label: row.display_name })),
         ]}
-        onChange={(selected) => {
-          setCustom(selected === "custom");
-          if (selected !== "custom")
-            onChange(selected === "none" ? "" : known[Number(selected.slice(6))]);
+        onChange={(selectedKey) => {
+          const row = models.find((item) => item.key === selectedKey);
+          onChange(row?.model_id ?? "", row?.key ?? "");
         }}
       />
-      {useCustom && (
-        <label className={rowClass}>
-          Custom model ID
-          <input
-            className={`${controlClass} rounded-lg border border-input bg-background px-2.5 py-2`}
-            aria-label={`${label} custom model ID`}
-            disabled={disabled}
-            value={value}
-            maxLength={200}
-            onChange={(event) => onChange(event.target.value)}
-          />
-        </label>
+      {!selected && !!value && (
+        <p className="text-sm text-amber-600">
+          Pick the model again. The saved model is no longer in this provider's table.
+        </p>
+      )}
+      {selected?.status === "gone" && (
+        <p className="text-sm text-amber-600">
+          {selected.model_id} is no longer listed by this provider. Pick another model or ask an
+          administrator.
+        </p>
       )}
     </div>
   );
@@ -130,6 +150,45 @@ export function VoiceInputSettings() {
   const [notice, setNotice] = useState("");
   const [connections, setConnections] = useState<ModelConnection[]>([]);
   const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState<"speech" | "cleanup" | null>(null);
+  const [testResults, setTestResults] = useState({ speech: "", cleanup: "" });
+
+  const clearTestResult = (slot: "speech" | "cleanup") =>
+    setTestResults((results) => ({ ...results, [slot]: "" }));
+
+  async function test(slot: "speech" | "cleanup") {
+    const providerName = slot === "speech" ? draft.speech_connection : draft.cleanup_connection;
+    const provider = connections.find((item) => item.name === providerName);
+    const key = slot === "speech" ? draft.speech_row : draft.cleanup_row;
+    const model = slot === "speech" ? draft.speech_model : draft.model;
+    const row = key
+      ? provider?.models.find((item) => item.key === key)
+      : provider?.models.find(
+          (item) =>
+            item.model_id === model || provider.model_previous_ids?.[item.key]?.includes(model),
+        );
+    if (!row) {
+      setTestResults((results) => ({ ...results, [slot]: "Pick the model again before testing." }));
+      return;
+    }
+    setTesting(slot);
+    try {
+      const result = await testVoiceModel({
+        slot,
+        connection: providerName,
+        row: row.key,
+        method: draft.speech_method,
+      });
+      setTestResults((results) => ({ ...results, [slot]: result.text }));
+    } catch {
+      setTestResults((results) => ({
+        ...results,
+        [slot]: "The test could not finish. Try again.",
+      }));
+    } finally {
+      setTesting(null);
+    }
+  }
 
   useEffect(() => {
     let mounted = true;
@@ -160,7 +219,24 @@ export function VoiceInputSettings() {
   const save = async () => {
     setSaving(true);
     try {
-      const value = await saveVoiceInputSettings(draft);
+      const resolve = (connection: string, key: string, legacy: string) => {
+        const provider = connections.find((item) => item.name === connection);
+        return key
+          ? provider?.models.find((row) => row.key === key)
+          : (provider?.models.find((row) => row.model_id === legacy) ??
+              provider?.models.find((row) =>
+                provider.model_previous_ids?.[row.key]?.includes(legacy),
+              ));
+      };
+      const speech = resolve(draft.speech_connection, draft.speech_row, draft.speech_model);
+      const cleanup = resolve(draft.cleanup_connection, draft.cleanup_row, draft.model);
+      const value = await saveVoiceInputSettings({
+        ...draft,
+        speech_row: speech?.key ?? draft.speech_row,
+        speech_model: speech?.model_id ?? draft.speech_model,
+        cleanup_row: cleanup?.key ?? draft.cleanup_row,
+        model: cleanup?.model_id ?? draft.model,
+      });
       setDraft(value);
       setNotice("Voice settings saved");
     } catch (error) {
@@ -175,7 +251,7 @@ export function VoiceInputSettings() {
   );
   const audioChatAvailable = speechProvider?.wire_api === "chat";
   const oneStep = draft.speech_source === "third" && draft.speech_method === "chat_audio";
-  const disabled = !ready || saving;
+  const disabled = !ready || saving || !!testing;
 
   return (
     <fieldset disabled={disabled} className="flex min-w-0 flex-col gap-3">
@@ -209,25 +285,33 @@ export function VoiceInputSettings() {
                     label: connection.display_name,
                   })),
               ]}
-              onChange={(value) =>
+              onChange={(value) => {
+                clearTestResult("speech");
                 setDraft({
                   ...draft,
                   speech_connection: value,
+                  speech_row: "",
+                  speech_model: "",
                   speech_method:
                     connections.find((connection) => connection.name === value)?.wire_api === "chat"
                       ? draft.speech_method
                       : "transcription",
-                })
-              }
+                });
+              }}
             />
             <ModelPicker
               key={`speech-${draft.speech_connection}`}
               label="Speech model"
               name="Speech model"
               value={draft.speech_model}
+              rowKey={draft.speech_row}
+              previous={speechProvider?.model_previous_ids}
               models={speechProvider?.models ?? []}
               disabled={disabled}
-              onChange={(value) => setDraft({ ...draft, speech_model: value })}
+              onChange={(value, key) => {
+                clearTestResult("speech");
+                setDraft({ ...draft, speech_model: value, speech_row: key });
+              }}
             />
             <SettingsSelect
               label="Speech API"
@@ -240,10 +324,24 @@ export function VoiceInputSettings() {
                   ? [{ value: "chat_audio", label: "Audio chat + cleanup" }]
                   : []),
               ]}
-              onChange={(value) =>
-                setDraft({ ...draft, speech_method: value as typeof draft.speech_method })
-              }
+              onChange={(value) => {
+                clearTestResult("speech");
+                setDraft({ ...draft, speech_method: value as typeof draft.speech_method });
+              }}
             />
+            <div className="flex items-center gap-3">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={disabled}
+                onClick={() => void test("speech")}
+              >
+                {testing === "speech" ? "Testing…" : "Test"}
+              </Button>
+              <span role="status" className="text-sm text-muted-foreground">
+                {testResults.speech}
+              </span>
+            </div>
             {audioChatAvailable && (
               <label className="flex min-w-0 items-center justify-between gap-3 text-ui">
                 <span>
@@ -256,9 +354,13 @@ export function VoiceInputSettings() {
                   aria-label="Also clean up in the same request"
                   checked={oneStep}
                   disabled={disabled}
-                  onCheckedChange={(checked) =>
-                    setDraft({ ...draft, speech_method: checked ? "chat_audio" : "transcription" })
-                  }
+                  onCheckedChange={(checked) => {
+                    clearTestResult("speech");
+                    setDraft({
+                      ...draft,
+                      speech_method: checked ? "chat_audio" : "transcription",
+                    });
+                  }}
                 />
               </label>
             )}
@@ -327,30 +429,58 @@ export function VoiceInputSettings() {
         Only newly dictated text and your word list go to the configured text provider. Restore the
         original with your device’s Undo command where supported.
       </p>
-      <SettingsSelect
-        label="Cleanup provider"
-        value={draft.cleanup_connection}
-        disabled={disabled || oneStep}
-        options={[
-          { value: "server-llm", label: "Server LLM (configuration file)" },
-          ...connections
-            .filter((connection) => connection.name !== "server-llm")
-            .map((connection) => ({ value: connection.name, label: connection.display_name })),
-        ]}
-        onChange={(value) => setDraft({ ...draft, cleanup_connection: value })}
-      />
-      <ModelPicker
-        key={`cleanup-${draft.cleanup_connection}`}
-        label="Cleanup model"
-        name="Voice cleanup model"
-        value={draft.model}
-        models={
-          connections.find((connection) => connection.name === draft.cleanup_connection)?.models ??
-          []
-        }
-        disabled={disabled || oneStep}
-        onChange={(value) => setDraft({ ...draft, model: value })}
-      />
+      {!oneStep && (
+        <>
+          <SettingsSelect
+            label="Cleanup provider"
+            value={draft.cleanup_connection}
+            disabled={disabled || oneStep}
+            options={[
+              { value: "server-llm", label: "Server LLM (configuration file)" },
+              ...connections
+                .filter((connection) => connection.name !== "server-llm")
+                .map((connection) => ({ value: connection.name, label: connection.display_name })),
+            ]}
+            onChange={(value) => {
+              clearTestResult("cleanup");
+              setDraft({ ...draft, cleanup_connection: value, cleanup_row: "", model: "" });
+            }}
+          />
+          <ModelPicker
+            key={`cleanup-${draft.cleanup_connection}`}
+            label="Cleanup model"
+            name="Voice cleanup model"
+            value={draft.model}
+            rowKey={draft.cleanup_row}
+            previous={
+              connections.find((connection) => connection.name === draft.cleanup_connection)
+                ?.model_previous_ids
+            }
+            models={
+              connections.find((connection) => connection.name === draft.cleanup_connection)
+                ?.models ?? []
+            }
+            disabled={disabled || oneStep}
+            onChange={(value, key) => {
+              clearTestResult("cleanup");
+              setDraft({ ...draft, model: value, cleanup_row: key });
+            }}
+          />
+          <div className="flex items-center gap-3">
+            <Button
+              type="button"
+              variant="outline"
+              disabled={disabled || draft.mode === "off"}
+              onClick={() => void test("cleanup")}
+            >
+              {testing === "cleanup" ? "Testing…" : "Test"}
+            </Button>
+            <span role="status" className="text-sm text-muted-foreground">
+              {testResults.cleanup}
+            </span>
+          </div>
+        </>
+      )}
       <label className={rowClass}>
         Timeout (seconds)
         <input
