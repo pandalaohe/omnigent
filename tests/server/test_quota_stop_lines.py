@@ -85,6 +85,61 @@ def test_live_refusal_release_and_unknown_fail_open(stop_env):
     assert stopped_line(env.app, env.conv) is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schema_version", [1, 2])
+async def test_renamed_pool_limits_tiles_floors_and_stop_scan_agree(
+    stop_env, client, monkeypatch, schema_version
+):
+    env = stop_env
+    raw_pool, pool = "codex:old/x", "codex:new/x"
+    env.prefs.patch_namespace(
+        RESERVED_USER_LOCAL, "model_provider_aliases", {"pairs": [["old", "new"]]}
+    )
+    env.value.update(
+        schemaVersion=schema_version, limits={raw_pool: env.value["limits"]["account-a"]}
+    )
+    if schema_version == 2:
+        env.value["limitRules"] = []
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL, env.value, env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"]
+    )
+    env.store.update_conversation(env.conv.id, model_override="new/x")
+    env.conv = env.store.get_conversation(env.conv.id)
+    env.service.report_account(
+        RESERVED_USER_LOCAL,
+        pool,
+        usage_report(
+            account_product="codex",
+            observed_at=env.now,
+            windows=[
+                {
+                    "id": "weekly",
+                    "kind": "weekly",
+                    "percent_used": 96,
+                    "window_minutes": 10080,
+                    "resets_at": env.now + 86400,
+                }
+            ],
+        ),
+        now=env.now,
+    )
+    # The previous fixture account is unrelated to the renamed pool.
+    env.service.delete_account(RESERVED_USER_LOCAL, "account-a")
+    assert stopped_line(env.app, env.conv).state == "stop"
+    lines = (await client.get("/v1/me/usage/lines")).json()["tiles"]
+    assert raw_pool not in lines and lines[pool]["state"] == "stop"
+    post = AsyncMock(return_value={"queued": False})
+    monkeypatch.setattr(env.app.state, "quota_stop_post_event", post)
+    await enforce_stop_lines(env.app)
+    assert post.await_count == 1
+    assert post.await_args.args[1] == env.conv.id
+    env.prefs.set_choice_floor_off(RESERVED_USER_LOCAL, raw_pool, FloorOff(until="manual"))
+    assert stopped_line(env.app, env.conv) is None
+    assert (await client.get("/v1/me/usage/lines")).json()["tiles"][pool]["released"] is True
+    await enforce_stop_lines(env.app)
+    assert post.await_count == 1
+
+
 def test_targets_exclude_idle_stale_mirrors_and_ambiguous_product(stop_env):
     env = stop_env
     settings = parse_session_choice(env.value)

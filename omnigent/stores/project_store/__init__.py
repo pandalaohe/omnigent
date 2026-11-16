@@ -58,6 +58,17 @@ class ProjectStore(ABC):
         """
         self.storage_location = storage_location
 
+    def transform_config(
+        self,
+        project_id: str,
+        *,
+        user_id: str | None,
+        expected_revision: str,
+        transform: Callable[[dict[str, Any]], dict[str, Any]],
+    ) -> Project | None:
+        """Transform config only while its observed revision still matches."""
+        raise NotImplementedError("Project store does not support configuration transforms")
+
     @abstractmethod
     def create(
         self,

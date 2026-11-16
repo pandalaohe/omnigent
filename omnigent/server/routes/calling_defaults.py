@@ -360,6 +360,13 @@ def create_calling_defaults_router(
             if resolved_host_id
             else []
         )
+        from omnigent.server.model_resolution import ResolutionContext, read_provider_groups
+
+        model_context = ResolutionContext(
+            resolved_host_id or "",
+            {row["harness"]: row for row in records},
+            await asyncio.to_thread(read_provider_groups, user_preferences_store, owner),
+        )
         resolution = await asyncio.to_thread(
             resolve_calling,
             explicit=explicit,
@@ -368,6 +375,7 @@ def create_calling_defaults_router(
             master=master,
             host_id=resolved_host_id,
             agent_harness=agent_harness,
+            model_resolver=model_context.resolve,
             permission_options=lambda host_id, harness: next(
                 (
                     row.get("permission_options", [])
@@ -380,7 +388,6 @@ def create_calling_defaults_router(
 
         catalog: dict[str, Any] | None = None
         if resolved_host_id is not None and resolution.harness is not None:
-            records = await asyncio.to_thread(catalog_store.list, [resolved_host_id])
             record = next((row for row in records if row["harness"] == resolution.harness), None)
             if record is not None:
                 catalog = {
@@ -393,6 +400,23 @@ def create_calling_defaults_router(
         if resolution.agent_id is not None:
             agent = await asyncio.to_thread(agent_row, resolution.agent_id)
             agent_name = getattr(agent, "name", None)
+            if agent is not None and resolution.model is None:
+                from omnigent.entities import Conversation
+                from omnigent.server.routes._sessions.helpers import _resolve_llm_model
+
+                default_model = await asyncio.to_thread(
+                    _resolve_llm_model,
+                    Conversation(
+                        id="",
+                        root_conversation_id="",
+                        created_at=0,
+                        updated_at=0,
+                        agent_id=resolution.agent_id,
+                    ),
+                    agent_store=agent_store,
+                    agent_cache=agent_cache,
+                )
+                resolution = model_context.apply_default(resolution, default_model)
         problems = check_calling_defaults(
             resolution=resolution,
             host_id=resolved_host_id or "",
@@ -405,6 +429,7 @@ def create_calling_defaults_router(
             # launches a saved joint agent through its own library flow.
             path_label="server-side creates",
         )
+        warnings.extend(model_context.warnings())
         return CallingDefaultsResolveResponse(
             agent_id=resolution.agent_id,
             harness=resolution.harness,
@@ -416,6 +441,7 @@ def create_calling_defaults_router(
             level=resolution.level,
             problems=problems,
             warnings=warnings,
+            notes=list(resolution.notes),
         )
 
     return router

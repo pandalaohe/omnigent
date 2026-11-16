@@ -157,6 +157,7 @@ UserPreferenceNamespace = Literal[
     "worktree_defaults",
     "builtin_agent_prompts",
     "voice_input",
+    "model_provider_aliases",
 ]
 
 
@@ -494,6 +495,7 @@ class CallingDefaultsResolveResponse(BaseModel):
     level: dict[str, str] = Field(default_factory=dict)
     problems: list[CallingDefaultsProblem] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    notes: list[dict[str, str]] = Field(default_factory=list)
 
 
 class PolicySummary(BaseModel):
@@ -2419,6 +2421,7 @@ class CreatedSessionResponse(BaseModel):
 
     session_id: str
     warnings: list[str] = Field(default_factory=list)
+    notes: list[dict[str, str]] = Field(default_factory=list)
     agent_id: str
     agent_name: str
     project_id: str | None = None
@@ -2905,6 +2908,7 @@ class SessionResponse(BaseModel):
     id: str
     session_prompt: str | None = None
     warnings: list[str] = Field(default_factory=list)
+    notes: list[dict[str, str]] = Field(default_factory=list)
     agent_id: str
     agent_template_id: str | None = None
     agent_name: str | None = None

@@ -2287,6 +2287,8 @@ def create_app(
             preferences=user_preferences_store,
         )
 
+    from omnigent.server.model_resolution import resolve_session_model
+
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
@@ -2294,6 +2296,15 @@ def create_app(
         session_choice_resolver=agent_quota_service.session_choice_line,
         standing_approval_resolver=standing_approval_service.line,
         instructions_override_resolver=_instructions_override,
+        model_resolution_resolver=partial(
+            resolve_session_model,
+            conversations=conversation_store,
+            permissions=permission_store,
+            agents=agent_store,
+            agent_cache=agent_cache,
+            preferences=user_preferences_store,
+            catalogs=host_model_catalog_cache_store,
+        ),
         peer_messaging_enabled=resolved_feature_flags.enabled(Feature.SESSION_PEER_MESSAGING),
         peer_messaging_resolver=partial(
             session_peer_enabled,
@@ -3020,6 +3031,9 @@ def create_app(
     # ``request.app.state``; None degrades to the project layers only.
     app.state.agent_cache = agent_cache
     app.state.user_preferences_store = user_preferences_store
+    from omnigent.server.routes.model_references import create_model_references_router
+
+    app.include_router(create_model_references_router(auth_provider), prefix="/v1")
     app.state.standing_approval_service = standing_approval_service
     app.state.agent_quota_service = agent_quota_service
     app.include_router(
@@ -3092,6 +3106,7 @@ def create_app(
 
     host_registry.launch_authorizer = _admit_host_launch
     app.state.agent_store = agent_store
+    app.state.artifact_store = artifact_store
     app.state.conversation_store = conversation_store
     app.state.permission_store = permission_store
     app.state.sandbox_config = sandbox_config

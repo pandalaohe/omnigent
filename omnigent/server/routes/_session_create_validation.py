@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
@@ -289,6 +289,15 @@ async def resolve_create_calling_stores(
     records = (
         await asyncio.to_thread(catalog_store.list, [host_id]) if host_id and catalog_store else []
     )
+    from omnigent.server.model_resolution import ResolutionContext, read_provider_groups
+
+    model_context = ResolutionContext(
+        host_id or "",
+        {row["harness"]: row for row in records},
+        await asyncio.to_thread(
+            read_provider_groups, preferences_store, user_id or RESERVED_USER_LOCAL
+        ),
+    )
     resolution = await asyncio.to_thread(
         resolve_calling,
         explicit=explicit,
@@ -297,6 +306,7 @@ async def resolve_create_calling_stores(
         master=master,
         host_id=host_id,
         agent_harness=agent_harness,
+        model_resolver=model_context.resolve,
         permission_options=lambda host_id, harness: next(
             (
                 row.get("permission_options", [])
@@ -326,9 +336,34 @@ async def resolve_create_calling_stores(
     agent = None
     if resolution.agent_id is not None and not is_library_agent_id(resolution.agent_id):
         agent = await asyncio.to_thread(get_agent, resolution.agent_id)
+    if (
+        resolution.model is None
+        and resolution.agent_id is not None
+        and agent is not None
+        and agent_cache is not None
+    ):
+        from omnigent.server.routes._sessions.helpers import _resolve_llm_model
+
+        probe = Conversation(
+            id="",
+            created_at=0,
+            updated_at=0,
+            root_conversation_id="",
+            agent_id=resolution.agent_id,
+        )
+        saved_default = await asyncio.to_thread(
+            _resolve_llm_model, probe, agent_store=agent_store, agent_cache=agent_cache
+        )
+        if saved_default:
+            resolution = model_context.apply_default(resolution, saved_default)
+    if model_context.notes:
+        resolution = replace(
+            resolution, notes=tuple(note.payload() for note in model_context.notes)
+        )
+    if warnings is not None:
+        warnings.extend(model_context.warnings())
     catalog: dict[str, Any] | None = None
     if host_id is not None and resolution.harness is not None and catalog_store is not None:
-        records = await asyncio.to_thread(catalog_store.list, [host_id])
         record = next((row for row in records if row["harness"] == resolution.harness), None)
         if record is not None:
             catalog = {
@@ -478,10 +513,17 @@ async def resolve_project_session_create(
         )
         if not routing_requested:
             speed, permission = resolution.speed, resolution.permission
-            if "model_override" not in fields_set and resolution.model is not None:
+            if resolution.model is not None:
                 updates["model_override"] = resolution.model
             if "reasoning_effort" not in fields_set and resolution.effort is not None:
                 updates["reasoning_effort"] = resolution.effort
+            if resolution.notes and "labels" in body.__class__.model_fields:
+                from omnigent.server.model_resolution import resolution_labels
+
+                updates["labels"] = {
+                    **(getattr(body, "labels", None) or {}),
+                    **resolution_labels(resolution.notes),
+                }
     elif project is None:
         if getattr(body, "agent_id", None) is None and "agent_id" in body.__class__.model_fields:
             raise OmnigentError("agent_id is required", code=ErrorCode.INVALID_INPUT)

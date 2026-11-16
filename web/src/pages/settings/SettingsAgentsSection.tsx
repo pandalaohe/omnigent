@@ -2,6 +2,7 @@ import { CallingDefaultsSection } from "@/components/CallingDefaultsSection";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import { SettingsCustomAgentsSection } from "./SettingsCustomAgentsSection";
 import { SettingsHarnessesSection } from "./SettingsHarnessesSection";
+import { ModelReferenceNotice } from "./ModelReferenceNotice";
 
 export function SettingsAgentsSection() {
   const { harness, agentId } = useSettingsRoute();
@@ -15,6 +16,7 @@ export function SettingsAgentsSection() {
         <>
           <section className="min-w-0 space-y-5" aria-label="Agents">
             <h1 className="settings-page-title text-2xl font-medium">Agents</h1>
+            <ModelReferenceNotice />
             <CallingDefaultsSection />
           </section>
           <SettingsCustomAgentsSection />

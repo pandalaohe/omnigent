@@ -3502,12 +3502,19 @@ def register_core_routes(
                     "create this session without a host-bound member",
                     code=ErrorCode.INVALID_INPUT,
                 )
+        from omnigent.server.model_resolution import read_provider_groups
+
         member_labels = await _member_snapshot_labels(
             spec,
             host_id=parsed_metadata.host_id,
             host_store=getattr(request.app.state, "host_store", None),
             locked=launched_from_library_agent(parsed_metadata.labels),
             member_hosts=member_hosts,
+            model_groups=await asyncio.to_thread(
+                read_provider_groups,
+                getattr(request.app.state, "user_preferences_store", None),
+                user_id or RESERVED_USER_LOCAL,
+            ),
             project_config=member_project_config,
             master=await load_master(
                 user_id,
@@ -3848,6 +3855,17 @@ def register_core_routes(
                 request, created_conversation, spec_harness(spec)
             )
         result.warnings.extend(calling_warnings)
+        if created_conversation is not None:
+            from omnigent.server.model_resolution import (
+                notes_from_labels,
+                resolve_app_session_model,
+            )
+
+            created_conversation = await resolve_app_session_model(
+                request.app, created_conversation
+            )
+            result.notes = notes_from_labels(created_conversation.labels)
+            result.labels.update(created_conversation.labels)
         return result
 
     # ── GET /sessions/projects ────────────────────────────────────

@@ -84,6 +84,148 @@ async def test_project_preview_exposes_unavailable_defaults(settings_app, monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["project", "host"])
+@pytest.mark.parametrize(
+    "catalog_model,resolved_model",
+    [("new/offered-model", "new/offered-model"), ("offered-model", "krill/offered-model")],
+)
+async def test_project_settings_resolve_owner_aliases_and_validate_catalog_row(
+    shared_settings_app, tmp_path, source, catalog_model, resolved_model
+):
+    app = shared_settings_app
+    LocalArtifactStore(str(tmp_path / "artifacts")).put("agent/bundle", _bundle("codex-native"))
+    app.state.agent_store.create(AGENT_ID, "Default Agent", "agent/bundle")
+    app.state.user_preferences_store.patch_namespace(
+        ALICE,
+        "model_provider_aliases",
+        {"pairs": [["old", resolved_model.partition("/")[0]]]},
+    )
+    app.state.host_model_catalog_cache_store.upsert(
+        _HOST_A,
+        "codex-native",
+        [
+            {
+                "id": catalog_model,
+                "supportedReasoningEfforts": ["high"],
+                "serviceTiers": [{"id": "priority", "name": "Fast"}],
+            }
+        ],
+        100,
+    )
+    defaults = {"effort": "high", "speed": "fast"}
+    config = {
+        "host_id": _HOST_A,
+        "agent_id": AGENT_ID,
+        "calling_defaults": {_HOST_A: {"harnesses": {"codex-native": defaults}}},
+    }
+    if source == "project":
+        config["model"] = "old/offered-model"
+    else:
+        defaults["model"] = "old/offered-model"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        headers=_as_user(ALICE),
+    ) as client:
+        project_id = await _make_project(client, headers=_as_user(ALICE))
+        assert (
+            await client.patch(f"/v1/projects/{project_id}", json={"config": config})
+        ).status_code == 200
+        url = f"/v1/projects/{project_id}/settings"
+        read = await client.get(
+            url,
+            headers=_as_user("admin@example.com"),
+            params={"host_id": _HOST_A, "harness": "codex-native"},
+        )
+        assert read.status_code == 200, read.text
+        row = read.json()["rows"][0]
+        assert row["effective"]["model"] == resolved_model
+        assert row["problems"] == []
+        assert row["available"]["efforts"] == ["high"]
+        assert "fast" in row["available"]["speed"]
+        revision = read.json()["revision"]
+        for patch in (
+            {"orchestration": {"child_cap": 4}},
+            {"project": {"model": "old/offered-model"}},
+            {
+                "host": {
+                    "host_id": _HOST_A,
+                    "harnesses": {
+                        "codex-native": {
+                            "model": "old/offered-model",
+                            "effort": "high",
+                            "speed": "fast",
+                        }
+                    },
+                }
+            },
+        ):
+            saved = await client.put(
+                url,
+                headers=_as_user("admin@example.com"),
+                json={"expected_revision": revision, **patch},
+            )
+            assert saved.status_code == 200, saved.text
+            revision = saved.json()["revision"]
+        rejected = await client.put(
+            url,
+            json={
+                "expected_revision": revision,
+                "host": {"host_id": _HOST_A, "harnesses": {"codex-native": {"effort": "medium"}}},
+            },
+        )
+        assert rejected.status_code == 400 and "effort" in rejected.text
+        assert (await client.get(url)).json()["revision"] == revision
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["project", "host"])
+async def test_project_settings_reject_unaliased_provider_substitution(
+    settings_app, tmp_path, source
+):
+    app = settings_app
+    LocalArtifactStore(str(tmp_path / "artifacts")).put("agent/bundle", _bundle("codex-native"))
+    app.state.agent_store.create(AGENT_ID, "Default Agent", "agent/bundle")
+    app.state.host_model_catalog_cache_store.upsert(
+        _HOST_A, "codex-native", [{"id": "real/offered-model"}], 100
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        project_id = await _make_project(client)
+        config = {"host_id": _HOST_A, "agent_id": AGENT_ID, "model": "real/offered-model"}
+        assert (
+            await client.patch(f"/v1/projects/{project_id}", json={"config": config})
+        ).status_code == 200
+        url = f"/v1/projects/{project_id}/settings"
+        before = (await client.get(url)).json()
+        patch = (
+            {"project": {"model": "typo/offered-model"}}
+            if source == "project"
+            else {
+                "host": {
+                    "host_id": _HOST_A,
+                    "harnesses": {"codex-native": {"model": "typo/offered-model"}},
+                }
+            }
+        )
+        rejected = await client.put(
+            url,
+            json={
+                "expected_revision": before["revision"],
+                "orchestration": {"child_cap": 4},
+                **patch,
+            },
+        )
+        assert rejected.status_code == 400, rejected.text
+        field = "project.model" if source == "project" else "host.harnesses.codex-native.model"
+        assert field in rejected.text and "not offered" in rejected.text
+        after = (await client.get(url)).json()
+        assert after["revision"] == before["revision"]
+        assert after["config"] == before["config"] == config
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("approval_key", ["standing_approval", "standing_pass"])
 async def test_orchestration_tool_to_store_requires_approval(
     settings_app, db_uri, caplog, approval_key

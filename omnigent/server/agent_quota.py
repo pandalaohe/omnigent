@@ -1078,6 +1078,9 @@ class AgentQuotaService:
         now = time.time() if now is None else now
         storage_available = self._hydrate(context.owner_id)
         settings = read_collab_settings(self.preferences, context.owner_id)
+        from omnigent.server.model_resolution import read_provider_groups
+
+        model_groups = read_provider_groups(self.preferences, context.owner_id)
         tiers = QuotaTiers(
             settings.quota_tight_below_pct,
             settings.quota_low_below_pct,
@@ -1139,7 +1142,10 @@ class AgentQuotaService:
                 )
             )
             period = settings.quota_period(
-                product, context.agent_id if context.product == product else None, context.model
+                product,
+                context.agent_id if context.product == product else None,
+                context.model,
+                groups=model_groups,
             ) or newest.get("pinned_period")
             quota = agent_quota(windows, tiers, now=now, deciding_period=period)
             if not fresh:
@@ -1169,6 +1175,9 @@ class AgentQuotaService:
         from omnigent.server.session_choice import active_on, ordered_links, pool_of
 
         choice = read_collab_settings(self.preferences, context.owner_id).session_choice
+        from omnigent.server.model_resolution import read_provider_groups
+
+        groups = read_provider_groups(self.preferences, context.owner_id)
         pools = []
         products: dict[str, str | None] = {}
         for link in ordered_links(choice):
@@ -1186,7 +1195,7 @@ class AgentQuotaService:
                 products[link.agent_id] = agent_key_for_harness(
                     _resolve_harness_impl(probe, agent_store=agent_store, agent_cache=agent_cache)
                 )
-            pools.append(pool_of(link, products[link.agent_id]))
+            pools.append(pool_of(link, products[link.agent_id], groups))
         payload: dict[str, Any] = {
             "tiers": asdict(tiers),
             "agents": {
@@ -1751,6 +1760,8 @@ class AgentQuotaService:
     def tile_lines(self, owner: str, *, now: float | None = None, settings=None) -> dict:
         from dataclasses import asdict
 
+        from omnigent.models.model_reference import canonical_pool_values
+        from omnigent.server.model_resolution import read_provider_groups
         from omnigent.server.session_choice import TileLimits, tile_line
 
         now = time.time() if now is None else now
@@ -1758,19 +1769,22 @@ class AgentQuotaService:
             settings = read_collab_settings(self.preferences, owner).session_choice
         readings = self.pool_readings(QuotaContext(owner, None), now=now)
         floors = self.preferences.choice_floor_off(owner) if self.preferences else {}
+        groups = read_provider_groups(self.preferences, owner)
+        limits = canonical_pool_values(settings.limits, groups)
+        floors = canonical_pool_values(floors, groups)
         return {
             "schema": 1,
             "generated_at": now,
             "tiles": {
                 tile: asdict(
                     tile_line(
-                        settings.limits.get(tile, TileLimits()),
+                        limits.get(tile, TileLimits()),
                         readings.get(tile),
                         floors.get(tile),
                         now,
                     )
                 )
-                for tile in sorted(readings.keys() | settings.limits.keys())
+                for tile in sorted(readings.keys() | limits.keys())
             },
         }
 
@@ -1778,8 +1792,15 @@ class AgentQuotaService:
         self, context: QuotaContext, *, now: float | None = None
     ) -> dict[str, UsageAccountView]:
         """Read the same tiles as the board, including reset data for selection."""
+        from omnigent.models.model_reference import canonical_pool
+        from omnigent.server.model_resolution import read_provider_groups
+
         now = time.time() if now is None else now
-        return {tile.id: tile for tile in self.overview(context.owner_id, now=now).accounts}
+        groups = read_provider_groups(self.preferences, context.owner_id)
+        return {
+            canonical_pool(tile.id, groups): tile
+            for tile in self.overview(context.owner_id, now=now).accounts
+        }
 
     def _native_account(
         self,

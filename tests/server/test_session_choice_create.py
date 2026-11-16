@@ -253,7 +253,7 @@ async def test_catalog_miss_does_not_exclude_configured_model(
 
     env = choice_env
     official = "gpt-example"
-    custom = "provider-example/gpt-example"
+    custom = "provider-example/missing-model"
     for index, model in enumerate((custom, official)):
         env.settings["hosts"][HOST]["work"][index][0]["links"][0]["model"] = model
     env.prefs.replace_session_choice(
@@ -314,6 +314,35 @@ async def test_catalog_miss_does_not_exclude_configured_model(
         )
         assert legacy.models[env.agents[0]["id"]] == frozenset({official})
         lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unique_provider_substitution_reaches_create_with_visible_note(
+    choice_env, db_uri, monkeypatch
+):
+    from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
+
+    env = choice_env
+    env.settings["hosts"][HOST]["work"][0][0]["links"][0]["model"] = "old/example-model"
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    catalogs = HostModelCatalogCacheStore(db_uri)
+    catalogs.upsert(HOST, "codex-native", [{"id": "new/example-model"}], time.time())
+    env.app.state.host_model_catalog_cache_store = catalogs
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._resolve_harness_impl",
+        lambda *a, **kw: "codex-native",
+    )
+    response = await create(env)
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["model_override"] == "new/example-model"
+    assert body["notes"][0]["saved"] == "old/example-model"
+    assert body["notes"][0]["outcome"] == "substituted"
+    assert body["session_choice"]["warnings"] and not body["session_choice"]["skipped"]
 
 
 @pytest.mark.asyncio

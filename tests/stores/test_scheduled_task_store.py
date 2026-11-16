@@ -508,6 +508,39 @@ def test_list_active_all_workspaces_pages_beyond_batch_size(
 # ── update ────────────────────────────────────────────────────────────────────
 
 
+def test_model_repair_is_owned_case_sensitive_and_keeps_other_fields(store):
+    task = store.create(
+        _uid("model-repair"),
+        "Repair",
+        "Keep prompt",
+        "FREQ=DAILY",
+        "owner@example.test",
+        _uid("agent"),
+        "UTC",
+        model_override="old/x",
+        reasoning_effort="high",
+    )
+    assert not store.replace_model_if_matches(
+        task.id, user_id="other@example.test", expected_model="old/x", model="new/x"
+    )
+    assert not store.replace_model_if_matches(
+        task.id, user_id=task.user_id, expected_model="OLD/x", model="new/x"
+    )
+    store.update(task.id, reasoning_effort="low")
+    assert store.replace_model_if_matches(
+        task.id, user_id=task.user_id, expected_model="old/x", model="new/x"
+    )
+    current = store.get(task.id)
+    assert (current.model_override, current.reasoning_effort, current.prompt) == (
+        "new/x",
+        "low",
+        "Keep prompt",
+    )
+    assert not store.replace_model_if_matches(
+        task.id, user_id=task.user_id, expected_model="old/x", model="new/y"
+    )
+
+
 def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledTaskStore) -> None:
     """``update`` mutates supplied fields and sets ``updated_at``."""
     store.create(

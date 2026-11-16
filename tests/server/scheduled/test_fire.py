@@ -1663,8 +1663,8 @@ async def test_deleted_project_falls_back_to_master_and_warns(
 
 
 @pytest.mark.asyncio
-async def test_fire_refuses_a_default_model_the_catalog_does_not_offer() -> None:
-    """A K5 offered miss fails the fire run with the shared refusal text."""
+async def test_fire_attempts_an_unlisted_default_with_a_visible_resolution_note() -> None:
+    """A catalog miss keeps the saved default; a label makes the uncertainty visible."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(
         rows={"task_1": _task(user_id="alice@example.com", project_id="proj_1")}
@@ -1696,12 +1696,14 @@ async def test_fire_refuses_a_default_model_the_catalog_does_not_offer() -> None
     await on_fire(0, "task_1")
     await _drain()
 
-    assert conv_store.created == []
+    from omnigent.server.model_resolution import notes_from_labels
+
+    assert len(conv_store.created) == 1
+    assert conv_store.updated[0]["model_override"] == "gpt-6-sol"
+    notes = notes_from_labels(conv_store.created[0]["labels"])
+    assert notes[0]["saved"] == "gpt-6-sol" and notes[0]["outcome"] == "missing"
     assert len(store.runs) == 1
-    assert store.runs[0]["status"] == "failed"
-    assert store.runs[0]["error_code"] == "invalid_input"
-    assert "is not offered by host" in store.runs[0]["error"]
-    assert "Change the setting, pass model, or run Sync models" in store.runs[0]["error"]
+    assert store.runs[0]["status"] == "running"
 
 
 @pytest.mark.asyncio

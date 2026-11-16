@@ -581,6 +581,39 @@ async def test_initializer_evicts_rejected_result_for_retry(
 
 
 @pytest.mark.asyncio
+async def test_initializer_sends_resolved_model_and_member_changes_again() -> None:
+    from omnigent.member_snapshot import encode_member_entry, member_label_key
+
+    client = _Client()
+    client.release.set()
+    initializer = RunnerSessionInitializer(_Registry(), server_version="test")
+    original = dataclasses.replace(_conversation(), model_override="old/example-model")
+    resolved = dataclasses.replace(original, model_override="new/example-model")
+    member_key = member_label_key("worker")
+    with_member = dataclasses.replace(
+        resolved,
+        labels={
+            **resolved.labels,
+            member_key: encode_member_entry(
+                {"host": "host-a", "harness": "codex", "model": "new/worker-model", "lead": False}
+            ),
+        },
+    )
+    for conversation in (original, resolved, with_member):
+        assert not initializer.is_initialized(conversation, client)
+        await initializer.initialize(conversation, client, timeout=10)
+        assert initializer.is_initialized(conversation, client)
+    snapshots = [call["session_init"]["snapshot"] for call in client.calls]
+    assert [snapshot["model_override"] for snapshot in snapshots] == [
+        "old/example-model",
+        "new/example-model",
+        "new/example-model",
+    ]
+    assert member_key not in snapshots[1]["labels"]
+    assert snapshots[2]["labels"][member_key] == with_member.labels[member_key]
+
+
+@pytest.mark.asyncio
 async def test_initializer_reposts_after_archive_revision_changes() -> None:
     registry = _Registry()
     client = _Client()

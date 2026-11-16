@@ -7,6 +7,7 @@ import type { UsageAccountView } from "@/pages/usageBoard/usageBoardData";
 import type { ChoiceLink, ChoiceLimit } from "./sessionChoiceData";
 import { guessMeter, type ChoiceAgent } from "./sessionChoiceEdits";
 import { canonicalNativeHarness } from "@/lib/nativeHarnessModes";
+import { splitModelId } from "@/lib/modelReference";
 
 export const CHOICE_SELECT =
   "h-8 min-w-0 rounded-md border border-input bg-background px-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
@@ -53,7 +54,18 @@ export function ChoiceLinkEditor({
     { poll: false },
   );
   const options = catalog.data ?? [];
-  const model = options.find((m) => m.id === link.model);
+  const identity = splitModelId(link.model ?? "");
+  const variants = [
+    ...new Map(
+      options
+        .filter((item) => splitModelId(item.id).model === identity.model)
+        .map((item) => [item.id, item]),
+    ).values(),
+  ];
+  const model =
+    options.find((m) => m.id === link.model) ?? (variants.length === 1 ? variants[0] : undefined);
+  const offered = options.some((item) => item.id === link.model);
+  const displayedModel = offered ? identity.model : (link.model ?? "");
   const efforts =
     model?.supportedReasoningEfforts?.map((e) => e.reasoningEffort) ?? model?.efforts ?? [];
   function changeIdentity(patch: Partial<ChoiceLink>) {
@@ -106,16 +118,23 @@ export function ChoiceLinkEditor({
           <Input
             aria-label="Link model"
             className="h-8"
-            value={link.model ?? ""}
+            value={displayedModel}
             placeholder="Agent default"
             list={`${listId}-models`}
-            onChange={(e) => changeIdentity({ model: e.target.value || null, effort: null })}
+            onChange={(e) => {
+              const value = e.target.value;
+              const exact = options.find((item) => item.id === value);
+              const matches = options.filter((item) => splitModelId(item.id).model === value);
+              const chosen =
+                exact ??
+                matches.find((item) => splitModelId(item.id).provider === identity.provider) ??
+                matches[0];
+              changeIdentity({ model: chosen?.id ?? (value || null), effort: null });
+            }}
           />
           <datalist id={`${listId}-models`}>
-            {options.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.displayName ?? m.id}
-              </option>
+            {[...new Set(options.map((item) => splitModelId(item.id).model))].map((name) => (
+              <option key={name} value={name} />
             ))}
           </datalist>
         </label>
@@ -136,6 +155,34 @@ export function ChoiceLinkEditor({
           </datalist>
         </label>
       </div>
+      {variants.length > 1 && (
+        <label className="flex min-w-0 flex-col gap-1 text-xs">
+          Provider
+          <select
+            aria-label="Link provider"
+            className={CHOICE_SELECT}
+            value={link.model ?? ""}
+            onChange={(event) => changeIdentity({ model: event.target.value, effort: null })}
+          >
+            {!offered && link.model && (
+              <option value={link.model}>
+                {identity.provider ?? "Saved provider"} (not offered here)
+              </option>
+            )}
+            {variants.map((item) => (
+              <option key={item.id} value={item.id}>
+                {splitModelId(item.id).provider ?? "Default provider"}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      {link.model && !offered && variants.length === 1 && identity.provider && (
+        <p className="text-xs text-muted-foreground">
+          Saved provider {identity.provider} is not offered here. Select the model again to use the
+          available provider.
+        </p>
+      )}
       {catalog.isError && (
         <p className="text-xs text-muted-foreground">
           Model list unavailable. You can type a model.

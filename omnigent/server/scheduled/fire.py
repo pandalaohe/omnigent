@@ -767,8 +767,9 @@ async def _run_fire_for_task(
             await recorder.finish("failed", error=str(exc), error_code=exc.error_code)
             return
 
+    resolution_notes: list[dict[str, str]] = []
     try:
-        effective = await _resolve_fire_calling(deps, effective)
+        effective = await _resolve_fire_calling(deps, effective, notes=resolution_notes)
     except OmnigentError as exc:
         await recorder.finish("failed", error=exc.message, error_code=exc.code)
         return
@@ -801,7 +802,13 @@ async def _run_fire_for_task(
     try:
         start_fire_stage("session_create")
         effective = await _own_task_agent(deps, effective)
-        conv = await _create_session(deps, effective, labels=_session_labels(task))
+        from omnigent.server.model_resolution import resolution_labels
+
+        conv = await _create_session(
+            deps,
+            effective,
+            labels={**_session_labels(task), **resolution_labels(resolution_notes)},
+        )
         log_session_created(conv.id)
     except _CannotLaunchScheduledFire as exc:
         _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
@@ -1680,6 +1687,8 @@ async def _create_library_agent_session(deps: FireDeps, task: ScheduledTask) -> 
         ),
         project_config=project.config if project is not None else None,
         master=await load_master(task.user_id, deps.preferences_store, warnings=warnings),
+        preferences_store=deps.preferences_store,
+        catalog_store=deps.catalog_store,
     )
     conv: Conversation | None = await asyncio.to_thread(
         deps.conversation_store.get_conversation, result.session_id
@@ -1750,7 +1759,9 @@ async def _task_project(deps: FireDeps, task: ScheduledTask) -> Project | None:
     return project
 
 
-async def _resolve_fire_calling(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
+async def _resolve_fire_calling(
+    deps: FireDeps, task: ScheduledTask, *, notes: list[dict[str, str]] | None = None
+) -> ScheduledTask:
     """Fill an unset model / effort from the task's calling-defaults chain.
 
     The task's stored values win; an explicit ``None`` recorded in
@@ -1798,6 +1809,8 @@ async def _resolve_fire_calling(deps: FireDeps, task: ScheduledTask) -> Schedule
         preferences_store=deps.preferences_store,
         catalog_store=deps.catalog_store,
     )
+    if notes is not None:
+        notes.extend(resolution.notes)
     return replace(
         task,
         model_override=resolution.model,
@@ -2017,11 +2030,12 @@ async def _create_session_resources(
         reasoning_effort = task.reasoning_effort
         if reasoning_effort is None:
             reasoning_effort = await _spec_reasoning_effort(deps, task)
-        if task.model_override is not None or reasoning_effort is not None:
+        model_override = conv.model_override if library_agent else task.model_override
+        if model_override is not None or reasoning_effort is not None:
             updated: Conversation | None = await asyncio.to_thread(
                 deps.conversation_store.update_conversation,
                 conv.id,
-                model_override=task.model_override,
+                model_override=model_override,
                 reasoning_effort=reasoning_effort,
             )
             if updated is not None:

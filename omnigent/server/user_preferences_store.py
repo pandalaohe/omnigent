@@ -42,6 +42,12 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.host.git_worktree import WorktreeError, validate_worktree_path_template
+from omnigent.models.model_reference import (
+    ALIASES_NAMESPACE,
+    ProviderGroups,
+    alias_pairs,
+    canonical_model,
+)
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.session_choice import SessionChoice
 
@@ -75,6 +81,7 @@ USER_PREFERENCE_NAMESPACES = frozenset(
         "worktree_defaults",
         "builtin_agent_prompts",
         "voice_input",
+        ALIASES_NAMESPACE,
     }
 )
 
@@ -669,12 +676,25 @@ class CollabSettings:
     session_choice_error: dict[str, Any] | None = None
 
     def quota_period(
-        self, product: str | None, agent: str | None = None, model: str | None = None
+        self,
+        product: str | None,
+        agent: str | None = None,
+        model: str | None = None,
+        *,
+        groups: ProviderGroups | None = None,
     ) -> str | None:
         matches = [
             row
             for row in self.quota_period_rules
-            if row["agent"] == agent and ("model" not in row or row["model"] == model)
+            if row["agent"] == agent
+            and (
+                "model" not in row
+                or (
+                    model is not None
+                    and canonical_model(row["model"], groups or {})
+                    == canonical_model(model, groups or {})
+                )
+            )
         ]
         if matches:
             return max(matches, key=lambda row: "model" in row)["period"]
@@ -1892,6 +1912,11 @@ def validate_preferences_envelope(envelope: Any) -> PreferencesEnvelope:
         )
     for value in settings.values():
         _validate_json(value)
+    if ALIASES_NAMESPACE in settings:
+        try:
+            alias_pairs(settings[ALIASES_NAMESPACE])
+        except ValueError as exc:
+            raise UserPreferencesValidationError(str(exc)) from exc
     if WORKTREE_ARCHIVE_NAMESPACE in settings:
         _validate_worktree_archive(settings[WORKTREE_ARCHIVE_NAMESPACE])
     if CHILD_IDLE_NAMESPACE in settings:
@@ -2320,6 +2345,41 @@ class SqlAlchemyUserPreferencesStore:
 
         return run_write_transaction(
             self._write_session, "patch_user_preferences_namespace", write
+        )
+
+    def transform_namespace(
+        self,
+        user_id: str,
+        namespace: str,
+        transform: Callable[[Any], Any],
+        *,
+        create_if_missing: bool = True,
+    ) -> PreferencesEnvelope:
+        """Transform one namespace under the same owner lock as ordinary patches."""
+        if namespace not in {"calling_defaults", "session_collab", ALIASES_NAMESPACE}:
+            raise UserPreferencesValidationError("Namespace does not support transforms")
+
+        def write(session: Session) -> PreferencesEnvelope:
+            _require_user_row(session, user_id, create_if_missing)
+            self._upsert_row(
+                session,
+                user_id=user_id,
+                key=_ENVELOPE_VERSION_KEY,
+                value=_encode_value(USER_PREFERENCE_VERSION),
+            )
+            settings, _ = _read_settings(session, user_id)
+            settings[namespace] = transform(deepcopy(settings.get(namespace)))
+            envelope = _assemble_envelope(settings)
+            self._upsert_row(
+                session,
+                user_id=user_id,
+                key=_settings_key(namespace),
+                value=_encode_namespace(namespace, envelope["settings"][namespace]),
+            )
+            return envelope
+
+        return run_write_transaction(
+            self._write_session, "transform_user_preferences_namespace", write
         )
 
     def session_choice(self, user_id: str) -> dict[str, Any]:
