@@ -450,33 +450,37 @@ export function ArchiveLibraryRail({
                   <div className="hidden shrink-0 items-center pr-1 md:flex">
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon-sm"
-                          className="max-md:size-11"
-                          aria-label="Unarchive session"
-                          disabled={busy}
-                          onClick={() => archive.mutate({ id: conversation.id, archived: false })}
-                        >
-                          <ArchiveRestoreIcon className="size-4" />
-                        </Button>
+                        <span className="inline-flex">
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon-sm"
+                            className="max-md:size-11"
+                            aria-label="Unarchive session"
+                            disabled={busy}
+                            onClick={() => archive.mutate({ id: conversation.id, archived: false })}
+                          >
+                            <ArchiveRestoreIcon className="size-4" />
+                          </Button>
+                        </span>
                       </TooltipTrigger>
                       <TooltipContent>Unarchive</TooltipContent>
                     </Tooltip>
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon-sm"
-                          className="max-md:size-11"
-                          aria-label="Delete archived session"
-                          disabled={busy}
-                          onClick={() => setDeleteTarget(conversation)}
-                        >
-                          <Trash2Icon className="size-4 text-destructive" />
-                        </Button>
+                        <span className="inline-flex">
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon-sm"
+                            className="max-md:size-11"
+                            aria-label="Delete archived session"
+                            disabled={busy}
+                            onClick={() => setDeleteTarget(conversation)}
+                          >
+                            <Trash2Icon className="size-4 text-destructive" />
+                          </Button>
+                        </span>
                       </TooltipTrigger>
                       <TooltipContent>Delete permanently</TooltipContent>
                     </Tooltip>
@@ -520,20 +524,22 @@ export function ArchiveLibraryRail({
             <TooltipProvider>
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button
-                    aria-label="Previous"
-                    type="button"
-                    variant="ghost"
-                    size="icon-sm"
-                    disabled={pageHistory.length === 0 || archivedQuery.isFetching}
-                    onClick={() => {
-                      const previous = pageHistory.at(-1);
-                      setPageHistory((current) => current.slice(0, -1));
-                      setPageAfter(previous);
-                    }}
-                  >
-                    <ChevronLeftIcon />
-                  </Button>
+                  <span className="inline-flex">
+                    <Button
+                      aria-label="Previous"
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      disabled={pageHistory.length === 0 || archivedQuery.isFetching}
+                      onClick={() => {
+                        const previous = pageHistory.at(-1);
+                        setPageHistory((current) => current.slice(0, -1));
+                        setPageAfter(previous);
+                      }}
+                    >
+                      <ChevronLeftIcon />
+                    </Button>
+                  </span>
                 </TooltipTrigger>
                 <TooltipContent>Previous</TooltipContent>
               </Tooltip>
@@ -542,21 +548,23 @@ export function ArchiveLibraryRail({
             <TooltipProvider>
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button
-                    aria-label="Next"
-                    type="button"
-                    variant="ghost"
-                    size="icon-sm"
-                    disabled={!archivedQuery.data?.has_more || archivedQuery.isFetching}
-                    onClick={() => {
-                      const next = archivedQuery.data?.last_id;
-                      if (!next) return;
-                      setPageHistory((current) => [...current, pageAfter]);
-                      setPageAfter(next);
-                    }}
-                  >
-                    <ChevronRightIcon />
-                  </Button>
+                  <span className="inline-flex">
+                    <Button
+                      aria-label="Next"
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      disabled={!archivedQuery.data?.has_more || archivedQuery.isFetching}
+                      onClick={() => {
+                        const next = archivedQuery.data?.last_id;
+                        if (!next) return;
+                        setPageHistory((current) => [...current, pageAfter]);
+                        setPageAfter(next);
+                      }}
+                    >
+                      <ChevronRightIcon />
+                    </Button>
+                  </span>
                 </TooltipTrigger>
                 <TooltipContent>Next</TooltipContent>
               </Tooltip>

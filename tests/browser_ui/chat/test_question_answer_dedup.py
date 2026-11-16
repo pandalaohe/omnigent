@@ -28,8 +28,9 @@ def test_question_image_icon_and_tooltip(
                 "params": {
                     "mode": "form",
                     "message": "Describe the change.",
-                    "phase": "pre_tool_use",
-                    "policy_name": "permission",
+                    "phase": "async_question",
+                    "policy_name": "claude_async_question",
+                    "async_kind": "question",
                     "ask_user_question": {
                         "questions": [{"question": "Describe the change.", "header": "Review"}]
                     },
@@ -45,6 +46,7 @@ def test_question_image_icon_and_tooltip(
     page.get_by_placeholder("Type something", exact=True).fill("Keep the toolbar compact.")
     with page.expect_file_chooser():
         button.click()
+    page.mouse.move(0, 0)
     button.hover()
     expect(page.get_by_role("tooltip")).to_have_text("Add image")
     output = Path(output_path)
@@ -59,6 +61,7 @@ def test_question_image_icon_and_tooltip(
             element.append(document.createTextNode('Add image'));
         }"""
     )
+    button.blur()
     page.mouse.move(0, 0)
     expect(page.get_by_role("tooltip")).not_to_be_visible()
     page.screenshot(

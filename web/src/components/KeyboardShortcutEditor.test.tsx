@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { KeyboardShortcutEditor } from "./KeyboardShortcutEditor";
@@ -67,6 +68,19 @@ describe("KeyboardShortcutEditor", () => {
     expect(
       screen.queryByRole("switch", { name: "Scroll to the bottom when opening a session" }),
     ).toBeNull();
+  });
+
+  it("explains restore defaults when the shortcut is already unchanged", async () => {
+    const user = userEvent.setup();
+    renderExpandedEditor();
+    const restore = screen.getByRole("button", {
+      name: "Restore default shortcut for Start a new session",
+    });
+    expect(restore).toBeDisabled();
+    await user.hover(restore.parentElement!);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "Restore default shortcut for Start a new session",
+    );
   });
 
   it("finds a platform key, filters changed rows and resets the entire row", () => {

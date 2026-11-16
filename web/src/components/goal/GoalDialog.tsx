@@ -331,18 +331,20 @@ function GoalActions({
         <TooltipProvider>
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button
-                aria-label="Pause"
-                size="icon"
-                type="button"
-                variant="outline"
-                onClick={onPause}
-                disabled={readOnly || busy}
-                loading={statusUpdating === "paused"}
-                data-testid="goal-pause"
-              >
-                <PauseCircleIcon className="size-3.5" />
-              </Button>
+              <span className="inline-flex">
+                <Button
+                  aria-label="Pause"
+                  size="icon"
+                  type="button"
+                  variant="outline"
+                  onClick={onPause}
+                  disabled={readOnly || busy}
+                  loading={statusUpdating === "paused"}
+                  data-testid="goal-pause"
+                >
+                  <PauseCircleIcon className="size-3.5" />
+                </Button>
+              </span>
             </TooltipTrigger>
             <TooltipContent>Pause</TooltipContent>
           </Tooltip>
@@ -352,18 +354,20 @@ function GoalActions({
         <TooltipProvider>
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button
-                aria-label="Resume"
-                size="icon"
-                type="button"
-                variant="outline"
-                onClick={onResume}
-                disabled={readOnly || busy}
-                loading={statusUpdating === "active"}
-                data-testid="goal-resume"
-              >
-                <PlayCircleIcon className="size-3.5" />
-              </Button>
+              <span className="inline-flex">
+                <Button
+                  aria-label="Resume"
+                  size="icon"
+                  type="button"
+                  variant="outline"
+                  onClick={onResume}
+                  disabled={readOnly || busy}
+                  loading={statusUpdating === "active"}
+                  data-testid="goal-resume"
+                >
+                  <PlayCircleIcon className="size-3.5" />
+                </Button>
+              </span>
             </TooltipTrigger>
             <TooltipContent>Resume</TooltipContent>
           </Tooltip>

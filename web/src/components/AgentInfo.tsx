@@ -1088,16 +1088,18 @@ function McpServerManagerDialog({
                 <TooltipProvider>
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <Button
-                        aria-label="Save"
-                        type="button"
-                        size="icon-sm"
-                        onClick={handleSave}
-                        loading={saving}
-                        disabled={validateMcpForm(form) !== null}
-                      >
-                        <SaveIcon className="size-3.5" />
-                      </Button>
+                      <span className="inline-flex">
+                        <Button
+                          aria-label="Save"
+                          type="button"
+                          size="icon-sm"
+                          onClick={handleSave}
+                          loading={saving}
+                          disabled={validateMcpForm(form) !== null}
+                        >
+                          <SaveIcon className="size-3.5" />
+                        </Button>
+                      </span>
                     </TooltipTrigger>
                     <TooltipContent>Save</TooltipContent>
                   </Tooltip>

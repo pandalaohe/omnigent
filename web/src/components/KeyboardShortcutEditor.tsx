@@ -435,20 +435,22 @@ export function KeyboardShortcutEditor() {
                       <TooltipProvider>
                         <Tooltip>
                           <TooltipTrigger asChild>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon-sm"
-                              aria-label={`Restore default shortcut for ${definition.label}`}
-                              disabled={!isChanged(definition.id)}
-                              onClick={() => {
-                                stopRecording();
-                                resetShortcutPreference(definition.id);
-                                setError(null);
-                              }}
-                            >
-                              <RotateCcwIcon />
-                            </Button>
+                            <span className="inline-flex">
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon-sm"
+                                aria-label={`Restore default shortcut for ${definition.label}`}
+                                disabled={!isChanged(definition.id)}
+                                onClick={() => {
+                                  stopRecording();
+                                  resetShortcutPreference(definition.id);
+                                  setError(null);
+                                }}
+                              >
+                                <RotateCcwIcon />
+                              </Button>
+                            </span>
                           </TooltipTrigger>
                           <TooltipContent>{`Restore default shortcut for ${definition.label}`}</TooltipContent>
                         </Tooltip>

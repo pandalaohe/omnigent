@@ -692,7 +692,7 @@ export function ArchiveTranscriptViewer({
                           <Button
                             type="button"
                             variant="ghost"
-                            size="icon-sm"
+                            size="xs"
                             aria-label="Copy message citation"
                             onClick={() =>
                               copy(
@@ -706,6 +706,7 @@ export function ArchiveTranscriptViewer({
                             ) : (
                               <CopyIcon />
                             )}
+                            Citation
                           </Button>
                         </ExplainedAction>
                         <ExplainedAction content="Link copies only the deep link to this exact message or response; it does not include the message text.">

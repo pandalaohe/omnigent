@@ -3296,7 +3296,7 @@ describe("question custom selection and editing", () => {
           }}
         />,
       );
-      expect(screen.getByRole("button", { name: "Prev" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Previous question" })).toBeDisabled();
       await user.click(screen.getByLabelText("Preset"));
       const toggle = screen.getByRole(multiSelect ? "checkbox" : "radio", {
         name: "Select custom answer",
@@ -3321,15 +3321,15 @@ describe("question custom selection and editing", () => {
       expect(toggle).toBeChecked();
       await user.type(editor, "Custom text");
       expect(submit).not.toHaveBeenCalled();
-      await user.click(screen.getByRole("button", { name: "Next" }));
+      await user.click(screen.getByRole("button", { name: "Next question" }));
       expect(screen.getByLabelText("Done")).toBeChecked();
       expect(screen.getByRole("button", { name: "Submit" })).toBeEnabled();
       await user.click(screen.getByLabelText("Done"));
-      await user.click(screen.getByRole("button", { name: "Prev" }));
+      await user.click(screen.getByRole("button", { name: "Previous question" }));
       expect(screen.getByRole("textbox", { name: "Custom answer" })).toHaveValue("Custom text");
       expect(screen.getByTestId("ask-user-question-custom-toggle")).toBeChecked();
       expect(screen.getByLabelText("Preset").matches(":checked")).toBe(multiSelect);
-      await user.click(screen.getByRole("button", { name: "Next" }));
+      await user.click(screen.getByRole("button", { name: "Next question" }));
       await user.click(screen.getByRole("button", { name: "Submit" }));
       expect(submit).toHaveBeenCalledExactlyOnceWith("custom-focus", "accept", {
         First: multiSelect ? ["Preset", "Custom text"] : "Custom text",

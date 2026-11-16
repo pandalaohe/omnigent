@@ -25,7 +25,14 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { CopyIcon, KeyRoundIcon, RefreshCwIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
+import {
+  CheckIcon,
+  CopyIcon,
+  KeyRoundIcon,
+  RefreshCwIcon,
+  Trash2Icon,
+  UserPlusIcon,
+} from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
@@ -489,9 +496,9 @@ function CopyableValue({ value }: { value: string }) {
               variant="outline"
               size="icon-sm"
               onClick={() => void onCopy()}
-              aria-label="Copy"
+              aria-label={copied ? "Copied" : "Copy"}
             >
-              <CopyIcon />
+              {copied ? <CheckIcon /> : <CopyIcon />}
             </Button>
           </TooltipTrigger>
           <TooltipContent>{copied ? "Copied" : "Copy"}</TooltipContent>
