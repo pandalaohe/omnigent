@@ -6482,23 +6482,25 @@ def register_events_routes(
 
     @event_router.post("/sessions/{session_id}/input-admission/resolve", include_in_schema=False)
     async def resolve_input_execution(
-        request: Request, session_id: str, body: InputExecutionClaim
+        request: Request, session_id: str, body: InputExecutionClaim, close: bool = True
     ):
         service = _retry_admission(request)
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None or not _has_bound_runner_authority(request, conv):
             raise HTTPException(403, "Bound receiver authority required")
         assert conv.runner_id is not None
-        if body.boundary in {"native_accept", "native_refuse"}:
-            # Reconcile the same observed native outcome; closing its reservation
-            # would discard proof that the native input was already consumed.
+        if body.boundary in {"native_accept", "native_refuse"} or (
+            not close and body.boundary == "native_reserve"
+        ):
+            # Reconcile the exact outcome or reservation through the admission
+            # fences; a read-only lookup cannot revalidate its owner.
             return await service.admit_execution(session_id, body, runner_id=conv.runner_id)
         return await asyncio.to_thread(
             service.journal.resolve_execution,
             session_id,
             body,
             runner_id=conv.runner_id,
-            close=True,
+            close=close,
         )
 
     async def _control_receiver(request: Request, session_id: str):

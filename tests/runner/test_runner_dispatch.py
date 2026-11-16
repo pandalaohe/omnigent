@@ -4039,10 +4039,12 @@ def test_subagent_read_tools_are_runner_local() -> None:
     ],
 )
 @pytest.mark.parametrize("runner_features", [None, "-peer_session_messaging"])
+@pytest.mark.parametrize("lost_response", [False, True])
 async def test_sys_session_send_reuses_existing_child_session(
     monkeypatch: pytest.MonkeyPatch,
     subagent_args: str | dict[str, str],
     runner_features: str | None,
+    lost_response: bool,
 ) -> None:
     """
     Re-sending to the same ``(agent, title)`` continues the existing child.
@@ -4110,6 +4112,8 @@ async def test_sys_session_send_reuses_existing_child_session(
             return httpx.Response(200, json={"ok": True})
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_existing/events":
             event_posts.append(json.loads(request.content))
+            if lost_response:
+                raise httpx.ReadTimeout("accepted message response lost", request=request)
             return httpx.Response(200, json={"ok": True})
         return httpx.Response(404, json={"error": str(request.url)})
 
@@ -4140,7 +4144,10 @@ async def test_sys_session_send_reuses_existing_child_session(
     payload = json.loads(output)
     assert create_posts == 0, "continuation must not create a duplicate child session"
     assert payload["conversation_id"] == "conv_existing"
-    assert payload["status"] == "launching"
+    assert payload["status"] == ("delivery_unknown" if lost_response else "launching")
+    assert len(event_posts) == 1
+    if lost_response:
+        assert payload["input_id"] == event_posts[0]["data"]["stable_id"]
     assert "continued ok" not in payload["message"]
     assert event_posts[0]["created_by"] == "bob@example.com"
     assert event_posts[0]["data"]["content"][0]["text"] == "continue"
@@ -17603,10 +17610,11 @@ async def test_sys_cancel_task_on_paneless_subagent_mirror_never_reports_cancell
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
-    [None, "message-post"],
+    [None, "message-post", "lost-response"],
     ids=[
         "message-sent",
         "message-failed",
+        "response-lost",
     ],
 )
 async def test_sys_session_create_first_message_delivery_failures(failure: str | None) -> None:
@@ -17661,6 +17669,8 @@ async def test_sys_session_create_first_message_delivery_failures(failure: str |
             return httpx.Response(200, json={"ok": True})
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
             posted.append(json.loads(request.content))
+            if failure == "lost-response":
+                raise httpx.ReadTimeout("accepted first input response lost", request=request)
             if failure == "message-post":
                 return httpx.Response(500, json={"error": "events unavailable"})
             return httpx.Response(202, json={"queued": True})
@@ -17695,6 +17705,13 @@ async def test_sys_session_create_first_message_delivery_failures(failure: str |
     )
     handle = json.loads(output)
     assert handle["conversation_id"] == "conv_child", output
+    if failure == "lost-response":
+        assert handle["initial_message"]["status"] == "pending"
+        assert handle["initial_message"]["error"] == "delivery_unknown"
+        assert handle["initial_message"]["input_id"] == posted[0]["data"]["stable_id"]
+        assert entry is not None and entry.status == "launching"
+        assert "Do not create a replacement" in handle["initial_message"]["guidance"]
+        return
     if failure is not None:
         assert handle["initial_message"]["status"] in {"failed", "pending"}, output
         assert "Do not create a replacement" in handle["initial_message"]["guidance"]
@@ -17720,6 +17737,7 @@ async def test_created_child_readiness_survives_old_budget(
 
     clock = [1000.0]
     posts = 0
+    input_ids = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         nonlocal posts
@@ -17727,6 +17745,7 @@ async def test_created_child_readiness_survives_old_budget(
             clock[0] += 121
             return httpx.Response(200, json={"runner_online": True})
         posts += 1
+        input_ids.append(json.loads(request.content)["data"]["stable_id"])
         if posts == 1:
             return httpx.Response(503)
         return httpx.Response(202, json={"queued": True})
@@ -17746,6 +17765,7 @@ async def test_created_child_readiness_survives_old_budget(
                 is None
             )
         assert posts == 2
+        assert len(set(input_ids)) == 1
         assert clock[0] == 1121.0
     finally:
         tool_dispatch._SESSION_START_DEADLINE.reset(token)
@@ -17764,6 +17784,63 @@ async def test_readiness_does_not_reset_expired_chain(monkeypatch: pytest.Monkey
         client.get.assert_not_awaited()
     finally:
         tool_dispatch._SESSION_START_DEADLINE.reset(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [True, False])
+async def test_unknown_admission_does_not_fail_independent_native_execution(monkeypatch, native):
+    from omnigent.runner import app as runner_app
+
+    monkeypatch.setattr(runner_app, "is_native_harness", lambda _harness: native)
+    app = create_runner_app(
+        process_manager=_RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([])),
+        server_client=NullServerClient(),
+    )
+    queue = asyncio.Queue()
+    app.state.session_event_queues["child"] = queue
+    app.state.begin_turn_slot("child", {"turn_id": "response", "input_id": "input"})
+    app.state.live_response_id["child"] = "response"
+    app.state.on_proxy_stream_end(
+        "child",
+        owner_response_id="response",
+        error={"code": "input_execution_acceptance_unknown", "message": "receipt unavailable"},
+    )
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    assert any(
+        e.get("type") == "session.status" and e.get("status") == "failed" for e in events
+    ) is (not native)
+    app.state.session_event_queues.pop("child", None)
+
+
+@pytest.mark.asyncio
+async def test_child_send_lost_response_returns_identity_without_resend_or_teardown():
+    from omnigent.runner import tool_dispatch
+
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        raise httpx.ReadTimeout("response lost after acceptance", request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await tool_dispatch._send_to_descendant_session(
+                "child",
+                "work",
+                server_client=client,
+                snap_data={"parent_session_id": "parent", "title": "worker"},
+                created_by=None,
+            )
+        )
+    assert result["status"] == "delivery_unknown"
+    assert result["conversation_id"] == "child"
+    assert len(requests) == 1
+    assert result["input_id"] == json.loads(requests[0].content)["data"]["stable_id"]
+    assert result["handle_id"] == "child"
 
 
 @pytest.mark.asyncio

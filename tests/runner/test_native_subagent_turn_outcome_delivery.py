@@ -230,6 +230,47 @@ async def test_turn_completed_idle_delivers_completed_result(harness: str) -> No
 
 
 @pytest.mark.asyncio
+async def test_codex_interrupted_producer_does_not_correct_provisional_cancel(tmp_path):
+    from omnigent.harnesses.codex_native import forwarder as fwd
+    from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState, write_bridge_state
+    from tests.harnesses.codex_native.forwarder._support import _RecordingClient
+
+    rig = _Rig("codex-native")
+    try:
+        async with _runner_client(rig.app, permission_harness=rig.harness) as client:
+            await rig.create_child_session(client)
+            subagent_work.mark_subagent_work_terminal(rig.child_id, status="cancelled", output="")
+            assert [item["status"] for item in rig.drained()] == ["cancelled"]
+            write_bridge_state(
+                tmp_path,
+                CodexNativeBridgeState(
+                    session_id=rig.child_id,
+                    thread_id="thread",
+                    active_turn_id="turn",
+                    socket_path=str(tmp_path / "rpc.sock"),
+                    codex_home=str(tmp_path / "home"),
+                ),
+            )
+            edge = fwd._terminal_turn_status_edge(
+                tmp_path,
+                "turn/completed",
+                {
+                    "threadId": "thread",
+                    "turn": {"id": "turn", "status": "interrupted"},
+                },
+            )
+            producer = _RecordingClient()
+            await fwd._post_turn_status_edge(producer, rig.child_id, edge, bridge_dir=tmp_path)
+            for _url, body in producer.posts:
+                response = await rig.post_status(client, body["data"])
+                assert response.status_code == 204, response.text
+            assert not any(item["status"] == "completed" for item in rig.drained())
+            assert subagent_work.get_subagent_work(rig.child_id).status == "cancelled"
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
 async def test_quiescence_idle_for_legacy_native_harness_still_completes() -> None:
     """Harnesses without turn-outcome plumbing keep the idle -> completed mapping.
 

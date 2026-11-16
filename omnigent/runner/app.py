@@ -2637,12 +2637,13 @@ def create_runner_app(
         await _flush_control_receipts(reference.session_id)
 
     async def _resolve_receiver_input(
-        session_id: str, claim: InputExecutionClaim
+        session_id: str, claim: InputExecutionClaim, *, close: bool = True
     ) -> InputExecutionReceipt:
         try:
             response = await server_client.post(
                 f"/v1/sessions/{session_id}/input-admission/resolve",
                 json=claim.model_dump(mode="json"),
+                params={"close": str(close).lower()},
                 timeout=5,
             )
             response.raise_for_status()
@@ -2690,6 +2691,7 @@ def create_runner_app(
             return
         key = (session_id, frame.claim.input_id)
         expected = _input_execution_claims.get(key, ...)
+        started = time.monotonic()
         expected_epoch = _turn_bind_epoch.get(session_id)
         expected_response = _live_response_id.get(session_id)
         result = InputExecutionReceipt(reason="input_identity_conflict")
@@ -2717,8 +2719,19 @@ def create_runner_app(
                 if result.reason != "control_pending" or time.time() >= expected[1]:
                     break
                 await asyncio.sleep(0.05)
-            if result.state == "pending":
-                result = await _resolve_receiver_input(session_id, claim)
+            while result.state == "pending":
+                # Query the original attempt while its receiver is still waiting.
+                # Closing early would fence a valid in-flight admission write.
+                expired = time.time() >= expected[1]
+                result = await _resolve_receiver_input(session_id, claim, close=expired)
+                if result.state != "pending" or expired:
+                    break
+                if (
+                    _turn_bind_epoch.get(session_id) != expected_epoch
+                    or _live_response_id.get(session_id) != expected_response
+                ):
+                    break
+                await asyncio.sleep(0.25)
             current_turn = (
                 _turn_bind_epoch.get(session_id) == expected_epoch
                 and _live_response_id.get(session_id) == expected_response
@@ -2773,6 +2786,17 @@ def create_runner_app(
             timeout=5,
         )
         reply.raise_for_status()
+        _logger.info(
+            "Input receipt relay session=%s input_id=%s claim_id=%s remote_outcome=%s "
+            "reason=%s latency_s=%.3f matched=%s",
+            session_id,
+            frame.claim.input_id,
+            frame.claim_id,
+            result.state,
+            result.reason,
+            time.monotonic() - started,
+            reply.headers.get("X-Input-Claim-Matched", "unknown"),
+        )
         if result.state == "pending":
             _abandoned_input_executions[key] = _pending_input_executions.get(key, frame.claim)
         elif result.state != "reserved":
@@ -7384,6 +7408,11 @@ def create_runner_app(
         was_interrupted = conv_id in _interrupted_sessions
         # Suppress terminal only if desync recovery claimed the token for THIS generation's epoch.
         _suppress_status = _desync_terminalized.get(conv_id) == _turn_bind_epoch.get(conv_id, 0)
+        delivery_unknown = (
+            error is not None
+            and error.get("code") == "input_execution_acceptance_unknown"
+            and _is_native_harness(conv_id)
+        )
         if _suppress_status:
             _desync_terminalized.pop(conv_id, None)
         if was_interrupted or cancelled:
@@ -7395,6 +7424,10 @@ def create_runner_app(
         elif sign_in_hold:
             # Nothing failed: the queued message is sent once the sign-in completes.
             pass
+        elif delivery_unknown:
+            # The native CLI has its own lifecycle stream. A missing admission
+            # receipt cannot terminate that execution or deliver a false failure.
+            _logger.warning("Native input delivery remains unknown for %s", conv_id)
         elif error is not None:
             if not has_buffered or error.get("code") != "databricks_sign_in_pending":
                 # Only a refusal that ended the wait fails the queue behind it too; after
@@ -7475,6 +7508,8 @@ def create_runner_app(
                     status="cancelled",
                     output=None,
                 )
+        elif delivery_unknown:
+            pass
         elif error is not None:
             _mark_subagent_terminal_and_wake(
                 conv_id,

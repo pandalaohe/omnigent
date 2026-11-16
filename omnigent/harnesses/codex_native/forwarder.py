@@ -2157,6 +2157,9 @@ class _CodexTurnStatusEdge:
     selected_model: str | None = None
     parent_turn_consumed: bool = False
     on_delivered: Callable[[], None] | None = None
+    terminal_outcome: str | None = None
+    bridge_revision: int | None = None
+    bridge_thread_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -8085,19 +8088,51 @@ def _terminal_turn_status_edge(
     :returns: Terminal status edge, or ``None`` when the event is stale.
     """
     terminal_turn_id = _terminal_turn_id_from_params(params)
+    error = _terminal_error_from_turn(params)
+    vendor_status = _turn_status_from_params(params)
+    outcome = (
+        "failed"
+        if error is not None or _turn_status_is_failed(params) or method == "turn/failed"
+        else "completed"
+        if vendor_status == "completed"
+        else "cancelled"
+        if vendor_status in {"interrupted", "cancelled"}
+        else None
+    )
+    before = read_bridge_state(bridge_dir) if bridge_dir is not None else None
+    bridge_revision = None
+    bridge_thread_id = None
     # Child threads share the app-server but have no on-disk bridge of their own.
     if bridge_dir is not None and not clear_active_turn_id_if_matches(
-        bridge_dir, terminal_turn_id
+        bridge_dir, terminal_turn_id, terminal_outcome=outcome
     ):
         if not _terminal_turn_boundary_matches_idle_bridge(bridge_dir, params, terminal_turn_id):
             return None
+        current = read_bridge_state(bridge_dir)
+        if current is not None and current.last_terminal_turn_id not in {None, terminal_turn_id}:
+            return None
+        if current is not None and current.last_terminal_turn_id == terminal_turn_id:
+            if current.last_terminal_outcome != outcome:
+                return None
+            bridge_revision = current.active_turn_revision
+            bridge_thread_id = current.thread_id
         source = f"{method}:recovered"
     else:
+        if bridge_dir is not None and before is not None:
+            current = read_bridge_state(bridge_dir)
+            if (
+                current is None
+                or current.thread_id != before.thread_id
+                or current.active_turn_revision != before.active_turn_revision + 1
+                or current.active_turn_id is not None
+            ):
+                return None
+            bridge_revision = current.active_turn_revision
+            bridge_thread_id = current.thread_id
         source = method
     # A failed turn carries ``turn.error`` (or an ``error`` item) even when
     # Codex reports it via ``turn/completed`` ("silent success"). Force
     # ``failed`` and attach the error so the reason is surfaced downstream.
-    error = _terminal_error_from_turn(params)
     if error is not None:
         _logger.info(
             "Codex forwarder forcing failed status from turn.error: turn_id=%s method=%s kind=%s",
@@ -8110,6 +8145,9 @@ def _terminal_turn_status_edge(
             turn_id=terminal_turn_id,
             source=f"{source}:turn-error",
             error=error,
+            terminal_outcome=outcome,
+            bridge_revision=bridge_revision,
+            bridge_thread_id=bridge_thread_id,
         )
     if _turn_status_is_failed(params):
         _logger.info(
@@ -8121,6 +8159,9 @@ def _terminal_turn_status_edge(
             status="failed",
             turn_id=terminal_turn_id,
             source=f"{source}:turn-failed",
+            terminal_outcome=outcome,
+            bridge_revision=bridge_revision,
+            bridge_thread_id=bridge_thread_id,
         )
     if method == "turn/completed":
         if _turn_items_are_empty(params):
@@ -8138,6 +8179,9 @@ def _terminal_turn_status_edge(
         status="idle" if method == "turn/completed" else "failed",
         turn_id=terminal_turn_id,
         source=source,
+        terminal_outcome=outcome,
+        bridge_revision=bridge_revision,
+        bridge_thread_id=bridge_thread_id,
     )
 
 
@@ -10687,6 +10731,8 @@ async def _post_status(
     input_id: str | None = None,
     recovered: bool = False,
     native_generation: int | None = None,
+    turn_completed: bool = False,
+    turn_outcome: str | None = None,
 ) -> bool:
     """
     Publish a native Codex status edge.
@@ -10711,6 +10757,10 @@ async def _post_status(
     :returns: None.
     """
     data: _JsonObject = {"status": status}
+    if turn_completed:
+        data["turn_completed"] = True
+    if turn_outcome is not None:
+        data["turn_outcome"] = turn_outcome
     if native_generation is not None:
         data["native_generation"] = native_generation
     if turn_id is not None and turn_id != response_id:
@@ -10769,6 +10819,16 @@ async def _post_turn_status_edge(
     """
     if edge is None:
         return
+    if bridge_dir is not None and edge.bridge_revision is not None:
+        current = read_bridge_state(bridge_dir)
+        if (
+            current is None
+            or current.thread_id != edge.bridge_thread_id
+            or current.active_turn_revision != edge.bridge_revision
+            or current.last_terminal_turn_id != edge.turn_id
+            or current.last_terminal_outcome != edge.terminal_outcome
+        ):
+            return
     _logger.info(
         "Codex forwarder publishing turn status: source=%s turn_id=%s status=%s",
         edge.source,
@@ -10837,6 +10897,13 @@ async def _post_turn_status_edge(
             ),
             recovered=recovered,
             native_generation=native_generation,
+            turn_completed=(
+                edge.status == "idle"
+                and edge.turn_id is not None
+                and edge.terminal_outcome == "completed"
+                and (bridge_dir is None or edge.bridge_revision is not None)
+            ),
+            turn_outcome="cancelled" if edge.terminal_outcome == "cancelled" else None,
         )
         if delivered and forwarder_state is not None and edge.status == "failed":
             forwarder_state.turn_failure_surfaced = True

@@ -1317,17 +1317,22 @@ async def test_provider_token_command_failure_posts_without_codex_login_hint(
 @pytest.mark.asyncio
 async def test_post_turn_status_edge_clean_idle_has_no_output(
     caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
 ) -> None:
     """A normal idle edge (no error) posts status only — the success path."""
     client = _RecordingClient()
-    edge = fwd._CodexTurnStatusEdge(status="idle", turn_id="turn_123", source="turn/completed")
+    _seed_active_turn(tmp_path, "turn_123")
+    edge = fwd._terminal_turn_status_edge(
+        tmp_path, "turn/completed", _turn_completed("turn_123", "completed")["params"]
+    )
 
-    await fwd._post_turn_status_edge(client, "conv_x", edge)
+    await fwd._post_turn_status_edge(client, "conv_x", edge, bridge_dir=tmp_path)
 
     assert len(client.posts) == 1
     _url, body = client.posts[0]
     data = body["data"]
     assert data["status"] == "idle"
+    assert data["turn_completed"] is True
     assert "output" not in data
     assert "reauth_required" not in data
     assert not any(
@@ -1383,7 +1388,7 @@ async def test_terminal_status_publication_diagnostics(
     assert bridge is not None
     assert bridge.active_turn_id == ("newer_turn" if failure_phase == "stale" else None)
     assert client.posts == (
-        [_status_post({"status": "idle", "response_id": "codex_turn_123"})]
+        [_status_post({"status": "idle", "response_id": "codex_turn_123", "turn_completed": True})]
         if failure_phase == "after_status"
         else []
     )
@@ -1767,7 +1772,9 @@ async def test_system_error_during_a_turn_waits_for_the_turn_outcome(tmp_path: P
 
     await _deliver_to_parent(client, tmp_path, state, _turn_completed("turn_1", "completed"))
 
-    assert client.posts == [_status_post({"status": "idle", "response_id": "codex_turn_1"})]
+    assert client.posts == [
+        _status_post({"status": "idle", "response_id": "codex_turn_1", "turn_completed": True})
+    ]
 
 
 @pytest.mark.asyncio
@@ -1835,7 +1842,7 @@ async def test_system_error_after_a_new_turn_is_reported_again(tmp_path: Path) -
     assert client.posts == [
         _status_post({"status": "failed", "response_id": "codex_turn_1"}),
         _status_post({"status": "running", "response_id": "codex_turn_2"}),
-        _status_post({"status": "idle", "response_id": "codex_turn_2"}),
+        _status_post({"status": "idle", "response_id": "codex_turn_2", "turn_completed": True}),
         _status_post({"status": "failed", "output": _SYSTEM_ERROR_OUTPUT}),
     ]
 
