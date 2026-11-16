@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import math
 import re
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Annotated
 
+from cachetools import TTLCache
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr
 from pydantic.alias_generators import to_camel
 
@@ -137,8 +139,20 @@ class ExternalRefusal:
 class ExternalAdmissionState:
     exclusions: dict[Scope, ExternalRefusal] = field(default_factory=dict)
     pending: dict[tuple[str, str], ExternalRefusal] = field(default_factory=dict)
+    terminal_statuses: TTLCache[tuple[str, str], str] = field(
+        default_factory=lambda: TTLCache(maxsize=4096, ttl=600)
+    )
+    terminal_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def terminal_status(self, key: tuple[str, str], status: str | None = None) -> str | None:
+        with self.terminal_lock:
+            if status is not None:
+                self.terminal_statuses.setdefault(key, status)
+            return self.terminal_statuses.get(key)
 
     def prune(self, now: float) -> None:
+        with self.terminal_lock:
+            self.terminal_statuses.expire()
         self.exclusions = {key: item for key, item in self.exclusions.items() if item.until > now}
         self.pending = {key: item for key, item in self.pending.items() if item.until > now}
 
@@ -149,6 +163,8 @@ class ExternalAdmissionState:
         readings: Mapping[str, UsageAccountView] | None,
         floors: Mapping[str, FloorOff] | None,
         now: float,
+        *,
+        saved_settings: SessionChoice | None = None,
     ) -> dict[str, float]:
         self.prune(now)
         result = {}
@@ -156,15 +172,18 @@ class ExternalAdmissionState:
             owner, host, agent = scope
             if (owner, host) != (request.owner, request.host):
                 continue
-            rule = external_admission_for(settings, host, agent)
+            live = saved_settings if request.preview else settings
+            if live is None:
+                # Without saved settings, a draft cannot prove recovery.
+                result[agent] = item.until
+                continue
+            rule = external_admission_for(live, host, agent)
             if rule is None or rule != item.rule:
                 if not request.preview:
                     self.exclusions.pop(scope, None)
                 continue
             if readings is not None and floors is not None:
-                states = route_states(
-                    rule, settings, readings, floors, now, request.provider_groups
-                )
+                states = route_states(rule, live, readings, floors, now, request.provider_groups)
                 if item.states is not None and states != item.states:
                     if not request.preview:
                         self.exclusions.pop(scope, None)

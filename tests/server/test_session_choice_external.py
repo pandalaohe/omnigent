@@ -1,9 +1,12 @@
 """External admission delegates stops and contains failed-child exclusions to one host."""
 
+import asyncio
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
+from itertools import count
 from unittest.mock import AsyncMock
 
 import pytest
@@ -525,14 +528,213 @@ def test_scope_isolation_models_and_config_removal():
         )
         == {}
     )
-    assert (
-        state.external_admission.active(
-            parse_session_choice(document()), replace(request, preview=True), {}, {}, 1000
-        )
-        == {}
-    )
+    assert state.external_admission.active(
+        parse_session_choice(document()), replace(request, preview=True), {}, {}, 1000
+    ) == {"agent-a": 1600}
     assert state.external_admission.active(settings, request, {}, {}, 1000) == {"agent-a": 1600}
     assert (
         state.external_admission.active(parse_session_choice(document()), request, {}, {}, 1000)
         == {}
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draft_change", ["remove", "disable", "duration", "threshold"])
+async def test_draft_preview_keeps_saved_exclusion(quota_runner, monkeypatch, draft_change):
+    from omnigent.server.session_choice_external import ExternalRefusal
+
+    env = quota_runner
+    now = int(time.time())
+    monkeypatch.setattr("omnigent.server.session_choice_runtime.time.time", lambda: now)
+    env.settings["limits"]["route-a"] = {
+        "reserve": {"mode": "total", "window": "weekly", "stopPct": 5}
+    }
+    env.app.state.agent_quota_service.report_account(
+        RESERVED_USER_LOCAL,
+        "route-a",
+        usage_report(
+            account_product="codex",
+            observed_at=now,
+            windows=[
+                {
+                    "id": "weekly",
+                    "percent_used": 50,
+                    "window_minutes": 10080,
+                    "resets_at": now + 3600,
+                }
+            ],
+        ),
+        now=now,
+    )
+    save_external(env)
+    saved = parse_session_choice(env.settings)
+    scope = (RESERVED_USER_LOCAL, HOST, env.agents[0]["id"])
+    from omnigent.server.session_choice import state_for
+
+    state = state_for(env.app)
+    original = ExternalRefusal(scope, saved.external_admission[0], now + 600, (("route-a", "ok"),))
+    state.external_admission.exclusions[scope] = original
+    draft = choice_document(saved)
+    if draft_change == "remove":
+        draft["externalAdmission"] = []
+    elif draft_change == "disable":
+        draft["externalAdmission"][0]["admittedByRouter"] = False
+    elif draft_change == "duration":
+        draft["externalAdmission"][0]["defaultExclusionSeconds"] = 42
+    else:
+        draft["limits"]["route-a"] = {
+            "reserve": {"mode": "total", "window": "weekly", "stopPct": 60}
+        }
+    context = await context_request(
+        env.app, RESERVED_USER_LOCAL, HOST, parse_session_choice(draft), env.parent, preview=True
+    )
+    assert context.link_exclusions == {env.agents[0]["id"]: now + 600}
+    assert state.external_admission.exclusions[scope] == original
+
+
+@pytest.mark.asyncio
+async def test_selection_preview_preserves_tile_change_projection(quota_runner, monkeypatch):
+    from omnigent.server.session_choice import state_for
+    from omnigent.server.session_choice_external import ExternalRefusal
+
+    env = quota_runner
+    now = int(time.time())
+    monkeypatch.setattr("omnigent.server.session_choice_runtime.time.time", lambda: now)
+    save_external(env)
+    settings = parse_session_choice(env.settings)
+    state = state_for(env.app)
+    scope = (RESERVED_USER_LOCAL, HOST, env.agents[0]["id"])
+    original = ExternalRefusal(
+        scope, settings.external_admission[0], now + 600, (("route-a", "stop"),)
+    )
+    state.external_admission.exclusions[scope] = original
+    context = await context_request(
+        env.app, RESERVED_USER_LOCAL, HOST, settings, env.parent, preview=True
+    )
+    assert context.link_exclusions == {}
+    choice = state.select(settings, "implementation", context, {}, {}, {}, now=now)
+    assert not any(item.why == "excluded" for item in choice.skipped)
+    assert state.external_admission.exclusions[scope] == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["failed", "idle"])
+@pytest.mark.parametrize("overlap", [False, True])
+async def test_terminal_during_error_snapshot_is_not_lost(
+    quota_runner, monkeypatch, terminal, overlap
+):
+    from omnigent.server import session_choice_runtime as runtime
+    from omnigent.server.session_choice import state_for
+
+    env = quota_runner
+    save_external(env)
+    first = (await create(env)).json()
+    session = env.store.get_conversation(first["id"])
+    reached, release = asyncio.Event(), asyncio.Event()
+    real_to_thread = asyncio.to_thread
+
+    async def gated_to_thread(function, *args, **kwargs):
+        if function is runtime.external_route_inputs:
+            reached.set()
+            await release.wait()
+        return await real_to_thread(function, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", gated_to_thread)
+
+    async def finish():
+        await observe_external_admission(
+            env.app,
+            session,
+            None,
+            actor=None,
+            from_runner=True,
+            response_id="turn",
+            status=terminal,
+        )
+
+    if not overlap:
+        await finish()
+    staging = asyncio.create_task(
+        observe_external_admission(
+            env.app, session, HEADER, actor=None, from_runner=True, response_id="turn"
+        )
+    )
+    try:
+        if overlap or terminal == "failed":
+            await asyncio.wait_for(reached.wait(), 5)
+        if overlap:
+            await finish()
+    finally:
+        release.set()
+        await staging
+    state = state_for(env.app).external_admission
+    scope = (RESERVED_USER_LOCAL, HOST, env.agents[0]["id"])
+    assert (scope in state.exclusions) == (terminal == "failed")
+    assert (session.id, "turn") not in state.pending
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reclaim", ["expiry", "capacity"])
+async def test_terminal_receipts_are_bounded_without_replaying_exclusions(
+    quota_runner, monkeypatch, reclaim
+):
+    from cachetools import TTLCache
+
+    from omnigent.server.session_choice import state_for
+
+    env = quota_runner
+    save_external(env)
+    first = (await create(env)).json()
+    session = env.store.get_conversation(first["id"])
+    state = state_for(env.app).external_admission
+    clock = [0.0]
+    state.terminal_statuses = TTLCache(maxsize=2, ttl=600, timer=lambda: clock[0])
+
+    async def observe(response, message=None, status=None):
+        await observe_external_admission(
+            env.app,
+            session,
+            message,
+            actor=None,
+            from_runner=True,
+            response_id=response,
+            status=status,
+        )
+
+    await observe("failed-turn", HEADER, "failed")
+    scope = (RESERVED_USER_LOCAL, HOST, env.agents[0]["id"])
+    original = state.exclusions[scope]
+    await observe("successful-turn", status="idle")
+    if reclaim == "expiry":
+        clock[0] = 601
+        state.prune(time.time())
+        assert not state.terminal_statuses
+    else:
+        for number in range(3):
+            await observe(f"other-{number}", status="idle")
+        assert len(state.terminal_statuses) == 2
+    assert (session.id, "successful-turn") not in state.terminal_statuses
+    await observe("successful-turn", HEADER)
+    assert state.exclusions[scope] == original
+    await observe("failed-turn", HEADER, "failed")
+    assert state.exclusions[scope] == original
+
+
+def test_terminal_receipts_support_concurrent_expiry_and_updates():
+    from cachetools import TTLCache
+
+    from omnigent.server.session_choice_external import ExternalAdmissionState
+
+    ticks = count()
+    state = ExternalAdmissionState(
+        terminal_statuses=TTLCache(maxsize=16, ttl=4, timer=lambda: next(ticks))
+    )
+
+    def observe(index):
+        for turn in range(100):
+            state.terminal_status((str(index), str(turn)), "idle")
+            state.prune(1000)
+
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        list(workers.map(observe, range(8)))
+    assert len(state.terminal_statuses) <= 16

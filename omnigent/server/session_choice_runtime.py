@@ -582,8 +582,9 @@ async def observe_external_admission(
     state = choice_state.external_admission
     state.prune(now)
     key = (session.id, response_id or "")
+    terminal = state.terminal_status(key, status) if response_id else status
     pending = state.pending.get(key) if response_id else None
-    if status is not None and status != "failed":
+    if terminal is not None and terminal != "failed":
         state.pending.pop(key, None)
         return
     identity = (
@@ -611,7 +612,11 @@ async def observe_external_admission(
         pending = ExternalRefusal(scope, rule, until, states)
     if identity in choice_state.quota_rejections:
         return
-    if status is None:
+    terminal = state.terminal_status(key) if response_id else status
+    if terminal is not None and terminal != "failed":
+        state.pending.pop(key, None)
+        return
+    if terminal is None:
         if response_id and pending is not None:
             state.pending.setdefault(key, pending)
         return
@@ -650,7 +655,18 @@ def external_link_exclusions(app, settings, request, now):
         if any(scope[:2] == (request.owner, request.host) for scope in state.exclusions)
         else (None, None)
     )
-    return state.active(settings, request, readings, floors, now)
+    saved = (
+        _read(
+            app,
+            request.owner,
+            "external admission",
+            lambda: choice_settings(app, request.owner),
+            None,
+        )
+        if request.preview
+        else None
+    )
+    return state.active(settings, request, readings, floors, now, saved_settings=saved)
 
 
 def _read(app: Any, owner: str, name: str, operation: Any, default: Any):

@@ -723,7 +723,7 @@ class ChoiceRequest:
     quota_tiers: QuotaTiers = field(default_factory=QuotaTiers)
     # Model identities include route prefixes; None selects all models of an agent.
     quota_periods: Mapping[tuple[str, str | None], str] = field(default_factory=dict)
-    link_exclusions: Mapping[str, float] = field(default_factory=dict)
+    link_exclusions: Mapping[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -841,7 +841,7 @@ def check_candidate_limits(
     settings, work_type, link, request, readings, running, floor_off, now, *, user_named=False
 ) -> Skipped | None:
     link = _candidate_link(settings, link, request)
-    if (until := request.link_exclusions.get(link.agent_id, 0)) > now:
+    if (until := (request.link_exclusions or {}).get(link.agent_id, 0)) > now:
         return Skipped(link, "excluded", until)
     if (
         settings.schema_version == 2
@@ -1440,10 +1440,11 @@ class ChoiceState:
         now: float,
     ) -> Choice:
         readings = self.quota_readings(request.owner, readings, now, request.provider_groups)
-        request = replace(
-            request,
-            link_exclusions=self.external_admission.active(settings, request, None, None, now),
-        )
+        if request.link_exclusions is None:
+            request = replace(
+                request,
+                link_exclusions=self.external_admission.active(settings, request, None, None, now),
+            )
         counters = self.counters
         if request.preview:
             preview_state = ChoiceState()
