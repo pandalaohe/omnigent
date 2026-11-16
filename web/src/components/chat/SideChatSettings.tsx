@@ -39,6 +39,16 @@ import { parentIdFromLabels } from "@/lib/sessionHost";
 import { sideChatSettingsMutationKey, type SideChatModelSettings } from "@/lib/sideChat";
 import type { Session } from "@/lib/types";
 
+function catalogSource(session: Session, parent?: Session | null) {
+  return JSON.stringify([
+    session.hostId ?? parent?.hostId ?? null,
+    session.agentId,
+    session.harness ?? null,
+    session.labels?.["omnigent.wrapper"] ?? null,
+    !!session.inferenceConfigured,
+  ]);
+}
+
 /** Model controls always address this pane's session, independent of the active main chat. */
 export function SideChatSettings({
   session,
@@ -79,19 +89,21 @@ export function SideChatSettings({
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
+  const source = catalogSource(session, parent);
   const catalog = useQuery({
-    queryKey: [
-      "session-model-options",
-      session.id,
-      session.hostId,
-      session.agentId,
-      session.harness,
-    ],
+    queryKey: ["session-model-options", session.id, source],
     queryFn: async () => {
       const models = await refreshSessionModelOptions(session.id, "force");
-      queryClient.setQueryData<Session>(["session", session.id], (current) =>
-        current && models.length > 0 ? { ...current, codexModelOptions: models } : current,
-      );
+      queryClient.setQueryData<Session>(["session", session.id], (current) => {
+        if (!current || !models.length) return current;
+        const parentId = current.parentSessionId ?? parentIdFromLabels(current.labels);
+        const currentParent = parentId
+          ? queryClient.getQueryData<Session>(["session", parentId])
+          : undefined;
+        return catalogSource(current, currentParent) === source
+          ? { ...current, codexModelOptions: models }
+          : current;
+      });
       return models;
     },
     enabled: configOpen && !draft && !session.inferenceConfigured,

@@ -378,6 +378,7 @@ from omnigent.util.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     EFFORT_VALUES,
     validate_effort,
+    validate_effort_for_harness,
 )
 from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
@@ -6622,17 +6623,28 @@ def register_core_routes(
                 requested_codex_collaboration_mode
             )
         effort = body.reasoning_effort
+        effort_harness = None
         dynamic_effort = False
         if "reasoning_effort" in body.model_fields_set:
+            from omnigent.harness_capabilities import EffortFamily
+            from omnigent.harness_plugins import harness_capabilities
+            from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
+
             effort_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if effort_conv is None:
                 raise _session_not_found()
             effort_harness = _resolve_harness(
                 effort_conv, agent_store=agent_store, agent_cache=agent_cache
             )
-            dynamic_effort = effort_harness == "acp" or bool(
-                effort_harness and effort_harness.startswith("acp:")
+            native_agent = native_coding_agent_for_wrapper_label(
+                effort_conv.labels.get("omnigent.wrapper")
             )
+            if native_agent is not None:
+                effort_harness = native_agent.harness
+            capabilities = harness_capabilities().get(effort_harness or "")
+            dynamic_effort = (
+                capabilities is not None and capabilities.effort is EffortFamily.DYNAMIC
+            ) or bool(effort_harness and effort_harness.startswith("acp:"))
         clear_effort = (
             (effort is None and "reasoning_effort" in body.model_fields_set)
             if dynamic_effort
@@ -6641,10 +6653,10 @@ def register_core_routes(
         )
         if effort is not None and not clear_effort:
             try:
-                effort = validate_effort(
-                    effort,
-                    "session metadata",
-                    None if dynamic_effort else EFFORT_VALUES,
+                effort = (
+                    validate_effort(effort, "session metadata", None)
+                    if dynamic_effort
+                    else validate_effort_for_harness(effort, effort_harness)
                 )
             except ValueError as exc:
                 raise OmnigentError(

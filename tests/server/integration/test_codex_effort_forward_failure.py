@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import uuid
 from collections.abc import AsyncIterator
@@ -806,3 +807,49 @@ async def test_sdk_settings_persist_for_next_turn(client, db_uri, harness, child
     reset = await client.patch(f"/v1/sessions/{sid}", json={"reasoning_effort": None})
     assert reset.status_code == 200, reset.text
     assert SqlAlchemyConversationStore(db_uri).get_conversation(sid).reasoning_effort is None
+
+
+@pytest.mark.parametrize("harness,effort", [("claude-sdk", "none"), ("cursor", "high")])
+async def test_settings_reject_unsupported_harness_effort(client, db_uri, harness, effort):
+    from omnigent.runner.session_projects import execute_session_update
+
+    agent = await create_test_agent(client)
+    created = await client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "harness_override": harness}
+    )
+    assert created.status_code == 201, created.text
+    sid = created.json()["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    before = store.get_conversation(sid)
+    response = await client.patch(
+        f"/v1/sessions/{sid}",
+        json={"reasoning_effort": effort, "model_override": "another-model"},
+    )
+    assert response.status_code == 400, response.text
+    assert "reasoning_effort" in response.text
+    assert harness in response.text
+    result = json.loads(
+        await execute_session_update({"session_id": sid, "reasoning_effort": effort}, client, sid)
+    )
+    assert "error" in result
+    assert "reasoning_effort" in result["error"]
+    after = store.get_conversation(sid)
+    assert after.reasoning_effort == before.reasoning_effort
+    assert after.model_override == before.model_override
+
+
+@pytest.mark.parametrize("harness", ["acp", "grok", "jcode"])
+async def test_settings_preserve_dynamic_effort_and_null_reset(client, db_uri, harness):
+    agent = await create_test_agent(client)
+    created = await client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "harness_override": harness}
+    )
+    assert created.status_code == 201, created.text
+    sid = created.json()["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    response = await client.patch(f"/v1/sessions/{sid}", json={"reasoning_effort": "deliberate"})
+    assert response.status_code == 200, response.text
+    assert store.get_conversation(sid).reasoning_effort == "deliberate"
+    reset = await client.patch(f"/v1/sessions/{sid}", json={"reasoning_effort": None})
+    assert reset.status_code == 200, reset.text
+    assert store.get_conversation(sid).reasoning_effort is None

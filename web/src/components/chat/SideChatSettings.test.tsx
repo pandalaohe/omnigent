@@ -752,3 +752,61 @@ it("keeps an empty SDK child catalog reachable and retries a failed load", async
     expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", { modelOverride: "host-model" }),
   );
 });
+
+it.each<Partial<Session>>([
+  { hostId: "host-b" },
+  { agentId: "new-agent" },
+  { harness: "claude-sdk" },
+  { labels: { ...child.labels, "omnigent.wrapper": "another-wrapper" } },
+  { inferenceConfigured: true },
+])("ignores a late catalog after the source changes: %j", async (updates) => {
+  let resolveOld!: (models: NativeModelOption[]) => void;
+  let resolveNew!: (models: NativeModelOption[]) => void;
+  const refresh = vi
+    .mocked(sessionsApi.refreshSessionModelOptions)
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveOld = resolve;
+        }),
+    )
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveNew = resolve;
+        }),
+    );
+  mount({ ...child, hostId: "host-a" });
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Side chat model and effort" }));
+  await user.click(screen.getByTestId("side-chat-model-edit"));
+  await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+  const newModels = [{ id: "new-model", displayName: "New host model" }];
+  act(() => {
+    cache.setQueryData(["session", "side"], {
+      ...child,
+      hostId: "host-a",
+      ...updates,
+      codexModelOptions: newModels,
+    });
+  });
+  if (!updates.inferenceConfigured) {
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      resolveNew(newModels);
+    });
+  }
+  if (!updates.labels) {
+    expect(await screen.findByRole("menuitemcheckbox", { name: "New host model" })).toBeEnabled();
+  }
+  await act(async () => {
+    resolveOld([{ id: "old-model", displayName: "Old host model" }]);
+  });
+  expect(cache.getQueryData<Session>(["session", "side"])?.codexModelOptions).toEqual(newModels);
+  if (!updates.labels) {
+    expect(screen.getByRole("menuitemcheckbox", { name: "New host model" })).toBeEnabled();
+  }
+  expect(
+    screen.queryByRole("menuitemcheckbox", { name: "Old host model" }),
+  ).not.toBeInTheDocument();
+});
