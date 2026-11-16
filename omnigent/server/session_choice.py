@@ -850,11 +850,21 @@ def candidate_quota(
     now: float,
 ) -> AgentQuota | None:
     """Project fresh pool windows through an exception without changing the shared view."""
-    period = candidate_period(request, link.agent_id, link.model)
+    model = link.model or request.default_models.get(link.agent_id)
+    period = candidate_period(request, link.agent_id, model)
     if period is None or reading is None or reading.freshness != "fresh":
         return None
+    # An explicit bucket ID wins; semantic periods can cover several buckets.
+    selected = [window for window in reading.windows if window.id == period]
+    if not selected:
+        selected = [
+            window
+            for window in reading.windows
+            if window.id.partition(" (")[0] == period
+            or (window.label or "").partition(" (")[0] == period
+        ]
     windows = []
-    for window in reading.windows:
+    for window in selected:
         if window.percent_used is None or window.window_minutes is None or window.past_reset:
             continue
         windows.append(
@@ -866,7 +876,7 @@ def candidate_quota(
                 now,
             )
         )
-    return agent_quota(windows, request.quota_tiers, now, deciding_period=period)
+    return agent_quota(windows, request.quota_tiers, now)
 
 
 def resolved_link(link: Link, request: ChoiceRequest) -> Link:

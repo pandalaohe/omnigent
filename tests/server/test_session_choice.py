@@ -1664,6 +1664,57 @@ def test_route_pin_candidate_matches_only_the_exact_model_period(route, pool):
     assert (picked.pool, picked.link.model) == (pool, f"{route}/gpt-small")
 
 
+@pytest.mark.parametrize("period", ["5h", "codex-primary", "relay-primary"])
+def test_period_exception_matches_native_labels_and_preserves_bucket_ids(db_uri, period):
+    from omnigent.server.agent_quota import QuotaContext
+    from tests.server.test_agent_quota import service_with_store, usage_report
+
+    service = service_with_store(db_uri)
+    service.report_account(OWNER, "codex-pro", usage_report(account_product="codex"), now=NOW)
+    service.report(
+        OWNER,
+        "host-a",
+        "codex",
+        {
+            "captured_at": NOW + 1,
+            "limits": [
+                {
+                    "limit_id": bucket,
+                    "windows": [
+                        {
+                            "kind": "primary",
+                            "used_percent": used,
+                            "window_duration_mins": 300,
+                            "resets_at": NOW + 1 + 18000,
+                        }
+                    ],
+                }
+                for bucket, used in (("codex", 90), ("relay", 65))
+            ],
+        },
+        now=NOW + 1,
+    )
+    quotas = service.pool_readings(QuotaContext(OWNER, "host-a"), now=NOW + 1)
+    assert [(w.id, w.label) for w in quotas["codex-pro"].windows] == [
+        ("codex-primary", "5h"),
+        ("relay-primary", "5h"),
+    ]
+    # The other pool's tight reading beats low quota, but loses a weighted tie.
+    quotas["other"] = reading("other", state="tight", pace=35)
+    first = {"agent": "agent-0", "model": "official/gpt-large"}
+    second = {"agent": "agent-1", "model": "model-1", "meter": "other"}
+    request = period_request(
+        products={"agent-0": "codex"},
+        quota_periods={("agent-0", "official/gpt-large"): period},
+    )
+    picked = pick(shared_pool(first, second), readings=quotas, request=request, now=NOW + 1)
+    assert picked.link.agent_id == ("agent-0" if period == "relay-primary" else "agent-1")
+    warning = pick(shared_pool(first), readings=quotas, request=request, now=NOW + 1)
+    assert warning.warnings == (
+        () if period == "relay-primary" else ("codex-pro may not last until its reset",)
+    )
+
+
 def test_candidate_period_keeps_the_owners_custom_tiers():
     from omnigent.quota_pace import QuotaTiers
 

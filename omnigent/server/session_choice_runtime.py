@@ -624,11 +624,7 @@ def _context_request(
     products: dict[str, str | None] = {}
     harnesses: dict[str, str | None] = {}
     default_models: dict[str, str | None] = {}
-    default_agents = {
-        link.agent_id
-        for link in ordered_links(settings)
-        if link.model is None and link.meter in {"codex-pro", "krill"}
-    }
+    default_agents = {link.agent_id for link in ordered_links(settings) if link.model is None}
     unavailable = set()
     host_store = getattr(app.state, "host_store", None)
     host_row = host_store.get_host(host) if host_store is not None else None
@@ -652,7 +648,7 @@ def _context_request(
         harness = _resolve_harness_impl(probe, agent_store=agents, agent_cache=cache, agent=agent)
         harnesses[agent_id] = harness
         products[agent_id] = agent_key_for_harness(harness)
-        if products[agent_id] == "codex" and agent_id in default_agents:
+        if agent_id in default_agents:
             default_models[agent_id] = _resolve_llm_model(
                 probe, agent_store=agents, agent_cache=cache
             )

@@ -1613,8 +1613,9 @@ async def test_owner_read_failure_only_blocks_a_possibly_matching_scope(
 @pytest.mark.parametrize(
     "route,pool_id", [(None, "pool-0"), ("official", "codex-pro"), ("krill", "krill")]
 )
+@pytest.mark.parametrize("omit_model", [False, True])
 async def test_persisted_period_rule_reaches_create_choice(
-    choice_env, monkeypatch, route, pool_id
+    choice_env, monkeypatch, route, pool_id, omit_model
 ):
     from omnigent.server.session_choice import state_for
     from omnigent.usage.contract import UsageAccountView, UsageWindowView
@@ -1630,6 +1631,14 @@ async def test_persisted_period_rule_reaches_create_choice(
         {"agent": agent["id"], "model": f"{route}/{model}" if route else model, "meter": pool_id}
         for agent, model in zip(env.agents, ("model-a", "model-b"), strict=True)
     ]
+    default_models = {link["agent"]: link["model"] for link in links}
+    if omit_model:
+        monkeypatch.setattr(
+            "omnigent.server.routes._sessions.helpers._resolve_llm_model",
+            lambda session, **kwargs: default_models.get(session.agent_id) if session else None,
+        )
+        for link in links:
+            link.pop("model")
     env.settings["strategy"] = "balance"
     env.settings["limits"] = {}
     for index, link in enumerate(links):
@@ -1688,10 +1697,20 @@ async def test_persisted_period_rule_reaches_create_choice(
     assert plain.json()["agent_id"] == env.agents[0]["id"]
 
     state_for(env.app).counters.clear()
-    rule = {"agent": env.agents[0]["id"], "model": links[0]["model"], "period": "5h"}
-    env.prefs.patch_namespace(RESERVED_USER_LOCAL, "session_collab", {"quotaPeriodRules": [rule]})
+    rule = {
+        "agent": env.agents[0]["id"],
+        "model": default_models[env.agents[0]["id"]],
+        "period": "5h",
+    }
+    env.prefs.patch_namespace(
+        RESERVED_USER_LOCAL,
+        "session_collab",
+        {"quotaPeriodRules": [{"agent": rule["agent"], "period": "7d"}, rule]},
+    )
     scoped = await create(env)
     assert scoped.status_code == 201, scoped.text
     assert scoped.json()["agent_id"] == env.agents[1]["id"]
-    assert scoped.json()["model_override"] == links[1]["model"]
+    assert scoped.json()["model_override"] == (
+        None if omit_model and route is None else default_models[env.agents[1]["id"]]
+    )
     assert scoped.json()["session_choice"]["pool"] == pool_id
