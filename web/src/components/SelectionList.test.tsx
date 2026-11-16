@@ -53,6 +53,16 @@ function Picker({ initial }: { initial: MultiValue }) {
 afterEach(cleanup);
 
 describe("SelectionList", () => {
+  it("opens, filters and removes marked members", () => {
+    render(<Picker initial={{ mode: "only", ids: ["alpha", "beta"] }} />);
+    fireEvent.click(screen.getByRole("button", { name: "Selected: 2" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Search Selected" }), {
+      target: { value: "beta" },
+    });
+    expect(screen.getByText("Showing 1 of 2")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Remove Beta" }));
+    expect(screen.getByTestId("selection")).not.toHaveTextContent("beta");
+  });
   it("limits bulk actions to shown eligible rows and groups skipped projects", () => {
     render(<Picker initial={{ mode: "except", ids: ["alpha", "beta"] }} />);
     expect(screen.getByText(/skipped 1/)).toBeInTheDocument();

@@ -160,7 +160,9 @@ function CountRow({
   const overLimit = maxIdleClis !== null && stats.idle > maxIdleClis;
   return (
     <tr className="border-b last:border-b-0">
-      <td className="py-1.5 pr-3">{familyLabel(family)}</td>
+      <td className="truncate py-1.5 pr-3" title={familyLabel(family)}>
+        {familyLabel(family)}
+      </td>
       <td className="py-1.5 pr-3 text-right tabular-nums">
         {stats.idle} / {maxIdleClis === null ? "No limit" : maxIdleClis}
       </td>
@@ -503,7 +505,17 @@ export function CliRetentionFold({ host }: { host: Host }) {
             </div>
             {response.configured && families.length > 0 ? (
               <div className="overflow-x-auto rounded-lg border px-3">
-                <table className="w-full text-sm" data-testid="cli-family-table">
+                <table
+                  className="w-full min-w-[620px] table-fixed text-sm"
+                  data-testid="cli-family-table"
+                >
+                  <colgroup>
+                    <col style={{ width: "24%" }} />
+                    <col style={{ width: "19%" }} />
+                    <col style={{ width: "17%" }} />
+                    <col style={{ width: "20%" }} />
+                    <col style={{ width: "20%" }} />
+                  </colgroup>
                   <thead>
                     <tr className="border-b text-sm text-muted-foreground">
                       <th className="py-1.5 pr-3 text-left font-medium">CLI</th>

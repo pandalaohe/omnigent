@@ -58,7 +58,7 @@ export function LayerGrid({
         className="w-full rounded-md px-3 py-2 text-left enabled:hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default"
         aria-label={`Edit ${title}`}
       >
-        <span className="block text-sm font-medium">
+        <span className="block truncate text-sm font-medium" title={title}>
           {layerShape(key) === "independent" ? "Independent" : title}
         </span>
         <span className="text-xs text-muted-foreground">
@@ -94,7 +94,17 @@ export function LayerGrid({
           : `An independent cell replaces only these ${role} instructions. Shared instructions still apply.`}
       </p>
       <div className="max-h-[32rem] overflow-auto rounded-lg border">
-        <table className="w-full border-collapse text-left">
+        <table
+          className="w-full table-fixed border-collapse text-left"
+          style={{ minWidth: `${180 + hosts.length * 220 + 140}px` }}
+        >
+          <colgroup>
+            <col style={{ width: 180 }} />
+            {hosts.map((host) => (
+              <col key={host.host_id} style={{ width: 220 }} />
+            ))}
+            <col style={{ width: 140 }} />
+          </colgroup>
           <caption className="sr-only">
             {role === "route"
               ? "Instruction layers by host and agent"

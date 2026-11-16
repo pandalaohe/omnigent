@@ -3,6 +3,7 @@ import { useEffect, useState, type ReactElement, type ReactNode } from "react";
 
 import { HelpTip } from "@/components/HelpTip";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { LayeredLevel } from "@/lib/layeredValues";
 import { cn } from "@/lib/utils";
 
@@ -160,6 +161,21 @@ function LevelState({ children, mark }: { children: ReactNode; mark?: boolean })
   );
 }
 
+function LevelLabel({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="block min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">
+            {children}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent>{label}</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
 const LEVEL_CELL = "h-px border-b border-border bg-background p-0 text-left align-top font-normal";
 const FIRST_COLUMN = "sticky left-0 min-w-34 max-w-34 border-r md:min-w-50 md:max-w-none";
 const BODY_COLUMN = "min-w-37.5";
@@ -242,7 +258,7 @@ export function LayeredTable({
       <button
         type="button"
         aria-label={summary ? `${ariaLabel}: ${summary}` : ariaLabel}
-        title={summary}
+        title={summary ? `${ariaLabel}: ${summary}` : ariaLabel}
         aria-pressed={selecting ? isSelected : undefined}
         disabled={selecting && levels?.length === 0}
         data-testid={cellTestId}
@@ -300,8 +316,15 @@ export function LayeredTable({
       <div className="max-w-full overflow-x-auto rounded-lg border border-border">
         <table
           aria-label={label}
-          className="w-full min-w-max border-separate border-spacing-0 text-sm"
+          className="w-full table-fixed border-separate border-spacing-0 text-sm"
+          style={{ minWidth: `${200 + columns.length * 180}px` }}
         >
+          <colgroup>
+            <col style={{ width: 200 }} />
+            {columns.map((col) => (
+              <col key={col.id} style={{ width: 180 }} />
+            ))}
+          </colgroup>
           <thead>
             <tr>
               <th className={cn("lt-c z-20", LEVEL_CELL, firstColumn)}>
@@ -324,7 +347,7 @@ export function LayeredTable({
                     { level: "col", col: col.id },
                     <>
                       <span className={LEVEL_NAME}>
-                        {col.content ?? col.label}
+                        <LevelLabel label={col.label}>{col.content ?? col.label}</LevelLabel>
                         {col.hostWins && (
                           <LayeredChip own title="Host wins">
                             H
@@ -356,7 +379,9 @@ export function LayeredTable({
                       {editorButton(
                         { level: "row", row: row.id },
                         <>
-                          <span className={LEVEL_NAME}>{row.content ?? row.label}</span>
+                          <span className={LEVEL_NAME}>
+                            <LevelLabel label={row.label}>{row.content ?? row.label}</LevelLabel>
+                          </span>
                           {row.detail && <LevelState mark={row.mark}>{row.detail}</LevelState>}
                         </>,
                         selecting ? `Select ${row.label} cells` : `Edit ${row.label}`,

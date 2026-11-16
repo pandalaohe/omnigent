@@ -2,6 +2,7 @@ import { useState, type ReactNode } from "react";
 
 import { AgentPicker } from "@/components/AgentPicker";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   representedRegistryKeys,
   SECTION_LABELS,
@@ -44,6 +45,7 @@ export function ExceptionList<T>({
   onRetry?: () => void;
 }) {
   const [openKey, setOpenKey] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
   const byKey = new Map<string, RegistryItem>();
   for (const item of items) {
     byKey.set(item.key, item);
@@ -52,6 +54,11 @@ export function ExceptionList<T>({
     }
   }
   const taken = new Set(Object.keys(rows).flatMap((key) => representedRegistryKeys(items, key)));
+  const entries = Object.entries(rows);
+  const visibleEntries = entries.filter(([key]) => {
+    const label = legacyLabels[key] ?? byKey.get(key)?.label ?? savedItems[key]?.label ?? key;
+    return key === openKey || `${label} ${key}`.toLowerCase().includes(query.trim().toLowerCase());
+  });
   return (
     <div className="space-y-2" data-testid="exception-list">
       <div className="flex items-center justify-between gap-3">
@@ -74,60 +81,77 @@ export function ExceptionList<T>({
           onRetry={onRetry}
         />
       </div>
-      {Object.keys(rows).length === 0 && (
+      {entries.length === 0 && (
         <p className="text-xs text-muted-foreground">All agents use the default.</p>
       )}
-      {Object.entries(rows).map(([key, value]) => {
-        const item = byKey.get(key) ?? savedItems[key];
-        const isLegacyProduct = Object.hasOwn(legacyLabels, key);
-        const label = isLegacyProduct
-          ? `${legacyLabels[key]} · direct sessions only`
-          : (item?.label ?? key);
-        return (
-          <div key={key} className="rounded-lg border border-border px-3 py-2">
-            <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 text-sm">
-              <div className="min-w-0">
-                <span className="font-medium break-all">{renderLabel?.(key, label) ?? label}</span>
-                <span className="ml-2 text-xs text-muted-foreground">
-                  {item ? SECTION_LABELS[item.section] : "Saved agent"}
-                </span>
-                {item && !item.deployed && (
-                  <span className="ml-2 text-xs text-muted-foreground">not deployed</span>
-                )}
-                <span className="ml-2 text-xs text-muted-foreground">{summary(value)}</span>
+      {entries.length > 0 && (
+        <>
+          <Input
+            aria-label="Search exceptions"
+            placeholder="Search exceptions"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+          <p className="text-xs text-muted-foreground">
+            Showing {visibleEntries.length} of {entries.length}
+          </p>
+        </>
+      )}
+      <div className="max-h-96 space-y-2 overflow-auto">
+        {visibleEntries.map(([key, value]) => {
+          const item = byKey.get(key) ?? savedItems[key];
+          const isLegacyProduct = Object.hasOwn(legacyLabels, key);
+          const label = isLegacyProduct
+            ? `${legacyLabels[key]} · direct sessions only`
+            : (item?.label ?? key);
+          return (
+            <div key={key} className="rounded-lg border border-border px-3 py-2">
+              <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 text-sm">
+                <div className="min-w-0">
+                  <span className="font-medium break-all">
+                    {renderLabel?.(key, label) ?? label}
+                  </span>
+                  <span className="ml-2 text-xs text-muted-foreground">
+                    {item ? SECTION_LABELS[item.section] : "Saved agent"}
+                  </span>
+                  {item && !item.deployed && (
+                    <span className="ml-2 text-xs text-muted-foreground">not deployed</span>
+                  )}
+                  <span className="ml-2 text-xs text-muted-foreground">{summary(value)}</span>
+                </div>
+                <div className="flex shrink-0 gap-1">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    aria-label={openKey === key ? `Done editing ${label}` : `Edit ${label}`}
+                    onClick={() => setOpenKey(openKey === key ? null : key)}
+                  >
+                    {openKey === key ? "Done" : "Edit"}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    aria-label={`Remove ${label}`}
+                    onClick={() => {
+                      onRemove(key);
+                      if (openKey === key) setOpenKey(null);
+                    }}
+                  >
+                    Remove this exception
+                  </Button>
+                </div>
               </div>
-              <div className="flex shrink-0 gap-1">
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="ghost"
-                  aria-label={openKey === key ? `Done editing ${label}` : `Edit ${label}`}
-                  onClick={() => setOpenKey(openKey === key ? null : key)}
-                >
-                  {openKey === key ? "Done" : "Edit"}
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="ghost"
-                  aria-label={`Remove ${label}`}
-                  onClick={() => {
-                    onRemove(key);
-                    if (openKey === key) setOpenKey(null);
-                  }}
-                >
-                  Remove this exception
-                </Button>
-              </div>
+              {openKey === key && (
+                <div className="mt-3 border-t border-border pt-3">
+                  {editor(value, (next) => onPatch(key, next), key)}
+                </div>
+              )}
             </div>
-            {openKey === key && (
-              <div className="mt-3 border-t border-border pt-3">
-                {editor(value, (next) => onPatch(key, next), key)}
-              </div>
-            )}
-          </div>
-        );
-      })}
+          );
+        })}
+      </div>
     </div>
   );
 }

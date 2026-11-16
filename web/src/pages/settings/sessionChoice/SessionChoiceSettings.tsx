@@ -381,7 +381,15 @@ export function SessionChoiceSettings() {
                 </Button>
               </p>
             ) : (
-              <table className="w-full min-w-[640px] text-left text-sm">
+              <table className="w-full min-w-[1000px] table-fixed text-left text-sm">
+                <colgroup>
+                  <col style={{ width: 180 }} />
+                  <col style={{ width: 300 }} />
+                  <col style={{ width: 150 }} />
+                  <col style={{ width: 140 }} />
+                  <col style={{ width: 130 }} />
+                  <col style={{ width: 100 }} />
+                </colgroup>
                 <thead>
                   <tr className="border-b border-border text-muted-foreground">
                     {["Tile", "Quota rule", "Current lines", "Floor", "Max running", "Running"].map(
@@ -443,7 +451,9 @@ export function SessionChoiceSettings() {
                       return (
                         <tr key={tile.id} className="border-b border-border/60 align-top">
                           <td className="py-3 pr-3 font-medium">
-                            <span className="break-all">{tile.display_name}</span>
+                            <span className="block truncate" title={tile.display_name}>
+                              {tile.display_name}
+                            </span>
                             {poolReferencesComplete && !referencedPools.has(tile.id) && (
                               <p className="mt-1 text-xs font-normal text-muted-foreground">
                                 Not referenced by current links. Saved limit retained.

@@ -238,49 +238,73 @@ export function TaskBoardToday({
             {t("g6.testReceipts")}
             <em>{t("g6.reportedChecks")}</em>
           </h3>
-          <table>
-            <thead>
-              <tr>
-                <th>{t("g6.task")}</th>
+          <div className="overflow-x-auto">
+            <table
+              className="w-full table-fixed"
+              style={{ minWidth: `${240 + hosts.length * 140 + 120}px` }}
+            >
+              <colgroup>
+                <col style={{ width: 240 }} />
                 {hosts.map((host) => (
-                  <th key={host}>{host}</th>
+                  <col key={host} style={{ width: 140 }} />
                 ))}
-                <th>{t("g6.lastCheck")}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {receipts.slice(0, 11).map(({ task, checks }) => (
-                <tr key={JSON.stringify([task["omnigent.ai:source"], task.uid])}>
-                  <th>
-                    <button type="button" onClick={() => onSelect(task)}>
-                      <b>{activityTaskName(task)}</b>
-                    </button>
-                  </th>
-                  {hosts.map((host, index) => {
-                    const check = checks[index];
-                    return (
-                      <td key={host} className={`v-${check?.verdict ?? "none"}`}>
-                        {check?.verdict === "passed" ? (
-                          <CircleCheck size={13} />
-                        ) : check?.verdict === "failed" ? (
-                          <CircleX size={13} />
-                        ) : check ? (
-                          <TriangleAlert size={13} />
-                        ) : null}
-                        {check ? t("sessions.check." + check.verdict) : t("g6.noReceipt")}
-                        {check && <small>{activityNumber(check.count)}</small>}
-                      </td>
-                    );
-                  })}
-                  <td className="td-t">
-                    {activityStamp(
-                      Math.max(...checks.flatMap((check) => (check ? [Date.parse(check.at)] : []))),
-                    )}
-                  </td>
+                <col style={{ width: 120 }} />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th>{t("g6.task")}</th>
+                  {hosts.map((host) => (
+                    <th key={host}>
+                      <span className="block truncate" title={host}>
+                        {host}
+                      </span>
+                    </th>
+                  ))}
+                  <th>{t("g6.lastCheck")}</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {receipts.slice(0, 11).map(({ task, checks }) => (
+                  <tr key={JSON.stringify([task["omnigent.ai:source"], task.uid])}>
+                    <th>
+                      <button
+                        type="button"
+                        className="block w-full min-w-0 text-left"
+                        onClick={() => onSelect(task)}
+                      >
+                        <b className="block truncate" title={activityTaskName(task)}>
+                          {activityTaskName(task)}
+                        </b>
+                      </button>
+                    </th>
+                    {hosts.map((host, index) => {
+                      const check = checks[index];
+                      return (
+                        <td key={host} className={`v-${check?.verdict ?? "none"}`}>
+                          {check?.verdict === "passed" ? (
+                            <CircleCheck size={13} />
+                          ) : check?.verdict === "failed" ? (
+                            <CircleX size={13} />
+                          ) : check ? (
+                            <TriangleAlert size={13} />
+                          ) : null}
+                          {check ? t("sessions.check." + check.verdict) : t("g6.noReceipt")}
+                          {check && <small>{activityNumber(check.count)}</small>}
+                        </td>
+                      );
+                    })}
+                    <td className="td-t">
+                      {activityStamp(
+                        Math.max(
+                          ...checks.flatMap((check) => (check ? [Date.parse(check.at)] : [])),
+                        ),
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </section>
       )}
       {quotes.length > 0 && (

@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
+import { CompactMembership } from "@/components/CompactMembership";
 import {
   Dialog,
   DialogContent,
@@ -81,6 +82,12 @@ function ModelListCard({ host, harness }: { host: Host; harness: string }) {
                   ? `${rows.length} ${rows.length === 1 ? "model" : "models"}`
                   : "No list. Type a name in the model menu."}
             </dd>
+            {rows.length > 0 && (
+              <CompactMembership
+                label="Models"
+                items={rows.map((row) => ({ id: row.id, label: row.id }))}
+              />
+            )}
             <Button
               size="sm"
               variant="outline"

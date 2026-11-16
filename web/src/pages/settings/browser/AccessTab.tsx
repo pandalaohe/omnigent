@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { XIcon } from "lucide-react";
+import { CompactMembership } from "@/components/CompactMembership";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -22,6 +22,17 @@ export function AccessTab() {
     [busy, setBusy] = useState(false),
     [message, setMessage] = useState(""),
     [servers, setServers] = useState<{ origin: string; current: boolean; entries: string[] }[]>([]);
+  const [serverQuery, setServerQuery] = useState("");
+  const visibleServers = servers
+    .map((server) => ({
+      ...server,
+      entries: server.entries.filter((entry) =>
+        `${server.origin} ${entry}`.toLowerCase().includes(serverQuery.trim().toLowerCase()),
+      ),
+    }))
+    .filter((server) => server.entries.length > 0);
+  const totalEntries = servers.reduce((count, server) => count + server.entries.length, 0);
+  const visibleEntries = visibleServers.reduce((count, server) => count + server.entries.length, 0);
   useEffect(() => {
     void bridge
       ?.get()
@@ -139,28 +150,20 @@ export function AccessTab() {
                 >
                   {text[key]}
                 </h3>
-                <div className="mb-3 flex flex-wrap gap-2">
-                  {access?.[key].map((entry) => (
-                    <span
-                      key={entry}
-                      className="inline-flex max-w-full items-center gap-1 rounded-md bg-muted px-2 py-1 text-xs"
-                    >
-                      <span className="min-w-0 break-all">{entry}</span>
-                      <button
-                        type="button"
-                        aria-label={`Remove ${entry} from ${text[key]}`}
-                        className="rounded p-1 focus-visible:ring-2 focus-visible:ring-ring"
-                        onClick={() =>
-                          setAccess({
-                            ...access,
-                            [key]: access[key].filter((value) => value !== entry),
-                          })
-                        }
-                      >
-                        <XIcon className="size-3" />
-                      </button>
-                    </span>
-                  ))}
+                <div className="mb-3">
+                  {access && (
+                    <CompactMembership
+                      label={text[key]}
+                      disabled={busy}
+                      items={access[key].map((entry) => ({ id: entry, label: entry }))}
+                      onRemove={(entry) =>
+                        setAccess({
+                          ...access,
+                          [key]: access[key].filter((value) => value !== entry),
+                        })
+                      }
+                    />
+                  )}
                 </div>
                 <form
                   onSubmit={(event) => {
@@ -226,29 +229,45 @@ export function AccessTab() {
             No remembered addresses. Agents ask when they need access.
           </p>
         ) : (
-          servers.map((server) => (
-            <div key={server.origin} className="mb-4">
-              <h3 className="mb-2 break-all text-sm font-medium">
-                {server.origin}{" "}
-                {server.current && (
-                  <span className="rounded bg-muted px-2 py-1 text-xs">This server</span>
-                )}
-              </h3>
-              {server.entries.map((entry) => (
-                <div key={entry} className="flex items-center justify-between gap-3 border-t py-2">
-                  <span className="break-all text-sm">{entry}</span>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={busy}
-                    onClick={() => void forget(server.origin, entry)}
-                  >
-                    Forget
-                  </Button>
+          <>
+            <Input
+              aria-label="Search remembered addresses"
+              placeholder="Search remembered addresses"
+              value={serverQuery}
+              onChange={(event) => setServerQuery(event.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              Showing {visibleEntries} of {totalEntries}
+            </p>
+            <div className="max-h-96 overflow-auto">
+              {visibleServers.map((server) => (
+                <div key={server.origin} className="mb-4">
+                  <h3 className="mb-2 break-all text-sm font-medium">
+                    {server.origin}{" "}
+                    {server.current && (
+                      <span className="rounded bg-muted px-2 py-1 text-xs">This server</span>
+                    )}
+                  </h3>
+                  {server.entries.map((entry) => (
+                    <div
+                      key={entry}
+                      className="flex items-center justify-between gap-3 border-t py-2"
+                    >
+                      <span className="break-all text-sm">{entry}</span>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={busy}
+                        onClick={() => void forget(server.origin, entry)}
+                      >
+                        Forget
+                      </Button>
+                    </div>
+                  ))}
                 </div>
               ))}
             </div>
-          ))
+          </>
         )}
       </BrowserGroup>
     </>

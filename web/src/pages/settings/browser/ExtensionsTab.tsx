@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
-import { MoreHorizontalIcon, PuzzleIcon } from "lucide-react";
+import { CheckIcon, MoreHorizontalIcon, PuzzleIcon, XIcon } from "lucide-react";
 import { browserLoginBridge } from "@/lib/nativeBridge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
+import { Input } from "@/components/ui/input";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { StatusIcon } from "@/components/ui/status-icon";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -23,8 +26,14 @@ export function ExtensionsTab() {
   const [rows, setRows] = useState<Extension[]>([]),
     [login, setLogin] = useState<boolean | null>(null),
     [busy, setBusy] = useState(false),
+    [query, setQuery] = useState(""),
     [status, setStatus] = useState(""),
     [removing, setRemoving] = useState<Extension | null>(null);
+  const visibleRows = rows.filter((extension) =>
+    `${extension.name} ${extension.id} ${extension.runtimeId ?? ""}`
+      .toLowerCase()
+      .includes(query.trim().toLowerCase()),
+  );
   const supported =
     !!bridge?.extensionsList &&
     !!bridge.extensionsAdd &&
@@ -95,8 +104,21 @@ export function ExtensionsTab() {
         </Button>
       </div>
       {!supported && <UpdateReason verb="manage extensions" />}
-      <div className={login === false ? "opacity-50" : undefined}>
-        {rows.map((extension) => (
+      {rows.length > 0 && (
+        <div className="space-y-2">
+          <Input
+            aria-label="Search extensions"
+            placeholder="Search extensions"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+          <p className="text-xs text-muted-foreground">
+            Showing {visibleRows.length} of {rows.length}
+          </p>
+        </div>
+      )}
+      <div className={`max-h-96 overflow-auto ${login === false ? "opacity-50" : ""}`}>
+        {visibleRows.map((extension) => (
           <div key={extension.id} className="flex items-center gap-3 border-t py-3">
             <span className="rounded-lg bg-muted p-2">
               <PuzzleIcon className="size-5" />
@@ -109,9 +131,13 @@ export function ExtensionsTab() {
                 </span>
               </p>
               <p className="text-xs text-muted-foreground">
-                <span className={extension.enabled ? "text-success" : "text-muted-foreground"}>
-                  ● {extension.enabled ? "On" : "Off"}
-                </span>{" "}
+                <TooltipProvider>
+                  <StatusIcon
+                    tone={extension.enabled ? "ok" : "neutral"}
+                    label={extension.enabled ? "Enabled" : "Disabled"}
+                    icon={extension.enabled ? <CheckIcon /> : <XIcon />}
+                  />
+                </TooltipProvider>{" "}
                 ·{" "}
                 <span title={extension.runtimeId ?? extension.id}>
                   ID …{(extension.runtimeId ?? extension.id).slice(-6)}

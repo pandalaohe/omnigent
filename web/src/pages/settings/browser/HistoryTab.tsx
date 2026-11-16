@@ -154,111 +154,116 @@ export function HistoryTab() {
           </Button>
         </div>
         {!removal && <UpdateReason verb="remove single pages" />}
-        {[...groups].map(([day, rows]) => {
-          const date = new Date(day),
-            label =
-              date.getTime() === today
-                ? "Today"
-                : date.getTime() === yesterday
-                  ? "Yesterday"
-                  : date.toLocaleDateString(undefined, {
-                      weekday: "long",
-                      month: "long",
-                      day: "numeric",
-                    });
-          return (
-            <div key={day}>
-              <div className="flex items-center gap-2 border-t py-3">
-                <h3 className="text-sm font-medium">
-                  <span className="md:hidden">{label}</span>
-                  <span className="hidden md:inline">
-                    {label === "Today" || label === "Yesterday"
-                      ? `${label} – ${date.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}`
-                      : label}
-                  </span>
-                </h3>
-                <span className="rounded bg-muted px-2 text-xs text-muted-foreground">
-                  {
-                    places.history.filter(
-                      (row) => new Date(row.visitedAt ?? 0).toDateString() === day,
-                    ).length
-                  }
-                </span>
-                {removal && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="ml-auto"
-                    disabled={places.busy}
-                    onClick={() =>
-                      void remove(
-                        places.history.filter(
-                          (row) => new Date(row.visitedAt ?? 0).toDateString() === day,
-                        ),
-                      )
+        <p className="text-xs text-muted-foreground">
+          Showing {Math.min(visible, filtered.length)} of {places.history.length}
+        </p>
+        <div className="max-h-96 overflow-auto">
+          {[...groups].map(([day, rows]) => {
+            const date = new Date(day),
+              label =
+                date.getTime() === today
+                  ? "Today"
+                  : date.getTime() === yesterday
+                    ? "Yesterday"
+                    : date.toLocaleDateString(undefined, {
+                        weekday: "long",
+                        month: "long",
+                        day: "numeric",
+                      });
+            return (
+              <div key={day}>
+                <div className="flex items-center gap-2 border-t py-3">
+                  <h3 className="text-sm font-medium">
+                    <span className="md:hidden">{label}</span>
+                    <span className="hidden md:inline">
+                      {label === "Today" || label === "Yesterday"
+                        ? `${label} – ${date.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}`
+                        : label}
+                    </span>
+                  </h3>
+                  <span className="rounded bg-muted px-2 text-xs text-muted-foreground">
+                    {
+                      places.history.filter(
+                        (row) => new Date(row.visitedAt ?? 0).toDateString() === day,
+                      ).length
                     }
-                  >
-                    Remove day
-                  </Button>
-                )}
-              </div>
-              {rows.map((row) => (
-                <div key={row.url} className="group flex min-w-0 items-center gap-3 py-2">
-                  <PageTile url={row.url} />
-                  <button
-                    type="button"
-                    onClick={() => open(row.url)}
-                    className="min-w-0 flex-1 text-left"
-                  >
-                    <p className="truncate text-sm">
-                      <Highlight text={row.title} query={query} />
-                    </p>
-                    <p className="truncate text-xs text-muted-foreground">
-                      <Highlight text={new URL(row.url).host} query={query} />
-                    </p>
-                  </button>
-                  <span className="hidden text-xs text-muted-foreground md:block">
-                    {new Date(row.visitedAt ?? 0).toLocaleTimeString(undefined, {
-                      hour: "2-digit",
-                      minute: "2-digit",
-                    })}
                   </span>
-                  <RowActions
-                    actions={[
-                      {
-                        label: places.bookmarks.some((saved) => saved.url === row.url)
-                          ? "Remove bookmark"
-                          : "Bookmark page",
-                        icon: (
-                          <StarIcon
-                            className={`size-4 ${places.bookmarks.some((saved) => saved.url === row.url) ? "fill-current" : ""}`}
-                          />
-                        ),
-                        disabled: places.busy,
-                        run: () => void toggleBookmark(row),
-                      },
-                      {
-                        label: "Copy link",
-                        icon: <CopyIcon className="size-4" />,
-                        run: () => void copyPage(row.url),
-                      },
-                      ...(removal
-                        ? [
-                            {
-                              label: "Remove page",
-                              icon: <TrashIcon className="size-4" />,
-                              disabled: places.busy,
-                              run: () => void remove([row]),
-                            },
-                          ]
-                        : []),
-                    ]}
-                  />
+                  {removal && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="ml-auto"
+                      disabled={places.busy}
+                      onClick={() =>
+                        void remove(
+                          places.history.filter(
+                            (row) => new Date(row.visitedAt ?? 0).toDateString() === day,
+                          ),
+                        )
+                      }
+                    >
+                      Remove day
+                    </Button>
+                  )}
                 </div>
-              ))}
-            </div>
-          );
-        })}
+                {rows.map((row) => (
+                  <div key={row.url} className="group flex min-w-0 items-center gap-3 py-2">
+                    <PageTile url={row.url} />
+                    <button
+                      type="button"
+                      onClick={() => open(row.url)}
+                      className="min-w-0 flex-1 text-left"
+                    >
+                      <p className="truncate text-sm">
+                        <Highlight text={row.title} query={query} />
+                      </p>
+                      <p className="truncate text-xs text-muted-foreground">
+                        <Highlight text={new URL(row.url).host} query={query} />
+                      </p>
+                    </button>
+                    <span className="hidden text-xs text-muted-foreground md:block">
+                      {new Date(row.visitedAt ?? 0).toLocaleTimeString(undefined, {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </span>
+                    <RowActions
+                      actions={[
+                        {
+                          label: places.bookmarks.some((saved) => saved.url === row.url)
+                            ? "Remove bookmark"
+                            : "Bookmark page",
+                          icon: (
+                            <StarIcon
+                              className={`size-4 ${places.bookmarks.some((saved) => saved.url === row.url) ? "fill-current" : ""}`}
+                            />
+                          ),
+                          disabled: places.busy,
+                          run: () => void toggleBookmark(row),
+                        },
+                        {
+                          label: "Copy link",
+                          icon: <CopyIcon className="size-4" />,
+                          run: () => void copyPage(row.url),
+                        },
+                        ...(removal
+                          ? [
+                              {
+                                label: "Remove page",
+                                icon: <TrashIcon className="size-4" />,
+                                disabled: places.busy,
+                                run: () => void remove([row]),
+                              },
+                            ]
+                          : []),
+                      ]}
+                    />
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+        </div>
         {!filtered.length && (
           <p className="py-6 text-sm text-muted-foreground">
             {query ? `No pages match “${query}”` : "Your recently visited pages will appear here."}

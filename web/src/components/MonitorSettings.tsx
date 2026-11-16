@@ -388,8 +388,16 @@ function MonitorOverheadTable({
   hostNames: Map<string, string>;
 }) {
   return (
-    <div className="mt-4 overflow-hidden rounded-lg border">
-      <table className="w-full text-sm" data-testid="monitor-overhead-table">
+    <div className="mt-4 overflow-x-auto rounded-lg border">
+      <table
+        className="w-full min-w-[480px] table-fixed text-sm"
+        data-testid="monitor-overhead-table"
+      >
+        <colgroup>
+          <col style={{ width: "40%" }} />
+          <col style={{ width: "20%" }} />
+          <col style={{ width: "40%" }} />
+        </colgroup>
         <thead>
           <tr className="border-b text-sm text-muted-foreground">
             <th className="px-3 py-1.5 text-left font-medium">Process</th>
@@ -409,7 +417,9 @@ function MonitorOverheadTable({
           </tr>
           {Object.entries(overhead.hosts).map(([hostId, cost]) => (
             <tr key={hostId} className="border-b last:border-b-0">
-              <td className="px-3 py-1.5">{hostNames.get(hostId) ?? hostId}</td>
+              <td className="truncate px-3 py-1.5" title={hostNames.get(hostId) ?? hostId}>
+                {hostNames.get(hostId) ?? hostId}
+              </td>
               <td className="px-3 py-1.5 text-right tabular-nums">{formatPct(cost.cpu_pct, 2)}</td>
               <td className="px-3 py-1.5 text-right tabular-nums">
                 {formatBytes(cost.rss_delta)} below start

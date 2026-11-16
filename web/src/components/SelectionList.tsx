@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNod
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { CompactMembership } from "@/components/CompactMembership";
 import { Segmented } from "@/components/ui/segmented";
 import { resolveMulti, suggestMode, summarizeMulti, type MultiValue } from "@/lib/multiSelection";
 
@@ -49,7 +50,6 @@ type Entry = { kind: "heading"; label: string; gloss?: string } | { kind: "row";
 export function SelectionList(props: Props) {
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<string[]>([]);
-  const [chipsExpanded, setChipsExpanded] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [active, setActive] = useState(0);
   const [focusId, setFocusId] = useState<string | null>(null);
@@ -269,11 +269,7 @@ export function SelectionList(props: Props) {
   const multi = props.mode === "multi" ? props : null;
   const summary = multi ? summarizeMulti(multi.value, multi.items) : null;
   const suggestion = multi ? suggestMode(multi.value, multi.items) : null;
-  const marked = multi
-    ? multi.value.ids.filter((id) =>
-        multi.items.some((item) => item.id === id && !item.unavailableReason),
-      )
-    : [];
+  const marked = multi ? multi.value.ids : [];
   return (
     <div className="flex min-h-0 flex-col" onKeyDown={handleKey}>
       {multi && (
@@ -290,35 +286,19 @@ export function SelectionList(props: Props) {
             />
           </div>
           {marked.length > 0 && (
-            <div className="flex flex-wrap items-center gap-1 px-4 pt-2 text-xs">
-              <span className="text-muted-foreground">
-                {multi.value.mode === "except" ? "Except:" : "Selected:"}
-              </span>
-              {(chipsExpanded ? marked : marked.slice(0, 6)).map((id) => (
-                <Button
-                  key={id}
-                  type="button"
-                  size="sm"
-                  variant="secondary"
-                  className="h-7 max-w-40 truncate"
-                  onClick={() => {
-                    const ids = multi.value.ids.filter((value) => value !== id);
-                    setDrafts((current) => ({ ...current, [multi.value.mode]: ids }));
-                    multi.onChange({ ...multi.value, ids });
-                  }}
-                >
-                  {multi.items.find((item) => item.id === id)?.label ?? id} ×
-                </Button>
-              ))}
-              {marked.length > 6 && (
-                <button
-                  type="button"
-                  className="text-primary"
-                  onClick={() => setChipsExpanded(!chipsExpanded)}
-                >
-                  {chipsExpanded ? "Collapse" : `and ${marked.length - 6} more · Expand`}
-                </button>
-              )}
+            <div className="px-4 pt-2">
+              <CompactMembership
+                label={multi.value.mode === "except" ? "Except" : "Selected"}
+                items={marked.map((id) => ({
+                  id,
+                  label: multi.items.find((item) => item.id === id)?.label ?? id,
+                }))}
+                onRemove={(id) => {
+                  const ids = multi.value.ids.filter((value) => value !== id);
+                  setDrafts((current) => ({ ...current, [multi.value.mode]: ids }));
+                  multi.onChange({ ...multi.value, ids });
+                }}
+              />
             </div>
           )}
           {suggestion && (
