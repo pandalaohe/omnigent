@@ -3817,11 +3817,6 @@ def register_core_routes(
                         workspace=parsed_metadata.workspace,
                         git=parsed_metadata.git,
                     )
-                    from omnigent.server.startup_registration import (
-                        STARTUP_CREATE_PREPARATION_LABEL_KEY,
-                    )
-
-                    result.labels.pop(STARTUP_CREATE_PREPARATION_LABEL_KEY, None)
                 else:
                     await _bind_and_launch_on_caller_host(
                         request,
@@ -3866,6 +3861,9 @@ def register_core_routes(
             )
             result.notes = notes_from_labels(created_conversation.labels)
             result.labels.update(created_conversation.labels)
+        from omnigent.server.startup_registration import STARTUP_CREATE_PREPARATION_LABEL_KEY
+
+        result.labels.pop(STARTUP_CREATE_PREPARATION_LABEL_KEY, None)
         return result
 
     # ── GET /sessions/projects ────────────────────────────────────
