@@ -355,6 +355,11 @@ from omnigent.server.routes._sessions.orchestration import (
     ensure_runner_connected,
 )
 from omnigent.server.routes._sessions.subagent_reconciliation import _read_native_subagent_probe
+from omnigent.server.routes.sessions.native_terminal_generation import (
+    NATIVE_TERMINAL_GENERATION_LABEL,
+    native_terminal_generation,
+    native_terminal_generation_is_current,
+)
 from omnigent.server.runner_session_init import conversation_archive_lineage
 from omnigent.server.scheduled.telemetry import start_fire_stage
 from omnigent.server.schemas import (
@@ -440,6 +445,10 @@ from omnigent.util.session_lifecycle import (
 
 # custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
 _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
+_native_status_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
 # One shared Resume attempt per session, split by caller for side chats; see
@@ -4084,6 +4093,16 @@ def register_events_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             sdk_peer_terminal = "sdk_peer_delivery" in body.data
+            if status in {"idle", "completed", "failed", "stopped", "killed"}:
+                if not native_terminal_generation_is_current(conv, body.data):
+                    return {"queued": False}
+                generation = native_terminal_generation(conv, body.data)
+                if generation is not None:
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        session_id,
+                        {NATIVE_TERMINAL_GENERATION_LABEL: generation.model_dump_json()},
+                    )
             sdk_peer_turn = None
             if sdk_peer_terminal:
                 from omnigent.server.routes.sessions.peer_child_turn import wait_for_sdk_peer_turn
@@ -5999,6 +6018,13 @@ def register_events_routes(
             return result
 
         if control_id is None:
+            if body.type == _EXTERNAL_SESSION_STATUS_TYPE:
+                lock = _native_status_locks.get(session_id)
+                if lock is None:
+                    lock = asyncio.Lock()
+                    _native_status_locks[session_id] = lock
+                async with lock:
+                    return await apply()
             return await apply()
         assert isinstance(service, SubagentRetryAdmission)
         task = asyncio.create_task(apply())

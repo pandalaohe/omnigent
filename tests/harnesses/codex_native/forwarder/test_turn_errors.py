@@ -1388,7 +1388,16 @@ async def test_terminal_status_publication_diagnostics(
     assert bridge is not None
     assert bridge.active_turn_id == ("newer_turn" if failure_phase == "stale" else None)
     assert client.posts == (
-        [_status_post({"status": "idle", "response_id": "codex_turn_123", "turn_completed": True})]
+        [
+            _status_post(
+                {
+                    "status": "idle",
+                    "response_id": "codex_turn_123",
+                    "turn_completed": True,
+                    "native_turn_generation": 1,
+                }
+            )
+        ]
         if failure_phase == "after_status"
         else []
     )
@@ -1773,7 +1782,14 @@ async def test_system_error_during_a_turn_waits_for_the_turn_outcome(tmp_path: P
     await _deliver_to_parent(client, tmp_path, state, _turn_completed("turn_1", "completed"))
 
     assert client.posts == [
-        _status_post({"status": "idle", "response_id": "codex_turn_1", "turn_completed": True})
+        _status_post(
+            {
+                "status": "idle",
+                "response_id": "codex_turn_1",
+                "turn_completed": True,
+                "native_turn_generation": 1,
+            }
+        )
     ]
 
 
@@ -1824,7 +1840,11 @@ async def test_system_error_after_a_failed_turn_boundary_is_not_repeated(tmp_pat
     await _deliver_to_parent(client, tmp_path, state, _turn_completed("turn_1", "failed"))
     await _deliver_to_parent(client, tmp_path, state, _system_error_event())
 
-    assert client.posts == [_status_post({"status": "failed", "response_id": "codex_turn_1"})]
+    assert client.posts == [
+        _status_post(
+            {"status": "failed", "response_id": "codex_turn_1", "native_turn_generation": 1}
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -1840,9 +1860,18 @@ async def test_system_error_after_a_new_turn_is_reported_again(tmp_path: Path) -
     await _deliver_to_parent(client, tmp_path, state, _system_error_event())
 
     assert client.posts == [
-        _status_post({"status": "failed", "response_id": "codex_turn_1"}),
+        _status_post(
+            {"status": "failed", "response_id": "codex_turn_1", "native_turn_generation": 1}
+        ),
         _status_post({"status": "running", "response_id": "codex_turn_2"}),
-        _status_post({"status": "idle", "response_id": "codex_turn_2", "turn_completed": True}),
+        _status_post(
+            {
+                "status": "idle",
+                "response_id": "codex_turn_2",
+                "turn_completed": True,
+                "native_turn_generation": 3,
+            }
+        ),
         _status_post({"status": "failed", "output": _SYSTEM_ERROR_OUTPUT}),
     ]
 
