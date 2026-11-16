@@ -682,6 +682,11 @@ _INPUT_LIFECYCLE_EVENT_TYPES = frozenset(
     }
 )
 
+# A message buffered behind a live turn already spent its forward admission
+# budget waiting. When it finally runs as its own turn it gets this fresh
+# consumption budget; retry/wake frames keep their own deadlines.
+_BUFFERED_INPUT_ADMISSION_TIMEOUT_S = 300.0
+
 
 def _input_identity(source: Mapping[str, object]) -> dict[str, str | int]:
     """Return validated client and server input IDs from a runner or harness body."""
@@ -7015,6 +7020,26 @@ def create_runner_app(
         else:
             _turn_pending_ids.pop(conv_id, None)
 
+    def _refresh_buffered_input_admission(conv_id: str, body: dict[str, Any]) -> None:
+        """Give a buffered ordinary message a fresh consumption budget when it runs.
+
+        The earlier forward's admission deadline was consumed by the queue wait.
+        Only ordinary frames are refreshed: a retry or wake keeps its own
+        deadline, so retry budgets never relax across a continuation turn.
+        """
+        if (
+            body.get("input_admission_required") is not True
+            or body.get("retry_guard") is not None
+            or body.get("_final_wake") is True
+            or body.get("recovered") is True
+        ):
+            return
+        deadline = time.time() + _BUFFERED_INPUT_ADMISSION_TIMEOUT_S
+        body["input_admission_deadline"] = deadline
+        input_id = body.get("input_id")
+        if isinstance(input_id, str) and input_id:
+            _input_execution_claims[(conv_id, input_id)] = (None, deadline, "ordinary")
+
     def _message_already_taken(conv_id: str, body: Mapping[str, Any]) -> bool:
         """Whether a forward repeats a message that is still queued or running.
 
@@ -8097,6 +8122,7 @@ def create_runner_app(
                 buf.clear()
                 _session_message_buffers.pop(session_id, None)
             next_body = drained[-1]
+            _refresh_buffered_input_admission(session_id, next_body)
 
             # Route the drained bodies as this turn starts: every user body's
             # mentions count (the coalesced non-native drain dispatches only the
@@ -10873,7 +10899,7 @@ def create_runner_app(
                     and execution[1] <= time.time()
                 ):
                     # Queue wait and harness setup are outside the consumption attempt.
-                    deadline = time.time() + 300
+                    deadline = time.time() + _BUFFERED_INPUT_ADMISSION_TIMEOUT_S
                     event_body["input_admission_deadline"] = deadline
                     _input_execution_claims[execution_key] = (None, deadline, "ordinary")
                 async with client.stream(

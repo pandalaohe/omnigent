@@ -36,3 +36,28 @@ Windows supervisor or real-provider behavior.
 Capture server/host builds, session ID, restart time, continuation count, final
 reply and any failure. Return those observations with the operation's outcome.
 Clean up the disposable instance through the feature-map launch helper.
+
+## Mid-turn input refusal
+
+Run the related runner admission and executor injection checks through the
+checkout's isolated pytest entry. An executor returning `False` is a known
+refusal; a timeout or ambiguous delivery must retain the duplicate-delivery
+fence. Component checks should exercise both outcomes and a buffered input
+whose original admission deadline expires while the current turn runs.
+
+After deployment, use a disposable Pi RPC session on the affected host:
+
+1. Start a long, harmless turn and send a uniquely identifiable follow-up while
+   it is active. Capture whether the executor accepts or refuses steering.
+2. For a confirmed refusal, let the active turn finish after the follow-up's
+   original deadline. Expect the follow-up to execute once on its continuation
+   turn without resending it or reporting `Input execution admission refused`.
+3. For accepted steering, expect the follow-up once in the active turn and no
+   second delivery after that turn finishes. An uncertain delivery needs log
+   reconciliation before any resend.
+
+Return the host and server revisions, session/input IDs, admission and executor
+outcomes, queue duration and observed execution count. Record a case without a
+confirmed executor refusal as unverified for the refusal scenario. Separately
+check three fresh Codex SDK children accepting their first message; a Pi
+steering result does not establish the cause of a Codex first-turn failure.

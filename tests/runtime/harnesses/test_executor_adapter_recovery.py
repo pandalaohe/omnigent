@@ -96,6 +96,51 @@ def _request() -> CreateResponseRequest:
     return CreateResponseRequest(model="agent", input="hi")
 
 
+async def test_turn_end_consumes_accepted_injection_during_settlement_wait() -> None:
+    from omnigent.entities.subagent_retry import InputExecutionReceipt
+    from omnigent.server.schemas import InjectionConsumedEvent, InputExecutionClaimEvent
+
+    finish = asyncio.Event()
+    executor = _FakeExecutor(events=[TurnComplete(response="done")], block_event=finish)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = _ctx("resp_settlement")
+    ctx._push_injection(
+        CreateResponseRequest(
+            model="agent",
+            input="follow-up",
+            injection_id="inj_settlement",
+            input_id="d" * 32,
+            input_admission_required=True,
+        )
+    )
+    task = asyncio.create_task(adapter.run_turn(_request(), ctx))
+    try:
+        reserve = await asyncio.wait_for(ctx._event_queue.get(), 3)
+        assert isinstance(reserve, InputExecutionClaimEvent)
+        assert reserve.claim.boundary == "injection_reserve"
+        ctx._complete_input_claim(
+            reserve.claim_id, InputExecutionReceipt(state="reserved", reason="reserved")
+        )
+        accept = await asyncio.wait_for(ctx._event_queue.get(), 3)
+        assert isinstance(accept, InputExecutionClaimEvent)
+        assert accept.claim.boundary == "injection_accept"
+        # The executor finishes before this receipt can return to the watcher.
+        finish.set()
+        await asyncio.wait_for(task, 3)
+        assert not ctx._complete_input_claim(
+            accept.claim_id, InputExecutionReceipt(state="accepted", reason="accepted")
+        )
+        emitted = []
+        while not ctx._event_queue.empty():
+            emitted.append(ctx._event_queue.get_nowait())
+        consumed = [event for event in emitted if isinstance(event, InjectionConsumedEvent)]
+        assert [event.injection_id for event in consumed] == ["inj_settlement"]
+    finally:
+        finish.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.mark.parametrize("steering_outcome", ["executor_accepted", "executor_refused", "error"])
 async def test_main_turn_and_steering_use_their_own_input_identity(
     steering_outcome: str, caplog: pytest.LogCaptureFixture

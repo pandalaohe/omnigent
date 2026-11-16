@@ -970,6 +970,14 @@ class ExecutorAdapter(HarnessApp):
         finally:
             self._resyncing = False
 
+    async def _admit_live_injection(
+        self, request: CreateResponseRequest, ctx: TurnContext
+    ) -> bool:
+        if request.peer_delivery is not None:
+            return await super()._admit_live_injection(request, ctx)
+        # The watcher reserves immediately before handing input to the executor.
+        return True
+
     async def _watch_injections(self, ctx: TurnContext, executor: Executor) -> None:
         """Forward mid-turn steering injections into the in-flight executor session.
 
@@ -1029,6 +1037,16 @@ class ExecutorAdapter(HarnessApp):
                 continue
             if ctx.cancelled.is_set():
                 return
+            if injection.input_admission_required:
+                try:
+                    if not await ctx.claim_input_execution(
+                        injection, boundary="injection_reserve"
+                    ):
+                        continue
+                except RuntimeError:
+                    _logger.warning("in-band injection reservation unresolved", exc_info=True)
+                    continue
+            certain = True
             try:
                 with (
                     input_delivery_scope(
@@ -1047,7 +1065,7 @@ class ExecutorAdapter(HarnessApp):
                         outcome = "executor_accepted" if accepted else "executor_refused"
                     except InjectionDeliveryAmbiguous:
                         # The harness may already hold the message; resending could duplicate it.
-                        accepted, outcome = True, "executor_ambiguous"
+                        accepted, outcome, certain = True, "executor_ambiguous", False
                     except BaseException as exc:
                         log_input_event(
                             _logger,
@@ -1065,11 +1083,29 @@ class ExecutorAdapter(HarnessApp):
                         session_id=ctx.session_id,
                         outcome=outcome,
                     )
+            except asyncio.CancelledError:
+                if injection.input_admission_required:
+                    _emit_injection_consumed(ctx, injection)
+                raise
             except Exception:
                 _logger.exception(
                     "inner executor.enqueue_session_message failed; in-band injection lost"
                 )
+                if injection.input_admission_required:
+                    _emit_injection_consumed(ctx, injection)
                 continue
+            try:
+                if injection.input_admission_required and certain:
+                    await ctx.claim_input_execution(
+                        injection, boundary="injection_accept" if accepted else "injection_refuse"
+                    )
+            except RuntimeError:
+                # A lost settlement keeps the durable reservation fenced.
+                _logger.warning("in-band injection settlement unresolved", exc_info=True)
+            finally:
+                # Turn completion may cancel settlement after the executor accepted.
+                if accepted:
+                    _emit_injection_consumed(ctx, injection)
             if not accepted:
                 _logger.warning(
                     "inner executor refused in-band injection "
@@ -1077,15 +1113,6 @@ class ExecutorAdapter(HarnessApp):
                     "not see the steered message until the next turn"
                 )
                 continue
-            # Echo injection_id so the runner drops the buffered copy and doesn't re-deliver it.
-            injection_id = getattr(injection, "injection_id", None)
-            if injection_id:
-                ctx.emit(
-                    InjectionConsumedEvent(
-                        type="injection.consumed",
-                        injection_id=injection_id,
-                    )
-                )
 
     async def _stable_tool_executor(
         self,
@@ -1912,6 +1939,13 @@ def _extract_last_user_message(
             if isinstance(text, str):
                 last_user_text = text
     return last_user_text
+
+
+def _emit_injection_consumed(ctx: TurnContext, injection: CreateResponseRequest) -> None:
+    if injection.injection_id:
+        ctx.emit(
+            InjectionConsumedEvent(type="injection.consumed", injection_id=injection.injection_id)
+        )
 
 
 def _extract_user_text(
