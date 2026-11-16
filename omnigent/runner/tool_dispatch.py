@@ -5441,6 +5441,15 @@ async def _post_created_child_message(
     return f"{resp.status_code} {resp.text}"
 
 
+_INPUT_DELIVERY_INSPECTION_GUIDANCE = (
+    "Inspect conversation_id with sys_session_get_info (session_id, status, last_activity_at) "
+    "and sys_session_get_history (persisted items[].id). For native sessions, input_id is only "
+    "an attempt correlation ID; these reads cannot confirm this specific input. "
+    "Do not match identical messages by text. Do not create a replacement; "
+    "do not automatically resend the task."
+)
+
+
 class _ChildMessageDeliveryUnknown(httpx.HTTPError):
     """A lost response retains the original input identity for inspection."""
 
@@ -5458,8 +5467,7 @@ class _ChildMessageDeliveryUnknown(httpx.HTTPError):
                 "input_id": self.input_id,
                 "message": (
                     "The send response was lost; execution may have started. "
-                    "Inspect this session with sys_session_get_info and sys_session_get_history "
-                    "for the input_id. Do not automatically resend or create a replacement."
+                    + _INPUT_DELIVERY_INSPECTION_GUIDANCE
                 ),
             }
         )
@@ -5520,10 +5528,7 @@ async def _post_child_message_recovering(
 
 # The created session exists, and a transport error can hide whether its
 # first task was accepted, so a blind retry could duplicate the work.
-_UNCONFIRMED_FIRST_TASK_GUIDANCE = (
-    "inspect this session before continuing. Do not create a replacement; "
-    "do not automatically resend the task."
-)
+_UNCONFIRMED_FIRST_TASK_GUIDANCE = _INPUT_DELIVERY_INSPECTION_GUIDANCE
 
 # sys_session_create argument -> session-create field, shared by the JSON
 # (agent_id) and multipart (config_path) creates so neither drops one.

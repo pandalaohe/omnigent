@@ -7818,6 +7818,61 @@ async def test_codex_producer_rejects_old_success_after_new_failure(client, tmp_
     assert (await client.get(f"/v1/sessions/{sid}")).json()["last_task_error"] is not None
 
 
+async def test_native_unknown_send_guidance_uses_public_query_fields(client):
+    from omnigent.runner.tool_dispatch import _ChildMessageDeliveryUnknown, execute_tool
+    from omnigent.runtime import pending_inputs
+
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": "codex-native"}}
+    )
+    sid = (
+        await _create_session(client, agent["id"], labels={"omnigent.wrapper": "codex-native"})
+    )["id"]
+    attempt_ids = ["a" * 32, "b" * 32]
+    persisted_ids = []
+    for index, attempt_id in enumerate(attempt_ids):
+        content = [{"type": "input_text", "text": "identical message"}]
+        pending_inputs.record(sid, content, stable_id=attempt_id, background_titles_enabled=False)
+        body = {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {"role": "user", "content": content},
+                "response_id": f"native-turn-{index}",
+                "source_id": f"native:source:{index}",
+            },
+        }
+        response = await client.post(f"/v1/sessions/{sid}/events", json=body)
+        assert response.status_code == 202, response.text
+        persisted_ids.append(response.json()["item_id"])
+        assert (await client.post(f"/v1/sessions/{sid}/events", json=body)).json()[
+            "item_id"
+        ] == persisted_ids[-1]
+    handle = json.loads(_ChildMessageDeliveryUnknown(sid, attempt_ids[0]).handle())
+    info = json.loads(
+        await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": handle["conversation_id"]}),
+            server_client=client,
+            conversation_id=sid,
+        )
+    )
+    history = json.loads(
+        await execute_tool(
+            tool_name="sys_session_get_history",
+            arguments=json.dumps({"conversation_id": handle["conversation_id"]}),
+            server_client=client,
+            conversation_id=sid,
+        )
+    )
+    assert info["session_id"] == sid
+    actual = [item["id"] for item in history["items"] if item.get("text") == "identical message"]
+    assert set(actual) == set(persisted_ids)
+    assert not set(actual) & set(attempt_ids)
+    assert "conversation_id" in handle["message"]
+    assert "cannot confirm this specific input" in handle["message"]
+
+
 async def test_publish_status_tracks_in_flight_response_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
