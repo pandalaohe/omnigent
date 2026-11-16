@@ -867,12 +867,15 @@ async def test_auto_create_repl_terminal_inherits_agent_sandbox(
     ],
 )
 @pytest.mark.asyncio
+@pytest.mark.parametrize("windows", [False, True])
 async def test_create_session_repl_terminal_dispatch(
     harness: str,
     sub_agent_name: str | None,
     expect_created: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    windows: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     ``POST /v1/sessions`` auto-creates the REPL terminal for SDK sessions only.
@@ -893,6 +896,7 @@ async def test_create_session_repl_terminal_dispatch(
     :returns: None.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr("omnigent.runner.app.IS_WINDOWS", windows, raising=False)
     monkeypatch.setattr(
         "omnigent.runtime.workflow._resolve_provider_for_build", lambda *_args, **_kwargs: None
     )
@@ -951,7 +955,12 @@ async def test_create_session_repl_terminal_dispatch(
     # Dispatch fired exactly for the SDK top-level case. An unexpected
     # entry here means natives/sub-agents grew a REPL pane; a missing
     # one means SDK sessions lost the embedded web TUI.
-    assert created_sessions == (["5eef02d60f39cba3fbd0ae188348643f"] if expect_created else [])
+    assert created_sessions == (
+        ["5eef02d60f39cba3fbd0ae188348643f"] if expect_created and not windows else []
+    )
+    if expect_created and windows:
+        assert resp.json()["optional_capabilities"]["repl_terminal"] == "unsupported"
+        assert not [record for record in caplog.records if record.levelno >= 40]
 
 
 @pytest.mark.parametrize("cached_predecessor", [False, True])

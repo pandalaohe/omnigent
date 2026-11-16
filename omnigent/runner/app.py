@@ -50,6 +50,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.debug_logging import (
     PRIMARY_SESSION_ID_ENV_VAR,
@@ -4966,12 +4967,26 @@ def create_runner_app(
                 _relay_task.add_done_callback(_background_tasks.discard)
                 _background_tasks.add(_relay_task)
 
+        repl_terminal_health = "not_requested"
         if (
             spec is not None
             and not is_native_harness(harness_name)
             and not _sa_name
             and resource_registry.terminal_registry is not None
+            and IS_WINDOWS
         ):
+            repl_terminal_health = "unsupported"
+            _logger.info(
+                "Optional REPL terminal unavailable on Windows; SDK initialization continues",
+                extra={"session_id": session_id, "optional_capability": "repl_terminal"},
+            )
+        elif (
+            spec is not None
+            and not is_native_harness(harness_name)
+            and not _sa_name
+            and resource_registry.terminal_registry is not None
+        ):
+            repl_terminal_health = "ready"
             _repl_lock = _repl_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
             async with _repl_lock:
                 _tr = resource_registry.terminal_registry
@@ -4994,6 +5009,7 @@ def create_runner_app(
                             agent_spec=repl_agent_spec,
                         )
                     except Exception:
+                        repl_terminal_health = "failed"
                         _logger.exception(
                             "Failed to auto-create omnigent REPL terminal for %s",
                             session_id,
@@ -5344,6 +5360,7 @@ def create_runner_app(
                     else None
                 ),
                 "terminal_ready": terminal_ready,
+                "optional_capabilities": {"repl_terminal": repl_terminal_health},
                 **(
                     {
                         "permission_tiers_capability": permission_tier_ack,
