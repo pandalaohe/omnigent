@@ -1858,6 +1858,12 @@ def register_resources_routes(
         elevated = body.get("elevated", False)
         if not isinstance(elevated, bool):
             raise HTTPException(status_code=400, detail="elevated must be a boolean")
+        agent_tier = body.get("agent_tier")
+        if agent_tier is not None and agent_tier not in ("off", "read", "read_write"):
+            raise HTTPException(status_code=400, detail="invalid agent tier")
+        if agent_tier in ("read", "read_write") and elevated:
+            require_terminal_browser_session(request, auth_provider)
+            await require_terminal_host_owner(request, conv, auth_provider, conversation_store)
         if elevated:
             from omnigent.host.frames import CAP_TERMINAL_ELEVATED
 
@@ -1946,6 +1952,18 @@ def register_resources_routes(
                 trigger="terminal_ensure",
             )
         timings.mark("ensure_runner")
+        if agent_tier is not None and agent_tier != ("off" if elevated else "read_write"):
+            if runner_client is None:
+                raise HTTPException(status_code=409, detail="terminal host is unavailable")
+            support = await runner_client.get("/v1/terminal-agent-tiers", timeout=10)
+            if support.status_code != 200 or support.json().get("tiers") != [
+                "off",
+                "read",
+                "read_write",
+            ]:
+                raise HTTPException(
+                    status_code=409, detail="update the host to set the initial agent tier"
+                )
         path = f"/v1/sessions/{session_id}/resources/terminals"
         router = runner_router or get_server_runner_router()
         if router is not None:
@@ -1985,11 +2003,10 @@ def register_resources_routes(
             and isinstance(metadata.get("instance_id"), str)
         ):
             name = f"{metadata.get('terminal_name')} · {metadata.get('session_key')}"
-            detail = (
-                f"admin shell {name} in this session. Ask with sys_terminal_request_access before using it."
-                if metadata.get("elevated")
-                else f"{name} in this session. You can read it, not type into it or close it."
-            )
+            tier = metadata.get("agent_tier", "off" if metadata.get("elevated") else "read_write")
+            detail = f"{name} in this session. Agent access: {tier}."
+            if metadata.get("elevated"):
+                detail += " Ask with sys_terminal_request_access for more."
             shell_notes.hold(
                 session_id,
                 payload["id"],
@@ -2035,7 +2052,7 @@ def register_resources_routes(
     async def set_terminal_agent_access(
         request: Request, session_id: str, terminal_id: str
     ) -> Any:
-        """Grant or revoke agent use of exactly one elevated terminal instance."""
+        """Set the agent tier for exactly one terminal instance."""
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
         require_terminal_browser_session(request, auth_provider)
         host_id = await require_terminal_host_owner(
@@ -2044,7 +2061,11 @@ def register_resources_routes(
         body = await request.json()
         if (
             not isinstance(body, dict)
-            or not isinstance(body.get("agent_access"), bool)
+            or (
+                body["agent_tier"] not in ("off", "read", "read_write")
+                if "agent_tier" in body
+                else not isinstance(body.get("agent_access"), bool)
+            )
             or not isinstance(body.get("instance_id"), str)
             or not body["instance_id"]
         ):
@@ -2056,11 +2077,25 @@ def register_resources_routes(
             terminal_access_lock,
         )
 
+        tier = body.get("agent_tier", "read_write" if body.get("agent_access") else "off")
         async with terminal_access_lock(session_id, terminal_id, body["instance_id"]):
+            current = await _proxy_get_to_runner(
+                session_id, f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}", conv
+            )
+            tier_capable = "agent_tier" in current.get("metadata", {})
+            if tier == "read" and not tier_capable:
+                raise HTTPException(
+                    status_code=409, detail="update the host to use read-only agent access"
+                )
+            change = {"instance_id": body["instance_id"]}
+            if tier_capable:
+                change["agent_tier"] = tier
+            else:
+                change["agent_access"] = tier == "read_write"
             status, payload = await _proxy_patch_to_runner(
                 session_id,
                 f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}",
-                {"agent_access": body["agent_access"], "instance_id": body["instance_id"]},
+                change,
                 conv,
             )
             if status >= 400:
@@ -2074,7 +2109,7 @@ def register_resources_routes(
                 session_id,
                 terminal_id,
                 body["instance_id"],
-                body["agent_access"],
+                tier,
                 conversation_store,
             )
         _logger.info(
@@ -2084,7 +2119,7 @@ def register_resources_routes(
             session_id,
             terminal_id,
             body["instance_id"],
-            body["agent_access"],
+            tier,
         )
         _publish_and_persist_resource_event(
             session_id,

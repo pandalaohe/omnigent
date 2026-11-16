@@ -68,6 +68,55 @@ def admin(tmp_path: Path):
     return registry, instance
 
 
+@pytest.mark.parametrize("elevated", [False, True])
+def test_agent_tier_defaults_and_legacy_mapping(admin, elevated):
+    registry, instance = admin
+    instance.elevated = elevated
+    assert instance.agent_tier == ("off" if elevated else "read_write")
+    registry.set_agent_access("session", "bash", "admin", instance.instance_id, True)
+    assert instance.agent_tier == "read_write"
+    registry.set_agent_access("session", "bash", "admin", instance.instance_id, False)
+    assert instance.agent_tier == "off"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("elevated", [False, True])
+@pytest.mark.parametrize("tier", ["off", "read", "read_write"])
+@pytest.mark.parametrize("operation", ["read", "send", "close"])
+async def test_terminal_tools_enforce_tier_on_every_shell(
+    admin, monkeypatch, elevated, tier, operation
+):
+    registry, instance = admin
+    instance.elevated = elevated
+    instance.send = AsyncMock(return_value={"status": "sent"})
+    instance.read = AsyncMock(return_value={"screen": "shell output"})
+    instance.close = AsyncMock()
+    monkeypatch.setenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, '["bash"]')
+    registry.set_agent_tier("session", "bash", "admin", instance.instance_id, tier)
+    result = json.loads(
+        await _execute_terminal_tool(
+            f"sys_terminal_{operation}",
+            {"terminal": "bash", "session": "admin", "text": "hello"},
+            terminal_registry=registry,
+            agent_spec=AgentSpec(
+                spec_version=1, name="test", terminals={"bash": TerminalEnvSpec()}
+            ),
+            conversation_id="session",
+            task_id="test",
+            agent_id="test",
+        )
+    )
+    allowed = tier == "read_write" or (tier == "read" and operation == "read")
+    if allowed:
+        assert "error" not in result, result
+        getattr(instance, operation).assert_awaited_once()
+    else:
+        assert "agent access not granted" in result["error"]
+        instance.send.assert_not_awaited()
+        instance.read.assert_not_awaited()
+        instance.close.assert_not_awaited()
+
+
 @pytest.mark.parametrize("declared", [False, True])
 def test_terminal_access_request_is_discovered_only_with_approval_transport(
     admin, monkeypatch, declared: bool
@@ -203,7 +252,8 @@ async def test_resource_projection_switch_and_transfer_are_instance_bound(admin)
         plain = await client.patch(
             path, json={"agent_access": True, "instance_id": replacement.instance_id}
         )
-        assert plain.status_code == 409
+        assert plain.status_code == 200
+        assert plain.json()["metadata"]["agent_tier"] == "read_write"
 
 
 @pytest.mark.parametrize("read_only", [False, True])

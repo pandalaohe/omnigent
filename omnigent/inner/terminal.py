@@ -1122,7 +1122,7 @@ class TerminalInstance:
     # Host-inventory shells keep their socket private even when agent-launched.
     host_shell: bool = False
     elevated: bool = False
-    agent_access: bool = False
+    _agent_tier: Literal["off", "read", "read_write"] | None = field(default=None, repr=False)
     linked_session_id: str | None = None
     last_input_at: float = field(default_factory=time.monotonic, repr=False)
     _elevated_watch_stop: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -1221,6 +1221,25 @@ class TerminalInstance:
         :returns: None.
         """
         self._last_client_interaction_at = time.monotonic()
+
+    @property
+    def agent_tier(self) -> Literal["off", "read", "read_write"]:
+        return self._agent_tier or ("off" if self.elevated else "read_write")
+
+    @agent_tier.setter
+    def agent_tier(self, value: Literal["off", "read", "read_write"]) -> None:
+        if value not in ("off", "read", "read_write"):
+            raise ValueError("invalid agent tier")
+        self._agent_tier = value
+
+    @property
+    def agent_access(self) -> bool:
+        """Legacy boolean compatibility; remove in 0.23.0."""
+        return self.agent_tier == "read_write"
+
+    @agent_access.setter
+    def agent_access(self, enabled: bool) -> None:
+        self.agent_tier = "read_write" if enabled else "off"
 
     def client_interaction_within(self, window_s: float) -> bool:
         """

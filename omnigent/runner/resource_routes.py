@@ -532,6 +532,11 @@ def register_resource_routes(
     ) -> JSONResponse:
         body = await request.json()
         elevated = body.get("elevated", False)
+        agent_tier = body.get("agent_tier")
+        if agent_tier is not None and agent_tier not in ("off", "read", "read_write"):
+            return JSONResponse(
+                status_code=400, content={"error": {"message": "invalid agent tier"}}
+            )
         if not isinstance(elevated, bool):
             return JSONResponse(
                 status_code=400, content={"error": {"message": "elevated must be a boolean"}}
@@ -863,6 +868,7 @@ def register_resource_routes(
                     resource_registry.launch_auxiliary_terminal,
                     elevated=elevated,
                     origin=terminal_origin_for_create(body),
+                    agent_tier=agent_tier,
                 )
             )
             resource_view = await launch_method(
@@ -1052,6 +1058,10 @@ def register_resource_routes(
             content=session_resource_view_to_dict(resource),
         )
 
+    @app.get("/v1/terminal-agent-tiers")
+    def terminal_agent_tiers() -> dict[str, list[str]]:
+        return {"tiers": ["off", "read", "read_write"]}
+
     @app.patch("/v1/sessions/{session_id}/resources/terminals/{terminal_id}")
     async def set_terminal_agent_access(
         session_id: str, terminal_id: str, request: Request
@@ -1059,7 +1069,11 @@ def register_resource_routes(
         body = await request.json()
         if (
             not isinstance(body, dict)
-            or not isinstance(body.get("agent_access"), bool)
+            or (
+                body["agent_tier"] not in ("off", "read", "read_write")
+                if "agent_tier" in body
+                else not isinstance(body.get("agent_access"), bool)
+            )
             or not isinstance(body.get("instance_id"), str)
         ):
             return JSONResponse(
@@ -1073,12 +1087,12 @@ def register_resource_routes(
             )
         try:
             instance = await asyncio.to_thread(
-                terminal_registry.set_agent_access,
+                terminal_registry.set_agent_tier,
                 session_id,
                 entry.terminal_name,
                 entry.session_key,
                 body["instance_id"],
-                body["agent_access"],
+                body.get("agent_tier", "read_write" if body.get("agent_access") else "off"),
             )
         except ValueError as exc:
             return JSONResponse(status_code=409, content={"error": {"message": str(exc)}})

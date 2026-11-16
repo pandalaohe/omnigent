@@ -388,6 +388,43 @@ async def test_terminal_request_withdrawal_and_web_switch(terminal_access, end):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("elevated", [False, True])
+async def test_tier_card_and_partial_strip_grant(terminal_access, elevated):
+    env = terminal_access
+    env.instance.elevated = elevated
+    env.instance.agent_tier = "off"
+    env.args["tier"] = "read_write"
+    eid, _, _ = await _publish(env, "relay")
+    pending = pending_elicitations.lookup(eid, conversation_id=env.sid)
+    assert pending is not None
+    assert pending[1]["params"]["terminal_access_tier"] == "read_write"
+    changed = await env.client.patch(
+        env.path,
+        json={"instance_id": env.instance.instance_id, "agent_tier": "read"},
+        headers={"Origin": "http://test"},
+    )
+    assert changed.status_code == 200, changed.text
+    assert env.instance.agent_tier == "read"
+    assert pending_elicitations.lookup(eid, conversation_id=env.sid) is not None
+    url, body = _answer(env, eid, "url", "accept")
+    accepted = await env.client.post(url, json=body, headers={"Origin": "http://test"})
+    assert accepted.status_code == 202, accepted.text
+    assert env.instance.agent_tier == "read_write"
+
+
+@pytest.mark.asyncio
+async def test_request_read_tier_grants_only_read(terminal_access):
+    env = terminal_access
+    env.args["tier"] = "read"
+    eid, _, _ = await _publish(env, "relay")
+    url, body = _answer(env, eid, "url", "accept")
+    accepted = await env.client.post(url, json=body, headers={"Origin": "http://test"})
+    assert accepted.status_code == 202, accepted.text
+    assert env.instance.agent_tier == "read"
+    assert not env.instance.agent_access
+
+
+@pytest.mark.asyncio
 async def test_web_revocation_waits_for_in_flight_card_grant(terminal_access, monkeypatch):
     env = terminal_access
     eid, _, _ = await _publish(env, "relay")
@@ -395,7 +432,7 @@ async def test_web_revocation_waits_for_in_flight_card_grant(terminal_access, mo
     original = env.runner_client.patch
 
     async def patch(*args, **kwargs):
-        if kwargs["json"]["agent_access"]:
+        if kwargs["json"].get("agent_tier") == "read_write" or kwargs["json"].get("agent_access"):
             patch_started.set()
             await release.wait()
         return await original(*args, **kwargs)
