@@ -102,7 +102,7 @@ from omnigent.native._native_post_delivery import (
 from omnigent.native._native_supersession import post_clear_supersession
 from omnigent.native_subagent_snapshot import NativeSubagentSnapshotPublisher
 from omnigent.process_logging import log_info_once
-from omnigent.runner.launch_failure import is_codex_provider_auth_failure
+from omnigent.runner.launch_failure import is_codex_provider_auth_failure, provider_billing_refusal
 from omnigent.runner.turn_routing import read_pending_replay, routed_prompt_block_reason
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
@@ -1933,6 +1933,8 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
         :data:`_CODEX_ERROR_KIND_GENERIC`.
     """
     lowered = message.lower()
+    if provider_billing_refusal(message) or provider_billing_refusal(json.dumps(error)):
+        return _CODEX_ERROR_KIND_GENERIC
     if any(
         fragment in lowered
         for fragment in (*_CODEX_BUDGET_EXHAUSTED_FRAGMENTS, *_CODEX_IP_ACCESS_LIST_FRAGMENTS)
