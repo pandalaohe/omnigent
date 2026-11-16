@@ -179,3 +179,40 @@ async def test_input_claim_uses_remaining_deadline_and_stops(
         assert await waiting
     assert (40 < budgets[0] <= 45) if explicit_deadline else budgets == [125]
     assert not ctx._pending_input_claims
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adapter", [False, True])
+@pytest.mark.parametrize("previous_response", [False, True])
+async def test_live_injection_ingress_keeps_non_executor_admission(adapter, previous_response):
+    from omnigent.inner.executor import Executor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    harness = ExecutorAdapter(executor_factory=Executor) if adapter else _scaffold.HarnessApp()
+    ctx = _scaffold.TurnContext("active", asyncio.Queue(), asyncio.Event(), "session")
+    harness._active_turn_ctx = ctx
+    harness._in_flight[ctx.response_id] = ctx
+    request = CreateResponseRequest(
+        model="agent",
+        input="follow-up",
+        input_id="d" * 32,
+        input_admission_required=True,
+        input_admission_deadline=time.time() + 30,
+        previous_response_id=ctx.response_id if previous_response else None,
+    )
+    delivery = asyncio.create_task(harness._start_or_inject_turn(request))
+    try:
+        if not adapter:
+            event = await asyncio.wait_for(ctx._event_queue.get(), 3)
+            assert event.claim.boundary == "receiver"
+            ctx._complete_input_claim(event.claim_id, InputExecutionReceipt(reason="refused"))
+        response = await asyncio.wait_for(delivery, 3)
+        assert response.status_code == (204 if adapter else 409)
+        if adapter:
+            assert await ctx.next_injection(timeout=1) == request
+            assert ctx._event_queue.empty()
+        else:
+            assert ctx._injection_queue.empty()
+    finally:
+        delivery.cancel()
+        await asyncio.gather(delivery, return_exceptions=True)

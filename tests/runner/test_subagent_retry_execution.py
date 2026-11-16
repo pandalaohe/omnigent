@@ -427,6 +427,197 @@ async def test_admission_relay_reconciles_one_id_and_fences_late_replacement(out
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["accepted", "refused", "unknown", "superseded"])
+async def test_injection_reservation_releases_only_definite_refusal(db_uri, outcome):
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from tests.stores.test_subagent_retry_store import _journal
+
+    journal = _journal(db_uri, SqlAlchemyConversationStore(db_uri))
+    async with _receiver(journal, True) as receive:
+        main = InputExecutionClaim(input_id=uuid4().hex, turn_id="active")
+        assert (await receive(main)).accepted
+        injection = InputExecutionClaim(
+            input_id=uuid4().hex,
+            turn_id="active",
+            boundary="injection_reserve",
+            admission_deadline=time.time() + 30,
+        )
+        assert (await receive(injection)).state == "reserved"
+        # A second delivery attempt on the same turn must not enter the executor.
+        assert (await receive(injection)).state == "refused"
+        wrong_turn = injection.model_copy(update={"turn_id": "other"})
+        assert (await receive(wrong_turn)).state == "refused"
+        if outcome == "superseded":
+            assert (
+                await receive(
+                    main.model_copy(update={"input_id": uuid4().hex, "turn_id": "replacement"})
+                )
+            ).accepted
+        if outcome in {"accepted", "refused"}:
+            settled = await receive(
+                injection.model_copy(
+                    update={
+                        "boundary": "injection_accept"
+                        if outcome == "accepted"
+                        else "injection_refuse"
+                    }
+                )
+            )
+            assert settled.accepted is (outcome == "accepted")
+        successor = injection.model_copy(update={"boundary": "receiver", "turn_id": "next"})
+        assert (await receive(successor)).accepted is (outcome == "refused")
+        # Late acknowledgements cannot settle a refused/replayed attempt.
+        late = injection.model_copy(update={"boundary": "injection_accept"})
+        assert (await receive(late)).accepted is (outcome in {"accepted", "unknown"})
+        stale = journal.store.admit_execution(journal.child, late, runner_id="stale-runner")
+        assert stale.reason == "stale_runner"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["accepted", "refused", "ambiguous", "error", "cancelled"])
+async def test_live_injection_survives_long_turn_without_duplicate_delivery(
+    db_uri, monkeypatch, outcome
+):
+    from omnigent.inner.executor import Executor, InjectionDeliveryAmbiguous
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from tests._helpers.live_server import reserve_port
+    from tests._helpers.polling import poll_until_async
+    from tests.stores.test_subagent_retry_store import _journal
+
+    journal = _journal(db_uri, SqlAlchemyConversationStore(db_uri))
+    main_id, followup_id = uuid4().hex, uuid4().hex
+    started, release, continued = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    executed, delivered, admissions = [], [], []
+    wall_time = time.time
+
+    class Inner(Executor):
+        async def enqueue_session_message(self, session_key, content):
+            delivered.append(content)
+            if outcome == "ambiguous":
+                raise InjectionDeliveryAmbiguous("Delivery acknowledgement lost")
+            if outcome == "error":
+                raise RuntimeError("Transport failed after submission")
+            if outcome == "cancelled":
+                raise asyncio.CancelledError
+            return outcome == "accepted"
+
+    inner = Inner()
+
+    class Harness(ExecutorAdapter):
+        async def run_turn(self, request, ctx):
+            executed.append((request.input_id, ctx.response_id))
+            if request.input_id != main_id:
+                continued.set()
+                return
+            watcher = asyncio.create_task(self._watch_injections(ctx, inner))
+            started.set()
+            try:
+                await release.wait()
+            finally:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+
+    harness = Harness(executor_factory=lambda: inner)
+    app = harness.build()
+    app.state.conversation_id = journal.child
+    app.state.harness_auth_token = "test-harness"
+    with reserve_port() as sock:
+        sock.listen()
+        server = uvicorn.Server(uvicorn.Config(app, log_level="warning", lifespan="on"))
+        serving = asyncio.create_task(server.serve(sockets=[sock]))
+        try:
+            await poll_until_async(lambda: server.started, timeout_s=5)
+            async with _receiver(journal, True) as receive:
+
+                class Server(NullServerClient):
+                    async def post(self, url, **kwargs):
+                        if not url.endswith("/input-admission"):
+                            return await super().post(url, **kwargs)
+                        claim = InputExecutionClaim.model_validate(kwargs["json"])
+                        admissions.append(claim)
+                        result = await receive(claim)
+                        return httpx.Response(
+                            200,
+                            json=result.model_dump(),
+                            request=httpx.Request("POST", "http://server" + url),
+                        )
+
+                async with httpx.AsyncClient(
+                    base_url=f"http://127.0.0.1:{sock.getsockname()[1]}",
+                    headers={"Authorization": "Bearer test-harness"},
+                ) as hc:
+                    runner = create_runner_app(
+                        process_manager=_FakeProcessManager(hc), server_client=Server()
+                    )
+                    async with _runner_test_client(runner) as client:
+                        body = {
+                            "type": "message",
+                            "role": "user",
+                            "model": "test",
+                            "content": [{"type": "input_text", "text": "main"}],
+                            "input_id": main_id,
+                            "input_admission_required": True,
+                            "input_admission_deadline": time.time() + 30,
+                        }
+                        task = asyncio.create_task(
+                            client.post(
+                                f"/v1/sessions/{journal.child}/events?stream=true", json=body
+                            )
+                        )
+                        try:
+                            await asyncio.wait_for(started.wait(), 5)
+                            sent = await client.post(
+                                f"/v1/sessions/{journal.child}/events",
+                                json={
+                                    **body,
+                                    "input_id": followup_id,
+                                    "content": [{"type": "input_text", "text": "follow-up"}],
+                                },
+                            )
+                            assert sent.status_code == 202
+                            expected = {"accepted": "accepted", "refused": "closed"}.get(
+                                outcome, "reserved"
+                            )
+                            await poll_until_async(
+                                lambda: (
+                                    (receipt := journal.store.get_input(followup_id)) is not None
+                                    and receipt.state == expected
+                                    and (
+                                        outcome == "refused"
+                                        or not runner.state.session_message_buffers.get(
+                                            journal.child
+                                        )
+                                    )
+                                ),
+                                timeout_s=5,
+                            )
+                            # The original forward deadline expires while the main turn runs.
+                            monkeypatch.setattr(
+                                "omnigent.runner.app.time.time", lambda: wall_time() + 900
+                            )
+                        finally:
+                            release.set()
+                        assert (await asyncio.wait_for(task, 8)).status_code == 200
+                        if outcome == "refused":
+                            await asyncio.wait_for(continued.wait(), 8)
+        finally:
+            release.set()
+            server.should_exit = True
+            await asyncio.wait_for(serving, 5)
+    assert delivered == ["follow-up"]
+    assert [identity for identity, _ in executed] == (
+        [main_id, followup_id] if outcome == "refused" else [main_id]
+    )
+    receipt = journal.store.get_input(followup_id)
+    assert receipt.state == ("accepted" if outcome in {"accepted", "refused"} else "reserved")
+    if outcome == "refused":
+        assert receipt.turn_id == executed[-1][1] != executed[0][1]
+        assert admissions[-1].input_id == followup_id
+        assert admissions[-1].admission_deadline > wall_time() + 900
+
+
+@pytest.mark.asyncio
 async def test_runner_posts_same_control_receipt_before_reply_and_recovers_lost_receipt_ack():
     control_id = "c" * 32
     state = {"state": "prepared", "version": 0}

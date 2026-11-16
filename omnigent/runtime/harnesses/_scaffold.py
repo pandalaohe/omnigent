@@ -850,7 +850,13 @@ class TurnContext:
         request: CreateResponseRequest,
         *,
         boundary: Literal[
-            "receiver", "native_reserve", "native_accept", "native_refuse"
+            "receiver",
+            "native_reserve",
+            "native_accept",
+            "native_refuse",
+            "injection_reserve",
+            "injection_accept",
+            "injection_refuse",
         ] = "receiver",
         native_turn_id: str | None = None,
         native_reason: str | None = None,
@@ -1681,6 +1687,11 @@ class HarnessApp:
         """
         return _keep_warm_receipt(attempt_id, outcome="skipped", reason="unsupported")
 
+    async def _admit_live_injection(
+        self, request: CreateResponseRequest, ctx: TurnContext
+    ) -> bool:
+        return not request.input_admission_required or await ctx.claim_input_execution(request)
+
     async def _start_or_inject_turn(
         self, request: CreateResponseRequest, *, session_id: str | None = None
     ) -> StreamingResponse | Response:
@@ -1721,7 +1732,7 @@ class HarnessApp:
             ctx = self._in_flight[request.previous_response_id]
             if ctx.retry_input:
                 return Response(status_code=status.HTTP_409_CONFLICT)
-            if request.input_admission_required and not await ctx.claim_input_execution(request):
+            if not await self._admit_live_injection(request, ctx):
                 return Response(status_code=status.HTTP_409_CONFLICT)
             ctx._push_injection(request)
             return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -1739,10 +1750,7 @@ class HarnessApp:
             ):
                 if request.retry_guard is not None or self._active_turn_ctx.retry_input:
                     return Response(status_code=status.HTTP_409_CONFLICT)
-                if (
-                    request.input_admission_required
-                    and not await self._active_turn_ctx.claim_input_execution(request)
-                ):
+                if not await self._admit_live_injection(request, self._active_turn_ctx):
                     return Response(status_code=status.HTTP_409_CONFLICT)
                 self._active_turn_ctx._push_injection(request)
                 return Response(status_code=status.HTTP_204_NO_CONTENT)

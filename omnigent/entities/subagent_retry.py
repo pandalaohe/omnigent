@@ -121,7 +121,15 @@ class InputExecutionClaim(BaseModel):
     retry: RetryExecutionGuard | None = None
     native_generation: int | None = Field(default=None, strict=True, ge=1)
     admission_deadline: float | None = Field(default=None, allow_inf_nan=False)
-    boundary: Literal["receiver", "native_reserve", "native_accept", "native_refuse"] = "receiver"
+    boundary: Literal[
+        "receiver",
+        "native_reserve",
+        "native_accept",
+        "native_refuse",
+        "injection_reserve",
+        "injection_accept",
+        "injection_refuse",
+    ] = "receiver"
     native_turn_id: str | None = Field(default=None, min_length=1, max_length=256)
     native_reason: str | None = Field(default=None, min_length=1, max_length=64)
     native_detail: str | None = Field(default=None, max_length=4096)

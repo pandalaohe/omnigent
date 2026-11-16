@@ -260,9 +260,14 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
             prior_receipt = _current(db, SqlRetryInput, (current_workspace_id(), claim.input_id))
             if pending_control is not None and (
                 (prior_receipt is None or prior_receipt.state != "accepted")
-                and claim.boundary not in {"native_accept", "native_refuse"}
+                and claim.boundary
+                not in {"native_accept", "native_refuse", "injection_accept", "injection_refuse"}
             ):
                 return InputExecutionReceipt(state="pending", reason="control_pending")
+            if claim.boundary.startswith("injection_"):
+                if guard is not None or claim.kind != "ordinary" or claim.turn_id is None:
+                    return InputExecutionReceipt(reason="invalid_injection_input")
+                return self._admit_injection(db, child_id, claim)
             if guard is not None:
                 if guard.input_id != claim.input_id or claim.turn_id is None:
                     return InputExecutionReceipt(reason="invalid_retry_input")
@@ -412,19 +417,27 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                         state="accepted", reason="accepted", receipt=_input(receipt)
                     )
                 original_turn = (receipt.reason or {}).get("execution_turn_id", receipt.turn_id)
+                injection_refused = (
+                    claim.kind == "ordinary"
+                    and receipt.kind == "human"
+                    and receipt.state == "closed"
+                    and receipt.payload.get("injection") is True
+                    and (receipt.reason or {}).get("code") == "injection_refused"
+                )
                 if (
                     receipt.target_id != child_id
                     or receipt.kind not in {"human", "control"}
                     or (
                         original_turn != claim.turn_id
                         and not (claim.kind == "recovery" and receipt.state == "closed")
+                        and not injection_refused
                     )
                 ):
                     return InputExecutionReceipt(reason="input_identity_conflict")
                 if receipt.state != "accepted":
                     retry_after = (receipt.reason or {}).get("retry_after")
                     if (
-                        claim.kind != "recovery"
+                        (claim.kind != "recovery" and not injection_refused)
                         or receipt.state != "closed"
                         or claim.admission_deadline is None
                         or (
@@ -433,8 +446,10 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
                         )
                         or original_turn == claim.turn_id
                         or claim.turn_id in (receipt.reason or {}).get("refused_turns", {})
-                        or retry_after is None
-                        or time.time() < retry_after
+                        or (
+                            not injection_refused
+                            and (retry_after is None or time.time() < retry_after)
+                        )
                     ):
                         return InputExecutionReceipt(
                             reason="input_closed", receipt=_input(receipt)
@@ -497,6 +512,68 @@ class SqlAlchemySubagentRetryStore(SubagentRetryStore):
             parent_id=claim.retry.owner.parent_id if claim.retry else None,
             recovery_id=claim.input_id if claim.kind == "recovery" else None,
         )
+
+    def _admit_injection(
+        self, db: Session, child_id: str, claim: InputExecutionClaim
+    ) -> InputExecutionReceipt:
+        """Keep an input reserved until delivery is accepted or explicitly refused."""
+        control = self._child_control(db, child_id)
+        receipt = _current(db, SqlRetryInput, (current_workspace_id(), claim.input_id))
+        if claim.boundary == "injection_reserve":
+            if receipt is not None:
+                # Even the same turn cannot submit the same reservation twice.
+                return InputExecutionReceipt(reason="input_already_reserved")
+            if control.turn_id != claim.turn_id:
+                return InputExecutionReceipt(reason="superseded")
+            if claim.admission_deadline is None or time.time() >= claim.admission_deadline:
+                return InputExecutionReceipt(reason="input_expired")
+            receipt = SqlRetryInput(
+                input_id=claim.input_id,
+                chain_id=None,
+                target_id=child_id,
+                kind="human",
+                attempt=0,
+                state="reserved",
+                payload={"injection": True},
+                version=0,
+                expected_input_generation=control.generation,
+                turn_id=claim.turn_id,
+                input_generation=None,
+                reason=None,
+            )
+            db.add(receipt)
+            return InputExecutionReceipt(
+                state="reserved", reason="reserved", receipt=_input(receipt)
+            )
+        if (
+            receipt is None
+            or receipt.target_id != child_id
+            or receipt.chain_id is not None
+            or receipt.kind != "human"
+            or receipt.payload.get("injection") is not True
+            or receipt.turn_id != claim.turn_id
+        ):
+            return InputExecutionReceipt(reason="input_identity_conflict")
+        if receipt.state == "accepted" and claim.boundary == "injection_accept":
+            return InputExecutionReceipt(
+                state="accepted", reason="accepted", receipt=_input(receipt)
+            )
+        if receipt.state != "reserved":
+            return InputExecutionReceipt(reason="input_closed", receipt=_input(receipt))
+        if claim.boundary == "injection_refuse":
+            receipt.state, receipt.reason = "closed", {"code": "injection_refused"}
+            receipt.version += 1
+            return InputExecutionReceipt(reason="injection_refused", receipt=_input(receipt))
+        if (
+            control.turn_id != claim.turn_id
+            or control.generation != receipt.expected_input_generation
+        ):
+            return InputExecutionReceipt(reason="superseded", receipt=_input(receipt))
+        control.generation += 1
+        control.input_id = claim.input_id
+        receipt.state, receipt.input_generation = "accepted", control.generation
+        receipt.version += 1
+        return InputExecutionReceipt(state="accepted", reason="accepted", receipt=_input(receipt))
 
     def _refuse_native_input(
         self,
