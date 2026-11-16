@@ -6557,24 +6557,27 @@ describe("Composer reply quotes", () => {
           results: [{ isFinal: true, 0: { transcript: "dictated words" } }],
         }),
       );
-      const dictated = textarea().value;
-      expect(dictated).toContain("dictated words");
-      if (scenario === "cleanup") {
+      if (scenario === "transfer") {
+        const manualEdit = "typed prefix newer manual edit";
+        fireEvent.change(textarea(), { target: { value: manualEdit } });
+        renderWithTooltips(<ComposerMicButton questionCard onTranscript={vi.fn()} />);
         await act(async () =>
-          fireEvent.click(screen.getByRole("button", { name: "Voice dictation" })),
+          fireEvent.click(screen.getAllByRole("button", { name: "Voice dictation" }).at(-1)!),
         );
-        await waitFor(() => expect(textarea()).toHaveValue("typed prefix Dictated words."));
-        expect(voiceApi.cleanupDictation).toHaveBeenCalledWith(
-          "dictated words",
-          expect.any(AbortSignal),
-        );
-        expect(screen.queryByRole("button", { name: "Clean up voice" })).not.toBeInTheDocument();
+        await waitFor(() => expect(textarea()).toHaveValue(manualEdit));
+        expect(textarea().value.toLowerCase()).not.toContain("dictated words");
         return;
       }
-      fireEvent.change(textarea(), { target: { value: dictated + " newer manual edit" } });
-      renderWithTooltips(<ComposerMicButton questionCard onTranscript={vi.fn()} />);
-      fireEvent.click(screen.getAllByRole("button", { name: "Voice dictation" }).at(-1)!);
-      expect(textarea()).toHaveValue(dictated + " newer manual edit");
+      await act(async () =>
+        fireEvent.click(screen.getByRole("button", { name: "Voice dictation" })),
+      );
+      await waitFor(() => expect(textarea().value.toLowerCase()).toContain("dictated words"));
+      await waitFor(() => expect(textarea()).toHaveValue("typed prefix Dictated words."));
+      expect(voiceApi.cleanupDictation).toHaveBeenCalledWith(
+        "dictated words",
+        expect.any(AbortSignal),
+      );
+      expect(screen.queryByRole("button", { name: "Clean up voice" })).not.toBeInTheDocument();
     },
   );
 
