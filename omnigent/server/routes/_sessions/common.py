@@ -850,6 +850,28 @@ _session_mcp_startup_cache: WorkspaceScopedCache[str, dict[str, McpServerStartup
 
 
 _model_options_cache: WorkspaceScopedCache[str, list[dict[str, Any]]] = WorkspaceScopedCache()
+_model_catalog_scope: WorkspaceScopedCache[str, tuple[object, ...]] = WorkspaceScopedCache()
+_model_catalog_fetched_at: WorkspaceScopedCache[str, float] = WorkspaceScopedCache()
+_model_catalog_error: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+_model_catalog_attempt_at: WorkspaceScopedCache[str, float] = WorkspaceScopedCache()
+
+
+def _bind_model_catalog(session_id: str, scope: tuple[object, ...]) -> None:
+    """Never serve or complete a catalog probe for a different host or agent."""
+    previous = _model_catalog_scope.get(session_id)
+    if previous is not None and previous != scope:
+        task = _model_options_inflight.pop(session_id, None)
+        if task is not None:
+            task.cancel()
+        _model_options_cache.pop(session_id, None)
+        _acp_effort_options_cache.pop(session_id, None)
+        _pushed_model_options_cache.pop(session_id, None)
+        _model_catalog_fetched_at.pop(session_id, None)
+        _model_catalog_error.pop(session_id, None)
+        _model_catalog_attempt_at.pop(session_id, None)
+    _model_catalog_scope[session_id] = scope
+
+
 _acp_effort_options_cache: WorkspaceScopedCache[str, list[dict[str, Any]]] = WorkspaceScopedCache()
 
 

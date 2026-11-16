@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useIsMutating, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import {
@@ -34,7 +34,7 @@ import {
   shouldShowEffortPicker,
 } from "@/lib/composerCapabilities";
 import { isEditorLevel } from "@/lib/permissionsApi";
-import { updateSession } from "@/lib/sessionsApi";
+import { refreshSessionModelOptions, updateSession } from "@/lib/sessionsApi";
 import { parentIdFromLabels } from "@/lib/sessionHost";
 import { sideChatSettingsMutationKey, type SideChatModelSettings } from "@/lib/sideChat";
 import type { Session } from "@/lib/types";
@@ -79,6 +79,24 @@ export function SideChatSettings({
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
+  const catalog = useQuery({
+    queryKey: [
+      "session-model-options",
+      session.id,
+      session.hostId,
+      session.agentId,
+      session.harness,
+    ],
+    queryFn: async () => {
+      const models = await refreshSessionModelOptions(session.id, "force");
+      queryClient.setQueryData<Session>(["session", session.id], (current) =>
+        current && models.length > 0 ? { ...current, codexModelOptions: models } : current,
+      );
+      return models;
+    },
+    enabled: configOpen && !draft && !session.inferenceConfigured,
+    retry: false,
+  });
   const mutationKey = sideChatSettingsMutationKey(session.id);
   const saving = useIsMutating({ mutationKey }) > 0;
   const [error, setError] = useState<string | null>(null);
@@ -103,10 +121,14 @@ export function SideChatSettings({
   const capabilities = nativeSide
     ? { ...session, labels: { ...session.labels, "omnigent.wrapper": "codex-native-ui" } }
     : session;
-  const sessionOptions = catalogs.find((catalog) => catalog?.length) ?? [];
+  const sessionOptions = catalogs.find((rows) => rows?.length) ?? [];
   const kind = modelPickerKindForConv(capabilities, sessionOptions);
   const probeHarness =
-    kind === "codex" || kind === "claude" || kind === "devin" ? `${kind}-native` : null;
+    kind === "codex" || kind === "claude" || kind === "devin"
+      ? `${kind}-native`
+      : kind === "sdk"
+        ? (session.harness ?? null)
+        : null;
   const { data: hostOptions } = useHostModelOptions(
     session.hostId ?? parent?.hostId ?? null,
     probeHarness ?? "",
@@ -116,8 +138,9 @@ export function SideChatSettings({
       sessionOptions.length === 0,
   );
   // Share the main composer's host catalog while the session has no model list.
-  const options =
-    !session.inferenceConfigured && sessionOptions.length === 0
+  const options = catalog.data?.length
+    ? catalog.data
+    : !session.inferenceConfigured && sessionOptions.length === 0
       ? (hostOptions ?? sessionOptions)
       : sessionOptions;
   const family = sdkEffortFamilyForHarness(session.harness, families);
@@ -140,7 +163,7 @@ export function SideChatSettings({
       : (session.reasoningEffort ?? null);
   const supportsEffort = shouldShowEffortPicker(capabilities, family);
   const efforts = supportsEffort ? effortLevelsForConv(capabilities, options, model, family) : [];
-  const showModels = kind !== null && options.length > 0;
+  const showModels = kind !== null;
   const inheritedEffort = selectedModel?.defaultReasoningEffort ?? null;
   const currentEffort = effort ?? inheritedEffort;
   const effortLevel = efforts.length
@@ -185,6 +208,20 @@ export function SideChatSettings({
             ? {
                 testId: "side-chat-models",
                 header: "Models",
+                leading:
+                  !draft && !session.inferenceConfigured ? (
+                    <div className="flex items-center gap-2 px-2 py-1 text-xs">
+                      {catalog.error && <span role="alert">{catalog.error.message}</span>}
+                      {!options.length && <span role="status">Load models to choose a model.</span>}
+                      <button
+                        type="button"
+                        disabled={catalog.isFetching || disabled}
+                        onClick={() => void catalog.refetch()}
+                      >
+                        Refresh models
+                      </button>
+                    </div>
+                  ) : undefined,
                 choices: options.map((option) => ({
                   key: option.id,
                   label: nativeModelLabel(option),

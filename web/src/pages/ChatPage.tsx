@@ -1104,7 +1104,9 @@ export function ChatPage() {
           ? "antigravity-native"
           : fallbackPickerKind === "devin"
             ? "devin-native"
-            : null;
+            : fallbackPickerKind === "sdk"
+              ? (activeSession?.harness ?? null)
+              : null;
   const { data: hostProbeOptions } = useHostModelOptions(
     activeSession?.hostId ?? null,
     hostProbeHarness ?? "",
@@ -6397,12 +6399,7 @@ function SessionHarnessPicker({
       const current = useChatStore.getState();
       // Older hosts may answer a probe with an empty cache while the snapshot
       // already carries the agent's live catalog.
-      if (
-        models.length === 0 &&
-        current.codexModelOptions.length > 0 &&
-        (modelPickerKind === "acp" || current.sessionHarness === "pi")
-      )
-        return;
+      if (models.length === 0 && current.codexModelOptions.length > 0) return;
       useChatStore.setState({ codexModelOptions: models });
       chatQueryClient()?.setQueryData<Session>(["session", sourceSessionId], (session) =>
         session ? { ...session, codexModelOptions: models } : session,
@@ -6538,8 +6535,7 @@ function SessionHarnessPicker({
     try {
       await change();
     } catch (error) {
-      if (modelPickerKind === "antigravity")
-        toast.error(error instanceof Error ? error.message : "Unable to change model or effort");
+      toast.error(error instanceof Error ? error.message : "Unable to change model or effort");
       // The store rolls back a refused change, so the pill shows what applied.
     } finally {
       busyRef.current = false;

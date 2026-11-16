@@ -18,7 +18,7 @@ PARENT = "e" * 32
 PROJECT_ID = "f" * 32
 READ_SHARED = "0" * 32
 MISSING = "1" * 31 + "2"
-CHECKED_INFO = {"session_move_source_checks": True}
+CHECKED_INFO = {"session_move_source_checks": True, "session_settings_source_checks": True}
 
 
 def _client(handler) -> httpx.AsyncClient:
@@ -221,3 +221,87 @@ async def test_list_pages_projects_and_sessions_until_the_last_page():
     assert seen["projects"][1]["after"] == "1" * 32
     assert last["projects"] == [page_two] and last["sessions"] == []
     assert last["next_cursor"] is None and last["projects_next_cursor"] is None
+
+
+@pytest.mark.parametrize("parent", [None, PARENT])
+@pytest.mark.parametrize("effort", [None, "high"])
+async def test_update_settings_uses_existing_session_patch_for_children(parent, effort):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json=CHECKED_INFO)
+        if request.method == "GET":
+            return httpx.Response(200, json={"permission_level": 4, "parent_session_id": parent})
+        return httpx.Response(
+            200, json={"model_override": "host-model", "reasoning_effort": effort}
+        )
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_session_update(
+                {"session_id": SOURCE, "model": "host-model", "reasoning_effort": effort},
+                client,
+                SOURCE,
+            )
+        )
+    assert result["status"] == "updated"
+    patches = [r for r in requests if r.method == "PATCH"]
+    assert len(patches) == 1
+    assert json.loads(patches[0].content) == {
+        "model_override": "host-model",
+        "reasoning_effort": effort,
+    }
+    assert patches[0].headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+
+
+async def test_update_settings_denies_foreign_readable_session():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(
+            200, json=CHECKED_INFO if request.url.path == "/v1/info" else {"permission_level": 2}
+        )
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_session_update(
+                {"session_id": SOURCE, "model": "host-model"}, client, SOURCE
+            )
+        )
+    assert "owner" in result["error"]
+    assert all(r.method == "GET" for r in requests)
+
+
+@pytest.mark.parametrize(
+    "capability",
+    [
+        "session_move_source_checks",
+        "session_settings_source_checks",
+        "session_organize_source_checks",
+    ],
+)
+async def test_settings_require_a_server_that_checks_setting_sources(capability):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={capability: True})
+        if request.method == "GET":
+            return httpx.Response(200, json={"permission_level": 4})
+        return httpx.Response(200, json={"model_override": "host-model"})
+
+    async with _client(handler) as client:
+        result = json.loads(
+            await execute_session_update(
+                {"session_id": SOURCE, "model": "host-model"}, client, SOURCE
+            )
+        )
+    if capability == "session_move_source_checks":
+        assert "cannot check" in result["error"]
+        assert len(requests) == 1
+    else:
+        assert result["model"] == "host-model"

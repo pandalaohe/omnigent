@@ -258,21 +258,28 @@ async def _set_project(
     return "updated", None
 
 
-async def _server_checks_move_source(client: httpx.AsyncClient) -> bool:
-    """Whether the server refuses project changes from a source shared with edit access."""
+async def _server_checks_move_source(client: httpx.AsyncClient, *, settings: bool = False) -> bool:
+    """Whether the server checks the calling session for this mutation."""
     try:
         info = await client.get("/v1/info", timeout=30.0)
         body = info.json() if info.status_code == 200 else None
     except (httpx.HTTPError, ValueError):
         return False
-    return isinstance(body, dict) and body.get("session_move_source_checks") is True
+    if not isinstance(body, dict):
+        return False
+    if settings:
+        return (
+            body.get("session_settings_source_checks") is True
+            or body.get("session_organize_source_checks") is True
+        )
+    return body.get("session_move_source_checks") is True
 
 
 async def execute_session_update(
     args: dict[str, Any], client: httpx.AsyncClient | None, source_id: str | None
 ) -> str:
     """
-    Update one of the owner's sessions; ``project`` is currently the only field.
+    Update one of the owner's sessions through the Web settings API.
 
     Filing is the sidebar's ``PATCH /v1/sessions/{id}``, which only changes
     folder membership, so a running session keeps its turn. The calling session
@@ -280,7 +287,7 @@ async def execute_session_update(
     both the update and any project creation from a session shared with edit
     access. A project is created only after the session is known to be movable.
 
-    :param args: Tool arguments: ``session_id`` and ``project`` (``""`` unfiles).
+    :param args: Session ID and optional project, model and reasoning effort.
     :param client: HTTP client pointed at the Omnigent server.
     :param source_id: The calling session.
     :returns: JSON with ``session_id``, ``status``, ``project`` and ``project_created``,
@@ -289,9 +296,24 @@ async def execute_session_update(
     session_id = args.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         return json.dumps({"error": "session_id must be a session ID"})
-    if "project" not in args:
-        return json.dumps({"session_id": session_id, "error": "nothing to update: pass project"})
-    project = args["project"]
+    settings = {key: args[key] for key in ("model", "reasoning_effort") if key in args}
+    if "project" not in args and not settings:
+        return json.dumps(
+            {
+                "session_id": session_id,
+                "error": "nothing to update: pass project, model or reasoning_effort",
+            }
+        )
+    if "model" in settings and (
+        not isinstance(settings["model"], str) or not settings["model"].strip()
+    ):
+        return json.dumps({"session_id": session_id, "error": "model must be a non-empty string"})
+    effort = settings.get("reasoning_effort")
+    if effort is not None and not isinstance(effort, str):
+        return json.dumps(
+            {"session_id": session_id, "error": "reasoning_effort must be a string or null"}
+        )
+    project = args.get("project", "")
     # Only an exact "" unfiles; a blank-looking name must not unfile the session.
     if (
         not isinstance(project, str)
@@ -310,12 +332,68 @@ async def execute_session_update(
         return json.dumps({"session_id": session_id, "error": "invalid session ID"})
     if client is None or source_id is None:
         return json.dumps({"error": "sys_session_update requires an authenticated runner"})
-    if not await _server_checks_move_source(client):
+    if not await _server_checks_move_source(client, settings=bool(settings)):
         return json.dumps(
             {
                 "error": "sys_session_update: this Omnigent server cannot check the calling "
-                "session's sharing before changing a project; upgrade the server or move "
-                "the session from the sidebar"
+                "session's sharing before this update; upgrade the server or use the Web controls"
+            }
+        )
+    if settings:
+        try:
+            snapshot = await client.get(
+                f"/v1/sessions/{canonical}", params=_SNAPSHOT_PARAMS, timeout=30.0
+            )
+            if snapshot.is_error:
+                return json.dumps({"session_id": session_id, "error": _refusal(snapshot)})
+            level = snapshot.json().get("permission_level")
+            if isinstance(level, int) and level < LEVEL_OWNER:
+                return json.dumps(
+                    {
+                        "session_id": session_id,
+                        "error": "only the session's owner can change its settings",
+                    }
+                )
+            payload = {
+                "model_override" if key == "model" else key: value
+                for key, value in settings.items()
+            }
+            project_result = {}
+            if "project" in args:
+                current, error = await _movable_snapshot(client, canonical)
+                if current is None:
+                    return json.dumps({"session_id": session_id, "error": error})
+                name = project.strip()
+                headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
+                project_id, created = (
+                    await resolve_project_id(client, name, headers=headers)
+                    if name
+                    else ("", False)
+                )
+                payload.update({"project_id": project_id, "labels": {PROJECT_LABEL_KEY: ""}})
+                project_result = {"project": name or None, "project_created": created}
+            updated = await client.patch(
+                f"/v1/sessions/{canonical}",
+                json=payload,
+                headers={ORCHESTRATION_SOURCE_HEADER: source_id},
+                timeout=60.0,
+            )
+            if updated.is_error:
+                return json.dumps({"session_id": session_id, "error": _refusal(updated)})
+            applied = updated.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            return json.dumps(
+                {"session_id": session_id, "error": f"update could not be confirmed: {exc}"}
+            )
+        return json.dumps(
+            {
+                "session_id": session_id,
+                "status": "updated",
+                **project_result,
+                **{
+                    key: applied.get("model_override" if key == "model" else key)
+                    for key in settings
+                },
             }
         )
     current, error = await _movable_snapshot(client, canonical)

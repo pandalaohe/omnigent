@@ -1313,3 +1313,46 @@ def test_facade_attr_proxy_monkeypatch_does_not_pin_instance_attribute() -> None
         assert runtime_session_stream.publish is not original
     assert "publish" not in vars(common.session_stream)
     assert runtime_session_stream.publish is original
+
+
+async def test_sdk_session_catalog_recovers_502_empty_cache_and_host_change(
+    client, app, stores, monkeypatch
+):
+    from omnigent.server.routes._sessions import common
+
+    _seed_agent(stores, AGENT_ID, "codex")
+    store = SqlAlchemyConversationStore(stores.agent_store.storage_location)
+    conv = store.create_conversation(agent_id=AGENT_ID)
+    store.set_host_id(conv.id, HOST_A, workspace="/opt/work")
+    store.update_conversation(conv.id, model_override="retired/model")
+    _register_host(app, HOST_A)
+    _register_host(app, HOST_B)
+    common._model_options_cache[conv.id] = []
+    responses = [
+        {"status": "failed", "models": []},
+        {"status": "ok", "models": [{"id": "host-model"}]},
+        {"status": "ok", "models": []},
+        {"status": "ok", "models": [{"id": "other-host-model"}]},
+    ]
+    seen = []
+
+    async def probe(**kwargs):
+        seen.append(kwargs["host_conn"].host_id)
+        return responses.pop(0)
+
+    monkeypatch.setattr("omnigent.server.routes.hosts._proxy_model_options", probe)
+    url = f"/v1/sessions/{conv.id}/model-options?refresh=auto"
+    assert (await client.get(url)).status_code == 502
+    assert common._model_catalog_error[conv.id]
+    recovered = await client.get(url)
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["models"] == [{"id": "host-model"}]
+    assert conv.id not in common._model_catalog_error
+    empty = await client.get(url.replace("auto", "force"))
+    assert empty.status_code == 502
+    assert common._model_options_cache[conv.id] == [{"id": "host-model"}]
+    store.set_host_id(conv.id, HOST_B, workspace="/opt/work")
+    changed = await client.get(url)
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["models"] == [{"id": "other-host-model"}]
+    assert seen == [HOST_A, HOST_A, HOST_A, HOST_B]

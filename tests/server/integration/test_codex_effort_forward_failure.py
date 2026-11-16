@@ -155,7 +155,9 @@ async def native_session(
         yield _NativeSession(session_id, store, bridge_dir, codex, remembered_efforts, runner)
 
 
-@pytest.mark.parametrize(("requested", "applied"), [("minimal", "low"), ("default", "medium")])
+@pytest.mark.parametrize(
+    ("requested", "applied"), [("minimal", "low"), ("default", "medium"), (None, "medium")]
+)
 async def test_successful_update_mirrors_unchanged_native_effort_without_notification(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
@@ -766,3 +768,41 @@ async def test_offline_or_silent_effort_change_is_saved_for_resume(
     saved = native_session.store.get_conversation(native_session.session_id)
     assert saved is not None and saved.reasoning_effort is None
     assert native_session.codex.requests == []
+
+
+@pytest.mark.parametrize("harness", ["codex", "claude-sdk"])
+@pytest.mark.parametrize("child", [False, True])
+@pytest.mark.parametrize("busy", [False, True])
+async def test_sdk_settings_persist_for_next_turn(client, db_uri, harness, child, busy):
+    from omnigent.server.routes._sessions.common import _session_status_cache
+
+    agent = await create_test_agent(client)
+    parent = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert parent.status_code == 201, parent.text
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "harness_override": harness,
+            "parent_session_id": parent.json()["id"] if child else None,
+            "model_override": "retired/model",
+            "reasoning_effort": "high",
+        },
+    )
+    assert response.status_code == 201, response.text
+    sid = response.json()["id"]
+    _session_status_cache[sid] = "running" if busy else "idle"
+    updated = await client.patch(
+        f"/v1/sessions/{sid}",
+        json={
+            "model_override": "host-model",
+            "reasoning_effort": "low",
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    stored = SqlAlchemyConversationStore(db_uri).get_conversation(sid)
+    assert stored.model_override == "host-model"
+    assert stored.reasoning_effort == "low"
+    reset = await client.patch(f"/v1/sessions/{sid}", json={"reasoning_effort": None})
+    assert reset.status_code == 200, reset.text
+    assert SqlAlchemyConversationStore(db_uri).get_conversation(sid).reasoning_effort is None

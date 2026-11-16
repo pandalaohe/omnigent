@@ -191,7 +191,7 @@ export function shouldShowEffortPicker(
   models?: readonly NativeModelOption[],
 ): boolean {
   if (isSdkHarnessSession(conv)) {
-    return conv?.parentSessionId == null && effortLevelsForFamily(effortFamily).length > 0;
+    return effortLevelsForFamily(effortFamily).length > 0;
   }
   return supportsEffortControl(conv, effortFamily, models);
 }
