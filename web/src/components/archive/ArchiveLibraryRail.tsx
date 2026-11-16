@@ -28,7 +28,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
 import {
   type Conversation,
   useArchiveConversation,
@@ -517,34 +517,50 @@ export function ArchiveLibraryRail({
         </div>
         {(pageHistory.length > 0 || archivedQuery.data?.has_more) && (
           <div className="flex h-8 shrink-0 items-center justify-between gap-2 border-t px-2">
-            <Button
-              type="button"
-              variant="ghost"
-              size="xs"
-              disabled={pageHistory.length === 0 || archivedQuery.isFetching}
-              onClick={() => {
-                const previous = pageHistory.at(-1);
-                setPageHistory((current) => current.slice(0, -1));
-                setPageAfter(previous);
-              }}
-            >
-              <ChevronLeftIcon /> Previous
-            </Button>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    aria-label="Previous"
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    disabled={pageHistory.length === 0 || archivedQuery.isFetching}
+                    onClick={() => {
+                      const previous = pageHistory.at(-1);
+                      setPageHistory((current) => current.slice(0, -1));
+                      setPageAfter(previous);
+                    }}
+                  >
+                    <ChevronLeftIcon />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Previous</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
             <span className="text-sm text-muted-foreground">Page {pageHistory.length + 1}</span>
-            <Button
-              type="button"
-              variant="ghost"
-              size="xs"
-              disabled={!archivedQuery.data?.has_more || archivedQuery.isFetching}
-              onClick={() => {
-                const next = archivedQuery.data?.last_id;
-                if (!next) return;
-                setPageHistory((current) => [...current, pageAfter]);
-                setPageAfter(next);
-              }}
-            >
-              Next <ChevronRightIcon />
-            </Button>
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    aria-label="Next"
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    disabled={!archivedQuery.data?.has_more || archivedQuery.isFetching}
+                    onClick={() => {
+                      const next = archivedQuery.data?.last_id;
+                      if (!next) return;
+                      setPageHistory((current) => [...current, pageAfter]);
+                      setPageAfter(next);
+                    }}
+                  >
+                    <ChevronRightIcon />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Next</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
           </div>
         )}
       </section>

@@ -1,3 +1,4 @@
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowLeftIcon } from "lucide-react";
 
@@ -29,15 +30,23 @@ export function ArchiveSessionPage() {
     return (
       <div className="p-6 pt-20">
         <p className="text-sm text-destructive">This archive reference is unavailable.</p>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="mt-3"
-          onClick={() => navigate(-1)}
-        >
-          <ArrowLeftIcon /> Back
-        </Button>
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                aria-label="Back"
+                type="button"
+                variant="outline"
+                size="icon-sm"
+                className="mt-3"
+                onClick={() => navigate(-1)}
+              >
+                <ArrowLeftIcon />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Back</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
       </div>
     );
   }

@@ -478,9 +478,10 @@ export function ArchiveTranscriptViewer({
           </p>
           <ExplainedAction content="Copy the selected words together with source metadata and a deep link, ready to paste into another session as directed context.">
             <Button
+              aria-label="Copy citation"
               type="button"
               variant="outline"
-              size="sm"
+              size="icon-sm"
               onClick={() =>
                 copy(
                   citation(
@@ -494,7 +495,6 @@ export function ArchiveTranscriptViewer({
               }
             >
               {copied === "selection" ? <CheckIcon /> : <CopyIcon />}
-              Copy citation
             </Button>
           </ExplainedAction>
         </div>
@@ -692,7 +692,7 @@ export function ArchiveTranscriptViewer({
                           <Button
                             type="button"
                             variant="ghost"
-                            size="xs"
+                            size="icon-sm"
                             aria-label="Copy message citation"
                             onClick={() =>
                               copy(
@@ -706,19 +706,17 @@ export function ArchiveTranscriptViewer({
                             ) : (
                               <CopyIcon />
                             )}
-                            Citation
                           </Button>
                         </ExplainedAction>
                         <ExplainedAction content="Link copies only the deep link to this exact message or response; it does not include the message text.">
                           <Button
                             type="button"
                             variant="ghost"
-                            size="xs"
+                            size="icon-sm"
                             aria-label="Copy message link"
                             onClick={() => copy(link, `link:${bubbleKey(bubble)}`)}
                           >
                             {copied === `link:${bubbleKey(bubble)}` ? <CheckIcon /> : <LinkIcon />}
-                            Link
                           </Button>
                         </ExplainedAction>
                       </div>

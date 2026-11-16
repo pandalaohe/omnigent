@@ -1,3 +1,4 @@
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 /**
  * Admin default-policies management page (``/settings/policies``; the legacy
  * ``/policies`` path redirects here). Rendered as a Settings sub-category.
@@ -607,9 +608,16 @@ export function PoliciesPage() {
       )}
 
       <div className="mt-3 flex items-center justify-end">
-        <Button variant="ghost" size="sm" onClick={refresh}>
-          <RefreshCwIcon /> Refresh
-        </Button>
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button aria-label="Refresh" variant="ghost" size="icon-sm" onClick={refresh}>
+                <RefreshCwIcon />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Refresh</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
       </div>
 
       <AddDefaultPolicyDialog registry={registry} open={addOpen} onOpenChange={setAddOpen} />

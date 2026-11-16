@@ -55,7 +55,7 @@ import {
 } from "@/components/ui/dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { ModelValueCombobox } from "@/components/ModelValueCombobox";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
 import { capitalizeAgentName } from "@/lib/agentLabels";
 import { coercePolicyParams } from "@/lib/policyParams";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
@@ -1085,16 +1085,23 @@ function McpServerManagerDialog({
                   <XIcon className="size-3.5" />
                   Clear
                 </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  onClick={handleSave}
-                  loading={saving}
-                  disabled={validateMcpForm(form) !== null}
-                >
-                  <SaveIcon className="size-3.5" />
-                  Save
-                </Button>
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        aria-label="Save"
+                        type="button"
+                        size="icon-sm"
+                        onClick={handleSave}
+                        loading={saving}
+                        disabled={validateMcpForm(form) !== null}
+                      >
+                        <SaveIcon className="size-3.5" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Save</TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
               </div>
             </fieldset>
           </div>
