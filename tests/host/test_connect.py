@@ -12217,6 +12217,8 @@ async def test_handle_launch_supersedes_previous_runner_for_same_session(
     variables.
     """
     host = _make_host_process()
+    startup_claim = AsyncMock(return_value=True)
+    host._claim_startup = startup_claim  # type: ignore[method-assign]
     maintenance_reasons: list[str] = []
     host._maintenance_janitor = SimpleNamespace(trigger=maintenance_reasons.append)  # type: ignore[assignment]
     host._auth_token_factory = lambda: "host-bootstrap-bearer"
@@ -12251,6 +12253,20 @@ async def test_handle_launch_supersedes_previous_runner_for_same_session(
             )
         )
         first_handle = host._runners[first.runner_id]
+        retry = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_a_retry",
+                binding_token="tok_a",
+                workspace=str(workspace),
+                session_id="conv_super",
+                superseded_runner_ids=(),
+            )
+        )
+        assert startup_claim.await_count == 2
+        assert retry.status == "exists"
+        assert retry.runner_id == first.runner_id
+        assert host._runners[first.runner_id] is first_handle
+        assert len(spawned_envs) == 1
         next_launch = HostLaunchRunnerFrame(
             request_id="req_b",
             binding_token="tok_b",

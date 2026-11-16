@@ -1190,7 +1190,6 @@ async def test_provider_attribution_uses_effective_codex_config_and_cleans_up(
             await asyncio.Future()
 
         client.request.side_effect = stalled_request
-        monkeypatch.setattr(app_server, "_PROVIDER_CONFIG_PROBE_TIMEOUT_SECONDS", 0.01)
     elif outcome != "inherited":
         client.request.side_effect = {
             "unsupported": CodexAppServerResponseError({"code": -32601}),
@@ -1222,7 +1221,8 @@ async def test_provider_attribution_uses_effective_codex_config_and_cleans_up(
         with pytest.raises(asyncio.CancelledError):
             await prepare
     else:
-        assert await prepare == overrides[:1]
+        # Optional attribution must return control promptly even if config/read hangs.
+        assert await asyncio.wait_for(prepare, timeout=2.0) == overrides[:1]
     started.assert_awaited_once_with(
         codex_path="/wrapped/codex",
         listen_url="ws://127.0.0.1:12345",

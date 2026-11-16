@@ -55,6 +55,7 @@ from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.debug_logging import (
     PRIMARY_SESSION_ID_ENV_VAR,
     debug_event,
+    log_attributes_scope,
     phase_scope,
     runner_primary_session_id,
     set_current_session_id,
@@ -4297,13 +4298,32 @@ def create_runner_app(
                     status_code=409,
                     content={"error": "stale_generation", "detail": "session is archiving"},
                 )
-            _cli_runtime_lifecycle.mark_starting(session_id)
-            response = await _initialize_session_locked(body)
-            if response.status_code < 400:
-                _cli_runtime_lifecycle.mark_live(session_id)
-            else:
-                _cli_runtime_lifecycle.finish_reclaim(session_id)
-            return response
+            raw_attempt = body.get("startup_attempt")
+            attempt = raw_attempt if isinstance(raw_attempt, dict) else {}
+            started = time.monotonic()
+            with log_attributes_scope(
+                startup_id=attempt.get("startup_id"),
+                startup_attempt=attempt.get("attempt_id"),
+                runner_generation=os.environ.get("OMNIGENT_RUNNER_ID"),
+                session_runtime_generation=expected_runtime_token,
+            ):
+                _cli_runtime_lifecycle.mark_starting(session_id)
+                response = await _initialize_session_locked(body)
+                if response.status_code < 400:
+                    _cli_runtime_lifecycle.mark_live(session_id)
+                else:
+                    _cli_runtime_lifecycle.finish_reclaim(session_id)
+                _logger.info(
+                    "Session startup phase closed",
+                    extra=debug_event(
+                        "session_startup_phase_closed",
+                        session_id=session_id,
+                        stage="session_init",
+                        status_code=response.status_code,
+                        duration_ms=round((time.monotonic() - started) * 1000),
+                    ),
+                )
+                return response
 
     async def _initialize_session_locked(body: _JsonObject) -> JSONResponse:
         from omnigent.runner.session_init_protocol import RunnerInferenceConfigMismatch
