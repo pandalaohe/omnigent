@@ -470,6 +470,7 @@ async def record_quota_exhaustion(
     actor: str | None,
     from_runner: bool,
     response_id: str | None,
+    input_generation: int | None = None,
 ) -> None:
     """Record a provider error for the session's server-selected owner and pool."""
     from omnigent.runner.launch_failure import provider_billing_refusal
@@ -494,8 +495,14 @@ async def record_quota_exhaustion(
     identity = (session.id, response_id or hashlib.sha256(message.encode()).hexdigest())
     if identity in state.quota_rejections:
         return
-    state.quota_rejections.add(identity)
     if reason is not None:
+        if (
+            not from_runner
+            or not response_id
+            or type(input_generation) is not int
+            or input_generation <= 0
+        ):
+            return
         current = session_identity(app, session)
         if (
             record
@@ -505,18 +512,29 @@ async def record_quota_exhaustion(
         ):
             return
         route = provider_route(current.host, current.agent, current.model)
-        state.refusals[(owner, pool, route)] = ProviderRefusal(
-            reason, now, until, session.id, identity[1]
-        )
+        key = (owner, pool, route)
+        attempt = state.provider_attempts.get((*key, session.id, response_id, input_generation))
+        if attempt is None or attempt <= state.provider_recoveries.get(key, float("-inf")):
+            return
+        state.quota_rejections.add(identity)
+        state.refusals[key] = ProviderRefusal(reason, now, until, session.id, identity[1])
         return
     assert until is not None
+    state.quota_rejections.add(identity)
     key = (owner, pool)
     state.exhausted[key] = max(state.exhausted.get(key, 0), until)
 
 
-async def record_provider_recovery(app, session, *, from_runner, response_id, started=False):
+async def record_provider_recovery(
+    app, session, *, from_runner, response_id, input_generation=None, started=False
+):
     """Clear a refusal only after a newer, authenticated same-route attempt succeeds."""
-    if not from_runner or not response_id:
+    if (
+        not from_runner
+        or not response_id
+        or type(input_generation) is not int
+        or input_generation <= 0
+    ):
         return
     from omnigent.server.session_choice import provider_route
     from omnigent.server.session_collab import collab_owner_for
@@ -532,16 +550,18 @@ async def record_provider_recovery(app, session, *, from_runner, response_id, st
         return
     state = state_for(app)
     key = (owner, pool, route)
+    execution = (*key, session.id, response_id, input_generation)
     if started:
-        state.provider_attempts[key] = (session.id, response_id, time.time())
+        state.provider_attempts.setdefault(execution, time.time())
         return
-    attempt = state.provider_attempts.get(key)
-    if attempt is None or attempt[:2] != (session.id, response_id):
+    attempt = state.provider_attempts.get(execution)
+    if attempt is None:
         return
+    state.provider_recoveries[key] = max(state.provider_recoveries.get(key, attempt), attempt)
     for key, refusal in tuple(state.refusals.items()):
         if (
             key == (owner, pool, route)
-            and attempt[2] > refusal.observed_at
+            and attempt > refusal.observed_at
             and (refusal.session_id != session.id or refusal.response_id != response_id)
         ):
             state.refusals.pop(key, None)

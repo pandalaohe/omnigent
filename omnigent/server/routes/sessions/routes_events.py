@@ -4255,11 +4255,11 @@ def register_events_routes(
                     return {"queued": False}
             # Input generations come from server admission, not native status producers.
             data.pop("input_generation", None)
+            provider_input_generation = None
             service = getattr(request.app.state, "subagent_retry_admission", None)
             native_identity = TurnIdentity.from_data(data)
             if (
                 isinstance(service, SubagentRetryAdmission)
-                and conv.parent_conversation_id
                 and conv.runner_id
                 and _has_bound_runner_authority(request, conv)
                 and native_identity.turn_id
@@ -4298,6 +4298,22 @@ def register_events_routes(
                     )
                 if observed is not None and observed.accepted and observed.receipt is not None:
                     data["input_generation"] = observed.receipt.input_generation
+                    control = await asyncio.to_thread(service.journal.get_control, session_id)
+                    receipt = observed.receipt
+                    # Historical receipts remain useful for transcript reconciliation,
+                    # but only the currently accepted execution can change route health.
+                    if control is not None and (
+                        receipt.target_id,
+                        receipt.input_id,
+                        receipt.turn_id,
+                        receipt.input_generation,
+                    ) == (
+                        session_id,
+                        control.input_id,
+                        control.turn_id,
+                        control.generation,
+                    ):
+                        provider_input_generation = receipt.input_generation
             # Forward only the same bounded, typed display detail that the
             # Server accepted. The Runner retains this across reconnects, so
             # raw/nested/oversized task objects must not become resident there.
@@ -4355,6 +4371,7 @@ def register_events_routes(
                             actor=user_id,
                             from_runner=_has_bound_runner_authority(request, conv),
                             response_id=response_id,
+                            input_generation=provider_input_generation,
                         )
                 harness = await asyncio.to_thread(
                     _resolve_harness,
@@ -4424,6 +4441,7 @@ def register_events_routes(
                     from_runner=_has_bound_runner_authority(request, conv),
                     response_id=response_id,
                     started=status == "running",
+                    input_generation=provider_input_generation,
                 )
             recovered_from_failure = (
                 turn_completed and _session_status_cache.get(session_id) == "failed"

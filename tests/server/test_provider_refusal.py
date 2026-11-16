@@ -65,19 +65,34 @@ async def test_record_and_recover_requires_owner_route_account_and_new_turn(monk
     )
     state = state_for(app)
     await record_provider_recovery(
-        app, session, from_runner=True, response_id="older-success", started=True
+        app,
+        session,
+        from_runner=True,
+        input_generation=1,
+        response_id="older-success",
+        started=True,
     )
-    args = {"actor": "other", "from_runner": False, "response_id": "failure"}
+    args = {
+        "actor": "other",
+        "from_runner": False,
+        "response_id": "failure",
+        "input_generation": 2,
+    }
     message = "HTTP 403 balance billing is disabled for this key"
     await record_quota_exhaustion(app, session, message, **args)
     assert not state.refusals
     args.update(actor="owner", from_runner=True)
+    await record_provider_recovery(
+        app, session, from_runner=True, response_id="failure", input_generation=2, started=True
+    )
     await record_quota_exhaustion(app, session, message, **args)
     key = ("owner", "account", provider_route("host", "agent", "route/model"))
     assert state.refusals[key].reason == "billing_disabled"
     other_key = ("owner", "other-account", key[2])
     state.refusals[other_key] = state.refusals[key]
-    await record_provider_recovery(app, session, from_runner=True, response_id="older-success")
+    await record_provider_recovery(
+        app, session, from_runner=True, input_generation=1, response_id="older-success"
+    )
     assert key in state.refusals
     for runner, turn, model in [
         (False, "success", "route/model"),
@@ -85,17 +100,34 @@ async def test_record_and_recover_requires_owner_route_account_and_new_turn(monk
         (True, "success", "other/model"),
     ]:
         identity.model = model
-        await record_provider_recovery(app, session, from_runner=runner, response_id=turn)
+        await record_provider_recovery(
+            app, session, from_runner=runner, input_generation=3, response_id=turn
+        )
         assert key in state.refusals
     identity.model = "route/another-model"
-    await record_provider_recovery(app, session, from_runner=True, response_id="success")
+    await record_provider_recovery(
+        app, session, from_runner=True, input_generation=3, response_id="success"
+    )
     assert key in state.refusals
     await record_provider_recovery(
-        app, session, from_runner=True, response_id="success", started=True
+        app, session, from_runner=True, input_generation=3, response_id="success", started=True
     )
-    await record_provider_recovery(app, session, from_runner=True, response_id="success")
+    await record_provider_recovery(
+        app, session, from_runner=True, input_generation=3, response_id="success"
+    )
     assert key not in state.refusals
     assert other_key in state.refusals
+    # First delivery of an older failure must not undo the later recovery.
+    await record_quota_exhaustion(
+        app,
+        session,
+        message,
+        actor="owner",
+        from_runner=True,
+        response_id="older-success",
+        input_generation=1,
+    )
+    assert key not in state.refusals
 
 
 def test_refusal_is_scoped_for_candidates_but_shared_with_tile():

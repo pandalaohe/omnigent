@@ -1610,6 +1610,91 @@ async def test_owner_read_failure_only_blocks_a_possibly_matching_scope(
 
 
 @pytest.mark.asyncio
+async def test_owner_billing_report_cannot_stop_provider(quota_runner):
+    from omnigent.server.session_choice import state_for
+
+    env = quota_runner
+    first = (await create(env)).json()
+    response = await env.client.post(
+        f"/v1/sessions/{first['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {
+                "status": "failed",
+                "output": "HTTP 403 balance billing is disabled for this key",
+                "response_id": "fabricated-turn",
+                "input_id": "fabricated-input",
+                "input_generation": 99,
+                "native_generation": 99,
+            },
+        },
+    )
+    assert response.status_code == 202, response.text
+    assert not state_for(env.app).refusals
+    env.store.set_session_live_status(first["id"], "idle")
+    assert (await create(env)).json()["session_choice"]["pool"] == "pool-0"
+
+
+@pytest.mark.asyncio
+async def test_codex_success_keeps_route_healthy_after_delayed_old_failure(quota_runner):
+    from omnigent.harnesses.codex_native import forwarder as fwd
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.server.session_choice import state_for
+
+    env = quota_runner
+    first = (await create(env)).json()
+    sid = first["id"]
+    binding = "test-provider-recovery-runner"
+    env.store.clear_runner_id(sid)
+    assert env.store.set_runner_id(sid, token_bound_runner_id(binding))
+    env.client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = binding
+    state = state_for(env.app)
+
+    async def start(turn, generation):
+        assert await fwd._post_status(
+            env.client,
+            sid,
+            "running",
+            response_id=f"codex_{turn}",
+            input_id=f"input-{turn}",
+            native_generation=generation,
+        )
+
+    async def fail(turn, generation):
+        assert await fwd._post_status(
+            env.client,
+            sid,
+            "failed",
+            response_id=f"codex_{turn}",
+            input_id=f"input-{turn}",
+            native_generation=generation,
+            output="HTTP 403 balance billing is disabled for this key",
+        )
+
+    # This older execution's failure has not yet reached the server.
+    await start("delayed", 1)
+    await start("failure", 2)
+    await fail("failure", 2)
+    assert state.refusals
+    await start("success", 3)
+    edge = fwd._terminal_turn_status_edge(
+        None, "turn/completed", {"turn": {"id": "success", "status": "completed"}}
+    )
+    assert edge is not None
+    # Use the actual Codex lifecycle producer, including its confirmed-success flag.
+    await fwd._post_turn_status_edge(env.client, sid, edge, input_id="input-success")
+    assert not state.refusals
+    await fail("delayed", 1)
+    assert not state.refusals
+    assert state.provider_recoveries
+    env.store.set_session_live_status(sid, "idle")
+    env.client.headers.pop(RUNNER_TUNNEL_TOKEN_HEADER)
+    selected = await create(env)
+    assert selected.status_code == 201, selected.text
+    assert selected.json()["session_choice"]["pool"] == "pool-0"
+
+
+@pytest.mark.asyncio
 async def test_billing_refusal_stops_usage_lines_and_selection_without_reset(quota_runner):
     from omnigent.usage.contract import UsageReportV2
 
@@ -1629,14 +1714,37 @@ async def test_billing_refusal_stops_usage_lines_and_selection_without_reset(quo
     )
     service.report_account(RESERVED_USER_LOCAL, "pool-0", report, now=time.time())
     first = (await create(env)).json()
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+
+    binding = "test-billing-runner"
+    env.store.clear_runner_id(first["id"])
+    assert env.store.set_runner_id(first["id"], token_bound_runner_id(binding))
+    headers = {RUNNER_TUNNEL_TOKEN_HEADER: binding}
+    running = await env.client.post(
+        f"/v1/sessions/{first['id']}/events",
+        headers=headers,
+        json={
+            "type": "external_session_status",
+            "data": {
+                "status": "running",
+                "response_id": "billing-failure",
+                "input_id": "billing-input",
+                "native_generation": 1,
+            },
+        },
+    )
+    assert running.status_code == 202, running.text
     response = await env.client.post(
         f"/v1/sessions/{first['id']}/events",
+        headers=headers,
         json={
             "type": "external_session_status",
             "data": {
                 "status": "failed",
                 "output": "HTTP 403 balance billing is disabled for this key",
                 "response_id": "billing-failure",
+                "input_id": "billing-input",
+                "native_generation": 1,
             },
         },
     )
