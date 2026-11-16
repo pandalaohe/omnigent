@@ -17,6 +17,7 @@ import { isElectronShell, startSystemDictation, supportsSystemDictation } from "
 import { cn } from "@/lib/utils";
 import { Loader2Icon, MicIcon, SquareIcon } from "lucide-react";
 import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 
 // Local-only types; speech-input.tsx already augments Window globally.
 interface SpeechRecognitionLike {
@@ -91,6 +92,8 @@ export interface ComposerMicButtonProps {
   questionCard?: boolean;
   /** Runs after the complete take (including cleanup) was delivered. */
   onVoiceEnd?: () => void;
+  /** Guarded replacement of an original already inserted when listening ended. */
+  onCleanup?: (original: string, text: string) => void;
   onTranscript: (
     text: string,
     meta?: FinalMeta & { source?: "browser" | "server" | "third" },
@@ -136,6 +139,7 @@ export const ComposerMicButton = ({
   inputRef,
   questionCard = false,
   onVoiceEnd,
+  onCleanup,
 }: ComposerMicButtonProps) => {
   // Web Speech is primary wherever its constructor exists; a take that dies with
   // "network" falls back to the server for that take only (see handleError).
@@ -147,6 +151,7 @@ export const ComposerMicButton = ({
   const serverInfo = useServerInfo();
   const [speechSource, setSpeechSource] = useState("browser");
   const cleanupEnabledRef = useRef(false);
+  const oneStepRef = useRef(false);
   useEffect(() => {
     let alive = true;
     const refresh = () => {
@@ -155,6 +160,8 @@ export const ComposerMicButton = ({
           if (alive) {
             setSpeechSource(settings.speech_source ?? "browser");
             cleanupEnabledRef.current = settings.mode !== "off" && !!settings.model.trim();
+            oneStepRef.current =
+              settings.speech_source === "third" && settings.speech_method === "chat_audio";
           }
         })
         .catch(() => {});
@@ -195,11 +202,14 @@ export const ComposerMicButton = ({
   // Refs so handlers aren't re-attached on every parent re-render.
   const onTranscriptRef = useRef(onTranscript);
   onTranscriptRef.current = onTranscript;
-  const segmentsRef = useRef<{ text: string; meta?: FinalMeta }[]>([]);
+  const segmentsRef = useRef<{ text: string; meta?: FinalMeta; excluded: boolean }[]>([]);
+  const serverOneStepRef = useRef(false);
   const cleanupAbortRef = useRef<AbortController | null>(null);
-  const bufferTranscript = useCallback((text: string, meta?: FinalMeta) => {
-    segmentsRef.current.push({ text, meta });
+  const bufferTranscript = useCallback((text: string, meta?: FinalMeta, excluded = false) => {
+    segmentsRef.current.push({ text, meta, excluded });
   }, []);
+  const onCleanupRef = useRef(onCleanup);
+  onCleanupRef.current = onCleanup;
   const onInterimRef = useRef(onInterim);
   onInterimRef.current = onInterim;
   // Synced refs so the mount-time listeners call the latest callbacks.
@@ -270,13 +280,14 @@ export const ComposerMicButton = ({
     const transcript = text.trim();
     if (!transcript) return;
     const takeGeneration = takeGenerationRef.current;
+    const excluded = serverOneStepRef.current;
     const deliver = () => {
       if (
         takeGeneration === takeGenerationRef.current &&
         !disabledRef.current &&
         !discardingRef.current
       ) {
-        bufferTranscript(transcript, meta);
+        bufferTranscript(transcript, meta, excluded);
       }
     };
     if (ordered) {
@@ -350,7 +361,22 @@ export const ComposerMicButton = ({
         const raw = segments.map((segment) => segment.meta?.raw ?? segment.text).join(" ");
         let output = text;
         let cleaned = segments.length > 0 && segments.every((segment) => segment.meta?.cleaned);
-        if (text && cleanupEnabledRef.current && !cleaned) {
+        const first = segments.findIndex((segment) => !segment.excluded && !segment.meta?.cleaned);
+        const replace = onCleanupRef.current;
+        const inserted = !!text && !!replace && cleanupEnabledRef.current && first !== -1;
+        if (inserted)
+          flushSync(() =>
+            onTranscriptRef.current(text, { raw, cleaned: false, cleanupHandled: true }),
+          );
+        if (text && cleanupEnabledRef.current && first !== -1) {
+          const prefix = segments
+            .slice(0, first)
+            .map((segment) => segment.text)
+            .join(" ");
+          const suffix = segments
+            .slice(first)
+            .map((segment) => segment.meta?.raw ?? segment.text)
+            .join(" ");
           const controller = new AbortController();
           cleanupAbortRef.current = controller;
           const field = inputRef?.current;
@@ -361,9 +387,9 @@ export const ComposerMicButton = ({
           };
           field?.addEventListener("input", onEdit);
           try {
-            const result = await cleanupDictation(raw, controller.signal);
+            const result = await cleanupDictation(suffix, controller.signal);
             if (!edited && field?.value === before) {
-              output = result.text;
+              output = [prefix, result.text].filter(Boolean).join(" ");
               cleaned = true;
             }
           } catch {
@@ -379,7 +405,9 @@ export const ComposerMicButton = ({
           generation !== takeGenerationRef.current
         )
           return;
-        if (output) {
+        if (inserted) {
+          if (output !== text) onCleanupRef.current?.(text, output);
+        } else if (output) {
           // Cleanup is owned here for every mic; insertion adapters must not retry it.
           if (cleaned || cleanupEnabledRef.current)
             onTranscriptRef.current(output, { raw, cleaned, cleanupHandled: true });
@@ -705,6 +733,7 @@ export const ComposerMicButton = ({
           onVoiceStartRef.current?.();
         }
         serverContinuesWebTakeRef.current = continueTake;
+        serverOneStepRef.current = oneStepRef.current;
         const generation = takeGenerationRef.current;
         const next = await DictationSession.start({
           onPartial: (text) => {
@@ -733,7 +762,7 @@ export const ComposerMicButton = ({
             const pending = interimRef.current.trim();
             interimRef.current = "";
             if (pending && !disabledRef.current && !discardingRef.current) {
-              bufferTranscript(pending);
+              bufferTranscript(pending, undefined, serverOneStepRef.current);
             } else {
               onInterimRef.current?.("");
             }

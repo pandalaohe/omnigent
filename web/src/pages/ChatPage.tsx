@@ -5737,6 +5737,7 @@ function ComposerImpl(
                 enableHotkey
                 disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
                 onVoiceStart={voiceCleanup.begin}
+                onCleanup={voiceCleanup.replaceFinal}
                 onVoiceDiscard={voiceCleanup.discard}
                 onVoiceEnd={() => void voiceCleanup.end()}
                 onListeningChange={setDictating}

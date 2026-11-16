@@ -24,7 +24,10 @@ import type { DictationSessionEvents } from "@/lib/dictation";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { AskUserQuestionForm } from "./blocks/AskUserQuestionForm";
 import { useChatStore } from "@/store/chatStore";
-import { useRef } from "react";
+import { useRef, useState } from "react";
+import { QuestionDictationControls } from "./QuestionDictationControls";
+import { useComposerVoiceCleanup } from "@/hooks/useComposerVoiceCleanup";
+import { useDictationInsert } from "@/hooks/useDictationInsert";
 import * as voiceApi from "@/lib/voiceInputApi";
 import { ComposerMicButton } from "./ComposerMicButton";
 
@@ -1628,3 +1631,178 @@ it("falls back from third-party to browser once, reports lost phrases and avoids
   expect(onTranscript).toHaveBeenCalledWith("browser words");
   expect(sessionStartMock).toHaveBeenCalledOnce();
 });
+
+it.each([false, true])("preserves one-step ownership with browser suffix: %s", async (fallback) => {
+  vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+    ...voiceApi.defaultVoiceInputSettings,
+    speech_source: "third",
+    speech_method: "chat_audio",
+    model: "cleanup-model",
+  });
+  vi.mocked(voiceApi.cleanupDictation).mockResolvedValue({ text: "Browser suffix." });
+  const onTranscript = vi.fn();
+  render(<ComposerMicButton onTranscript={onTranscript} />);
+  await act(async () => {});
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Voice dictation" })));
+  act(() =>
+    sessionEvents?.onFinal(fallback ? "Accepted prefix." : "raw fallback", {
+      raw: "raw fallback",
+      cleaned: fallback,
+    }),
+  );
+  if (fallback) {
+    act(() => sessionEvents?.onError("failed", { code: "third_party_failed" }));
+    act(() => handlers.start?.({}));
+    act(() => handlers.result?.(resultEvent("browser suffix")));
+    await finishBrowserTake();
+    expect(voiceApi.cleanupDictation).toHaveBeenCalledExactlyOnceWith(
+      "browser suffix",
+      expect.any(AbortSignal),
+    );
+    expect(onTranscript).toHaveBeenCalledWith(
+      "Accepted prefix. Browser suffix.",
+      expect.objectContaining({ cleanupHandled: true }),
+    );
+  } else {
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Voice dictation" })));
+    expect(voiceApi.cleanupDictation).not.toHaveBeenCalled();
+    expect(onTranscript).toHaveBeenCalledWith(
+      "raw fallback",
+      expect.objectContaining({ cleanupHandled: true }),
+    );
+  }
+});
+
+function QuestionVoiceAnswer() {
+  const [text, setText] = useState("");
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const revision = useRef(0);
+  return (
+    <>
+      <textarea
+        aria-label="Answer"
+        ref={inputRef}
+        value={text}
+        onChange={(e) => {
+          revision.current++;
+          setText(e.target.value);
+        }}
+      />
+      <QuestionDictationControls
+        inputRef={inputRef}
+        getText={() => text}
+        getRevision={() => revision.current}
+        getSelection={() => ({
+          start: inputRef.current?.selectionStart ?? 0,
+          end: inputRef.current?.selectionEnd ?? 0,
+        })}
+        onChange={(value) => {
+          revision.current++;
+          setText(value);
+        }}
+      />
+    </>
+  );
+}
+
+it.each(["edit", "failure", "success"])(
+  "preserves the real question take during cleanup: %s",
+  async (scenario) => {
+    vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+      ...voiceApi.defaultVoiceInputSettings,
+      model: "cleanup-model",
+    });
+    let resolve!: (value: { text: string }) => void;
+    let reject!: (reason: Error) => void;
+    vi.mocked(voiceApi.cleanupDictation).mockReturnValue(
+      new Promise((yes, no) => {
+        resolve = yes;
+        reject = no;
+      }),
+    );
+    render(<QuestionVoiceAnswer />);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => handlers.start?.({}));
+    act(() => handlers.result?.(resultEvent("spoken original")));
+    await finishBrowserTake();
+    const answer = screen.getByRole("textbox", { name: "Answer" });
+    if (scenario !== "success")
+      fireEvent.change(answer, {
+        target: { value: (answer as HTMLTextAreaElement).value + " typed" },
+      });
+    await act(async () => {
+      if (scenario === "failure") reject(new Error("unavailable"));
+      else resolve({ text: "Edited voice." });
+    });
+    expect(answer).toHaveValue(scenario === "success" ? "Edited voice." : "spoken original typed");
+    expect(voiceApi.cleanupDictation).toHaveBeenCalledOnce();
+  },
+);
+
+function RegionVoiceComposer() {
+  const [region, setRegion] = useState(0);
+  const [values, setValues] = useState(["", ""]);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const voice = useComposerVoiceCleanup(
+    values[region],
+    (value) => setValues((current) => current.map((v, i) => (i === region ? value : v))),
+    inputRef,
+    String(region),
+  );
+  const dictation = useDictationInsert(values[region], voice.produce, inputRef);
+  return (
+    <>
+      {["first", "second"].map((id, i) => (
+        <textarea
+          key={id}
+          aria-label={`Region ${i}`}
+          value={values[i]}
+          readOnly
+          ref={(node) => {
+            if (i === region) inputRef.current = node;
+          }}
+          onFocus={() => setRegion(i)}
+        />
+      ))}
+      <ComposerMicButton
+        inputRef={inputRef}
+        onVoiceStart={voice.begin}
+        onVoiceEnd={() => void voice.end()}
+        onCleanup={voice.replaceFinal}
+        onTranscript={(text, meta) => {
+          voice.record(text, meta);
+          dictation.appendFinal(text);
+        }}
+      />
+    </>
+  );
+}
+
+it.each([false, true])(
+  "keeps cleanup bound to its composer region (switch: %s)",
+  async (switchRegion) => {
+    vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+      ...voiceApi.defaultVoiceInputSettings,
+      model: "cleanup-model",
+    });
+    let resolve!: (value: { text: string }) => void;
+    vi.mocked(voiceApi.cleanupDictation).mockReturnValue(
+      new Promise((done) => {
+        resolve = done;
+      }),
+    );
+    render(<RegionVoiceComposer />);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => handlers.start?.({}));
+    act(() => handlers.result?.(resultEvent("region original")));
+    await finishBrowserTake();
+    if (switchRegion) fireEvent.focus(screen.getByRole("textbox", { name: "Region 1" }));
+    await act(async () => resolve({ text: "Cleaned region." }));
+    expect(screen.getByRole("textbox", { name: "Region 0" })).toHaveValue(
+      switchRegion ? "region original" : "Cleaned region.",
+    );
+    expect(screen.getByRole("textbox", { name: "Region 1" })).toHaveValue("");
+  },
+);

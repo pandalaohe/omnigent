@@ -129,6 +129,12 @@ export function QuestionDictationControls({
         questionCard
         disabled={disabled}
         className="!size-11"
+        onCleanup={(original, text) => {
+          const take = takeRef.current;
+          if (!aliveRef.current || !take || take.raw !== original || !matches(take)) return;
+          take.expected = apply(take, text, true);
+          take.revision = getRevision();
+        }}
         onVoiceStart={() => {
           abortRef.current?.abort();
           setNotice("");
