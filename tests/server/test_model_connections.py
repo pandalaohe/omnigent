@@ -3,6 +3,7 @@
 import json
 import stat
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -203,3 +204,183 @@ def test_member_cannot_write_or_fetch_models(tmp_path, monkeypatch):
         )
         assert client.get("/v1/model-connections", headers=headers).status_code == 200
     assert not (tmp_path / "model_connections.json").exists()
+
+
+def test_row_identity_names_compatibility_and_conflicting_create(client):
+    from omnigent.onboarding.provider_config import load_providers
+
+    response = client.put(
+        "/v1/model-connections/new?create=true",
+        json=draft(model_display_names={"default": "Speech"}),
+    )
+    assert response.status_code == 200
+    assert response.json()["models"] == [
+        {
+            "key": "default",
+            "display_name": "Speech",
+            "model_id": "test-model",
+            "status": "unchecked",
+            "used_by": {"users": 0, "slots": []},
+        }
+    ]
+    assert load_providers({"providers": connections._load()}) is not None
+    response = client.put(
+        "/v1/model-connections/new?create=true", json=draft(models={"other": "replacement"})
+    )
+    assert response.status_code == 409
+    assert connections.resolve_reference("new", "default", "older") == (
+        "default",
+        "test-model",
+        False,
+    )
+    assert connections.resolve_reference("new", "missing", "older") == (None, "older", True)
+
+
+def test_usage_delete_guards_and_legacy_follows_row_changes(client):
+    assert client.put("/v1/model-connections/example", json=draft()).status_code == 200
+    preferences = [
+        (
+            "member@example.test",
+            {
+                "speech_source": "third",
+                "speech_connection": "example",
+                "speech_model": "test-model",
+            },
+        )
+    ]
+    store = SimpleNamespace(namespace_values=lambda namespace: preferences)
+    app = FastAPI()
+    app.include_router(create_model_connections_router(user_preferences_store=store), prefix="/v1")
+    with TestClient(app) as guarded:
+        response = guarded.put("/v1/model-connections/example", json=draft(models={}))
+        assert response.status_code == 409
+        assert response.json()["detail"]["rows"]["default"]["users"] == 1
+        assert guarded.delete("/v1/model-connections/example").status_code == 409
+        assert (
+            guarded.put(
+                "/v1/model-connections/example", json=draft(models={"default": "new-model"})
+            ).status_code
+            == 200
+        )
+        assert connections.resolve_reference("example", "", "test-model") == (
+            "default",
+            "new-model",
+            False,
+        )
+        listing = guarded.get("/v1/model-connections").json()["connections"][0]
+        assert listing["models"][0]["used_by"]["slots"] == [
+            {"feature": "Voice input", "slot": "Speech to text", "users": 1}
+        ]
+        preferences[0][1]["speech_model"] = "unmatched"
+        assert guarded.delete("/v1/model-connections/example").status_code == 409
+        assert (
+            guarded.put(
+                "/v1/model-connections/example", json=draft(models={"default": "new-model"})
+            ).status_code
+            == 200
+        )
+        assert connections._load()["example"]["model_previous_ids"]["default"] == []
+        preferences.clear()
+        assert guarded.delete("/v1/model-connections/example").status_code == 204
+
+
+def test_catalogue_refresh_preserves_rows_and_statuses(client, monkeypatch):
+    assert (
+        client.put(
+            "/v1/model-connections/example",
+            json=draft(models={"known": "listed", "typo": "unknown"}),
+        ).status_code
+        == 200
+    )
+    original = httpx.Client
+    ids = ["listed"]
+    monkeypatch.setattr(
+        connections.httpx,
+        "Client",
+        lambda **kwargs: original(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200, json={"data": [{"id": model} for model in ids]}
+                )
+            ),
+            **kwargs,
+        ),
+    )
+    first = client.post("/v1/model-connections/example/refresh").json()
+    assert [row["status"] for row in first["models"]] == ["listed", "not_listed"]
+    assert client.get("/v1/model-connections/example/catalog").json()["ids"] == ["listed"]
+    ids.clear()
+    second = client.post("/v1/model-connections/example/refresh").json()
+    assert [row["status"] for row in second["models"]] == ["gone", "not_listed"]
+    assert [row["key"] for row in second["models"]] == ["known", "typo"]
+    ids.extend([f"model-{i}" for i in range(2500)] + ["listed"])
+    third = client.post("/v1/model-connections/example/refresh").json()
+    assert third["catalog"]["complete"] is False
+    assert len(third["catalog"]["ids"]) == 2000
+    assert all(row["status"] == "unchecked" for row in third["models"])
+    assert connections._load()["example"]["model_seen"]["known"] == "listed"
+    member = connections.load_connections()[0]
+    assert "used_by" not in member and "catalog" not in member
+    assert all("used_by" not in row for row in member["models"])
+
+
+def test_metadata_pruned_with_deleted_rows(client):
+    assert client.put("/v1/model-connections/example", json=draft()).status_code == 200
+    entries = connections._load()
+    entries["example"].update(
+        model_seen={"default": "test-model"}, model_previous_ids={"default": ["old"]}
+    )
+    connections._write(entries)
+    assert client.put("/v1/model-connections/example", json=draft(models={})).status_code == 200
+    entry = connections._load()["example"]
+    assert entry["model_display_names"] == entry["model_seen"] == entry["model_previous_ids"] == {}
+
+
+def test_one_step_does_not_lock_unused_separate_cleanup_provider(client):
+    assert client.put("/v1/model-connections/example", json=draft()).status_code == 200
+    store = SimpleNamespace(
+        namespace_values=lambda namespace: [
+            (
+                "member@example.test",
+                {
+                    "speech_source": "third",
+                    "speech_connection": "another",
+                    "speech_method": "chat_audio",
+                    "speech_row": "speech",
+                    "speech_model": "audio",
+                    "cleanup_connection": "example",
+                    "model": "test-model",
+                    "mode": "automatic",
+                },
+            )
+        ]
+    )
+    assert connections.references(store)["providers"] == {"another": 1}
+    connections.delete_connection("example", store=store)
+
+
+def test_disabled_legacy_preference_retains_model_history(client):
+    assert client.put("/v1/model-connections/example", json=draft()).status_code == 200
+    store = SimpleNamespace(
+        namespace_values=lambda namespace: [
+            (
+                "member@example.test",
+                {
+                    "cleanup_connection": "example",
+                    "model": "test-model",
+                    "mode": "off",
+                },
+            )
+        ]
+    )
+    connections.upsert_connection(
+        "example",
+        connections.ConnectionWrite.model_validate(draft(models={"default": "renamed"})),
+        store=store,
+    )
+    assert connections.resolve_reference("example", "", "test-model") == (
+        "default",
+        "renamed",
+        False,
+    )
+    assert connections.references(store)["providers"] == {}

@@ -20006,6 +20006,47 @@
         "title": "ValidationError",
         "type": "object"
       },
+      "VoiceTestRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "connection": {
+            "maxLength": 48,
+            "minLength": 1,
+            "title": "Connection",
+            "type": "string"
+          },
+          "method": {
+            "default": "transcription",
+            "enum": [
+              "transcription",
+              "chat_audio"
+            ],
+            "title": "Method",
+            "type": "string"
+          },
+          "row": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Row",
+            "type": "string"
+          },
+          "slot": {
+            "enum": [
+              "speech",
+              "cleanup"
+            ],
+            "title": "Slot",
+            "type": "string"
+          }
+        },
+        "required": [
+          "slot",
+          "connection",
+          "row"
+        ],
+        "title": "VoiceTestRequest",
+        "type": "object"
+      },
       "WriteOutcome": {
         "properties": {
           "applied": {
@@ -21671,6 +21712,49 @@
           }
         },
         "summary": "Restore Dictation Punctuation",
+        "tags": [
+          "dictation"
+        ]
+      }
+    },
+    "/v1/dictation/test": {
+      "post": {
+        "operationId": "test_model_v1_dictation_test_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VoiceTestRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Test Model V1 Dictation Test Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Test Model",
         "tags": [
           "dictation"
         ]
@@ -26358,7 +26442,8 @@
                 "future",
                 "closedDays",
                 "accountDays",
-                "releases"
+                "releases",
+                "repositoryDailyCommits"
               ],
               "title": "Part",
               "type": "string"
@@ -31333,6 +31418,16 @@
               "title": "Name",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "create",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Create",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -31356,6 +31451,86 @@
           }
         },
         "summary": "Put",
+        "tags": [
+          "model connections"
+        ]
+      }
+    },
+    "/v1/model-connections/{name}/catalog": {
+      "get": {
+        "operationId": "catalog_v1_model_connections__name__catalog_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Catalog",
+        "tags": [
+          "model connections"
+        ]
+      }
+    },
+    "/v1/model-connections/{name}/refresh": {
+      "post": {
+        "operationId": "refresh_v1_model_connections__name__refresh_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refresh",
         "tags": [
           "model connections"
         ]

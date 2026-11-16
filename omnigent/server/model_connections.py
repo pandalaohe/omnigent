@@ -8,6 +8,7 @@ import re
 import tempfile
 import threading
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -19,6 +20,14 @@ from omnigent.onboarding.provider_config import load_providers
 from omnigent.server.admin_list import resolve_data_dir
 
 _LOCK = threading.Lock()
+
+
+class ConnectionConflict(ValueError):
+    """A provider or row is still referenced, or a create id already exists."""
+
+    def __init__(self, detail: dict):
+        self.detail = detail
+        super().__init__("Provider conflict")
 
 
 class ConnectionUnavailable(ValueError):
@@ -42,6 +51,7 @@ class ConnectionWrite(BaseModel):
     base_url: str = Field(max_length=2048)
     wire_api: Literal["chat", "responses"] = "chat"
     models: dict[str, str] = Field(default_factory=dict, max_length=50)
+    model_display_names: dict[str, str] = Field(default_factory=dict, max_length=50)
     key: KeyValue | KeyEnvironment | None = Field(default=None, repr=False)
 
     @field_validator("base_url")
@@ -69,6 +79,13 @@ class ConnectionWrite(BaseModel):
             for role, model in value.items()
         ):
             raise ValueError("Invalid models")
+        return value
+
+    @field_validator("model_display_names")
+    @classmethod
+    def display_lengths(cls, value: dict[str, str]) -> dict[str, str]:
+        if any(len(key) > 200 or len(name) > 100 for key, name in value.items()):
+            raise ValueError("Invalid model display names")
         return value
 
 
@@ -118,9 +135,12 @@ def _entry(name: str, draft: ConnectionWrite, previous: dict | None = None) -> d
         reference = f"env:{draft.key.env}"
     if not reference:
         raise ValueError("A key source is required")
-    entry = {
+    entry: dict = {
         "kind": draft.kind,
         "display_name": draft.display_name or name,
+        "model_display_names": {
+            key: draft.model_display_names.get(key, "") for key in draft.models
+        },
         "openai": {
             "base_url": draft.base_url,
             "wire_api": draft.wire_api,
@@ -128,6 +148,13 @@ def _entry(name: str, draft: ConnectionWrite, previous: dict | None = None) -> d
             "models": draft.models,
         },
     }
+    for field_name in ("model_catalog", "model_seen", "model_previous_ids"):
+        if previous and field_name in previous:
+            entry[field_name] = previous[field_name]
+    for field_name in ("model_seen", "model_previous_ids"):
+        entry[field_name] = {
+            key: value for key, value in entry.get(field_name, {}).items() if key in draft.models
+        }
     load_providers({"providers": {name: entry}})
     return entry
 
@@ -160,7 +187,104 @@ def resolve_connection(name: str) -> ResolvedConnection:
         raise ConnectionUnavailable("Provider key unavailable") from None
 
 
-def _row(name: str, entry: dict, admin: bool) -> dict:
+def resolve_reference(
+    connection: str, row_key: str, legacy_id: str, *, entries: dict | None = None
+) -> tuple[str | None, str, bool]:
+    if connection == "server-llm":
+        from omnigent.runtime import get_caps
+
+        llm = get_caps().llm
+        if row_key == "config" and llm is not None:
+            return "config", llm.model, False
+        if not row_key and llm is not None and legacy_id == llm.model:
+            return "config", llm.model, False
+        return None, legacy_id, bool(row_key or legacy_id)
+    entry = (entries if entries is not None else _load()).get(connection, {})
+    models = entry.get("openai", {}).get("models", {})
+    if row_key:
+        return (row_key, models[row_key], False) if row_key in models else (None, legacy_id, True)
+    for key, model in models.items():
+        if model == legacy_id:
+            return key, model, False
+    for key, old in entry.get("model_previous_ids", {}).items():
+        if key in models and legacy_id in old:
+            return key, models[key], False
+    return None, legacy_id, bool(legacy_id)
+
+
+def _voice_slots(value: dict):
+    if value.get("speech_source") == "third":
+        yield (
+            "Speech to text",
+            value.get("speech_connection", ""),
+            value.get("speech_row", ""),
+            value.get("speech_model", ""),
+        )
+    one_step = value.get("speech_source") == "third" and value.get("speech_method") == "chat_audio"
+    if not one_step and value.get("mode", "automatic") != "off" and value.get("model"):
+        yield (
+            "Cleanup",
+            value.get("cleanup_connection", "server-llm"),
+            value.get("cleanup_row", ""),
+            value["model"],
+        )
+
+
+def references(store, *, entries: dict | None = None) -> dict:
+    entries = _load() if entries is None else entries
+    providers: dict[str, set[str]] = {}
+    slots: dict[tuple[str, str], dict[str, set[str]]] = {}
+    legacy: dict[str, set[str]] = {}
+    for user, value in store.namespace_values("voice_input") if store is not None else []:
+        if not isinstance(value, dict):
+            continue
+        for provider, row, model in (
+            (
+                value.get("speech_connection", ""),
+                value.get("speech_row", ""),
+                value.get("speech_model", ""),
+            ),
+            (
+                value.get("cleanup_connection", "server-llm"),
+                value.get("cleanup_row", ""),
+                value.get("model", ""),
+            ),
+        ):
+            if not row and model:
+                legacy.setdefault(provider, set()).add(model)
+        for slot, provider, row, model in _voice_slots(value):
+            providers.setdefault(provider, set()).add(user)
+            key, _, _ = resolve_reference(provider, row, model, entries=entries)
+            if key:
+                slots.setdefault((provider, key), {}).setdefault(slot, set()).add(user)
+    return {
+        "providers": {provider: len(users) for provider, users in providers.items()},
+        "rows": {
+            key: {
+                "users": len(set().union(*values.values())),
+                "slots": [
+                    {"feature": "Voice input", "slot": slot, "users": len(users)}
+                    for slot, users in values.items()
+                ],
+            }
+            for key, values in slots.items()
+        },
+        "legacy": legacy,
+    }
+
+
+def _status(entry: dict, key: str, model: str) -> str:
+    cache = entry.get("model_catalog")
+    if not cache:
+        return "unchecked"
+    if model in cache.get("ids", []):
+        return "listed"
+    if not cache.get("complete", False):
+        return "unchecked"
+    return "gone" if entry.get("model_seen", {}).get(key) == model else "not_listed"
+
+
+def _row(name: str, entry: dict, admin: bool, usage: dict | None = None) -> dict:
     family = entry["openai"]
     reference = family["api_key_ref"]
     try:
@@ -173,20 +297,43 @@ def _row(name: str, entry: dict, admin: bool) -> dict:
         "kind": entry["kind"],
         "base_url": family["base_url"],
         "wire_api": family["wire_api"],
-        "models": list(family.get("models", {}).values()),
+        "models": [
+            {
+                "key": key,
+                "display_name": entry.get("model_display_names", {}).get(key) or model,
+                "model_id": model,
+                "status": _status(entry, key, model),
+                **(
+                    {
+                        "used_by": (usage or {})
+                        .get("rows", {})
+                        .get((name, key), {"users": 0, "slots": []})
+                    }
+                    if admin
+                    else {}
+                ),
+            }
+            for key, model in family.get("models", {}).items()
+        ],
         "key_set": key_set,
         "key_source": "env" if reference.startswith("env:") else "stored",
         "editable": True,
+        "model_previous_ids": entry.get("model_previous_ids", {}),
     }
     if admin and reference.startswith("env:"):
         row["key_env"] = reference[4:]
+    if admin:
+        row["catalog"] = entry.get("model_catalog")
+        row["used_by"] = (usage or {}).get("providers", {}).get(name, 0)
     return row
 
 
-def load_connections(*, admin: bool = False) -> list[dict]:
+def load_connections(*, admin: bool = False, store=None) -> list[dict]:
     from omnigent.runtime import get_caps
 
-    rows = [_row(name, entry, admin) for name, entry in _load().items()]
+    entries = _load()
+    usage = references(store, entries=entries) if admin else None
+    rows = [_row(name, entry, admin, usage) for name, entry in entries.items()]
     llm = get_caps().llm
     if llm is not None:
         # Configuration may contain credentials; expose only the URL hostname.
@@ -200,7 +347,23 @@ def load_connections(*, admin: bool = False) -> list[dict]:
                 "kind": "key",
                 "base_url": urlsplit(address).hostname or "provider default",
                 "wire_api": "responses",
-                "models": [llm.model],
+                "models": [
+                    {
+                        "key": "config",
+                        "display_name": llm.model,
+                        "model_id": llm.model,
+                        "status": "config",
+                        **(
+                            {
+                                "used_by": (usage or {})
+                                .get("rows", {})
+                                .get(("server-llm", "config"), {"users": 0, "slots": []})
+                            }
+                            if admin
+                            else {}
+                        ),
+                    }
+                ],
                 "key_set": bool(connection.get("api_key") or connection.get("profile")),
                 "key_source": "config-file",
                 "editable": False,
@@ -209,10 +372,33 @@ def load_connections(*, admin: bool = False) -> list[dict]:
     return rows
 
 
-def upsert_connection(name: str, draft: ConnectionWrite) -> dict:
+def upsert_connection(
+    name: str, draft: ConnectionWrite, *, store=None, create: bool = False
+) -> dict:
     with _LOCK:
         entries = _load()
+        if create and name in entries:
+            raise ConnectionConflict({"kind": "exists"})
+        usage = references(store, entries=entries)
+        blocked = {
+            key: value
+            for (provider, key), value in usage["rows"].items()
+            if provider == name and key not in draft.models
+        }
+        if blocked:
+            raise ConnectionConflict({"kind": "in_use", "rows": blocked})
         entry = _entry(name, draft, entries.get(name))
+        previous_models = entries.get(name, {}).get("openai", {}).get("models", {})
+        for key, model in draft.models.items():
+            history = entry["model_previous_ids"].get(key, [])
+            old = previous_models.get(key)
+            if old and old != model:
+                history = [*history, old]
+            entry["model_previous_ids"][key] = list(
+                dict.fromkeys(
+                    value for value in history if value in usage["legacy"].get(name, set())
+                )
+            )[-5:]
         if isinstance(draft.key, KeyValue):
             secrets.store_secret(
                 f"server-connection:{name}",
@@ -221,19 +407,22 @@ def upsert_connection(name: str, draft: ConnectionWrite) -> dict:
             )
         entries[name] = entry
         _write(entries)
-        return _row(name, entry, True)
+        return _row(name, entry, True, usage)
 
 
-def delete_connection(name: str) -> None:
+def delete_connection(name: str, *, store=None) -> None:
     validate_name(name)
     with _LOCK:
         entries = _load()
+        users = references(store, entries=entries)["providers"].get(name, 0)
+        if users:
+            raise ConnectionConflict({"kind": "in_use", "users": users})
         entries.pop(name, None)
         _write(entries)
         secrets.delete_secret(f"server-connection:{name}", home=str(resolve_data_dir()))
 
 
-def probe_connection(name: str, draft: ConnectionWrite) -> dict:
+def probe_connection(name: str, draft: ConnectionWrite, *, full: bool = False) -> dict:
     entry = _entry(name, draft, _load().get(name))
     try:
         if isinstance(draft.key, KeyValue):
@@ -260,7 +449,10 @@ def probe_connection(name: str, draft: ConnectionWrite) -> dict:
                 if isinstance(item, dict)
                 and isinstance(item.get("id"), str)
                 and 0 < len(item["id"]) <= 200
-            ][:200]
+            ]
+            ids = list(dict.fromkeys(ids))
+            if not full:
+                ids = ids[:200]
             return {"ok": True, "model_ids": ids, "error_kind": None}
     except httpx.TimeoutException:
         error = "timeout"
@@ -271,3 +463,37 @@ def probe_connection(name: str, draft: ConnectionWrite) -> dict:
     except (ValueError, KeyError, TypeError):
         error = "bad_response"
     return {"ok": False, "model_ids": [], "error_kind": error}
+
+
+def catalog(name: str) -> dict:
+    cache = _load().get(name, {}).get("model_catalog", {})
+    return {"fetched_at": cache.get("fetched_at"), "ids": cache.get("ids", [])}
+
+
+def refresh_catalog(name: str, *, store=None) -> dict:
+    entry = _load().get(name)
+    if entry is None:
+        raise ConnectionUnavailable("Provider unavailable")
+    family = entry["openai"]
+    draft = ConnectionWrite(base_url=family["base_url"], models=family.get("models", {}))
+    result = probe_connection(name, draft, full=True)
+    if not result["ok"]:
+        return result
+    ids = result["model_ids"]
+    with _LOCK:
+        entries = _load()
+        current = entries.get(name)
+        if current is None or current["openai"] != family:
+            raise ConnectionConflict({"kind": "changed"})
+        current["model_catalog"] = {
+            "fetched_at": datetime.now(UTC).isoformat(),
+            "ids": ids[:2000],
+            "complete": len(ids) <= 2000,
+        }
+        seen = current.setdefault("model_seen", {})
+        membership = set(ids)
+        for key, model in family.get("models", {}).items():
+            if model in membership:
+                seen[key] = model
+        _write(entries)
+        return _row(name, current, True, references(store, entries=entries))

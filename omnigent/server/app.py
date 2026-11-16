@@ -5371,7 +5371,7 @@ def create_app(
             )
 
     app.include_router(
-        create_model_connections_router(auth_provider, permission_store),
+        create_model_connections_router(auth_provider, permission_store, user_preferences_store),
         prefix="/v1",
         tags=["model connections"],
     )

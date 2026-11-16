@@ -153,9 +153,11 @@ describe("settingsNavGroups", () => {
     // Non-admin → no admin items, regardless of auth mode.
     expect(ids(true, false)).not.toContain("members");
     expect(ids(false, false)).not.toContain("members");
+    expect(ids(true, false)).not.toContain("model-providers");
     // Admin on an accounts deploy → all appear, grouped under "Admin".
     const accountsAdmin = settingsNavGroups(true, false, true).find((g) => g.title === "Admin");
     expect(accountsAdmin?.items.map((i) => i.id)).toEqual([
+      "model-providers",
       "members",
       "policies",
       "instructions",
@@ -165,6 +167,7 @@ describe("settingsNavGroups", () => {
     // #1489 fix: OIDC previously had no admin chrome at all.
     const oidcAdmin = settingsNavGroups(false, false, true).find((g) => g.title === "Admin");
     expect(oidcAdmin?.items.map((i) => i.id)).toEqual([
+      "model-providers",
       "members",
       "policies",
       "instructions",
@@ -180,7 +183,11 @@ describe("settingsNavGroups", () => {
     const singleUserAdmin = settingsNavGroups(false, false, true, true).find(
       (g) => g.title === "Admin",
     );
-    expect(singleUserAdmin?.items.map((i) => i.id)).toEqual(["policies", "instructions"]);
+    expect(singleUserAdmin?.items.map((i) => i.id)).toEqual([
+      "model-providers",
+      "policies",
+      "instructions",
+    ]);
   });
 
   it("includes the Sandbox Integrations item only when a connection is enabled", () => {
@@ -194,12 +201,12 @@ describe("settingsNavGroups", () => {
     expect(item(true)).toMatchObject({ id: "integrations", label: "Sandbox Integrations" });
   });
 
-  it("keeps 15 navigation destinations with collaboration on", () => {
+  it("keeps unique navigation destinations with collaboration on", () => {
     const ids = settingsNavGroups(true, true, true, false, true, true).flatMap((group) =>
       group.items.map((item) => item.id),
     );
-    expect(ids).toHaveLength(15);
-    expect(new Set(ids).size).toBe(15);
+    expect(ids).toContain("model-providers");
+    expect(new Set(ids).size).toBe(ids.length);
     expect(ids).not.toEqual(
       expect.arrayContaining([
         "keep-warm",

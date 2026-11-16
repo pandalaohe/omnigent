@@ -100,7 +100,7 @@ import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import { SettingsLabel } from "@/components/SettingsLabel";
 import { SessionTitleInstructionsControl } from "@/components/SessionTitleInstructionsControl";
-import { ModelConnectionsSettings } from "@/components/ModelConnectionsSettings";
+import { ModelProvidersSection } from "@/pages/settings/ModelProvidersSection";
 import { VoiceInputSettings } from "@/components/VoiceInputSettings";
 import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
@@ -494,6 +494,7 @@ export function SettingsPage() {
     >
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
+      {section === "model-providers" && <ModelProvidersSection />}
       {section === "browser" && <BrowserSection />}
       {section === "agents" && <SettingsAgentsSection />}
       {section === "git" && <GitSection />}
@@ -2339,11 +2340,8 @@ function GeneralSection() {
         <SettingsGroup title="Links" testId="settings-group-links">
           <ArtifactSharingSettings />
         </SettingsGroup>
-        <SettingsGroup title="Model providers">
-          <ModelConnectionsSettings />
-          <div className="mt-4 border-t border-border pt-4">
-            <ModelReferenceNotice />
-          </div>
+        <SettingsGroup title="Model references">
+          <ModelReferenceNotice />
         </SettingsGroup>
         <SettingsGroup title="语音输入" testId="settings-group-voice-input">
           <VoiceInputSettings />

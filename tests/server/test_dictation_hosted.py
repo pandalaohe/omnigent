@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from omnigent.server import dictation_hosted as hosted
+from omnigent.server import model_connections
 from omnigent.server.model_connections import ResolvedConnection
 from omnigent.server.routes.dictation import create_dictation_router
 from omnigent.server.voice_input import VoiceInputSettings
@@ -20,6 +21,25 @@ from tests._helpers.polling import poll_until
 
 SPEECH = array("h", [2000, -2000] * 160).tobytes()
 SILENCE = bytes(640)
+
+
+def test_saved_row_follows_current_model_and_legacy_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr(model_connections, "resolve_data_dir", lambda: tmp_path)
+    monkeypatch.setenv("EXAMPLE_PROVIDER_KEY", "fake-key")
+    model_connections.upsert_connection(
+        "example",
+        model_connections.ConnectionWrite(
+            base_url="https://provider.example/v1",
+            models={"row": "current-model"},
+            key=model_connections.KeyEnvironment(env="EXAMPLE_PROVIDER_KEY"),
+        ),
+    )
+    settings = VoiceInputSettings(
+        speech_connection="example", speech_row="row", speech_model="old"
+    )
+    assert hosted.engine_for_settings(settings).model == "current-model"
+    settings.speech_row = "missing"
+    assert hosted.engine_for_settings(settings).model == "old"
 
 
 @pytest.mark.parametrize(
