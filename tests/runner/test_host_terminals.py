@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.runner import _entry
 from omnigent.runner.host_terminals import create_host_terminal_app
 from omnigent.runner.identity import RUNNER_PURPOSE_ENV_VAR
@@ -45,7 +46,9 @@ class _RecordingTerminalRegistry:
     def get(self, *_args):
         return None
 
-    async def launch(self, _key, _name, _session_key, spec, *, elevated=False):
+    async def launch(
+        self, _key, _name, _session_key, spec, *, elevated=False, linked_session_id=None
+    ):
         self.specs.append(spec)
         return SimpleNamespace(elevated=elevated)
 
@@ -131,6 +134,72 @@ def test_terminal_app_real_tmux_roundtrip_and_no_session_surface(tmp_path: Path)
         assert client.delete(f"/v1/host-terminals/{body['terminal_id']}").status_code == 204
         assert not app.state.has_active_work()
         assert app.state.host_terminal_idle_since() >= old_idle
+
+
+def test_host_terminal_agent_real_shell_probe(tmp_path: Path) -> None:
+    """Exercise the same agent REST leg with tmux and Windows ConPTY."""
+    app = create_host_terminal_app(home=tmp_path, shells=["powershell" if IS_WINDOWS else "sh"])
+    with TestClient(app) as client:
+        key = uuid.uuid4().hex
+        session_id = uuid.uuid4().hex
+        created = client.post(
+            "/v1/host-terminals",
+            json={"session_key": key, "linked_session_id": session_id},
+        )
+        assert created.status_code == 201, created.text
+        base = f"/v1/host-terminals/{key}/agent"
+        for operation in ("read", "send"):
+            denied = client.post(f"{base}/{operation}", json={"session_id": "another-session"})
+            assert denied.status_code == 403, denied.text
+        # Require an output line, rather than matching the command's input echo.
+        marker = f"probe-{uuid.uuid4().hex}"
+        sent = client.post(
+            f"{base}/send", json={"session_id": session_id, "text": f"echo {marker}"}
+        )
+        assert sent.status_code == 200 and "error" not in sent.json(), sent.text
+        observed = ""
+
+        def has_output() -> bool:
+            nonlocal observed
+            read = client.post(f"{base}/read", json={"session_id": session_id})
+            assert read.status_code == 200, read.text
+            observed = read.json().get("screen", "")
+            return marker in (line.strip() for line in observed.splitlines())
+
+        poll_until(has_output, timeout_s=15)
+        assert marker in observed
+        instance = app.state.terminal_registry.get("host-terminals", "shell", key)
+        assert instance.backend == ("conpty" if IS_WINDOWS else "tmux")
+        relinked = client.post(
+            "/v1/host-terminals", json={"session_key": key, "linked_session_id": "other"}
+        )
+        assert relinked.status_code == 409
+        assert client.delete(f"/v1/host-terminals/{key}").status_code == 204
+        assert client.post(f"{base}/read", json={"session_id": session_id}).status_code == 404
+    print(f"HOST_TERMINAL_AGENT_PROBE=PASS BACKEND={'conpty' if IS_WINDOWS else 'tmux'}")
+
+
+def test_host_terminal_agent_rejects_unlinked_and_ungranted_admin(tmp_path: Path) -> None:
+    app = create_host_terminal_app(home=tmp_path, shells=["powershell" if IS_WINDOWS else "sh"])
+    with TestClient(app) as client:
+        key = uuid.uuid4().hex
+        assert client.post("/v1/host-terminals", json={"session_key": key}).status_code == 201
+        for operation in ("read", "send"):
+            assert (
+                client.post(
+                    f"/v1/host-terminals/{key}/agent/{operation}", json={"session_id": "session"}
+                ).status_code
+                == 403
+            )
+        instance = app.state.terminal_registry.get("host-terminals", "shell", key)
+        instance.linked_session_id = "session"
+        instance.elevated = True
+        for operation in ("read", "send"):
+            denied = client.post(
+                f"/v1/host-terminals/{key}/agent/{operation}", json={"session_id": "session"}
+            )
+            assert denied.status_code == 403
+            assert "sys_terminal_request_access" in denied.json()["detail"]
 
 
 def test_entry_chooses_terminal_only_app_before_harness_bootstrap(

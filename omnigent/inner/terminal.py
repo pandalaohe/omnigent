@@ -1123,6 +1123,7 @@ class TerminalInstance:
     host_shell: bool = False
     elevated: bool = False
     agent_access: bool = False
+    linked_session_id: str | None = None
     last_input_at: float = field(default_factory=time.monotonic, repr=False)
     _elevated_watch_stop: threading.Event = field(default_factory=threading.Event, repr=False)
     on_elevated_exit: Callable[[], None] | None = field(default=None, repr=False)

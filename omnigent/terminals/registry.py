@@ -300,6 +300,7 @@ class TerminalRegistry:
         agent_invocation: bool = False,
         host_shell: bool = False,
         origin: Literal["user", "agent", "harness"] = "harness",
+        linked_session_id: str | None = None,
     ) -> TerminalInstance:
         """Launch a terminal session, or return the existing one.
 
@@ -341,6 +342,8 @@ class TerminalRegistry:
         with self._lock:
             existing = self._by_conversation.get(conversation_id, {}).get(key)
         if existing is not None and existing.running:
+            if existing.linked_session_id != linked_session_id:
+                raise ValueError("terminal already belongs to a different session")
             if agent_invocation and existing.elevated and not existing.agent_access:
                 raise ValueError(AGENT_ACCESS_REQUIRED)
             if existing.elevated != elevated and not agent_invocation:
@@ -392,6 +395,7 @@ class TerminalRegistry:
         stage = "terminal_spawn"
         try:
             created.instance.elevated = elevated
+            created.instance.linked_session_id = linked_session_id
             created.instance.origin = "agent" if agent_invocation else origin
             created.instance.host_shell = host_shell
             created.instance.program_status_app = program_status_app
@@ -495,6 +499,8 @@ class TerminalRegistry:
                     session_key,
                     conversation_id,
                 )
+        if winning_instance.linked_session_id != linked_session_id:
+            raise ValueError("terminal already belongs to a different session")
         if agent_invocation and winning_instance.elevated and not winning_instance.agent_access:
             raise ValueError(AGENT_ACCESS_REQUIRED)
         if not agent_invocation and winning_instance.elevated != elevated:
