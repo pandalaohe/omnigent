@@ -84,6 +84,27 @@ def test_pause_segmentation_and_tail_use_wav_prompt(monkeypatch):
     assert not take.worker.is_alive()
 
 
+@pytest.mark.parametrize("frames", [0, 5, 14])
+def test_stop_preserves_short_tail_and_partial_frame(monkeypatch, frames):
+    calls = []
+
+    def handle(request):
+        calls.append(request.content)
+        return httpx.Response(200, json={"text": "last word"})
+
+    take = stream(monkeypatch, handle)
+    tail = SPEECH * frames + SPEECH[:320]
+    try:
+        take.feed_pcm16(tail)
+        result = take.finish_update()
+        assert result.finalized == "last word"
+        assert len(calls) == 1
+        assert tail in calls[0]
+        assert result.undelivered == {"segments": 0, "seconds": 0.0}
+    finally:
+        take.close()
+
+
 def test_silence_skips_requests_and_long_speech_is_cut(monkeypatch):
     calls = []
 

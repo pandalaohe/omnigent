@@ -154,7 +154,7 @@ export function QuestionDictationControls({
           take.segments.push({
             shown: text,
             original: meta?.raw ?? text,
-            cleaned: meta?.cleaned === true,
+            cleaned: meta?.cleaned === true || meta?.cleanupHandled === true,
             source: meta?.source,
           });
           const previous = take.raw;

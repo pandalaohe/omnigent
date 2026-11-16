@@ -99,7 +99,11 @@ export function useComposerVoiceCleanup(
       };
     },
     record: (text: string, meta?: Parameters<ComposerMicButtonProps["onTranscript"]>[1]) => {
-      take.current?.segments.push({ text, cleaned: meta?.cleaned === true, source: meta?.source });
+      take.current?.segments.push({
+        text,
+        cleaned: meta?.cleaned === true || meta?.cleanupHandled === true,
+        source: meta?.source,
+      });
     },
     replaceFinal: (original: string, text: string) => {
       const current = take.current;

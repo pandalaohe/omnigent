@@ -51,6 +51,7 @@ export interface Undelivered {
 export interface FinalMeta {
   raw?: string;
   cleaned?: boolean;
+  cleanupHandled?: boolean;
 }
 export interface ErrorMeta {
   code?: string;
