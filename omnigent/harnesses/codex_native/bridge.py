@@ -230,6 +230,8 @@ class CodexNativeBridgeState:
     pending_shell_parent_turn_id: str | None = None
     active_shell_turn_id: str | None = None
     active_turn_revision: int = 0
+    last_terminal_turn_id: str | None = None
+    last_terminal_outcome: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1441,6 +1443,14 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                     "pending_shell_parent_turn_id": state.pending_shell_parent_turn_id,
                     "active_shell_turn_id": state.active_shell_turn_id,
                     "active_turn_revision": state.active_turn_revision,
+                    **(
+                        {
+                            "last_terminal_turn_id": state.last_terminal_turn_id,
+                            "last_terminal_outcome": state.last_terminal_outcome,
+                        }
+                        if state.last_terminal_turn_id is not None
+                        else {}
+                    ),
                 },
                 handle,
                 sort_keys=True,
@@ -1472,6 +1482,8 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
                 state,
                 retry_inputs={**state.retry_inputs, **previous.retry_inputs},
                 retry_sources={**state.retry_sources, **previous.retry_sources},
+                last_terminal_turn_id=previous.last_terminal_turn_id,
+                last_terminal_outcome=previous.last_terminal_outcome,
             )
         current = previous
         if current is not None and (
@@ -2109,6 +2121,15 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
             active_turn_revision=(
                 value if isinstance(value := raw.get("active_turn_revision"), int) else 0
             ),
+            last_terminal_turn_id=(
+                value if isinstance(value := raw.get("last_terminal_turn_id"), str) else None
+            ),
+            last_terminal_outcome=(
+                value
+                if isinstance(value := raw.get("last_terminal_outcome"), str)
+                and value in {"completed", "cancelled", "failed"}
+                else None
+            ),
         ),
         "ready",
     )
@@ -2437,6 +2458,12 @@ def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | Non
                 state,
                 thread_id=thread_id,
                 active_turn_id=active_turn_id,
+                last_terminal_turn_id=(
+                    state.last_terminal_turn_id if state.thread_id == thread_id else None
+                ),
+                last_terminal_outcome=(
+                    state.last_terminal_outcome if state.thread_id == thread_id else None
+                ),
                 retry_inputs=state.retry_inputs if state.thread_id == thread_id else {},
                 retry_sources=state.retry_sources if state.thread_id == thread_id else {},
                 cwd=state.cwd,
@@ -2450,6 +2477,7 @@ def clear_active_turn_id_if_matches(
     completed_turn_id: str | None,
     *,
     on_cleared: Callable[[], None] | None = None,
+    terminal_outcome: str | None = None,
 ) -> bool:
     """
     Clear the active Codex turn id if a terminal event matches it.
@@ -2514,6 +2542,8 @@ def clear_active_turn_id_if_matches(
                 active_turn_id=None,
                 active_shell_turn_id=None,
                 active_turn_revision=state.active_turn_revision + 1,
+                last_terminal_turn_id=completed_turn_id,
+                last_terminal_outcome=terminal_outcome,
             ),
         )
         _run_on_cleared()
