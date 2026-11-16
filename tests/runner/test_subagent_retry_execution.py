@@ -313,7 +313,9 @@ async def test_human_buffered_during_retry_admission_executes_on_own_turn(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["accepted", "lost_ack", "replacement", "expired"])
+@pytest.mark.parametrize(
+    "outcome", ["accepted", "lost_ack", "late_receipt", "replacement", "expired"]
+)
 async def test_admission_relay_reconciles_one_id_and_fences_late_replacement(outcome, caplog):
     entered, release = asyncio.Event(), asyncio.Event()
     deadline = time.time() + 30
@@ -344,7 +346,7 @@ async def test_admission_relay_reconciles_one_id_and_fences_late_replacement(out
                 admissions.append(kwargs["json"])
                 entered.set()
                 await release.wait()
-                if outcome == "lost_ack":
+                if outcome in {"lost_ack", "late_receipt"}:
                     raise httpx.ReadTimeout("Accepted input response lost")
                 return httpx.Response(
                     200,
@@ -357,9 +359,14 @@ async def test_admission_relay_reconciles_one_id_and_fences_late_replacement(out
                 )
             if url.endswith("/input-admission/resolve"):
                 lookups.append(kwargs["json"])
+                assert kwargs["params"] == {"close": "false"}
                 return httpx.Response(
                     200,
-                    json=accepted.model_dump(),
+                    json=(
+                        InputExecutionReceipt(state="pending", reason="acceptance_unknown")
+                        if outcome == "late_receipt" and len(lookups) == 1
+                        else accepted
+                    ).model_dump(),
                     request=httpx.Request("POST", "http://server" + url),
                 )
             return await super().post(url, **kwargs)
@@ -398,7 +405,7 @@ async def test_admission_relay_reconciles_one_id_and_fences_late_replacement(out
             response = await asyncio.wait_for(task, 5)
     assert response.status_code == 200
     assert len(admissions) == 1 and admissions[0]["input_id"] == input_id
-    assert len(lookups) == int(outcome == "lost_ack")
+    assert len(lookups) == (2 if outcome == "late_receipt" else int(outcome == "lost_ack"))
     if lookups:
         assert lookups[0] == admissions[0]
     results = [

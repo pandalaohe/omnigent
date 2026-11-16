@@ -1556,10 +1556,22 @@ class HarnessApp:
                     break
             return Response(status_code=status.HTTP_204_NO_CONTENT)
         if isinstance(body, InputExecutionResultEvent):
+            matched = False
             for ctx in self._in_flight.values():
                 if ctx._complete_input_claim(body.claim_id, body.result):
+                    matched = True
                     break
-            return Response(status_code=status.HTTP_204_NO_CONTENT)
+            _logger.info(
+                "Input execution receipt claim_id=%s remote_outcome=%s reason=%s matched=%s",
+                body.claim_id,
+                body.result.state,
+                body.result.reason,
+                matched,
+            )
+            return Response(
+                status_code=status.HTTP_204_NO_CONTENT,
+                headers={"X-Input-Claim-Matched": str(matched).lower()},
+            )
         if isinstance(body, KeepWarmEvent):
             return await self._handle_keep_warm_event(body)
         # Pydantic's discriminated-union validator should reject

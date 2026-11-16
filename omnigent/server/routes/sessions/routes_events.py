@@ -6472,7 +6472,7 @@ def register_events_routes(
 
     @event_router.post("/sessions/{session_id}/input-admission/resolve", include_in_schema=False)
     async def resolve_input_execution(
-        request: Request, session_id: str, body: InputExecutionClaim
+        request: Request, session_id: str, body: InputExecutionClaim, close: bool = True
     ):
         service = _retry_admission(request)
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -6488,7 +6488,7 @@ def register_events_routes(
             session_id,
             body,
             runner_id=conv.runner_id,
-            close=True,
+            close=close,
         )
 
     async def _control_receiver(request: Request, session_id: str):
