@@ -84,6 +84,7 @@ function mount(session = child) {
 beforeEach(() => {
   cache = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   useChatStore.setState({ conversationId: "parent", sideChatComposers: {} });
+  vi.spyOn(sessionsApi, "refreshSessionModelOptions").mockResolvedValue([]);
   vi.spyOn(toast, "error").mockReturnValue("error");
   vi.spyOn(sessionsApi, "updateSession").mockImplementation(
     async (id, updates) =>
@@ -245,7 +246,7 @@ it("offers SDK effort controls without inventing a model catalog", async () => {
   const user = userEvent.setup();
   await user.click(screen.getByRole("button", { name: "Side chat model and effort" }));
   await user.click(screen.getByTestId("side-chat-model-edit"));
-  expect(screen.queryByTestId("side-chat-models")).not.toBeInTheDocument();
+  expect(screen.getByTestId("side-chat-models")).toBeInTheDocument();
   await user.click(screen.getByTestId("side-chat-effort-low"));
   expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", { reasoningEffort: "low" });
 });
@@ -589,7 +590,7 @@ it.each([false, true])(
   },
 );
 
-it("hides unsupported custom native effort", () => {
+it("keeps model loading reachable without unsupported native effort", async () => {
   render(
     <QueryClientProvider client={cache}>
       <SideChatSettings
@@ -602,9 +603,11 @@ it("hides unsupported custom native effort", () => {
       />
     </QueryClientProvider>,
   );
-  expect(
-    screen.queryByRole("button", { name: "Side chat model and effort" }),
-  ).not.toBeInTheDocument();
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Side chat model and effort" }));
+  await user.click(screen.getByTestId("side-chat-model-edit"));
+  expect(screen.queryByTestId("side-chat-efforts")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Refresh models" })).toBeInTheDocument();
 });
 
 it.each([
@@ -721,4 +724,89 @@ it("refreshes native settings support when the parent runner reconnects", async 
   expect(await screen.findByRole("button", { name: "Side chat model and effort" })).toBeVisible();
   expect(snapshot).toHaveBeenCalledTimes(2);
   expect(cache.getQueryData(["session", "parent"])).toEqual(parent);
+});
+
+it("keeps an empty SDK child catalog reachable and retries a failed load", async () => {
+  const user = userEvent.setup();
+  const refresh = vi
+    .spyOn(sessionsApi, "refreshSessionModelOptions")
+    .mockRejectedValueOnce(new Error("Model refresh failed (502)"))
+    .mockResolvedValue([{ id: "host-model", displayName: "Host model" }]);
+  mount({
+    ...child,
+    harness: "codex",
+    parentSessionId: "parent",
+    labels: {},
+    codexModelOptions: [],
+    modelOverride: "retired/model",
+  });
+  await user.click(screen.getByRole("button", { name: "Side chat model and effort" }));
+  await user.click(screen.getByTestId("side-chat-model-edit"));
+  expect(await screen.findByRole("alert")).toHaveTextContent("502");
+  await user.click(screen.getByRole("button", { name: "Refresh models" }));
+  expect(await screen.findByRole("menuitemcheckbox", { name: "Host model" })).toBeEnabled();
+  expect(refresh).toHaveBeenCalledWith("side", "force");
+  expect(screen.getByTestId("side-chat-effort-high")).toBeInTheDocument();
+  await user.click(screen.getByRole("menuitemcheckbox", { name: "Host model" }));
+  await waitFor(() =>
+    expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", { modelOverride: "host-model" }),
+  );
+});
+
+it.each<Partial<Session>>([
+  { hostId: "host-b" },
+  { agentId: "new-agent" },
+  { harness: "claude-sdk" },
+  { labels: { ...child.labels, "omnigent.wrapper": "another-wrapper" } },
+  { inferenceConfigured: true },
+])("ignores a late catalog after the source changes: %j", async (updates) => {
+  let resolveOld!: (models: NativeModelOption[]) => void;
+  let resolveNew!: (models: NativeModelOption[]) => void;
+  const refresh = vi
+    .mocked(sessionsApi.refreshSessionModelOptions)
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveOld = resolve;
+        }),
+    )
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveNew = resolve;
+        }),
+    );
+  mount({ ...child, hostId: "host-a" });
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Side chat model and effort" }));
+  await user.click(screen.getByTestId("side-chat-model-edit"));
+  await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+  const newModels = [{ id: "new-model", displayName: "New host model" }];
+  act(() => {
+    cache.setQueryData(["session", "side"], {
+      ...child,
+      hostId: "host-a",
+      ...updates,
+      codexModelOptions: newModels,
+    });
+  });
+  if (!updates.inferenceConfigured) {
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      resolveNew(newModels);
+    });
+  }
+  if (!updates.labels) {
+    expect(await screen.findByRole("menuitemcheckbox", { name: "New host model" })).toBeEnabled();
+  }
+  await act(async () => {
+    resolveOld([{ id: "old-model", displayName: "Old host model" }]);
+  });
+  expect(cache.getQueryData<Session>(["session", "side"])?.codexModelOptions).toEqual(newModels);
+  if (!updates.labels) {
+    expect(screen.getByRole("menuitemcheckbox", { name: "New host model" })).toBeEnabled();
+  }
+  expect(
+    screen.queryByRole("menuitemcheckbox", { name: "Old host model" }),
+  ).not.toBeInTheDocument();
 });

@@ -450,6 +450,8 @@ describe("running Codex speed and catalog refresh", () => {
   it.each([
     ["acp", "acp"],
     ["sdk", "pi"],
+    ["sdk", "codex"],
+    ["sdk", "claude-sdk"],
   ] as const)(
     "refreshes %s and preserves live rows when the cached response is empty",
     async (modelPickerKind, sessionHarness) => {
@@ -9675,5 +9677,71 @@ describe("saved sandbox inference policy", () => {
       }
       expect(useChatStore.getState().setModel).not.toHaveBeenCalled();
     },
+  );
+});
+
+it("exports model and effort component DOM for acceptance", async () => {
+  const target = process.env.MODEL_EFFORT_ACCEPTANCE_HTML;
+  if (!target) return;
+  const rows = [{ id: "host-model", displayName: "Host model" }];
+  useChatStore.setState({
+    conversationId: "conv_acceptance",
+    sessionHarness: "codex",
+    codexModelOptions: [],
+    sessionModelOverride: "retired/model",
+    sessionReasoningEffort: "high",
+  });
+  const refresh = vi
+    .spyOn(sessionsApi, "refreshSessionModelOptions")
+    .mockRejectedValueOnce(new Error("Model refresh failed (502). Refresh models to retry."))
+    .mockResolvedValue(rows);
+  const { rerender } = renderWithTooltips(
+    <Composer
+      {...composerProps({
+        showModels: true,
+        modelPickerKind: "sdk",
+        codexModelOptions: [],
+        showEffort: true,
+      })}
+    />,
+  );
+  await openSessionModels();
+  await screen.findByRole("alert");
+  const failed = document.body.innerHTML;
+  fireEvent.click(screen.getByTestId("composer-model-refresh"));
+  await waitFor(() => expect(refresh).toHaveBeenCalledWith("conv_acceptance", "force"));
+  await waitFor(() => expect(useChatStore.getState().codexModelOptions).toEqual(rows));
+  rerender(
+    <TooltipProvider>
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "sdk",
+          codexModelOptions: rows,
+          showEffort: true,
+        })}
+      />
+    </TooltipProvider>,
+  );
+  await screen.findByTestId("composer-agent-model-host-model");
+  const recovered = document.body.innerHTML;
+  const { writeFileSync, readFileSync, readdirSync } = await import("node:fs");
+  const { resolve } = await import("node:path");
+  const assetDir = resolve("../omnigent/server/static/web-ui/assets");
+  const css = readdirSync(assetDir)
+    .filter((name) => name.endsWith(".css"))
+    .map((name) => readFileSync(resolve(assetDir, name), "utf8"))
+    .join("\n");
+  const frames = [failed, recovered].map(
+    (dom) =>
+      `<!doctype html><html><head><style>${css}</style></head><body style="min-height:650px">${dom}</body></html>`,
+  );
+  writeFileSync(
+    target,
+    `<!doctype html><html lang="zh"><meta charset="utf-8"><title>会话 model / effort 验收</title>
+    <style>body{font:16px system-ui;margin:24px;background:#f6f7fa;color:#202733}button{margin:8px;padding:8px}iframe{width:100%;height:760px;border:1px solid #adb5c5}</style>
+    <h1>会话 model / effort 控件</h1><p>真实 Composer 的 vitest DOM；切换查看失败和恢复状态。页面不连接服务，实际点击行为由组件测试覆盖。</p>
+    <button onclick="show(0)">502：错误与重试</button><button onclick="show(1)">200：模型和 effort 可选</button><iframe title="真实组件 DOM"></iframe>
+    <script>const frames=${JSON.stringify(frames).replace(/</g, "\\u003c")};function show(i){document.querySelector('iframe').srcdoc=frames[i]}show(0)</script></html>`,
   );
 });

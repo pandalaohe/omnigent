@@ -15343,6 +15343,9 @@ async def _load_model_options(
     # ``sessions._MODEL_OPTIONS_RETRY_DELAYS_S`` reach this impl.
     import omnigent.server.routes.sessions as _facade
 
+    from .common import _model_catalog_error, _model_catalog_fetched_at, _model_catalog_scope
+
+    scope = _model_catalog_scope.get(session_id)
     delays = _facade._MODEL_OPTIONS_RETRY_DELAYS_S
     for attempt in range(len(delays) + 1):
         try:
@@ -15353,6 +15356,10 @@ async def _load_model_options(
                 session_id,
                 extra={"session_id": session_id},
             )
+            if _model_catalog_scope.get(session_id) == scope:
+                _model_catalog_error[session_id] = (
+                    "Model list unavailable; refresh models to retry"
+                )
             return
         if resp.status_code != 200:
             # An older runner has no unified route; drop to the harness-named
@@ -15366,6 +15373,10 @@ async def _load_model_options(
             if resp.status_code == 503 and attempt < len(delays):
                 await asyncio.sleep(delays[attempt])
                 continue
+            if _model_catalog_scope.get(session_id) == scope:
+                _model_catalog_error[session_id] = (
+                    "Model list unavailable; refresh models to retry"
+                )
             return
         try:
             options = _model_options_from_wire(resp.json().get("models", []))
@@ -15375,6 +15386,10 @@ async def _load_model_options(
                 session_id,
                 extra={"session_id": session_id},
             )
+            if _model_catalog_scope.get(session_id) == scope:
+                _model_catalog_error[session_id] = (
+                    "Model list unavailable; refresh models to retry"
+                )
             return
         if not options and not accept_empty:
             # Older runners returned 200 + [] for the same not-ready window.
@@ -15383,10 +15398,18 @@ async def _load_model_options(
             if attempt < len(delays):
                 await asyncio.sleep(delays[attempt])
                 continue
+            if _model_catalog_scope.get(session_id) == scope:
+                _model_catalog_error[session_id] = (
+                    "Model list unavailable; refresh models to retry"
+                )
+            return
+        if _model_catalog_scope.get(session_id) != scope:
             return
         cache = _acp_effort_options_cache if acp_effort_only else _model_options_cache
         changed = cache.get(session_id) != options
         cache[session_id] = options
+        _model_catalog_fetched_at[session_id] = time.time()
+        _model_catalog_error.pop(session_id, None)
         _model_options_stale.discard(session_id)
         if changed or not publish_on_change_only:
             _publish_model_options(session_id)
@@ -15578,16 +15601,26 @@ async def _load_model_options_from_host(session_id: str, host_id: str, harness: 
     # ``sessions._host_model_options_via_registry`` reach this impl.
     import omnigent.server.routes.sessions as _facade
 
-    raw = await _facade._host_model_options_via_registry(host_id, harness)
-    if not raw:
-        return
+    from .common import _model_catalog_error, _model_catalog_fetched_at, _model_catalog_scope
+
+    scope = _model_catalog_scope.get(session_id)
     try:
+        raw = await _facade._host_model_options_via_registry(host_id, harness)
+        if not raw:
+            raise ValueError("Model list unavailable; refresh models to retry")
         options = _model_options_from_wire(raw)
-    except ValueError:
+        if not options:
+            raise ValueError("Model list empty; refresh models to retry")
+    except (ValueError, httpx.HTTPError):
+        if _model_catalog_scope.get(session_id) == scope:
+            _model_catalog_error[session_id] = "Model list unavailable; refresh models to retry"
+            _publish_model_options(session_id)
         return
-    if not options:
+    if _model_catalog_scope.get(session_id) != scope:
         return
     _model_options_cache[session_id] = options
+    _model_catalog_fetched_at[session_id] = time.time()
+    _model_catalog_error.pop(session_id, None)
     if harness == "claude-native":
         _model_options_stale.add(session_id)
     _publish_model_options(session_id)

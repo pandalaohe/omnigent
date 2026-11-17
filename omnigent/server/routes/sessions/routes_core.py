@@ -378,6 +378,7 @@ from omnigent.util.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     EFFORT_VALUES,
     validate_effort,
+    validate_effort_for_harness,
 )
 from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
@@ -1253,6 +1254,29 @@ def register_core_routes(
             raise _session_not_found()
         from omnigent.server.routes._session_create_validation import session_acp_harness
         from omnigent.server.routes._sessions import orchestration as catalog_routes
+        from omnigent.server.routes._sessions.common import (
+            _bind_model_catalog,
+            _model_catalog_error,
+            _model_catalog_fetched_at,
+            _model_catalog_scope,
+        )
+
+        catalog_host_id = await asyncio.to_thread(effective_host_id, conversation_store, conv)
+        catalog_harness = _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
+        from omnigent.harness_aliases import canonicalize_harness
+
+        catalog_harness = canonicalize_harness(catalog_harness)
+        _bind_model_catalog(
+            session_id,
+            (
+                catalog_host_id,
+                conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) or catalog_harness,
+                conv.agent_id,
+                conv.sub_agent_name,
+                repr(conv.inference_snapshot),
+            ),
+        )
+        catalog_scope = _model_catalog_scope.get(session_id)
 
         acp_harness = await asyncio.to_thread(session_acp_harness, conv, agent_store, agent_cache)
         cached = _model_options_cache.get(session_id)
@@ -1267,7 +1291,7 @@ def register_core_routes(
             )
         if refresh is None or (
             refresh == "auto"
-            and cached is not None
+            and bool(cached)
             and time.monotonic() - model_refresh_at.get(session_id, 0) <= 300
         ):
             return {"models": cached or []}
@@ -1332,14 +1356,20 @@ def register_core_routes(
                 raise HTTPException(
                     status_code=502, detail="invalid session model catalog"
                 ) from exc
-            if not options and cached:
+            if not options:
                 raise HTTPException(status_code=502, detail="empty session model catalog")
+            if _model_catalog_scope.get(session_id) != catalog_scope:
+                raise HTTPException(
+                    status_code=409, detail="session catalog source changed; retry"
+                )
             if acp_harness:
                 catalog_routes._acp_effort_options_cache[session_id] = options
                 options = catalog_routes._acp_model_options_with_effort(curated, options)
             else:
                 _model_options_cache[session_id] = options
             model_refresh_at[session_id] = time.monotonic()
+            _model_catalog_fetched_at[session_id] = time.time()
+            _model_catalog_error.pop(session_id, None)
             _publish_model_options(session_id)
             return options
 
@@ -1353,7 +1383,12 @@ def register_core_routes(
                     model_refresh_inflight.pop(session_id, None)
 
             task.add_done_callback(clear_finished)
-        return {"models": await asyncio.shield(task)}
+        try:
+            return {"models": await asyncio.shield(task)}
+        except HTTPException:
+            if _model_catalog_scope.get(session_id) == catalog_scope:
+                _model_catalog_error[session_id] = "Model refresh failed; retry"
+            raise
 
     @router.get("/sessions/{session_id}/worktree-status")
     async def worktree_status(
@@ -5936,6 +5971,9 @@ def register_core_routes(
         # resolved (strictest requested) level gates them all with no redundant
         # second permission-store read.
         set_project = "project_id" in body.model_fields_set
+        tool_settings = ORCHESTRATION_SOURCE_HEADER in request.headers and bool(
+            {"model_override", "reasoning_effort"} & body.model_fields_set
+        )
         set_launch_args = (
             body.terminal_launch_args is not None
             or body.permission_mode is not None
@@ -5953,6 +5991,7 @@ def register_core_routes(
             or body.archive_locked is not None
             or set_project
             or set_launch_args
+            or tool_settings
         ):
             required_level = LEVEL_OWNER
         elif set_share_workspace:
@@ -6296,7 +6335,10 @@ def register_core_routes(
                     viewer_id=user_id,
                     request=request,
                 )
-        if set_project:
+        if set_project or (
+            ORCHESTRATION_SOURCE_HEADER in request.headers
+            and {"model_override", "reasoning_effort"} & body.model_fields_set
+        ):
             # A session shared with edit access must not let collaborators
             # refile the owner's other sessions through agent tools.
             await asyncio.to_thread(
@@ -6597,28 +6639,40 @@ def register_core_routes(
                 requested_codex_collaboration_mode
             )
         effort = body.reasoning_effort
+        effort_harness = None
         dynamic_effort = False
         if "reasoning_effort" in body.model_fields_set:
+            from omnigent.harness_capabilities import EffortFamily
+            from omnigent.harness_plugins import harness_capabilities
+            from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
+
             effort_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if effort_conv is None:
                 raise _session_not_found()
             effort_harness = _resolve_harness(
                 effort_conv, agent_store=agent_store, agent_cache=agent_cache
             )
-            dynamic_effort = effort_harness == "acp" or bool(
-                effort_harness and effort_harness.startswith("acp:")
+            native_agent = native_coding_agent_for_wrapper_label(
+                effort_conv.labels.get("omnigent.wrapper")
             )
+            if native_agent is not None:
+                effort_harness = native_agent.harness
+            capabilities = harness_capabilities().get(effort_harness or "")
+            dynamic_effort = (
+                capabilities is not None and capabilities.effort is EffortFamily.DYNAMIC
+            ) or bool(effort_harness and effort_harness.startswith("acp:"))
         clear_effort = (
             (effort is None and "reasoning_effort" in body.model_fields_set)
             if dynamic_effort
             else effort in EFFORT_CLEAR_VALUES
+            or (effort is None and "reasoning_effort" in body.model_fields_set)
         )
         if effort is not None and not clear_effort:
             try:
-                effort = validate_effort(
-                    effort,
-                    "session metadata",
-                    None if dynamic_effort else EFFORT_VALUES,
+                effort = (
+                    validate_effort(effort, "session metadata", None)
+                    if dynamic_effort
+                    else validate_effort_for_harness(effort, effort_harness)
                 )
             except ValueError as exc:
                 raise OmnigentError(

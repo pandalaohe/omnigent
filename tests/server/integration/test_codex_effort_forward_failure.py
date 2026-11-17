@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import uuid
 from collections.abc import AsyncIterator
@@ -155,7 +156,9 @@ async def native_session(
         yield _NativeSession(session_id, store, bridge_dir, codex, remembered_efforts, runner)
 
 
-@pytest.mark.parametrize(("requested", "applied"), [("minimal", "low"), ("default", "medium")])
+@pytest.mark.parametrize(
+    ("requested", "applied"), [("minimal", "low"), ("default", "medium"), (None, "medium")]
+)
 async def test_successful_update_mirrors_unchanged_native_effort_without_notification(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
@@ -766,3 +769,87 @@ async def test_offline_or_silent_effort_change_is_saved_for_resume(
     saved = native_session.store.get_conversation(native_session.session_id)
     assert saved is not None and saved.reasoning_effort is None
     assert native_session.codex.requests == []
+
+
+@pytest.mark.parametrize("harness", ["codex", "claude-sdk"])
+@pytest.mark.parametrize("child", [False, True])
+@pytest.mark.parametrize("busy", [False, True])
+async def test_sdk_settings_persist_for_next_turn(client, db_uri, harness, child, busy):
+    from omnigent.server.routes._sessions.common import _session_status_cache
+
+    agent = await create_test_agent(client)
+    parent = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert parent.status_code == 201, parent.text
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "harness_override": harness,
+            "parent_session_id": parent.json()["id"] if child else None,
+            "model_override": "retired/model",
+            "reasoning_effort": "high",
+        },
+    )
+    assert response.status_code == 201, response.text
+    sid = response.json()["id"]
+    _session_status_cache[sid] = "running" if busy else "idle"
+    updated = await client.patch(
+        f"/v1/sessions/{sid}",
+        json={
+            "model_override": "host-model",
+            "reasoning_effort": "low",
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    stored = SqlAlchemyConversationStore(db_uri).get_conversation(sid)
+    assert stored.model_override == "host-model"
+    assert stored.reasoning_effort == "low"
+    reset = await client.patch(f"/v1/sessions/{sid}", json={"reasoning_effort": None})
+    assert reset.status_code == 200, reset.text
+    assert SqlAlchemyConversationStore(db_uri).get_conversation(sid).reasoning_effort is None
+
+
+@pytest.mark.parametrize("harness,effort", [("claude-sdk", "none"), ("cursor", "high")])
+async def test_settings_reject_unsupported_harness_effort(client, db_uri, harness, effort):
+    from omnigent.runner.session_projects import execute_session_update
+
+    agent = await create_test_agent(client)
+    created = await client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "harness_override": harness}
+    )
+    assert created.status_code == 201, created.text
+    sid = created.json()["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    before = store.get_conversation(sid)
+    response = await client.patch(
+        f"/v1/sessions/{sid}",
+        json={"reasoning_effort": effort, "model_override": "another-model"},
+    )
+    assert response.status_code == 400, response.text
+    assert "reasoning_effort" in response.text
+    assert harness in response.text
+    result = json.loads(
+        await execute_session_update({"session_id": sid, "reasoning_effort": effort}, client, sid)
+    )
+    assert "error" in result
+    assert "reasoning_effort" in result["error"]
+    after = store.get_conversation(sid)
+    assert after.reasoning_effort == before.reasoning_effort
+    assert after.model_override == before.model_override
+
+
+@pytest.mark.parametrize("harness", ["acp", "grok", "jcode"])
+async def test_settings_preserve_dynamic_effort_and_null_reset(client, db_uri, harness):
+    agent = await create_test_agent(client)
+    created = await client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "harness_override": harness}
+    )
+    assert created.status_code == 201, created.text
+    sid = created.json()["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    response = await client.patch(f"/v1/sessions/{sid}", json={"reasoning_effort": "deliberate"})
+    assert response.status_code == 200, response.text
+    assert store.get_conversation(sid).reasoning_effort == "deliberate"
+    reset = await client.patch(f"/v1/sessions/{sid}", json={"reasoning_effort": None})
+    assert reset.status_code == 200, reset.text
+    assert store.get_conversation(sid).reasoning_effort is None

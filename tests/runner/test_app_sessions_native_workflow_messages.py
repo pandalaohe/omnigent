@@ -1186,7 +1186,13 @@ async def test_forwarded_model_override_reaches_the_harness() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "harness,initial,changed", [("pi", "high", "low"), ("acp", "deliberate", "quick")]
+    "harness,initial,changed",
+    [
+        ("pi", "high", "low"),
+        ("acp", "deliberate", "quick"),
+        ("claude-sdk", "high", "low"),
+        ("codex", "high", "low"),
+    ],
 )
 async def test_forwarded_reasoning_effort_reaches_the_harness(
     harness: str, initial: str, changed: str

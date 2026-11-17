@@ -17451,7 +17451,27 @@ async def _fetch_model_options(
     :returns: Model options, or ``[]`` when the session has no model picker or
         the runner-owned options are not yet available.
     """
+    from omnigent.harness_aliases import canonicalize_harness
+
+    from .common import _bind_model_catalog, _model_catalog_attempt_at, _model_catalog_fetched_at
+
     wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+    harness = (
+        canonicalize_harness(_resolve_harness(conv, agent_store=agent_store))
+        if not wrapper
+        else None
+    )
+    catalog_host_id = host_id or conv.host_id
+    _bind_model_catalog(
+        session_id,
+        (
+            catalog_host_id,
+            wrapper or harness,
+            conv.agent_id,
+            conv.sub_agent_name,
+            repr(conv.inference_snapshot),
+        ),
+    )
     if wrapper == _PI_NATIVE_WRAPPER_LABEL_VALUE:
         # pi-native's catalog is PUSHED by its extension (its live
         # ``ctx.modelRegistry``), not fetched: that reflects the models pi
@@ -17483,24 +17503,25 @@ async def _fetch_model_options(
             return _acp_model_options_with_effort(
                 curated, _acp_effort_options_cache.get(session_id, [])
             )
-        from omnigent.harness_aliases import canonicalize_harness
-
-        harness = canonicalize_harness(_resolve_harness(conv, agent_store=agent_store))
         if harness in {"claude-sdk", "codex", "pi"}:
             cached = _model_options_cache.get(session_id)
-            if cached is not None:
+            if cached and time.time() - _model_catalog_fetched_at.get(session_id, 0) < 300:
                 return cached
-            catalog_host_id = host_id or conv.host_id
+            if time.time() - _model_catalog_attempt_at.get(session_id, 0) < 5:
+                return cached or []
             if allow_host_fill and catalog_host_id and session_id not in _model_options_inflight:
+                _model_catalog_attempt_at[session_id] = time.time()
                 task = asyncio.create_task(
                     _load_model_options_from_host(session_id, catalog_host_id, harness)
                 )
                 _model_options_inflight[session_id] = task
 
                 def _clear_sdk_options_inflight(_task: asyncio.Task[None]) -> None:
-                    _model_options_inflight.pop(session_id, None)
+                    if _model_options_inflight.get(session_id) is _task:
+                        _model_options_inflight.pop(session_id, None)
 
                 task.add_done_callback(_clear_sdk_options_inflight)
+            return cached or []
         return []
     cached = _model_options_cache.get(session_id)
     if runner_client is None:
@@ -17516,18 +17537,21 @@ async def _fetch_model_options(
             wrapper == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
             and conv.host_id is not None
             and session_id not in _model_options_inflight
+            and time.time() - _model_catalog_attempt_at.get(session_id, 0) >= 5
         ):
+            _model_catalog_attempt_at[session_id] = time.time()
             task = asyncio.create_task(
                 _load_model_options_from_host(session_id, conv.host_id, "claude-native")
             )
             _model_options_inflight[session_id] = task
 
             def _clear_host_options_inflight(_task: asyncio.Task[None]) -> None:
-                _model_options_inflight.pop(session_id, None)
+                if _model_options_inflight.get(session_id) is _task:
+                    _model_options_inflight.pop(session_id, None)
 
             task.add_done_callback(_clear_host_options_inflight)
         return []
-    if cached is not None and session_id not in _model_options_stale:
+    if cached and session_id not in _model_options_stale:
         return cached
     if session_id not in _model_options_inflight:
         # Unified route first; the harness-named route is the fallback for
@@ -17543,7 +17567,8 @@ async def _fetch_model_options(
         _model_options_inflight[session_id] = task
 
         def _clear_runner_options_inflight(_task: asyncio.Task[None]) -> None:
-            _model_options_inflight.pop(session_id, None)
+            if _model_options_inflight.get(session_id) is _task:
+                _model_options_inflight.pop(session_id, None)
 
         task.add_done_callback(_clear_runner_options_inflight)
     # A stale catalog serves while the re-fetch runs; success publishes

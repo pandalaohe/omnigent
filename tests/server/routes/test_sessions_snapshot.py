@@ -41,7 +41,7 @@ async def _drain_model_options(session_id: str) -> None:
     serves the cache.
     """
     for _ in range(100):
-        if session_id in _sessions_mod._model_options_cache:
+        if _sessions_mod._model_options_cache.get(session_id):
             return
         await asyncio.sleep(0)
 
@@ -2677,8 +2677,10 @@ async def test_session_snapshot_fills_sdk_catalog_from_host(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cached_empty", [False, True])
 async def test_session_snapshot_retries_empty_model_options(
     monkeypatch: pytest.MonkeyPatch,
+    cached_empty: bool,
 ) -> None:
     """
     An early empty Codex catalog is treated as not-ready, not cached.
@@ -2750,12 +2752,14 @@ async def test_session_snapshot_retries_empty_model_options(
         conversations={"a17f935755fe66e4a0f42878eee28820": conv},
     )
 
+    if cached_empty:
+        _mod._model_options_cache[conv.id] = []
     first = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
         "a17f935755fe66e4a0f42878eee28820",
     )
     assert first.model_options == []
-    await _drain_model_options("a17f935755fe66e4a0f42878eee28820")
+    await _drain_model_options(conv.id)
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
         "a17f935755fe66e4a0f42878eee28820",
@@ -3890,3 +3894,106 @@ def test_native_terminal_fallback_respects_child_ownership(agent, ownership: str
     response = _build_session_response(conversation, [], "running", agent_name=agent.agent_name)
     assert response.labels.get("omnigent.ui") == (None if ownership == "mirror" else "terminal")
     assert conversation.labels == labels
+
+
+@pytest.mark.asyncio
+async def test_sdk_catalog_retries_empty_cache_and_isolates_host(monkeypatch):
+    from omnigent.server.routes import sessions as facade
+    from omnigent.server.routes._sessions import common
+    from omnigent.server.routes._sessions import orchestration as orch
+
+    sid = "conv_catalog_retry_host"
+    common._model_options_cache.clear()
+    common._model_catalog_scope.clear()
+    common._model_catalog_attempt_at.clear()
+    common._model_options_cache[sid] = []
+    calls = []
+
+    async def probe(host_id, harness):
+        calls.append((host_id, harness))
+        return [{"id": host_id, "displayName": host_id}]
+
+    monkeypatch.setattr(facade, "_host_model_options_via_registry", probe)
+    conv = Conversation(
+        id=sid,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=sid,
+        agent_id="agent",
+        host_id="host_a",
+        harness_override="codex",
+    )
+    assert await orch._fetch_model_options(None, sid, conv) == []
+    await common._model_options_inflight[sid]
+    assert common._model_options_cache[sid][0]["id"] == "host_a"
+    conv.host_id = "host_b"
+    assert await orch._fetch_model_options(None, sid, conv) == []
+    await common._model_options_inflight[sid]
+    assert common._model_options_cache[sid][0]["id"] == "host_b"
+    assert calls == [("host_a", "codex"), ("host_b", "codex")]
+
+
+@pytest.mark.asyncio
+async def test_sdk_catalog_failed_cold_load_notifies_and_recovers(monkeypatch):
+    from omnigent.server.routes import sessions as facade
+    from omnigent.server.routes._sessions import common
+    from omnigent.server.routes._sessions import orchestration as orch
+
+    sid = "conv_catalog_failed_cold"
+    common._model_options_cache.clear()
+    common._model_catalog_scope.clear()
+    common._model_catalog_attempt_at.clear()
+    outcomes = [None, [{"id": "host-model"}]]
+    notices = []
+
+    async def probe(host_id, harness):
+        return outcomes.pop(0)
+
+    monkeypatch.setattr(facade, "_host_model_options_via_registry", probe)
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.helpers._publish_model_options", notices.append
+    )
+    conv = Conversation(
+        id=sid,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=sid,
+        agent_id="agent",
+        host_id="host_a",
+        harness_override="codex",
+    )
+    await orch._fetch_model_options(None, sid, conv)
+    await common._model_options_inflight[sid]
+    assert "unavailable" in common._model_catalog_error[sid]
+    assert notices == [sid]
+    common._model_catalog_attempt_at.pop(sid, None)
+    await orch._fetch_model_options(None, sid, conv)
+    await common._model_options_inflight[sid]
+    assert common._model_options_cache[sid] == [{"id": "host-model"}]
+    assert sid not in common._model_catalog_error
+    assert common._model_catalog_fetched_at[sid] > 0
+
+
+@pytest.mark.asyncio
+async def test_native_catalog_ignores_late_response_from_old_host(monkeypatch):
+    from omnigent.server.routes._sessions import common, helpers
+
+    sid = "conv_late_catalog"
+    common._model_options_cache.pop(sid, None)
+    common._bind_model_catalog(sid, ("host_a", "codex-native"))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class Runner:
+        async def get(self, path, timeout):
+            entered.set()
+            await release.wait()
+            return SimpleNamespace(status_code=200, json=lambda: {"models": [{"id": "old"}]})
+
+    task = asyncio.create_task(helpers._load_model_options(Runner(), sid, "/model-options"))
+    await entered.wait()
+    common._bind_model_catalog(sid, ("host_b", "codex-native"))
+    common._model_options_cache[sid] = [{"id": "new"}]
+    release.set()
+    await task
+    assert common._model_options_cache[sid] == [{"id": "new"}]

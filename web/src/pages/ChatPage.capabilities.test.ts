@@ -256,7 +256,7 @@ describe("shouldShowModelPicker", () => {
       const child = { labels: {}, harness, parentSessionId: "parent" };
       expect(modelPickerKindForConv(child)).toBe("sdk");
       expect(shouldShowEffortPicker(child, harness === "codex" ? "openai" : "anthropic")).toBe(
-        false,
+        true,
       );
     }
   });
@@ -431,7 +431,7 @@ describe("shouldShowEffortPicker for SDK harnesses (declared effort family)", ()
     expect(shouldShowEffortPicker({ labels: {}, harness: "codex" }, "openai")).toBe(true);
   });
 
-  it("stays closed with no family, a ladder-less family, or on a sub-agent child", () => {
+  it("requires an effort family for both parents and children", () => {
     expect(shouldShowEffortPicker({ labels: {}, harness: "claude-sdk" })).toBe(false);
     expect(shouldShowEffortPicker({ labels: {}, harness: "openai-agents" }, "none")).toBe(false);
     expect(
@@ -439,6 +439,6 @@ describe("shouldShowEffortPicker for SDK harnesses (declared effort family)", ()
         { labels: {}, harness: "claude-sdk", parentSessionId: "parent" },
         "anthropic",
       ),
-    ).toBe(false);
+    ).toBe(true);
   });
 });

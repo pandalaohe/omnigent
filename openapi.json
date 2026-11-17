@@ -10788,6 +10788,11 @@
             "title": "Session Search Scope",
             "type": "boolean"
           },
+          "session_settings_source_checks": {
+            "default": false,
+            "title": "Session Settings Source Checks",
+            "type": "boolean"
+          },
           "session_title_instructions": {
             "default": false,
             "title": "Session Title Instructions",

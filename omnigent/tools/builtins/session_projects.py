@@ -83,7 +83,10 @@ class SysSessionUpdateTool(Tool):
             "Changing the project only changes the folder: a running session, including "
             "this one, keeps working. Sub-agent sessions follow their parent's project, "
             "and a family shares the project of the session its members list as "
-            "moves_with. Call once per session."
+            "moves_with. model and reasoning_effort update this existing session's "
+            "next turn through the same settings operation as the Web menu; use a "
+            "model id advertised by its host. Null reasoning_effort restores the default. "
+            "Call once per session."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -104,6 +107,11 @@ class SysSessionUpdateTool(Tool):
                             "maxLength": MAX_PROJECT_NAME_LENGTH,
                             "description": 'Project name to file the session into; "" '
                             "removes it from its project.",
+                        },
+                        "model": {"type": "string", "description": "Host-advertised model ID."},
+                        "reasoning_effort": {
+                            "type": ["string", "null"],
+                            "description": "Reasoning effort for the next turn; null resets it.",
                         },
                     },
                     "required": ["session_id"],
