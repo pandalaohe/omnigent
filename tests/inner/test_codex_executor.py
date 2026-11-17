@@ -7523,7 +7523,10 @@ def test_catalog_normalization_failure_preserves_complete_private_config(
     assert (source / "config.toml").read_text() == original
     if os.name != "nt":
         assert stat.S_IMODE(copied.stat().st_mode) == 0o600
-    assert sorted(path.name for path in private.iterdir()) == ["config.toml"]
+    assert sorted(path.name for path in private.iterdir()) == [
+        ".collab-generations",
+        "config.toml",
+    ]
 
 
 def test_populate_codex_home_config_normalizes_deprecated_effort(tmp_path: Path) -> None:
@@ -7639,7 +7642,7 @@ def test_populate_codex_home_config_normalizes_effort_after_multiline_array(
 
 def test_populate_codex_home_config_missing_source_dir(tmp_path: Path) -> None:
     """When the source ``CODEX_HOME`` dir doesn't exist (fresh install),
-    nothing is created in the target.
+    no config is copied into the target; the coordination lock may be created.
 
     Handles the case where codex has never been run locally — the
     populator must no-op cleanly rather than raising on a missing path.
@@ -7652,7 +7655,7 @@ def test_populate_codex_home_config_missing_source_dir(tmp_path: Path) -> None:
 
     _populate_codex_home_config(target, source)
 
-    assert list(target.iterdir()) == []
+    assert [path.name for path in target.iterdir()] == [".collab-generations"]
 
 
 def test_populate_codex_home_config_symlinks_hooks_json(tmp_path: Path) -> None:
@@ -8170,7 +8173,7 @@ def test_populate_codex_home_config_windows_sandbox_write_failure_keeps_config(
         with pytest.raises(OSError):
             os.fstat(fd)
     assert private_config.read_bytes() == original
-    assert set(target.iterdir()) == {private_config}
+    assert set(target.iterdir()) == {private_config, target / ".collab-generations"}
 
     _populate_codex_home_config(target, source)
     assert tomllib.loads(private_config.read_text())["windows"]["sandbox"] == "host"
@@ -8231,14 +8234,14 @@ def test_populate_codex_home_config_role_sync_write_failure_keeps_config(
         'model = "gpt-a"\n\n[agents]\ndefault_subagent_model = "gpt-sub-b"\n'
     )
 
-    real_write_text = Path.write_text
+    real_replace = os.replace
 
-    def _deny_private_config_write(self: Path, *args: object, **kwargs: object) -> int:
-        if self == config_path:
+    def deny_private_config_replace(source, destination):
+        if Path(destination) == config_path:
             raise PermissionError("private config is read-only")
-        return real_write_text(self, *args, **kwargs)
+        return real_replace(source, destination)
 
-    monkeypatch.setattr(Path, "write_text", _deny_private_config_write)
+    monkeypatch.setattr(os, "replace", deny_private_config_replace)
     _populate_codex_home_config(target, source)
 
     assert config_path.read_text() == original_text

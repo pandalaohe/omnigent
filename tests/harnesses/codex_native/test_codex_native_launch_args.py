@@ -419,8 +419,8 @@ def test_profile_update_recovers_after_interrupted_write(
         with pytest.raises(OSError, match="injected write failure"):
             materialize_codex_config_profile(private, source, selected, codex_version=(0, 155, 0))
     assert sorted(path.name for path in private.iterdir()) in (
-        ["config.toml"],
-        [".omnigent-config-profile.toml", "config.toml"],
+        [".collab-generations", "config.toml"],
+        [".collab-generations", ".omnigent-config-profile.toml", "config.toml"],
     )
     materialize_codex_config_profile(private, source, selected, codex_version=(0, 155, 0))
     effective = tomlkit.parse(config_path.read_text()).unwrap()

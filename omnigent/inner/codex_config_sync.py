@@ -20,6 +20,7 @@ import yaml
 
 from omnigent.config import load_global_config
 from omnigent.harnesses.codex_native.launch_args import absolute_codex_path
+from omnigent.util.codex_home_lock import ConfigChanged, config_writer, replace_config
 
 _logger = logging.getLogger(__name__)
 _LEAF = "auto_review.extra_policy"
@@ -169,6 +170,7 @@ def _sync_pinned_policy(source_data: dict, document: MutableMapping) -> None:
         review["extra_policy"] = value
 
 
+@config_writer("target", busy="conflict")
 def sync_codex_config(
     source: Path,
     target: Path,
@@ -233,11 +235,11 @@ def sync_codex_config(
                 raise ValueError("CONCURRENT_SOURCE_CHANGE")
             if target_snapshot is None:
                 # Unlike replace, link refuses a target created concurrently.
-                os.link(temporary, target)
+                replace_config(temporary, target)
             else:
                 if _snapshot(target) != target_snapshot:
-                    raise ValueError("CONCURRENT_TARGET_CHANGE")
-                os.replace(temporary, target)
+                    raise ConfigChanged
+                replace_config(temporary, target)
             _logger.info(
                 "Codex config sync: %s", "created" if target_snapshot is None else "updated"
             )

@@ -113,6 +113,7 @@ from omnigent.startup_protocol import (
     unknown_context_evidence_v2,
 )
 from omnigent.telemetry.surface import harness_client_surface
+from omnigent.util.codex_home_lock import config_writer, copy_config, replace_config, write_config
 from omnigent.util.codex_inventory import read_loaded_codex_thread_ids
 from omnigent.util.reasoning_effort import (
     CODEX_EFFORTS,
@@ -1314,6 +1315,7 @@ def _mirror_codex_home_dir_copy(source_subdir: Path, link_path: Path) -> None:
     staging.rename(link_path)
 
 
+@config_writer("dest_config")
 def _sync_codex_role_defaults(source_config: Path, dest_config: Path) -> None:
     """Re-sync the host-configured ``[agents]`` role defaults into an existing copy.
 
@@ -1366,11 +1368,12 @@ def _sync_codex_role_defaults(source_config: Path, dest_config: Path) -> None:
             changed = True
     if changed:
         try:
-            dest_config.write_text(tomlkit.dumps(document), encoding="utf-8")
+            write_config(dest_config, tomlkit.dumps(document))
         except OSError as exc:
             logger.warning("could not write %s (%s); skipping role-default sync", dest_config, exc)
 
 
+@config_writer("dest_config")
 def _sync_codex_windows_sandbox(source_config: Path, dest_config: Path) -> None:
     """Refresh only the host's explicit Windows sandbox setting in a private copy."""
     import tomllib
@@ -1413,7 +1416,7 @@ def _sync_codex_windows_sandbox(source_config: Path, dest_config: Path) -> None:
         with handle:
             handle.write(tomlkit.dumps(document))
         os.chmod(tmp_name, stat.S_IMODE(dest_config.stat().st_mode))
-        os.replace(tmp_name, dest_config)
+        replace_config(tmp_name, dest_config)
     except OSError as exc:
         logger.warning("could not write %s (%s); skipping Windows sandbox sync", dest_config, exc)
     finally:
@@ -1429,6 +1432,7 @@ def _sync_codex_windows_sandbox(source_config: Path, dest_config: Path) -> None:
                 logger.warning("could not remove temporary Codex config %s (%s)", tmp_name, exc)
 
 
+@config_writer("config_path")
 def _apply_codex_current_route(
     config_path: Path, *, picker_only: bool = False, source_home: Path | None = None
 ) -> str | None:
@@ -1479,6 +1483,7 @@ def _apply_codex_current_route(
     return None
 
 
+@config_writer("target_dir", home=True)
 def _populate_codex_home_config(
     target_dir: Path,
     source_dir: Path,
@@ -1743,11 +1748,11 @@ def _populate_codex_home_config(
                 if key in source_config:
                     minimal_document[key] = source_config[key]
             drop_usage_metrics_exporter(minimal_document)
-            dest_path.write_text(tomlkit.dumps(minimal_document))
+            write_config(dest_path, tomlkit.dumps(minimal_document))
             _normalize_copied_codex_catalog_paths(dest_path, source_dir)
             continue
         if not synced_copy:
-            shutil.copy2(source_file, dest_path)
+            copy_config(source_file, dest_path)
         if filename == "config.toml":
             _normalize_copied_codex_effort(dest_path, supported_efforts=supported_efforts)
             _normalize_copied_codex_catalog_paths(dest_path, source_dir)
@@ -1778,6 +1783,7 @@ def _populate_codex_home_config(
                 )
 
 
+@config_writer("codex_home", home=True, required=True)
 def materialize_codex_provider_config(
     codex_home: Path,
     config_overrides: Iterable[str],
@@ -1983,7 +1989,7 @@ def materialize_codex_provider_config(
         os.chmod(tmp_name, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(tomlkit.dumps(document))
-        os.replace(tmp_name, config_path)
+        replace_config(tmp_name, config_path)
         os.chmod(config_path, 0o600)
     finally:
         with suppress(FileNotFoundError):
@@ -2673,6 +2679,7 @@ def write_codex_model_catalog(
     return path
 
 
+@config_writer("config_path", busy=False)
 def _write_codex_config(config_path: Path, text: str) -> bool:
     """Publish a complete private config, retaining the prior file on failure."""
     temporary_path: Path | None = None
@@ -2687,7 +2694,7 @@ def _write_codex_config(config_path: Path, text: str) -> bool:
         ) as handle:
             temporary_path = Path(handle.name)
             handle.write(text)
-        os.replace(temporary_path, config_path)
+        replace_config(temporary_path, config_path)
     except OSError as exc:
         logger.warning("could not write %s (%s)", config_path, exc)
         return False
@@ -2698,6 +2705,7 @@ def _write_codex_config(config_path: Path, text: str) -> bool:
     return True
 
 
+@config_writer("config_path", busy=False)
 def set_codex_model_catalog_path(
     config_path: Path,
     catalog_path: Path,
@@ -2808,6 +2816,7 @@ def write_required_brokered_model_catalog(
 _EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
 
 
+@config_writer("config_path")
 def _normalize_copied_codex_catalog_paths(config_path: Path, source_home: Path) -> None:
     """Resolve copied catalog paths before Codex loads the private config."""
     import tomlkit
@@ -2820,6 +2829,7 @@ def _normalize_copied_codex_catalog_paths(config_path: Path, source_home: Path) 
         _write_codex_config(config_path, tomlkit.dumps(document))
 
 
+@config_writer("config_path")
 def _normalize_copied_codex_effort(
     config_path: Path,
     *,
@@ -2885,7 +2895,7 @@ def _normalize_copied_codex_effort(
             array_depth = 0
     if changed:
         try:
-            config_path.write_text("".join(lines), encoding="utf-8")
+            write_config(config_path, "".join(lines))
         except OSError:
             logger.warning("could not normalize model_reasoning_effort in %s", config_path)
 
