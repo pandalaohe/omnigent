@@ -1,4 +1,3 @@
-import { Link } from "@/lib/routing";
 import { AlertTriangleIcon } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useSession } from "@/hooks/useSession";
@@ -37,12 +36,6 @@ export function ModelResolutionChip({ sessionId }: { sessionId: string }) {
             </li>
           ))}
         </ul>
-        <Link
-          className="text-primary underline underline-offset-2"
-          to="/settings/agents#model-references"
-        >
-          Review saved models
-        </Link>
       </PopoverContent>
     </Popover>
   );

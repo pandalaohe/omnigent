@@ -3031,9 +3031,6 @@ def create_app(
     # ``request.app.state``; None degrades to the project layers only.
     app.state.agent_cache = agent_cache
     app.state.user_preferences_store = user_preferences_store
-    from omnigent.server.routes.model_references import create_model_references_router
-
-    app.include_router(create_model_references_router(auth_provider), prefix="/v1")
     app.state.standing_approval_service = standing_approval_service
     app.state.agent_quota_service = agent_quota_service
     app.include_router(
