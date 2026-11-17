@@ -2303,6 +2303,8 @@ class HostProcess:
         )
 
     async def _handle_launch(self, frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
+        from omnigent.debug_logging import log_attributes_scope
+
         # Attribution must not move token validation ahead of the launch preflight.
         log_runner_id = (
             token_bound_runner_id(frame.binding_token) if frame.binding_token.strip() else None
@@ -2310,6 +2312,11 @@ class HostProcess:
         with (
             runner_log_scope(frame.session_id, log_runner_id),
             scheduled_run_scope(frame.scheduled_run, session_id=frame.session_id),
+            log_attributes_scope(
+                startup_id=frame.startup.startup_id if frame.startup else frame.request_id,
+                startup_attempt=frame.startup.attempt_id if frame.startup else frame.request_id,
+                runner_generation=log_runner_id,
+            ),
         ):
             _logger.info(
                 "Runner launch requested",
@@ -2320,7 +2327,27 @@ class HostProcess:
                     harness=frame.harness,
                 ),
             )
-            return await self._handle_launch_impl(frame)
+            started = time.monotonic()
+            try:
+                result = await self._handle_launch_impl(frame)
+                _logger.info(
+                    "Runner startup finished",
+                    extra=debug_event(
+                        "runner_startup_finished",
+                        stage="runner_launch",
+                        status=result.status,
+                        duration_ms=round((time.monotonic() - started) * 1000),
+                    ),
+                )
+                return result
+            finally:
+                _logger.info(
+                    "Runner startup phase closed",
+                    extra=debug_event(
+                        "runner_startup_phase_closed",
+                        duration_ms=round((time.monotonic() - started) * 1000),
+                    ),
+                )
 
     async def _claim_startup(self, frame: HostLaunchRunnerFrame, *, spawn: bool = False) -> bool:
         """Revalidate permission on this authenticated connection before cold work."""
@@ -2375,6 +2402,7 @@ class HostProcess:
             include a machine-readable ``error_code``.
         """
         terminal_runner = frame.purpose == "host_terminals"
+        prepare_started = time.monotonic()
         if terminal_runner:
             if frame.session_id or frame.harness or frame.inference_config or frame.startup:
                 return self._launch_failed(frame, "terminal runners cannot host sessions")
@@ -2391,6 +2419,21 @@ class HostProcess:
                         runner_id=existing_id,
                         exists=existing_id,
                     )
+        known_runner_id = (
+            token_bound_runner_id(frame.binding_token) if frame.binding_token.strip() else None
+        )
+        # Reusing the exact live generation performs no cold work and must not
+        # consume the one-shot startup boundary a second time.
+        existing = self._runners.get(known_runner_id) if known_runner_id is not None else None
+        if existing is not None and await asyncio.to_thread(existing.proc.poll) is None:
+            if existing.session_id != (frame.session_id or None):
+                return self._launch_failed(frame, "Runner generation belongs to another session")
+            return HostLaunchRunnerResultFrame(
+                request_id=frame.request_id,
+                status="exists",
+                runner_id=known_runner_id or "",
+                exists=known_runner_id,
+            )
         if not await self._claim_startup(frame):
             return self._launch_failed(
                 frame, "Startup permission is no longer current", error_code="startup_not_admitted"
@@ -2590,6 +2633,15 @@ class HostProcess:
             return self._launch_failed(
                 frame, "Startup permission changed before spawn", error_code="startup_not_admitted"
             )
+        _logger.info(
+            "Runner startup preparation finished",
+            extra=debug_event(
+                "runner_startup_prepared",
+                stage="runner_prepare",
+                duration_ms=round((time.monotonic() - prepare_started) * 1000),
+            ),
+        )
+        spawn_started = time.monotonic()
         with self._host_subprocess_op():
             spawn = asyncio.ensure_future(
                 asyncio.to_thread(self._spawn_runner_proc, env, _session_slug, workspace)
@@ -2624,6 +2676,15 @@ class HostProcess:
             # The returned result retains the diagnostic tail, while
             # _launch_failed limits the host lifecycle line to its first line.
             return self._launch_failed(frame, error, error_category=ErrorCategory.RUNNER)
+
+        _logger.info(
+            "Runner startup spawn finished",
+            extra=debug_event(
+                "runner_startup_spawned",
+                stage="runner_spawn",
+                duration_ms=round((time.monotonic() - spawn_started) * 1000),
+            ),
+        )
 
         # One live runner per session: the session's previous runner —
         # whose binding the server has already rotated away — is
@@ -2971,12 +3032,20 @@ class HostProcess:
         """
 
         async def _stop_and_log() -> None:
+            started = time.monotonic()
             try:
                 await self._stop_runner_and_trigger(handle.proc, "runner_superseded")
                 _logger.info(
                     "Stopped superseded runner %s for session %s",
                     runner_id,
                     session_id,
+                    extra=debug_event(
+                        "runner_startup_teardown",
+                        runner_id=runner_id,
+                        runner_generation=runner_id,
+                        session_id=session_id,
+                        duration_ms=round((time.monotonic() - started) * 1000),
+                    ),
                 )
             except Exception:
                 _logger.warning(

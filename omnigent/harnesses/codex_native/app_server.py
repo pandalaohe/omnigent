@@ -190,9 +190,9 @@ _SESSION_CONNECT_TIMEOUT_SECONDS = 120.0
 # Initialization and model/list can stall after the listener becomes ready.
 _MODEL_CATALOG_PROBE_TIMEOUT_SECONDS = 30.0
 _PICKER_CATALOG_WAIT_SECONDS = 2.0
-# Provider attribution is best-effort on the launch path, so it shares discovery's
-# readiness budget; a probe that runs out falls back to the generated config.
-_PROVIDER_CONFIG_PROBE_TIMEOUT_SECONDS = _CONNECT_TIMEOUT_SECONDS
+# Attribution is optional; a stalled config read must not consume the discovery
+# readiness budget before model input. Routing and permission checks remain mandatory.
+_PROVIDER_CONFIG_PROBE_TIMEOUT_SECONDS = 1.0
 _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
 _CONTEXT_CATALOG_TIMEOUT_SECONDS = 2.0
 _MODEL_DISCOVERY_STDERR_TAIL_BYTES = 64 * 1024

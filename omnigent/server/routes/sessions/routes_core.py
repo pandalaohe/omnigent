@@ -223,6 +223,7 @@ from omnigent.server.routes._sessions.helpers import (
     _latest_message_preview,
     _live_settings_change,
     _LiveSettingsChange,
+    _log_runner_allocation,
     _member_hosts_from_library_agent,
     _member_snapshot_labels,
     _model_options_from_wire,
@@ -2196,6 +2197,16 @@ def register_core_routes(
             ),
         )
         request_id = secrets.token_hex(8)
+        _log_runner_allocation(
+            session_id,
+            caller="session_create",
+            request_id=getattr(request.state, "audit_request_id", None),
+            old_runner_id=None,
+            new_runner_id=runner_id,
+            action="allocate",
+            host_request_id=request_id,
+            retained=retained,
+        )
         future: asyncio.Future[HostLaunchResult] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
         if workspace is None:  # pragma: no cover — schema guards

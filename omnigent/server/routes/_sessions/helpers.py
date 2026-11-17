@@ -7906,11 +7906,45 @@ async def _note_workspace_recreated_on_host(
         _publish_external_conversation_item(conv.id, persisted[0])
 
 
+def _log_runner_allocation(
+    session_id: str,
+    *,
+    caller: str,
+    request_id: str | None,
+    old_runner_id: str | None,
+    new_runner_id: str | None,
+    action: str,
+    host_request_id: str | None = None,
+    superseded: Sequence[str] = (),
+    retained: Sequence[str] = (),
+) -> None:
+    """Keep allocation identity visible even without the structured log sink."""
+    metadata: dict[str, Any] = {
+        "caller": caller,
+        "request_id": request_id,
+        "old_generation": old_runner_id,
+        "new_generation": new_runner_id,
+        "action": action,
+        "host_request_id": host_request_id,
+        "superseded": list(superseded),
+        "retained": list(retained),
+    }
+    _logger.info(
+        "Runner allocation: %s",
+        json.dumps({"session_id": session_id, **metadata}, sort_keys=True),
+        extra=debug_event("runner_allocation", session_id=session_id, **metadata),
+    )
+
+
 async def _launch_runner_on_host_impl(
     conv: Conversation,
     conversation_store: ConversationStore,
     host_registry: HostRegistry,
     host_conn: HostConnection,
+    *,
+    runner_router: RunnerRouter | None = None,
+    caller: str = "recovery",
+    request_id: str | None = None,
 ) -> _HostLaunchAttempt:
     """
     Ask a host to spawn a runner for a session and capture the result.
@@ -7963,13 +7997,50 @@ async def _launch_runner_on_host_impl(
         last = _relaunch_last_attempt.get(conv.id)
         # A waiter may already have read the active flight's replacement binding.
         if last is not None and last is not previous_attempt and last.runner_id == fresh.runner_id:
+            _log_runner_allocation(
+                conv.id,
+                caller=caller,
+                request_id=request_id,
+                old_runner_id=conv.runner_id,
+                new_runner_id=last.runner_id,
+                action="join",
+            )
             return last
         if fresh.runner_id and fresh.runner_id != conv.runner_id:
+            _log_runner_allocation(
+                conv.id,
+                caller=caller,
+                request_id=request_id,
+                old_runner_id=conv.runner_id,
+                new_runner_id=fresh.runner_id,
+                action="join",
+            )
             if last is not None and last.runner_id == fresh.runner_id:
                 return last
             return _HostLaunchAttempt(runner_id=fresh.runner_id)
+        # The caller's offline observation can expire while it waits for this
+        # lock. Re-resolve the current generation before rotating its binding.
+        router = runner_router if runner_router is not None else get_server_runner_router()
+        if fresh.runner_id and router is not None:
+            client = await _get_runner_client(conv.id, router, conversation=fresh)
+            if client is not None:
+                _log_runner_allocation(
+                    conv.id,
+                    caller=caller,
+                    request_id=request_id,
+                    old_runner_id=conv.runner_id,
+                    new_runner_id=fresh.runner_id,
+                    action="reuse",
+                )
+                return _HostLaunchAttempt(runner_id=fresh.runner_id, acknowledged=True)
         attempt = await _launch_runner_on_host_locked(
-            fresh, conversation_store, host_registry, host_conn
+            fresh,
+            conversation_store,
+            host_registry,
+            host_conn,
+            runner_router=router,
+            caller=caller,
+            request_id=request_id,
         )
         # Re-insert so the plain dict's insertion order is newest-last, then
         # evict from the front once past the cap.
@@ -7985,6 +8056,10 @@ async def _launch_runner_on_host_locked(
     conversation_store: ConversationStore,
     host_registry: HostRegistry,
     host_conn: HostConnection,
+    *,
+    runner_router: RunnerRouter | None = None,
+    caller: str = "recovery",
+    request_id: str | None = None,
 ) -> _HostLaunchAttempt:
     """The launch round-trip proper; runs under the conversation's lock."""
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
@@ -8000,11 +8075,27 @@ async def _launch_runner_on_host_locked(
     binding_token = secrets.token_urlsafe(32)
     new_runner_id = token_bound_runner_id(binding_token)
 
-    bound_conv = await asyncio.to_thread(
-        conversation_store.replace_runner_id,
-        conv.id,
-        new_runner_id,
-    )
+    def replace_binding() -> Conversation:
+        return conversation_store.replace_runner_id(conv.id, new_runner_id, expected_binding=conv)
+
+    # Preparation above can yield while the old generation connects. Fence
+    # the write itself against connection admission, after every slow await.
+    if superseded_runner_id and runner_router is not None:
+        bound_conv = await asyncio.to_thread(
+            runner_router.run_if_runner_offline, superseded_runner_id, replace_binding
+        )
+        if bound_conv is None:
+            _log_runner_allocation(
+                conv.id,
+                caller=caller,
+                request_id=request_id,
+                old_runner_id=superseded_runner_id,
+                new_runner_id=superseded_runner_id,
+                action="reuse",
+            )
+            return _HostLaunchAttempt(runner_id=superseded_runner_id, acknowledged=True)
+    else:
+        bound_conv = await asyncio.to_thread(replace_binding)
     if bound_conv.runner_last_seen is not None:
         # The new token has not reached the host, so this stamp can only
         # belong to the previous runner. Clear it before launching.
@@ -8047,10 +8138,21 @@ async def _launch_runner_on_host_locked(
                 ),
             )
             return _HostLaunchAttempt(runner_id=new_runner_id)
-        request_id = secrets.token_hex(8)
+        host_request_id = secrets.token_hex(8)
+        _log_runner_allocation(
+            conv.id,
+            caller=caller,
+            request_id=request_id,
+            old_runner_id=superseded_runner_id,
+            new_runner_id=new_runner_id,
+            action="allocate",
+            host_request_id=host_request_id,
+            superseded=(superseded_runner_id,) if superseded_runner_id else (),
+            retained=retained,
+        )
         launch_frame = encode_host_frame(
             HostLaunchRunnerFrame(
-                request_id=request_id,
+                request_id=host_request_id,
                 binding_token=binding_token,
                 scheduled_run=current_scheduled_run(),
                 workspace=conv.workspace,
@@ -8075,11 +8177,11 @@ async def _launch_runner_on_host_locked(
             launch_future: asyncio.Future[HostLaunchResult] = (
                 asyncio.get_running_loop().create_future()
             )
-            host_conn.pending_launches[request_id] = launch_future
+            host_conn.pending_launches[host_request_id] = launch_future
             try:
                 host_registry.send_text(host_conn, launch_frame)
             except ConnectionError:
-                host_conn.pending_launches.pop(request_id, None)
+                host_conn.pending_launches.pop(host_request_id, None)
                 launch_future.cancel()
                 replacement = host_registry.get(host_conn.host_id)
                 if (
@@ -8127,7 +8229,7 @@ async def _launch_runner_on_host_locked(
             )
             return _HostLaunchAttempt(runner_id=new_runner_id)
         finally:
-            host_conn.pending_launches.pop(request_id, None)
+            host_conn.pending_launches.pop(host_request_id, None)
             if not launch_future.done():
                 launch_future.cancel()
         if result.get("status") == "failed":
