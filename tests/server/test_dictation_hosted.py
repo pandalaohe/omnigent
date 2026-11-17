@@ -314,3 +314,58 @@ def test_stop_deadline_counts_inflight(monkeypatch):
     finally:
         release.set()
         take.close()
+
+
+@pytest.mark.parametrize("failure", ["timeout", 429, 503])
+def test_stop_retries_transient_failure_with_remaining_budget(monkeypatch, failure):
+    monkeypatch.setenv("OMNIGENT_DICTATION_HOSTED_STOP_S", "1")
+    calls = []
+
+    def handle(request):
+        calls.append(request.content)
+        if len(calls) == 1:
+            if failure == "timeout":
+                raise httpx.ReadTimeout("slow provider", request=request)
+            return httpx.Response(failure, json={"error": {"message": "try again"}})
+        return httpx.Response(200, json={"text": "last words"})
+
+    take = stream(monkeypatch, handle)
+    try:
+        take.feed_pcm16(SPEECH * 20)
+        result = take.finish_update()
+        assert result.finalized == "last words"
+        assert result.undelivered == {"segments": 0, "seconds": 0.0}
+        assert len(calls) == 2
+        assert all(SPEECH * 20 in body for body in calls)
+    finally:
+        take.close()
+
+
+def test_failed_phrase_preserves_queued_phrase_and_recording_tail(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def handle(request):
+        calls.append(request.content)
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(timeout=2)
+            return httpx.Response(400, json={"error": {"message": "bad phrase"}})
+        return httpx.Response(200, json={"text": "kept"})
+
+    take = stream(monkeypatch, handle)
+    try:
+        take.feed_pcm16(SPEECH * 20 + SILENCE * 30)
+        assert entered.wait(timeout=1)
+        take.feed_pcm16(SPEECH * 20 + SILENCE * 30 + SPEECH * 20)
+        release.set()
+        with take.condition:
+            assert take.condition.wait_for(lambda: not take.inflight, timeout=2)
+        result = take.finish_update()
+        assert result.finalized == "kept kept"
+        assert result.undelivered == {"segments": 1, "seconds": 1.0}
+        assert len(calls) == 3
+    finally:
+        release.set()
+        take.close()
