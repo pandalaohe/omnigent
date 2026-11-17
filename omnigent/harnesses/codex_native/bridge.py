@@ -29,6 +29,7 @@ from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR
 from omnigent.harnesses.codex_egress import CertificateFailure
 from omnigent.native import native_bridge_common, policy_allow_cache
 from omnigent.process_logging import DATA_DIR_ENV_VAR
+from omnigent.util.codex_home_lock import config_writer, replace_config
 
 if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
@@ -1303,6 +1304,7 @@ def mirror_applied_codex_settings(bridge_dir: Path, applied: Mapping[str, str]) 
     return failed
 
 
+@config_writer("config_path", busy=False)
 def _upsert_top_level_config_key(
     config_path: Path,
     key: str,
@@ -1357,7 +1359,7 @@ def _upsert_top_level_config_key(
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(output)
-            os.replace(tmp_name, config_path)
+            replace_config(tmp_name, config_path)
         finally:
             if os.path.exists(tmp_name):
                 os.unlink(tmp_name)

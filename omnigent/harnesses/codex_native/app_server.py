@@ -42,6 +42,13 @@ from websockets.exceptions import ConnectionClosed
 from omnigent.models import model_catalog
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.telemetry.surface import CLIENT_SURFACE_ENV_VAR
+from omnigent.util.codex_home_lock import (
+    config_journal,
+    config_writer,
+    copy_config,
+    remove_config,
+    write_config,
+)
 from omnigent.util.codex_inventory import read_loaded_codex_thread_ids
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -456,6 +463,7 @@ def _codex_mcp_server_config_section(
 _EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
 
 
+@config_writer("codex_home", home=True)
 def _pin_codex_config_model(codex_home: Path, model: str) -> None:
     """
     Write *model* as the top-level ``model`` key in the session config.toml.
@@ -497,9 +505,10 @@ def _pin_codex_config_model(codex_home: Path, model: str) -> None:
                 lines[i] = f"{effort_match.group(1)}{clamped}{effort_match.group(3)}"
     if not replaced:
         lines.insert(0, pin_line)
-    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_config(config_path, "\n".join(lines) + "\n")
 
 
+@config_writer("codex_home", home=True)
 def _pin_codex_config_effort(codex_home: Path, effort: str, model: str | None) -> None:
     """
     Write *effort* as the top-level ``model_reasoning_effort`` in the session config.
@@ -543,9 +552,10 @@ def _pin_codex_config_effort(codex_home: Path, effort: str, model: str | None) -
             break
     if not replaced:
         lines.insert(0, pin_line)
-    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_config(config_path, "\n".join(lines) + "\n")
 
 
+@config_writer("codex_home", home=True)
 def _pin_codex_config_service_tier(codex_home: Path, speed: str) -> None:
     """Pin the session's speed before any TOML table in its private config."""
     from omnigent.session_default_modes import codex_service_tier
@@ -558,9 +568,10 @@ def _pin_codex_config_service_tier(codex_home: Path, speed: str) -> None:
     # A root key; tomlkit keeps it ahead of every table and leaves quoted keys
     # and multiline strings alone.
     document["service_tier"] = tier
-    config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+    write_config(config_path, tomlkit.dumps(document))
 
 
+@config_writer("config_path")
 def _materialize_config_symlink(config_path: Path) -> None:
     """
     Replace a symlinked session ``config.toml`` with a private copy.
@@ -573,16 +584,16 @@ def _materialize_config_symlink(config_path: Path) -> None:
     if not config_path.is_symlink():
         return
     target = config_path.resolve()
-    config_path.unlink()
     if target.is_file():
-        import shutil
-
-        shutil.copy2(target, config_path)
+        copy_config(target, config_path)
+    else:
+        remove_config(config_path)
 
 
 _NO_INSTRUCTION_BASE_OVERRIDE = object()
 
 
+@config_writer("codex_home", home=True)
 def _sync_codex_developer_instructions(
     codex_home: Path,
     instructions: str | None,
@@ -622,13 +633,7 @@ def _sync_codex_developer_instructions(
     config_path = codex_home / "config.toml"
     state_path = codex_home / ".omnigent-developer-instructions-state.toml"
     legacy_base_path = codex_home / ".omnigent-developer-instructions-base"
-    if config_path.is_symlink():
-        target = config_path.resolve()
-        config_path.unlink()
-        if target.is_file():
-            import shutil
-
-            shutil.copy2(target, config_path)
+    _materialize_config_symlink(config_path)
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     try:
         document = tomlkit.parse(existing) if existing else tomlkit.document()
@@ -707,9 +712,10 @@ def _sync_codex_developer_instructions(
         del document["developer_instructions"]
     pending_state = tomlkit.dumps({"base": base, "applied": current_base, "pending": active})
     final_state = tomlkit.dumps({"base": base, "applied": active})
-    _write_private_config(state_path, pending_state)
-    _write_private_config(config_path, tomlkit.dumps(document))
-    _write_private_config(state_path, final_state)
+    with config_journal(state_path):
+        _write_private_config(state_path, pending_state)
+        _write_private_config(config_path, tomlkit.dumps(document))
+        _write_private_config(state_path, final_state)
 
 
 def _migrate_profile_instruction_base(
@@ -801,6 +807,7 @@ def _selected_profile_instructions(
     return value.strip() if isinstance(value, str) else value
 
 
+@config_writer("codex_home", home=True)
 def _materialize_codex_profile_for_start(
     codex_home: Path,
     source_home: Path,
@@ -1040,6 +1047,7 @@ def _codex_model_upgrade_metadata_is_malformed(entry: dict[str, object]) -> bool
     return True
 
 
+@config_writer("codex_home", home=True)
 def _acknowledge_codex_model_migration(codex_home: Path, model: str, target: str) -> None:
     """Suppress one model-migration prompt in a private runner-owned config."""
     config_path = codex_home / "config.toml"
@@ -1054,9 +1062,10 @@ def _acknowledge_codex_model_migration(codex_home: Path, model: str, target: str
         migrations = tomlkit.table()
         notice["model_migrations"] = migrations
     migrations[model] = target
-    config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+    write_config(config_path, tomlkit.dumps(document))
 
 
+@config_writer("codex_home", home=True)
 def _inject_mcp_server_config(
     codex_home: Path,
     bridge_dir: Path,
@@ -2236,10 +2245,16 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     key = hashlib.sha256("\n".join(key_parts).encode("utf-8")).hexdigest()[:12]
     home = Path.home() / ".omnigent" / "cache" / "codex-model-probe" / key
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _refresh_probe_codex_home(home, source_home, route_identity)
+    return home
+
+
+@config_writer("home", home=True)
+def _refresh_probe_codex_home(home: Path, source_home: Path, route_identity: str | None) -> None:
     # The bridge skips files that already exist, and config.toml is copied
     # (not symlinked), so drop the copy to re-read an edited source config.
     with contextlib.suppress(OSError):
-        (home / "config.toml").unlink(missing_ok=True)
+        remove_config(home / "config.toml")
     # The probe drives the same native codex binary as a session launch, so
     # keep the full native effort ladder instead of clamping max/ultra.
     _populate_codex_home_config(
@@ -2256,12 +2271,11 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
             tomlkit.parse(config_path.read_text()) if config_path.exists() else tomlkit.document()
         )
         document.update(picker_config)
-        config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+        write_config(config_path, tomlkit.dumps(document))
     config_path = home / "config.toml"
     if route_identity is not None and not config_path.exists():
-        config_path.write_text("", encoding="utf-8")
+        write_config(config_path, "")
     _apply_codex_current_route(config_path, picker_only=True, source_home=source_home)
-    return home
 
 
 def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> list[_JsonObject]:
@@ -4683,6 +4697,7 @@ async def trust_native_policy_hooks(client: CodexAppServerClient, *, cwd: str) -
         )
 
 
+@config_writer("codex_home", home=True)
 def _trust_codex_project(codex_home: Path, cwd: Path) -> None:
     """
     Trust a runner-selected workspace in the private Codex config.
@@ -4709,9 +4724,10 @@ def _trust_codex_project(codex_home: Path, cwd: Path) -> None:
         project = tomlkit.table()
         projects[project_key] = project
     project["trust_level"] = "trusted"
-    config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+    write_config(config_path, tomlkit.dumps(document))
 
 
+@config_writer("codex_home", home=True)
 def _add_codex_writable_roots(codex_home: Path, roots: Sequence[str]) -> None:
     """
     Append ``--add-dir`` roots to the private config's workspace-write roots.
@@ -4739,7 +4755,7 @@ def _add_codex_writable_roots(codex_home: Path, roots: Sequence[str]) -> None:
     if not isinstance(configured, list):
         raise ValueError("sandbox_workspace_write.writable_roots must be an array of paths")
     sandbox["writable_roots"] = list(dict.fromkeys([*configured, *roots]))
-    config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+    write_config(config_path, tomlkit.dumps(document))
 
 
 @dataclass(frozen=True)

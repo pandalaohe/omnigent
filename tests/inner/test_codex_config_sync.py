@@ -196,7 +196,7 @@ def test_symlink_is_not_read_or_replaced(
 
 
 @pytest.mark.parametrize("changed", ["source", "private", "new_private"])
-def test_change_during_preparation_aborts_without_overwriting(
+def test_change_during_preparation_preserves_concurrent_values(
     homes: tuple[Path, Path],
     monkeypatch: pytest.MonkeyPatch,
     changed: str,
@@ -214,9 +214,12 @@ def test_change_during_preparation_aborts_without_overwriting(
 
     monkeypatch.setattr(codex_config_sync.os, "fsync", change_during_flush)
     _populate_codex_home_config(target, source)
-    assert target_path.read_text() == (_PRIVATE if changed == "source" else concurrent)
-    assert "conflict" in caplog.text
-    assert sorted(p.name for p in target.iterdir()) == ["config.toml"]
+    if changed == "source":
+        assert target_path.read_text() == _PRIVATE
+        assert "conflict" in caplog.text
+    else:
+        assert tomllib.loads(target_path.read_text())["model"] == "concurrent"
+    assert sorted(p.name for p in target.iterdir()) == [".collab-generations", "config.toml"]
 
 
 def test_atomic_write_failure_keeps_original(
@@ -232,7 +235,7 @@ def test_atomic_write_failure_keeps_original(
     monkeypatch.setattr(codex_config_sync.os, "replace", fail_replace)
     _populate_codex_home_config(target, source)
     assert target_path.read_text() == _PRIVATE
-    assert sorted(p.name for p in target.iterdir()) == ["config.toml"]
+    assert sorted(p.name for p in target.iterdir()) == [".collab-generations", "config.toml"]
     assert "conflict" in caplog.text
     assert "DO_NOT_LOG" not in caplog.text
 

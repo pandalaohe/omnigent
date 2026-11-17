@@ -28,6 +28,7 @@ from omnigent.runtime.filesystem_registry import (
     detect_git_root,
     linked_worktree_git_dir,
 )
+from omnigent.util.codex_home_lock import config_journal, config_writer, replace_config
 
 _logger = logging.getLogger(__name__)
 
@@ -944,7 +945,10 @@ def _write_private_config(path: Path, content: str) -> None:
             handle.write(fix_surrogates(content))
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        if path.name == "config.toml":
+            replace_config(temporary, path)
+        else:
+            os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
 
@@ -1047,6 +1051,7 @@ def validate_codex_config_profile_state(codex_home: Path) -> None:
     _profile_base(state_path, current)
 
 
+@config_writer("codex_home", home=True)
 def materialize_codex_config_profile(
     codex_home: Path,
     source_home: Path,
@@ -1101,9 +1106,10 @@ def materialize_codex_config_profile(
     rendered = tomlkit.dumps(rendered_config)
     pending_state = tomlkit.dumps({"base": base, "applied": current_config, "pending": merged})
     final_state = tomlkit.dumps({"base": base, "applied": merged})
-    _write_private_config(state_path, pending_state)
-    _write_private_config(config_path, rendered)
-    _write_private_config(state_path, final_state)
+    with config_journal(state_path):
+        _write_private_config(state_path, pending_state)
+        _write_private_config(config_path, rendered)
+        _write_private_config(state_path, final_state)
 
 
 def redact_codex_launch_args(args: Sequence[str]) -> list[str]:
