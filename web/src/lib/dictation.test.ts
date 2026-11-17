@@ -5,7 +5,7 @@
 // against the server's fake engine.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { parseDictationEvent, restoreDictationPunctuation } from "./dictation";
+import { DictationSession, parseDictationEvent, restoreDictationPunctuation } from "./dictation";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -95,3 +95,124 @@ it("preserves cleaned tail and typed loss metadata", () => {
     undelivered: { segments: 2, seconds: 1 },
   });
 });
+
+it("parses hosted processing and failed audio ranges", () => {
+  expect(parseDictationEvent('{"type":"processing"}')).toEqual({ type: "processing" });
+  expect(parseDictationEvent('{"type":"ready","whole_take":true}')).toEqual({
+    type: "ready",
+    whole_take: true,
+  });
+  expect(parseDictationEvent('{"type":"stopped","text":"kept","retry_ranges":[[0,640]]}')).toEqual({
+    type: "stopped",
+    text: "kept",
+    retry_ranges: [[0, 640]],
+  });
+});
+
+it("waits beyond the relay timer for a whole-take result", async () => {
+  vi.useFakeTimers();
+  const socket = {
+    readyState: 1,
+    send: vi.fn(),
+    close: vi.fn(),
+    onmessage: null as ((msg: { data: string }) => void) | null,
+  };
+  const port = {
+    onmessage: null as ((msg: { data: null }) => void) | null,
+    postMessage: () => port.onmessage?.({ data: null }),
+  };
+  const take: DictationSession = Reflect.construct(DictationSession, [
+    { onPartial: vi.fn(), onFinal: vi.fn(), onError: vi.fn() },
+    socket,
+    { getTracks: () => [{ stop: vi.fn() }] },
+    { state: "closed" },
+    { port },
+  ]);
+  try {
+    const stopped = take.stop();
+    await Promise.resolve();
+    socket.onmessage?.({ data: '{"type":"processing"}' });
+    await vi.advanceTimersByTimeAsync(16000);
+    expect(socket.close).not.toHaveBeenCalled();
+    socket.onmessage?.({ data: '{"type":"stopped","text":"whole take"}' });
+    await expect(stopped).resolves.toEqual({ type: "stopped", text: "whole take" });
+  } finally {
+    take.cancel();
+    vi.useRealTimers();
+  }
+});
+
+it.each([false, true])(
+  "retries only uncommitted PCM (disconnect before stopped: %s)",
+  async (disconnected) => {
+    const sent: unknown[] = [];
+    const delivered = vi.fn();
+    const originalSocket = {
+      readyState: 1,
+      send: vi.fn(),
+      close: vi.fn(),
+      onmessage: null as ((msg: { data: string }) => void) | null,
+      onclose: null as (() => void) | null,
+    };
+    const port = {
+      onmessage: null as ((msg: { data: Int16Array | null }) => void) | null,
+      postMessage: () => port.onmessage?.({ data: null }),
+    };
+    const take: DictationSession = Reflect.construct(DictationSession, [
+      { onPartial: vi.fn(), onFinal: delivered, onError: vi.fn() },
+      originalSocket,
+      { getTracks: () => [{ stop: vi.fn() }] },
+      { state: "closed" },
+      { port },
+      true,
+    ]);
+    const input = new Int16Array([1, 2, 3, 4]);
+    port.onmessage?.({ data: input });
+    const stopped = take.stop();
+    await Promise.resolve();
+    if (disconnected) {
+      originalSocket.onmessage?.({ data: '{"type":"final","text":"uncommitted prefix"}' });
+      expect(delivered).not.toHaveBeenCalled();
+      originalSocket.onclose?.();
+    } else {
+      originalSocket.onmessage?.({
+        data: JSON.stringify({
+          type: "stopped",
+          text: "kept",
+          undelivered: { segments: 1, seconds: 0.000125 },
+          retry_ranges: [[2, 6]],
+        }),
+      });
+    }
+    const first = await stopped;
+    if (disconnected) expect(first.text).toBe("");
+    let replayMessage: (data: string) => void = () => {};
+    vi.stubGlobal(
+      "WebSocket",
+      class {
+        static OPEN = 1;
+        readyState = 1;
+        onmessage = null as ((msg: { data: string }) => void) | null;
+        constructor() {
+          replayMessage = (data) => this.onmessage?.({ data });
+        }
+        send(data: unknown) {
+          sent.push(data);
+        }
+        close() {}
+      },
+    );
+    const retried = take.retry();
+    replayMessage('{"type":"ready","whole_take":true}');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(Array.from(sent[0] as Int16Array)).toEqual(disconnected ? [1, 2, 3, 4] : [2, 3]);
+    expect((sent[0] as Int16Array).buffer).toBe(input.buffer);
+    replayMessage('{"type":"final","text":"prefix"}');
+    expect(delivered).not.toHaveBeenCalled();
+    replayMessage('{"type":"stopped","text":"recovered"}');
+    await expect(retried).resolves.toMatchObject({ text: "prefix recovered" });
+    await expect(take.retry()).resolves.toEqual({ text: "" });
+    take.cancel();
+  },
+);

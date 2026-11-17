@@ -60,9 +60,11 @@ export interface ErrorMeta {
 export interface DictationTail extends FinalMeta {
   text: string;
   undelivered?: Undelivered;
+  retry_ranges?: [number, number][];
 }
 export type DictationEvent =
-  | { type: "ready" }
+  | { type: "ready"; whole_take?: boolean }
+  | { type: "processing" }
   | { type: "partial"; text: string }
   | ({ type: "final"; text: string } & FinalMeta)
   | ({ type: "stopped" } & DictationTail)
@@ -132,7 +134,19 @@ export function parseDictationEvent(raw: string): DictationEvent | null {
   }
   if (typeof data !== "object" || data === null) return null;
   const frame = data as Record<string, unknown>;
-  const meta: FinalMeta & ErrorMeta = {};
+  const meta: FinalMeta & ErrorMeta & { retry_ranges?: [number, number][] } = {};
+  if (
+    Array.isArray(frame.retry_ranges) &&
+    frame.retry_ranges.every(
+      (range) =>
+        Array.isArray(range) &&
+        range.length === 2 &&
+        range.every(Number.isSafeInteger) &&
+        range[0] >= 0 &&
+        range[1] > range[0],
+    )
+  )
+    meta.retry_ranges = frame.retry_ranges;
   if (typeof frame.raw === "string") meta.raw = frame.raw;
   if (typeof frame.cleaned === "boolean") meta.cleaned = frame.cleaned;
   if (typeof frame.code === "string") meta.code = frame.code;
@@ -148,7 +162,9 @@ export function parseDictationEvent(raw: string): DictationEvent | null {
   }
   switch (frame.type) {
     case "ready":
-      return { type: "ready" };
+      return frame.whole_take === true ? { type: "ready", whole_take: true } : { type: "ready" };
+    case "processing":
+      return { type: "processing" };
     case "partial":
     case "final":
     case "stopped":
@@ -260,13 +276,18 @@ function workletUrl(): string {
  */
 export class DictationSession {
   private readonly events: DictationSessionEvents;
-  private readonly ws: WebSocket;
+  private ws: WebSocket;
+  private readonly wholeTake: boolean;
+  private audio: Int16Array<ArrayBuffer>[] = [];
+  private pendingFinals: DictationTail[] = [];
+  private static retained: DictationSession | null = null;
   private readonly mediaStream: MediaStream;
   private readonly audioContext: AudioContext;
   private readonly workletNode: AudioWorkletNode;
   private stopResolve: ((tail: DictationTail) => void) | null = null;
   private flushResolve: (() => void) | null = null;
   private closed = false;
+  private stopTimer: ReturnType<typeof setTimeout> | undefined;
 
   private constructor(
     events: DictationSessionEvents,
@@ -274,7 +295,9 @@ export class DictationSession {
     mediaStream: MediaStream,
     audioContext: AudioContext,
     workletNode: AudioWorkletNode,
+    wholeTake = false,
   ) {
+    this.wholeTake = wholeTake;
     this.events = events;
     this.ws = ws;
     this.mediaStream = mediaStream;
@@ -288,21 +311,33 @@ export class DictationSession {
         this.flushResolve = null;
         return;
       }
-      if (ws.readyState === WebSocket.OPEN) ws.send(msg.data.buffer);
+      if (this.wholeTake) {
+        this.audio.push(msg.data);
+      }
+      if (this.ws.readyState === WebSocket.OPEN) this.ws.send(msg.data.buffer);
     };
+    this.bindSocket();
+  }
+
+  private bindSocket(): void {
+    const ws = this.ws;
     ws.onmessage = (msg) => {
       if (typeof msg.data !== "string") return;
       const event = parseDictationEvent(msg.data);
       if (event === null) return;
       if (event.type === "partial") this.events.onPartial(event.text);
-      else if (event.type === "final") this.events.onFinal(event.text, event);
-      else if (event.type === "stopped") this.resolveStop(event);
+      else if (event.type === "final") {
+        if (this.wholeTake) this.pendingFinals.push(event);
+        else this.events.onFinal(event.text, event);
+      } else if (event.type === "processing" && this.stopResolve) clearTimeout(this.stopTimer);
+      else if (event.type === "stopped") this.resolveStop(event, true);
       else if (event.type === "error") this.fail(event.message, event);
     };
     ws.onclose = () => {
       // A close during stop() is the normal end of a take; any other
       // close means the server went away mid-dictation.
-      if (this.stopResolve !== null) this.resolveStop({ text: "" });
+      if (this.stopResolve !== null) this.resolveStop(this.failedTail());
+      else if (this.wholeTake && !this.closed) return;
       else if (!this.closed) this.fail("Dictation connection closed");
     };
   }
@@ -313,7 +348,16 @@ export class DictationSession {
    * denied, the socket fails, the server is at capacity
    * ({@link DictationBusyError}), or the engine never comes up.
    */
+  static discardRetainedAudio(): void {
+    if (this.retained) {
+      this.retained.audio = [];
+      this.retained.pendingFinals = [];
+    }
+    this.retained = null;
+  }
+
   static async start(events: DictationSessionEvents): Promise<DictationSession> {
+    this.discardRetainedAudio();
     const mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
     });
@@ -323,7 +367,7 @@ export class DictationSession {
     try {
       ws = new WebSocket(buildDictationUrl());
       ws.binaryType = "arraybuffer";
-      await waitForReady(ws);
+      const ready = await waitForReady(ws);
       // Detect a close during the async audio-graph setup below: the
       // handler-swap in the constructor would otherwise never see it and
       // start() would resolve a dead session that silently drops audio.
@@ -356,7 +400,16 @@ export class DictationSession {
       if (closedDuringSetup || ws.readyState !== WebSocket.OPEN) {
         throw new Error("dictation connection closed during setup");
       }
-      return new DictationSession(events, ws, mediaStream, audioContext, node);
+      const session = new DictationSession(
+        events,
+        ws,
+        mediaStream,
+        audioContext,
+        node,
+        ready.whole_take === true,
+      );
+      if (session.wholeTake) this.retained = session;
+      return session;
     } catch (error) {
       for (const track of mediaStream.getTracks()) track.stop();
       if (audioContext && audioContext.state !== "closed") void audioContext.close();
@@ -376,20 +429,70 @@ export class DictationSession {
     this.teardownAudio();
     if (this.ws.readyState !== WebSocket.OPEN) {
       this.closed = true;
-      return { text: "" };
+      return this.wholeTake ? this.failedTail() : { text: "" };
     }
     return new Promise<DictationTail>((resolve) => {
       this.stopResolve = resolve;
-      this.ws.send(JSON.stringify({ type: "stop" }));
-      setTimeout(() => this.resolveStop({ text: "" }), STOP_TIMEOUT_MS);
+      if (!this.wholeTake) this.waitForStop(STOP_TIMEOUT_MS);
+      try {
+        this.ws.send(JSON.stringify({ type: "stop" }));
+      } catch {
+        this.resolveStop(this.failedTail());
+      }
     });
+  }
+
+  /** Replay only retained failed audio, without opening the microphone again. */
+  async retry(): Promise<DictationTail> {
+    if (!this.audio.length) return { text: "" };
+    const ws = new WebSocket(buildDictationUrl());
+    this.ws = ws;
+    this.closed = false;
+    this.pendingFinals = [];
+    try {
+      await waitForReady(ws);
+      if (this.closed) return { text: "" };
+      this.bindSocket();
+      for (const data of this.audio) ws.send(data);
+      return await this.stop();
+    } catch (error) {
+      ws.close();
+      throw error;
+    }
+  }
+
+  private failedTail(): DictationTail {
+    const bytes = this.audio.reduce((sum, frame) => sum + frame.byteLength, 0);
+    return bytes
+      ? { text: "", undelivered: { segments: 1, seconds: bytes / 32000 } }
+      : { text: "" };
+  }
+
+  private retainFailedAudio(tail: DictationTail): void {
+    if (!this.wholeTake || !tail.undelivered?.segments) {
+      this.audio = [];
+      return;
+    }
+    if (!tail.retry_ranges) return;
+    const failed: Int16Array<ArrayBuffer>[] = [];
+    let offset = 0;
+    for (const frame of this.audio) {
+      for (const [start, end] of tail.retry_ranges) {
+        const first = Math.max(0, start - offset);
+        const last = Math.min(frame.byteLength, end - offset);
+        if (last > first) failed.push(frame.subarray(first / 2, last / 2));
+      }
+      offset += frame.byteLength;
+    }
+    this.audio = failed;
   }
 
   /** Immediate teardown without waiting for the tail (unmount, disable). */
   cancel(): void {
+    clearTimeout(this.stopTimer);
     this.teardownAudio();
     this.closed = true;
-    this.ws.close();
+    this.resolveStop({ text: "" });
   }
 
   /** Ask the worklet to post its partial chunk; wait for its marker. */
@@ -406,7 +509,35 @@ export class DictationSession {
     });
   }
 
-  private resolveStop(tail: DictationTail): void {
+  private waitForStop(timeoutMs: number): void {
+    clearTimeout(this.stopTimer);
+    this.stopTimer = setTimeout(() => this.resolveStop({ text: "" }), timeoutMs);
+  }
+
+  private resolveStop(value: DictationTail, commitFinals = false): void {
+    let tail = value;
+    if (this.wholeTake) {
+      if (commitFinals && this.pendingFinals.length) {
+        const parts = [...this.pendingFinals, tail];
+        tail = {
+          ...tail,
+          text: parts
+            .map((part) => part.text)
+            .filter(Boolean)
+            .join(" "),
+          raw: parts.some((part) => part.raw !== undefined)
+            ? parts
+                .map((part) => part.raw ?? part.text)
+                .filter(Boolean)
+                .join(" ")
+            : undefined,
+          cleaned: parts.every((part) => part.cleaned === true),
+        };
+      }
+      this.pendingFinals = [];
+    }
+    this.retainFailedAudio(tail);
+    clearTimeout(this.stopTimer);
     this.closed = true;
     const resolve = this.stopResolve;
     this.stopResolve = null;
@@ -415,6 +546,11 @@ export class DictationSession {
   }
 
   private fail(message: string, meta?: ErrorMeta): void {
+    if (this.wholeTake) {
+      if (this.stopResolve) this.resolveStop(this.failedTail());
+      else this.ws.close();
+      return;
+    }
     this.closed = true;
     this.teardownAudio();
     this.ws.close();
@@ -432,7 +568,7 @@ export class DictationSession {
  * close (typed {@link DictationBusyError} for the 1013 at-capacity close),
  * or timeout.
  */
-function waitForReady(ws: WebSocket): Promise<void> {
+function waitForReady(ws: WebSocket): Promise<{ whole_take?: boolean }> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       reject(new Error("dictation server did not become ready"));
@@ -442,7 +578,7 @@ function waitForReady(ws: WebSocket): Promise<void> {
       const event = parseDictationEvent(msg.data);
       if (event?.type === "ready") {
         clearTimeout(timer);
-        resolve();
+        resolve(event);
       } else if (event?.type === "error") {
         // The engine failed to initialize; surface its message rather
         // than the generic close that follows.

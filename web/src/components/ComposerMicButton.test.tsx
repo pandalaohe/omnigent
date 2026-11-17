@@ -20,7 +20,7 @@ import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import type { AnyBlock } from "@/lib/blocks";
 import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
-import type { DictationSessionEvents } from "@/lib/dictation";
+import type { DictationSessionEvents, DictationTail } from "@/lib/dictation";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { AskUserQuestionForm } from "./blocks/AskUserQuestionForm";
 import { useChatStore } from "@/store/chatStore";
@@ -46,11 +46,13 @@ async function hoverMicTooltip(button: HTMLElement): Promise<HTMLElement> {
 // factory reads the mutable spies at call time, so each test installs its
 // own behavior in beforeEach.
 interface SessionStub {
-  stop: () => Promise<string>;
+  stop: () => Promise<string | DictationTail>;
+  retry?: () => Promise<DictationTail>;
   cancel: () => void;
 }
 let sessionStartMock: Mock<(events: DictationSessionEvents) => Promise<SessionStub>>;
-let sessionStopMock: Mock<() => Promise<string>>;
+let sessionStopMock: Mock<() => Promise<string | DictationTail>>;
+let sessionRetryMock: Mock<() => Promise<DictationTail>>;
 let sessionCancelMock: Mock<() => void>;
 let sessionEvents: DictationSessionEvents | null;
 let punctuationMock: Mock<(text: string) => Promise<string>>;
@@ -61,6 +63,7 @@ vi.mock("@/lib/dictation", () => {
     DictationBusyError,
     DictationSession: {
       start: (events: DictationSessionEvents) => sessionStartMock(events),
+      discardRetainedAudio: vi.fn(),
     },
     restoreDictationPunctuation: (text: string) => punctuationMock(text),
   };
@@ -74,10 +77,11 @@ vi.mock("@/components/ui/toast", () => ({ showToast: (msg: unknown) => showToast
 function installDictationSession() {
   sessionEvents = null;
   sessionStopMock = vi.fn(async () => "");
+  sessionRetryMock = vi.fn(async () => ({ text: "recovered words" }));
   sessionCancelMock = vi.fn();
   sessionStartMock = vi.fn(async (events: DictationSessionEvents) => {
     sessionEvents = events;
-    return { stop: sessionStopMock, cancel: sessionCancelMock };
+    return { stop: sessionStopMock, cancel: sessionCancelMock, retry: sessionRetryMock };
   });
 }
 
@@ -1770,77 +1774,68 @@ it.each(["unmount", "discard", "new take"])(
   },
 );
 
-it("falls back from third-party to browser once, reports lost phrases and avoids a retry loop", async () => {
+it("keeps a third-party take active after recognition failure without switching providers", async () => {
   vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
     ...voiceApi.defaultVoiceInputSettings,
     speech_source: "third",
   });
-  const onTranscript = vi.fn();
-  const onVoiceStart = vi.fn();
-  render(
-    <CapabilitiesContext.Provider value={NO_DICTATION_INFO}>
-      <ComposerMicButton onTranscript={onTranscript} onVoiceStart={onVoiceStart} />
-    </CapabilitiesContext.Provider>,
-  );
+  render(<ComposerMicButton onTranscript={vi.fn()} />);
   await act(async () => {});
-  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Voice dictation" })));
-  act(() =>
-    sessionEvents?.onError("failed", {
-      code: "third_party_failed",
-      undelivered: { segments: 2, seconds: 1.2 },
-    }),
-  );
-  expect(startSpy).toHaveBeenCalledOnce();
-  expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("2 phrase(s) (~1.2 s)"));
-  act(() => handlers.start?.({}));
-  act(() => handlers.result?.(resultEvent("browser words")));
-  expect(onTranscript).not.toHaveBeenCalled();
-  expect(onVoiceStart).toHaveBeenCalledOnce();
-  await act(async () => handlers.error?.({ error: "network" }));
-  expect(onTranscript).toHaveBeenCalledWith("browser words");
-  expect(sessionStartMock).toHaveBeenCalledOnce();
+  const button = screen.getByRole("button", { name: "Voice dictation" });
+  await act(async () => fireEvent.click(button));
+  act(() => sessionEvents?.onError("failed", { code: "third_party_failed" }));
+  expect(startSpy).not.toHaveBeenCalled();
+  expect(button).toHaveAttribute("aria-pressed", "true");
+  expect(sessionCancelMock).not.toHaveBeenCalled();
+  await act(async () => fireEvent.click(button));
+  expect(button).toHaveAttribute("aria-pressed", "false");
 });
 
-it.each([false, true])("preserves one-step ownership with browser suffix: %s", async (fallback) => {
+it("cancels pending hosted transcription through the microphone control", async () => {
   vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
     ...voiceApi.defaultVoiceInputSettings,
     speech_source: "third",
-    speech_method: "chat_audio",
-    model: "cleanup-model",
   });
-  vi.mocked(voiceApi.cleanupDictation).mockResolvedValue({ text: "Browser suffix." });
-  const onTranscript = vi.fn();
-  render(<ComposerMicButton onTranscript={onTranscript} />);
+  sessionStopMock.mockReturnValue(new Promise(() => {}));
+  render(<ComposerMicButton onTranscript={vi.fn()} />);
   await act(async () => {});
-  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Voice dictation" })));
-  act(() =>
-    sessionEvents?.onFinal(fallback ? "Accepted prefix." : "raw fallback", {
-      raw: "raw fallback",
-      cleaned: fallback,
-    }),
-  );
-  if (fallback) {
-    act(() => sessionEvents?.onError("failed", { code: "third_party_failed" }));
-    act(() => handlers.start?.({}));
-    act(() => handlers.result?.(resultEvent("browser suffix")));
-    await finishBrowserTake();
-    expect(voiceApi.cleanupDictation).toHaveBeenCalledExactlyOnceWith(
-      "browser suffix",
-      expect.any(AbortSignal),
+  const button = screen.getByRole("button", { name: "Voice dictation" });
+  await act(async () => fireEvent.click(button));
+  fireEvent.click(button);
+  expect(button).toHaveAttribute("aria-busy", "true");
+  await act(async () => fireEvent.click(button));
+  expect(sessionCancelMock).toHaveBeenCalledOnce();
+  expect(button).toHaveAttribute("aria-busy", "false");
+});
+
+it.each([false, true])(
+  "preserves one-step metadata without a browser fallback: %s",
+  async (cleaned) => {
+    vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+      ...voiceApi.defaultVoiceInputSettings,
+      speech_source: "third",
+      speech_method: "chat_audio",
+      model: "cleanup-model",
+    });
+    const onTranscript = vi.fn();
+    render(<ComposerMicButton onTranscript={onTranscript} />);
+    await act(async () => {});
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+    await act(async () => fireEvent.click(button));
+    act(() =>
+      sessionEvents?.onFinal(cleaned ? "Accepted words." : "raw fallback", {
+        raw: "raw fallback",
+        cleaned,
+      }),
     );
-    expect(onTranscript).toHaveBeenCalledWith(
-      "Accepted prefix. Browser suffix.",
-      expect.objectContaining({ cleanupHandled: true }),
-    );
-  } else {
-    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Voice dictation" })));
+    await act(async () => fireEvent.click(button));
     expect(voiceApi.cleanupDictation).not.toHaveBeenCalled();
     expect(onTranscript).toHaveBeenCalledWith(
-      "raw fallback",
+      cleaned ? "Accepted words." : "raw fallback",
       expect.objectContaining({ cleanupHandled: true }),
     );
-  }
-});
+  },
+);
 
 function QuestionVoiceAnswer() {
   const [text, setText] = useState("");
@@ -1972,3 +1967,62 @@ it.each([false, true])(
     expect(screen.getByRole("textbox", { name: "Region 1" })).toHaveValue("");
   },
 );
+
+it("offers retry for retained failed audio without reopening the microphone", async () => {
+  vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+    ...voiceApi.defaultVoiceInputSettings,
+    speech_source: "third",
+  });
+  sessionStopMock.mockResolvedValue({ text: "", undelivered: { segments: 1, seconds: 2 } });
+  const onTranscript = vi.fn();
+  render(<ComposerMicButton onTranscript={onTranscript} />);
+  await act(async () => {});
+  const button = screen.getByRole("button", { name: "Voice dictation" });
+  await act(async () => fireEvent.click(button));
+  await act(async () => fireEvent.click(button));
+  const message = showToastMock.mock.calls.at(-1)?.[0];
+  render(message);
+  const capture = vi.mocked(navigator.mediaDevices.getUserMedia);
+  capture.mockClear();
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Retry" })));
+  expect(capture).not.toHaveBeenCalled();
+  expect(sessionRetryMock).toHaveBeenCalledOnce();
+  expect(sessionStartMock).toHaveBeenCalledOnce();
+  expect(onTranscript).toHaveBeenCalledWith("recovered words");
+});
+
+it("Escape during Retry clears processing, releases keys and discards late text", async () => {
+  vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+    ...voiceApi.defaultVoiceInputSettings,
+    speech_source: "third",
+  });
+  sessionStopMock.mockResolvedValue({ text: "", undelivered: { segments: 1, seconds: 2 } });
+  let finishRetry!: (tail: DictationTail) => void;
+  sessionRetryMock.mockReturnValue(
+    new Promise((resolve) => {
+      finishRetry = resolve;
+    }),
+  );
+  const onTranscript = vi.fn();
+  const onVoiceDiscard = vi.fn();
+  render(<ComposerMicButton onTranscript={onTranscript} onVoiceDiscard={onVoiceDiscard} />);
+  await act(async () => {});
+  const button = screen.getByRole("button", { name: "Voice dictation" });
+  await act(async () => fireEvent.click(button));
+  await act(async () => fireEvent.click(button));
+  render(showToastMock.mock.calls.at(-1)?.[0]);
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Retry" })));
+  expect(button).toHaveAttribute("aria-busy", "true");
+  fireEvent.keyDown(window, { key: "Escape" });
+  expect(onVoiceDiscard).toHaveBeenCalledOnce();
+  expect(sessionCancelMock).toHaveBeenCalledOnce();
+  expect(button).toHaveAttribute("aria-busy", "false");
+  for (const key of ["Enter", "Escape"]) {
+    const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+    window.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+  }
+  await act(async () => finishRetry({ text: "late words" }));
+  expect(onTranscript).not.toHaveBeenCalled();
+  expect(button).toHaveAttribute("aria-busy", "false");
+});
