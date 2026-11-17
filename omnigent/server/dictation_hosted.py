@@ -172,11 +172,9 @@ def _transcribe(
 class _HostedStream:
     def __init__(self, engine: HostedTranscriptionEngine):
         self.engine = engine
+        self.whole_take = True
         self.timeout = max(
-            0.1, float(os.environ.get("OMNIGENT_DICTATION_HOSTED_REQUEST_TIMEOUT_S", "30"))
-        )
-        self.stop_timeout = max(
-            0.1, float(os.environ.get("OMNIGENT_DICTATION_HOSTED_STOP_S", "65"))
+            60.0, float(os.environ.get("OMNIGENT_DICTATION_HOSTED_REQUEST_TIMEOUT_S", "120"))
         )
         # Leave room for the WAV header and multipart overhead below 25 MB.
         self.max_chunk_bytes = (
@@ -214,24 +212,20 @@ class _HostedStream:
         self.logged = False
         self.request_started: float | None = None
         self.inflight = 0
-        self.inflight_abandoned = False
         self.lost_segments = 0
         self.lost_seconds = 0.0
         self.cancelled = False
         self.closed = False
         self.stopping = False
-        self.deadline: float | None = None
+        self.processed_bytes = 0
+        self.retry_ranges: list[tuple[int, int]] = []
         self.worker = threading.Thread(target=self._run, daemon=True, name="hosted-dictation")
         self.worker.start()
 
     def _lost(self, audio: bytes) -> None:
+        self.retry_ranges.append((self.processed_bytes, self.processed_bytes + len(audio)))
         self.lost_segments += 1
         self.lost_seconds += len(audio) / 32000
-
-    @property
-    def stop_budget(self) -> float:
-        chunks = max(1, math.ceil((len(self.audio) + len(self.pending)) / self.max_chunk_bytes))
-        return self.stop_timeout * chunks
 
     def _segment(self) -> None:
         data = bytes(self.audio) + bytes(self.pending[: len(self.pending) // 2 * 2])
@@ -266,6 +260,7 @@ class _HostedStream:
             else None,
             finalized_cleaned=cleaned,
             undelivered={"segments": self.lost_segments, "seconds": round(self.lost_seconds, 2)},
+            retry_ranges=list(self.retry_ranges) or None,
         )
 
     def feed_pcm16(self, data: bytes) -> DictationUpdate:
@@ -286,19 +281,8 @@ class _HostedStream:
                 self.audio.extend(frame)
             return self._update()
 
-    def _abandon_inflight(self) -> None:
-        if self.inflight and not self.inflight_abandoned:
-            self.lost_segments += 1
-            self.lost_seconds += self.inflight / 32000
-            self.inflight_abandoned = True
-
     def _call(self, pcm: bytes) -> OneStepOutcome:
-        timeout = (
-            min(self.timeout, max(0.01, self.deadline - time.monotonic()))
-            if self.deadline
-            else self.timeout
-        )
-        return _transcribe(self.engine, self.client, pcm, timeout)
+        return _transcribe(self.engine, self.client, pcm, self.timeout)
 
     def _run(self) -> None:
         while True:
@@ -309,10 +293,9 @@ class _HostedStream:
                 pcm = self.queue.popleft()
                 self.inflight = len(pcm)
                 self.chunks_sent += 1
-                self.inflight_abandoned = False
             try:
                 result = None
-                for attempt in range(2):
+                for attempt in range(3):
                     started = time.monotonic()
                     self.request_started = started
                     request_status = "ok"
@@ -330,17 +313,11 @@ class _HostedStream:
                             or exc.status_code == 429
                             or exc.status_code >= 500
                         )
-                        if (
-                            attempt
-                            or not retryable
-                            or (self.deadline and self.deadline <= time.monotonic())
-                        ):
+                        if attempt == 2 or not retryable:
                             raise
                         self.retries += 1
                         with self.condition:
-                            # Stopping uses the remaining request budget without backoff.
-                            if self.deadline is None:
-                                self.condition.wait(timeout=0.5)
+                            self.condition.wait_for(lambda: self.cancelled, timeout=2**attempt)
                             if self.cancelled:
                                 return
                     except Exception:
@@ -366,6 +343,7 @@ class _HostedStream:
                         self._lost(pcm)
             finally:
                 with self.condition:
+                    self.processed_bytes += len(pcm)
                     self.inflight = 0
                     self.condition.notify_all()
 
@@ -373,23 +351,14 @@ class _HostedStream:
         with self.condition:
             if self.stopping:
                 return self._update()
-            self.deadline = time.monotonic() + self.stop_budget
             self.take_seconds = (len(self.audio) + len(self.pending) // 2 * 2) / 32000
             self._segment()
             self.stopping = True
             self.condition.notify_all()
             self.condition.wait_for(
-                lambda: not self.queue and not self.inflight,
-                timeout=max(0, self.deadline - time.monotonic()),
+                lambda: self.cancelled or (not self.queue and not self.inflight)
             )
-            if self.queue or self.inflight:
-                for pcm in self.queue:
-                    self._lost(pcm)
-                self.queue.clear()
-                self._abandon_inflight()
-                self.cancelled = True
-                self.condition.notify_all()
-            self._log_take("stopped")
+            self._log_take("cancelled" if self.cancelled else "stopped")
             return self._update()
 
     def drain_updates(self) -> list[DictationUpdate]:
@@ -429,7 +398,7 @@ class _HostedStream:
                         [
                             {
                                 "latency_s": round(time.monotonic() - self.request_started, 3),
-                                "status": "deadline_exceeded",
+                                "status": "user_cancelled",
                             }
                         ]
                         if self.request_started is not None
@@ -457,7 +426,7 @@ class _HostedStream:
         try:
             self.client.close()
         finally:
-            self.worker.join(timeout=min(2, self.stop_timeout))
+            self.worker.join(timeout=0.1)
 
     def wait_closed(self) -> None:
         """Retain the router's capacity lease until the synchronous request really exits."""

@@ -243,8 +243,8 @@ def test_over_limit_uses_fewest_quiet_cuts_and_keeps_other_chunks(monkeypatch, f
         with wave.open(io.BytesIO(body[wav_start : wav_start + length])) as wav:
             payloads.append(wav.readframes(wav.getnframes()))
         calls.append(request)
-        # The middle chunk fails twice, then the final chunk still succeeds.
-        if fail_middle and len(calls) in (2, 3):
+        # The middle chunk fails three times, then the final chunk still succeeds.
+        if fail_middle and len(calls) in (2, 3, 4):
             return httpx.Response(503, json={"error": {"message": "redacted"}})
         return httpx.Response(200, json={"text": str(len(calls))})
 
@@ -252,13 +252,14 @@ def test_over_limit_uses_fewest_quiet_cuts_and_keeps_other_chunks(monkeypatch, f
     audio = SPEECH * 39 + SILENCE + SPEECH * 59 + SILENCE + SPEECH * 20
     try:
         take.feed_pcm16(audio)
-        assert take.stop_budget == 195
+        assert take.timeout >= 60
         result = take.finish_update()
         unique = [payloads[0], payloads[1], payloads[-1]]
         assert b"".join(unique) == audio
         assert len(unique[0]) == 640 * 40
         assert all(len(p) <= 640 * 50 for p in payloads)
-        assert result.finalized == ("1 4" if fail_middle else "1 2 3")
+        assert result.finalized == ("1 5" if fail_middle else "1 2 3")
+        assert result.retry_ranges == ([(640 * 40, 640 * 90)] if fail_middle else None)
         assert result.undelivered == {
             "segments": int(fail_middle),
             "seconds": 1.0 if fail_middle else 0.0,
@@ -320,29 +321,39 @@ def test_disconnect_retains_capacity_until_blocked_transport_exits(monkeypatch):
         take.wait_closed()
 
 
-def test_stop_deadline_counts_inflight(monkeypatch):
-    monkeypatch.setenv("OMNIGENT_DICTATION_HOSTED_STOP_S", ".1")
+def test_processing_waits_until_user_cancels(monkeypatch):
     release = threading.Event()
+    entered = threading.Event()
+    finished = threading.Event()
 
     def handle(request):
-        release.wait(timeout=2)
+        entered.set()
+        release.wait(timeout=5)
         return httpx.Response(200, json={"text": "too late"})
 
     take = stream(monkeypatch, handle)
+
+    def finish():
+        take.finish_update()
+        finished.set()
+
+    worker = threading.Thread(target=finish)
     try:
         take.feed_pcm16(SPEECH * 20)
-        started = time.monotonic()
-        result = take.finish_update()
-        assert time.monotonic() - started < 1
-        assert result.finalized is None
-        assert result.undelivered["segments"] == 1
+        worker.start()
+        assert entered.wait(timeout=1)
+        assert not finished.is_set()
+        take.close()
+        assert finished.wait(timeout=1)
     finally:
         release.set()
         take.close()
+        take.wait_closed()
+        worker.join(timeout=1)
 
 
 @pytest.mark.parametrize("failure", ["timeout", 429, 503])
-def test_stop_retries_transient_failure_with_remaining_budget(monkeypatch, failure):
+def test_stop_retries_transient_failure_with_backoff(monkeypatch, failure):
     monkeypatch.setenv("OMNIGENT_DICTATION_HOSTED_STOP_S", "1")
     calls = []
 

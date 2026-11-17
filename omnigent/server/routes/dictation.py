@@ -21,8 +21,8 @@ Wire protocol on the WebSocket
   finish the take. Unknown shapes are ignored so future control
   messages don't break older servers.
 - **Server → client, text frames**: JSON events.
-    - ``{"type": "processing", "timeout_ms": ...}`` — hosted transcription's
-      stop budget, sent before provider work; scales with the number of chunks.
+    - ``{"type": "processing"}`` — hosted transcription is running; the client
+      waits for completion or explicit cancellation.
     - ``{"type": "ready"}`` — sent once after the engine is ready;
       the client may start streaming audio.
     - ``{"type": "partial", "text": ...}`` — revisable in-progress
@@ -281,7 +281,9 @@ def create_dictation_router(
             # close() just frees the recognizer stream, so a best-effort
             # close on the way out is enough.
             try:
-                await websocket.send_text(json.dumps({"type": "ready"}))
+                await websocket.send_text(
+                    json.dumps({"type": "ready", **({"whole_take": True} if third else {})})
+                )
                 await _pump_dictation(websocket, handle)
             finally:
                 _logger.info(
@@ -359,12 +361,13 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
             if isinstance(control, dict) and control.get("type") == "stop":
                 finish_update = getattr(handle, "finish_update", None)
                 if finish_update is not None:
-                    stop_budget = getattr(handle, "stop_budget", None)
-                    if stop_budget is not None:
-                        await websocket.send_json(
-                            {"type": "processing", "timeout_ms": int(stop_budget * 1000) + 5000}
-                        )
-                    update = await asyncio.to_thread(finish_update)
+                    if getattr(handle, "whole_take", False):
+                        await websocket.send_json({"type": "processing"})
+                        update = await _finish_hosted(websocket, handle, finish_update)
+                        if update is None:
+                            return
+                    else:
+                        update = await asyncio.to_thread(finish_update)
                     drain = getattr(handle, "drain_updates", None)
                     updates = [update] + (await asyncio.to_thread(drain) if drain else [])
                     for completed in updates[:-1]:
@@ -404,6 +407,35 @@ def _update_event(kind: str, update: DictationUpdate) -> dict:
     event: dict[str, Any] = {"type": kind, "text": update.finalized or ""}
     if update.finalized_raw is not None:
         event.update(raw=update.finalized_raw, cleaned=update.finalized_cleaned)
+    if update.retry_ranges is not None:
+        event["retry_ranges"] = update.retry_ranges
     if update.undelivered is not None:
         event["undelivered"] = update.undelivered
     return event
+
+
+async def _finish_hosted(
+    websocket: WebSocket,
+    handle: DictationStreamHandle,
+    finish_update: Callable[[], DictationUpdate],
+) -> DictationUpdate | None:
+    work = asyncio.create_task(asyncio.to_thread(finish_update))
+    receive = asyncio.create_task(websocket.receive())
+    try:
+        while True:
+            done, _ = await asyncio.wait((work, receive), return_when=asyncio.FIRST_COMPLETED)
+            if work in done:
+                return work.result()
+            message = receive.result()
+            if message["type"] == "websocket.disconnect":
+                await asyncio.to_thread(handle.close)
+                await work
+                return None
+            receive = asyncio.create_task(websocket.receive())
+    finally:
+        receive.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await receive
+        if not work.done():
+            await asyncio.to_thread(handle.close)
+            await work

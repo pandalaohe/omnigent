@@ -145,6 +145,7 @@ class DictationUpdate:
     finalized_raw: str | None = None
     finalized_cleaned: bool = False
     undelivered: dict[str, int | float] | None = None
+    retry_ranges: list[tuple[int, int]] | None = None
 
 
 class DictationTakeError(Exception):
