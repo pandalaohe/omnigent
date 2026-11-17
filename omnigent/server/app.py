@@ -2589,6 +2589,9 @@ def create_app(
                         host_load_notices = getattr(app_inst.state, "host_load_notices", None)
                         if host_load_notices is not None:
                             await host_load_notices.tick(system_status_hub, app_inst)
+                        linked_terminals = getattr(app_inst.state, "linked_host_terminals", None)
+                        if linked_terminals is not None:
+                            await linked_terminals.sweep()
                         ticks += 1
                         if ticks % FLUSH_EVERY_TICKS == 0:
                             await system_status_hub.save_history()
@@ -6513,6 +6516,22 @@ def create_app(
         else None
     )
     app.state.host_terminals = host_terminals
+    from omnigent.server.linked_host_terminals import LinkedHostTerminals
+
+    linked_host_terminals = (
+        LinkedHostTerminals(
+            host_terminals,
+            conversation_store,
+            auth_provider=auth_provider,
+            permissions=permission_store,
+        )
+        if host_terminals is not None
+        else None
+    )
+    app.state.linked_host_terminals = linked_host_terminals
+    from omnigent.server.terminal_agent_access import set_linked_terminal_service
+
+    set_linked_terminal_service(linked_host_terminals)
     app.include_router(
         create_runner_tunnel_router(
             tunnel_registry,
@@ -6561,6 +6580,16 @@ def create_app(
         system_status.load()
         app.state.system_status = system_status
         assert host_terminals is not None
+        from omnigent.server.routes.session_host_terminals import (
+            create_session_host_terminals_router,
+        )
+
+        assert linked_host_terminals is not None
+        app.include_router(
+            create_session_host_terminals_router(linked_host_terminals),
+            prefix="/v1",
+            tags=["sessions"],
+        )
         app.include_router(
             create_host_terminals_router(
                 host_terminals,

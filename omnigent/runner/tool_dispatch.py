@@ -11748,6 +11748,7 @@ async def execute_tool(
                 runner_workspace=runner_workspace,
                 session_inbox=session_inbox,
                 publish_event=publish_event,
+                server_client=server_client,
             )
         elif tool_name in _ASYNC_INBOX_TOOLS:
             output = await _execute_async_inbox_tool(
@@ -12798,6 +12799,7 @@ async def _execute_terminal_tool(
     runner_workspace: Path | None = None,
     session_inbox: asyncio.Queue[_JsonObject] | None = None,
     publish_event: Callable[[str, _JsonObject], None] | None = None,
+    server_client: httpx.AsyncClient | None = None,
 ) -> str:
     """Execute a terminal tool using the runner's TerminalRegistry.
 
@@ -12825,6 +12827,38 @@ async def _execute_terminal_tool(
         return "Error: agent_spec not available for terminal dispatch"
     if conversation_id is None:
         return "Error: conversation_id required for terminal tools"
+
+    if args.get("host_id") is not None:
+        from urllib.parse import quote
+
+        host_id, terminal_id = args.get("host_id"), args.get("session")
+        operation = tool_name.removeprefix("sys_terminal_")
+        if (
+            server_client is None
+            or not isinstance(host_id, str)
+            or not isinstance(terminal_id, str)
+            or not host_id
+            or not terminal_id
+            or operation not in ("read", "send", "close", "request_access")
+        ):
+            return json.dumps({"error": "Linked terminal operation is unavailable"})
+        path = (
+            f"/v1/sessions/{quote(conversation_id, safe='')}/host-terminals/"
+            f"{quote(host_id, safe='')}/{quote(terminal_id, safe='')}/agent/{operation}"
+        )
+        try:
+            response = await server_client.post(path, json=dict(args), timeout=15)
+            if response.status_code >= 400:
+                error = response.json().get("error", {})
+                return json.dumps(
+                    {
+                        "error": error.get("message", "Linked terminal operation refused"),
+                        "status": response.status_code,
+                    }
+                )
+            return json.dumps(response.json())
+        except httpx.HTTPError:
+            return json.dumps({"error": "Linked terminal host unavailable"})
 
     from omnigent.tools.base import ToolContext
 
@@ -12880,6 +12914,35 @@ async def _execute_terminal_tool(
             resource_registry=resource_registry,
             publish_event=publish_event,
         )
+    if tool_name == SysTerminalListTool.name() and server_client is not None:
+        try:
+            response = await server_client.get(
+                f"/v1/sessions/{conversation_id}/host-terminals", timeout=10
+            )
+            response.raise_for_status()
+            page = response.json()
+            local = json.loads(output)
+            if isinstance(local, list):
+                local.extend(
+                    {
+                        "terminal": "shell",
+                        "session": terminal["terminal_id"],
+                        "host_id": terminal["host_id"],
+                        "host_name": terminal["host_name"],
+                        "instance_id": terminal["instance_id"],
+                        "agent_tier": terminal["agent_tier"],
+                        "elevated": terminal["elevated"],
+                        "running": True,
+                    }
+                    for terminal in page["terminals"]
+                )
+                if not page.get("complete", True):
+                    local.append({"linked_unavailable": True})
+                output = json.dumps(local)
+        except (httpx.HTTPError, ValueError, KeyError):
+            local = json.loads(output)
+            if isinstance(local, list):
+                output = json.dumps([*local, {"linked_unavailable": True}])
     return output
 
 

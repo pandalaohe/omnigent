@@ -803,6 +803,29 @@ async def test_cancel_unregistered_launch_cleans_only_its_process(
 
 
 @pytestmark_tmux
+@pytest.mark.parametrize("tier", ["off", "read", "read_write"])
+async def test_launch_publishes_initial_tier(reg_with_tmux, bash_spec, cleanup, monkeypatch, tier):
+    del cleanup
+    launch = TerminalInstance.launch
+
+    async def observe_launch(instance, **kwargs):
+        assert instance.agent_tier == tier
+        assert reg_with_tmux.get("tier-session", "bash", "initial") is None
+        await launch(instance, **kwargs)
+
+    monkeypatch.setattr(TerminalInstance, "launch", observe_launch)
+    instance = await reg_with_tmux.launch(
+        "tier-session", "bash", "initial", bash_spec, agent_tier=tier
+    )
+    assert reg_with_tmux.get("tier-session", "bash", "initial").agent_tier == tier
+    if tier == "off":
+        with pytest.raises(ValueError, match="agent access not granted"):
+            reg_with_tmux.require_agent_access(
+                "tier-session", "bash", "initial", instance, need="read"
+            )
+
+
+@pytestmark_tmux
 async def test_launch_get_close_round_trip(
     reg_with_tmux: TerminalRegistry,
     bash_spec: TerminalEnvSpec,

@@ -300,6 +300,8 @@ class TerminalRegistry:
         agent_invocation: bool = False,
         host_shell: bool = False,
         origin: Literal["user", "agent", "harness"] = "harness",
+        linked_session_id: str | None = None,
+        agent_tier: Literal["off", "read", "read_write"] | None = None,
     ) -> TerminalInstance:
         """Launch a terminal session, or return the existing one.
 
@@ -338,10 +340,14 @@ class TerminalRegistry:
             tool wraps in a JSON error envelope.
         """
         key = (terminal_name, session_key)
+        if agent_tier is not None and agent_tier not in ("off", "read", "read_write"):
+            raise ValueError("invalid agent tier")
         with self._lock:
             existing = self._by_conversation.get(conversation_id, {}).get(key)
         if existing is not None and existing.running:
-            if agent_invocation and existing.elevated and not existing.agent_access:
+            if existing.linked_session_id != linked_session_id:
+                raise ValueError("terminal already belongs to a different session")
+            if agent_invocation and existing.agent_tier != "read_write":
                 raise ValueError(AGENT_ACCESS_REQUIRED)
             if existing.elevated != elevated and not agent_invocation:
                 raise ValueError("terminal key already belongs to a different elevation mode")
@@ -392,6 +398,9 @@ class TerminalRegistry:
         stage = "terminal_spawn"
         try:
             created.instance.elevated = elevated
+            if agent_tier is not None:
+                created.instance.agent_tier = agent_tier
+            created.instance.linked_session_id = linked_session_id
             created.instance.origin = "agent" if agent_invocation else origin
             created.instance.host_shell = host_shell
             created.instance.program_status_app = program_status_app
@@ -495,7 +504,9 @@ class TerminalRegistry:
                     session_key,
                     conversation_id,
                 )
-        if agent_invocation and winning_instance.elevated and not winning_instance.agent_access:
+        if winning_instance.linked_session_id != linked_session_id:
+            raise ValueError("terminal already belongs to a different session")
+        if agent_invocation and winning_instance.agent_tier != "read_write":
             raise ValueError(AGENT_ACCESS_REQUIRED)
         if not agent_invocation and winning_instance.elevated != elevated:
             raise ValueError("terminal key already belongs to a different elevation mode")
@@ -516,6 +527,8 @@ class TerminalRegistry:
         terminal_name: str,
         session_key: str,
         expected: TerminalInstance,
+        *,
+        need: Literal["read", "read_write"] = "read_write",
     ) -> None:
         """Recheck under the operation lock, after any pending grant/revoke."""
         with self._lock:
@@ -524,7 +537,9 @@ class TerminalRegistry:
             )
             if current is not expected:
                 raise ValueError("terminal instance no longer current")
-            if current.elevated and not current.agent_access:
+            if current.agent_tier == "off" or (
+                need == "read_write" and current.agent_tier != need
+            ):
                 raise ValueError(AGENT_ACCESS_REQUIRED)
 
     def set_agent_access(
@@ -535,7 +550,26 @@ class TerminalRegistry:
         instance_id: str,
         enabled: bool,
     ) -> TerminalInstance:
+        """Legacy boolean PATCH compatibility; remove in 0.23.0."""
+        return self.set_agent_tier(
+            conversation_id,
+            terminal_name,
+            session_key,
+            instance_id,
+            "read_write" if enabled else "off",
+        )
+
+    def set_agent_tier(
+        self,
+        conversation_id: str,
+        terminal_name: str,
+        session_key: str,
+        instance_id: str,
+        tier: Literal["off", "read", "read_write"],
+    ) -> TerminalInstance:
         """Atomically change consent for the named live instance only."""
+        if tier not in ("off", "read", "read_write"):
+            raise ValueError("invalid agent tier")
         lock = self.get_instance_lock(conversation_id, terminal_name, session_key)
         if lock is None:
             raise ValueError("terminal instance not found")
@@ -545,9 +579,7 @@ class TerminalRegistry:
             )
             if instance is None or instance.instance_id != instance_id or not instance.running:
                 raise ValueError("terminal instance no longer running")
-            if not instance.elevated:
-                raise ValueError("not an admin terminal")
-            instance.agent_access = enabled
+            instance.agent_tier = tier
             return instance
 
     def _watch_elevated(

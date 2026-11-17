@@ -1665,6 +1665,7 @@ class SessionResourceRegistry:
         resource_role: str | None = None,
         elevated: bool = False,
         origin: Literal["user", "agent", "harness"] = "harness",
+        agent_tier: Literal["off", "read", "read_write"] | None = None,
     ) -> SessionResourceView:
         """Launch a terminal resource attached to the owning session.
 
@@ -1687,6 +1688,7 @@ class SessionResourceRegistry:
             resource_role=resource_role,
             elevated=elevated,
             origin=origin,
+            agent_tier=agent_tier,
         )
 
     async def _launch_terminal_with_lifecycle(
@@ -1703,6 +1705,7 @@ class SessionResourceRegistry:
         resource_role: str | None = None,
         elevated: bool = False,
         origin: Literal["user", "agent", "harness"] = "harness",
+        agent_tier: Literal["off", "read", "read_write"] | None = None,
     ) -> SessionResourceView:
         """Launch a terminal, then observe it with the requested lifecycle."""
         if self._terminal_registry is None:
@@ -1728,6 +1731,7 @@ class SessionResourceRegistry:
                 sandbox_override=sandbox_override,
                 elevated=elevated,
                 origin=origin,
+                agent_tier=agent_tier,
                 program_status_app=program_status_app,
             )
         except TerminalExitedDuringLaunch as exc:

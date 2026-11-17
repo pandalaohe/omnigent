@@ -1282,6 +1282,12 @@ export function ApprovalCard({
                 <dd className="break-all">{terminalAccess.instanceId}</dd>
                 <dt>Owner</dt>
                 <dd className="break-all">{terminalAccess.owner}</dd>
+                {terminalAccess.tier && (
+                  <>
+                    <dt>Requested access</dt>
+                    <dd>{terminalAccess.tier === "read" ? "Read" : "Read & write"}</dd>
+                  </>
+                )}
               </dl>
             )}
             {agyPermission?.actionDescription && (

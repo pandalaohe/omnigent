@@ -189,7 +189,7 @@ async def test_sdk_agent_can_use_plain_host_shells(
     assert instance is not None
     assert instance.os_env is not None and instance.os_env.cwd == ctx.workspace
     assert instance.os_env.spec.sandbox.type == "none"
-    assert not instance.agent_access
+    assert instance.agent_tier == "read_write"
     assert await invoke("send", {**target, "text": "printf 'sdk-%s\\n' marker"}) == {
         "status": "sent"
     }

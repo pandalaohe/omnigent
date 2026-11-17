@@ -172,6 +172,7 @@ def _format_launch_envelope(
             **(
                 {"tmux_socket": str(instance.socket_path)}
                 if not instance.elevated
+                and instance.agent_tier == "read_write"
                 and instance.origin != "user"
                 and not instance.host_shell
                 and instance.backend == "tmux"
@@ -180,7 +181,8 @@ def _format_launch_envelope(
             "instance_id": instance.instance_id,
             "origin": instance.origin,
             "elevated": instance.elevated,
-            "agent_access": instance.agent_access if instance.elevated else True,
+            "agent_access": instance.agent_access,
+            "agent_tier": instance.agent_tier,
             "has_os_env": instance.os_env is not None,
             "status": "already_running" if was_running else "launched",
         }
@@ -335,6 +337,13 @@ _SEND_SCHEMA: dict[str, Any] = {
     "properties": {
         "terminal": {"type": "string"},
         "session": {"type": "string"},
+        "host_id": {
+            "type": "string",
+            "description": (
+                "For a linked terminal, use its host_id and session from sys_terminal_list; "
+                "terminal is ignored."
+            ),
+        },
         "text": {
             "type": "string",
             "description": "Literal text to type (sent via tmux send-keys -l).",
@@ -358,6 +367,13 @@ _READ_SCHEMA: dict[str, Any] = {
     "properties": {
         "terminal": {"type": "string"},
         "session": {"type": "string"},
+        "host_id": {
+            "type": "string",
+            "description": (
+                "For a linked terminal, use its host_id and session from sys_terminal_list; "
+                "terminal is ignored."
+            ),
+        },
         "scrollback": {
             "type": "integer",
             "default": 0,
@@ -382,6 +398,13 @@ _CLOSE_SCHEMA: dict[str, Any] = {
     "properties": {
         "terminal": {"type": "string"},
         "session": {"type": "string"},
+        "host_id": {
+            "type": "string",
+            "description": (
+                "For a linked terminal, use its host_id and session from sys_terminal_list; "
+                "terminal is ignored."
+            ),
+        },
     },
     "required": ["terminal", "session"],
 }
@@ -507,7 +530,9 @@ def _resolve_running_instance(
                 )
             }
         )
-    if instance.elevated and not instance.agent_access:
+    if instance.agent_tier == "off" or (
+        tool_name == "sys_terminal_send" and instance.agent_tier != "read_write"
+    ):
         from omnigent.terminals.elevation import AGENT_ACCESS_REQUIRED
 
         return json.dumps({"error": AGENT_ACCESS_REQUIRED})
@@ -1009,6 +1034,7 @@ class SysTerminalReadTool(Tool):
                     resolved.parsed["terminal"],
                     resolved.parsed["session"],
                     resolved.instance,
+                    need="read",
                 )
                 result = asyncio.run(resolved.instance.read(scrollback=scrollback_raw))
             except (RuntimeError, OSError, ValueError) as exc:
@@ -1199,7 +1225,7 @@ class SysTerminalRequestAccessTool(Tool):
     @classmethod
     def description(cls) -> str:
         return (
-            "Ask the host owner to allow agent use of one admin terminal instance. "
+            "Ask the host owner to grant read or read_write access to one terminal instance. "
             "Use terminal, session and instance_id from sys_terminal_list and give a reason. "
             "The application asks the human once; access lasts until this terminal closes "
             "or the human turns it off. This request cannot be run asynchronously."
@@ -1217,7 +1243,13 @@ class SysTerminalRequestAccessTool(Tool):
                         "terminal": {"type": "string", "minLength": 1},
                         "session": {"type": "string", "minLength": 1},
                         "instance_id": {"type": "string", "minLength": 1},
+                        "host_id": {"type": "string", "minLength": 1},
                         "reason": {"type": "string", "minLength": 1, "maxLength": 4096},
+                        "tier": {
+                            "type": "string",
+                            "enum": ["read", "read_write"],
+                            "default": "read_write",
+                        },
                     },
                     "required": ["terminal", "session", "instance_id", "reason"],
                     "additionalProperties": False,
@@ -1230,6 +1262,9 @@ class SysTerminalRequestAccessTool(Tool):
         if ctx.conversation_id is None or _validate_session_required_args(args) is not None:
             return json.dumps({"status": "rejected", "error": "terminal session is required"})
         instance = self._registry.get(ctx.conversation_id, args["terminal"], args["session"])
+        tier = args.get("tier", "read_write")
+        if tier not in ("read", "read_write"):
+            return json.dumps({"status": "rejected", "error": "invalid requested tier"})
         lock = self._registry.get_instance_lock(
             ctx.conversation_id, args["terminal"], args["session"]
         )
@@ -1241,8 +1276,8 @@ class SysTerminalRequestAccessTool(Tool):
                 current is instance
                 and instance.instance_id == args.get("instance_id")
                 and instance.running
-                and instance.elevated
-                and instance.agent_access
+                and instance.agent_tier != "off"
+                and (tier == "read" or instance.agent_tier == "read_write")
             )
         return json.dumps({"status": "granted" if granted else "rejected"})
 
@@ -1271,10 +1306,12 @@ def _describe_entry(
         "instance_id": instance.instance_id,
         "origin": instance.origin,
         "elevated": instance.elevated,
-        "agent_access": instance.agent_access if instance.elevated else True,
+        "agent_access": instance.agent_access,
+        "agent_tier": instance.agent_tier,
     }
     if (
         not instance.elevated
+        and instance.agent_tier == "read_write"
         and instance.origin != "user"
         and not instance.host_shell
         and instance.backend == "tmux"

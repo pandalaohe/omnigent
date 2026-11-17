@@ -8,7 +8,7 @@ import threading
 import time
 import weakref
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from fastapi import Request
@@ -27,6 +27,16 @@ from omnigent.stores import ConversationStore
 logger = logging.getLogger(__name__)
 TERMINAL_ACCESS_TOOL = "sys_terminal_request_access"
 
+if TYPE_CHECKING:
+    from omnigent.server.linked_host_terminals import LinkedHostTerminals
+
+_linked_terminals: LinkedHostTerminals | None = None
+
+
+def set_linked_terminal_service(service: LinkedHostTerminals | None) -> None:
+    global _linked_terminals
+    _linked_terminals = service
+
 
 @dataclass
 class _AccessRequest:
@@ -40,7 +50,9 @@ class _AccessRequest:
     host_id: str
     owner: str | None
     deadline: float
+    tier: str = "read_write"
     approved: bool = False
+    linked: bool = False
 
 
 _requests: WorkspaceScopedCache[tuple[str, str, str], _AccessRequest] = WorkspaceScopedCache()
@@ -62,14 +74,32 @@ def terminal_access_lock(session_id: str, terminal_id: str, instance_id: str) ->
 
 
 async def _terminal_context(
-    session_id: str, terminal_id: str, store: ConversationStore
-) -> tuple[Conversation, HostConnection, httpx.AsyncClient, dict[str, Any]]:
+    session_id: str,
+    terminal_id: str,
+    store: ConversationStore,
+    linked_host_id: str | None = None,
+) -> tuple[Conversation, HostConnection, Any, dict[str, Any]]:
     from omnigent.server.routes._sessions.common import get_server_host_registry
     from omnigent.server.routes._sessions.helpers import _get_runner_client_for_resource_access
 
     conv = await asyncio.to_thread(store.get_conversation, session_id)
     if conv is None:
         raise OmnigentError("Terminal session not found", code=ErrorCode.NOT_FOUND)
+    if linked_host_id is not None:
+        service = _linked_terminals
+        if service is None:
+            raise OmnigentError("Linked terminals unavailable", code=ErrorCode.CONFLICT)
+        user = await service.agent_owner(conv)
+        _, conn = await service.target(linked_host_id, user)
+        terminal = await service.resource(session_id, linked_host_id, terminal_id, user)
+        return (
+            conv,
+            conn,
+            _LinkedTerminalClient(service, session_id, linked_host_id, terminal_id, user),
+            {
+                "metadata": {**terminal, "running": True},
+            },
+        )
     host_id = await asyncio.to_thread(routing_host_id, conv, store)
     hosts = get_server_host_registry()
     conn = hosts.get(host_id) if hosts is not None and host_id is not None else None
@@ -93,13 +123,45 @@ async def _terminal_context(
     return conv, conn, client, resource
 
 
+@dataclass
+class _LinkedTerminalClient:
+    service: LinkedHostTerminals
+    session_id: str
+    host_id: str
+    terminal_id: str
+    user: str | None
+
+    async def patch(self, path: str, *, json: dict[str, Any], timeout: float) -> httpx.Response:
+        del path, timeout
+        from urllib.parse import quote
+
+        await self.service.resource(self.session_id, self.host_id, self.terminal_id, self.user)
+        resource = await self.service.call(
+            self.host_id,
+            self.user,
+            "PATCH",
+            f"/v1/host-terminals/{quote(self.terminal_id, safe='')}",
+            body=json,
+        )
+        return httpx.Response(200, json={"metadata": {**resource, "running": True}})
+
+
 def _current_instance(resource: dict[str, Any], instance_id: str) -> dict[str, Any]:
     metadata = resource["metadata"]
     if metadata.get("instance_id") != instance_id or metadata.get("running") is not True:
         raise OmnigentError("Terminal instance not found", code=ErrorCode.CONFLICT)
-    if metadata.get("elevated") is not True:
+    if "agent_tier" not in metadata and metadata.get("elevated") is not True:
         raise OmnigentError("Not an admin terminal", code=ErrorCode.CONFLICT)
     return metadata
+
+
+def _tier_covers(current: object, requested: str) -> bool:
+    tiers = ("off", "read", "read_write")
+    return current in tiers and tiers.index(current) >= tiers.index(requested)
+
+
+def _metadata_tier(metadata: dict[str, Any]) -> object:
+    return metadata.get("agent_tier", "read_write" if metadata.get("agent_access") else "off")
 
 
 async def terminal_access_card_fields(
@@ -125,13 +187,23 @@ async def terminal_access_card_fields(
     terminal, session_key, instance_id, reason = (
         tool_input[key] for key in ("terminal", "session", "instance_id", "reason")
     )
+    tier = tool_input.get("tier", "read_write")
+    if tier not in ("read", "read_write"):
+        raise OmnigentError("Invalid requested tier", code=ErrorCode.INVALID_INPUT)
     if len(reason) > 4096:
         raise OmnigentError("Terminal access reason is too long", code=ErrorCode.INVALID_INPUT)
-    terminal_id = terminal_resource_id(terminal, session_key)
-    conv, conn, _, resource = await _terminal_context(session_id, terminal_id, store)
+    linked_host_id = tool_input.get("host_id")
+    if linked_host_id is not None and (not isinstance(linked_host_id, str) or not linked_host_id):
+        raise OmnigentError("Invalid host_id", code=ErrorCode.INVALID_INPUT)
+    terminal_id = session_key if linked_host_id else terminal_resource_id(terminal, session_key)
+    conv, conn, _, resource = await _terminal_context(
+        session_id, terminal_id, store, linked_host_id
+    )
     if conn.owner is None:
         raise OmnigentError("Terminal host has no owner", code=ErrorCode.CONFLICT)
     metadata = _current_instance(resource, instance_id)
+    if tier == "read" and "agent_tier" not in metadata:
+        raise OmnigentError("Update the host for read-only access", code=ErrorCode.CONFLICT)
     key = (session_id, terminal_id, instance_id)
     with _lock:
         previous = _requests.get(key)
@@ -139,7 +211,7 @@ async def terminal_access_card_fields(
         await end_terminal_access_requests(session_id, terminal_id, instance_id, store)
     with _lock:
         existing = _requests.get(key)
-        if metadata.get("agent_access") is True:
+        if _tier_covers(_metadata_tier(metadata), tier):
             if (
                 existing is None
                 or not existing.approved
@@ -171,10 +243,13 @@ async def terminal_access_card_fields(
                 conn.host_id,
                 conn.owner,
                 time.monotonic() + timeout_s,
+                tier=tier,
+                linked=linked_host_id is not None,
             )
             _requests[key] = existing
         elif (
             existing.reason != reason
+            or existing.tier != tier
             or existing.host_id != conn.host_id
             or existing.owner != conn.owner
         ):
@@ -184,7 +259,9 @@ async def terminal_access_card_fields(
         "terminal_access_terminal_id": terminal_id,
         "terminal_access_instance_id": instance_id,
         "terminal_access_host_id": conn.host_id,
-        "message": f"Allow this session's agent to use admin terminal {terminal}:{session_key} "
+        "terminal_access_tier": tier,
+        "message": f"Allow this session's agent {tier} access to terminal "
+        f"{terminal}:{session_key} "
         f"on {conn.hello.name}? "
         f"Session: {conv.title or session_id}; agent: {conv.agent_id}. "
         f"Access lasts until this terminal closes or you turn it off. Reason: {reason}",
@@ -246,14 +323,25 @@ async def authorize_terminal_access_resolution(
         await asyncio.to_thread(
             resolve_host_owner, user_id=user_id, host_id=pending.host_id, host_store=host_store
         )
-        _, conn, client, resource = await _terminal_context(session_id, pending.terminal_id, store)
-        _current_instance(resource, pending.instance_id)
+        _, conn, client, resource = await _terminal_context(
+            session_id, pending.terminal_id, store, pending.host_id if pending.linked else None
+        )
+        metadata = _current_instance(resource, pending.instance_id)
         if conn.host_id != pending.host_id or conn.owner != pending.owner:
             raise OmnigentError("Terminal host ownership changed", code=ErrorCode.FORBIDDEN)
         try:
+            change: dict[str, Any] = {"instance_id": pending.instance_id}
+            if "agent_tier" in metadata:
+                change["agent_tier"] = pending.tier
+            elif pending.tier == "read":
+                raise OmnigentError(
+                    "Update the host for read-only access", code=ErrorCode.CONFLICT
+                )
+            else:
+                change["agent_access"] = True
             response = await client.patch(
                 f"/v1/sessions/{session_id}/resources/terminals/{pending.terminal_id}",
-                json={"agent_access": True, "instance_id": pending.instance_id},
+                json=change,
                 timeout=10,
             )
         except httpx.HTTPError as exc:
@@ -266,19 +354,24 @@ async def authorize_terminal_access_resolution(
             raise OmnigentError("Invalid terminal resource", code=ErrorCode.CONFLICT) from exc
         if not isinstance(updated, dict) or not isinstance(updated.get("metadata"), dict):
             raise OmnigentError("Invalid terminal resource", code=ErrorCode.CONFLICT)
-        if _current_instance(updated, pending.instance_id).get("agent_access") is not True:
+        if not _tier_covers(
+            _metadata_tier(_current_instance(updated, pending.instance_id)), pending.tier
+        ):
             raise OmnigentError("Terminal access was not granted", code=ErrorCode.CONFLICT)
         pending.approved = True
         from omnigent.server.routes._sessions.helpers import _publish_and_persist_resource_event
 
-        _publish_and_persist_resource_event(
-            session_id,
-            "session.resource.created",
-            pending.terminal_id,
-            "terminal",
-            store,
-            updated,
-        )
+        if pending.linked and _linked_terminals is not None:
+            _linked_terminals.changed(session_id)
+        else:
+            _publish_and_persist_resource_event(
+                session_id,
+                "session.resource.created",
+                pending.terminal_id,
+                "terminal",
+                store,
+                updated,
+            )
         logger.info(
             "Terminal agent access changed user=%s host=%s session=%s "
             "terminal=%s instance=%s enabled=True route=C",
@@ -318,7 +411,11 @@ def release_terminal_access_request(session_id: str, elicitation_id: str) -> Non
 
 
 async def settle_terminal_access_switch(
-    session_id: str, terminal_id: str, instance_id: str, enabled: bool, store: ConversationStore
+    session_id: str,
+    terminal_id: str,
+    instance_id: str,
+    enabled: bool | str,
+    store: ConversationStore,
 ) -> None:
     """Settle a web switch while its caller holds the instance resolution lock."""
     from omnigent.server.routes._sessions.common import get_server_runner_router
@@ -329,15 +426,18 @@ async def settle_terminal_access_switch(
         pending = _requests.get(key)
         if pending is None:
             return
-        pending.approved = enabled
-        if not enabled:
+        tier = ("read_write" if enabled else "off") if isinstance(enabled, bool) else enabled
+        if tier != "off" and not _tier_covers(tier, pending.tier):
+            return
+        pending.approved = tier != "off"
+        if tier == "off":
             _requests.pop(key, None)
     if pending_elicitations.lookup(pending.elicitation_id, conversation_id=session_id) is not None:
         await _resolve_elicitation(
             session_id,
             {
                 "elicitation_id": pending.elicitation_id,
-                "action": "accept" if enabled else "cancel",
+                "action": "accept" if pending.approved else "cancel",
             },
             get_server_runner_router(),
             store,

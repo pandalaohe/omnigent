@@ -696,6 +696,16 @@ def create_runner_tunnel_router(
                         )
                     )
 
+                if terminal_binding is not None:
+                    links = getattr(ws.app.state, "linked_host_terminals", None)
+                    if links is not None:
+                        owned.append(
+                            asyncio.create_task(
+                                links.sweep(terminal_binding.host_id),
+                                name=f"terminal-sweep:{runner_id}",
+                            )
+                        )
+
                 done, _pending = await asyncio.wait(
                     {sender_task, ping_task, receive_task},
                     return_when=asyncio.FIRST_COMPLETED,

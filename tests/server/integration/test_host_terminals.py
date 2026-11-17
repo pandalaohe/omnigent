@@ -27,7 +27,7 @@ from omnigent.host.frames import (
     encode_host_frame,
 )
 from omnigent.runner.host_terminals import create_host_terminal_app
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
+from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.frames import (
     PingFrame,
     PongFrame,
@@ -183,18 +183,24 @@ class FakeHost:
 
 
 @pytest.fixture
-def setup(runtime_init, db_uri, tmp_path):
+def setup(runtime_init, db_uri, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNIGENT_WS_ALLOWED_ORIGINS", "http://testserver")
     accounts = SqlAlchemyAccountStore(db_uri)
     owner = accounts.create_user_with_password("terminal-owner", "synthetic-hash", is_admin=True)
     other = accounts.create_user_with_password("other-admin", "synthetic-hash", is_admin=True)
 
     def headers(account):
         return {
-            "Authorization": "Bearer "
+            "Cookie": "ap_session="
             + mint_session_token(
-                account.id, _KEY, 3600, "accounts", account_generation=account.account_generation
+                account.id,
+                _KEY,
+                3600,
+                "accounts",
+                account_generation=account.account_generation,
+                browser_session=True,
             ),
-            "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+            "Origin": "http://testserver",
         }
 
     def make_server(port=None, *, auth_mode="accounts"):

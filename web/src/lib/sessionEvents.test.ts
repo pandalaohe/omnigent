@@ -2011,3 +2011,11 @@ describe("session.model_options (FLAT envelope)", () => {
     expect(out).toEqual([]);
   });
 });
+
+it("parses linked-terminal invalidation without resource contents", () => {
+  const event = parse("session.resource.changed", {
+    type: "session.resource.changed",
+    session_id: "session-a",
+  });
+  expect(event).toEqual([{ type: "session_resource_changed", sessionId: "session-a" }]);
+});

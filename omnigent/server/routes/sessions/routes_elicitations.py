@@ -285,6 +285,7 @@ def register_elicitations_routes(
                     "terminal_access_terminal_id",
                     "terminal_access_instance_id",
                     "terminal_access_host_id",
+                    "terminal_access_tier",
                 )
                 if key in params
             },

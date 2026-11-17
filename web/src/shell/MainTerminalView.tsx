@@ -497,6 +497,11 @@ export function MainTerminalView({
                   <span className="shrink-0 text-muted-foreground/60">
                     · {activeTerminal.session}
                   </span>
+                  {activeTerminal.hostName && (
+                    <span className="truncate rounded border px-1 text-xs text-muted-foreground">
+                      {activeTerminal.hostName}
+                    </span>
+                  )}
                   <TerminalStatusBadge status={getStatus(activeTerminal)} />
                 </span>
                 <span className="flex-1" />
@@ -533,22 +538,25 @@ export function MainTerminalView({
                   >
                     {terminal ? (
                       <>
-                        {terminal.elevated && (
-                          <TerminalAgentAccess
-                            conversationId={conversationId}
-                            terminal={terminal}
-                          />
-                        )}
+                        <TerminalAgentAccess conversationId={conversationId} terminal={terminal} />
                         <Suspense fallback={null}>
                           <TerminalView
-                            sessionId={conversationId}
-                            terminalId={terminal.id}
+                            {...(terminal.hostId
+                              ? { hostId: terminal.hostId }
+                              : {
+                                  sessionId: conversationId,
+                                  directAttachUrl: terminal.directAttachUrl,
+                                })}
+                            terminalId={terminal.hostTerminalId ?? terminal.id}
                             readOnly={readOnly}
                             active={visible && active && focused}
                             showKeyRows={!split || focused}
-                            directAttachUrl={terminal.directAttachUrl}
                             onResume={
-                              runnerOffline && onResume && !showLoading && !showResumeError
+                              !terminal.hostId &&
+                              runnerOffline &&
+                              onResume &&
+                              !showLoading &&
+                              !showResumeError
                                 ? () => handleResume()
                                 : undefined
                             }

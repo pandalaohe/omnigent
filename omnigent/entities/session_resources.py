@@ -166,7 +166,8 @@ def terminal_resource_view(session_id: str, entry: TerminalListEntry) -> Session
             "instance_id": entry.instance.instance_id,
             "origin": entry.instance.origin,
             "elevated": entry.instance.elevated,
-            "agent_access": entry.instance.agent_access if entry.instance.elevated else True,
+            "agent_access": entry.instance.agent_access,
+            "agent_tier": entry.instance.agent_tier,
             **(
                 {}
                 if entry.instance.elevated

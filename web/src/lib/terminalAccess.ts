@@ -3,6 +3,7 @@ export interface TerminalAccessRequest {
   terminalId: string;
   instanceId: string;
   hostId: string;
+  tier?: "read" | "read_write";
 }
 
 export function isTerminalAccessPolicyName(name: string): boolean {
@@ -27,5 +28,12 @@ export function parseTerminalAccess(value: unknown): TerminalAccessRequest | nul
     !hostId
   )
     return null;
-  return { owner, terminalId, instanceId, hostId };
+  const tier = params.terminal_access_tier;
+  return {
+    owner,
+    terminalId,
+    instanceId,
+    hostId,
+    ...(tier === "read" || tier === "read_write" ? { tier } : {}),
+  };
 }

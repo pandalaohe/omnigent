@@ -1,4 +1,6 @@
 /** UI-facing terminal record returned by the session resources API. */
+export type AgentTier = "off" | "read" | "read_write";
+
 export interface TerminalInfo {
   /** Opaque, stable resource id used for addressing and tab keys. */
   id: string;
@@ -19,6 +21,10 @@ export interface TerminalInfo {
   instanceId?: string;
   elevated?: boolean;
   agentAccess?: boolean;
+  agentTier?: AgentTier;
+  hostId?: string;
+  hostName?: string;
+  hostTerminalId?: string;
   origin?: "user" | "agent" | "harness";
 }
 
@@ -263,6 +269,9 @@ export function terminalInfoFromResource(resource: Record<string, unknown>): Ter
           elevated: metadata.elevated,
           agentAccess: metadata.elevated ? metadata.agent_access === true : true,
         }
+      : {}),
+    ...(["off", "read", "read_write"].includes(metadata.agent_tier as string)
+      ? { agentTier: metadata.agent_tier as AgentTier }
       : {}),
   };
 }

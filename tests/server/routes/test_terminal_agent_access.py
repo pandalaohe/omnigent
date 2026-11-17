@@ -28,6 +28,7 @@ from tests.server.routes.test_shell_permission_gate import _StubPermissionStore
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("method", ["POST", "PATCH"])
+@pytest.mark.parametrize("tier", [None, "read"])
 @pytest.mark.parametrize(
     "credential",
     [
@@ -48,6 +49,7 @@ async def test_admin_terminal_requires_host_owner_browser(
     caplog,
     method,
     credential,
+    tier,
 ):
     del runner_globals_reset
     owner = "owner@example.test"
@@ -122,17 +124,29 @@ async def test_admin_terminal_requires_host_owner_browser(
         headers["origin"] = "http://untrusted.example"
     path = f"/v1/sessions/{sid}/resources/terminals"
     body = {"terminal": "bash", "session_key": "admin", "elevated": True}
+    if tier is not None:
+        body["agent_tier"] = tier
     if method == "PATCH":
         path += "/terminal_bash_admin"
         body = {"agent_access": True, "instance_id": "instance-one"}
+        if tier is not None:
+            body = {"agent_tier": tier, "instance_id": "instance-one"}
     with caplog.at_level("INFO"):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app), base_url="http://server"
         ) as client:
             result = await client.request(method, path, json=body, headers=headers)
-    assert result.status_code == (200 if credential == "browser" else 403), result.text
-    assert runner.calls == ([(method, path)] if credential == "browser" else [])
-    if method == "PATCH" and credential == "browser":
+    expected_status = 403
+    if credential == "browser":
+        expected_status = 409 if tier == "read" else 200
+    assert result.status_code == expected_status, result.text
+    expected = ([("GET", path)] if method == "PATCH" else []) + [(method, path)]
+    if method == "PATCH" and tier == "read":
+        expected = [("GET", path)]
+    if method == "POST" and tier == "read":
+        expected = []
+    assert runner.calls == (expected if credential == "browser" else [])
+    if method == "PATCH" and credential == "browser" and tier is None:
         assert "instance=instance-one" in caplog.text and "route=W" in caplog.text
 
 

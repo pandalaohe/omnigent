@@ -3,12 +3,12 @@ import { useIsAdmin } from "./useIsAdmin";
 import { useSession } from "./useSession";
 import { isEditorLevel } from "@/lib/permissionsApi";
 
-export function useSessionTerminalAccess(conversationId: string) {
+export function useSessionTerminalAccess(conversationId: string, selectedHostId?: string) {
   const { session } = useSession(conversationId);
   const { data: hosts } = useHosts();
   const isAdmin = useIsAdmin();
   // /v1/hosts is owner-scoped, including when the session itself is shared.
-  const host = hosts?.find((item) => item.host_id === session?.hostId);
+  const host = hosts?.find((item) => item.host_id === (selectedHostId ?? session?.hostId));
   return {
     session,
     host,

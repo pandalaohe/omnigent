@@ -1059,6 +1059,12 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       sessionId,
     } satisfies SessionResourceDeletedEvent;
   }
+  if (eventType === "session.resource.changed") {
+    const sessionId = data.session_id;
+    return typeof sessionId === "string" && sessionId
+      ? { type: "session_resource_changed", sessionId }
+      : null;
+  }
   if (eventType === "session.child_session.updated") {
     const conversationId = data.conversation_id;
     const childSessionId = data.child_session_id;

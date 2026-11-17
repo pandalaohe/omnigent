@@ -233,6 +233,11 @@ export function TerminalsPanel({
                 <span className="truncate text-sm text-muted-foreground/70">
                   {t.elevated ? "root" : t.name}
                 </span>
+                {t.hostName && (
+                  <span className="truncate rounded border px-1 text-xs text-muted-foreground">
+                    {t.hostName}
+                  </span>
+                )}
                 <span className="flex-1" />
                 <TerminalStatusBadge status={getStatus(t)} />
               </button>
@@ -250,15 +255,17 @@ export function TerminalsPanel({
               key={`${conversationId}:${activeTerminal.id}:${activeTerminal.instanceId ?? ""}`}
               className="flex h-full flex-col"
             >
-              {activeTerminal.elevated && (
-                <TerminalAgentAccess conversationId={conversationId} terminal={activeTerminal} />
-              )}
+              <TerminalAgentAccess conversationId={conversationId} terminal={activeTerminal} />
               <Suspense fallback={null}>
                 <TerminalView
-                  sessionId={conversationId}
-                  terminalId={activeTerminal.id}
+                  {...(activeTerminal.hostId
+                    ? { hostId: activeTerminal.hostId }
+                    : {
+                        sessionId: conversationId,
+                        directAttachUrl: activeTerminal.directAttachUrl,
+                      })}
+                  terminalId={activeTerminal.hostTerminalId ?? activeTerminal.id}
                   readOnly={readOnly}
-                  directAttachUrl={activeTerminal.directAttachUrl}
                   onStateChange={(state) => {
                     setTerminalConnectionState(activeTerminal.id, state);
                   }}

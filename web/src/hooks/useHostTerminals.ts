@@ -7,6 +7,7 @@ export interface HostTerminal {
   elevated: boolean;
   created_at: number;
   attach_path: string;
+  linked_session_id?: string | null;
 }
 
 export function hostTerminalsPath(hostId: string): string {

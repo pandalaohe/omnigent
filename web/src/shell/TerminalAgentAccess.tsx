@@ -19,11 +19,81 @@ export function TerminalAgentAccess({
   conversationId: string;
   terminal: TerminalInfo;
 }) {
-  const context = useSessionTerminalAccess(conversationId);
+  if (!terminal.elevated && terminal.agentTier === undefined) return null;
+  return <TerminalAgentAccessControl conversationId={conversationId} terminal={terminal} />;
+}
+
+function TerminalAgentAccessControl({
+  conversationId,
+  terminal,
+}: {
+  conversationId: string;
+  terminal: TerminalInfo;
+}) {
+  const context = useSessionTerminalAccess(conversationId, terminal.hostId);
   const update = useTerminalAgentAccess(conversationId);
   const [confirmation, setConfirmation] = useState<{ instanceId: string; hostId: string } | null>(
     null,
   );
+  if (terminal.agentTier !== undefined) {
+    const labels = { off: "Off", read: "Read", read_write: "Read & write" } as const;
+    return (
+      <div className="shrink-0 border-b px-3 py-2 text-sm">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-medium">Agent access</span>
+          <div
+            role="group"
+            aria-label="Agent access"
+            className="inline-flex rounded-md border p-0.5"
+          >
+            {(["off", "read", "read_write"] as const).map((tier) => (
+              <Button
+                key={tier}
+                variant={terminal.agentTier === tier ? "secondary" : "ghost"}
+                size="sm"
+                aria-pressed={terminal.agentTier === tier}
+                disabled={
+                  !context.canManageAgentAccess ||
+                  !terminal.running ||
+                  !terminal.instanceId ||
+                  update.isPending
+                }
+                onClick={() =>
+                  update.mutate({
+                    terminalId: terminal.id,
+                    instanceId: terminal.instanceId!,
+                    tier,
+                    hostId: terminal.hostId,
+                    hostTerminalId: terminal.hostTerminalId,
+                  })
+                }
+              >
+                {labels[tier]}
+              </Button>
+            ))}
+          </div>
+          {terminal.hostName && (
+            <span className="rounded border px-1.5 text-xs text-muted-foreground">
+              {terminal.hostName}
+            </span>
+          )}
+        </div>
+        {terminal.elevated && terminal.agentTier === "read_write" && (
+          <p className="mt-1 text-destructive">
+            The agent can run administrator commands in this terminal.
+          </p>
+        )}
+        {!context.canManageAgentAccess && (
+          <p className="text-muted-foreground">Only the host owner can change agent access.</p>
+        )}
+        {update.isError && (
+          <p role="alert" className="text-destructive">
+            {update.error.message}
+          </p>
+        )}
+      </div>
+    );
+  }
   if (!terminal.elevated) return null;
   const enabled = terminal.agentAccess === true;
   const canChange =

@@ -1,353 +1,181 @@
-// Tests for the gated "new shell" affordance.
-//
-// The component is rendered with a real QueryClient and a stubbed
-// global fetch, so the access gate is exercised end-to-end through
-// the real useSessionAgent / useCreateTerminal hooks: the agent
-// response's `terminals` list decides visibility, and a click drives
-// the real POST body.
-
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { NewTerminalButton, NewAdminTerminalMenuItem } from "./NewTerminalButton";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+import { NewTerminalButton } from "./NewTerminalButton";
 
-const elevated = vi.hoisted(() => ({ allowed: false }));
-const toastMocks = vi.hoisted(() => ({ showToast: vi.fn() }));
-vi.mock("@/hooks/useSessionTerminalAccess", () => ({
-  useSessionTerminalAccess: () => ({ canCreateElevated: elevated.allowed }),
+const state = vi.hoisted(() => ({
+  shells: ["zsh", "bash"],
+  admin: true,
+  phone: false,
+  local: vi.fn(),
+  linked: vi.fn(),
+  launch: vi.fn(),
+  toast: vi.fn(),
 }));
-vi.mock("@/components/ui/toast", () => ({ showToast: toastMocks.showToast }));
-import type { TerminalFirstContextValue } from "./TerminalFirstContext";
-import { TerminalFirstContextProvider } from "./TerminalFirstContext";
+vi.mock("@/components/ui/toast", () => ({ showToast: state.toast }));
+vi.mock("@/hooks/useAgents", () => ({
+  useSessionAgent: () => ({ data: { terminals: state.shells } }),
+}));
+vi.mock("@/hooks/useSession", () => ({ useSession: () => ({ session: { hostId: "host-a" } }) }));
+vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => state.admin }));
+vi.mock("@/hooks/useIsPhone", () => ({ useIsPhone: () => state.phone }));
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: () => ({
+    data: [
+      {
+        host_id: "host-a",
+        name: "Session machine",
+        status: "online",
+        capabilities: ["terminal_elevated_v1"],
+      },
+      {
+        host_id: "host-b",
+        name: "Other machine",
+        status: "online",
+        capabilities: ["host_terminal_links_v1", "terminal_elevated_v1"],
+      },
+      {
+        host_id: "host-c",
+        name: "Offline machine",
+        status: "offline",
+        capabilities: ["host_terminal_links_v1"],
+      },
+      { host_id: "host-d", name: "Old machine", status: "online", capabilities: [] },
+    ],
+  }),
+}));
+vi.mock("@/hooks/useTerminals", () => ({
+  useCreateTerminal: () => ({ mutateAsync: state.local, launch: state.launch, isPending: false }),
+  terminalTabKey: (t: { id: string }) => `terminal:${t.id}`,
+}));
+vi.mock("@/hooks/useLinkedTerminals", () => ({
+  useCreateLinkedTerminal: () => ({ mutateAsync: state.linked, isPending: false }),
+}));
 
-function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
-  return {
-    ok: init?.ok ?? true,
-    status: init?.status ?? 200,
-    statusText: "OK",
-    json: async () => body,
-  } as unknown as Response;
+async function openMenu() {
+  fireEvent.pointerDown(screen.getByRole("button", { name: "New shell" }), { button: 0 });
+  await screen.findByRole("menuitem", { name: "Shell (zsh)" });
 }
-
-const fetchMock = vi.fn();
-
-/** Wire-shaped agent object with the given declared terminal names. */
-function agentWire(terminals: string[]): Record<string, unknown> {
-  return { id: "ag_1", object: "agent", name: "test-agent", terminals };
+async function options() {
+  await openMenu();
+  fireEvent.click(screen.getByRole("button", { name: "Shell options" }));
+  await screen.findByText("Shell options");
 }
-
-/** Minimal TerminalFirst context; only `isNativeWrapper` matters here. */
-function terminalFirstCtx(isNativeWrapper: boolean): TerminalFirstContextValue {
-  return {
-    isClaudeNative: false,
-    isNativeWrapper,
-    isTerminalFirst: isNativeWrapper,
-    isShellView: false,
-    view: "chat",
-    terminalViewKey: null,
-    setView: () => {},
-    terminalsAvailable: true,
-    terminalStartingUp: false,
-  } as TerminalFirstContextValue;
-}
-
-function renderButton(
-  onCreated?: (key: string) => void,
-  variant?: "icon" | "row",
-  isNativeWrapper = false,
-) {
-  const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  });
-  return render(
-    <QueryClientProvider client={queryClient}>
-      <TerminalFirstContextProvider value={terminalFirstCtx(isNativeWrapper)}>
-        <NewTerminalButton conversationId="conv_abc" onCreated={onCreated} variant={variant} />
-      </TerminalFirstContextProvider>
-    </QueryClientProvider>,
-  );
-}
-
 beforeEach(() => {
-  elevated.allowed = false;
-  toastMocks.showToast.mockReset();
-  fetchMock.mockReset();
-  vi.stubGlobal("fetch", fetchMock);
+  state.shells = ["zsh", "bash"];
+  state.admin = true;
+  state.phone = false;
+  state.local.mockReset().mockResolvedValue({ id: "local" });
+  state.linked.mockReset().mockResolvedValue({ id: "remote" });
+  state.launch.mockReset();
+  state.toast.mockReset();
+  localStorage.clear();
 });
+afterEach(cleanup);
 
-afterEach(() => {
-  cleanup();
-  vi.unstubAllGlobals();
-});
-
-describe("NewTerminalButton access gate", () => {
-  it("keeps the shell picker's admin creation callback after its menu closes", async () => {
-    elevated.allowed = true;
-    fetchMock.mockImplementation(async (_url, init) =>
-      mockResponse(
-        init?.method === "POST"
-          ? {
-              id: "terminal_root",
-              metadata: {
-                terminal_name: "shell",
-                session_key: "root-key",
-                running: true,
-                elevated: true,
-                instance_id: "instance-a",
-                agent_access: false,
-              },
-            }
-          : agentWire(["shell"]),
-      ),
+describe("unified shell entry", () => {
+  it("reports a delayed default launch failure after the menu unmounts", async () => {
+    let rejectLaunch!: (error: Error) => void;
+    state.launch.mockImplementation((_shell, callbacks) => {
+      rejectLaunch = callbacks.onError;
+    });
+    render(<NewTerminalButton conversationId="session" />);
+    await openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Shell (zsh)" }));
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    act(() => rejectLaunch(new Error("The terminal host went offline")));
+    expect(state.toast).toHaveBeenCalledWith(
+      "Couldn't open a shell: The terminal host went offline",
+      { duration: 0 },
     );
-    const created = vi.fn();
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(
-      <QueryClientProvider client={client}>
-        <DropdownMenu>
-          <DropdownMenuTrigger>Session menu</DropdownMenuTrigger>
-          <DropdownMenuContent>
-            <NewAdminTerminalMenuItem conversationId="conv_abc" onCreated={created} />
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </QueryClientProvider>,
-    );
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Session menu" }), { button: 0 });
-    fireEvent.click(await screen.findByRole("menuitem", { name: "New admin shell" }));
-    await waitFor(() => expect(created).toHaveBeenCalledWith("terminal:terminal_root"));
     expect(screen.queryByRole("menu")).toBeNull();
-    client.clear();
   });
-  it("shows the server refusal when admin creation fails", async () => {
-    elevated.allowed = true;
-    const refusal = "a trusted human browser session is required";
-    fetchMock.mockImplementation(async (_url, init) =>
-      init?.method === "POST"
-        ? mockResponse({ error: { message: refusal } }, { ok: false, status: 403 })
-        : mockResponse(agentWire(["shell"])),
-    );
-    const created = vi.fn();
-    renderButton(created);
-    await screen.findByRole("button", { name: "Choose shell" });
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Choose shell" }), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "New admin shell" }));
-
+  it("uses the shell selected in Options as the next default", async () => {
+    render(<NewTerminalButton conversationId="session" />);
+    await options();
+    fireEvent.change(screen.getByRole("combobox", { name: "Shell" }), {
+      target: { value: "bash" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open shell" }));
     await waitFor(() =>
-      expect(toastMocks.showToast).toHaveBeenCalledWith(
-        `Couldn't open an admin terminal: ${refusal}`,
-      ),
+      expect(state.local).toHaveBeenCalledWith(expect.objectContaining({ terminal: "bash" })),
     );
-    expect(created).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByRole("combobox", { name: "Shell" })).toBeNull());
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Shell (bash)" }));
+    expect(state.launch).toHaveBeenCalledWith("bash", expect.any(Object));
   });
-
-  it("adds Admin and sends elevated true for a capable owner", async () => {
-    elevated.allowed = true;
-    fetchMock.mockImplementation(async (_url, init) =>
-      mockResponse(
-        init?.method === "POST"
-          ? {
-              id: "terminal_root",
-              metadata: {
-                terminal_name: "shell",
-                session_key: "root-key",
-                running: true,
-                elevated: true,
-                instance_id: "instance-a",
-                agent_access: false,
-              },
-            }
-          : agentWire(["shell"]),
-      ),
-    );
-    const created = vi.fn();
-    renderButton(created);
-    await screen.findByRole("button", { name: "Choose shell" });
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Choose shell" }), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "New admin shell" }));
-    await waitFor(() => expect(created).toHaveBeenCalledWith("terminal:terminal_root"));
-    const post = fetchMock.mock.calls.find(([, init]) => init?.method === "POST");
-    expect(JSON.parse(post?.[1].body)).toMatchObject({ terminal: "shell", elevated: true });
+  it("opens phone options as a dismissible sheet without creating a shell", async () => {
+    state.phone = true;
+    render(<NewTerminalButton conversationId="session" />);
+    await openMenu();
+    fireEvent.click(screen.getByRole("button", { name: "Shell options" }));
+    const sheet = await screen.findByRole("dialog", { name: "Shell options" });
+    expect(within(sheet).getByRole("combobox", { name: "Host" })).toHaveValue("host-a");
+    fireEvent.click(within(sheet).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(state.local).not.toHaveBeenCalled();
+    expect(state.linked).not.toHaveBeenCalled();
   });
-  it("renders nothing when the agent declares no terminals", async () => {
-    fetchMock.mockResolvedValue(mockResponse(agentWire([])));
-
-    renderButton();
-
-    // Wait for the agent query to resolve so the absence below is the
-    // gate's decision, not just the loading state.
-    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
-    // The iff gate: no declared terminals → no affordance at all.
-    expect(screen.queryByRole("button", { name: /new shell/i })).toBeNull();
+  it("has one default Shell entry and no separate Admin entry", async () => {
+    render(<NewTerminalButton conversationId="session" />);
+    await openMenu();
+    expect(screen.getAllByRole("menuitem")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Shell (zsh)" }));
+    expect(state.launch).toHaveBeenCalledWith("zsh", expect.any(Object));
   });
-
-  it("creates the single declared terminal on click and focuses it", async () => {
-    fetchMock.mockImplementation(async (_url: string, init?: RequestInit) => {
-      if (init?.method === "POST") {
-        return mockResponse({
-          id: "terminal_shell_u-x1",
-          object: "session.resource",
-          type: "terminal",
-          session_id: "conv_abc",
-          name: "shell:u-x1",
-          metadata: { terminal_name: "shell", session_key: "u-x1", running: true },
-        });
-      }
-      return mockResponse(agentWire(["shell"]));
-    });
-    const onCreated = vi.fn();
-
-    renderButton(onCreated);
-
-    const button = await screen.findByRole("button", { name: /new shell/i });
-    fireEvent.click(button);
-
-    // The created terminal's tab key reaches the host surface so it
-    // can focus the new tab — a miss means the click created a
-    // terminal the user never sees selected.
-    await waitFor(() => expect(onCreated).toHaveBeenCalledWith("terminal:terminal_shell_u-x1"));
-
-    const postCall = fetchMock.mock.calls.find(
-      (call) => (call[1] as RequestInit | undefined)?.method === "POST",
-    ) as [string, RequestInit];
-    expect(postCall[0]).toBe("/v1/sessions/conv_abc/resources/terminals");
-    // The single declared name is used directly — no picker.
-    expect(JSON.parse(postCall[1].body as string).terminal).toBe("shell");
+  it("hides the entry when no shell is offered", () => {
+    state.shells = [];
+    render(<NewTerminalButton conversationId="session" />);
+    expect(screen.queryByRole("button", { name: "New shell" })).toBeNull();
   });
-
-  it("row variant renders a labeled list row that creates on click", async () => {
-    fetchMock.mockImplementation(async (_url: string, init?: RequestInit) => {
-      if (init?.method === "POST") {
-        return mockResponse({
-          id: "terminal_shell_u-x2",
-          object: "session.resource",
-          type: "terminal",
-          session_id: "conv_abc",
-          name: "shell:u-x2",
-          metadata: { terminal_name: "shell", session_key: "u-x2", running: true },
-        });
-      }
-      return mockResponse(agentWire(["shell"]));
-    });
-    const onCreated = vi.fn();
-
-    renderButton(onCreated, "row");
-
-    // The virtual row carries a visible label (not an icon-only
-    // tooltip button) so an empty Shells list reads as a list with one
-    // actionable entry.
-    const row = await screen.findByRole("button", { name: /new shell/i });
-    expect(row).toHaveTextContent("New shell");
-    fireEvent.click(row);
-
-    // Same create + focus contract as the icon variant — a divergence
-    // means the variants forked behavior, not just presentation.
-    await waitFor(() => expect(onCreated).toHaveBeenCalledWith("terminal:terminal_shell_u-x2"));
-  });
-});
-
-/**
- * Wire a fetch mock that answers the agent query with the given declared
- * terminals and echoes any create POST back as a terminal resource whose
- * ``terminal_name`` is the launched name.
- */
-function mockAgentAndCreate(terminals: string[]): void {
-  fetchMock.mockImplementation(async (_url: string, init?: RequestInit) => {
-    if (init?.method === "POST") {
-      const name = JSON.parse(init.body as string).terminal as string;
-      return mockResponse({
-        id: `terminal_${name}_u-xx`,
-        object: "session.resource",
-        type: "terminal",
-        session_id: "conv_abc",
-        name: `${name}:u-xx`,
-        metadata: { terminal_name: name, session_key: "u-xx", running: true },
-      });
-    }
-    return mockResponse(agentWire(terminals));
-  });
-}
-
-/** The POST body's ``terminal`` field for the single create call made so far. */
-function launchedTerminal(): string {
-  const postCall = fetchMock.mock.calls.find(
-    (call) => (call[1] as RequestInit | undefined)?.method === "POST",
-  ) as [string, RequestInit];
-  return JSON.parse(postCall[1].body as string).terminal;
-}
-
-describe("NewTerminalButton native shell picker", () => {
-  it("keeps admin creation absent when its capability is off", async () => {
-    mockAgentAndCreate(["zsh", "bash"]);
-    renderButton(vi.fn(), "row", true);
-    fireEvent.pointerDown(await screen.findByRole("button", { name: "Choose shell" }), {
-      button: 0,
-    });
-    expect(screen.getByRole("menuitem", { name: "zsh (default)" })).toBeVisible();
-    expect(screen.queryByRole("menuitem", { name: "New admin shell" })).toBeNull();
-  });
-  it("split button launches the default shell (declared[0]) on primary click", async () => {
-    // Native wrapper declares the host's installed shells, $SHELL first.
-    mockAgentAndCreate(["zsh", "bash", "fish"]);
-    const onCreated = vi.fn();
-
-    renderButton(onCreated, "icon", true);
-
-    // Primary segment is the "New shell" button; the caret is separate.
-    const primary = await screen.findByRole("button", { name: /^new shell$/i });
-    fireEvent.click(primary);
-
-    await waitFor(() => expect(onCreated).toHaveBeenCalledWith("terminal:terminal_zsh_u-xx"));
-    // The default ($SHELL, first) launches directly — no menu interaction.
-    expect(launchedTerminal()).toBe("zsh");
-  });
-
-  it("caret opens a picker that can launch a non-default shell", async () => {
-    mockAgentAndCreate(["zsh", "bash", "fish"]);
-    const onCreated = vi.fn();
-
-    renderButton(onCreated, "icon", true);
-
-    // Open the picker via the caret, then choose fish (not the default).
-    // Radix menus open on pointerdown, not click.
-    const caret = await screen.findByRole("button", { name: /choose shell/i });
-    fireEvent.pointerDown(caret, { button: 0 });
-    const fishItem = await screen.findByRole("menuitem", { name: /^fish$/ });
-    // While the menu is open: the default entry is labeled as such; the
-    // others are bare names. (Radix unmounts the menu on select, so this
-    // must be checked before clicking.)
-    expect(screen.queryByRole("menuitem", { name: /zsh \(default\)/i })).not.toBeNull();
-    fireEvent.click(fishItem);
-
-    await waitFor(() => expect(onCreated).toHaveBeenCalledWith("terminal:terminal_fish_u-xx"));
-    expect(launchedTerminal()).toBe("fish");
-  });
-
-  it("SDK agent with multiple terminals keeps a plain dropdown (no default click)", async () => {
-    // Not a native wrapper: distinct-purpose terminals, no privileged default.
-    mockAgentAndCreate(["worker", "shell"]);
-    const onCreated = vi.fn();
-
-    renderButton(onCreated, "icon", false);
-
-    // The whole control is the dropdown trigger — opening it (Radix opens on
-    // pointerdown) reveals the menu rather than launching anything, and there
-    // is no separate caret.
-    expect(screen.queryByRole("button", { name: /choose shell/i })).toBeNull();
-    const trigger = await screen.findByRole("button", { name: /new shell/i });
-    fireEvent.pointerDown(trigger, { button: 0 });
-    // No launch happened from opening the menu.
+  it("defaults Options to this session host and read/write, gates offline/old hosts", async () => {
+    render(<NewTerminalButton conversationId="session" />);
+    await options();
+    expect(screen.getByRole("combobox", { name: "Host" })).toHaveValue("host-a");
+    expect(screen.getByRole("option", { name: /Offline machine/ })).toBeDisabled();
+    expect(screen.getByRole("option", { name: /Old machine.*update the host/ })).toBeDisabled();
     expect(
-      fetchMock.mock.calls.some((c) => (c[1] as RequestInit | undefined)?.method === "POST"),
-    ).toBe(false);
-    // Picking the first entry launches it verbatim, unlabeled.
-    const workerItem = await screen.findByRole("menuitem", { name: /^worker$/ });
-    fireEvent.click(workerItem);
-    await waitFor(() => expect(onCreated).toHaveBeenCalledWith("terminal:terminal_worker_u-xx"));
-    expect(launchedTerminal()).toBe("worker");
+      within(screen.getByRole("group", { name: "Initial agent access" })).getByRole("button", {
+        name: "Read & write",
+      }),
+    ).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Open shell" }));
+    await waitFor(() =>
+      expect(state.local).toHaveBeenCalledWith({
+        terminal: "zsh",
+        elevated: false,
+        agentTier: "read_write",
+      }),
+    );
+  });
+  it("admin defaults to Off and other-host opening preserves the selected Read tier", async () => {
+    const created = vi.fn();
+    render(<NewTerminalButton conversationId="session" onCreated={created} />);
+    await options();
+    fireEvent.change(screen.getByRole("combobox", { name: "Host" }), {
+      target: { value: "host-b" },
+    });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Administrator" }));
+    const group = within(screen.getByRole("group", { name: "Initial agent access" }));
+    expect(group.getByRole("button", { name: "Off" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(group.getByRole("button", { name: "Read" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open shell" }));
+    await waitFor(() =>
+      expect(state.linked).toHaveBeenCalledWith({
+        host_id: "host-b",
+        elevated: true,
+        agent_tier: "read",
+      }),
+    );
+    expect(created).toHaveBeenCalledWith("terminal:remote");
+  });
+  it("shows why admin is unavailable and reports create errors", async () => {
+    state.admin = false;
+    state.local.mockRejectedValue(new Error("host unavailable"));
+    render(<NewTerminalButton conversationId="session" />);
+    await options();
+    expect(screen.getByRole("checkbox", { name: "Administrator" })).toBeDisabled();
+    expect(screen.getByText("Administrator access is required.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open shell" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("host unavailable");
   });
 });

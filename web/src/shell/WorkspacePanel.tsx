@@ -6,7 +6,6 @@ import {
   ChevronDownIcon,
   FileIcon,
   GlobeIcon,
-  Loader2Icon,
   MaximizeIcon,
   MessagesSquareIcon,
   MinimizeIcon,
@@ -62,9 +61,6 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -100,7 +96,7 @@ import {
   type TerminalInfo,
 } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
-import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
+import { ShellMenuEntry } from "./ShellMenuEntry";
 import { revealWorkspaceTab, WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
 import { FilesPanel } from "./FilesPanel";
 import { ContentSearchPanel } from "./ContentSearchPanel";
@@ -110,7 +106,6 @@ import { PullRequestPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
-import { useSessionTerminalAccess } from "@/hooks/useSessionTerminalAccess";
 import { TerminalAgentAccess } from "./TerminalAgentAccess";
 import type { RightRailTab } from "./railTabs";
 import {
@@ -259,13 +254,9 @@ function NewTabMenu({
 }) {
   const { data: agent } = useSessionAgent(conversationId);
   const create = useCreateTerminal(conversationId);
-  const { canCreateElevated } = useSessionTerminalAccess(conversationId);
   const newShellShortcut = useShortcutHint("newShell");
   const newBrowserShortcut = useShortcutHint("newBrowserTab");
   const connectState = shellConnectState(liveness);
-  // Remembered shell type, persisted across remounts/reloads. Seeded from
-  // localStorage so the "+" in either strip spot agrees on the current pick.
-  const [preferred, setPreferred] = useState<string | null>(() => readPreferredShell());
   // Controlled so a launch can force the menu closed on select.
   const [menuOpen, setMenuOpen] = useState(false);
   const onMenuOpenChange = (open: boolean) => {
@@ -277,10 +268,6 @@ function NewTabMenu({
   const declaredTerminals = agent?.terminals ?? [];
   const canOpenShell = declaredTerminals.length > 0;
   if (!canOpenShell && !onOpenBrowser && !onOpenSideChat && panels.length === 0) return null;
-
-  // The remembered shell, or the first declared type. Used only when shell
-  // access is available; the menu can also contain just built-in pages.
-  const defaultShell = resolveDefaultShell(declaredTerminals, preferred) as string;
 
   const launchShell = (name: string, elevated = false) => {
     setMenuOpen(false);
@@ -294,51 +281,14 @@ function NewTabMenu({
       onOpen: (info) => onOpenTerminal(terminalTabKey(info)),
       onError: (error, opened) => {
         onCreateError?.(opened);
-        if (elevated) toast.error(`Couldn't open an admin terminal: ${error.message}`);
+        toast.error(
+          `Couldn't open ${elevated ? "an admin terminal" : "a shell"}: ${error.message}`,
+        );
       },
     });
   };
 
-  // Launch a type and remember it as the new default for next time.
-  const pickShell = (name: string) => {
-    setPreferred(name);
-    writePreferredShell(name);
-    launchShell(name);
-  };
-
-  // One declared shell → a plain "Shell" item. Several → the same row carries a
-  // flyout to the other types.
-  const multipleShells = declaredTerminals.length > 1;
-  // The other declared types, shown in the row's flyout (the current default is
-  // already named in the row itself).
-  const otherShells = declaredTerminals.filter((name) => name !== defaultShell);
-
-  // Liveness-derived affordance for the "Shell" item. A create in flight on a
-  // wakeable session reads "Reconnecting…" (the server is waking the runner);
-  // an offline session disables the item since the browser can't reconnect it.
-  const isReconnecting = create.isPending && connectState === "wakeable";
   const shellDisabled = create.isPending || connectState === "offline";
-  // Icon + label + trailing hint for the "Shell" item. The label names the
-  // current default inline — "Shell (zsh)" — so the type is visible without
-  // opening the flyout.
-  const shellItemContent = (
-    <>
-      {isReconnecting ? (
-        <Loader2Icon className="size-4 animate-spin" />
-      ) : (
-        <TerminalIcon className="size-4" />
-      )}
-      <span className="whitespace-nowrap">
-        {isReconnecting ? "Reconnecting…" : `Shell (${defaultShell})`}
-      </span>
-      <span className="ml-auto flex items-center gap-2 pl-4">
-        {connectState === "offline" && (
-          <span className="text-sm text-muted-foreground">Offline</span>
-        )}
-        <WorkspaceMenuShortcut keys={newShellShortcut.keys} />
-      </span>
-    </>
-  );
 
   return (
     <DropdownMenu open={menuOpen} onOpenChange={onMenuOpenChange}>
@@ -399,58 +349,21 @@ function NewTabMenu({
             Side chat
           </DropdownMenuItem>
         )}
-        {canOpenShell &&
-          (multipleShells ? (
-            // Several types → a single "Shell (default)" row that launches the
-            // default on click and reveals a flyout of the OTHER types on hover.
-            // The sub-trigger's built-in chevron is hidden ([&>svg:last-child]) to
-            // keep the row clean. The click handler guards on ``shellDisabled``
-            // itself because Radix runs a sub-trigger's onClick before its own
-            // disabled check — without the guard an offline session would still
-            // fire a create.
-            <DropdownMenuSub>
-              <DropdownMenuSubTrigger
-                disabled={shellDisabled}
-                onClick={() => {
-                  if (!shellDisabled) launchShell(defaultShell);
-                }}
-                className="cursor-pointer [&>svg:last-child]:hidden"
-              >
-                {shellItemContent}
-              </DropdownMenuSubTrigger>
-              {/* min-w-0 drops the default 96px floor so the box hugs the shell
-                  name (e.g. "bash") instead of padding it out. */}
-              <DropdownMenuSubContent className="min-w-0">
-                <DropdownMenuLabel>Other shells</DropdownMenuLabel>
-                {otherShells.map((name) => (
-                  <DropdownMenuItem
-                    key={name}
-                    onSelect={() => pickShell(name)}
-                    disabled={shellDisabled}
-                    className="cursor-pointer"
-                  >
-                    {name}
-                  </DropdownMenuItem>
-                ))}
-              </DropdownMenuSubContent>
-            </DropdownMenuSub>
-          ) : (
-            // Single type → a plain launch item.
-            <DropdownMenuItem
-              onSelect={() => launchShell(defaultShell)}
-              disabled={shellDisabled}
-              className="cursor-pointer"
-            >
-              {shellItemContent}
-            </DropdownMenuItem>
-          ))}
-        {canOpenShell && canCreateElevated && (
-          <DropdownMenuItem
+        {canOpenShell && (
+          <ShellMenuEntry
+            conversationId={conversationId}
+            onCreated={onOpenTerminal}
             disabled={shellDisabled}
-            onSelect={() => launchShell(defaultShell, true)}
-          >
-            Admin
-          </DropdownMenuItem>
+            status={
+              connectState === "offline"
+                ? "Offline"
+                : create.isPending && connectState === "wakeable"
+                  ? "Reconnecting…"
+                  : undefined
+            }
+            onDefaultOpen={launchShell}
+            shortcut={<WorkspaceMenuShortcut keys={newShellShortcut.keys} />}
+          />
         )}
       </DropdownMenuContent>
     </DropdownMenu>
@@ -691,17 +604,16 @@ function RailTerminalView({
       key={`${terminal.id}:${terminal.instanceId ?? ""}`}
       className="flex h-full min-h-0 flex-col"
     >
-      {terminal.elevated && (
-        <TerminalAgentAccess conversationId={conversationId} terminal={terminal} />
-      )}
+      <TerminalAgentAccess conversationId={conversationId} terminal={terminal} />
       <Suspense fallback={null}>
         <TerminalView
-          sessionId={conversationId}
-          terminalId={terminal.id}
+          {...(terminal.hostId
+            ? { hostId: terminal.hostId }
+            : { sessionId: conversationId, directAttachUrl: terminal.directAttachUrl })}
+          terminalId={terminal.hostTerminalId ?? terminal.id}
           readOnly={readOnly}
           showKeyRows={false}
           focusOnConnect={autoFocus}
-          directAttachUrl={terminal.directAttachUrl}
           onStateChange={(state) => setTerminalConnectionState(terminal.id, state)}
           onActivity={() => markTerminalActive(terminal.id)}
         />

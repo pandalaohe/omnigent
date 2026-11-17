@@ -108,6 +108,7 @@ CAP_MCP_REGISTRY = "mcp_registry"
 # The host bounds a whole worktree create by ``HostCreateWorktreeFrame.timeout_s``:
 CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
 CAP_HOST_TERMINALS = "host_terminals_v1"
+CAP_HOST_TERMINAL_LINKS = "host_terminal_links_v1"
 
 # The server gates ``raw``/``within`` reads on this: an old host ignores unknown params silently.
 CAP_FS_READ_RAW = "fs_read_raw"
