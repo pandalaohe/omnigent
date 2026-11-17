@@ -2,7 +2,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { TerminalAgentAccess } from "./TerminalAgentAccess";
-import { terminalsQueryKey, type TerminalInfo } from "@/hooks/useTerminals";
+import { AGENT_TERMINAL_IDS, terminalsQueryKey, type TerminalInfo } from "@/hooks/useTerminals";
+import { linkedTerminalInfo } from "@/hooks/useLinkedTerminals";
 import { authenticatedFetch } from "@/lib/identity";
 import type * as Identity from "@/lib/identity";
 
@@ -60,6 +61,85 @@ beforeEach(() => {
   vi.mocked(authenticatedFetch).mockReset();
 });
 afterEach(cleanup);
+it.each([...AGENT_TERMINAL_IDS])("keeps the harness terminal %s free of access controls", (id) => {
+  const view = mount({ ...root, id, elevated: false, agentTier: "read_write" });
+  expect(view.container).toBeEmptyDOMElement();
+  expect(authenticatedFetch).not.toHaveBeenCalled();
+  view.dispose();
+});
+// A user shell may declare an agent terminal's name with a colliding key
+// (``claude`` + ``main``), so the id alone does not prove the pane is the
+// agent's. The runner's origin does, and the user's shell keeps its control.
+const collidingShell: TerminalInfo = { ...root, id: "terminal_claude_main", origin: "user" };
+
+it.each(["user", "agent"] as const)(
+  "keeps the control on a colliding id whose origin is %s",
+  (origin) => {
+    const view = mount({ ...collidingShell, origin, elevated: false, agentTier: "read_write" });
+    expect(screen.getByRole("group", { name: "Agent access" })).toBeInTheDocument();
+    view.dispose();
+  },
+);
+it.each(["user", "agent"] as const)(
+  "keeps the root switch on a colliding elevated id whose origin is %s",
+  (origin) => {
+    const view = mount({ ...collidingShell, origin });
+    expect(screen.getByRole("switch")).toBeInTheDocument();
+    view.dispose();
+  },
+);
+it("hides the control by origin when the id is the agent's own", () => {
+  const view = mount({
+    ...collidingShell,
+    origin: "harness",
+    elevated: false,
+    agentTier: "read_write",
+  });
+  expect(view.container).toBeEmptyDOMElement();
+  view.dispose();
+});
+it("falls back to the id rule when the resource carries no origin", () => {
+  const view = mount({ ...collidingShell, origin: undefined });
+  expect(view.container).toBeEmptyDOMElement();
+  expect(authenticatedFetch).not.toHaveBeenCalled();
+  view.dispose();
+});
+
+it("keeps a linked host shell's tier control and host badge", async () => {
+  const terminal = linkedTerminalInfo({
+    terminal_id: "a".repeat(32),
+    host_id: "host-a",
+    host_name: "Host A",
+    elevated: false,
+    instance_id: "instance-a",
+    agent_tier: "read_write",
+  });
+  vi.mocked(authenticatedFetch).mockResolvedValue(
+    Response.json({
+      terminal_id: "a".repeat(32),
+      host_id: "host-a",
+      host_name: "Host A",
+      elevated: false,
+      instance_id: "instance-a",
+      agent_tier: "read",
+    }),
+  );
+  const view = mount(terminal);
+  expect(screen.getByRole("group", { name: "Agent access" })).toBeInTheDocument();
+  expect(screen.getByText("Host A")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Read" }));
+  await waitFor(() =>
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      `/v1/sessions/session-a/host-terminals/host-a/${"a".repeat(32)}`,
+      expect.objectContaining({
+        method: "PATCH",
+        body: '{"agent_tier":"read","instance_id":"instance-a"}',
+      }),
+    ),
+  );
+  view.dispose();
+});
+
 it("lets an owner lower an ordinary shell to Read without a confirmation", async () => {
   const terminal: TerminalInfo = { ...root, elevated: false, agentTier: "read_write" };
   vi.mocked(authenticatedFetch).mockResolvedValue(
