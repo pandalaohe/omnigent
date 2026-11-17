@@ -746,6 +746,11 @@ def _extension_source() -> str:
 def native_support_source() -> str:
     """Keep generated native hooks on the same source and semantic classifier."""
     source = files(_EXTENSION_PACKAGE).joinpath("native_support.cjs").read_text()
+    client = files(_EXTENSION_PACKAGE).joinpath("scoped_client.cjs").read_text()
+    source = source.replace(
+        'require("./scoped_client.cjs")',
+        "(() => { const module = { exports: {} };\n" + client + "\nreturn module.exports; })()",
+    )
     policy = files("omnigent.permission_tiers").joinpath("native_support_rules.json").read_text()
     source = source.replace('require("../../permission_tiers/native_support_rules.json")', policy)
     return "(() => { const module = { exports: {} };\n" + source + "\nreturn module.exports; })()"

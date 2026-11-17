@@ -39,8 +39,9 @@ const dist = __PI_SDK_DIR__;
 const extensionPath = __OMNIGENT_EXTENSION__;
 const resourceAgentSource = __PI_RESOURCE_AGENT_DIR__;
 const scopedHandoff = __OMNIGENT_SCOPED_HANDOFF__;
+let handoff;
 (async () => {
-  const handoff = scopedHandoff
+  handoff = scopedHandoff
     ? await require(__OMNIGENT_SCOPED_CLIENT__).connectFromHandoff(scopedHandoff) : null;
   const load = (name) => import(pathToFileURL(path.join(dist, name)).href);
   const { setupCli } = await load("cli/setup.js");
@@ -90,6 +91,7 @@ const scopedHandoff = __OMNIGENT_SCOPED_HANDOFF__;
     extensionFactories: [{ name: "omnigent-permission", factory }],
   });
 })().catch(() => {
+  handoff?.connection.close();
   console.error("Pi cannot prove permission extension ordering; check Pi SDK/extension errors.");
   process.exitCode = 1;
 });
