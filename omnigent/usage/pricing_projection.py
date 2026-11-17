@@ -12,6 +12,8 @@ from omnigent.usage.price_resolution import row_value
 from omnigent.usage.pricing import Currency, PricingBaseline, PurchasedCard
 from omnigent.usage.value import Coverage, Value, combine, divide, exact, multiply, subtract
 
+VALUATION_CACHE_LIMIT = 4096
+
 
 def allocation(paid: Fraction, billing: tuple[int, int], selected: tuple[int, int]) -> Fraction:
     start, until = billing
@@ -28,6 +30,25 @@ def _matches(card: PurchasedCard, row: AnalysisRowView) -> bool:
     )
 
 
+def payment_periods(view, baseline, *, limit=None):
+    """One immutable window context shared by all analysis scopes."""
+    result = []
+    accounts = set(view.account_spans)
+    for card in baseline.cards:
+        if card.parent not in accounts and card.target_id not in accounts:
+            continue
+        span = view.account_spans.get(card.parent) or view.span
+        for index, billing in baseline.card_periods(
+            card, span.counted_from, span.until, int(view.generated_at)
+        ):
+            if limit is not None and len(result) >= limit:
+                from omnigent.stores.usage_hours_store import UsageReadLimit
+
+                raise UsageReadLimit("aggregation_over_limit")
+            result.append((card, index, billing))
+    return tuple(result)
+
+
 def _value_usage_stream(
     view: UsageAnalysisView,
     baseline: PricingBaseline,
@@ -41,6 +62,8 @@ def _value_usage_stream(
     card_models: dict[tuple[str, int], set[str]],
     include_components: bool = True,
     valuation_cache: dict | None = None,
+    payment_context=None,
+    include_payment: bool = True,
 ) -> Generator[None, list[AnalysisRowView] | None, dict[str, Any]]:
     """Never split a shared purchase by model or infer pool activity from payment."""
     pools = {(parent, pool) for parent in view.account_spans} if pool is not None else pools
@@ -73,27 +96,21 @@ def _value_usage_stream(
             **metadata,
         )
 
-    accounts = set(view.account_spans)
-    all_cards = [
-        card
-        for card in baseline.cards
-        if (card.parent in accounts or card.target_id in accounts)
-        and (
-            pools is None
-            or (card.target_kind == "pool" and (card.parent, card.target_id) in pools)
-        )
-        and (card_ids is None or card.id in card_ids)
-    ]
-    periods = [
-        (card, index, billing)
-        for card in all_cards
-        for index, billing in baseline.card_periods(
-            card,
-            (view.account_spans.get(card.parent) or view.span).counted_from,
-            (view.account_spans.get(card.parent) or view.span).until,
-            as_of,
-        )
-    ]
+    accounts = view.account_spans
+    periods = payment_context if payment_context is not None else payment_periods(view, baseline)
+
+    def selected_periods():
+        for card, index, billing in periods:
+            if (
+                (card.parent in accounts or card.target_id in accounts)
+                and (
+                    pools is None
+                    or (card.target_kind == "pool" and (card.parent, card.target_id) in pools)
+                )
+                and (card_ids is None or card.id in card_ids)
+            ):
+                yield card, index, billing
+
     cards = []
     paid_components = []
     known_paid_rows_partial = False
@@ -125,7 +142,9 @@ def _value_usage_stream(
         if row.agent_money_unknown:
             return unknown("agents_money_over_total")
         key = (id(row), id(card), id(recorded), len(card_models or ()) > 1)
-        if valuation_cache is None:
+        if valuation_cache is None or (
+            key not in valuation_cache and len(valuation_cache) >= VALUATION_CACHE_LIMIT
+        ):
             return row_value(row, baseline, card=card, card_models=card_models, recorded=recorded)
         if key not in valuation_cache:
             valuation_cache[key] = row_value(
@@ -133,7 +152,9 @@ def _value_usage_stream(
             )
         return valuation_cache[key]
 
-    for card, period_index, billing in periods:
+    for card, period_index, billing in selected_periods():
+        if not include_payment:
+            break
         # Per-account billing ranges can differ for reset-based selections.
         span = (
             view.account_spans.get(card.parent)
@@ -152,7 +173,6 @@ def _value_usage_stream(
         paid_full = Fraction(card.retail_amount) * Fraction(discount)
         paid = allocation(paid_full, billing, selected)
         period_values[(card.id, billing[0])] = (selected, paid)
-        original = exact(paid, unit="money", currency=card.purchase_currency, **metadata)
         converted = money(paid, card.purchase_currency)
         if models is not None:
             converted = unknown("shared_payment_cannot_be_split_by_model")
@@ -169,47 +189,53 @@ def _value_usage_stream(
                         "amount": money(paid_full, card.purchase_currency),
                     }
                 )
-        reset_results = []
-        for reset in card.reset_spans(period_index):
-            reset_paid = allocation(
-                paid_full, billing, (max(selected[0], reset[0]), min(selected[1], reset[1]))
-            )
-            reset_money = money(reset_paid, card.purchase_currency)
-            allowance = (
-                exact(Fraction(card.allowance_usd), unit="USD_allowance", **metadata)
-                if card.allowance_usd is not None
-                else unknown("no_allowance", "USD_allowance", None)
-            )
-            reset_results.append(
+        if include_components:
+            reset_results = []
+            for reset in card.reset_spans(period_index):
+                reset_paid = allocation(
+                    paid_full, billing, (max(selected[0], reset[0]), min(selected[1], reset[1]))
+                )
+                reset_money = money(reset_paid, card.purchase_currency)
+                allowance = (
+                    exact(Fraction(card.allowance_usd), unit="USD_allowance", **metadata)
+                    if card.allowance_usd is not None
+                    else unknown("no_allowance", "USD_allowance", None)
+                )
+                reset_results.append(
+                    {
+                        "start": reset[0],
+                        "until": reset[1],
+                        "paid": reset_money,
+                        "allowance": allowance,
+                        "paid_per_quota": divide(
+                            reset_money,
+                            allowance,
+                            unit="money_per_USD_allowance",
+                            currency=currency,
+                        ),
+                    }
+                )
+            cards.append(
                 {
-                    "start": reset[0],
-                    "until": reset[1],
-                    "paid": reset_money,
-                    "allowance": allowance,
-                    "paid_per_quota": divide(
-                        reset_money, allowance, unit="money_per_USD_allowance", currency=currency
+                    "id": card.id,
+                    "period_id": f"{card.id}:{billing[0]}",
+                    "repeats": card.repeats,
+                    "next_renewal": baseline.next_renewal(card, as_of),
+                    "name": card.name,
+                    "parent_account_id": card.parent,
+                    "pool_id": card.target_id if card.target_kind == "pool" else None,
+                    "starts_at": billing[0],
+                    "ends_at": billing[1],
+                    "effective_discount": discount,
+                    "original_paid": exact(
+                        paid, unit="money", currency=card.purchase_currency, **metadata
                     ),
+                    "paid": converted,
+                    "resets": reset_results,
+                    "api_value": unknown("per_card_usage_not_attributable"),
+                    "tokens": unknown("per_card_usage_not_attributable", "tokens", None),
                 }
             )
-        cards.append(
-            {
-                "id": card.id,
-                "period_id": f"{card.id}:{billing[0]}",
-                "repeats": card.repeats,
-                "next_renewal": baseline.next_renewal(card, as_of),
-                "name": card.name,
-                "parent_account_id": card.parent,
-                "pool_id": card.target_id if card.target_kind == "pool" else None,
-                "starts_at": billing[0],
-                "ends_at": billing[1],
-                "effective_discount": discount,
-                "original_paid": original,
-                "paid": converted,
-                "resets": reset_results,
-                "api_value": unknown("per_card_usage_not_attributable"),
-                "tokens": unknown("per_card_usage_not_attributable", "tokens", None),
-            }
-        )
 
     legacy_paid: dict[str, Fraction] = {}
     legacy_api: dict[str, Fraction] = {}
@@ -224,7 +250,7 @@ def _value_usage_stream(
                 if any(
                     _matches(card, row)
                     and b <= row.hour < min(e, baseline.replacement_boundary(card))
-                    for card, _, (b, e) in periods
+                    for card, _, (b, e) in selected_periods()
                 )
             ]
         rows = [
@@ -292,21 +318,28 @@ def _value_usage_stream(
                 default=None,
             )
 
-        for card, _, billing in periods:
-            context = period_values.get((card.id, billing[0]))
+        for card, _, billing in selected_periods():
+            span = view.account_spans.get(card.parent) or view.span
+            context = (
+                ((int(span.counted_from), int(span.until)), Fraction(0))
+                if not include_payment
+                else period_values.get((card.id, billing[0]))
+            )
             if context is None:
                 continue
             selected, paid = context
-            converted = money(paid, card.purchase_currency)
-            if models is not None:
-                converted = unknown("shared_payment_cannot_be_split_by_model")
+            paid_known = (
+                include_payment
+                and models is None
+                and defaults.fx_to_display.get(card.purchase_currency) is not None
+            )
             card_rows = [
                 row
                 for row in rows_by_parent.get(card.parent, [])
                 if _matches(card, row)
                 and billing[0] <= row.hour < min(billing[1], baseline.replacement_boundary(card))
             ]
-            if converted.low is not None:
+            if paid_known:
                 known_paid_cohort_units += sum(row.tokens or 0 for row in card_rows)
                 ratio_units_complete = ratio_units_complete and all(
                     row.tokens is not None for row in card_rows
@@ -338,7 +371,7 @@ def _value_usage_stream(
                     if source not in price_sources:
                         price_sources.append(source)
                 priced_units += valued.coverage.priced_units
-                if converted.low is not None:
+                if paid_known:
                     known_api += amount
                     known_priced_units += valued.coverage.priced_units
                     known_api_partial = known_api_partial or valued.state == "partial"
@@ -367,7 +400,7 @@ def _value_usage_stream(
                 key=lambda item: item.basis == "billed",
                 default=None,
             )
-            if billed is not None and billed.cost_usd is not None:
+            if include_payment and billed is not None and billed.cost_usd is not None:
                 legacy_precision = True
                 legacy_paid[row.parent_account_id] = legacy_paid.get(
                     row.parent_account_id, Fraction(0)
@@ -382,7 +415,7 @@ def _value_usage_stream(
                     )
                 known_paid_cohort_units += row.tokens or 0
                 ratio_units_complete = ratio_units_complete and row.tokens is not None
-            else:
+            elif include_payment:
                 missing_paid_accounts.add(row.parent_account_id)
             valued = value_row(row, recorded=listed)
             if valued.low is not None and row.tokens is not None:
@@ -400,7 +433,7 @@ def _value_usage_stream(
                 priced_units += valued.coverage.priced_units
                 if valued.state == "partial":
                     api_partial = True
-                if billed is not None:
+                if include_payment and billed is not None:
                     known_priced_units += valued.coverage.priced_units
                     known_api_partial = known_api_partial or valued.state == "partial"
                     known_api_high = (
@@ -582,7 +615,9 @@ def add_card_models(result, rows, view, baseline, *, limit=None) -> None:
                 and _matches(card, row)
                 and start <= row.hour < min(until, baseline.replacement_boundary(card))
             )
-            if limit is not None and sum(map(len, result.values())) > limit:
+            if limit is not None and (
+                len(result) > limit or sum(map(len, result.values())) > limit
+            ):
                 from omnigent.stores.usage_hours_store import UsageReadLimit
 
                 raise UsageReadLimit("card_models_over_limit")
@@ -633,6 +668,7 @@ class ValueUsageFold:
         include_accounts=True,
         include_components=True,
         valuation_cache=None,
+        payment_context=None,
     ):
         self.view, self.baseline = view, baseline
         self.include_accounts = include_accounts
@@ -666,6 +702,7 @@ class ValueUsageFold:
             card_models=context,
             include_components=include_components,
             valuation_cache=valuation_cache,
+            payment_context=payment_context,
             **self.options,
         )
         self.by_account = (
@@ -676,6 +713,7 @@ class ValueUsageFold:
                     card_models=context,
                     include_components=include_components,
                     valuation_cache=valuation_cache,
+                    payment_context=payment_context,
                     **self.options,
                 )
                 for key in self.accounts

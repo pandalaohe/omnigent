@@ -147,7 +147,10 @@ def read_analysis_v2(
             result, incomplete = collect_window(reader, filters, baseline, owner, evidence, budget)
         except UsageReadLimit as exc:
             result = AnalysisFold(
-                reader.metadata, baseline, filters, {None: {}, "host": {}}
+                reader.metadata,
+                baseline.model_copy(update={"cards": []}),
+                filters,
+                {None: {}, "host": {}},
             ).result()
             incomplete = str(exc)
         reason = reason or incomplete

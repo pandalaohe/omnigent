@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from itertools import batched
 from typing import Any, cast
 
 from sqlalchemy import CursorResult, delete, func, select, tuple_
@@ -159,12 +160,20 @@ class UsageEvidenceStore:
             alias_query = alias_query.where(SqlUsagePriceAliases.account_id == account)
         if model is not None:
             query = query.where(table.model == model)
-        if keys is not None:
-            query = query.where(tuple_(table.account_id, table.hour_utc, table.model).in_(keys))
         with self.sessions._read_session()("read_price_evidence") as session:
+            # Three binds per key plus scope/range predicates fit even SQLite's 999 limit.
+            queries = (
+                (
+                    query.where(tuple_(table.account_id, table.hour_utc, table.model).in_(batch))
+                    for batch in batched(keys, 250)
+                )
+                if keys is not None
+                else (query,)
+            )
             rows = [
                 {column.name: getattr(row, column.name) for column in table.__table__.columns}
-                for row in session.scalars(query)
+                for selected in queries
+                for row in session.scalars(selected)
             ]
             aliases = [
                 {

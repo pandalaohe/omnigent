@@ -514,7 +514,13 @@ class UsageAnalysisHoursView(BaseModel):
     span: AnalysisSpan
     complete: bool
     incomplete_reason: (
-        Literal["hour_over_limit", "scan_over_limit", "card_models_over_limit"] | None
+        Literal[
+            "hour_over_limit",
+            "scan_over_limit",
+            "card_models_over_limit",
+            "aggregation_over_limit",
+        ]
+        | None
     )
     approx: bool
     hours: list[AnalysisHourV2]
@@ -529,7 +535,13 @@ class UsageAnalysisV2View(BaseModel):
     tz: str
     complete: bool
     incomplete_reason: (
-        Literal["hour_over_limit", "scan_over_limit", "card_models_over_limit"] | None
+        Literal[
+            "hour_over_limit",
+            "scan_over_limit",
+            "card_models_over_limit",
+            "aggregation_over_limit",
+        ]
+        | None
     )
     approx: bool
     totals: AnalysisAmountsV2

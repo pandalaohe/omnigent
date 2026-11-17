@@ -59,7 +59,12 @@ export interface UsageAnalysisV2 {
   tz: string;
   span: UsageAnalysis["span"];
   complete: boolean;
-  incomplete_reason: "hour_over_limit" | "scan_over_limit" | "card_models_over_limit" | null;
+  incomplete_reason:
+    | "hour_over_limit"
+    | "scan_over_limit"
+    | "card_models_over_limit"
+    | "aggregation_over_limit"
+    | null;
   approx: boolean;
   totals: AnalysisAmounts;
   series: (AnalysisAmounts & { at: number | string })[];

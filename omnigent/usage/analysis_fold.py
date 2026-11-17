@@ -6,10 +6,16 @@ from fractions import Fraction
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from omnigent.stores.usage_hours_store import UsageReadLimit
 from omnigent.usage.analysis_filters import local_day, local_slot
 from omnigent.usage.contract import AnalysisSpan
-from omnigent.usage.pricing_projection import ValueUsageFold, _PricingFold
+from omnigent.usage.pricing_projection import ValueUsageFold, _PricingFold, payment_periods
 from omnigent.usage.value import Value, endpoint
+
+SCOPE_LIMIT = 2048
+ACCUMULATOR_LIMIT = 50000
+PAYMENT_PERIOD_LIMIT = 20000
+
 
 KINDS = {
     "input": "uncached_input_tokens",
@@ -136,6 +142,8 @@ class ScopeFold:
         pools=None,
         card_ids=None,
         valuation_cache=None,
+        payment_context=None,
+        payment=True,
     ):
         view = view.model_copy(update={"rows": []})
         if parents is not None:
@@ -147,27 +155,20 @@ class ScopeFold:
                 }
             )
         self.view = view
-        self.pricing = ValueUsageFold(
-            view,
-            baseline,
-            pools=pools,
-            card_ids=card_ids,
-            card_models=card_models,
-            include_accounts=False,
-            include_components=False,
-            valuation_cache=valuation_cache,
+        options = {
+            "pools": pools,
+            "card_ids": card_ids,
+            "card_models": card_models,
+            "include_components": False,
+            "valuation_cache": valuation_cache,
+            "payment_context": payment_context,
+        }
+        self.pricing = (
+            ValueUsageFold(view, baseline, include_accounts=False, **options) if payment else None
         )
         self.api = (
-            _PricingFold(
-                view,
-                baseline,
-                pools=pools,
-                card_ids=card_ids,
-                card_models=card_models,
-                include_components=False,
-                valuation_cache=valuation_cache,
-            )
-            if self.pricing.classes
+            _PricingFold(view, baseline, include_payment=False, **options)
+            if self.pricing is None or self.pricing.classes
             else None
         )
         self.card_ids = card_ids
@@ -177,17 +178,23 @@ class ScopeFold:
         partial = partial or any(row.reason for row in rows)
         if partial:
             self.counts.coverage = True
-            self.pricing.mark_partial()
+            if self.pricing is not None:
+                self.pricing.mark_partial()
             if self.api is not None:
                 self.api.view.partial = True
         self.counts.add(rows)
-        self.pricing.add(rows)
+        if self.pricing is not None:
+            self.pricing.add(rows)
         if self.api is not None:
             self.api.add(rows)
 
     def result(self, *, payment=True):
-        priced = self.pricing.result()
-        api = self.api.result() if self.api is not None else priced
+        if self.pricing is not None:
+            priced = self.pricing.result()
+        else:
+            assert self.api is not None
+            priced = self.api.result()
+        api = self.api.result() if self.api is not None and self.pricing is not None else priced
         result = {
             **self.counts.result(),
             "api_value": api["api_value"],
@@ -214,7 +221,10 @@ class AnalysisFold:
         self.card_models = card_models
         self.zone = ZoneInfo(filters.tz)
         self.valuation_cache = {}
-        self.total = self.scope()
+        self.scope_count = self.accumulator_count = 0
+        self.payment_context = payment_periods(view, baseline, limit=PAYMENT_PERIOD_LIMIT)
+        self.restricted = bool(filters.host or filters.agent or filters.model or filters.slot)
+        self.total = self.scope(payment=not self.restricted)
         self.series = {}
         self.groups = {}
         self.facets = {name: {} for name in ("account", "model", "host", "agent")}
@@ -233,7 +243,18 @@ class AnalysisFold:
             for offset in range((end - start).days + 1):
                 self.day(start + timedelta(days=offset))
 
-    def scope(self, *, parents=None, pools=None, card_ids=None, omit=None, span=None):
+    def reserve(self):
+        if self.accumulator_count >= ACCUMULATOR_LIMIT:
+            raise UsageReadLimit("aggregation_over_limit")
+        self.accumulator_count += 1
+
+    def scope(
+        self, *, parents=None, pools=None, card_ids=None, omit=None, span=None, payment=False
+    ):
+        if self.scope_count >= SCOPE_LIMIT:
+            raise UsageReadLimit("aggregation_over_limit")
+        self.reserve()
+        self.scope_count += 1
         if self.filters.account and omit != "account":
             parents = (
                 set(self.filters.account)
@@ -253,6 +274,8 @@ class AnalysisFold:
             pools=pools,
             card_ids=card_ids,
             valuation_cache=self.valuation_cache,
+            payment_context=self.payment_context,
+            payment=payment,
         )
 
     def day(self, day):
@@ -343,6 +366,8 @@ class AnalysisFold:
                         pools=pools,
                         card_ids={key} if self.filters.group == "card" else None,
                         omit=self.filters.group,
+                        payment=self.filters.group in {"account", "pool", "card"}
+                        and not self.restricted,
                     ),
                     "trend": {},
                 }
@@ -354,7 +379,10 @@ class AnalysisFold:
                     if self.view.span.until - self.view.span.requested_from <= 48 * 3600
                     else day
                 )
-                self.groups[key]["trend"].setdefault(bucket, CountsFold()).add([row])
+                if bucket not in self.groups[key]["trend"]:
+                    self.reserve()
+                    self.groups[key]["trend"][bucket] = CountsFold()
+                self.groups[key]["trend"][bucket].add([row])
         for dimension, facets in self.facets.items():
             values = defaultdict(list)
             for row in source(omit=dimension, dimension=dimension):
@@ -409,7 +437,7 @@ class AnalysisFold:
                         until=min(hour + 3600, self.view.span.until),
                         approx=self.view.span.approx,
                     )
-                    amounts = self.scope(span=span)
+                    amounts = self.scope(span=span, payment=not self.restricted)
                     amounts.add(group, partial=partial)
                     self.days[key]["hours"][hour]["amounts"] = amounts.result(
                         payment=not (
@@ -419,6 +447,8 @@ class AnalysisFold:
                             or self.filters.slot
                         )
                     )
+                    self.scope_count -= 1
+                    self.accumulator_count -= 1
         for row in selected:
             key = local_slot(row.hour, self.zone)[0]
             if key not in self.days:
@@ -432,11 +462,15 @@ class AnalysisFold:
                         ("host", row.host_id),
                         ("model", row.model),
                     ):
+                        if value not in hour[dimension]:
+                            self.reserve()
                         hour[dimension][value] += row.tokens or 0
         for row in selected if agent_rows is None else agent_rows:
             key = local_slot(row.hour, self.zone)[0]
             hour = self.days.get(key, {}).get("hours", {}).get(row.hour)
             if hour is not None and row.contributes_usage:
+                if row.agent not in hour["agent"]:
+                    self.reserve()
                 hour["agent"][row.agent] += row.tokens or 0
 
     def result(self) -> dict[str, Any]:

@@ -19607,7 +19607,8 @@
                 "enum": [
                   "hour_over_limit",
                   "scan_over_limit",
-                  "card_models_over_limit"
+                  "card_models_over_limit",
+                  "aggregation_over_limit"
                 ],
                 "type": "string"
               },
@@ -19704,7 +19705,8 @@
                 "enum": [
                   "hour_over_limit",
                   "scan_over_limit",
-                  "card_models_over_limit"
+                  "card_models_over_limit",
+                  "aggregation_over_limit"
                 ],
                 "type": "string"
               },
@@ -30775,6 +30777,7 @@
     },
     "/v1/me/usage/analysis": {
       "get": {
+        "description": "With group, v2 requires an explicit range and accepts repeated filters.",
         "operationId": "read_analysis_v1_me_usage_analysis_get",
         "parameters": [
           {
@@ -30847,7 +30850,11 @@
             "schema": {
               "anyOf": [
                 {
-                  "type": "string"
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 64,
+                  "type": "array"
                 },
                 {
                   "type": "null"
@@ -30879,7 +30886,11 @@
             "schema": {
               "anyOf": [
                 {
-                  "type": "string"
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 64,
+                  "type": "array"
                 },
                 {
                   "type": "null"
@@ -30980,6 +30991,14 @@
             "schema": {
               "anyOf": [
                 {
+                  "enum": [
+                    "account",
+                    "pool",
+                    "model",
+                    "card",
+                    "host",
+                    "agent"
+                  ],
                   "type": "string"
                 },
                 {
@@ -31031,6 +31050,7 @@
                   "items": {
                     "type": "string"
                   },
+                  "maxItems": 64,
                   "type": "array"
                 },
                 {
@@ -31050,6 +31070,7 @@
                   "items": {
                     "type": "string"
                   },
+                  "maxItems": 64,
                   "type": "array"
                 },
                 {
@@ -31067,6 +31088,10 @@
               "anyOf": [
                 {
                   "items": {
+                    "enum": [
+                      "previous",
+                      "rows"
+                    ],
                     "type": "string"
                   },
                   "type": "array"
@@ -31115,6 +31140,180 @@
     "/v1/me/usage/analysis/hours": {
       "get": {
         "operationId": "read_analysis_hours_v1_me_usage_analysis_hours_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "group",
+            "required": true,
+            "schema": {
+              "enum": [
+                "account",
+                "pool",
+                "model",
+                "card",
+                "host",
+                "agent"
+              ],
+              "title": "Group",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "range",
+            "required": true,
+            "schema": {
+              "enum": [
+                "today",
+                "d7",
+                "d30",
+                "d90",
+                "custom"
+              ],
+              "title": "Range",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "day",
+            "required": true,
+            "schema": {
+              "format": "date",
+              "title": "Day",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tz",
+            "required": false,
+            "schema": {
+              "default": "UTC",
+              "title": "Tz",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "account",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 64,
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Account"
+            }
+          },
+          {
+            "in": "query",
+            "name": "model",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 64,
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Model"
+            }
+          },
+          {
+            "in": "query",
+            "name": "host",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 64,
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Host"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 64,
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent"
+            }
+          },
+          {
+            "in": "query",
+            "name": "slot",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Slot"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "enum": [
+                      "previous",
+                      "rows"
+                    ],
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Include"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -31125,6 +31324,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "Read Analysis Hours"

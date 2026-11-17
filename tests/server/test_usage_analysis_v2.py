@@ -709,3 +709,139 @@ async def test_warning_reaches_report_api(service):
     assert response.status_code == 200, response.text
     assert response.json()["applied"] == 1
     assert response.json()["warnings"][0]["reason"] == "agents_over_total"
+
+
+def test_payment_free_scopes_share_context_and_skip_reset_display(monkeypatch):
+    from omnigent.usage.analysis_fold import AnalysisFold
+    from omnigent.usage.pricing import PurchasedCard
+    from omnigent.usage.pricing_projection import _PricingFold, card_model_sets
+    from tests.server.test_usage_pricing_math import baseline, card, view
+
+    purchase = card(repeats=True, starts_on="2026-01-01")
+    source, saved = view(purchase), baseline(purchase)
+    source.span = source.span.model_copy(update={"until": source.span.until + 70 * 86400})
+    source.account_spans = {"account-a": source.span}
+    source.generated_at = source.span.until
+    models = card_model_sets(source, saved)
+
+    def no_reset_display(*args):
+        pytest.fail("component-free folds must not construct card reset displays")
+
+    monkeypatch.setattr(PurchasedCard, "reset_spans", no_reset_display)
+    fold = AnalysisFold(
+        source,
+        saved,
+        AnalysisFilter(group="host", range="d7"),
+        {None: models, "host": models},
+    )
+    for index in range(20):
+        fold.add([source.rows[0].model_copy(update={"host_id": str(index), "model": str(index)})])
+    assert len(fold.payment_context) > 5
+    scopes = [entry["counts"] for entry in fold.groups.values()]
+    scopes += [item for facet in fold.facets.values() for item in facet.values()]
+    for scope in scopes:
+        assert scope.pricing is None
+        state = scope.api.stream.gi_frame.f_locals
+        assert state["periods"] is fold.payment_context
+        assert state["cards"] == state["paid_components"] == []
+        assert state["period_values"] == {}
+        assert state["ratio_items"] == set()
+    totals = fold.result()["totals"]
+    plain = _PricingFold(source, saved, card_models=models, include_components=False)
+    plain.add(source.rows)
+    assert Fraction(totals["api_value"].low) == 20 * Fraction(plain.result()["api_value"].low)
+
+
+def test_aggregation_scope_bound_is_explicit_and_reported(service, monkeypatch):
+    import omnigent.usage.analysis_fold as module
+    from omnigent.stores.usage_hours_store import UsageReadLimit
+    from tests.server.test_usage_pricing_math import baseline, view
+
+    monkeypatch.setattr(module, "SCOPE_LIMIT", 16)
+    source, saved = view(), baseline()
+    fold = module.AnalysisFold(
+        source, saved, AnalysisFilter(group="host", range="d7"), {None: {}, "host": {}}
+    )
+    with pytest.raises(UsageReadLimit, match="aggregation_over_limit"):
+        for index in range(100):
+            fold.add([source.rows[0].model_copy(update={"host_id": str(index)})])
+    assert fold.scope_count == 16
+    assert sum(len(items) for items in fold.facets.values()) + len(fold.groups) < 16
+    fold.result()  # A refused addition must leave a serializable partial fold.
+
+    monkeypatch.setattr(module, "SCOPE_LIMIT", 9)
+    entries = [
+        ActivityEntryV2(hour=HOUR, model=str(index), host=str(index), tokens=1)
+        for index in range(10)
+    ]
+    service.report_account(
+        OWNER, "plan", UsageReportV2(schema_version=2, observed_at=NOW, activity=entries), now=NOW
+    )
+    response = read_analysis_v2(service, OWNER, AnalysisFilter(group="host", range="d7"), now=NOW)
+    assert response["complete"] is False
+    assert response["incomplete_reason"] == "aggregation_over_limit"
+
+
+def test_aggregation_entry_and_payment_period_bounds(monkeypatch):
+    import omnigent.usage.analysis_fold as module
+    from omnigent.stores.usage_hours_store import UsageReadLimit
+    from omnigent.usage.pricing_projection import payment_periods
+    from tests.server.test_usage_pricing_math import baseline, card, view
+
+    source, saved = view(), baseline()
+    fold = module.AnalysisFold(
+        source, saved, AnalysisFilter(group="host", range="d7"), {None: {}, "host": {}}
+    )
+    monkeypatch.setattr(module, "ACCUMULATOR_LIMIT", fold.accumulator_count + 2)
+    fold.reserve()
+    fold.reserve()
+    with pytest.raises(UsageReadLimit, match="aggregation_over_limit"):
+        fold.reserve()
+    assert fold.accumulator_count == module.ACCUMULATOR_LIMIT
+    purchase = card(repeats=True)
+    saved = baseline(purchase)
+    long = source.model_copy(
+        update={
+            "span": source.span.model_copy(update={"until": source.span.until + 90 * 86400}),
+            "account_spans": {},
+        }
+    )
+    long.account_spans = {"account-a": long.span}
+    long.generated_at = long.span.until
+    with pytest.raises(UsageReadLimit, match="aggregation_over_limit"):
+        payment_periods(long, saved, limit=2)
+
+
+@pytest.mark.asyncio
+async def test_v2_openapi_repeated_filters_and_required_hours_queries(service):
+    app = FastAPI()
+    app.include_router(
+        create_agent_quota_router(service, auth_provider=None, host_store=None), prefix="/v1"
+    )
+    schema = app.openapi()
+    for path in ("/v1/me/usage/analysis", "/v1/me/usage/analysis/hours"):
+        params = {p["name"]: p for p in schema["paths"][path]["get"]["parameters"]}
+        for name in ("account", "model", "host", "agent", "include"):
+            variants = params[name]["schema"].get("anyOf", [params[name]["schema"]])
+            assert any(item.get("type") == "array" for item in variants), (path, name)
+        if path.endswith("/hours"):
+            assert {name for name, param in params.items() if param["required"]} == {
+                "group",
+                "range",
+                "day",
+            }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        for query in (
+            "range=d7&day=2026-11-05",
+            "group=host&day=2026-11-05",
+            "group=host&range=d7",
+        ):
+            assert (await client.get("/v1/me/usage/analysis/hours?" + query)).status_code == 422
+        response = await client.get(
+            "/v1/me/usage/analysis?group=host&range=d7&account=b&account=a&model=y&model=x"
+        )
+        assert response.status_code == 200
+        assert response.json()["filter"]["account"] == ["a", "b"]
+        assert response.json()["filter"]["model"] == ["x", "y"]

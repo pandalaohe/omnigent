@@ -180,3 +180,53 @@ def test_daily_prune_covers_workspaces_and_last_confirmation(db_uri, confirmatio
             assert store.read_events(OWNER)[2] == 0
             expected = ["new", "old"] if confirmation_age_days == 0 else ["new"]
             assert [row["source"] for row in store.read_sources(OWNER)] == expected
+
+
+def test_price_evidence_keys_are_batched_below_sqlite_bind_limit(db_uri):
+    from sqlalchemy import event as sql_event
+    from sqlalchemy import insert
+
+    from omnigent.db.db_models import SqlUsagePriceEvidence
+    from omnigent.db.utils import run_write_transaction
+
+    store = UsageEvidenceStore(db_uri)
+    engine = get_or_create_engine(db_uri)
+    hour = int(now_epoch() // 3600) * 3600 - 3600
+    keys = {("plan", hour, f"model-{index}") for index in range(11000)}
+    values = [
+        {
+            "workspace_id": workspace,
+            "owner_id": owner,
+            "account_id": account,
+            "hour_utc": stamp,
+            "model": model,
+            "updated_at": hour,
+        }
+        for workspace, owner in ((0, OWNER), (0, "other@example.test"), (7, OWNER))
+        for account, stamp, model in keys
+    ]
+
+    def write(session):
+        for start in range(0, len(values), 250):
+            session.execute(insert(SqlUsagePriceEvidence), values[start : start + 250])
+
+    run_write_transaction(store.sessions._write_session(), "test_bulk_price_keys", write)
+    bind_counts = []
+
+    def record(connection, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT") and "usage_price_evidence" in statement:
+            bind_counts.append(len(parameters))
+
+    sql_event.listen(engine, "before_cursor_execute", record)
+    try:
+        rows, aliases = store.read_prices(
+            OWNER, hour, hour + 3600, keys=keys, include_aliases=False
+        )
+        assert {(r["account_id"], r["hour_utc"], r["model"]) for r in rows} == keys
+        assert len(rows) == len(keys) and aliases == []
+        assert all(r["owner_id"] == OWNER and r["workspace_id"] == 0 for r in rows)
+        assert len(bind_counts) == 44 and max(bind_counts) < 999
+        assert store.read_prices(OWNER, hour, hour + 3600, keys=set())[0] == []
+        assert store.read_prices(OWNER, hour + 3600, hour + 7200, keys=keys)[0] == []
+    finally:
+        sql_event.remove(engine, "before_cursor_execute", record)
