@@ -5,7 +5,7 @@
 // against the server's fake engine.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { parseDictationEvent, restoreDictationPunctuation } from "./dictation";
+import { DictationSession, parseDictationEvent, restoreDictationPunctuation } from "./dictation";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -94,4 +94,47 @@ it("preserves cleaned tail and typed loss metadata", () => {
     code: "third_party_failed",
     undelivered: { segments: 2, seconds: 1 },
   });
+});
+
+it("accepts a hosted whole-take stop budget and rejects invalid timers", () => {
+  expect(parseDictationEvent('{"type":"processing","timeout_ms":70000}')).toEqual({
+    type: "processing",
+    timeout_ms: 70000,
+  });
+  for (const timeout_ms of [-1, 0, "70000", 2147483648]) {
+    expect(parseDictationEvent(JSON.stringify({ type: "processing", timeout_ms }))).toBeNull();
+  }
+});
+
+it("waits beyond the relay timer for a whole-take result", async () => {
+  vi.useFakeTimers();
+  const socket = {
+    readyState: 1,
+    send: vi.fn(),
+    close: vi.fn(),
+    onmessage: null as ((msg: { data: string }) => void) | null,
+  };
+  const port = {
+    onmessage: null as ((msg: { data: null }) => void) | null,
+    postMessage: () => port.onmessage?.({ data: null }),
+  };
+  const take: DictationSession = Reflect.construct(DictationSession, [
+    { onPartial: vi.fn(), onFinal: vi.fn(), onError: vi.fn() },
+    socket,
+    { getTracks: () => [{ stop: vi.fn() }] },
+    { state: "closed" },
+    { port },
+  ]);
+  try {
+    const stopped = take.stop();
+    await Promise.resolve();
+    socket.onmessage?.({ data: '{"type":"processing","timeout_ms":70000}' });
+    await vi.advanceTimersByTimeAsync(16000);
+    expect(socket.close).not.toHaveBeenCalled();
+    socket.onmessage?.({ data: '{"type":"stopped","text":"whole take"}' });
+    await expect(stopped).resolves.toEqual({ type: "stopped", text: "whole take" });
+  } finally {
+    take.cancel();
+    vi.useRealTimers();
+  }
 });

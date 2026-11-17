@@ -1,4 +1,4 @@
-"""Hosted audio uses the production segmenter, SDK and bounded worker with fake HTTP."""
+"""Hosted audio uses the production take buffer, SDK and bounded worker with fake HTTP."""
 
 import json
 import threading
@@ -80,24 +80,25 @@ def stream(monkeypatch, handler, **kwargs):
     ).create_stream()
 
 
-def test_pause_segmentation_and_tail_use_wav_prompt(monkeypatch):
+def test_whole_take_keeps_quiet_start_pauses_and_tail(monkeypatch):
     calls = []
 
     def handle(request):
         calls.append(request)
         assert request.url.path == "/v1/audio/transcriptions"
-        assert b"RIFF" in request.content
         assert b"preferred-term" in request.content
         return httpx.Response(200, json={"text": "recognized"})
 
     take = stream(monkeypatch, handle, dictionary="preferred-term")
+    quiet = array("h", [50, -50] * 160).tobytes()
+    audio = quiet * 5 + SPEECH * 20 + SILENCE * 30 + SPEECH * 20 + SPEECH[:320]
     try:
-        take.feed_pcm16(SILENCE * 5 + SPEECH * 20 + SILENCE * 30)
-        take.feed_pcm16(SPEECH * 20)
+        take.feed_pcm16(audio)
         result = take.finish_update()
-        assert result.finalized == "recognized recognized"
+        assert result.finalized == "recognized"
         assert result.undelivered == {"segments": 0, "seconds": 0.0}
-        assert len(calls) == 2
+        assert len(calls) == 1
+        assert audio in calls[0].content
     finally:
         take.close()
         take.close()
@@ -125,29 +126,20 @@ def test_stop_preserves_short_tail_and_partial_frame(monkeypatch, frames):
         take.close()
 
 
-def test_silence_skips_requests_and_long_speech_is_cut(monkeypatch):
+def test_silence_is_sent_without_a_volume_gate(monkeypatch):
     calls = []
-
-    def handle(request):
-        calls.append(request)
-        return httpx.Response(200, json={"text": "recognized"})
-
-    take = stream(monkeypatch, handle)
+    take = stream(
+        monkeypatch,
+        lambda request: (
+            calls.append(request.content),
+            httpx.Response(200, json={"text": "quiet words"}),
+        )[1],
+    )
     try:
         take.feed_pcm16(SILENCE * 250)
-        assert take.finish_update().finalized is None
         assert not calls
-    finally:
-        take.close()
-    # Use the same SDK patch only once; the engine creates a fresh client.
-    take = hosted.HostedTranscriptionEngine(
-        ResolvedConnection("https://provider.example/v1", "fake-key"), "test-model"
-    ).create_stream()
-    try:
-        take.feed_pcm16(SPEECH * 2000)
-        result = take.finish_update()
-        assert result.finalized == "recognized recognized"
-        assert len(calls) == 2
+        assert take.finish_update().finalized == "quiet words"
+        assert SILENCE * 250 in calls[0]
     finally:
         take.close()
 
@@ -203,45 +195,76 @@ def hosted_app(take):
     return app
 
 
-@pytest.mark.parametrize("complete_active", [True, False])
-def test_router_overload_drains_active_or_counts_it_once(monkeypatch, complete_active):
-    monkeypatch.setenv("OMNIGENT_DICTATION_HOSTED_STOP_S", ".2")
-    entered = threading.Event()
-    release = threading.Event()
+def test_slow_provider_gets_whole_sixty_second_take_and_redacted_diagnostics(monkeypatch, caplog):
+    calls = []
 
     def handle(request):
-        entered.set()
-        release.wait(timeout=5)
-        return httpx.Response(200, json={"text": "delivered"})
+        calls.append(request.content)
+        time.sleep(5)
+        return httpx.Response(200, json={"text": "private transcript"})
 
     take = stream(monkeypatch, handle)
+    audio = SILENCE * 100 + SPEECH * 2800 + SILENCE * 100
     try:
-        with TestClient(hosted_app(take)) as client:
-            with client.websocket_connect("/v1/dictation/stream") as socket:
-                assert socket.receive_json()["type"] == "ready"
-                socket.send_bytes(SPEECH * 20 + SILENCE * 30)
-                assert entered.wait(timeout=1)
-                socket.send_bytes((SPEECH * 20 + SILENCE * 30) * 3)
-                with take.condition:
-                    assert take.condition.wait_for(lambda: take.fatal is not None, timeout=1)
-                if complete_active:
-                    release.set()
-                    result = socket.receive_json()
-                    assert (result["type"], result["text"]) == ("final", "delivered")
-                    socket.send_bytes(b"")
-                result = socket.receive_json()
-                assert result["type"] == "error"
-                assert result["code"] == "third_party_overloaded"
-                lost = 3 if complete_active else 4
-                assert result["undelivered"] == {"segments": lost, "seconds": float(lost)}
-                # A second flush must not count the timed-out active request twice.
-                assert take.finish_update().undelivered == result["undelivered"]
-                release.set()
-                take.wait_closed()
+        take.feed_pcm16(audio)
+        assert not calls
+        with caplog.at_level("INFO", logger=hosted.__name__):
+            result = take.finish_update()
+        assert result.finalized == "private transcript"
+        assert result.undelivered == {"segments": 0, "seconds": 0.0}
+        assert len(calls) == 1 and audio in calls[0]
+        records = [
+            r.getMessage() for r in caplog.records if "hosted dictation take" in r.getMessage()
+        ]
+        assert len(records) == 1
+        assert "private transcript" not in records[0] and "RIFF" not in records[0]
+        diagnostic = json.loads(records[0].split("hosted dictation take ", 1)[1])
+        assert diagnostic["take_seconds"] == 60
+        assert diagnostic["transcript_chars"] == 18
+        assert diagnostic["chunks_sent"] == 1
+        assert diagnostic["requests"][0]["latency_s"] >= 5
+        assert diagnostic["rms_p10_p50_p90"] == [2000, 2000, 2000]
     finally:
-        release.set()
         take.close()
-        take.wait_closed()
+
+
+@pytest.mark.parametrize("fail_middle", [False, True])
+def test_over_limit_uses_fewest_quiet_cuts_and_keeps_other_chunks(monkeypatch, fail_middle):
+    monkeypatch.setenv("OMNIGENT_DICTATION_HOSTED_MAX_AUDIO_BYTES", str(640 * 50 + 44))
+    calls = []
+    payloads = []
+    import io
+    import wave
+
+    def handle(request):
+        body = request.content
+        wav_start = body.index(b"RIFF")
+        length = int.from_bytes(body[wav_start + 4 : wav_start + 8], "little") + 8
+        with wave.open(io.BytesIO(body[wav_start : wav_start + length])) as wav:
+            payloads.append(wav.readframes(wav.getnframes()))
+        calls.append(request)
+        # The middle chunk fails twice, then the final chunk still succeeds.
+        if fail_middle and len(calls) in (2, 3):
+            return httpx.Response(503, json={"error": {"message": "redacted"}})
+        return httpx.Response(200, json={"text": str(len(calls))})
+
+    take = stream(monkeypatch, handle)
+    audio = SPEECH * 39 + SILENCE + SPEECH * 59 + SILENCE + SPEECH * 20
+    try:
+        take.feed_pcm16(audio)
+        assert take.stop_budget == 195
+        result = take.finish_update()
+        unique = [payloads[0], payloads[1], payloads[-1]]
+        assert b"".join(unique) == audio
+        assert len(unique[0]) == 640 * 40
+        assert all(len(p) <= 640 * 50 for p in payloads)
+        assert result.finalized == ("1 4" if fail_middle else "1 2 3")
+        assert result.undelivered == {
+            "segments": int(fail_middle),
+            "seconds": 1.0 if fail_middle else 0.0,
+        }
+    finally:
+        take.close()
 
 
 def test_disconnect_retains_capacity_until_blocked_transport_exits(monkeypatch):
@@ -269,6 +292,8 @@ def test_disconnect_retains_capacity_until_blocked_transport_exits(monkeypatch):
             with client.websocket_connect("/v1/dictation/stream") as socket:
                 assert socket.receive_json()["type"] == "ready"
                 socket.send_bytes(SPEECH * 20 + SILENCE * 30)
+                socket.send_json({"type": "stop"})
+                assert socket.receive_json()["type"] == "processing"
                 assert entered.wait(timeout=1)
             assert close_returned.wait(timeout=1)
             take.worker.join(timeout=2.1)
@@ -338,34 +363,4 @@ def test_stop_retries_transient_failure_with_remaining_budget(monkeypatch, failu
         assert len(calls) == 2
         assert all(SPEECH * 20 in body for body in calls)
     finally:
-        take.close()
-
-
-def test_failed_phrase_preserves_queued_phrase_and_recording_tail(monkeypatch):
-    entered = threading.Event()
-    release = threading.Event()
-    calls = []
-
-    def handle(request):
-        calls.append(request.content)
-        if len(calls) == 1:
-            entered.set()
-            assert release.wait(timeout=2)
-            return httpx.Response(400, json={"error": {"message": "bad phrase"}})
-        return httpx.Response(200, json={"text": "kept"})
-
-    take = stream(monkeypatch, handle)
-    try:
-        take.feed_pcm16(SPEECH * 20 + SILENCE * 30)
-        assert entered.wait(timeout=1)
-        take.feed_pcm16(SPEECH * 20 + SILENCE * 30 + SPEECH * 20)
-        release.set()
-        with take.condition:
-            assert take.condition.wait_for(lambda: not take.inflight, timeout=2)
-        result = take.finish_update()
-        assert result.finalized == "kept kept"
-        assert result.undelivered == {"segments": 1, "seconds": 1.0}
-        assert len(calls) == 3
-    finally:
-        release.set()
         take.close()

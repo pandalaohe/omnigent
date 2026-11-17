@@ -63,6 +63,7 @@ export interface DictationTail extends FinalMeta {
 }
 export type DictationEvent =
   | { type: "ready" }
+  | { type: "processing"; timeout_ms: number }
   | { type: "partial"; text: string }
   | ({ type: "final"; text: string } & FinalMeta)
   | ({ type: "stopped" } & DictationTail)
@@ -149,6 +150,13 @@ export function parseDictationEvent(raw: string): DictationEvent | null {
   switch (frame.type) {
     case "ready":
       return { type: "ready" };
+    case "processing":
+      return typeof frame.timeout_ms === "number" &&
+        Number.isFinite(frame.timeout_ms) &&
+        frame.timeout_ms > 0 &&
+        frame.timeout_ms <= 2_147_483_647
+        ? { type: "processing", timeout_ms: frame.timeout_ms }
+        : null;
     case "partial":
     case "final":
     case "stopped":
@@ -267,6 +275,7 @@ export class DictationSession {
   private stopResolve: ((tail: DictationTail) => void) | null = null;
   private flushResolve: (() => void) | null = null;
   private closed = false;
+  private stopTimer: ReturnType<typeof setTimeout> | undefined;
 
   private constructor(
     events: DictationSessionEvents,
@@ -296,6 +305,7 @@ export class DictationSession {
       if (event === null) return;
       if (event.type === "partial") this.events.onPartial(event.text);
       else if (event.type === "final") this.events.onFinal(event.text, event);
+      else if (event.type === "processing" && this.stopResolve) this.waitForStop(event.timeout_ms);
       else if (event.type === "stopped") this.resolveStop(event);
       else if (event.type === "error") this.fail(event.message, event);
     };
@@ -380,13 +390,14 @@ export class DictationSession {
     }
     return new Promise<DictationTail>((resolve) => {
       this.stopResolve = resolve;
+      this.waitForStop(STOP_TIMEOUT_MS);
       this.ws.send(JSON.stringify({ type: "stop" }));
-      setTimeout(() => this.resolveStop({ text: "" }), STOP_TIMEOUT_MS);
     });
   }
 
   /** Immediate teardown without waiting for the tail (unmount, disable). */
   cancel(): void {
+    clearTimeout(this.stopTimer);
     this.teardownAudio();
     this.closed = true;
     this.ws.close();
@@ -406,7 +417,13 @@ export class DictationSession {
     });
   }
 
+  private waitForStop(timeoutMs: number): void {
+    clearTimeout(this.stopTimer);
+    this.stopTimer = setTimeout(() => this.resolveStop({ text: "" }), timeoutMs);
+  }
+
   private resolveStop(tail: DictationTail): void {
+    clearTimeout(this.stopTimer);
     this.closed = true;
     const resolve = this.stopResolve;
     this.stopResolve = null;

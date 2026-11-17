@@ -21,6 +21,8 @@ Wire protocol on the WebSocket
   finish the take. Unknown shapes are ignored so future control
   messages don't break older servers.
 - **Server → client, text frames**: JSON events.
+    - ``{"type": "processing", "timeout_ms": ...}`` — hosted transcription's
+      stop budget, sent before provider work; scales with the number of chunks.
     - ``{"type": "ready"}`` — sent once after the engine is ready;
       the client may start streaming audio.
     - ``{"type": "partial", "text": ...}`` — revisable in-progress
@@ -357,6 +359,11 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
             if isinstance(control, dict) and control.get("type") == "stop":
                 finish_update = getattr(handle, "finish_update", None)
                 if finish_update is not None:
+                    stop_budget = getattr(handle, "stop_budget", None)
+                    if stop_budget is not None:
+                        await websocket.send_json(
+                            {"type": "processing", "timeout_ms": int(stop_budget * 1000) + 5000}
+                        )
                     update = await asyncio.to_thread(finish_update)
                     drain = getattr(handle, "drain_updates", None)
                     updates = [update] + (await asyncio.to_thread(drain) if drain else [])

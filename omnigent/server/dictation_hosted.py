@@ -1,10 +1,11 @@
-"""Bounded pause-segmented dictation through an OpenAI-compatible endpoint."""
+"""Whole-take dictation through an OpenAI-compatible endpoint."""
 
 from __future__ import annotations
 
 import base64
 import io
 import json
+import logging
 import math
 import os
 import threading
@@ -17,13 +18,15 @@ from dataclasses import dataclass
 import httpx
 import openai
 
-from omnigent.server.dictation import DictationTakeError, DictationUpdate
+from omnigent.server.dictation import DictationUpdate
 from omnigent.server.model_connections import (
     ResolvedConnection,
     resolve_connection,
     resolve_reference,
 )
 from omnigent.server.voice_input import CLEANUP_RULES, TRANSCRIPTION_RULES, VoiceInputSettings
+
+_logger = logging.getLogger(__name__)
 
 _ONE_STEP_OUTPUT = (
     "Return JSON with exactly three fields: raw (string, the verbatim transcript), "
@@ -170,17 +173,23 @@ class _HostedStream:
     def __init__(self, engine: HostedTranscriptionEngine):
         self.engine = engine
         self.timeout = max(
-            0.1, float(os.environ.get("OMNIGENT_DICTATION_HOSTED_REQUEST_TIMEOUT_S", "8"))
+            0.1, float(os.environ.get("OMNIGENT_DICTATION_HOSTED_REQUEST_TIMEOUT_S", "30"))
         )
-        self.stop_timeout = min(
-            12.0, max(0.1, float(os.environ.get("OMNIGENT_DICTATION_HOSTED_STOP_S", "12")))
+        self.stop_timeout = max(
+            0.1, float(os.environ.get("OMNIGENT_DICTATION_HOSTED_STOP_S", "65"))
         )
-        self.queue_size = max(1, int(os.environ.get("OMNIGENT_DICTATION_HOSTED_QUEUE", "2")))
-        self.pause_frames = max(
-            1, int(os.environ.get("OMNIGENT_DICTATION_HOSTED_PAUSE_MS", "600")) // 20
-        )
-        self.max_frames = max(
-            15, int(float(os.environ.get("OMNIGENT_DICTATION_HOSTED_MAX_SEGMENT_S", "25")) * 50)
+        # Leave room for the WAV header and multipart overhead below 25 MB.
+        self.max_chunk_bytes = (
+            max(
+                640,
+                min(
+                    24_000_000,
+                    int(os.environ.get("OMNIGENT_DICTATION_HOSTED_MAX_AUDIO_BYTES", "24000000")),
+                )
+                - 44,
+            )
+            // 640
+            * 640
         )
         self.client = openai.OpenAI(
             base_url=engine.connection.base_url,
@@ -191,16 +200,23 @@ class _HostedStream:
         self.condition = threading.Condition()
         self.queue: deque[bytes] = deque()
         self.results: deque[OneStepOutcome] = deque()
-        self.noise: deque[float] = deque([100.0], maxlen=75)
         self.pending = bytearray()
         self.audio = bytearray()
-        self.voiced = 0
-        self.silent = 0
+        self.rms: list[float] = []
+        self.connected_at = time.monotonic()
+        self.first_frame_delay: float | None = None
+        self.frames_received = 0
+        self.requests: list[dict[str, str | float]] = []
+        self.chunks_sent = 0
+        self.retries = 0
+        self.transcript_chars = 0
+        self.cleanup_outcome = "unknown"
+        self.logged = False
+        self.request_started: float | None = None
         self.inflight = 0
         self.inflight_abandoned = False
         self.lost_segments = 0
         self.lost_seconds = 0.0
-        self.fatal: str | None = None
         self.cancelled = False
         self.closed = False
         self.stopping = False
@@ -212,23 +228,28 @@ class _HostedStream:
         self.lost_segments += 1
         self.lost_seconds += len(audio) / 32000
 
+    @property
+    def stop_budget(self) -> float:
+        chunks = max(1, math.ceil((len(self.audio) + len(self.pending)) / self.max_chunk_bytes))
+        return self.stop_timeout * chunks
+
     def _segment(self) -> None:
-        if self.voiced > 0:
-            data = bytes(self.audio)
-            if self.fatal:
-                self._lost(data)
-            elif len(self.queue) >= self.queue_size:
-                self._lost(data)
-                self.fatal = "third_party_overloaded"
-                self.deadline = time.monotonic() + self.stop_timeout
-                while self.queue:
-                    self._lost(self.queue.popleft())
-                self.condition.notify_all()
-            else:
-                self.queue.append(data)
-                self.condition.notify_all()
+        data = bytes(self.audio) + bytes(self.pending[: len(self.pending) // 2 * 2])
         self.audio.clear()
-        self.voiced = self.silent = 0
+        self.pending.clear()
+        start = 0
+        remaining = math.ceil(len(data) / self.max_chunk_bytes)
+        while remaining > 1:
+            # Feasible cuts keep the fewest chunks; choose the quietest frame.
+            first = max(start + 640, len(data) - (remaining - 1) * self.max_chunk_bytes)
+            first = (first + 639) // 640
+            last = (start + self.max_chunk_bytes) // 640
+            cut = min(range(first, last + 1), key=lambda i: (self.rms[i - 1], -i)) * 640
+            self.queue.append(data[start:cut])
+            start = cut
+            remaining -= 1
+        if start < len(data):
+            self.queue.append(data[start:])
 
     def _update(self, *, all_results: bool = False) -> DictationUpdate:
         values: list[OneStepOutcome] = []
@@ -249,39 +270,20 @@ class _HostedStream:
 
     def feed_pcm16(self, data: bytes) -> DictationUpdate:
         with self.condition:
-            if self.fatal or self.cancelled:
-                return self._drain_fatal()
+            if self.cancelled or self.stopping:
+                return self._update()
+            if data and self.first_frame_delay is None:
+                self.first_frame_delay = time.monotonic() - self.connected_at
+            self.frames_received += bool(data)
             self.pending.extend(data)
             while len(self.pending) >= 640:
                 frame = bytes(self.pending[:640])
                 del self.pending[:640]
                 samples = array("h", frame)
-                rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples))
-                voiced = rms >= max(300, 3 * min(self.noise))
-                if not voiced:
-                    self.noise.append(rms)
-                # Keep a quiet floor available when a take begins in speech.
-                if not self.audio and rms >= 300:
-                    voiced = True
-                if voiced or self.audio:
-                    self.audio.extend(frame)
-                    if voiced:
-                        self.voiced += 1
-                        self.silent = 0
-                    else:
-                        self.silent += 1
-                    if (
-                        self.silent >= self.pause_frames
-                        or len(self.audio) // 640 >= self.max_frames
-                    ):
-                        self._segment()
-            if self.fatal:
-                if self.voiced > 0:
-                    self._lost(bytes(self.audio) + bytes(self.pending))
-                self.audio.clear()
-                self.pending.clear()
-                self.voiced = self.silent = 0
-                return self._drain_fatal()
+                self.rms.append(
+                    math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+                )
+                self.audio.extend(frame)
             return self._update()
 
     def _abandon_inflight(self) -> None:
@@ -289,26 +291,6 @@ class _HostedStream:
             self.lost_segments += 1
             self.lost_seconds += self.inflight / 32000
             self.inflight_abandoned = True
-
-    def _drain_fatal(self) -> DictationUpdate:
-        if self.results:
-            return self._update()
-        if self.inflight and not self.cancelled:
-            self.deadline = self.deadline or time.monotonic() + self.stop_timeout
-            self.condition.wait_for(
-                lambda: not self.inflight,
-                timeout=max(0, self.deadline - time.monotonic()),
-            )
-            if self.inflight:
-                self._abandon_inflight()
-                self.cancelled = True
-                self.condition.notify_all()
-        if self.results:
-            return self._update()
-        raise DictationTakeError(self.fatal or "third_party_failed", self._undelivered())
-
-    def _undelivered(self) -> dict[str, int | float]:
-        return {"segments": self.lost_segments, "seconds": round(self.lost_seconds, 2)}
 
     def _call(self, pcm: bytes) -> OneStepOutcome:
         timeout = (
@@ -321,21 +303,28 @@ class _HostedStream:
     def _run(self) -> None:
         while True:
             with self.condition:
-                self.condition.wait_for(
-                    lambda: self.cancelled or self.queue or self.stopping or self.fatal
-                )
+                self.condition.wait_for(lambda: self.cancelled or self.queue or self.stopping)
                 if self.cancelled or not self.queue:
                     return
                 pcm = self.queue.popleft()
                 self.inflight = len(pcm)
+                self.chunks_sent += 1
                 self.inflight_abandoned = False
             try:
                 result = None
                 for attempt in range(2):
+                    started = time.monotonic()
+                    self.request_started = started
+                    request_status = "ok"
                     try:
                         result = self._call(pcm)
                         break
                     except (openai.APIConnectionError, openai.APIStatusError) as exc:
+                        request_status = (
+                            str(exc.status_code)
+                            if isinstance(exc, openai.APIStatusError)
+                            else "connection_error"
+                        )
                         retryable = (
                             isinstance(exc, openai.APIConnectionError)
                             or exc.status_code == 429
@@ -347,15 +336,30 @@ class _HostedStream:
                             or (self.deadline and self.deadline <= time.monotonic())
                         ):
                             raise
+                        self.retries += 1
                         with self.condition:
                             # Stopping uses the remaining request budget without backoff.
                             if self.deadline is None:
                                 self.condition.wait(timeout=0.5)
                             if self.cancelled:
                                 return
+                    except Exception:
+                        request_status = "invalid_response"
+                        raise
+                    finally:
+                        self.request_started = None
+                        self.requests.append(
+                            {
+                                "latency_s": round(time.monotonic() - started, 3),
+                                "status": request_status,
+                            }
+                        )
                 with self.condition:
                     if not self.cancelled and result is not None:
                         self.results.append(result)
+                        self.transcript_chars += len(result.text)
+                        if self.engine.method == "chat_audio":
+                            self.cleanup_outcome = "cleaned" if result.cleaned else "raw_fallback"
             except Exception:  # noqa: BLE001 - redact provider and credential failures
                 with self.condition:
                     if not self.cancelled:
@@ -367,19 +371,11 @@ class _HostedStream:
 
     def finish_update(self) -> DictationUpdate:
         with self.condition:
-            self.deadline = self.deadline or time.monotonic() + self.stop_timeout
-            if not self.fatal:
-                # The worklet flush can end between 20 ms frames.
-                remainder = bytes(self.pending[: len(self.pending) // 2 * 2])
-                self.pending.clear()
-                if remainder:
-                    samples = array("h", remainder)
-                    rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples))
-                    if rms >= max(300, 3 * min(self.noise)):
-                        self.voiced += 1
-                    if self.audio or self.voiced:
-                        self.audio.extend(remainder)
-                self._segment()
+            if self.stopping:
+                return self._update()
+            self.deadline = time.monotonic() + self.stop_budget
+            self.take_seconds = (len(self.audio) + len(self.pending) // 2 * 2) / 32000
+            self._segment()
             self.stopping = True
             self.condition.notify_all()
             self.condition.wait_for(
@@ -393,6 +389,7 @@ class _HostedStream:
                 self._abandon_inflight()
                 self.cancelled = True
                 self.condition.notify_all()
+            self._log_take("stopped")
             return self._update()
 
     def drain_updates(self) -> list[DictationUpdate]:
@@ -405,11 +402,56 @@ class _HostedStream:
     def finish(self) -> str:
         return self.finish_update().finalized or ""
 
+    def _log_take(self, outcome: str) -> None:
+        if self.logged:
+            return
+        self.logged = True
+        levels = sorted(self.rms)
+        quantiles = [
+            round(levels[min(len(levels) - 1, int((len(levels) - 1) * q))], 2) if levels else 0
+            for q in (0.1, 0.5, 0.9)
+        ]
+        _logger.info(
+            "hosted dictation take %s",
+            json.dumps(
+                {
+                    "outcome": outcome,
+                    "take_seconds": getattr(
+                        self, "take_seconds", (len(self.audio) + len(self.pending)) / 32000
+                    ),
+                    "first_frame_delay_s": self.first_frame_delay,
+                    "frames_received": self.frames_received,
+                    "rms_p10_p50_p90": quantiles,
+                    "rms_max": round(max(levels, default=0), 2),
+                    "chunks_sent": self.chunks_sent,
+                    "requests": list(self.requests)
+                    + (
+                        [
+                            {
+                                "latency_s": round(time.monotonic() - self.request_started, 3),
+                                "status": "deadline_exceeded",
+                            }
+                        ]
+                        if self.request_started is not None
+                        else []
+                    ),
+                    "retries": self.retries,
+                    "undelivered_seconds": round(self.lost_seconds, 2),
+                    "transcript_chars": self.transcript_chars,
+                    "cleanup_outcome": self.cleanup_outcome,
+                }
+            ),
+        )
+
     def close(self) -> None:
         with self.condition:
             if self.closed:
                 return
+            if not self.stopping:
+                self._log_take("cancelled")
             self.closed = self.cancelled = True
+            self.audio.clear()
+            self.pending.clear()
             self.queue.clear()
             self.condition.notify_all()
         try:
