@@ -484,3 +484,46 @@ def test_spool_io_failure_is_explicit_and_removes_audio(monkeypatch, operation):
         take.close()
         take.wait_closed()
     assert not take.audio_path.exists()
+
+
+def test_unlink_failure_still_releases_stream_resources(tmp_path, monkeypatch, caplog):
+    from pathlib import Path
+    from unittest.mock import Mock
+
+    monkeypatch.setattr(hosted, "_spool_root", lambda: tmp_path)
+    take = stream(monkeypatch, lambda request: httpx.Response(200, json={"text": "kept"}))
+    real_close, real_join, real_unlink = take.client.close, take.worker.join, Path.unlink
+    close = Mock(wraps=real_close)
+    join = Mock(wraps=real_join)
+    notify = Mock(wraps=take.condition.notify_all)
+    monkeypatch.setattr(take.client, "close", close)
+    monkeypatch.setattr(take.worker, "join", join)
+    monkeypatch.setattr(take.condition, "notify_all", notify)
+
+    def blocked_unlink(path, *args, **kwargs):
+        if path == take.audio_path:
+            raise PermissionError("private audio location must not appear in logs")
+        return real_unlink(path, *args, **kwargs)
+
+    try:
+        take.feed_pcm16(SPEECH)
+        with monkeypatch.context() as patch, caplog.at_level("WARNING", logger=hosted.__name__):
+            patch.setattr(Path, "unlink", blocked_unlink)
+            take.close()
+            take.close()
+        close.assert_called_once()
+        assert notify.called and join.called
+        real_join(timeout=1)
+        assert not take.worker.is_alive()
+        messages = " ".join(record.getMessage() for record in caplog.records)
+        assert all(record.exc_info is None for record in caplog.records)
+        assert "dictation spool cleanup failed" in messages
+        assert "private audio location" not in messages
+        assert str(take.audio_path) not in messages
+    finally:
+        with take.condition:
+            take.cancelled = True
+            take.condition.notify_all()
+        real_close()
+        real_join(timeout=1)
+        real_unlink(take.audio_path, missing_ok=True)

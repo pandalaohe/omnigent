@@ -1042,6 +1042,11 @@ export const ComposerMicButton = ({
         // composer, then tear the take down immediately (no tail flush).
         e.preventDefault();
         e.stopPropagation();
+        if (retrying) {
+          cancelTake();
+          onVoiceDiscardRef.current?.();
+          return;
+        }
         discardingRef.current = true;
         takeGenerationRef.current += 1;
         punctuationQueueRef.current = Promise.resolve();
@@ -1064,7 +1069,7 @@ export const ComposerMicButton = ({
     };
     window.addEventListener("keydown", handler, true);
     return () => window.removeEventListener("keydown", handler, true);
-  }, [isListening, retrying, toggle, questionCard]);
+  }, [isListening, retrying, toggle, questionCard, cancelTake]);
 
   if (questionCard && systemDictation) {
     return (

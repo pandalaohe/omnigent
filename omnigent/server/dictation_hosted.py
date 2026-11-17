@@ -356,8 +356,13 @@ class _HostedStream:
         self.rms_max = max(self.rms_max, level)
 
     def _close_spool(self) -> None:
-        self.spool_context.close()
-        self.audio_path.unlink(missing_ok=True)
+        try:
+            try:
+                self.spool_context.close()
+            finally:
+                self.audio_path.unlink(missing_ok=True)
+        except OSError as exc:
+            _logger.warning("dictation spool cleanup failed (%s)", type(exc).__name__)
 
     def _call(self, pcm: bytes) -> OneStepOutcome:
         return _transcribe(self.engine, self.client, pcm, self.timeout)
@@ -520,17 +525,22 @@ class _HostedStream:
         with self.condition:
             if self.closed:
                 return
-            if not self.stopping:
-                self._log_take("cancelled")
             self.closed = self.cancelled = True
-            self._close_spool()
-            self.pending.clear()
-            self.queue.clear()
-            self.condition.notify_all()
         try:
-            self.client.close()
+            with self.condition:
+                try:
+                    if not self.stopping:
+                        self._log_take("cancelled")
+                    self._close_spool()
+                finally:
+                    self.pending.clear()
+                    self.queue.clear()
+                    self.condition.notify_all()
         finally:
-            self.worker.join(timeout=0.1)
+            try:
+                self.client.close()
+            finally:
+                self.worker.join(timeout=0.1)
 
     def wait_closed(self) -> None:
         """Retain the router's capacity lease until the synchronous request really exits."""

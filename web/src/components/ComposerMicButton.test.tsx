@@ -1943,3 +1943,39 @@ it("offers retry for retained failed audio without reopening the microphone", as
   expect(sessionStartMock).toHaveBeenCalledOnce();
   expect(onTranscript).toHaveBeenCalledWith("recovered words");
 });
+
+it("Escape during Retry clears processing, releases keys and discards late text", async () => {
+  vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+    ...voiceApi.defaultVoiceInputSettings,
+    speech_source: "third",
+  });
+  sessionStopMock.mockResolvedValue({ text: "", undelivered: { segments: 1, seconds: 2 } });
+  let finishRetry!: (tail: DictationTail) => void;
+  sessionRetryMock.mockReturnValue(
+    new Promise((resolve) => {
+      finishRetry = resolve;
+    }),
+  );
+  const onTranscript = vi.fn();
+  const onVoiceDiscard = vi.fn();
+  render(<ComposerMicButton onTranscript={onTranscript} onVoiceDiscard={onVoiceDiscard} />);
+  await act(async () => {});
+  const button = screen.getByRole("button", { name: "Voice dictation" });
+  await act(async () => fireEvent.click(button));
+  await act(async () => fireEvent.click(button));
+  render(showToastMock.mock.calls.at(-1)?.[0]);
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Retry" })));
+  expect(button).toHaveAttribute("aria-busy", "true");
+  fireEvent.keyDown(window, { key: "Escape" });
+  expect(onVoiceDiscard).toHaveBeenCalledOnce();
+  expect(sessionCancelMock).toHaveBeenCalledOnce();
+  expect(button).toHaveAttribute("aria-busy", "false");
+  for (const key of ["Enter", "Escape"]) {
+    const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+    window.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+  }
+  await act(async () => finishRetry({ text: "late words" }));
+  expect(onTranscript).not.toHaveBeenCalled();
+  expect(button).toHaveAttribute("aria-busy", "false");
+});
