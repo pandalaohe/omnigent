@@ -33,6 +33,7 @@ from omnigent.models.model_reference import (
     resolve_saved_model,
 )
 from omnigent.quota_pace import AgentQuota, QuotaTiers, Window, agent_quota
+from omnigent.server.session_choice_external import ExternalAdmission, ExternalAdmissionState
 
 if TYPE_CHECKING:
     from omnigent.entities import Conversation
@@ -322,12 +323,15 @@ class SessionChoice(_DocumentModel):
     limits: dict[str, TileLimits] = Field(default_factory=dict)
     hosts: dict[str, dict[str, tuple[tuple[Row, ...], ...]]] = Field(default_factory=dict)
     ability_order: tuple[tuple[Identifier, ...], ...] = ()
+    external_admission: tuple[ExternalAdmission, ...] = ()
 
     @model_serializer(mode="wrap")
     def legacy_shape(
         self, handler: SerializerFunctionWrapHandler, info: SerializationInfo
     ) -> dict[str, Any]:
         result = handler(self)
+        if not self.external_admission and "external_admission" not in self.model_fields_set:
+            result.pop("externalAdmission" if info.by_alias else "external_admission", None)
         if self.schema_version == 1:
             result.pop("limitRules" if info.by_alias else "limit_rules", None)
             if "schema_version" not in self.model_fields_set:
@@ -336,6 +340,11 @@ class SessionChoice(_DocumentModel):
 
     @model_validator(mode="after")
     def references(self) -> Self:
+        scopes = [(rule.host, rule.agent) for rule in self.external_admission]
+        if len(scopes) != len(set(scopes)):
+            raise ValueError("externalAdmission host/agent pairs must be unique")
+        if any("*" in scope for scope in scopes):
+            raise ValueError("externalAdmission requires exact host/agent identities")
         if self.schema_version == 1 and "limit_rules" in self.model_fields_set:
             raise ValueError("limitRules requires schemaVersion 2")
         if self.schema_version == 2 and "limit_rules" not in self.model_fields_set:
@@ -712,6 +721,7 @@ class ChoiceRequest:
     quota_tiers: QuotaTiers = field(default_factory=QuotaTiers)
     # Model identities include route prefixes; None selects all models of an agent.
     quota_periods: Mapping[tuple[str, str | None], str] = field(default_factory=dict)
+    link_exclusions: Mapping[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -831,6 +841,8 @@ def check_candidate_limits(
     settings, work_type, link, request, readings, running, floor_off, now, *, user_named=False
 ) -> Skipped | None:
     link = _candidate_link(settings, link, request)
+    if (until := (request.link_exclusions or {}).get(link.agent_id, 0)) > now:
+        return Skipped(link, "excluded", until)
     if (
         settings.schema_version == 2
         and link.model is None
@@ -1389,6 +1401,7 @@ class ChoiceState:
         self.provider_attempts: dict[tuple[str, str, str, str], tuple[str, int, float]] = {}
         self.provider_recoveries: dict[tuple[str, str, str], float] = {}
         self.tiers: dict[tuple[str, str, str, int], tuple[Row, ...]] = {}
+        self.external_admission = ExternalAdmissionState()
 
     def quota_readings(
         self,
@@ -1492,6 +1505,11 @@ class ChoiceState:
         now: float,
     ) -> Choice:
         readings = self.quota_readings(request.owner, readings, now, request.provider_groups)
+        if request.link_exclusions is None:
+            request = replace(
+                request,
+                link_exclusions=self.external_admission.active(settings, request, None, None, now),
+            )
         counters = self.counters
         if request.preview:
             preview_state = ChoiceState()

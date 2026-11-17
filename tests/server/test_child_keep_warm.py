@@ -4396,7 +4396,8 @@ async def test_host_offline_archive_runs_only_every_tenth_tick(harness: _Harness
     assert _archived(harness, child.id) is True
 
 
-async def test_quota_stop_skips_ping_then_release_allows_it(harness, db_uri):
+@pytest.mark.parametrize("release_mode", ["floor", "external-router"])
+async def test_quota_stop_skips_ping_then_release_allows_it(harness, db_uri, release_mode):
     from omnigent.server.auth import RESERVED_USER_LOCAL
     from omnigent.server.session_choice import FloorOff
     from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
@@ -4446,6 +4447,15 @@ async def test_quota_stop_skips_ping_then_release_allows_it(harness, db_uri):
     )
     await _tick(harness)
     assert harness.forward.pings() == []
-    prefs.set_choice_floor_off(RESERVED_USER_LOCAL, "a", FloorOff(until="manual"))
+    if release_mode == "floor":
+        prefs.set_choice_floor_off(RESERVED_USER_LOCAL, "a", FloorOff(until="manual"))
+    else:
+        harness.store.set_host_id(main.id, _HOST_ID, workspace="/opt/work/project")
+        value["externalAdmission"] = [
+            {"host": _HOST_ID, "agent": main.agent_id, "admittedByRouter": True}
+        ]
+        prefs.replace_session_choice(
+            RESERVED_USER_LOCAL, value, prefs.session_choice(RESERVED_USER_LOCAL)["revision"]
+        )
     await _tick(harness)
     assert [ping["session_id"] for ping in harness.forward.pings()] == [main.id]
