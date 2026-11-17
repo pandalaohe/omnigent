@@ -317,13 +317,20 @@ async def test_unconfigured_or_off_refuses(
 
 
 @pytest.mark.parametrize(
-    "failure,status", [(TimeoutError(), 504), (RuntimeError("provider failed"), 503)]
+    "failure,status,kind",
+    [
+        (TimeoutError("private provider data"), 504, "timeout"),
+        (httpx.ReadTimeout("private provider data"), 503, "timeout"),
+        (RuntimeError("private provider data"), 503, "provider-error"),
+    ],
 )
 async def test_failure_keeps_text_client_side(
     voice_store: SqlAlchemyUserPreferencesStore,
     llm: SimpleNamespace,
     failure: Exception,
     status: int,
+    kind: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     save_settings(
         voice_store, VoiceInputSettings(model="openai/test-cleanup").model_dump(), user_id=None
@@ -334,7 +341,91 @@ async def test_failure_keeps_text_client_side(
     ) as client:
         response = await client.post("/v1/dictation/cleanup", json={"text": "keep original"})
     assert response.status_code == status
-    assert "provider failed" not in response.text
+    assert f"Voice cleanup failed ({kind})" in caplog.text
+    assert "private provider data" not in caplog.text + response.text
+    assert "keep original" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "output,status,kind",
+    [
+        (
+            '```python\n{"complete":true,"text":"private model data"}\n```',
+            "completed",
+            "parse:fence",
+        ),
+        (
+            'Here is the edit: {"complete":true,"text":"private model data"}',
+            "completed",
+            "parse:prose",
+        ),
+        ('{"complete":"true","text":"private model data"}', "completed", "parse:field-type"),
+        ('{"complete":false,"text":"private model data"}', "completed", "model-declined"),
+        ('{"complete":true,"text":"private model data', "completed", "parse:incomplete"),
+        (
+            '{"complete":true,"text":"private model data"}',
+            "private status data",
+            "status-not-completed",
+        ),
+    ],
+)
+async def test_cleanup_logs_only_failure_class(voice_store, llm, caplog, output, status, kind):
+    caplog.set_level("INFO", logger=voice_input.__name__)
+    save_settings(
+        voice_store, VoiceInputSettings(model="openai/test-cleanup").model_dump(), user_id=None
+    )
+    llm.responses.create.return_value.output[0].content[0].text = output
+    llm.responses.create.return_value.status = status
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_for(voice_store, llm)), base_url="http://test"
+    ) as client:
+        response = await client.post("/v1/dictation/cleanup", json={"text": "private user data"})
+    assert response.status_code == 503
+    records = [record for record in caplog.records if record.name == voice_input.__name__]
+    event = "not applied" if kind == "model-declined" else "failed"
+    assert [record.getMessage() for record in records] == [f"Voice cleanup {event} ({kind})"]
+    assert all(record.exc_info is None for record in records)
+    assert all(
+        value not in caplog.text + response.text
+        for value in ("private model data", "private user data", "private status data")
+    )
+
+
+@pytest.mark.parametrize("fence", ["```", "```json"])
+async def test_cleanup_applies_one_fenced_json_object(voice_store, llm, fence):
+    save_settings(
+        voice_store, VoiceInputSettings(model="openai/test-cleanup").model_dump(), user_id=None
+    )
+    llm.responses.create.return_value.output[0].content[0].text = (
+        fence + '\n{"complete":true,"text":"Do not deploy at 12:30."}\n```'
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_for(voice_store, llm)), base_url="http://test"
+    ) as client:
+        response = await client.post("/v1/dictation/cleanup", json={"text": "synthetic input"})
+    assert response.status_code == 200
+    assert response.json() == {"text": "Do not deploy at 12:30."}
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        'Here is the edit:\n```json\n{"complete":true,"text":"Edited."}\n```',
+        '```json\n{"complete":true,"text":"Edited."}\n```\nExplanation.',
+        '```json\n```json\n{"complete":true,"text":"Edited."}\n```\n```',
+        '```json\n{"complete":true,"text":"First."}\n```\n```json\n{"complete":true,"text":"Second."}\n```',
+    ],
+)
+async def test_cleanup_rejects_prose_or_multiple_fences(voice_store, llm, output):
+    save_settings(
+        voice_store, VoiceInputSettings(model="openai/test-cleanup").model_dump(), user_id=None
+    )
+    llm.responses.create.return_value.output[0].content[0].text = output
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_for(voice_store, llm)), base_url="http://test"
+    ) as client:
+        response = await client.post("/v1/dictation/cleanup", json={"text": "synthetic input"})
+    assert response.status_code == 503
 
 
 async def test_wall_timeout_cancels_the_call(
