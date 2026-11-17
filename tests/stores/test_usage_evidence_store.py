@@ -229,6 +229,48 @@ def test_episode_pairing_across_pages_and_out_of_order_arrival(db_uri):
     assert filtered["next_before"] is not None
 
 
+@pytest.mark.parametrize("fault_type", ["connection", "Connection"])
+def test_episode_types_preserve_case_and_matching_type_pairs_across_pages(db_uri, fault_type):
+    store = UsageEvidenceStore(db_uri)
+    service = UsageEvidenceService(store)
+    now = now_epoch()
+    fault = event("fault").model_copy(
+        update={
+            "type": fault_type,
+            "severity": "error",
+            "time": datetime.fromtimestamp(now - 60, UTC).isoformat(),
+        }
+    )
+    other = event("other-case-recovery").model_copy(
+        update={
+            "type": "Connection" if fault_type == "connection" else "connection",
+            "severity": "recover",
+            "time": datetime.fromtimestamp(now - 30, UTC).isoformat(),
+        }
+    )
+    store.insert_events(OWNER, [fault, other])
+    rows = {row["id"]: row for row in service.read_events(OWNER)["events"]}
+    assert set(rows) == {"fault", "other-case-recovery"}
+    assert rows["fault"]["episode"] is None
+
+    matching = event("matching-recovery").model_copy(
+        update={
+            "type": fault_type,
+            "severity": "recover",
+            "time": datetime.fromtimestamp(now, UTC).isoformat(),
+        }
+    )
+    store.insert_events(OWNER, [matching])
+    page1 = service.read_events(OWNER, limit=2)
+    assert [row["id"] for row in page1["events"]] == ["other-case-recovery"]
+    page2 = service.read_events(OWNER, before=page1["next_before"], limit=2)
+    assert page2["events"][0]["id"] == "fault"
+    assert page2["events"][0]["episode"] == {
+        "recovered_at": now,
+        "recover_event_id": "matching-recovery",
+    }
+
+
 def test_report_log_import_replays_same_identity(db_uri):
     from omnigent.usage.source_events import report_log_event
 

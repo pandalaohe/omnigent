@@ -347,7 +347,6 @@ class UsageEvidenceStore:
             *self.scope(table, owner),
             table.account_id == (row["account"] or ""),
             table.source == row["source"],
-            table.type == row["type"],
             table.severity.in_(("error", "warn", "recover")),
         )
         later = (table.time_utc > row["time"]) | (
@@ -365,6 +364,14 @@ class UsageEvidenceStore:
             .limit(1)
         )
         with self.sessions._read_session()("pair_source_event") as session:
+            event_type = table.type
+            dialect = session.get_bind().dialect.name
+            if dialect == "mysql":
+                event_type = event_type.collate("utf8mb4_0900_bin")
+            elif dialect == "sqlite":
+                event_type = event_type.collate("BINARY")
+            # PostgreSQL and CockroachDB string equality already preserves case.
+            query = query.where(event_type == row["type"])
             match = session.scalar(query)
             return (
                 None
