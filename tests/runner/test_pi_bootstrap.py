@@ -201,6 +201,104 @@ async def test_scoped_rpc_failure_codes_are_safe(attestor_relay, monkeypatch, ca
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["relay_close", "peer_exit", "backstop"])
+async def test_scoped_rpc_releases_waiter_but_retains_host_operation(
+    attestor_relay, monkeypatch, caplog, ending
+):
+    from omnigent.runner.mcp_execution_registry import McpExecutionRegistry, McpExecutionResult
+
+    _runtime, broker, relay, _source, _registry = attestor_relay
+    _actor, admission = await bind_ready(_runtime, broker, relay)
+    registry = McpExecutionRegistry()
+    entered, release, waiter_done, cancelled = (asyncio.Event() for _ in range(4))
+
+    async def host_operation():
+        entered.set()
+        try:
+            await release.wait()
+            return McpExecutionResult(200, {"stdout": "completed"})
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async def execute(*_args):
+        try:
+            result = await registry.execute(
+                session_id="session-a",
+                operation_id="operation",
+                step="initial",
+                params={},
+                run=host_operation,
+            )
+            return {"result": result.content}
+        finally:
+            waiter_done.set()
+
+    monkeypatch.setattr(PiScopeRelay, "execute_rpc", execute)
+    globals_ = relay._httpd.RequestHandlerClass._handle_pi_rpc.__globals__
+    monkeypatch.setitem(globals_, "_PI_RPC_WAIT_BACKSTOP_S", 0.2 if ending == "backstop" else 10)
+    reader, writer = await asyncio.open_connection("127.0.0.1", relay._httpd.server_port)
+    body = json.dumps({"payload": "{}"}).encode()
+    writer.write(
+        f"POST /pi/rpc HTTP/1.0\r\nAuthorization: Bearer {admission.credential}\r\n"
+        f"Content-Length: {len(body)}\r\n\r\n".encode()
+        + body
+    )
+    await writer.drain()
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        if ending == "peer_exit":
+            writer.close()
+            await writer.wait_closed()
+        elif ending == "relay_close":
+            await asyncio.to_thread(relay.close)
+        if ending != "peer_exit":
+            response = await asyncio.wait_for(reader.read(), 2)
+            payload = json.loads(response.split(b"\r\n\r\n", 1)[1])
+            assert payload["reason"] == (
+                "rpc_timeout" if ending == "backstop" else "rpc_delivery_failed"
+            )
+            assert "may have run" in payload["error"]
+        await asyncio.wait_for(waiter_done.wait(), 2)
+        assert not cancelled.is_set()
+        assert ("rpc_timeout" if ending == "backstop" else "rpc_delivery_failed") in caplog.text
+        release.set()
+        retained = await registry.execute(
+            session_id="session-a",
+            operation_id="operation",
+            step="initial",
+            params={},
+            run=host_operation,
+        )
+        assert retained.content == {"stdout": "completed"}
+        assert not cancelled.is_set()
+    finally:
+        release.set()
+        writer.close()
+        await writer.wait_closed()
+
+
+@pytest.mark.parametrize("ending", ["loop_stop", "loop_closed", "socket_closed"])
+def test_scoped_rpc_wait_releases_on_stopped_loop(ending):
+    from omnigent.harnesses.claude_native.bridge import _wait_for_pi_rpc_result
+
+    future = Future()
+    loop = SimpleNamespace(
+        is_closed=lambda: ending == "loop_closed", is_running=lambda: ending == "socket_closed"
+    )
+    connection, peer = socket.socketpair()
+    try:
+        if ending == "socket_closed":
+            connection.close()
+        with pytest.raises(ConnectionAbortedError):
+            _wait_for_pi_rpc_result(future, loop, connection, threading.Event())
+        assert future.cancelled()
+    finally:
+        connection.close()
+        peer.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "fault", ["none", "other-path", "missing-loaded", "changed-loaded", "changed-file"]
 )

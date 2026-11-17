@@ -261,14 +261,14 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
       evaluate:(event,revision)=>request("/policies/evaluate",{event:{type:"PHASE_TOOL_CALL",target:"",context:{},data:{name:event.toolName,arguments:event.input,call_id:event.toolCallId,expected_permission_tier_revision:revision}}},scopeCredential),
       execute:(metadata,onResponse)=>request("/permission-tiers/control",{type:"permission_tier_execute",...metadata},scopeCredential,onResponse),
       finish:metadata=>request("/permission-tiers/control",{type:"permission_tier_finish",...metadata},scopeCredential),
-      revoke:()=>control("revoke",{handle}),
+      revoke:()=>{scopeLifetime.abort();return control("revoke",{handle});},
       rpc:(port,metadata)=>{
         if(port===0||port===null||port===undefined)
-          return request("/pi/rpc",{payload:JSON.stringify(metadata)},scopeCredential);
+          return request("/pi/rpc",{payload:JSON.stringify(metadata)},scopeCredential,undefined,scopeLifetime.signal);
         return new Promise((resolve,reject)=>{
           if(!Number.isInteger(port)||port<1||port>65535){reject(rpcError("rpc_configuration_invalid"));return;}
           const id=crypto.randomUUID();let text="",received=0,settled=false;
-          const socket=net.createConnection({port,host:"127.0.0.1"});
+          const socket=net.createConnection({port,host:"127.0.0.1",signal:AbortSignal.any([lifetime.signal,scopeLifetime.signal])});
           socket.setEncoding("utf8");
           const fail=(reason="rpc_delivery_failed")=>{if(!settled){settled=true;reject(rpcError(reason));}socket.destroy();};
           socket.on("connect",()=>socket.write(JSON.stringify({id,kind:"pi_scoped",credential:scopeCredential,payload:JSON.stringify(metadata)})+"\n"));

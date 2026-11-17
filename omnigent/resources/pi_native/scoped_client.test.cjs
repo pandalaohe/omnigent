@@ -126,6 +126,42 @@ test("a sealed client records its first cause once and gives recovery guidance",
  assert.deepEqual(f.diagnostics.filter(r=>r.event==="client_sealed"),[{event:"client_sealed",cause:"transport_lost"}]);
  assert.equal(f.diagnostics.at(-1).cause,"transport_lost");
 });
+
+test("in-flight HTTP and TCP RPCs release on connection loss or scope revocation",async t=>{
+ const http=require("node:http"),net=require("node:net");
+ for(const transport of ["http","tcp"])for(const loss of ["close","continuity","revoke","client_close"])await t.test(`${transport}: ${loss}`,async t=>{
+  let watch,entered,rpcClosed;
+  const started=new Promise(resolve=>entered=resolve),closed=new Promise(resolve=>rpcClosed=resolve),sockets=new Set();
+  const frame={incarnation:"epoch",launch_epoch:"launch",live:true,revoked_scopes:[]};
+  const server=http.createServer((req,res)=>{
+   req.resume();
+   if(req.url==="/pi/bootstrap/watch") {watch=res;res.writeHead(200);res.write(JSON.stringify(frame)+"\n");}
+   else if(req.url==="/pi/rpc") {req.socket.once("close",()=>rpcClosed());entered();}
+   else if(req.url==="/policies/evaluate") res.end(JSON.stringify({result:"POLICY_ACTION_ALLOW",permission_tier_binding:{call_id:"pi:"+crypto.createHash("sha256").update("scope\0A").digest("hex"),revision:3,arguments_digest:"0".repeat(64),pi_origin_receipt:receipt}}));
+   else if(req.url==="/permission-tiers/control")res.end(JSON.stringify({executed:true}));
+   else res.end(JSON.stringify({revoked:true,scope_id:"scope",installation_id:"install"}));
+  });
+  const tcp=net.createServer(socket=>{sockets.add(socket);socket.on("close",()=>{sockets.delete(socket);rpcClosed();});socket.once("data",()=>entered());});
+  await Promise.all([new Promise(resolve=>server.listen(0,"127.0.0.1",resolve)),new Promise(resolve=>tcp.listen(0,"127.0.0.1",resolve))]);
+  t.after(()=>{server.closeAllConnections();server.close();for(const socket of sockets)socket.destroy();tcp.close();});
+  const connection=await connectAttestor({endpoint:`http://127.0.0.1:${server.address().port}`,credential:"fixture",brokerIncarnation:"epoch",launchEpoch:"launch"});
+  t.after(()=>connection.close());
+  const client=connection.client({scope,credential:"fixture"},"handle",()=>({status:"ready",revision:3}),async()=>support);
+  await client.evaluate(event,{},support);
+  const pending=client.execute(event,{},()=>client.bridge(event,transport==="http"?0:tcp.address().port));
+  await started;
+  if(loss==="close")connection.close();
+  else if(loss==="continuity")watch.end();
+  else if(loss==="revoke")watch.write(JSON.stringify({...frame,revoked_scopes:[scope.scope_id]})+"\n");
+  else await client.close();
+  let timer;
+  try {
+   const [reply]=await Promise.race([Promise.all([pending,closed]),new Promise((_,reject)=>timer=setTimeout(()=>reject(new Error("RPC waiter or socket survived authority loss")),1000))]);
+   assert.equal(reply.reason,"rpc_delivery_failed");
+   assert.match(reply.error,/may have run/);
+  } finally {clearTimeout(timer);}
+ });
+});
 test("state refusal and changed support are distinguishable without logging their values",async()=>{
  const state={status:"blocked",revision:3,private:receipt},f=fixture({state});
  assert.equal((await f.client.evaluate(event,{},support)).block,true);
