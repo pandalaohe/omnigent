@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 
 const { playLevelMock, nativeShellState, listSystemSoundsMock } = vi.hoisted(() => ({
   playLevelMock: vi.fn(),
@@ -184,8 +184,12 @@ describe("SoundAlertSettings", () => {
     );
     render(<SoundAlertSettings />);
 
-    expect(await screen.findAllByRole("option", { name: "Glass" })).not.toHaveLength(0);
-    expect(screen.getByTestId("sound-alert-sound-done")).toHaveValue("system:Glass");
+    const sound = await within(screen.getByTestId("sound-alert-settings")).findByRole("combobox", {
+      name: "Done (unread dot) sound",
+    });
+    fireEvent.click(sound);
+    expect(await screen.findByRole("option", { name: /Glass.*System sound/ })).toBeVisible();
+    expect(sound).toHaveValue("Glass");
     expect(screen.getByTestId("sound-alert-system-sounds-hint")).toHaveTextContent(
       "System sounds apply to this device only.",
     );

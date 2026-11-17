@@ -3,6 +3,7 @@ import { toast } from "sonner";
 import { useNavigate, useLocation } from "@/lib/routing";
 import { SettingsLabel } from "@/components/SettingsLabel";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Segmented } from "@/components/ui/segmented";
 import { browserLoginBridge, browserSettingsBridge } from "@/lib/nativeBridge";
@@ -22,6 +23,14 @@ export function SignInTab() {
     [sites, setSites] = useState<{ origin: string; id: string; label: string }[]>([]),
     [local, setLocal] = useState<{ origin: string; allowed: boolean }[]>([]),
     [bitwarden, setBitwarden] = useState<boolean | null>(null);
+  const [siteQuery, setSiteQuery] = useState("");
+  const [localQuery, setLocalQuery] = useState("");
+  const visibleSites = sites.filter((site) =>
+    `${site.origin} ${site.label}`.toLowerCase().includes(siteQuery.trim().toLowerCase()),
+  );
+  const visibleLocal = local.filter((site) =>
+    site.origin.toLowerCase().includes(localQuery.trim().toLowerCase()),
+  );
   useEffect(() => {
     void bridge
       ?.get()
@@ -162,45 +171,60 @@ export function SignInTab() {
         {!bridge?.fillApprovals || !bridge.revokeFillApproval ? (
           <UpdateReason verb="manage saved login approvals" />
         ) : (
-          <div className="divide-y">
-            {!sites.length && (
-              <p className="text-sm text-muted-foreground">
-                No sites approved. A session asks the first time it fills a saved login.
-              </p>
+          <div>
+            {sites.length > 0 && (
+              <>
+                <Input
+                  aria-label="Search saved login approvals"
+                  placeholder="Search saved login approvals"
+                  value={siteQuery}
+                  onChange={(event) => setSiteQuery(event.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Showing {visibleSites.length} of {sites.length}
+                </p>
+              </>
             )}
-            {sites.map((site) => (
-              <div
-                key={`${site.origin}:${site.id}`}
-                className="flex items-center justify-between gap-3 py-3 first:pt-0 last:pb-0"
-              >
-                <span className="min-w-0 break-all text-sm">
-                  {site.origin} · {site.label}
-                </span>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={busy}
-                  onClick={() => {
-                    setBusy(true);
-                    void bridge.revokeFillApproval!(site)
-                      .then((result) => {
-                        if (result.ok) {
-                          setSites((previous) =>
-                            previous.filter(
-                              (row) => row.origin !== site.origin || row.id !== site.id,
-                            ),
-                          );
-                          toast(`Revoked for ${site.origin}. Sessions will ask again.`);
-                        } else setStatus("Could not revoke approval.");
-                      })
-                      .catch(() => setStatus("Could not revoke approval."))
-                      .finally(() => setBusy(false));
-                  }}
+            <div className="max-h-96 divide-y overflow-auto">
+              {!sites.length && (
+                <p className="text-sm text-muted-foreground">
+                  No sites approved. A session asks the first time it fills a saved login.
+                </p>
+              )}
+              {visibleSites.map((site) => (
+                <div
+                  key={`${site.origin}:${site.id}`}
+                  className="flex items-center justify-between gap-3 py-3 first:pt-0 last:pb-0"
                 >
-                  Revoke
-                </Button>
-              </div>
-            ))}
+                  <span className="min-w-0 break-all text-sm">
+                    {site.origin} · {site.label}
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={busy}
+                    onClick={() => {
+                      setBusy(true);
+                      void bridge.revokeFillApproval!(site)
+                        .then((result) => {
+                          if (result.ok) {
+                            setSites((previous) =>
+                              previous.filter(
+                                (row) => row.origin !== site.origin || row.id !== site.id,
+                              ),
+                            );
+                            toast(`Revoked for ${site.origin}. Sessions will ask again.`);
+                          } else setStatus("Could not revoke approval.");
+                        })
+                        .catch(() => setStatus("Could not revoke approval."))
+                        .finally(() => setBusy(false));
+                    }}
+                  >
+                    Revoke
+                  </Button>
+                </div>
+              ))}
+            </div>
           </div>
         )}
       </BrowserGroup>
@@ -212,33 +236,44 @@ export function SignInTab() {
             No saved choices. Sites will ask before reaching your local network.
           </p>
         ) : (
-          <div className="divide-y">
-            {local.map((site) => (
-              <div
-                key={site.origin}
-                className="flex flex-wrap items-center justify-between gap-3 py-3 first:pt-0 last:pb-0"
-              >
-                <span className="min-w-0 break-all text-sm">{site.origin}</span>
-                <fieldset disabled={busy} className="flex items-center gap-2">
-                  <Segmented
-                    label={`Local network for ${site.origin}`}
-                    value={site.allowed ? "allow" : "block"}
-                    options={[
-                      { value: "allow", label: "Allow" },
-                      { value: "block", label: "Block" },
-                    ]}
-                    onChange={(value) => void choice(site.origin, value === "allow")}
-                  />
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => void choice(site.origin, null)}
-                  >
-                    Forget
-                  </Button>
-                </fieldset>
-              </div>
-            ))}
+          <div>
+            <Input
+              aria-label="Search local network choices"
+              placeholder="Search local network choices"
+              value={localQuery}
+              onChange={(event) => setLocalQuery(event.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              Showing {visibleLocal.length} of {local.length}
+            </p>
+            <div className="max-h-96 divide-y overflow-auto">
+              {visibleLocal.map((site) => (
+                <div
+                  key={site.origin}
+                  className="flex flex-wrap items-center justify-between gap-3 py-3 first:pt-0 last:pb-0"
+                >
+                  <span className="min-w-0 break-all text-sm">{site.origin}</span>
+                  <fieldset disabled={busy} className="flex items-center gap-2">
+                    <Segmented
+                      label={`Local network for ${site.origin}`}
+                      value={site.allowed ? "allow" : "block"}
+                      options={[
+                        { value: "allow", label: "Allow" },
+                        { value: "block", label: "Block" },
+                      ]}
+                      onChange={(value) => void choice(site.origin, value === "allow")}
+                    />
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void choice(site.origin, null)}
+                    >
+                      Forget
+                    </Button>
+                  </fieldset>
+                </div>
+              ))}
+            </div>
           </div>
         )}
         {localStatus && (

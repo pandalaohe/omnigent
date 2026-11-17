@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { CompactMembership } from "@/components/CompactMembership";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { apiKeysRequest, type ApiKeyList, type ManagedApiKey } from "@/lib/apiKeysApi";
 import text from "@/lib/locales/apiKeys.en.json";
@@ -39,6 +40,7 @@ function ApiKeysPanel({ scope }: { scope: string }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
+  const [query, setQuery] = useState("");
   const live = useRef(true);
   const current = () => live.current && identityScope() === scope;
 
@@ -129,6 +131,11 @@ function ApiKeysPanel({ scope }: { scope: string }) {
   }
 
   const labels: Record<string, string> = { usage: text.usage, tasks: text.tasks };
+  const keys =
+    data?.keys.filter((key) => key.name.toLowerCase().includes(query.trim().toLowerCase())) ?? [];
+  const readOnly =
+    data?.read_only.filter((key) => key.name.toLowerCase().includes(query.trim().toLowerCase())) ??
+    [];
   const title = value
     ? "API key ready"
     : action?.kind === "create"
@@ -153,66 +160,91 @@ function ApiKeysPanel({ scope }: { scope: string }) {
       )}
       {!data && !error && <p>Loading API keys…</p>}
       {data?.keys.length === 0 && <p className="text-sm text-muted-foreground">No API keys yet.</p>}
-      {data?.keys.map((key) => (
-        <div key={key.id} className="space-y-2 rounded-lg border border-border p-4">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div>
-              <span className="font-medium">{key.name}</span>{" "}
-              <code className="text-xs text-muted-foreground">{key.prefix}…</code>
+      {data && data.keys.length + data.read_only.length > 0 && (
+        <>
+          <Input
+            aria-label="Search API keys"
+            placeholder="Search API keys"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+          <p className="text-xs text-muted-foreground">
+            Showing {keys.length + readOnly.length} of {data.keys.length + data.read_only.length}
+          </p>
+        </>
+      )}
+      <div className="max-h-96 space-y-3 overflow-auto">
+        {keys.map((key) => (
+          <div key={key.id} className="space-y-2 rounded-lg border border-border p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <span className="font-medium">{key.name}</span>{" "}
+                <code className="text-xs text-muted-foreground">{key.prefix}…</code>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {(["edit", "regenerate", "delete"] as const).map((kind) => (
+                  <Button
+                    key={kind}
+                    size="sm"
+                    variant="outline"
+                    disabled={busy}
+                    onClick={() => open({ kind, key })}
+                  >
+                    {kind === "edit" ? "Edit" : kind === "delete" ? "Delete" : "Regenerate"}
+                  </Button>
+                ))}
+              </div>
             </div>
-            <div className="flex flex-wrap gap-2">
-              {(["edit", "regenerate", "delete"] as const).map((kind) => (
-                <Button
-                  key={kind}
-                  size="sm"
-                  variant="outline"
-                  disabled={busy}
-                  onClick={() => open({ kind, key })}
-                >
-                  {kind === "edit" ? "Edit" : kind === "delete" ? "Delete" : "Regenerate"}
-                </Button>
-              ))}
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              {key.scopes.includes("*") && <span>All permissions</span>}
+              <CompactMembership
+                label="Permissions"
+                items={key.scopes.map((s) => ({
+                  id: s,
+                  label: s === "*" ? "All permissions" : (labels[s] ?? s),
+                }))}
+              />
             </div>
+            <p
+              className={`text-xs ${key.expires_at !== null && key.expires_at <= Date.now() / 1000 ? "text-destructive" : "text-muted-foreground"}`}
+            >
+              {key.expires_at === null
+                ? "No expiration"
+                : `${key.expires_at <= Date.now() / 1000 ? "Expired" : "Expires"} ${utc(key.expires_at)}`}{" "}
+              · {key.last_used_at === null ? "Never used" : `Last used ${utc(key.last_used_at)}`}
+            </p>
           </div>
-          <div className="flex flex-wrap gap-2 text-xs">
-            {key.scopes.map((s) => (
-              <span key={s} className="rounded bg-muted px-2 py-1">
-                {s === "*" ? "All permissions" : (labels[s] ?? s)}
-              </span>
-            ))}
-          </div>
-          <p
-            className={`text-xs ${key.expires_at !== null && key.expires_at <= Date.now() / 1000 ? "text-destructive" : "text-muted-foreground"}`}
+        ))}
+        {readOnly.map((key) => (
+          <div
+            key={key.name}
+            className="space-y-2 rounded-lg border border-dashed border-border p-4 text-sm"
           >
-            {key.expires_at === null
-              ? "No expiration"
-              : `${key.expires_at <= Date.now() / 1000 ? "Expired" : "Expires"} ${utc(key.expires_at)}`}{" "}
-            · {key.last_used_at === null ? "Never used" : `Last used ${utc(key.last_used_at)}`}
-          </p>
-        </div>
-      ))}
-      {data?.read_only.map((key) => (
-        <div
-          key={key.name}
-          className="space-y-2 rounded-lg border border-dashed border-border p-4 text-sm"
-        >
-          <p className="font-medium">
-            {key.name} <span className="font-normal text-muted-foreground">Read-only</span>
-          </p>
-          <p>
-            {key.source === "environment"
-              ? "OMNIGENT_USAGE_READ_TOKEN (deprecated)"
-              : "Server config file"}{" "}
-            · {key.scopes.map((s) => labels[s] ?? s).join(", ")}
-          </p>
-          <p className="text-muted-foreground">
-            {key.last_used_at === null
-              ? "Not used since server start"
-              : `Last used ${utc(key.last_used_at)} since server start`}
-          </p>
-          <p className="text-muted-foreground">{text.readOnlyHelp}</p>
-        </div>
-      ))}
+            <p className="font-medium">
+              {key.name} <span className="font-normal text-muted-foreground">Read-only</span>
+            </p>
+            <p>
+              {key.source === "environment"
+                ? "OMNIGENT_USAGE_READ_TOKEN (deprecated)"
+                : "Server config file"}
+            </p>
+            {key.scopes.includes("*") && <p>All permissions</p>}
+            <CompactMembership
+              label="Permissions"
+              items={key.scopes.map((s) => ({
+                id: s,
+                label: s === "*" ? "All permissions" : (labels[s] ?? s),
+              }))}
+            />
+            <p className="text-muted-foreground">
+              {key.last_used_at === null
+                ? "Not used since server start"
+                : `Last used ${utc(key.last_used_at)} since server start`}
+            </p>
+            <p className="text-muted-foreground">{text.readOnlyHelp}</p>
+          </div>
+        ))}
+      </div>
       <Dialog
         open={action !== null}
         onOpenChange={(isOpen) => {

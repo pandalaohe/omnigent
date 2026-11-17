@@ -95,7 +95,11 @@ export function StandingApprovalDefaults() {
               Another action
             </label>
             <HelpTip label="About another action" className="size-11 md:size-4">
-              <table className="w-full text-left">
+              <table className="w-full table-fixed text-left">
+                <colgroup>
+                  <col style={{ width: "40%" }} />
+                  <col style={{ width: "60%" }} />
+                </colgroup>
                 <thead>
                   <tr>
                     <th>Write</th>

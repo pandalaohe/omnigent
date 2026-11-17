@@ -1,4 +1,7 @@
 import { useBrowserActivity } from "@/lib/browserActivity";
+import { LoaderCircleIcon } from "lucide-react";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { StatusIcon } from "@/components/ui/status-icon";
 import { browserViewOwnerId } from "@/lib/browserTabs";
 import { useChatStore } from "@/store/chatStore";
 
@@ -7,7 +10,15 @@ export function BrowserActivityStatus({ viewId }: { viewId: string }) {
   if (!operating) return null;
   return (
     <div className="flex shrink-0 items-center justify-between gap-2 border-border border-b bg-card px-3 py-1 text-muted-foreground text-xs">
-      <span role="status">Session is operating this page</span>
+      <TooltipProvider>
+        <span role="status" aria-label="Session is operating this page">
+          <StatusIcon
+            tone="neutral"
+            label="Session is operating this page"
+            icon={<LoaderCircleIcon />}
+          />
+        </span>
+      </TooltipProvider>
       <button
         type="button"
         className="rounded px-2 py-1 text-foreground hover:bg-muted focus-visible:outline focus-visible:outline-ring"

@@ -84,6 +84,7 @@ export function ConnectedAppsSettings({
   const [code, setCode] = useState("");
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
   const [receiptScope, setReceiptScope] = useState(scope);
   const [oldGrantId, setOldGrantId] = useState("");
   const [batchId, setBatchId] = useState("");
@@ -158,6 +159,12 @@ export function ConnectedAppsSettings({
   };
 
   const visibleApps = loadedScope === scope ? apps : null;
+  const matchingApps =
+    visibleApps?.filter((app) =>
+      `${app.label} ${app.client_name} ${app.scope}`
+        .toLowerCase()
+        .includes(query.trim().toLowerCase()),
+    ) ?? [];
   const visibleBatch = receiptScope === scope ? checkedBatch : null;
   const message = visibleBatch ? receiptMessage(visibleBatch.receipt) : null;
 
@@ -252,32 +259,44 @@ export function ConnectedAppsSettings({
       ) : visibleApps.length === 0 ? (
         <p className="mt-4 text-sm text-muted-foreground">No connected apps.</p>
       ) : (
-        <ul className="mt-4 divide-y divide-border border-y border-border">
-          {visibleApps.map((app) => (
-            <li
-              key={app.grant_id}
-              className="flex flex-wrap items-center justify-between gap-3 py-3"
-            >
-              <div className="min-w-0 text-sm">
-                <div className="font-medium">{app.label || app.client_name}</div>
-                <div className="text-muted-foreground">
-                  {app.scope === "annotations:write" ? "Web annotations" : app.scope} · Connected{" "}
-                  {dateLabel(app.created_at)} · Expires {dateLabel(app.expires_at)}
-                </div>
-              </div>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={busyId === app.grant_id}
-                aria-label={`Revoke ${app.label || app.client_name}`}
-                onClick={() => void revoke(app.grant_id)}
+        <>
+          <Input
+            className="mt-4"
+            aria-label="Search connected apps"
+            placeholder="Search connected apps"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+          <p className="text-xs text-muted-foreground">
+            Showing {matchingApps.length} of {visibleApps.length}
+          </p>
+          <ul className="mt-4 max-h-96 divide-y divide-border overflow-auto border-y border-border">
+            {matchingApps.map((app) => (
+              <li
+                key={app.grant_id}
+                className="flex flex-wrap items-center justify-between gap-3 py-3"
               >
-                Revoke
-              </Button>
-            </li>
-          ))}
-        </ul>
+                <div className="min-w-0 text-sm">
+                  <div className="font-medium">{app.label || app.client_name}</div>
+                  <div className="text-muted-foreground">
+                    {app.scope === "annotations:write" ? "Web annotations" : app.scope} · Connected{" "}
+                    {dateLabel(app.created_at)} · Expires {dateLabel(app.expires_at)}
+                  </div>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={busyId === app.grant_id}
+                  aria-label={`Revoke ${app.label || app.client_name}`}
+                  onClick={() => void revoke(app.grant_id)}
+                >
+                  Revoke
+                </Button>
+              </li>
+            ))}
+          </ul>
+        </>
       )}
       {pairingAvailable && (
         <div className="mt-5 border-t border-border pt-5">

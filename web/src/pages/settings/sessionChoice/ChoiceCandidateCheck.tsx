@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
 import type { Host } from "@/hooks/useHosts";
 import { CHOICE_SELECT } from "./ChoiceLinkEditor";
@@ -94,39 +95,77 @@ export function ChoiceCandidateCheck({
         <div className="grid gap-3 sm:grid-cols-3">
           <label className="grid min-w-0 gap-1 text-sm">
             Preview agent
-            <select
-              className={CHOICE_SELECT}
-              value={agent}
-              onChange={(e) => {
-                setAgent(e.target.value);
-                setError(null);
-              }}
-            >
-              <option value="">Choose an agent</option>
-              {agents.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.display_name}
-                </option>
-              ))}
-            </select>
+            {agents.length > COMBOBOX_OPTION_THRESHOLD ? (
+              <Combobox
+                mode="select"
+                options={agents.map((item) => ({
+                  key: item.id,
+                  label: item.display_name,
+                  description: item.name,
+                }))}
+                value={agent}
+                onValueChange={(value) => {
+                  setAgent(value);
+                  setError(null);
+                }}
+                placeholder="Choose an agent"
+                aria-label="Preview agent"
+                className="h-auto w-full rounded-none! bg-transparent p-0"
+              />
+            ) : (
+              <select
+                className={CHOICE_SELECT}
+                value={agent}
+                onChange={(e) => {
+                  setAgent(e.target.value);
+                  setError(null);
+                }}
+              >
+                <option value="">Choose an agent</option>
+                {agents.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.display_name}
+                  </option>
+                ))}
+              </select>
+            )}
           </label>
           <label className="grid min-w-0 gap-1 text-sm">
             Preview host
-            <select
-              className={CHOICE_SELECT}
-              value={targetHost}
-              onChange={(e) => {
-                setTargetHost(e.target.value);
-                setError(null);
-              }}
-            >
-              <option value="">Choose a host</option>
-              {hosts.map((item) => (
-                <option key={item.host_id} value={item.host_id}>
-                  {item.name}
-                </option>
-              ))}
-            </select>
+            {hosts.length > COMBOBOX_OPTION_THRESHOLD ? (
+              <Combobox
+                mode="select"
+                options={hosts.map((item) => ({
+                  key: item.host_id,
+                  label: item.name,
+                  description: item.status === "online" ? undefined : "Offline",
+                }))}
+                value={targetHost}
+                onValueChange={(value) => {
+                  setTargetHost(value);
+                  setError(null);
+                }}
+                placeholder="Choose a host"
+                aria-label="Preview host"
+                className="h-auto w-full rounded-none! bg-transparent p-0"
+              />
+            ) : (
+              <select
+                className={CHOICE_SELECT}
+                value={targetHost}
+                onChange={(e) => {
+                  setTargetHost(e.target.value);
+                  setError(null);
+                }}
+              >
+                <option value="">Choose a host</option>
+                {hosts.map((item) => (
+                  <option key={item.host_id} value={item.host_id}>
+                    {item.name}
+                  </option>
+                ))}
+              </select>
+            )}
           </label>
           <label className="grid min-w-0 gap-1 text-sm">
             Preview model

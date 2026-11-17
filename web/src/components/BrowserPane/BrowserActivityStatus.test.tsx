@@ -18,7 +18,7 @@ it("keeps concurrent actions visible through remount and clears after the last q
   const first = beginBrowserActivity("browser-tab:session:one");
   const second = beginBrowserActivity("browser-tab:session:one");
   const pane = render(<BrowserActivityStatus viewId="browser-tab:session:one" />);
-  expect(screen.getByRole("status")).toHaveTextContent("Session is operating this page");
+  expect(screen.getByRole("status")).toHaveAccessibleName("Session is operating this page");
   act(() => {
     first();
     vi.advanceTimersByTime(BROWSER_ACTIVITY_QUIET_MS * 2);

@@ -85,3 +85,33 @@ it("keeps add, enable and Bitwarden permission review available with visible out
   await screen.findByText("Extension permissions reviewed.");
   expect(review).toHaveBeenCalledWith("package");
 });
+
+it("filters extensions while retaining their actions", async () => {
+  Object.assign(window, {
+    omnigentDesktop: {
+      kind: "electron",
+      getBrowserLoginSetting: vi.fn().mockResolvedValue({ ok: true, enabled: true }),
+      setBrowserLoginSetting: vi.fn(),
+      clearBrowserLogin: vi.fn(),
+      browserExtensionsList: async () => ({
+        ok: true,
+        extensions: [
+          { id: "one", name: "First", version: "1", enabled: true },
+          { id: "two", name: "Second", version: "1", enabled: false },
+        ],
+      }),
+      browserExtensionsAdd: vi.fn(),
+      browserExtensionsEnable: vi.fn(),
+      browserExtensionsRemove: vi.fn(),
+    },
+  });
+  render(<ExtensionsTab />);
+  const search = await screen.findByRole("textbox", { name: "Search extensions" });
+  expect(screen.getByText("Showing 2 of 2")).toBeVisible();
+  fireEvent.change(search, { target: { value: "second" } });
+  expect(screen.getByText("Showing 1 of 2")).toBeVisible();
+  expect(screen.queryByRole("switch", { name: "Enable First" })).toBeNull();
+  expect(screen.getByRole("switch", { name: "Enable Second" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Actions for Second" })).toBeVisible();
+  expect(screen.getByLabelText("Disabled")).toBeVisible();
+});

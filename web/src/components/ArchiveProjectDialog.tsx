@@ -10,6 +10,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { ProjectSinglePicker } from "@/components/ProjectSinglePicker";
 import { SelectionList } from "@/components/SelectionList";
 import { resolveMulti, type MultiValue } from "@/lib/multiSelection";
@@ -122,9 +123,12 @@ export function ArchiveProjectDialog({
   const [moveKind, setMoveKind] = useState<"sessions" | "tasks" | null>(null);
   const [moveSelection, setMoveSelection] = useState<MultiValue>({ mode: "only", ids: [] });
   const [destination, setDestination] = useState<string | null>(null);
-  const [expandedSessions, setExpandedSessions] = useState(false);
+  const [sessionQuery, setSessionQuery] = useState("");
   const sessions = useMemo(() => preview.data?.sessions ?? [], [preview.data]);
   const tasks = useMemo(() => preview.data?.scheduled_tasks ?? [], [preview.data]);
+  const visibleSessions = sessions.filter((session) =>
+    `${session.title} ${session.id}`.toLowerCase().includes(sessionQuery.trim().toLowerCase()),
+  );
   const projectChoices = (projects.data ?? []).filter((project) => project.id !== projectId);
   const moveItems = useMemo(
     () =>
@@ -270,34 +274,35 @@ export function ArchiveProjectDialog({
               <div className="space-y-4">
                 <section>
                   <h3 className="font-medium">{sessions.length} sessions will be archived</h3>
-                  {(expandedSessions ? sessions : sessions.slice(0, 8)).map((session) => (
-                    <div
-                      key={session.id}
-                      className="flex flex-wrap justify-between gap-x-3 border-b py-2"
-                    >
-                      <span>
-                        {session.title || session.id}
-                        {session.via_parent_outside_project && (
-                          <span className="ml-2 text-xs text-muted-foreground">
-                            Child in another project
-                          </span>
-                        )}
-                      </span>
-                      <span className="text-xs text-muted-foreground">
-                        {sessionStopText(session)}
-                      </span>
-                    </div>
-                  ))}
-                  {sessions.length > 8 && (
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => setExpandedSessions(!expandedSessions)}
-                    >
-                      {expandedSessions ? "Show fewer" : `Show all ${sessions.length}`}
-                    </Button>
-                  )}
+                  <Input
+                    aria-label="Search archived sessions"
+                    placeholder="Search sessions"
+                    value={sessionQuery}
+                    onChange={(event) => setSessionQuery(event.target.value)}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Showing {visibleSessions.length} of {sessions.length}
+                  </p>
+                  <div className="max-h-64 overflow-auto">
+                    {visibleSessions.map((session) => (
+                      <div
+                        key={session.id}
+                        className="flex flex-wrap justify-between gap-x-3 border-b py-2"
+                      >
+                        <span>
+                          {session.title || session.id}
+                          {session.via_parent_outside_project && (
+                            <span className="ml-2 text-xs text-muted-foreground">
+                              Child in another project
+                            </span>
+                          )}
+                        </span>
+                        <span className="text-xs text-muted-foreground">
+                          {sessionStopText(session)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
                 </section>
                 <section>
                   <h3 className="font-medium">{tasks.length} automations will stop firing</h3>

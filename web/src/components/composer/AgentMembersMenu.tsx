@@ -1,8 +1,10 @@
 import { LockIcon, PencilIcon, TriangleAlertIcon } from "lucide-react";
+import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { ComposerAgentIcon } from "@/components/composer/ComposerAgentIcon";
 import { AgentEditor } from "@/components/AgentEditor";
 import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
 import { CUSTOM_AGENTS_QUERY_KEY, useCustomAgents, type CustomAgent } from "@/lib/customAgentsApi";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
@@ -128,6 +130,12 @@ export function AgentMembersMenu({
   /** Present only when the session carries a saved-Agent template id. */
   onEditAgent?: () => void;
 }) {
+  const [query, setQuery] = useState("");
+  const visibleMembers = members.filter((member) =>
+    `${member.role} ${memberConfigLine(member, hosts)}`
+      .toLowerCase()
+      .includes(query.trim().toLowerCase()),
+  );
   return (
     <div data-testid="agent-members-menu">
       {agentName !== null && (
@@ -142,8 +150,18 @@ export function AgentMembersMenu({
         <LockIcon className="mt-0.5 size-3 shrink-0" aria-hidden="true" />
         Members are fixed for this session; edits apply to new sessions
       </div>
-      <div className="flex flex-col gap-0.5 py-1">
-        {members.map((member) => (
+      <Input
+        aria-label="Search session members"
+        placeholder="Search members"
+        value={query}
+        onChange={(event) => setQuery(event.target.value)}
+        onKeyDown={(event) => event.stopPropagation()}
+      />
+      <p className="px-2 text-xs text-muted-foreground">
+        Showing {visibleMembers.length} of {members.length}
+      </p>
+      <div className="flex max-h-64 flex-col gap-0.5 overflow-auto py-1">
+        {visibleMembers.map((member) => (
           <AgentMemberRow
             key={member.role}
             member={member}

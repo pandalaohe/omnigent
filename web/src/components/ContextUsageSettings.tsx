@@ -1819,7 +1819,9 @@ export function ContextUsageSettings() {
                 className="group/name flex max-w-full min-w-0 items-center gap-1.5 rounded-sm text-left text-ui font-medium text-foreground underline-offset-2 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring aria-expanded:underline"
               >
                 {badge ? <AgentBadgeMark badge={badge} data-testid="agent-name-badge" /> : null}
-                <span className="min-w-0 wrap-anywhere">{label}</span>
+                <span className="min-w-0 truncate" title={label}>
+                  {label}
+                </span>
                 <PlusIcon
                   aria-hidden
                   className="hidden size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover/name:opacity-100 group-focus-visible/name:opacity-100 group-aria-expanded/name:opacity-100 md:block"
@@ -1901,8 +1903,15 @@ export function ContextUsageSettings() {
           <div className="max-w-full overflow-x-auto rounded-lg border border-border">
             <table
               aria-label="Context limits"
-              className="w-full min-w-max border-separate border-spacing-0 text-sm"
+              className="w-full table-fixed border-separate border-spacing-0 text-sm"
+              style={{ minWidth: `${200 + columns.length * 200}px` }}
             >
+              <colgroup>
+                <col style={{ width: 200 }} />
+                {columns.map((column) => (
+                  <col key={column.id} style={{ width: 200 }} />
+                ))}
+              </colgroup>
               <thead>
                 <tr>
                   <th className={cn("z-20", TABLE_CELL, FIRST_COLUMN, "px-3 py-2")}>
@@ -1923,11 +1932,11 @@ export function ContextUsageSettings() {
                       <span className="flex">
                         <span className={cn("min-w-0 flex-1", CELL_PADDING)}>
                           <span
-                            className="block text-ui font-medium text-foreground wrap-anywhere"
+                            className="block truncate text-ui font-medium text-foreground"
                             title={
                               column.hostId && column.hostId !== column.label
                                 ? column.hostId
-                                : undefined
+                                : column.label
                             }
                           >
                             {column.label}
@@ -1988,7 +1997,10 @@ export function ContextUsageSettings() {
                                     ROW_HEIGHT,
                                   )}
                                 >
-                                  <span className="min-w-0 flex-1 py-1 text-sm wrap-anywhere text-foreground">
+                                  <span
+                                    className="min-w-0 flex-1 truncate py-1 text-sm text-foreground"
+                                    title={row.label}
+                                  >
                                     {row.label}
                                   </span>
                                   {removeButton(row)}
@@ -2053,7 +2065,10 @@ export function ContextUsageSettings() {
                                       ROW_HEIGHT,
                                     )}
                                   >
-                                    <span className="min-w-0 flex-1 py-1 text-sm wrap-anywhere text-foreground">
+                                    <span
+                                      className="min-w-0 flex-1 truncate py-1 text-sm text-foreground"
+                                      title={row.label}
+                                    >
                                       {row.label}
                                     </span>
                                     {removeButton(row)}

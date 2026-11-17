@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Combobox } from "@/components/ui/combobox";
 import { useIsPhone } from "@/hooks/useIsPhone";
 import {
   Dialog,
@@ -431,25 +432,27 @@ export function TerminalKeySheet({
                 </div>
                 <label className="grid gap-1.5">
                   More keys
-                  <select
-                    aria-label="More keys"
-                    className="min-h-11 rounded-md border border-input bg-background px-2"
+                  <Combobox
+                    mode="select"
+                    options={[
+                      ...KEY_GROUPS.flatMap((group) =>
+                        group.choices.map(([code, label]) => ({
+                          key: code,
+                          label,
+                          description: group.label,
+                        })),
+                      ),
+                      ...(!KEY_GROUPS.some((group) =>
+                        group.choices.some(([code]) => code === draft.chord.code),
+                      )
+                        ? [{ key: draft.chord.code, label: draft.chord.code }]
+                        : []),
+                    ]}
                     value={draft.chord.code}
-                    onChange={(event) => chooseCode(event.target.value)}
-                  >
-                    {KEY_GROUPS.map((group) => (
-                      <optgroup key={group.label} label={group.label}>
-                        {group.choices.map(([code, label]) => (
-                          <option key={code} value={code}>
-                            {label}
-                          </option>
-                        ))}
-                      </optgroup>
-                    ))}
-                    {!KEY_GROUPS.some((group) =>
-                      group.choices.some(([code]) => code === draft.chord.code),
-                    ) && <option value={draft.chord.code}>{draft.chord.code}</option>}
-                  </select>
+                    onValueChange={chooseCode}
+                    aria-label="More keys"
+                    className="h-auto w-full rounded-none! bg-transparent p-0"
+                  />
                 </label>
                 <div className="flex flex-wrap gap-2" role="group" aria-label="Key modifiers">
                   {(

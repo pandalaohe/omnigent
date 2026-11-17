@@ -1,5 +1,6 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
@@ -62,8 +63,19 @@ function seed(master: CallingDefaultsTable) {
 }
 
 async function choose(value: string) {
-  fireEvent.click(screen.getByRole("combobox", { name: "Permission" }));
-  fireEvent.click(await screen.findByRole("option", { name: value }));
+  const picker = screen.getByRole("combobox", { name: "Permission" });
+  const user = userEvent.setup();
+  await user.click(picker);
+  if (picker instanceof HTMLInputElement) {
+    await user.clear(picker);
+    fireEvent.change(picker, { target: { value } });
+  }
+  await user.click(
+    await screen.findByRole("option", {
+      name: (name) => name.startsWith(value),
+    }),
+  );
+  await waitFor(() => expect(picker).toHaveAttribute("aria-expanded", "false"));
 }
 
 afterEach(() => {

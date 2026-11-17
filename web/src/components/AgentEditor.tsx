@@ -6,6 +6,7 @@ import { AgentMemberTrigger } from "@/components/AgentMemberTrigger";
 import { BuiltinPromptEditor } from "@/components/BuiltinPromptEditor";
 import { AgentNameTag } from "@/components/AgentNameTag";
 import { Button } from "@/components/ui/button";
+import { CompactMembership } from "@/components/CompactMembership";
 import {
   Dialog,
   DialogContent,
@@ -203,6 +204,7 @@ export function AgentEditor({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [focusKey, setFocusKey] = useState<number | null>(null);
+  const [memberQuery, setMemberQuery] = useState("");
   const initialized = useRef(false);
   const nextKey = useRef(0);
   const nameRefs = useRef(new Map<number, HTMLInputElement | null>());
@@ -287,6 +289,18 @@ export function AgentEditor({
     const live = new Set(members.slice(1).map((member) => member.name.trim()));
     return baseline.slice(1).some((member) => !live.has(member.name.trim()));
   }, [members, baseline]);
+  const memberVisible = (member: MemberDraft, index: number) =>
+    index === 0 ||
+    !member.saved ||
+    JSON.stringify(member) !== JSON.stringify(baseline.find((saved) => saved.key === member.key)) ||
+    `${member.name} ${member.description}`.toLowerCase().includes(memberQuery.trim().toLowerCase());
+  const memberWarnings = members.flatMap((member) => {
+    const warning = memberHostWarning(member, hostList);
+    return warning === null ? [] : [{ member, warning }];
+  });
+  const visibleWarnings = memberWarnings.filter(({ warning }) =>
+    warning.toLowerCase().includes(memberQuery.trim().toLowerCase()),
+  );
 
   const unavailable = !detail.data || detail.isFetching || baseVersion === null;
   const canSave =
@@ -410,118 +424,141 @@ export function AgentEditor({
           </label>
           <div className="space-y-2">
             <span className="text-sm">Members</span>
-            {members.map((member, index) =>
-              index === 0 ? (
-                <div
-                  key={member.key}
-                  data-testid="agent-member-row"
-                  className="flex items-center gap-2 rounded-md border border-border p-2"
-                >
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className="truncate text-sm font-medium">
-                        <AgentNameTag
-                          agentId={agent.id}
-                          name={name.trim()}
-                          harness={member.harness}
-                        />
-                      </span>
-                      <span className="shrink-0 rounded-full border border-border px-1.5 text-xs text-muted-foreground">
-                        Lead
-                      </span>
+            <Input
+              aria-label="Search members"
+              placeholder="Search members"
+              value={memberQuery}
+              onChange={(event) => setMemberQuery(event.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              Showing {members.filter(memberVisible).length} of {members.length}
+            </p>
+            <div className="max-h-96 space-y-2 overflow-auto">
+              {members.map((member, index) =>
+                !memberVisible(member, index) ? null : index === 0 ? (
+                  <div
+                    key={member.key}
+                    data-testid="agent-member-row"
+                    className="flex items-center gap-2 rounded-md border border-border p-2"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="truncate text-sm font-medium">
+                          <AgentNameTag
+                            agentId={agent.id}
+                            name={name.trim()}
+                            harness={member.harness}
+                          />
+                        </span>
+                        <span className="shrink-0 rounded-full border border-border px-1.5 text-xs text-muted-foreground">
+                          Lead
+                        </span>
+                      </div>
+                      {description.trim() !== "" && (
+                        <p className="truncate text-xs text-muted-foreground">
+                          {description.trim()}
+                        </p>
+                      )}
                     </div>
-                    {description.trim() !== "" && (
-                      <p className="truncate text-xs text-muted-foreground">{description.trim()}</p>
-                    )}
-                  </div>
-                  <AgentMemberTrigger
-                    harness={member.harness}
-                    model={member.model}
-                    effort={member.effort}
-                    speed={member.speed}
-                    harnessOptions={leadHarnessOptions}
-                    hostId={member.hostId}
-                    sessionHostId={sessionHostId}
-                    hosts={hosts}
-                    onChange={(next) => updateMember(member.key, next)}
-                    disabled={unavailable || busy}
-                  />
-                </div>
-              ) : (
-                <div
-                  key={member.key}
-                  data-testid="agent-member-row"
-                  className="space-y-1 rounded-md border border-border p-2"
-                >
-                  <div className="flex items-center gap-2">
-                    {member.saved ? (
-                      <span
-                        data-testid="agent-member-role-name"
-                        className="min-w-0 flex-1 truncate text-sm leading-8"
-                        title={member.name}
-                      >
-                        <AgentNameTag agentId={null} name={member.name} harness={member.harness} />
-                      </span>
-                    ) : (
-                      <Input
-                        ref={(element) => {
-                          if (element) nameRefs.current.set(member.key, element);
-                          else nameRefs.current.delete(member.key);
-                        }}
-                        data-testid="agent-member-name"
-                        aria-label="Role name"
-                        placeholder="role-name"
-                        value={member.name}
-                        onChange={(event) => updateMember(member.key, { name: event.target.value })}
-                        disabled={unavailable || busy}
-                      />
-                    )}
                     <AgentMemberTrigger
                       harness={member.harness}
                       model={member.model}
                       effort={member.effort}
                       speed={member.speed}
-                      harnessOptions={memberHarnessOptions}
+                      harnessOptions={leadHarnessOptions}
                       hostId={member.hostId}
                       sessionHostId={sessionHostId}
                       hosts={hosts}
                       onChange={(next) => updateMember(member.key, next)}
                       disabled={unavailable || busy}
                     />
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      aria-label={`Remove ${member.name.trim() || "member"}`}
-                      data-testid="agent-member-remove"
-                      disabled={unavailable || busy}
-                      onClick={() =>
-                        setMembers((current) => current.filter((row) => row.key !== member.key))
-                      }
-                    >
-                      <TrashIcon className="size-3.5" />
-                    </Button>
                   </div>
-                  <Input
-                    data-testid="agent-member-description"
-                    aria-label="Role description"
-                    placeholder="What this member does"
-                    value={member.description}
-                    onChange={(event) =>
-                      updateMember(member.key, { description: event.target.value })
-                    }
-                    disabled={unavailable || busy}
-                  />
-                  {roleErrors.has(member.key) && (
-                    <p role="alert" className="text-xs text-destructive">
-                      {roleErrors.get(member.key)}
-                    </p>
-                  )}
-                </div>
-              ),
+                ) : (
+                  <div
+                    key={member.key}
+                    data-testid="agent-member-row"
+                    className="space-y-1 rounded-md border border-border p-2"
+                  >
+                    <div className="flex items-center gap-2">
+                      {member.saved ? (
+                        <span
+                          data-testid="agent-member-role-name"
+                          className="min-w-0 flex-1 truncate text-sm leading-8"
+                          title={member.name}
+                        >
+                          <AgentNameTag
+                            agentId={null}
+                            name={member.name}
+                            harness={member.harness}
+                          />
+                        </span>
+                      ) : (
+                        <Input
+                          ref={(element) => {
+                            if (element) nameRefs.current.set(member.key, element);
+                            else nameRefs.current.delete(member.key);
+                          }}
+                          data-testid="agent-member-name"
+                          aria-label="Role name"
+                          placeholder="role-name"
+                          value={member.name}
+                          onChange={(event) =>
+                            updateMember(member.key, { name: event.target.value })
+                          }
+                          disabled={unavailable || busy}
+                        />
+                      )}
+                      <AgentMemberTrigger
+                        harness={member.harness}
+                        model={member.model}
+                        effort={member.effort}
+                        speed={member.speed}
+                        harnessOptions={memberHarnessOptions}
+                        hostId={member.hostId}
+                        sessionHostId={sessionHostId}
+                        hosts={hosts}
+                        onChange={(next) => updateMember(member.key, next)}
+                        disabled={unavailable || busy}
+                      />
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label={`Remove ${member.name.trim() || "member"}`}
+                        data-testid="agent-member-remove"
+                        disabled={unavailable || busy}
+                        onClick={() =>
+                          setMembers((current) => current.filter((row) => row.key !== member.key))
+                        }
+                      >
+                        <TrashIcon className="size-3.5" />
+                      </Button>
+                    </div>
+                    <Input
+                      data-testid="agent-member-description"
+                      aria-label="Role description"
+                      placeholder="What this member does"
+                      value={member.description}
+                      onChange={(event) =>
+                        updateMember(member.key, { description: event.target.value })
+                      }
+                      disabled={unavailable || busy}
+                    />
+                    {roleErrors.has(member.key) && (
+                      <p role="alert" className="text-xs text-destructive">
+                        {roleErrors.get(member.key)}
+                      </p>
+                    )}
+                  </div>
+                ),
+              )}
+            </div>
+            {memberWarnings.length > 0 && (
+              <p className="text-xs text-muted-foreground">
+                Showing {visibleWarnings.length} of {memberWarnings.length} host warnings
+              </p>
             )}
-            {members.map((member) => {
-              const warning = memberHostWarning(member, hostList);
-              return warning === null ? null : (
+            <div className="max-h-40 overflow-auto">
+              {visibleWarnings.map(({ member, warning }) => (
                 <p
                   key={`host-warning-${member.key}`}
                   role="alert"
@@ -531,8 +568,8 @@ export function AgentEditor({
                 >
                   {warning}
                 </p>
-              );
-            })}
+              ))}
+            </div>
             {leadModelMissing && (
               <p className="text-xs text-muted-foreground">
                 Pick a model — the omnigent executor requires one.
@@ -651,27 +688,13 @@ export function BuiltinAgentView({
         {agent.members == null ? (
           <p className="py-2 text-sm text-muted-foreground">Members unavailable</p>
         ) : (
-          <div className="space-y-2">
-            {agent.members.map((member) => (
-              <div
-                key={member.name}
-                data-testid="builtin-member-row"
-                className="flex items-center gap-2 rounded-md border border-border p-2"
-              >
-                <span className="min-w-0 flex-1 truncate text-sm">
-                  <AgentNameTag agentId={null} name={member.name} harness={member.harness} />
-                </span>
-                {member.lead && (
-                  <span className="shrink-0 rounded-full border border-border px-1.5 text-xs text-muted-foreground">
-                    Lead
-                  </span>
-                )}
-                <span className="shrink-0 text-xs text-muted-foreground">
-                  {memberSettings(member, harnessLabels)}
-                </span>
-              </div>
-            ))}
-          </div>
+          <CompactMembership
+            label="Members"
+            items={agent.members.map((member) => ({
+              id: member.name,
+              label: `${member.name}${member.lead ? " · Lead" : ""} · ${memberSettings(member, harnessLabels)}`,
+            }))}
+          />
         )}
         {error && (
           <p role="alert" className="text-sm text-destructive">

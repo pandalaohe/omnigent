@@ -1,5 +1,6 @@
 import { CircleHelpIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   Select,
@@ -52,33 +53,58 @@ export function SessionDefaultModeSelect({
   const legacyTier = tierDefault ? normalizeAgyPermissionTier(value) : null;
   const selected = tierDefault ? legacyTier : value === "priority" ? "fast" : value;
   const available = selected == null || options.some((option) => option.value === selected);
-  const select = (
-    <Select
-      value={selected ?? "__default__"}
-      disabled={disabled}
-      onOpenChange={onOpenChange}
-      onValueChange={(next) => {
-        if (next !== "") onChange(next === "__default__" ? null : next);
-      }}
-    >
-      <SelectTrigger className="h-8 w-full min-w-0" aria-label={label} data-testid={testId}>
-        <SelectValue>{selected == null ? inheritLabel : undefined}</SelectValue>
-      </SelectTrigger>
-      <SelectContent position="popper" align="start" className="w-(--radix-select-trigger-width)">
-        <SelectItem value="__default__">Default</SelectItem>
-        {!available && selected && (
-          <SelectItem value={selected} disabled>
-            Unavailable ({value})
-          </SelectItem>
-        )}
-        {options.map((option) => (
-          <SelectItem key={option.value} value={option.value}>
-            {option.label}
-          </SelectItem>
-        ))}
-      </SelectContent>
-    </Select>
-  );
+  const select =
+    options.length > COMBOBOX_OPTION_THRESHOLD ? (
+      <fieldset disabled={disabled} className="contents">
+        <div data-testid={testId} className="min-w-0 flex-1">
+          <Combobox
+            mode="select"
+            options={[
+              {
+                key: "__default__",
+                label: inheritLabel,
+                description: inheritLabel === "Default" ? undefined : "Default",
+              },
+              ...(!available && selected
+                ? [{ key: selected, label: `Unavailable (${value})`, disabled: true }]
+                : []),
+              ...options.map((option) => ({ key: option.value, label: option.label })),
+            ]}
+            value={selected ?? "__default__"}
+            onOpenChange={onOpenChange}
+            onValueChange={(next) => onChange(next === "__default__" ? null : next)}
+            aria-label={label}
+            className="h-auto w-full rounded-none! bg-transparent p-0"
+          />
+        </div>
+      </fieldset>
+    ) : (
+      <Select
+        value={selected ?? "__default__"}
+        disabled={disabled}
+        onOpenChange={onOpenChange}
+        onValueChange={(next) => {
+          if (next !== "") onChange(next === "__default__" ? null : next);
+        }}
+      >
+        <SelectTrigger className="h-8 w-full min-w-0" aria-label={label} data-testid={testId}>
+          <SelectValue>{selected == null ? inheritLabel : undefined}</SelectValue>
+        </SelectTrigger>
+        <SelectContent position="popper" align="start" className="w-(--radix-select-trigger-width)">
+          <SelectItem value="__default__">Default</SelectItem>
+          {!available && selected && (
+            <SelectItem value={selected} disabled>
+              Unavailable ({value})
+            </SelectItem>
+          )}
+          {options.map((option) => (
+            <SelectItem key={option.value} value={option.value}>
+              {option.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    );
   if (tierDefault && ["auto-strict", "auto-standard"].includes(value ?? "")) {
     return (
       <div className="min-w-0 flex-1">

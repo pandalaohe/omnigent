@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { PinIcon, PinOffIcon, PlusIcon } from "lucide-react";
 
 import { AgentEditor, BuiltinAgentView, memberSettings } from "@/components/AgentEditor";
+import { CompactMembership } from "@/components/CompactMembership";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { SECTION_ORDER, useAgentRegistry, type SectionId } from "@/hooks/useAgentRegistry";
 import { useAgentBadgePreferences } from "@/hooks/useAgentBadgePreferences";
@@ -306,9 +307,19 @@ export function AgentsSettings({
           </div>
           {members && members.length > 0 ? (
             <>
-              <div className="truncate text-xs text-muted-foreground">
-                {rosterSummary(members, harnessLabels)}
-              </div>
+              {members.length > 1 ? (
+                <CompactMembership
+                  label="Members"
+                  items={members.map((member) => ({
+                    id: member.name,
+                    label: `${member.name}${member.lead ? " · Lead" : ""} · ${memberSettings(member, harnessLabels)}`,
+                  }))}
+                />
+              ) : (
+                <div className="truncate text-xs text-muted-foreground">
+                  {rosterSummary(members, harnessLabels)}
+                </div>
+              )}
               {agent.description && (
                 <div className="truncate text-xs text-muted-foreground">{agent.description}</div>
               )}
@@ -393,35 +404,40 @@ export function AgentsSettings({
           : visibleInstalledAgents.length > 0 && (
               <div>
                 <h2 className="mb-2 text-sm text-muted-foreground">Saved configurations</h2>
-                {visibleInstalledAgents.map((agent) => (
-                  <div
-                    key={agent.id}
-                    className="flex min-h-14 flex-wrap items-center gap-2 border-b py-2"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate text-sm">
-                        <AgentNameTag
-                          agentId={agent.id}
-                          name={registryItemFor(agent)?.label ?? agent.display_name}
-                          harness={agent.harness ?? null}
-                        />
-                      </div>
-                      {agent.description && (
-                        <div className="truncate text-xs text-muted-foreground">
-                          {agent.description}
+                <p className="text-xs text-muted-foreground">
+                  Showing {visibleInstalledAgents.length} of {installedAgents.length}
+                </p>
+                <div className="max-h-96 overflow-auto">
+                  {visibleInstalledAgents.map((agent) => (
+                    <div
+                      key={agent.id}
+                      className="flex min-h-14 flex-wrap items-center gap-2 border-b py-2"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-sm">
+                          <AgentNameTag
+                            agentId={agent.id}
+                            name={registryItemFor(agent)?.label ?? agent.display_name}
+                            harness={agent.harness ?? null}
+                          />
                         </div>
-                      )}
+                        {agent.description && (
+                          <div className="truncate text-xs text-muted-foreground">
+                            {agent.description}
+                          </div>
+                        )}
+                      </div>
+                      <PinToggle
+                        agentId={agent.id}
+                        name={agent.display_name}
+                        pinned={pinnedIdSet.has(agent.id)}
+                        canPin={!atPinLimit}
+                        ready={pinsReady}
+                        onToggle={togglePin}
+                      />
                     </div>
-                    <PinToggle
-                      agentId={agent.id}
-                      name={agent.display_name}
-                      pinned={pinnedIdSet.has(agent.id)}
-                      canPin={!atPinLimit}
-                      ready={pinsReady}
-                      onToggle={togglePin}
-                    />
-                  </div>
-                ))}
+                  ))}
+                </div>
               </div>
             )}
         {catalog.isLoading && (
@@ -440,102 +456,118 @@ export function AgentsSettings({
         {catalog.data?.length === 0 && query === "" && (
           <p className="py-4 text-sm text-muted-foreground">No custom agents yet.</p>
         )}
-        {visibleCustomAgents
-          .filter((agent) => (agent.members?.length ?? 0) <= 1)
-          .map(renderCustomAgent)}
+        <p className="text-xs text-muted-foreground">
+          Showing {visibleCustomAgents.filter((agent) => (agent.members?.length ?? 0) <= 1).length}{" "}
+          of {customAgentRows.filter((agent) => (agent.members?.length ?? 0) <= 1).length}
+        </p>
+        <div className="max-h-96 overflow-auto">
+          {visibleCustomAgents
+            .filter((agent) => (agent.members?.length ?? 0) <= 1)
+            .map(renderCustomAgent)}
+        </div>
       </section>
       <div>
         <h2 className="mb-2 text-sm text-muted-foreground">Team agents</h2>
-        {visibleCustomAgents
-          .filter((agent) => (agent.members?.length ?? 0) > 1)
-          .map(renderCustomAgent)}
-        {!available.isLoading &&
-          !available.error &&
-          visibleBuiltinAgents.length === 0 &&
-          !visibleCustomAgents.some((agent) => (agent.members?.length ?? 0) > 1) && (
-            <p className="text-sm text-muted-foreground">No team agents.</p>
+        <p className="text-xs text-muted-foreground">
+          Showing{" "}
+          {visibleCustomAgents.filter((agent) => (agent.members?.length ?? 0) > 1).length +
+            visibleBuiltinAgents.length}{" "}
+          of{" "}
+          {customAgentRows.filter((agent) => (agent.members?.length ?? 0) > 1).length +
+            memberBuiltinAgents.filter((agent) => !isSdkAgent(agent)).length}
+        </p>
+        <div className="max-h-96 overflow-auto">
+          {visibleCustomAgents
+            .filter((agent) => (agent.members?.length ?? 0) > 1)
+            .map(renderCustomAgent)}
+          {!available.isLoading &&
+            !available.error &&
+            visibleBuiltinAgents.length === 0 &&
+            !visibleCustomAgents.some((agent) => (agent.members?.length ?? 0) > 1) && (
+              <p className="text-sm text-muted-foreground">No team agents.</p>
+            )}
+          {available.isLoading && (
+            <p role="status" className="text-sm text-muted-foreground">
+              Loading agents…
+            </p>
           )}
-        {available.isLoading && (
-          <p role="status" className="text-sm text-muted-foreground">
-            Loading agents…
-          </p>
-        )}
-        {available.error && (
-          <p role="alert" className="text-sm text-destructive">
-            {errorText(available.error)}
-          </p>
-        )}
-        {builtinSections.map(({ section, agents }) => (
-          <div key={section}>
-            {agents.map((agent) => {
-              const memberControls = isMemberBuiltin(agent);
-              return (
-                <div
-                  key={agent.id}
-                  className="flex min-h-14 flex-wrap items-center gap-2 border-b py-2"
-                >
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-sm">
-                      <AgentNameTag
-                        agentId={agent.id}
-                        name={registryItemFor(agent)?.label ?? agent.display_name}
-                        harness={agent.harness ?? null}
-                      />
-                    </div>
-                    {memberControls && (
-                      <div className="truncate text-xs text-muted-foreground">
-                        {builtinSubtitle(agent)}
+          {available.error && (
+            <p role="alert" className="text-sm text-destructive">
+              {errorText(available.error)}
+            </p>
+          )}
+          {builtinSections.map(({ section, agents }) => (
+            <div key={section}>
+              {agents.map((agent) => {
+                const memberControls = isMemberBuiltin(agent);
+                return (
+                  <div
+                    key={agent.id}
+                    className="flex min-h-14 flex-wrap items-center gap-2 border-b py-2"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm">
+                        <AgentNameTag
+                          agentId={agent.id}
+                          name={registryItemFor(agent)?.label ?? agent.display_name}
+                          harness={agent.harness ?? null}
+                        />
                       </div>
+                      {memberControls && (
+                        <div className="truncate text-xs text-muted-foreground">
+                          {builtinSubtitle(agent)}
+                        </div>
+                      )}
+                    </div>
+                    {memberControls && !isSdkAgent(agent) && (
+                      <PinToggle
+                        agentId={agent.id}
+                        name={agent.display_name}
+                        pinned={pinnedIdSet.has(agent.id)}
+                        canPin={!atPinLimit}
+                        ready={pinsReady}
+                        onToggle={togglePin}
+                      />
+                    )}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setBadgeEditing({ id: agent.id, name: agent.display_name })}
+                      aria-label={`Edit badge for ${agent.display_name}`}
+                    >
+                      Edit badge
+                    </Button>
+                    {memberControls && (
+                      <>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          aria-label={`View ${agent.display_name}`}
+                          disabled={duplicatingId !== null}
+                          onClick={() => {
+                            setError(null);
+                            setViewing(agent);
+                          }}
+                        >
+                          View
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          aria-label={`Duplicate ${agent.display_name}`}
+                          disabled={duplicatingId !== null}
+                          onClick={() => void duplicateBuiltin(agent)}
+                        >
+                          Duplicate
+                        </Button>
+                      </>
                     )}
                   </div>
-                  {memberControls && !isSdkAgent(agent) && (
-                    <PinToggle
-                      agentId={agent.id}
-                      name={agent.display_name}
-                      pinned={pinnedIdSet.has(agent.id)}
-                      canPin={!atPinLimit}
-                      ready={pinsReady}
-                      onToggle={togglePin}
-                    />
-                  )}
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => setBadgeEditing({ id: agent.id, name: agent.display_name })}
-                    aria-label={`Edit badge for ${agent.display_name}`}
-                  >
-                    Edit badge
-                  </Button>
-                  {memberControls && (
-                    <>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        aria-label={`View ${agent.display_name}`}
-                        disabled={duplicatingId !== null}
-                        onClick={() => {
-                          setError(null);
-                          setViewing(agent);
-                        }}
-                      >
-                        View
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        aria-label={`Duplicate ${agent.display_name}`}
-                        disabled={duplicatingId !== null}
-                        onClick={() => void duplicateBuiltin(agent)}
-                      >
-                        Duplicate
-                      </Button>
-                    </>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        ))}
+                );
+              })}
+            </div>
+          ))}
+        </div>
       </div>
       {query !== "" &&
         visibleBuiltinAgents.length === 0 &&
@@ -551,25 +583,30 @@ export function AgentsSettings({
           <summary className="cursor-pointer text-muted-foreground">
             Import from existing sessions
           </summary>
-          {visibleSessionAgents.map((agent) => (
-            <div key={agent.id} className="mt-2 flex items-center gap-2 border-b py-2">
-              <span className="min-w-0 flex-1 truncate">
-                <AgentNameTag
-                  agentId={agent.id}
-                  name={agent.display_name}
-                  harness={agent.harness ?? null}
-                />
-              </span>
-              <Button
-                size="sm"
-                variant="ghost"
-                disabled={busy}
-                onClick={() => void importAgent(agent)}
-              >
-                Import
-              </Button>
-            </div>
-          ))}
+          <p className="text-xs text-muted-foreground">
+            Showing {visibleSessionAgents.length} of {sessionAgents.length}
+          </p>
+          <div className="max-h-96 overflow-auto">
+            {visibleSessionAgents.map((agent) => (
+              <div key={agent.id} className="mt-2 flex items-center gap-2 border-b py-2">
+                <span className="min-w-0 flex-1 truncate">
+                  <AgentNameTag
+                    agentId={agent.id}
+                    name={agent.display_name}
+                    harness={agent.harness ?? null}
+                  />
+                </span>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={busy}
+                  onClick={() => void importAgent(agent)}
+                >
+                  Import
+                </Button>
+              </div>
+            ))}
+          </div>
         </details>
       )}
       {error && !deleting && !viewing && (

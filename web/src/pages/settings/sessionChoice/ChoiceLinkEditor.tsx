@@ -1,6 +1,7 @@
 import { useId, useState } from "react";
 import { XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
 import { useHostModelOptions, type Host } from "@/hooks/useHosts";
 import type { UsageAccountView } from "@/pages/usageBoard/usageBoardData";
@@ -79,26 +80,49 @@ export function ChoiceLinkEditor({
       <div className="flex items-end gap-2">
         <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">
           Agent
-          <select
-            aria-label="Link agent"
-            className={CHOICE_SELECT}
-            value={link.agent}
-            onChange={(e) => changeIdentity({ agent: e.target.value, model: null, effort: null })}
-          >
-            <option value="" disabled>
-              Choose an agent
-            </option>
-            {link.agent && !usableAgents.some((item) => item.id === link.agent) && (
-              <option value={link.agent} disabled hidden>
-                {agent ? agentLabel(agent) : link.agent} (saved; not ready)
+          {usableAgents.length > COMBOBOX_OPTION_THRESHOLD ? (
+            <Combobox
+              mode="select"
+              options={[
+                ...(link.agent && !usableAgents.some((item) => item.id === link.agent)
+                  ? [
+                      {
+                        key: link.agent,
+                        label: `${agent ? agentLabel(agent) : link.agent} (saved; not ready)`,
+                        disabled: true,
+                      },
+                    ]
+                  : []),
+                ...usableAgents.map((item) => ({ key: item.id, label: agentLabel(item) })),
+              ]}
+              value={link.agent}
+              onValueChange={(value) => changeIdentity({ agent: value, model: null, effort: null })}
+              placeholder="Choose an agent"
+              aria-label="Link agent"
+              className="h-auto w-full rounded-none! bg-transparent p-0"
+            />
+          ) : (
+            <select
+              aria-label="Link agent"
+              className={CHOICE_SELECT}
+              value={link.agent}
+              onChange={(e) => changeIdentity({ agent: e.target.value, model: null, effort: null })}
+            >
+              <option value="" disabled>
+                Choose an agent
               </option>
-            )}
-            {usableAgents.map((a) => (
-              <option key={a.id} value={a.id}>
-                {agentLabel(a)}
-              </option>
-            ))}
-          </select>
+              {link.agent && !usableAgents.some((item) => item.id === link.agent) && (
+                <option value={link.agent} disabled hidden>
+                  {agent ? agentLabel(agent) : link.agent} (saved; not ready)
+                </option>
+              )}
+              {usableAgents.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {agentLabel(a)}
+                </option>
+              ))}
+            </select>
+          )}
         </label>
         {removable && (
           <Button
@@ -191,27 +215,49 @@ export function ChoiceLinkEditor({
       <div className="flex items-end gap-2">
         <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">
           Meter · quota counter
-          <select
-            aria-label="Link meter"
-            className={CHOICE_SELECT}
-            value={link.meter ?? ""}
-            onChange={(e) => {
-              onPickMeter();
-              const next = { ...link, meter: e.target.value || null };
-              if (next.meter) delete next.maxRunning;
-              onChange(next);
-            }}
-          >
-            <option value="">No meter</option>
-            {link.meter && !meters.some((m) => m.id === link.meter) && (
-              <option value={link.meter}>{link.meter} (tile gone)</option>
-            )}
-            {meters.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.display_name}
-              </option>
-            ))}
-          </select>
+          {meters.length > COMBOBOX_OPTION_THRESHOLD ? (
+            <Combobox
+              mode="select"
+              options={[
+                { key: "__none__", label: "No meter" },
+                ...(link.meter && !meters.some((meter) => meter.id === link.meter)
+                  ? [{ key: link.meter, label: `${link.meter} (tile gone)` }]
+                  : []),
+                ...meters.map((meter) => ({ key: meter.id, label: meter.display_name })),
+              ]}
+              value={link.meter ?? "__none__"}
+              onValueChange={(value) => {
+                onPickMeter();
+                const next = { ...link, meter: value === "__none__" ? null : value };
+                if (next.meter) delete next.maxRunning;
+                onChange(next);
+              }}
+              aria-label="Link meter"
+              className="h-auto w-full rounded-none! bg-transparent p-0"
+            />
+          ) : (
+            <select
+              aria-label="Link meter"
+              className={CHOICE_SELECT}
+              value={link.meter ?? ""}
+              onChange={(e) => {
+                onPickMeter();
+                const next = { ...link, meter: e.target.value || null };
+                if (next.meter) delete next.maxRunning;
+                onChange(next);
+              }}
+            >
+              <option value="">No meter</option>
+              {link.meter && !meters.some((m) => m.id === link.meter) && (
+                <option value={link.meter}>{link.meter} (tile gone)</option>
+              )}
+              {meters.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.display_name}
+                </option>
+              ))}
+            </select>
+          )}
         </label>
         {!link.meter && (
           <label className="flex w-28 flex-col gap-1 text-xs">

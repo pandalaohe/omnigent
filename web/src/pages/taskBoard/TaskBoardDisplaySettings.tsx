@@ -1,5 +1,6 @@
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { MonitorIcon, MoonIcon, SunIcon } from "lucide-react";
+import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { PALETTES, PALETTE_TOKEN_CSS_NAMES } from "@/lib/themePalette";
 import { boardDefaults, boardViews, type BoardPreferences } from "./taskBoardPreferences";
 import type { TaskSource } from "./taskBoardData";
@@ -69,21 +70,31 @@ export function BoardAppearanceControls({
           ))}
         </div>
       )}
-      {part !== "theme" && (
-        <select
-          aria-label={t("display.palette")}
-          value={preferences.palette}
-          onChange={(event) =>
-            update({ palette: event.target.value as BoardPreferences["palette"] })
-          }
-        >
-          {PALETTES.map((palette) => (
-            <option key={palette.id} value={palette.id}>
-              {palette.label}
-            </option>
-          ))}
-        </select>
-      )}
+      {part !== "theme" &&
+        (PALETTES.length > COMBOBOX_OPTION_THRESHOLD ? (
+          <Combobox
+            mode="select"
+            options={PALETTES.map((palette) => ({ key: palette.id, label: palette.label }))}
+            value={preferences.palette}
+            onValueChange={(palette) => update({ palette: palette as BoardPreferences["palette"] })}
+            aria-label={t("display.palette")}
+            className="h-auto w-36 rounded-none! bg-transparent p-0"
+          />
+        ) : (
+          <select
+            aria-label={t("display.palette")}
+            value={preferences.palette}
+            onChange={(event) =>
+              update({ palette: event.target.value as BoardPreferences["palette"] })
+            }
+          >
+            {PALETTES.map((palette) => (
+              <option key={palette.id} value={palette.id}>
+                {palette.label}
+              </option>
+            ))}
+          </select>
+        ))}
     </>
   );
 }
@@ -128,20 +139,30 @@ export function TaskBoardDisplaySettings({
     key: "lodStation" | "lodPhase" | "boardHours" | "watch",
     options: number[],
     unit: string,
-  ) => (
-    <select
-      aria-label={t(`display.${key}`)}
-      value={preferences[key]}
-      onChange={(event) => update({ [key]: Number(event.target.value) })}
-    >
-      {options.map((value) => (
-        <option key={value} value={value}>
-          {value}
-          {unit}
-        </option>
-      ))}
-    </select>
-  );
+  ) =>
+    options.length > COMBOBOX_OPTION_THRESHOLD ? (
+      <Combobox
+        mode="select"
+        options={options.map((value) => ({ key: String(value), label: `${value}${unit}` }))}
+        value={String(preferences[key])}
+        onValueChange={(value) => update({ [key]: Number(value) })}
+        aria-label={t(`display.${key}`)}
+        className="h-auto w-28 rounded-none! bg-transparent p-0"
+      />
+    ) : (
+      <select
+        aria-label={t(`display.${key}`)}
+        value={preferences[key]}
+        onChange={(event) => update({ [key]: Number(event.target.value) })}
+      >
+        {options.map((value) => (
+          <option key={value} value={value}>
+            {value}
+            {unit}
+          </option>
+        ))}
+      </select>
+    );
   return (
     <section className="tb-display-settings" aria-label={t("display.settings")}>
       <div>

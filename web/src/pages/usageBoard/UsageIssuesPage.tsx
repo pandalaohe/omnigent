@@ -1,4 +1,6 @@
 import { boardPath } from "@/lib/boardFrame";
+import { useState } from "react";
+import { Input } from "@/components/ui/input";
 import { Link, useParams } from "@/lib/routing";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { UsageBoardFrame } from "./UsageBoardFrame";
@@ -19,6 +21,7 @@ export function UsageIssuesPage() {
   const board = useUsageContextPreferences().board;
   const overview = useUsageOverview(true);
   const query = useUsageIssues(accountId);
+  const [search, setSearch] = useState("");
   const names = new Map(
     overview.data?.accounts.map((account) => [account.id, account.display_name]),
   );
@@ -26,6 +29,22 @@ export function UsageIssuesPage() {
   const failures = query.data?.failures.filter((item) => visible(item.account)) ?? [];
   const unpriced = query.data?.unpriced_models.filter((item) => visible(item.account)) ?? [];
   const reports = query.data?.source_reports.filter((item) => visible(item.account)) ?? [];
+  const matches = (value: string) => value.toLowerCase().includes(search.trim().toLowerCase());
+  const shownFailures = failures.filter((item) =>
+    matches(
+      `${item.account} ${names.get(item.account) ?? ""} ${Object.keys(item.reasons).join(" ")}`,
+    ),
+  );
+  const shownUnpriced = unpriced.filter((item) =>
+    matches(`${item.account} ${names.get(item.account) ?? ""} ${item.model}`),
+  );
+  const shownReports = reports.filter((item) =>
+    matches(
+      `${item.account} ${names.get(item.account) ?? ""} ${item.kind} ${SOURCE_LABELS[item.kind] ?? ""}`,
+    ),
+  );
+  const priceSources = query.data?.price_source ?? [];
+  const shownPrices = priceSources.filter((item) => matches(item.error));
   const title = accountId ? `${names.get(accountId) ?? "Account"} · Issues` : "Issues";
   function accountLink(id: string) {
     return (
@@ -49,82 +68,110 @@ export function UsageIssuesPage() {
       actions={<UsageRangeControl />}
     >
       {query.data && !query.error ? (
-        <div className="grid min-w-0 gap-3 lg:grid-cols-3">
-          <section
-            className="min-w-0 rounded-[11px] border border-border bg-card p-3.5"
-            aria-label="Failures"
-          >
-            <h2 className="mb-2 text-sm font-semibold">Failures</h2>
-            {!failures.length ? (
-              <p className="text-xs text-muted-foreground">No reported failures in this range.</p>
-            ) : (
-              failures.map((item) => (
-                <div key={item.account} className="mb-3 text-xs last:mb-0">
-                  {accountLink(item.account)}
-                  <p className="my-1 tabular-nums">
-                    {item.failed} of {item.requests} requests · {(item.failure_pct ?? 0).toFixed(1)}
-                    %
+        <div className="min-w-0 space-y-3">
+          <Input
+            aria-label="Search issues"
+            placeholder="Search issues"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+          />
+          <div className="grid min-w-0 gap-3 lg:grid-cols-3">
+            <section
+              className="min-w-0 rounded-[11px] border border-border bg-card p-3.5"
+              aria-label="Failures"
+            >
+              <h2 className="mb-2 text-sm font-semibold">Failures</h2>
+              <p className="text-xs text-muted-foreground">
+                Showing {shownFailures.length} of {failures.length}
+              </p>
+              <div className="max-h-96 overflow-auto">
+                {!failures.length ? (
+                  <p className="text-xs text-muted-foreground">
+                    No reported failures in this range.
                   </p>
-                  <dl className="text-muted-foreground">
-                    {Object.entries(item.reasons).map(([reason, count]) => (
-                      <div key={reason} className="flex gap-3">
-                        <dt className="min-w-0 flex-1">
-                          <UsageName>{reason}</UsageName>
-                        </dt>
-                        <dd>{count}</dd>
-                      </div>
-                    ))}
-                  </dl>
-                </div>
-              ))
-            )}
-          </section>
-          <section
-            className="min-w-0 rounded-[11px] border border-border bg-card p-3.5"
-            aria-label="Unpriced models"
-          >
-            <h2 className="mb-2 text-sm font-semibold">Unpriced models</h2>
-            {!unpriced.length ? (
-              <p className="text-xs text-muted-foreground">No unpriced usage in this range.</p>
-            ) : (
-              unpriced.map((item) => (
-                <div key={`${item.account}:${item.model}`} className="mb-3 text-xs last:mb-0">
-                  {accountLink(item.account)}
-                  <UsageName className="my-1 text-muted-foreground">
-                    {item.model || "Unknown model"}
-                  </UsageName>
-                  <p>{item.unpriced} unpriced rows</p>
-                </div>
-              ))
-            )}
-          </section>
-          <section
-            className="min-w-0 rounded-[11px] border border-border bg-card p-3.5"
-            aria-label="Source reports"
-          >
-            <h2 className="mb-2 text-sm font-semibold">Source reports</h2>
-            {!reports.length ? (
-              <p className="text-xs text-muted-foreground">No source issues in this range.</p>
-            ) : (
-              reports.map((item) => (
-                <div
-                  key={`${item.account}:${item.at}:${item.kind}`}
-                  className="mb-3 text-xs last:mb-0"
-                >
-                  {accountLink(item.account)}
-                  <UsageName className="my-1">{SOURCE_LABELS[item.kind] ?? item.kind}</UsageName>
-                  <p className="text-muted-foreground">{formatFullDate(item.at)}</p>
-                </div>
-              ))
-            )}
-            {query.data?.price_source?.map((item) => (
-              <div key={`price:${item.at}:${item.error}`} className="mt-3 text-xs">
-                <p className="font-medium">Price source</p>
-                <p className="my-1">{item.error}</p>
-                <p className="text-muted-foreground">{formatFullDate(item.at)}</p>
+                ) : (
+                  shownFailures.map((item) => (
+                    <div key={item.account} className="mb-3 text-xs last:mb-0">
+                      {accountLink(item.account)}
+                      <p className="my-1 tabular-nums">
+                        {item.failed} of {item.requests} requests ·{" "}
+                        {(item.failure_pct ?? 0).toFixed(1)}%
+                      </p>
+                      <dl className="text-muted-foreground">
+                        {Object.entries(item.reasons).map(([reason, count]) => (
+                          <div key={reason} className="flex gap-3">
+                            <dt className="min-w-0 flex-1">
+                              <UsageName>{reason}</UsageName>
+                            </dt>
+                            <dd>{count}</dd>
+                          </div>
+                        ))}
+                      </dl>
+                    </div>
+                  ))
+                )}
               </div>
-            ))}
-          </section>
+            </section>
+            <section
+              className="min-w-0 rounded-[11px] border border-border bg-card p-3.5"
+              aria-label="Unpriced models"
+            >
+              <h2 className="mb-2 text-sm font-semibold">Unpriced models</h2>
+              <p className="text-xs text-muted-foreground">
+                Showing {shownUnpriced.length} of {unpriced.length}
+              </p>
+              <div className="max-h-96 overflow-auto">
+                {!unpriced.length ? (
+                  <p className="text-xs text-muted-foreground">No unpriced usage in this range.</p>
+                ) : (
+                  shownUnpriced.map((item) => (
+                    <div key={`${item.account}:${item.model}`} className="mb-3 text-xs last:mb-0">
+                      {accountLink(item.account)}
+                      <UsageName className="my-1 text-muted-foreground">
+                        {item.model || "Unknown model"}
+                      </UsageName>
+                      <p>{item.unpriced} unpriced rows</p>
+                    </div>
+                  ))
+                )}
+              </div>
+            </section>
+            <section
+              className="min-w-0 rounded-[11px] border border-border bg-card p-3.5"
+              aria-label="Source reports"
+            >
+              <h2 className="mb-2 text-sm font-semibold">Source reports</h2>
+              <p className="text-xs text-muted-foreground">
+                Showing {shownReports.length + shownPrices.length} of{" "}
+                {reports.length + priceSources.length}
+              </p>
+              <div className="max-h-96 overflow-auto">
+                {!reports.length ? (
+                  <p className="text-xs text-muted-foreground">No source issues in this range.</p>
+                ) : (
+                  shownReports.map((item) => (
+                    <div
+                      key={`${item.account}:${item.at}:${item.kind}`}
+                      className="mb-3 text-xs last:mb-0"
+                    >
+                      {accountLink(item.account)}
+                      <UsageName className="my-1">
+                        {SOURCE_LABELS[item.kind] ?? item.kind}
+                      </UsageName>
+                      <p className="text-muted-foreground">{formatFullDate(item.at)}</p>
+                    </div>
+                  ))
+                )}
+                {shownPrices.map((item) => (
+                  <div key={`price:${item.at}:${item.error}`} className="mt-3 text-xs">
+                    <p className="font-medium">Price source</p>
+                    <p className="my-1">{item.error}</p>
+                    <p className="text-muted-foreground">{formatFullDate(item.at)}</p>
+                  </div>
+                ))}
+              </div>
+            </section>
+          </div>
         </div>
       ) : null}
     </UsageBoardFrame>

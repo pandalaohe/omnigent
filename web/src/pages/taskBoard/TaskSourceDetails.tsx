@@ -6,6 +6,7 @@ import { safeSourceLink } from "./taskBoardData";
 import { t, formatDate } from "./taskBoardText";
 import { isBlankDetailValue } from "./taskBoardPresentation";
 import { TaskBoardFoldText } from "./TaskBoardFoldText";
+import { Input } from "@/components/ui/input";
 
 export function TaskSourceDetails({
   display,
@@ -14,11 +15,21 @@ export function TaskSourceDetails({
   display?: TaskDisplay;
   hasParent?: boolean;
 }) {
-  const [allFiles, setAllFiles] = useState(false),
-    [oldFiles, setOldFiles] = useState(false);
+  const [oldFiles, setOldFiles] = useState(false);
+  const [fileQuery, setFileQuery] = useState("");
+  const [linkQuery, setLinkQuery] = useState("");
   const files = boardFiles(display?.rows ?? []),
     current = files.filter((file) => !file.old),
     old = files.filter((file) => file.old);
+  const visibleCurrent = current.filter((file) =>
+    file.path.toLowerCase().includes(fileQuery.trim().toLowerCase()),
+  );
+  const visibleOld = old.filter((file) =>
+    file.path.toLowerCase().includes(fileQuery.trim().toLowerCase()),
+  );
+  const visibleLinks = (display?.links ?? []).filter((link) =>
+    `${link.label} ${link.href}`.toLowerCase().includes(linkQuery.trim().toLowerCase()),
+  );
   const badges = display?.badges?.filter((badge) => !["state", "series"].includes(badge.id)) ?? [];
   const rows =
     display?.rows?.filter(
@@ -41,20 +52,37 @@ export function TaskSourceDetails({
           <h5>
             {t("visual.files")} <small>{current.length}</small>
           </h5>
-          {(allFiles ? current : current.slice(0, 6)).map((file) => (
-            <FilePath key={file.path} file={file} />
-          ))}
-          {current.length > 6 && (
-            <button type="button" onClick={() => setAllFiles(!allFiles)}>
-              {t(allFiles ? "detail.showLess" : "visual.moreFiles", { count: current.length - 6 })}
-            </button>
-          )}
+          <Input
+            aria-label="Search files"
+            placeholder="Search files"
+            value={fileQuery}
+            onChange={(event) => setFileQuery(event.target.value)}
+          />
+          <p className="text-xs text-muted-foreground">
+            Showing {visibleCurrent.length} of {current.length}
+          </p>
+          <div className="max-h-64 overflow-auto">
+            {visibleCurrent.map((file) => (
+              <FilePath key={file.path} file={file} />
+            ))}
+          </div>
           {old.length > 0 && (
             <>
               <button type="button" aria-expanded={oldFiles} onClick={() => setOldFiles(!oldFiles)}>
                 {t("visual.olderFiles", { count: old.length })}
               </button>
-              {oldFiles && old.map((file) => <FilePath key={file.path} file={file} />)}
+              {oldFiles && (
+                <>
+                  <p className="text-xs text-muted-foreground">
+                    Showing {visibleOld.length} of {old.length}
+                  </p>
+                  <div className="max-h-64 overflow-auto">
+                    {visibleOld.map((file) => (
+                      <FilePath key={file.path} file={file} />
+                    ))}
+                  </div>
+                </>
+              )}
             </>
           )}
         </div>
@@ -96,27 +124,38 @@ export function TaskSourceDetails({
         </dl>
       )}
       {!!display.links?.length && (
-        <ul className="space-y-1">
-          {display.links.map((link) => {
-            const href = safeSourceLink(link.href);
-            return (
-              <li key={link.id} className="break-words">
-                {href ? (
-                  <a
-                    href={href}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="underline underline-offset-2"
-                  >
-                    {link.label}
-                  </a>
-                ) : (
-                  <span>{link.label}</span>
-                )}
-              </li>
-            );
-          })}
-        </ul>
+        <div>
+          <Input
+            aria-label="Search links"
+            placeholder="Search links"
+            value={linkQuery}
+            onChange={(event) => setLinkQuery(event.target.value)}
+          />
+          <p className="text-xs text-muted-foreground">
+            Showing {visibleLinks.length} of {display.links.length}
+          </p>
+          <ul className="max-h-64 space-y-1 overflow-auto">
+            {visibleLinks.map((link) => {
+              const href = safeSourceLink(link.href);
+              return (
+                <li key={link.id} className="break-words">
+                  {href ? (
+                    <a
+                      href={href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="underline underline-offset-2"
+                    >
+                      {link.label}
+                    </a>
+                  ) : (
+                    <span>{link.label}</span>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
       )}
     </section>
   );

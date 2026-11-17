@@ -11,6 +11,7 @@ import { Segmented } from "@/components/ui/segmented";
 import { HelpTip } from "@/components/HelpTip";
 import { sessionDefaultModeOptions } from "@/lib/sessionDefaultModes";
 import { Button } from "@/components/ui/button";
+import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import {
   Select,
   SelectContent,
@@ -316,64 +317,109 @@ export function CallingDefaultsSection() {
             <p className="text-sm text-muted-foreground">No hosts are connected.</p>
           ) : (
             <div className="flex min-w-0 flex-col gap-4">
-              <div className="flex min-w-0 flex-wrap gap-2">
-                {hostList.map((candidate) => {
-                  const selected = candidate.host_id === host?.host_id;
-                  const name = candidate.name || candidate.host_id;
-                  return (
-                    <Button
-                      key={candidate.host_id}
-                      type="button"
-                      variant={selected ? "secondary" : "outline"}
-                      size="sm"
-                      className="max-w-full"
-                      aria-pressed={selected}
-                      onClick={() => setSelectedHostId(candidate.host_id)}
-                      data-testid={`calling-defaults-host-${candidate.host_id}`}
-                    >
-                      <span className="min-w-0 truncate" title={name}>
-                        {name}
-                      </span>
-                      {candidate.status !== "online" && (
-                        <span className="shrink-0 text-xs text-muted-foreground">(offline)</span>
-                      )}
-                    </Button>
-                  );
-                })}
-              </div>
+              {hostList.length > COMBOBOX_OPTION_THRESHOLD ? (
+                <Combobox
+                  mode="select"
+                  options={hostList.map((candidate) => ({
+                    key: candidate.host_id,
+                    label: candidate.name || candidate.host_id,
+                    description: candidate.status === "online" ? undefined : "Offline",
+                  }))}
+                  value={host?.host_id ?? ""}
+                  onValueChange={setSelectedHostId}
+                  aria-label="Host"
+                  className="h-auto w-full rounded-none! bg-transparent p-0"
+                />
+              ) : (
+                <div className="flex min-w-0 flex-wrap gap-2">
+                  {hostList.map((candidate) => {
+                    const selected = candidate.host_id === host?.host_id;
+                    const name = candidate.name || candidate.host_id;
+                    return (
+                      <Button
+                        key={candidate.host_id}
+                        type="button"
+                        variant={selected ? "secondary" : "outline"}
+                        size="sm"
+                        className="max-w-full"
+                        aria-pressed={selected}
+                        onClick={() => setSelectedHostId(candidate.host_id)}
+                        data-testid={`calling-defaults-host-${candidate.host_id}`}
+                      >
+                        <span className="min-w-0 truncate" title={name}>
+                          {name}
+                        </span>
+                        {candidate.status !== "online" && (
+                          <span className="shrink-0 text-xs text-muted-foreground">(offline)</span>
+                        )}
+                      </Button>
+                    );
+                  })}
+                </div>
+              )}
               {host && (
                 <div className="flex min-w-0 flex-col gap-2 rounded-md border p-3">
-                  <label className="text-ui font-medium" htmlFor="new-project-agent">
-                    New project agent
-                  </label>
-                  <Select
-                    value={templates[host.host_id] ?? "__none__"}
-                    onValueChange={(value) =>
-                      setProjectHostAgent(host.host_id, value === "__none__" ? null : value)
-                    }
-                  >
-                    <SelectTrigger
-                      id="new-project-agent"
-                      className="w-full min-w-0"
-                      data-testid="new-project-agent"
+                  <span className="text-ui font-medium">New project agent</span>
+                  {templateAgents.length > COMBOBOX_OPTION_THRESHOLD ? (
+                    <div data-testid="new-project-agent">
+                      <Combobox
+                        mode="select"
+                        options={[
+                          { key: "__none__", label: "No template" },
+                          ...templateAgents.map((agent) => ({
+                            key: agent.id,
+                            label: agent.display_name,
+                            description: agent.name,
+                          })),
+                          ...(templates[host.host_id] &&
+                          !templateAgents.some((agent) => agent.id === templates[host.host_id])
+                            ? [
+                                {
+                                  key: templates[host.host_id]!,
+                                  label: "Unavailable agent",
+                                  disabled: true,
+                                },
+                              ]
+                            : []),
+                        ]}
+                        value={templates[host.host_id] ?? "__none__"}
+                        onValueChange={(value) =>
+                          setProjectHostAgent(host.host_id, value === "__none__" ? null : value)
+                        }
+                        aria-label="New project agent"
+                        className="h-auto w-full rounded-none! bg-transparent p-0"
+                      />
+                    </div>
+                  ) : (
+                    <Select
+                      value={templates[host.host_id] ?? "__none__"}
+                      onValueChange={(value) =>
+                        setProjectHostAgent(host.host_id, value === "__none__" ? null : value)
+                      }
                     >
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent position="popper" className="w-(--radix-select-trigger-width)">
-                      <SelectItem value="__none__">No template</SelectItem>
-                      {templateAgents.map((agent) => (
-                        <SelectItem key={agent.id} value={agent.id}>
-                          {agent.display_name}
-                        </SelectItem>
-                      ))}
-                      {templates[host.host_id] &&
-                        !templateAgents.some((agent) => agent.id === templates[host.host_id]) && (
-                          <SelectItem value={templates[host.host_id]!} disabled>
-                            Unavailable agent
+                      <SelectTrigger
+                        id="new-project-agent"
+                        className="w-full min-w-0"
+                        data-testid="new-project-agent"
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent position="popper" className="w-(--radix-select-trigger-width)">
+                        <SelectItem value="__none__">No template</SelectItem>
+                        {templateAgents.map((agent) => (
+                          <SelectItem key={agent.id} value={agent.id}>
+                            {agent.display_name}
                           </SelectItem>
-                        )}
-                    </SelectContent>
-                  </Select>
+                        ))}
+                        {templates[host.host_id] &&
+                          !templateAgents.some((agent) => agent.id === templates[host.host_id]) && (
+                            <SelectItem value={templates[host.host_id]!} disabled>
+                              Unavailable agent
+                            </SelectItem>
+                          )}
+                      </SelectContent>
+                    </Select>
+                  )}
                   <p className="text-sm text-muted-foreground">
                     Used for new bindings when the project has no All hosts agent. Existing bindings
                     keep their agent.

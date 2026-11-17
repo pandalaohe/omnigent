@@ -9,6 +9,7 @@ import { useQuery } from "@tanstack/react-query";
 import { HelpTip } from "@/components/HelpTip";
 import { ProjectSinglePicker } from "@/components/ProjectSinglePicker";
 import { Button } from "@/components/ui/button";
+import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import {
   Dialog,
   DialogContent,
@@ -262,34 +263,62 @@ function HealthCheckSettingsForm({ settings }: { settings: SystemStatusSettings 
       </div>
 
       <div className="flex flex-col gap-1.5">
-        <label htmlFor="health-check-host" className="text-ui font-normal md:font-medium">
+        <label
+          htmlFor={hostOptions.length > COMBOBOX_OPTION_THRESHOLD ? undefined : "health-check-host"}
+          className="text-ui font-normal md:font-medium"
+        >
           Ops host
         </label>
-        <Select
-          value={hostId === "" ? HEALTH_CHECK_HOST_UNSET : hostId}
-          onValueChange={(value) =>
-            setDraft((current) => ({
-              ...current,
-              hostId: value === HEALTH_CHECK_HOST_UNSET ? "" : value,
-            }))
-          }
-        >
-          <SelectTrigger
-            id="health-check-host"
-            data-testid="health-check-host-trigger"
-            className="w-full"
+        {hostOptions.length > COMBOBOX_OPTION_THRESHOLD ? (
+          <div data-testid="health-check-host-trigger">
+            <Combobox
+              mode="select"
+              options={[
+                { key: HEALTH_CHECK_HOST_UNSET, label: "No host" },
+                ...hostOptions.map((host) => ({
+                  key: host.host_id,
+                  label: host.name,
+                  description: host.status === "offline" ? "Offline" : undefined,
+                })),
+              ]}
+              value={hostId === "" ? HEALTH_CHECK_HOST_UNSET : hostId}
+              onValueChange={(value) =>
+                setDraft((current) => ({
+                  ...current,
+                  hostId: value === HEALTH_CHECK_HOST_UNSET ? "" : value,
+                }))
+              }
+              aria-label="Ops host"
+              className="h-auto w-full rounded-none! bg-transparent p-0"
+            />
+          </div>
+        ) : (
+          <Select
+            value={hostId === "" ? HEALTH_CHECK_HOST_UNSET : hostId}
+            onValueChange={(value) =>
+              setDraft((current) => ({
+                ...current,
+                hostId: value === HEALTH_CHECK_HOST_UNSET ? "" : value,
+              }))
+            }
           >
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent position="popper" align="start">
-            <SelectItem value={HEALTH_CHECK_HOST_UNSET}>No host</SelectItem>
-            {hostOptions.map((host) => (
-              <SelectItem key={host.host_id} value={host.host_id}>
-                {host.status === "offline" ? `${host.name} (offline)` : host.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+            <SelectTrigger
+              id="health-check-host"
+              data-testid="health-check-host-trigger"
+              className="w-full"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent position="popper" align="start">
+              <SelectItem value={HEALTH_CHECK_HOST_UNSET}>No host</SelectItem>
+              {hostOptions.map((host) => (
+                <SelectItem key={host.host_id} value={host.host_id}>
+                  {host.status === "offline" ? `${host.name} (offline)` : host.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
         <p className="text-sm text-muted-foreground">
           The check opens a session as you, in this project on this host; both must be yours.
         </p>
@@ -388,8 +417,16 @@ function MonitorOverheadTable({
   hostNames: Map<string, string>;
 }) {
   return (
-    <div className="mt-4 overflow-hidden rounded-lg border">
-      <table className="w-full text-sm" data-testid="monitor-overhead-table">
+    <div className="mt-4 overflow-x-auto rounded-lg border">
+      <table
+        className="w-full min-w-[480px] table-fixed text-sm"
+        data-testid="monitor-overhead-table"
+      >
+        <colgroup>
+          <col style={{ width: "40%" }} />
+          <col style={{ width: "20%" }} />
+          <col style={{ width: "40%" }} />
+        </colgroup>
         <thead>
           <tr className="border-b text-sm text-muted-foreground">
             <th className="px-3 py-1.5 text-left font-medium">Process</th>
@@ -409,7 +446,9 @@ function MonitorOverheadTable({
           </tr>
           {Object.entries(overhead.hosts).map(([hostId, cost]) => (
             <tr key={hostId} className="border-b last:border-b-0">
-              <td className="px-3 py-1.5">{hostNames.get(hostId) ?? hostId}</td>
+              <td className="truncate px-3 py-1.5" title={hostNames.get(hostId) ?? hostId}>
+                {hostNames.get(hostId) ?? hostId}
+              </td>
               <td className="px-3 py-1.5 text-right tabular-nums">{formatPct(cost.cpu_pct, 2)}</td>
               <td className="px-3 py-1.5 text-right tabular-nums">
                 {formatBytes(cost.rss_delta)} below start

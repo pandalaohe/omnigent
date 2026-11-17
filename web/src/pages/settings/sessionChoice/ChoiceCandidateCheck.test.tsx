@@ -87,6 +87,29 @@ it("checks the exact draft outside tiers and distinguishes unknown counts, legac
   );
 });
 
+it("uses typeahead when the agent and host catalogs exceed five options", async () => {
+  request.mockResolvedValue(response());
+  const agents = Array.from({ length: 6 }, (_, index) => ({
+    id: `agent-${index}`,
+    name: `agent-${index}`,
+    display_name: `Agent ${index}`,
+    harness: "codex",
+  }));
+  const hosts = Array.from({ length: 6 }, (_, index) => ({
+    host_id: `host-${index}`,
+    name: `Host ${index}`,
+    status: "online" as const,
+  })) as Host[];
+  render(<ChoiceCandidateCheck {...props} host="host-0" hosts={hosts} agents={agents} />);
+  fireEvent.click(screen.getByText("Check a combination"));
+  const agent = screen.getByRole("combobox", { name: "Preview agent" });
+  fireEvent.change(agent, { target: { value: "Agent 5" } });
+  fireEvent.click(screen.getByRole("option", { name: /Agent 5.*agent-5/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Check draft" }));
+  await waitFor(() => expect(request).toHaveBeenCalledOnce());
+  expect(JSON.parse(request.mock.calls[0][1].body).candidate.agent_id).toBe("agent-5");
+});
+
 it("discards an in-flight explanation after the draft changes", async () => {
   let resolve!: (data: ChoiceCandidatePreview) => void;
   request.mockImplementation(
