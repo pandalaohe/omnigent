@@ -397,10 +397,18 @@ function redirectToLogin(loginUrl: string, forceReauth = false): boolean {
   return true;
 }
 
+function terminalLoginUrl(): string | null {
+  return (getCachedServerInfo()?.login_url ?? serverLoginUrl)?.trim() || null;
+}
+
+export function canSignInForTerminal(): boolean {
+  return supportsSignInAgain() || terminalLoginUrl() !== null;
+}
+
 /** Renew human browser authority without treating an old cookie as a fresh login. */
 export async function signInForTerminal(): Promise<boolean | "redirecting"> {
   if (supportsSignInAgain()) return signInAgain();
-  const loginUrl = getCachedServerInfo()?.login_url ?? serverLoginUrl;
+  const loginUrl = terminalLoginUrl();
   if (!loginUrl) return false;
   return redirectToLogin(loginUrl, true) ? "redirecting" : false;
 }

@@ -36,7 +36,7 @@ import {
   type TerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
-import { signInForTerminal } from "@/lib/identity";
+import { canSignInForTerminal, signInForTerminal } from "@/lib/identity";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 import {
   isTerminalLaunching,
@@ -1065,8 +1065,13 @@ function StatusOverlay({
           Object.hasOwn(TERMINAL_REFUSAL_MESSAGES, state.reason) ? state.reason : "access_denied"
         ]
       : undefined;
-  const needsSignIn =
+  const browserSessionMissing =
     refusal !== undefined && state.kind === "closed" && state.reason === "browser_session_missing";
+  const needsSignIn = browserSessionMissing && canSignInForTerminal();
+  const refusalMessage =
+    browserSessionMissing && !needsSignIn
+      ? "Sign in again through this server's sign-in page to use this terminal."
+      : refusal;
   const recoverSignIn = async () => {
     setSignInPending(true);
     setSignInError(null);
@@ -1101,7 +1106,7 @@ function StatusOverlay({
       {state.kind === "closed" && !reconnectPending && (
         <div className="flex flex-wrap items-center justify-center gap-2 px-3">
           <span role={refusal ? "status" : undefined}>
-            {refusal ?? `Bridge closed: ${state.reason}`}
+            {refusalMessage ?? `Bridge closed: ${state.reason}`}
           </span>
           {needsSignIn && (
             <Button

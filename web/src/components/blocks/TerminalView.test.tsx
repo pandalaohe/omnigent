@@ -17,6 +17,8 @@ import { Toaster } from "@/components/ui/sonner";
 import { FileViewerContext, type OpenFileOptions } from "@/shell/FileViewerContext";
 import { toast } from "sonner";
 import { signInForTerminal } from "@/lib/identity";
+import * as capabilities from "@/lib/capabilities";
+import * as nativeBridge from "@/lib/nativeBridge";
 import {
   dispatchMobileAssistantAction,
   dispatchMobileAssistantButton,
@@ -107,6 +109,48 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
 }));
 
 describe("terminal access recovery", () => {
+  beforeEach(() => {
+    vi.spyOn(capabilities, "getCachedServerInfo").mockReturnValue({
+      ...capabilities.FALLBACK_SERVER_INFO,
+      login_url: "/login",
+    });
+    vi.spyOn(nativeBridge, "supportsSignInAgain").mockReturnValue(false);
+  });
+
+  it.each([
+    [null, false, false],
+    [" ", false, false],
+    ["/login", false, true],
+    [null, true, true],
+  ] as const)(
+    "offers recovery only when available (login=%s, bridge=%s)",
+    async (loginUrl, bridge, available) => {
+      vi.mocked(capabilities.getCachedServerInfo).mockReturnValue({
+        ...capabilities.FALLBACK_SERVER_INFO,
+        login_url: loginUrl,
+      });
+      vi.mocked(nativeBridge.supportsSignInAgain).mockReturnValue(bridge);
+      render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      act(() =>
+        terminalSessionMock.instances[0].onState({
+          kind: "closed",
+          code: 4403,
+          reason: "browser_session_missing",
+        }),
+      );
+      expect(screen.queryByRole("button", { name: "Sign in again" }) !== null).toBe(available);
+      expect(
+        screen.getByText(
+          available
+            ? "Sign in again to use this terminal."
+            : "Sign in again through this server's sign-in page to use this terminal.",
+        ),
+      ).toBeInTheDocument();
+      expect(screen.queryByTestId("terminal-reconnecting")).not.toBeInTheDocument();
+    },
+  );
+
   it.each([
     ["origin_untrusted", "Open this terminal from a trusted server address."],
     ["runner_credential", "Sign in through the web app to use this terminal."],

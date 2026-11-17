@@ -1351,7 +1351,8 @@ describe("login redirect", () => {
         ...capabilities.FALLBACK_SERVER_INFO,
         login_url: loginUrl,
       });
-      const { signInForTerminal } = await import("./identity");
+      const { canSignInForTerminal, signInForTerminal } = await import("./identity");
+      expect(canSignInForTerminal()).toBe(true);
       expect(await signInForTerminal()).toBe("redirecting");
       expect(hrefWrites).toEqual([`${loginUrl}?return_to=%2Fc%2Fabc%3Ftab%3Dterminal&reauth=1`]);
       cached.mockRestore();
@@ -1528,7 +1529,8 @@ describe("browser authority recovery", () => {
   it("uses desktop interactive sign-in and preserves its cancellation result", async () => {
     const signInAgain = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
     vi.doMock("./nativeBridge", () => ({ supportsSignInAgain: () => true, signInAgain }));
-    const { signInForTerminal } = await import("./identity");
+    const { canSignInForTerminal, signInForTerminal } = await import("./identity");
+    expect(canSignInForTerminal()).toBe(true);
     expect(await signInForTerminal()).toBe(false);
     expect(await signInForTerminal()).toBe(true);
     expect(signInAgain).toHaveBeenCalledTimes(2);
