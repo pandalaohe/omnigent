@@ -897,6 +897,207 @@
         "title": "AnalysisAccountTotal",
         "type": "object"
       },
+      "AnalysisAmountsV2": {
+        "properties": {
+          "api_value": {
+            "$ref": "#/components/schemas/Value"
+          },
+          "coverage": {
+            "enum": [
+              "complete",
+              "partial"
+            ],
+            "title": "Coverage",
+            "type": "string"
+          },
+          "failed": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failed"
+          },
+          "last_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last At"
+          },
+          "paid": {
+            "$ref": "#/components/schemas/Value"
+          },
+          "payback": {
+            "$ref": "#/components/schemas/Value"
+          },
+          "requests": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requests"
+          },
+          "tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tokens"
+          }
+        },
+        "required": [
+          "tokens",
+          "requests",
+          "failed",
+          "last_at",
+          "coverage",
+          "api_value",
+          "paid",
+          "payback"
+        ],
+        "title": "AnalysisAmountsV2",
+        "type": "object"
+      },
+      "AnalysisHourV2": {
+        "properties": {
+          "coverage": {
+            "enum": [
+              "complete",
+              "partial"
+            ],
+            "title": "Coverage",
+            "type": "string"
+          },
+          "failed": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failed"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "last_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last At"
+          },
+          "requests": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requests"
+          },
+          "start": {
+            "format": "int64",
+            "title": "Start",
+            "type": "integer"
+          },
+          "tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tokens"
+          },
+          "top_agent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Top Agent"
+          },
+          "top_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Top Host"
+          },
+          "top_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Top Model"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/AnalysisAmountsV2"
+          }
+        },
+        "required": [
+          "tokens",
+          "requests",
+          "failed",
+          "last_at",
+          "coverage",
+          "start",
+          "label",
+          "totals",
+          "top_host",
+          "top_agent",
+          "top_model"
+        ],
+        "title": "AnalysisHourV2",
+        "type": "object"
+      },
       "AnalysisParentTotal": {
         "properties": {
           "parent_account_id": {
@@ -919,6 +1120,11 @@
         "properties": {
           "account_id": {
             "title": "Account Id",
+            "type": "string"
+          },
+          "agent": {
+            "default": "",
+            "title": "Agent",
             "type": "string"
           },
           "attributed": {
@@ -1136,6 +1342,18 @@
               }
             ],
             "title": "Uncached Input Tokens"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
           }
         },
         "required": [
@@ -4031,6 +4249,42 @@
         "title": "CopyFilesRequest",
         "type": "object"
       },
+      "Coverage": {
+        "properties": {
+          "known_paid": {
+            "default": 0,
+            "format": "int64",
+            "title": "Known Paid",
+            "type": "integer"
+          },
+          "priced_units": {
+            "default": 0,
+            "format": "int64",
+            "title": "Priced Units",
+            "type": "integer"
+          },
+          "total_items": {
+            "default": 0,
+            "format": "int64",
+            "title": "Total Items",
+            "type": "integer"
+          },
+          "usage_units": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Usage Units"
+          }
+        },
+        "title": "Coverage",
+        "type": "object"
+      },
       "CreateDefaultPolicyRequest": {
         "description": "Request body for `POST /v1/policies`.",
         "properties": {
@@ -4773,7 +5027,8 @@
             "enum": [
               "lower_reread",
               "partial_over_complete",
-              "out_of_range"
+              "out_of_range",
+              "agents_over_total"
             ],
             "title": "Reason",
             "type": "string"
@@ -6097,6 +6352,22 @@
       "HostTerminalCreate": {
         "additionalProperties": false,
         "properties": {
+          "agent_tier": {
+            "anyOf": [
+              {
+                "enum": [
+                  "off",
+                  "read",
+                  "read_write"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Tier"
+          },
           "elevated": {
             "default": false,
             "title": "Elevated",
@@ -6124,6 +6395,16 @@
       },
       "HostTerminalResource": {
         "properties": {
+          "agent_tier": {
+            "default": "off",
+            "enum": [
+              "off",
+              "read",
+              "read_write"
+            ],
+            "title": "Agent Tier",
+            "type": "string"
+          },
           "attach_path": {
             "title": "Attach Path",
             "type": "string"
@@ -6136,6 +6417,22 @@
           "elevated": {
             "title": "Elevated",
             "type": "boolean"
+          },
+          "instance_id": {
+            "default": "",
+            "title": "Instance Id",
+            "type": "string"
+          },
+          "linked_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Linked Session Id"
           },
           "terminal_id": {
             "title": "Terminal Id",
@@ -8645,6 +8942,47 @@
           "per_token"
         ],
         "title": "PriceRate",
+        "type": "object"
+      },
+      "PriceSource": {
+        "properties": {
+          "fetched_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fetched At"
+          },
+          "layer": {
+            "title": "Layer",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "layer",
+          "name"
+        ],
+        "title": "PriceSource",
         "type": "object"
       },
       "PriceSourceSelection": {
@@ -12340,6 +12678,42 @@
           "type"
         ],
         "title": "SessionHeartbeatEvent",
+        "type": "object"
+      },
+      "SessionHostTerminalCreate": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_tier": {
+            "anyOf": [
+              {
+                "enum": [
+                  "off",
+                  "read",
+                  "read_write"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Tier"
+          },
+          "elevated": {
+            "default": false,
+            "title": "Elevated",
+            "type": "boolean"
+          },
+          "host_id": {
+            "minLength": 1,
+            "title": "Host Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "host_id"
+        ],
+        "title": "SessionHostTerminalCreate",
         "type": "object"
       },
       "SessionInputConsumedEvent": {
@@ -19205,6 +19579,204 @@
         "title": "UsageAccountView",
         "type": "object"
       },
+      "UsageAnalysisHoursView": {
+        "properties": {
+          "approx": {
+            "title": "Approx",
+            "type": "boolean"
+          },
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "filter": {
+            "additionalProperties": true,
+            "title": "Filter",
+            "type": "object"
+          },
+          "hours": {
+            "items": {
+              "$ref": "#/components/schemas/AnalysisHourV2"
+            },
+            "title": "Hours",
+            "type": "array"
+          },
+          "incomplete_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "hour_over_limit",
+                  "scan_over_limit",
+                  "card_models_over_limit"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Incomplete Reason"
+          },
+          "span": {
+            "$ref": "#/components/schemas/AnalysisSpan"
+          }
+        },
+        "required": [
+          "filter",
+          "span",
+          "complete",
+          "incomplete_reason",
+          "approx",
+          "hours"
+        ],
+        "title": "UsageAnalysisHoursView",
+        "type": "object"
+      },
+      "UsageAnalysisV2View": {
+        "description": "Complete-window contract selected by the group query parameter.",
+        "properties": {
+          "approx": {
+            "title": "Approx",
+            "type": "boolean"
+          },
+          "cache_savings": {
+            "additionalProperties": true,
+            "title": "Cache Savings",
+            "type": "object"
+          },
+          "classes": {
+            "additionalProperties": true,
+            "title": "Classes",
+            "type": "object"
+          },
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "days": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Days",
+            "type": "array"
+          },
+          "facets": {
+            "additionalProperties": {
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "title": "Facets",
+            "type": "object"
+          },
+          "filter": {
+            "additionalProperties": true,
+            "title": "Filter",
+            "type": "object"
+          },
+          "generated_at": {
+            "format": "double",
+            "title": "Generated At",
+            "type": "number"
+          },
+          "groups": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Groups",
+            "type": "array"
+          },
+          "heat": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Heat",
+            "type": "array"
+          },
+          "incomplete_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "hour_over_limit",
+                  "scan_over_limit",
+                  "card_models_over_limit"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Incomplete Reason"
+          },
+          "previous": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/AnalysisRowView"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "rows_truncated": {
+            "default": false,
+            "title": "Rows Truncated",
+            "type": "boolean"
+          },
+          "series": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Series",
+            "type": "array"
+          },
+          "span": {
+            "$ref": "#/components/schemas/AnalysisSpan"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/AnalysisAmountsV2"
+          },
+          "tz": {
+            "title": "Tz",
+            "type": "string"
+          }
+        },
+        "required": [
+          "generated_at",
+          "filter",
+          "span",
+          "tz",
+          "complete",
+          "incomplete_reason",
+          "approx",
+          "totals",
+          "series",
+          "groups",
+          "facets",
+          "heat",
+          "days",
+          "classes",
+          "cache_savings"
+        ],
+        "title": "UsageAnalysisV2View",
+        "type": "object"
+      },
       "UsageAnalysisView": {
         "properties": {
           "account_cost_classes": {
@@ -19946,6 +20518,95 @@
         "title": "ValidationError",
         "type": "object"
       },
+      "Value": {
+        "properties": {
+          "as_of": {
+            "format": "int64",
+            "title": "As Of",
+            "type": "integer"
+          },
+          "cohort_id": {
+            "title": "Cohort Id",
+            "type": "string"
+          },
+          "coverage": {
+            "$ref": "#/components/schemas/Coverage"
+          },
+          "currency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Currency"
+          },
+          "high": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "High"
+          },
+          "low": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Low"
+          },
+          "price_sources": {
+            "items": {
+              "$ref": "#/components/schemas/PriceSource"
+            },
+            "title": "Price Sources",
+            "type": "array"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "state": {
+            "default": "unknown",
+            "enum": [
+              "exact",
+              "range",
+              "partial",
+              "unknown"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "unit": {
+            "title": "Unit",
+            "type": "string"
+          }
+        },
+        "required": [
+          "unit",
+          "cohort_id",
+          "as_of"
+        ],
+        "title": "Value",
+        "type": "object"
+      },
       "VoiceTestRequest": {
         "additionalProperties": false,
         "properties": {
@@ -20019,6 +20680,13 @@
               "$ref": "#/components/schemas/EntryOutcome"
             },
             "title": "Skipped",
+            "type": "array"
+          },
+          "warnings": {
+            "items": {
+              "$ref": "#/components/schemas/EntryOutcome"
+            },
+            "title": "Warnings",
             "type": "array"
           }
         },
@@ -27090,6 +27758,148 @@
                               {
                                 "items": {
                                   "properties": {
+                                    "agents": {
+                                      "anyOf": [
+                                        {
+                                          "items": {
+                                            "description": "One agent's nullable measures within a whole-key report.",
+                                            "properties": {
+                                              "agent": {
+                                                "pattern": "^[a-z0-9][a-z0-9._-]{0,31}$",
+                                                "title": "Agent",
+                                                "type": "string"
+                                              },
+                                              "cache_creation_input_tokens": {
+                                                "anyOf": [
+                                                  {
+                                                    "minimum": 0,
+                                                    "type": "integer"
+                                                  },
+                                                  {
+                                                    "type": "null"
+                                                  }
+                                                ],
+                                                "title": "Cache Creation Input Tokens"
+                                              },
+                                              "cache_read_input_tokens": {
+                                                "anyOf": [
+                                                  {
+                                                    "minimum": 0,
+                                                    "type": "integer"
+                                                  },
+                                                  {
+                                                    "type": "null"
+                                                  }
+                                                ],
+                                                "title": "Cache Read Input Tokens"
+                                              },
+                                              "cost_usd": {
+                                                "anyOf": [
+                                                  {
+                                                    "anyOf": [
+                                                      {
+                                                        "type": "number"
+                                                      },
+                                                      {
+                                                        "type": "integer"
+                                                      }
+                                                    ],
+                                                    "ge": 0
+                                                  },
+                                                  {
+                                                    "type": "null"
+                                                  }
+                                                ],
+                                                "title": "Cost Usd"
+                                              },
+                                              "failed": {
+                                                "anyOf": [
+                                                  {
+                                                    "minimum": 0,
+                                                    "type": "integer"
+                                                  },
+                                                  {
+                                                    "type": "null"
+                                                  }
+                                                ],
+                                                "title": "Failed"
+                                              },
+                                              "output_tokens": {
+                                                "anyOf": [
+                                                  {
+                                                    "minimum": 0,
+                                                    "type": "integer"
+                                                  },
+                                                  {
+                                                    "type": "null"
+                                                  }
+                                                ],
+                                                "title": "Output Tokens"
+                                              },
+                                              "reasoning_tokens": {
+                                                "anyOf": [
+                                                  {
+                                                    "minimum": 0,
+                                                    "type": "integer"
+                                                  },
+                                                  {
+                                                    "type": "null"
+                                                  }
+                                                ],
+                                                "title": "Reasoning Tokens"
+                                              },
+                                              "requests": {
+                                                "anyOf": [
+                                                  {
+                                                    "minimum": 0,
+                                                    "type": "integer"
+                                                  },
+                                                  {
+                                                    "type": "null"
+                                                  }
+                                                ],
+                                                "title": "Requests"
+                                              },
+                                              "tokens": {
+                                                "anyOf": [
+                                                  {
+                                                    "minimum": 0,
+                                                    "type": "integer"
+                                                  },
+                                                  {
+                                                    "type": "null"
+                                                  }
+                                                ],
+                                                "title": "Tokens"
+                                              },
+                                              "uncached_input_tokens": {
+                                                "anyOf": [
+                                                  {
+                                                    "minimum": 0,
+                                                    "type": "integer"
+                                                  },
+                                                  {
+                                                    "type": "null"
+                                                  }
+                                                ],
+                                                "title": "Uncached Input Tokens"
+                                              }
+                                            },
+                                            "required": [
+                                              "agent"
+                                            ],
+                                            "title": "AgentPart",
+                                            "type": "object"
+                                          },
+                                          "maxItems": 32,
+                                          "type": "array"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ],
+                                      "title": "Agents"
+                                    },
                                     "cache_creation_input_tokens": {
                                       "anyOf": [
                                         {
@@ -28661,6 +29471,148 @@
                           {
                             "items": {
                               "properties": {
+                                "agents": {
+                                  "anyOf": [
+                                    {
+                                      "items": {
+                                        "description": "One agent's nullable measures within a whole-key report.",
+                                        "properties": {
+                                          "agent": {
+                                            "pattern": "^[a-z0-9][a-z0-9._-]{0,31}$",
+                                            "title": "Agent",
+                                            "type": "string"
+                                          },
+                                          "cache_creation_input_tokens": {
+                                            "anyOf": [
+                                              {
+                                                "minimum": 0,
+                                                "type": "integer"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ],
+                                            "title": "Cache Creation Input Tokens"
+                                          },
+                                          "cache_read_input_tokens": {
+                                            "anyOf": [
+                                              {
+                                                "minimum": 0,
+                                                "type": "integer"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ],
+                                            "title": "Cache Read Input Tokens"
+                                          },
+                                          "cost_usd": {
+                                            "anyOf": [
+                                              {
+                                                "anyOf": [
+                                                  {
+                                                    "type": "number"
+                                                  },
+                                                  {
+                                                    "type": "integer"
+                                                  }
+                                                ],
+                                                "ge": 0
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ],
+                                            "title": "Cost Usd"
+                                          },
+                                          "failed": {
+                                            "anyOf": [
+                                              {
+                                                "minimum": 0,
+                                                "type": "integer"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ],
+                                            "title": "Failed"
+                                          },
+                                          "output_tokens": {
+                                            "anyOf": [
+                                              {
+                                                "minimum": 0,
+                                                "type": "integer"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ],
+                                            "title": "Output Tokens"
+                                          },
+                                          "reasoning_tokens": {
+                                            "anyOf": [
+                                              {
+                                                "minimum": 0,
+                                                "type": "integer"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ],
+                                            "title": "Reasoning Tokens"
+                                          },
+                                          "requests": {
+                                            "anyOf": [
+                                              {
+                                                "minimum": 0,
+                                                "type": "integer"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ],
+                                            "title": "Requests"
+                                          },
+                                          "tokens": {
+                                            "anyOf": [
+                                              {
+                                                "minimum": 0,
+                                                "type": "integer"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ],
+                                            "title": "Tokens"
+                                          },
+                                          "uncached_input_tokens": {
+                                            "anyOf": [
+                                              {
+                                                "minimum": 0,
+                                                "type": "integer"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ],
+                                            "title": "Uncached Input Tokens"
+                                          }
+                                        },
+                                        "required": [
+                                          "agent"
+                                        ],
+                                        "title": "AgentPart",
+                                        "type": "object"
+                                      },
+                                      "maxItems": 32,
+                                      "type": "array"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ],
+                                  "title": "Agents"
+                                },
                                 "cache_creation_input_tokens": {
                                   "anyOf": [
                                     {
@@ -30020,6 +30972,111 @@
               "title": "Include Previous",
               "type": "boolean"
             }
+          },
+          {
+            "in": "query",
+            "name": "group",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Group"
+            }
+          },
+          {
+            "in": "query",
+            "name": "day",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Day"
+            }
+          },
+          {
+            "in": "query",
+            "name": "slot",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Slot"
+            }
+          },
+          {
+            "in": "query",
+            "name": "host",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Host"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Include"
+            }
           }
         ],
         "responses": {
@@ -30027,7 +31084,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/UsageAnalysisView"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/UsageAnalysisView"
+                    },
+                    {
+                      "$ref": "#/components/schemas/UsageAnalysisV2View"
+                    }
+                  ],
+                  "title": "Response Read Analysis V1 Me Usage Analysis Get"
                 }
               }
             },
@@ -30045,6 +31110,24 @@
           }
         },
         "summary": "Read Analysis"
+      }
+    },
+    "/v1/me/usage/analysis/hours": {
+      "get": {
+        "operationId": "read_analysis_hours_v1_me_usage_analysis_hours_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageAnalysisHoursView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Analysis Hours"
       }
     },
     "/v1/me/usage/events": {
@@ -39696,7 +40779,7 @@
         ]
       },
       "patch": {
-        "description": "Grant or revoke agent use of exactly one elevated terminal instance.",
+        "description": "Set the agent tier for exactly one terminal instance.",
         "operationId": "set_terminal_agent_access_v1_sessions__session_id__resources_terminals__terminal_id__patch",
         "parameters": [
           {
@@ -40304,6 +41387,280 @@
           }
         },
         "summary": "Worktree Status",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{sid}/host-terminals": {
+      "get": {
+        "operationId": "list_terminals_v1_sessions__sid__host_terminals_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sid",
+            "required": true,
+            "schema": {
+              "title": "Sid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Terminals V1 Sessions  Sid  Host Terminals Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Terminals",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "post": {
+        "operationId": "create_v1_sessions__sid__host_terminals_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sid",
+            "required": true,
+            "schema": {
+              "title": "Sid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionHostTerminalCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Create V1 Sessions  Sid  Host Terminals Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{sid}/host-terminals/{host_id}/{tid}": {
+      "delete": {
+        "operationId": "delete_v1_sessions__sid__host_terminals__host_id___tid__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sid",
+            "required": true,
+            "schema": {
+              "title": "Sid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tid",
+            "required": true,
+            "schema": {
+              "title": "Tid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "patch": {
+        "operationId": "set_tier_v1_sessions__sid__host_terminals__host_id___tid__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sid",
+            "required": true,
+            "schema": {
+              "title": "Sid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tid",
+            "required": true,
+            "schema": {
+              "title": "Tid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Set Tier V1 Sessions  Sid  Host Terminals  Host Id   Tid  Patch"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Tier",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{sid}/host-terminals/{host_id}/{tid}/agent/{operation}": {
+      "post": {
+        "operationId": "agent_operation_v1_sessions__sid__host_terminals__host_id___tid__agent__operation__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sid",
+            "required": true,
+            "schema": {
+              "title": "Sid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "tid",
+            "required": true,
+            "schema": {
+              "title": "Tid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "operation",
+            "required": true,
+            "schema": {
+              "title": "Operation",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Agent Operation V1 Sessions  Sid  Host Terminals  Host Id   Tid  Agent  Operation  Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Agent Operation",
         "tags": [
           "sessions"
         ]

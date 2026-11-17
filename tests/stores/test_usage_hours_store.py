@@ -549,3 +549,232 @@ def test_closed_hour_fill_records_its_actual_price_ref(db_uri):
     )
     row = store.read("owner@example.test", HOUR, OTHER_HOUR)[0]
     assert row.price_ref == "import:v1" and row.priced
+
+
+def test_agent_parts_replace_replay_remove_and_invalid_sum(db_uri):
+    from omnigent.stores.usage_agent_parts import split_row
+    from omnigent.usage.contract import AgentPart
+
+    store = UsageHoursStore(db_uri)
+    owner = "owner@example.test"
+    entry = ActivityEntryV2(
+        hour=HOUR,
+        model="m",
+        tokens=100,
+        requests=10,
+        agents=[
+            AgentPart(agent="claude", tokens=30, requests=3),
+            AgentPart(agent="codex", tokens=50, requests=5),
+        ],
+    )
+    for _ in range(2):
+        assert store.replace_rows(owner, "plan", [entry]).applied == 1
+        [rows] = list(store.read_chunks(owner, HOUR, OTHER_HOUR))
+        [row] = rows
+        assert {part.agent: part.total_tokens for part in split_row(row, row.agent_parts)} == {
+            "claude": 30,
+            "codex": 50,
+            "": 20,
+        }
+        assert len(row.agent_parts) == 2
+    unsplit = entry.model_copy(update={"agents": None})
+    store.replace_rows(owner, "plan", [unsplit])
+    assert next(iter(store.read_chunks(owner, HOUR, OTHER_HOUR)))[0].agent_parts == ()
+    invalid = entry.model_copy(update={"agents": [AgentPart(agent="codex", tokens=101)]})
+    outcome = store.replace_rows(owner, "plan", [invalid])
+    assert outcome.warnings[0].reason == "agents_over_total"
+    row = next(iter(store.read_chunks(owner, HOUR, OTHER_HOUR)))[0]
+    assert row.total_tokens == 100 and not row.agent_parts
+    store.replace_rows(owner, "plan", [entry])
+    store.replace_rows(owner, "plan", [ActivityEntryV2(hour=HOUR, model="m", removed=True)])
+    assert list(store.read_chunks(owner, HOUR, OTHER_HOUR)) == []
+    store.replace_rows(owner, "plan", [entry])
+    store.delete_account(owner, "plan")
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlUsageHourAgent
+
+    with store._read_session()("test_deleted_parts") as session:
+        assert list(session.scalars(select(SqlUsageHourAgent))) == []
+
+
+def test_otlp_agent_parts_increment_in_same_key(db_uri):
+    from omnigent.stores.usage_hours_store import UsageBuckets
+
+    store = UsageHoursStore(db_uri)
+    for agent in ("claude", "codex", "codex"):
+        store.add_activity(
+            "owner@example.test",
+            "otlp",
+            HOUR,
+            "m",
+            "h",
+            "list",
+            True,
+            UsageBuckets(total_tokens=10),
+            1,
+            0,
+            0.25,
+            agent=agent,
+        )
+    [row] = next(iter(store.read_chunks("owner@example.test", HOUR, OTHER_HOUR)))
+    assert row.total_tokens == 30 and row.cost_usd == 0.75
+    assert {part["agent"]: part["total_tokens"] for part in row.agent_parts} == {
+        "claude": 10,
+        "codex": 20,
+    }
+
+
+def test_agent_prune_preserves_cutoff_and_rejects_stale_over_total_split(db_uri):
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlUsageHour
+    from omnigent.db.utils import run_write_transaction
+    from omnigent.stores.usage_agent_parts import split_row
+    from omnigent.stores.usage_hours_store import _ACTIVITY_MAX_AGE_S
+    from omnigent.usage.contract import AgentPart
+
+    store = UsageHoursStore(db_uri)
+    owner = "owner@example.test"
+    for hour in (HOUR, OTHER_HOUR):
+        store.replace_rows(
+            owner,
+            "plan",
+            [ActivityEntryV2(hour=hour, tokens=100, agents=[AgentPart(agent="codex", tokens=90)])],
+        )
+
+    def old_writer(session):
+        session.execute(
+            update(SqlUsageHour).where(SqlUsageHour.hour_utc == HOUR).values(total_tokens=50)
+        )
+
+    run_write_transaction(store._write_session(), "test_old_writer", old_writer)
+    row = next(iter(store.read_chunks(owner, HOUR, OTHER_HOUR)))[0]
+    assert [(part.agent, part.total_tokens) for part in split_row(row, row.agent_parts)] == [
+        ("", 50)
+    ]
+    count = 0
+    while removed := store.prune_hours(OTHER_HOUR + _ACTIVITY_MAX_AGE_S, limit=1):
+        count += removed
+    assert count == 2
+    assert store.prune_hours(OTHER_HOUR + _ACTIVITY_MAX_AGE_S) == 0
+    row = next(iter(store.read_chunks(owner, HOUR, OTHER_HOUR + 3600)))[0]
+    assert row.hour_utc == OTHER_HOUR and len(row.agent_parts) == 1
+
+
+def test_dense_hour_limit_never_returns_a_complete_partial_hour(db_uri):
+    from sqlalchemy import insert
+
+    from omnigent.db.db_models import SqlUsageHour
+    from omnigent.db.utils import run_write_transaction
+    from omnigent.stores.usage_hours_store import UsageReadLimit
+
+    store = UsageHoursStore(db_uri)
+    values = [
+        {
+            "workspace_id": 0,
+            "owner_id": "owner@example.test",
+            "account_id": "plan",
+            "hour_utc": HOUR,
+            "model": f"model-{index}",
+            "host_id": "h",
+            "basis": "list",
+            "priced": 0,
+            "total_tokens": 1,
+            "cost_usd": 0,
+            "updated_at": HOUR,
+        }
+        for index in range(20001)
+    ]
+
+    def write(session):
+        for offset in range(0, len(values), 500):
+            session.execute(insert(SqlUsageHour), values[offset : offset + 500])
+
+    run_write_transaction(store._write_session(), "test_dense_hour", write)
+    with pytest.raises(UsageReadLimit, match="hour_over_limit"):
+        list(store.read_chunks("owner@example.test", HOUR, OTHER_HOUR))
+
+
+@pytest.mark.parametrize("increments", [5, 50])
+def test_agent_increment_rounding_never_discards_integer_attribution(db_uri, increments):
+    from fractions import Fraction
+
+    from omnigent.stores.usage_agent_parts import split_row
+    from omnigent.stores.usage_hours_store import UsageBuckets
+
+    store = UsageHoursStore(db_uri)
+    for _ in range(increments):
+        for agent in ("claude", "codex"):
+            store.add_activity(
+                "owner@example.test",
+                "otlp",
+                HOUR,
+                "m",
+                "h",
+                "list",
+                True,
+                UsageBuckets(total_tokens=10),
+                1,
+                0,
+                0.1,
+                agent=agent,
+            )
+    [row] = next(store.read_chunks("owner@example.test", HOUR, OTHER_HOUR))
+    parts = split_row(row, row.agent_parts)
+    assert {part.agent: part.total_tokens for part in parts} == {
+        "claude": increments * 10,
+        "codex": increments * 10,
+    }
+    assert sum(Fraction(str(part.cost_usd)) for part in parts) == Fraction(str(row.cost_usd))
+
+
+@pytest.mark.parametrize("overflow", ["cost_usd", "tokens", "requests", "uncached_input_tokens"])
+def test_agent_overflow_preserves_only_proven_splits(db_uri, overflow):
+    from omnigent.stores.usage_agent_parts import split_row
+    from omnigent.usage.contract import AgentPart
+
+    store = UsageHoursStore(db_uri)
+    figures = {"tokens": 100, "requests": 10, "uncached_input_tokens": 100, "cost_usd": 1.0}
+    child = {**figures, overflow: figures[overflow] + 1}
+    outcome = store.replace_rows(
+        "owner@example.test",
+        "plan",
+        [ActivityEntryV2(hour=HOUR, **figures, agents=[AgentPart(agent="codex", **child)])],
+    )
+    [row] = next(store.read_chunks("owner@example.test", HOUR, OTHER_HOUR))
+    [part] = split_row(row, row.agent_parts)
+    assert part.total_tokens == 100 and part.requests == 10
+    if overflow == "cost_usd":
+        assert not outcome.warnings
+        assert part.agent == "codex" and part.cost_usd is None and part.agent_money_unknown
+    else:
+        assert outcome.warnings[0].reason == "agents_over_total"
+        assert part.agent == "" and part.cost_usd == 1.0 and not part.agent_money_unknown
+
+
+def test_agent_parts_owner_and_workspace_isolation(db_uri):
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.usage.contract import AgentPart
+
+    store = UsageHoursStore(db_uri)
+    for workspace in (0, 7):
+        with workspace_scope(workspace):
+            for owner, agent in (("a@example.test", "claude"), ("b@example.test", "codex")):
+                store.replace_rows(
+                    owner,
+                    "plan",
+                    [
+                        ActivityEntryV2(
+                            hour=HOUR,
+                            tokens=workspace + 10,
+                            agents=[AgentPart(agent=agent, tokens=workspace + 10)],
+                        )
+                    ],
+                )
+    for workspace in (0, 7):
+        with workspace_scope(workspace):
+            for owner, agent in (("a@example.test", "claude"), ("b@example.test", "codex")):
+                [row] = next(store.read_chunks(owner, HOUR, OTHER_HOUR))
+                assert row.total_tokens == workspace + 10
+                assert [part["agent"] for part in row.agent_parts] == [agent]

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, delete, func, select
+from sqlalchemy import CursorResult, delete, func, select, tuple_
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -145,6 +145,9 @@ class UsageEvidenceStore:
         end: float,
         account: str | None = None,
         model: str | None = None,
+        *,
+        keys: set[tuple[str, int, str]] | None = None,
+        include_aliases: bool = True,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         table = SqlUsagePriceEvidence
         query = select(table).where(
@@ -156,6 +159,8 @@ class UsageEvidenceStore:
             alias_query = alias_query.where(SqlUsagePriceAliases.account_id == account)
         if model is not None:
             query = query.where(table.model == model)
+        if keys is not None:
+            query = query.where(tuple_(table.account_id, table.hour_utc, table.model).in_(keys))
         with self.sessions._read_session()("read_price_evidence") as session:
             rows = [
                 {column.name: getattr(row, column.name) for column in table.__table__.columns}
@@ -168,7 +173,11 @@ class UsageEvidenceStore:
                     "observed_at": row.observed_at,
                     "updated_at": row.updated_at,
                 }
-                for row in session.scalars(alias_query.order_by(SqlUsagePriceAliases.account_id))
+                for row in (
+                    session.scalars(alias_query.order_by(SqlUsagePriceAliases.account_id))
+                    if include_aliases
+                    else []
+                )
             ]
             return rows, aliases
 

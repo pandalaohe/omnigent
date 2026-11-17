@@ -6,9 +6,19 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, StrictFloat, StrictInt, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    StrictFloat,
+    StrictInt,
+    model_serializer,
+    model_validator,
+)
 
 from omnigent.usage.prices import PriceEstimate
+from omnigent.usage.value import Value
 
 _Id = Annotated[
     str,
@@ -132,6 +142,35 @@ class UsageBalance(BaseModel):
     expires_at: Annotated[_Number, Field(gt=0)] | None = None
 
 
+class AgentPart(BaseModel):
+    """One agent's nullable measures within a whole-key report."""
+
+    model_config = ConfigDict(extra="ignore")
+    agent: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,31}$")
+    uncached_input_tokens: Annotated[StrictInt, Field(ge=0)] | None = None
+    cache_read_input_tokens: Annotated[StrictInt, Field(ge=0)] | None = None
+    cache_creation_input_tokens: Annotated[StrictInt, Field(ge=0)] | None = None
+    output_tokens: Annotated[StrictInt, Field(ge=0)] | None = None
+    reasoning_tokens: Annotated[StrictInt, Field(ge=0)] | None = None
+    tokens: Annotated[StrictInt, Field(ge=0)] | None = None
+    requests: Annotated[StrictInt, Field(ge=0)] | None = None
+    failed: Annotated[StrictInt, Field(ge=0)] | None = None
+    cost_usd: Annotated[_Number, Field(ge=0)] | None = None
+
+    def total(self) -> int | None:
+        buckets = (
+            self.uncached_input_tokens,
+            self.cache_read_input_tokens,
+            self.cache_creation_input_tokens,
+            self.output_tokens,
+        )
+        return (
+            sum(value for value in buckets if value is not None)
+            if all(value is not None for value in buckets)
+            else self.tokens
+        )
+
+
 class ActivityEntryV2(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -152,6 +191,7 @@ class ActivityEntryV2(BaseModel):
     coverage: Literal["complete", "partial"] = "complete"
     removed: bool = Field(default=False, strict=True)
     correction: bool = Field(default=False, strict=True)
+    agents: list[AgentPart] | None = Field(default=None, max_length=32)
 
     @model_validator(mode="before")
     @classmethod
@@ -167,6 +207,8 @@ class ActivityEntryV2(BaseModel):
     @model_validator(mode="after")
     def validate_entry(self) -> ActivityEntryV2:
         ActivityHour(hour=self.hour, reasons=self.reasons)
+        if self.agents and len({part.agent for part in self.agents}) != len(self.agents):
+            raise ValueError("agent parts must have distinct names")
         if self.cost_basis == "estimate":
             self.cost_basis = "list"
         figures = (
@@ -206,14 +248,22 @@ class EntryOutcome(BaseModel):
     host: str
     model: str
     cost_basis: str
-    reason: Literal["lower_reread", "partial_over_complete", "out_of_range"]
+    reason: Literal["lower_reread", "partial_over_complete", "out_of_range", "agents_over_total"]
 
 
 class WriteOutcome(BaseModel):
     applied: int = Field(default=0, ge=0)
     held: list[EntryOutcome] = Field(default_factory=list)
     skipped: list[EntryOutcome] = Field(default_factory=list)
+    warnings: list[EntryOutcome] = Field(default_factory=list)
     older_sections: list[Literal["windows", "balances"]] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def serialize_outcome(self, handler):
+        result = handler(self)
+        if not self.warnings:
+            result.pop("warnings", None)
+        return result
 
 
 class _ReportFields(BaseModel):
@@ -412,6 +462,10 @@ class AnalysisRowView(BaseModel):
     hour: int
     model: str = ""
     host_id: str = ""
+    agent: str = ""
+    agent_split: bool = Field(default=False, exclude=True)
+    agent_money_unknown: bool = Field(default=False, exclude=True)
+    updated_at: int | None = None
     basis: str
     price_ref: str | None = None
     price_estimate: PriceEstimate | None = None
@@ -430,6 +484,65 @@ class AnalysisRowView(BaseModel):
     contributes_usage: bool = False
     contributes_money: bool = False
     reason: str | None = None
+
+
+class AnalysisCountsV2(BaseModel):
+    tokens: int | None
+    requests: int | None
+    failed: int | None
+    last_at: int | None
+    coverage: Literal["complete", "partial"]
+
+
+class AnalysisAmountsV2(AnalysisCountsV2):
+    api_value: Value
+    paid: Value
+    payback: Value
+
+
+class AnalysisHourV2(AnalysisCountsV2):
+    start: int
+    label: str
+    totals: AnalysisAmountsV2
+    top_host: str | None
+    top_agent: str | None
+    top_model: str | None
+
+
+class UsageAnalysisHoursView(BaseModel):
+    filter: dict[str, Any]
+    span: AnalysisSpan
+    complete: bool
+    incomplete_reason: (
+        Literal["hour_over_limit", "scan_over_limit", "card_models_over_limit"] | None
+    )
+    approx: bool
+    hours: list[AnalysisHourV2]
+
+
+class UsageAnalysisV2View(BaseModel):
+    """Complete-window contract selected by the group query parameter."""
+
+    generated_at: float
+    filter: dict[str, Any]
+    span: AnalysisSpan
+    tz: str
+    complete: bool
+    incomplete_reason: (
+        Literal["hour_over_limit", "scan_over_limit", "card_models_over_limit"] | None
+    )
+    approx: bool
+    totals: AnalysisAmountsV2
+    series: list[dict[str, Any]]
+    groups: list[dict[str, Any]]
+    facets: dict[str, list[dict[str, Any]]]
+    heat: list[dict[str, Any]]
+    days: list[dict[str, Any]]
+    classes: dict[str, Any]
+    cache_savings: dict[str, Any]
+    previous: dict[str, Any] | None = None
+    rows: list[AnalysisRowView] = Field(default_factory=list)
+    rows_truncated: bool = False
 
 
 class AnalysisAccountTotal(BaseModel):

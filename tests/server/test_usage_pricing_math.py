@@ -185,6 +185,32 @@ def test_incompatible_models_partitions_and_card_selection():
     assert value_usage(view(), baseline(), model="model-a")["paid"].state == "unknown"
 
 
+@pytest.mark.parametrize("size", [1, 7, 2000, 10000])
+@pytest.mark.parametrize("named", [False, True])
+def test_window_card_models_survive_hour_chunking(size, named):
+    from omnigent.usage.pricing_projection import ValueUsageFold, card_model_sets
+
+    sample = view()
+    sample.rows.append(
+        sample.rows[0].model_copy(update={"model": "model-b", "hour": sample.rows[0].hour + 3600})
+    )
+    saved = baseline()
+    if named:
+        saved.cards[0].rates_usd_per_million.model = "model-a"
+    reference = value_usage(sample, saved)
+    fold = ValueUsageFold(
+        sample.model_copy(update={"rows": []}), saved, card_models=card_model_sets(sample, saved)
+    )
+    for offset in range(0, len(sample.rows), size):
+        fold.add(sample.rows[offset : offset + size])
+    result = fold.result()
+    assert result == reference
+    if named:
+        assert result["api_value"].low is not None
+    else:
+        assert result["api_value"].reason == "card rates name no model"
+
+
 @pytest.mark.parametrize("priced,expected", [(49, "unknown"), (50, "partial")])
 def test_priced_unit_threshold(priced, expected):
     sample = view(

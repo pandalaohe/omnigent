@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -17,6 +17,7 @@ from omnigent.usage.contract import (
     AnalysisTotals,
     AnalysisUnmapped,
     PoolCatalogEntry,
+    UsageAnalysisView,
 )
 
 #: Hard bound on the model-hour rows one analysis response carries.
@@ -24,6 +25,14 @@ MAX_ANALYSIS_ROWS = 5_000
 
 #: Hard bound on the calendar span one analysis request may cover (days).
 MAX_ANALYSIS_SPAN_DAYS = 370
+
+
+@dataclass
+class AnalysisReader:
+    metadata: UsageAnalysisView
+    chunks: Callable[..., Iterator[tuple[UsageAnalysisView, list[HourRow]]]]
+    for_span: Callable[..., AnalysisReader] | None = None
+
 
 #: Bases whose money is a list-price figure rather than a bill. A ``list_cost``
 #: channel counts only these; a ``metered_cost`` channel counts the rest.
@@ -88,6 +97,8 @@ class AnalysedRow:
             hour=row.hour_utc,
             model=row.model,
             host_id=row.host_id,
+            agent=row.agent,
+            updated_at=row.updated_at,
             basis=row.basis,
             priced=row.priced,
             price_ref=row.price_ref,

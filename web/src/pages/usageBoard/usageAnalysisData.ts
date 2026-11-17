@@ -5,6 +5,80 @@ import { USAGE_BOARD_POLL_MS } from "./usageBoardData";
 import { formatRingPercent } from "./usageBoardFormat";
 
 export type AnalysisDimension = "account" | "pool" | "model";
+export type AnalysisGroup = AnalysisDimension | "card" | "host" | "agent";
+export interface AnalysisFilter {
+  group: AnalysisGroup;
+  range: "today" | "d7" | "d30" | "d90" | "custom";
+  tz: string;
+  account: string[];
+  model: string[];
+  host: string[];
+  agent: string[];
+  day: string | null;
+  slot: string | null;
+  from: string | null;
+  to: string | null;
+}
+
+export interface AnalysisCounts {
+  tokens: number | null;
+  requests: number | null;
+  failed: number | null;
+  last_at: number | null;
+  coverage: "complete" | "partial";
+}
+export interface AnalysisAmounts extends AnalysisCounts {
+  api_value: AnalysisValue;
+  paid: AnalysisValue;
+  payback: AnalysisValue;
+}
+export interface AnalysisClasses {
+  basis: "price_table_estimate";
+  items: {
+    kind: "input" | "cache_read" | "cache_write" | "output";
+    tokens: number;
+    cost_low_usd: string;
+    cost_high_usd: string;
+    unpriced_tokens: number;
+  }[];
+  unpriced_tokens: Record<string, number>;
+  unsplit_tokens: number;
+  unsplit_cost: { low: string; high: string | null };
+}
+export interface AnalysisHour extends AnalysisCounts {
+  start: number;
+  label: string;
+  totals: AnalysisAmounts;
+  top_host: string | null;
+  top_agent: string | null;
+  top_model: string | null;
+}
+export interface UsageAnalysisV2 {
+  generated_at: number;
+  filter: AnalysisFilter;
+  tz: string;
+  span: UsageAnalysis["span"];
+  complete: boolean;
+  incomplete_reason: "hour_over_limit" | "scan_over_limit" | "card_models_over_limit" | null;
+  approx: boolean;
+  totals: AnalysisAmounts;
+  series: (AnalysisAmounts & { at: number | string })[];
+  groups: (Partial<AnalysisAmounts> & {
+    key: string | [string, string] | null;
+    selected?: boolean;
+    remainder?: boolean;
+    trend?: (AnalysisCounts & { at: number | string })[];
+  })[];
+  facets: Record<"account" | "model" | "host" | "agent", UsageAnalysisV2["groups"]>;
+  heat: (AnalysisCounts & { slot: string })[];
+  days: (AnalysisAmounts & { day: string; classes: AnalysisClasses; hours: AnalysisHour[] })[];
+  classes: AnalysisClasses;
+  cache_savings: { state: string; reason?: string };
+  previous?: Pick<UsageAnalysisV2, "span" | "totals" | "series">;
+  rows: (AnalysisRow & { host_id: string; agent: string })[];
+  rows_truncated: boolean;
+  hours: AnalysisHour[];
+}
 export interface AnalysisRow {
   account_id: string;
   parent_account_id: string;

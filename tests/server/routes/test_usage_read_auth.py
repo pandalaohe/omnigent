@@ -102,6 +102,18 @@ def test_usage_scope_requires_live_owner_grant() -> None:
     assert provider.get_user_id(_request(_token(scope="sessions"))) is None
 
 
+def test_hour_read_scope_is_exact():
+    from omnigent.server.auth import api_key_scope_allows
+
+    path = "/v1/me/usage/analysis/hours"
+    assert api_key_scope_allows(("usage",), "GET", path)
+    assert api_key_scope_allows(("*",), "GET", path)
+    for scope in ("tasks", "usage:read", "sessions"):
+        assert not api_key_scope_allows((scope,), "GET", path)
+    assert not api_key_scope_allows(("usage",), "POST", path)
+    assert not api_key_scope_allows(("usage",), "GET", path + "/other")
+
+
 @pytest.fixture
 def config_token(monkeypatch: pytest.MonkeyPatch) -> str:
     token = "fake_usage_" + secrets.token_urlsafe(32)

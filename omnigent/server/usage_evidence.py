@@ -30,9 +30,19 @@ class UsageEvidenceService:
         self.store = store
         self.retention_days = retention_days
 
-    def attach_prices(self, owner: str, view: UsageAnalysisView) -> None:
+    def attach_prices(self, owner: str, view: UsageAnalysisView, *, bounded: bool = False) -> None:
         """Join exact account/hour/model evidence without relabelling native history."""
-        rows, _ = self.store.read_prices(owner, int(view.span.counted_from), view.span.until)
+        if bounded and not view.rows:
+            return
+        start = min(row.hour for row in view.rows) if bounded else int(view.span.counted_from)
+        until = max(row.hour for row in view.rows) + 3600 if bounded else view.span.until
+        rows, _ = self.store.read_prices(
+            owner,
+            start,
+            until,
+            keys={(row.account_id, row.hour, row.model) for row in view.rows} if bounded else None,
+            include_aliases=not bounded,
+        )
         prices = {(row["account_id"], row["hour_utc"], row["model"]): row for row in rows}
         cohorts = Counter(
             (row.account_id, row.hour, row.model) for row in view.rows if row.contributes_usage
