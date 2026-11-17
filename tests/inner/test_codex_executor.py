@@ -3548,7 +3548,11 @@ class TestCodexExecutor(unittest.TestCase):
             second_events = [
                 e
                 async for e in executor.run_turn(
-                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [
+                        {"role": "user", "content": "hi", "session_id": "s1"},
+                        {"role": "assistant", "content": "one", "session_id": "s1"},
+                        {"role": "user", "content": "continue", "session_id": "s1"},
+                    ],
                     []
                     if change_model
                     else [
@@ -3567,6 +3571,9 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertEqual(second_events[-1].response, "two")
             self.assertTrue(first.closed)
             self.assertFalse(second.closed)
+            self.assertEqual(list(executor._session_states), ["s1"])
+            self.assertEqual(second.calls[0]["messages"][-1]["content"], "continue")
+            self.assertEqual(second.calls[0]["messages"][-2]["content"], "one")
             self.assertEqual(first.calls[0]["reasoning_effort"], "high")
             self.assertIsNone(second.calls[0]["reasoning_effort"])
             self.assertEqual(

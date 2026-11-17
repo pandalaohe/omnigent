@@ -34,6 +34,11 @@ export interface UsageHostView {
 }
 
 export interface UsageAccountMark {
+  provider_refusal?: {
+    source: string;
+    observed_at: number;
+    resets_at: number | null;
+  };
   level?: string;
   requests?: number;
   failed?: number;

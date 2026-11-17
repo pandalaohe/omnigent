@@ -1988,9 +1988,12 @@ async def _post_child_message_event(
     *,
     content: list[_JsonObject],
     created_by: str | None,
+    input_id: str | None = None,
 ) -> httpx.Response:
     """Post a child message, retrying once without best-effort attribution."""
     from omnigent.server.session_collab import AGENT_SESSION_HEADER
+
+    input_id = input_id or uuid.uuid4().hex
 
     def _payload(actor: str | None) -> _JsonObject:
         return {
@@ -1998,21 +2001,25 @@ async def _post_child_message_event(
             "data": {
                 "role": "user",
                 "content": content,
+                "stable_id": input_id,
             },
             **({"created_by": actor} if actor is not None else {}),
         }
 
-    resp = await server_client.post(
-        f"{_session_url(session_id)}/events",
-        json=_payload(created_by),
-        headers={AGENT_SESSION_HEADER: "agent"},
-        # This message is gated at the recipient's REQUEST phase, which can
-        # PARK on a human ASK (e.g. session_cost_budget) up to the policy's
-        # ``ask_timeout``. A 30s read budget severed that park → fail-closed
-        # /retry → duplicate cards. Wait for the real verdict (one-day read
-        # budget, fast connect); a non-parking eval still returns immediately.
-        timeout=_ASK_GATE_DELIVERY_TIMEOUT,
-    )
+    async def post(actor: str | None) -> httpx.Response:
+        try:
+            return await server_client.post(
+                f"{_session_url(session_id)}/events",
+                json=_payload(actor),
+                headers={AGENT_SESSION_HEADER: "agent"},
+                # REQUEST policy may park for a human verdict; keep its existing
+                # transport lifetime rather than timing out and resending.
+                timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+            )
+        except httpx.TransportError as exc:
+            raise _ChildMessageDeliveryUnknown(session_id, input_id) from exc
+
+    resp = await post(created_by)
     if created_by is None or resp.status_code != 403:
         return resp
 
@@ -2020,12 +2027,7 @@ async def _post_child_message_event(
         "Child message POST attribution rejected for session=%s; retrying without actor",
         session_id,
     )
-    return await server_client.post(
-        f"{_session_url(session_id)}/events",
-        json=_payload(None),
-        headers={AGENT_SESSION_HEADER: "agent"},
-        timeout=_ASK_GATE_DELIVERY_TIMEOUT,
-    )
+    return await post(None)
 
 
 async def _send_to_in_flight_child(
@@ -2114,6 +2116,8 @@ async def _send_to_in_flight_child(
             content=[{"type": "input_text", "text": message}],
             created_by=created_by,
         )
+    except _ChildMessageDeliveryUnknown as exc:
+        return exc.handle()
     except httpx.HTTPError as exc:
         return (
             f"Error: failed to steer in-flight sub-agent {agent!r} title {title!r}: "
@@ -4409,6 +4413,8 @@ async def _execute_subagent_tool(
             content=message_content,
             created_by=dispatch_created_by,
         )
+    except _ChildMessageDeliveryUnknown as exc:
+        return exc.handle()
     except httpx.HTTPError as exc:
         teardown_warning = await _teardown_failed_child(
             server_client,
@@ -4831,6 +4837,8 @@ async def _send_to_descendant_session(
             content=[{"type": "input_text", "text": message}],
             created_by=created_by,
         )
+    except _ChildMessageDeliveryUnknown as exc:
+        return exc.handle()
     except httpx.HTTPError as exc:
         return (
             f"Error: sys_session_send failed to send message to descendant "
@@ -5074,6 +5082,8 @@ async def _send_to_existing_session(
             content=[{"type": "input_text", "text": message}],
             created_by=created_by,
         )
+    except _ChildMessageDeliveryUnknown as exc:
+        return exc.handle()
     except httpx.HTTPError as exc:
         await _teardown_failed_child(server_client, target_session_id, created_child=False)
         return f"Error: failed to send message to child: {type(exc).__name__}: {exc}"
@@ -5393,13 +5403,17 @@ async def _post_created_child_message(
     :returns: ``None`` on success; a short error description otherwise.
     """
     content: list[_JsonObject] = [{"type": "input_text", "text": message}]
+    input_id = uuid.uuid4().hex
     try:
         resp = await _post_child_message_event(
             server_client,
             child_session_id,
             content=content,
             created_by=None,
+            input_id=input_id,
         )
+    except _ChildMessageDeliveryUnknown:
+        raise
     except httpx.TimeoutException:
         raise
     except httpx.HTTPError as exc:
@@ -5414,7 +5428,10 @@ async def _post_created_child_message(
                     child_session_id,
                     content=content,
                     created_by=None,
+                    input_id=input_id,
                 )
+            except _ChildMessageDeliveryUnknown:
+                raise
             except httpx.TimeoutException:
                 raise
             except httpx.HTTPError as exc:
@@ -5422,6 +5439,38 @@ async def _post_created_child_message(
             if _message_post_accepted(resp):
                 return None
     return f"{resp.status_code} {resp.text}"
+
+
+_INPUT_DELIVERY_INSPECTION_GUIDANCE = (
+    "Inspect conversation_id with sys_session_get_info (session_id, status, last_activity_at) "
+    "and sys_session_get_history (persisted items[].id). For native sessions, input_id is only "
+    "an attempt correlation ID; these reads cannot confirm this specific input. "
+    "Do not match identical messages by text. Do not create a replacement; "
+    "do not automatically resend the task."
+)
+
+
+class _ChildMessageDeliveryUnknown(httpx.HTTPError):
+    """A lost response retains the original input identity for inspection."""
+
+    def __init__(self, session_id: str, input_id: str) -> None:
+        super().__init__("Child message delivery is unknown")
+        self.session_id = session_id
+        self.input_id = input_id
+
+    def handle(self) -> str:
+        return json.dumps(
+            {
+                "status": "delivery_unknown",
+                "conversation_id": self.session_id,
+                "handle_id": self.session_id,
+                "input_id": self.input_id,
+                "message": (
+                    "The send response was lost; execution may have started. "
+                    + _INPUT_DELIVERY_INSPECTION_GUIDANCE
+                ),
+            }
+        )
 
 
 async def _post_child_message_recovering(
@@ -5446,17 +5495,27 @@ async def _post_child_message_recovering(
     :param created_by: Human actor that sent the message, if known.
     :returns: The accepted repost, or the last refused/error response.
     """
-    resp = await _post_child_message_event(
-        server_client, session_id, content=content, created_by=created_by
-    )
+    input_id = uuid.uuid4().hex
+
+    async def post() -> httpx.Response:
+        try:
+            return await _post_child_message_event(
+                server_client,
+                session_id,
+                content=content,
+                created_by=created_by,
+                input_id=input_id,
+            )
+        except httpx.TransportError as exc:
+            raise _ChildMessageDeliveryUnknown(session_id, input_id) from exc
+
+    resp = await post()
     if _message_post_accepted(resp) or not _message_post_needs_runner_wait(resp):
         return resp
     if await _wait_for_runner_online(
         server_client, session_id, timeout_s=_BY_ID_CHILD_READY_TIMEOUT_S
     ):
-        return await _post_child_message_event(
-            server_client, session_id, content=content, created_by=created_by
-        )
+        return await post()
     retry = await server_client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "retry_session", "data": {}},
@@ -5464,17 +5523,12 @@ async def _post_child_message_recovering(
     )
     if retry.status_code >= 400:
         return retry
-    return await _post_child_message_event(
-        server_client, session_id, content=content, created_by=created_by
-    )
+    return await post()
 
 
 # The created session exists, and a transport error can hide whether its
 # first task was accepted, so a blind retry could duplicate the work.
-_UNCONFIRMED_FIRST_TASK_GUIDANCE = (
-    "inspect this session before continuing. Do not create a replacement; "
-    "do not automatically resend the task."
-)
+_UNCONFIRMED_FIRST_TASK_GUIDANCE = _INPUT_DELIVERY_INSPECTION_GUIDANCE
 
 # sys_session_create argument -> session-create field, shared by the JSON
 # (agent_id) and multipart (config_path) creates so neither drops one.
@@ -5970,14 +6024,25 @@ async def _complete_created_session(
                 registered_by="sys_session_create",
             )
             registration_error = await clear_registration_barrier()
-            post_error = (
-                registration_error
-                if registration_error is not None
-                else await _post_created_child_message(
-                    server_client, child_id, message, remote=remote
+            delivery_unknown = None
+            try:
+                post_error = (
+                    registration_error
+                    if registration_error is not None
+                    else await _post_created_child_message(
+                        server_client, child_id, message, remote=remote
+                    )
                 )
-            )
-            if post_error is not None:
+            except _ChildMessageDeliveryUnknown as exc:
+                delivery_unknown = exc
+                post_error = None
+            if delivery_unknown is not None:
+                initial_message = {
+                    "status": "pending",
+                    "error": "delivery_unknown",
+                    "input_id": delivery_unknown.input_id,
+                }
+            elif post_error is not None:
                 from omnigent.entities.subagent_terminal import TerminalEnvelope
 
                 _subagent_work.mark_subagent_work_terminal(

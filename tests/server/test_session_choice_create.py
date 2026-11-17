@@ -1923,3 +1923,224 @@ async def test_persisted_period_rule_reaches_create_choice(
         None if omit_model and route is None else default_models[env.agents[1]["id"]]
     )
     assert scoped.json()["session_choice"]["pool"] == pool_id
+
+
+@pytest.mark.asyncio
+async def test_owner_billing_report_cannot_stop_provider(quota_runner):
+    from omnigent.server.session_choice import state_for
+
+    env = quota_runner
+    first = (await create(env)).json()
+    response = await env.client.post(
+        f"/v1/sessions/{first['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {
+                "status": "failed",
+                "output": "HTTP 403 balance billing is disabled for this key",
+                "response_id": "fabricated-turn",
+                "input_id": "fabricated-input",
+                "input_generation": 99,
+                "native_generation": 99,
+            },
+        },
+    )
+    assert response.status_code == 202, response.text
+    assert not state_for(env.app).refusals
+    env.store.set_session_live_status(first["id"], "idle")
+    assert (await create(env)).json()["session_choice"]["pool"] == "pool-0"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["live", "resume"])
+async def test_codex_success_keeps_route_healthy_after_delayed_old_failure(
+    quota_runner, tmp_path, delivery
+):
+    from omnigent.harnesses.codex_native import bridge
+    from omnigent.harnesses.codex_native import forwarder as fwd
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.server.session_choice import state_for
+
+    env = quota_runner
+    first = (await create(env)).json()
+    sid = first["id"]
+    binding = "test-provider-recovery-runner"
+    env.store.clear_runner_id(sid)
+    assert env.store.set_runner_id(sid, token_bound_runner_id(binding))
+    env.client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = binding
+    state = state_for(env.app)
+
+    async def start(turn, generation):
+        assert await fwd._post_status(
+            env.client,
+            sid,
+            "running",
+            response_id=f"codex_{turn}",
+            input_id=f"input-{turn}",
+            native_generation=generation,
+        )
+
+    async def fail(turn, generation):
+        assert await fwd._post_status(
+            env.client,
+            sid,
+            "failed",
+            response_id=f"codex_{turn}",
+            input_id=f"input-{turn}",
+            native_generation=generation,
+            output="HTTP 403 balance billing is disabled for this key",
+            native_turn_generation=generation,
+        )
+
+    # This older execution's failure has not yet reached the server.
+    await start("delayed", 1)
+    await start("failure", 2)
+    await fail("failure", 2)
+    assert state.refusals
+    await start("success", 3)
+    if delivery == "resume":
+        assert await fwd._post_status(
+            env.client,
+            sid,
+            "idle",
+            response_id="codex_delayed",
+            input_id="input-delayed",
+            recovered=True,
+            turn_completed=True,
+            native_turn_generation=1,
+        )
+        assert state.refusals
+        assert await fwd._post_status(
+            env.client,
+            sid,
+            "idle",
+            response_id="codex_unaccepted",
+            input_id="unaccepted-input",
+            recovered=True,
+            turn_completed=True,
+            native_turn_generation=4,
+            native_generation=999,
+        )
+        assert state.refusals
+        assert env.app.state.subagent_retry_admission.journal.get_input("unaccepted-input") is None
+    bridge.write_bridge_state(
+        tmp_path,
+        bridge.CodexNativeBridgeState(
+            session_id=sid,
+            socket_path="/opt/work/app.sock",
+            thread_id="thread",
+            codex_home=str(tmp_path / "home"),
+            active_turn_id="success",
+            active_turn_revision=5,
+            input_id="input-success",
+            input_turn_id="success",
+        ),
+    )
+    if delivery == "resume":
+        await fwd._post_resume_turn_status(
+            env.client,
+            session_id=sid,
+            bridge_dir=tmp_path,
+            thread_id="thread",
+            turns=[{"id": "success", "status": "completed", "items": []}],
+        )
+    else:
+        edge = fwd._terminal_turn_status_edge(
+            tmp_path, "turn/completed", {"turn": {"id": "success", "status": "completed"}}
+        )
+        assert edge is not None
+        await fwd._post_turn_status_edge(
+            env.client, sid, edge, input_id="input-success", bridge_dir=tmp_path
+        )
+    assert not state.refusals
+    await fail("delayed", 1)
+    assert not state.refusals
+    assert state.provider_recoveries
+    env.store.set_session_live_status(sid, "idle")
+    env.client.headers.pop(RUNNER_TUNNEL_TOKEN_HEADER)
+    selected = await create(env)
+    assert selected.status_code == 201, selected.text
+    assert selected.json()["session_choice"]["pool"] == "pool-0"
+
+
+@pytest.mark.asyncio
+async def test_billing_refusal_stops_usage_lines_and_selection_without_reset(quota_runner):
+    from omnigent.usage.contract import UsageReportV2
+
+    env = quota_runner
+    service = env.app.state.agent_quota_service
+    service.usage_enabled = True
+    report = UsageReportV2.model_validate(
+        {
+            "schema_version": 2,
+            "observed_at": time.time(),
+            "status": "available",
+            "windows": [],
+            "balances": [{"id": "credit", "unit": "USD", "remaining": 10}],
+            "source_type": "relay",
+            "source": "sample-feeder",
+        }
+    )
+    service.report_account(RESERVED_USER_LOCAL, "pool-0", report, now=time.time())
+    first = (await create(env)).json()
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+
+    binding = "test-billing-runner"
+    env.store.clear_runner_id(first["id"])
+    assert env.store.set_runner_id(first["id"], token_bound_runner_id(binding))
+    headers = {RUNNER_TUNNEL_TOKEN_HEADER: binding}
+    running = await env.client.post(
+        f"/v1/sessions/{first['id']}/events",
+        headers=headers,
+        json={
+            "type": "external_session_status",
+            "data": {
+                "status": "running",
+                "response_id": "billing-failure",
+                "input_id": "billing-input",
+                "native_generation": 1,
+            },
+        },
+    )
+    assert running.status_code == 202, running.text
+    response = await env.client.post(
+        f"/v1/sessions/{first['id']}/events",
+        headers=headers,
+        json={
+            "type": "external_session_status",
+            "data": {
+                "status": "failed",
+                "output": "HTTP 403 balance billing is disabled for this key",
+                "response_id": "billing-failure",
+                "input_id": "billing-input",
+                "native_generation": 1,
+            },
+        },
+    )
+    assert response.status_code == 202, response.text
+    env.store.set_session_live_status(first["id"], "idle")
+    lines = await env.client.get("/v1/me/usage/lines")
+    assert lines.status_code == 200, lines.text
+    tile = lines.json()["tiles"]["pool-0"]
+    assert tile["state"] == "stop"
+    assert tile["reason"] == "billing_disabled"
+    assert tile["source"] == f"{first['id']}:billing-failure"
+    assert tile["clears_at"] is None
+    overview = await env.client.get("/v1/me/usage")
+    assert overview.status_code == 200, overview.text
+    account = next(row for row in overview.json()["accounts"] if row["id"] == "pool-0")
+    assert account["state"] == "stopped"
+    assert account["balances"][0]["remaining"] == 10
+    assert account["mark"]["provider_refusal"]["source"] == tile["source"]
+    assert account["source_type"] == "relay"
+    assert account["source"] == "sample-feeder"
+    newer = report.model_copy(update={"observed_at": time.time() + 1})
+    service.report_account(RESERVED_USER_LOCAL, "pool-0", newer, now=time.time())
+    assert (await env.client.get("/v1/me/usage/lines")).json()["tiles"]["pool-0"][
+        "state"
+    ] == "stop"
+    second = await create(env)
+    assert second.status_code == 201, second.text
+    choice = second.json()["session_choice"]
+    assert choice["pool"] == "pool-1"
+    assert choice["skipped"][0]["why"] == "stop"

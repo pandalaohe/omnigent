@@ -81,6 +81,7 @@ export function neverRead(account: UsageAccountView): boolean {
  * with no reading, or an old one, takes no colour — it must not claim pace.
  */
 export function accountTone(account: UsageAccountView, stale: boolean): UsageTone {
+  if (account.mark?.provider_refusal && account.state === "stopped") return "crit";
   if (stale || neverRead(account)) return "mute";
   const rank: Record<string, number> = { ok: 0, tight: 1, low: 2, exhausted: 3 };
   let worst = 0;

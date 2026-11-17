@@ -1757,7 +1757,9 @@ class AgentQuotaService:
                     )
         return issues
 
-    def tile_lines(self, owner: str, *, now: float | None = None, settings=None) -> dict:
+    def tile_lines(
+        self, owner: str, *, now: float | None = None, settings=None, choice_state=None
+    ) -> dict:
         from dataclasses import asdict
 
         from omnigent.models.model_reference import canonical_pool_values
@@ -1768,6 +1770,8 @@ class AgentQuotaService:
         if settings is None:
             settings = read_collab_settings(self.preferences, owner).session_choice
         readings = self.pool_readings(QuotaContext(owner, None), now=now)
+        if choice_state is not None:
+            readings = choice_state.quota_readings(owner, readings, now)
         floors = self.preferences.choice_floor_off(owner) if self.preferences else {}
         groups = read_provider_groups(self.preferences, owner)
         limits = canonical_pool_values(settings.limits, groups)

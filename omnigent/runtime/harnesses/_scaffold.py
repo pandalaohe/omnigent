@@ -513,6 +513,10 @@ def _keep_warm_receipt(attempt_id: str, *, outcome: str, reason: str | None) -> 
     }
 
 
+class _InputExecutionAcceptanceUnknown(RuntimeError):
+    """The receiver cannot prove whether its original admission committed."""
+
+
 class TurnContext:
     """
     Per-turn interaction surface the scaffold hands to ``run_turn``.
@@ -889,10 +893,10 @@ class TurnContext:
             remaining = max(0, deadline - time.time()) if deadline else _INPUT_CLAIM_TIMEOUT_S
             result = await asyncio.wait_for(future, timeout=remaining + 5)
             if result.state == "pending":
-                raise RuntimeError("input_execution_acceptance_unknown")
+                raise _InputExecutionAcceptanceUnknown("input_execution_acceptance_unknown")
             return result.state in {"accepted", "reserved"} and not self.cancelled.is_set()
         except TimeoutError:
-            raise RuntimeError("input_execution_acceptance_unknown") from None
+            raise _InputExecutionAcceptanceUnknown("input_execution_acceptance_unknown") from None
         finally:
             self._pending_input_claims.pop(claim_id, None)
 
@@ -1181,6 +1185,14 @@ class HarnessApp:
             so AP-side retry decisions can act on it.
         """
         from omnigent.server.schemas import ErrorDetail
+
+        if isinstance(exception, _InputExecutionAcceptanceUnknown):
+            return ErrorDetail(
+                code="input_execution_acceptance_unknown",
+                message=(
+                    "Input delivery could not be confirmed; inspect its receipt before resending."
+                ),
+            )
 
         # P2.11: a turn-context desync (the inner generation outlived its turn)
         # carries the stable ``runner_turn_context_desync`` code. Surface it
@@ -1562,10 +1574,22 @@ class HarnessApp:
                     break
             return Response(status_code=status.HTTP_204_NO_CONTENT)
         if isinstance(body, InputExecutionResultEvent):
+            matched = False
             for ctx in self._in_flight.values():
                 if ctx._complete_input_claim(body.claim_id, body.result):
+                    matched = True
                     break
-            return Response(status_code=status.HTTP_204_NO_CONTENT)
+            _logger.info(
+                "Input execution receipt claim_id=%s remote_outcome=%s reason=%s matched=%s",
+                body.claim_id,
+                body.result.state,
+                body.result.reason,
+                matched,
+            )
+            return Response(
+                status_code=status.HTTP_204_NO_CONTENT,
+                headers={"X-Input-Claim-Matched": str(matched).lower()},
+            )
         if isinstance(body, KeepWarmEvent):
             return await self._handle_keep_warm_event(body)
         # Pydantic's discriminated-union validator should reject

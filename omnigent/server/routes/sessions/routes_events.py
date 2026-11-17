@@ -355,6 +355,11 @@ from omnigent.server.routes._sessions.orchestration import (
     ensure_runner_connected,
 )
 from omnigent.server.routes._sessions.subagent_reconciliation import _read_native_subagent_probe
+from omnigent.server.routes.sessions.native_terminal_generation import (
+    NATIVE_TERMINAL_GENERATION_LABEL,
+    native_terminal_generation,
+    native_terminal_generation_is_current,
+)
 from omnigent.server.runner_session_init import conversation_archive_lineage
 from omnigent.server.scheduled.telemetry import start_fire_stage
 from omnigent.server.schemas import (
@@ -440,6 +445,10 @@ from omnigent.util.session_lifecycle import (
 
 # custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
 _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
+_native_status_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
 # One shared Resume attempt per session, split by caller for side chats; see
@@ -4084,6 +4093,16 @@ def register_events_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             sdk_peer_terminal = "sdk_peer_delivery" in body.data
+            if status in {"idle", "completed", "failed", "stopped", "killed"}:
+                if not native_terminal_generation_is_current(conv, body.data):
+                    return {"queued": False}
+                generation = native_terminal_generation(conv, body.data)
+                if generation is not None:
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        session_id,
+                        {NATIVE_TERMINAL_GENERATION_LABEL: generation.model_dump_json()},
+                    )
             sdk_peer_turn = None
             if sdk_peer_terminal:
                 from omnigent.server.routes.sessions.peer_child_turn import wait_for_sdk_peer_turn
@@ -4255,17 +4274,16 @@ def register_events_routes(
                     return {"queued": False}
             # Input generations come from server admission, not native status producers.
             data.pop("input_generation", None)
+            provider_input_generation = None
             service = getattr(request.app.state, "subagent_retry_admission", None)
             native_identity = TurnIdentity.from_data(data)
             if (
                 isinstance(service, SubagentRetryAdmission)
-                and conv.parent_conversation_id
                 and conv.runner_id
                 and _has_bound_runner_authority(request, conv)
                 and native_identity.turn_id
                 and native_identity.input_id
                 and data.get("event_kind") != "dispatch_failed"
-                and data.get("recovered") is not True
             ):
                 stored = await asyncio.to_thread(
                     service.journal.get_input, native_identity.input_id
@@ -4277,7 +4295,20 @@ def register_events_routes(
                     else None
                 )
                 observed = None
-                if stored is not None and stored.state in {"reserved", "accepted"}:
+                receipt = None
+                if data.get("recovered") is True:
+                    # Resume can attest an existing execution, never admit or rebind one.
+                    if (
+                        status == "idle"
+                        and data.get("turn_completed") is True
+                        and stored is not None
+                        and stored.state == "accepted"
+                        and stored.target_id == session_id
+                        and stored.turn_id == native_identity.turn_id
+                        and native_terminal_generation(conv, data) is not None
+                    ):
+                        receipt = stored
+                elif stored is not None and stored.state in {"reserved", "accepted"}:
                     observed = await asyncio.to_thread(
                         service.journal.bind_native_turn,
                         session_id,
@@ -4297,7 +4328,29 @@ def register_events_routes(
                         runner_id=conv.runner_id,
                     )
                 if observed is not None and observed.accepted and observed.receipt is not None:
-                    data["input_generation"] = observed.receipt.input_generation
+                    receipt = observed.receipt
+                if receipt is not None:
+                    data["input_generation"] = receipt.input_generation
+                    control = await asyncio.to_thread(service.journal.get_control, session_id)
+                    # Historical receipts remain useful for transcript reconciliation,
+                    # but only the currently accepted execution can change route health.
+                    if (
+                        (status == "running" or native_terminal_generation_is_current(conv, data))
+                        and control is not None
+                        and (
+                            receipt.target_id,
+                            receipt.input_id,
+                            receipt.turn_id,
+                            receipt.input_generation,
+                        )
+                        == (
+                            session_id,
+                            control.input_id,
+                            control.turn_id,
+                            control.generation,
+                        )
+                    ):
+                        provider_input_generation = receipt.input_generation
             # Forward only the same bounded, typed display detail that the
             # Server accepted. The Runner retains this across reconnects, so
             # raw/nested/oversized task objects must not become resident there.
@@ -4355,6 +4408,7 @@ def register_events_routes(
                             actor=user_id,
                             from_runner=_has_bound_runner_authority(request, conv),
                             response_id=response_id,
+                            input_generation=provider_input_generation,
                         )
                 harness = await asyncio.to_thread(
                     _resolve_harness,
@@ -4415,6 +4469,17 @@ def register_events_routes(
             # A confirmed turn completion after a failure means a later turn
             # succeeded, so the earlier failure must not outlive it.
             turn_completed = status == "idle" and data.get("turn_completed") is True
+            if (turn_completed or status == "running") and not replayed:
+                from omnigent.server.session_choice_runtime import record_provider_recovery
+
+                await record_provider_recovery(
+                    request.app,
+                    conv,
+                    from_runner=_has_bound_runner_authority(request, conv),
+                    response_id=response_id,
+                    started=status == "running",
+                    input_generation=provider_input_generation,
+                )
             recovered_from_failure = (
                 turn_completed and _session_status_cache.get(session_id) == "failed"
             )
@@ -5999,6 +6064,13 @@ def register_events_routes(
             return result
 
         if control_id is None:
+            if body.type == _EXTERNAL_SESSION_STATUS_TYPE:
+                lock = _native_status_locks.get(session_id)
+                if lock is None:
+                    lock = asyncio.Lock()
+                    _native_status_locks[session_id] = lock
+                async with lock:
+                    return await apply()
             return await apply()
         assert isinstance(service, SubagentRetryAdmission)
         task = asyncio.create_task(apply())
@@ -6472,23 +6544,25 @@ def register_events_routes(
 
     @event_router.post("/sessions/{session_id}/input-admission/resolve", include_in_schema=False)
     async def resolve_input_execution(
-        request: Request, session_id: str, body: InputExecutionClaim
+        request: Request, session_id: str, body: InputExecutionClaim, close: bool = True
     ):
         service = _retry_admission(request)
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None or not _has_bound_runner_authority(request, conv):
             raise HTTPException(403, "Bound receiver authority required")
         assert conv.runner_id is not None
-        if body.boundary in {"native_accept", "native_refuse"}:
-            # Reconcile the same observed native outcome; closing its reservation
-            # would discard proof that the native input was already consumed.
+        if body.boundary in {"native_accept", "native_refuse"} or (
+            not close and body.boundary == "native_reserve"
+        ):
+            # Reconcile the exact outcome or reservation through the admission
+            # fences; a read-only lookup cannot revalidate its owner.
             return await service.admit_execution(session_id, body, runner_id=conv.runner_id)
         return await asyncio.to_thread(
             service.journal.resolve_execution,
             session_id,
             body,
             runner_id=conv.runner_id,
-            close=True,
+            close=close,
         )
 
     async def _control_receiver(request: Request, session_id: str):

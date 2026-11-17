@@ -67,6 +67,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_model,
     read_mcp_startup,
     record_child_usage_baseline,
+    record_resumed_terminal,
     record_retry_source,
     resolve_codex_auto_compact_token_limit,
     settle_pending_mcp_startup,
@@ -102,7 +103,7 @@ from omnigent.native._native_post_delivery import (
 from omnigent.native._native_supersession import post_clear_supersession
 from omnigent.native_subagent_snapshot import NativeSubagentSnapshotPublisher
 from omnigent.process_logging import log_info_once
-from omnigent.runner.launch_failure import is_codex_provider_auth_failure
+from omnigent.runner.launch_failure import is_codex_provider_auth_failure, provider_billing_refusal
 from omnigent.runner.turn_routing import read_pending_replay, routed_prompt_block_reason
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
@@ -1933,6 +1934,8 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
         :data:`_CODEX_ERROR_KIND_GENERIC`.
     """
     lowered = message.lower()
+    if provider_billing_refusal(message) or provider_billing_refusal(json.dumps(error)):
+        return _CODEX_ERROR_KIND_GENERIC
     if any(
         fragment in lowered
         for fragment in (*_CODEX_BUDGET_EXHAUSTED_FRAGMENTS, *_CODEX_IP_ACCESS_LIST_FRAGMENTS)
@@ -1969,11 +1972,21 @@ def _error_payload_message(payload: _JsonObject) -> str:
     :param payload: A ``turn.error`` object or an ``error`` ThreadItem.
     :returns: Non-empty error text.
     """
+    billing = provider_billing_refusal(json.dumps(payload))
+    billing_message = (
+        "Balance billing is disabled."
+        if billing == "billing_disabled"
+        else "Plan exhausted."
+        if billing == "plan_exhausted"
+        else None
+    )
     for key in ("message", "error", "text", "detail"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
+            if billing_message and not provider_billing_refusal(value):
+                return f"{value.strip()}\n\n{billing_message}"
             return value.strip()
-    return "Codex turn ended with an unspecified error."
+    return billing_message or "Codex turn ended with an unspecified error."
 
 
 def _codex_terminal_launch_args_from_settings(payload: _JsonObject) -> list[str] | None:
@@ -2145,6 +2158,9 @@ class _CodexTurnStatusEdge:
     selected_model: str | None = None
     parent_turn_consumed: bool = False
     on_delivered: Callable[[], None] | None = None
+    terminal_outcome: str | None = None
+    bridge_revision: int | None = None
+    bridge_thread_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -4428,15 +4444,39 @@ def _resume_turn_status_edge_for_latest_turn(
         status = _omnigent_status_from_resume_turn(turn)
         if status is None:
             return None
-        update_active_turn_id(bridge_dir, turn_id if status == "running" else None)
         # Parity with the live path — surface ``turn.error`` (if any) that
         # forced this resume turn to ``failed``.
         error = _terminal_error_from_turn({"turn": turn})
+        outcome = None
+        revision = None
+        if status == "running":
+            update_active_turn_id(bridge_dir, turn_id)
+        else:
+            vendor_status = _turn_status_from_params({"turn": turn})
+            outcome = (
+                "failed"
+                if status == "failed"
+                else "cancelled"
+                if vendor_status in {"interrupted", "cancelled", "canceled"}
+                else "completed"
+            )
+            turn_ids = [
+                value
+                for item in turns
+                if isinstance(item, dict) and (value := _turn_id_from_payload(item)) is not None
+            ]
+            current = record_resumed_terminal(bridge_dir, state, turn_ids, outcome)
+            if current is None:
+                return None
+            revision = current.active_turn_revision
         return _CodexTurnStatusEdge(
             status=status,
             turn_id=turn_id,
             source="thread/resume:turn-error" if error is not None else "thread/resume",
             error=error,
+            terminal_outcome=outcome,
+            bridge_revision=revision,
+            bridge_thread_id=thread_id if revision is not None else None,
         )
     return None
 
@@ -8073,19 +8113,51 @@ def _terminal_turn_status_edge(
     :returns: Terminal status edge, or ``None`` when the event is stale.
     """
     terminal_turn_id = _terminal_turn_id_from_params(params)
+    error = _terminal_error_from_turn(params)
+    vendor_status = _turn_status_from_params(params)
+    outcome = (
+        "failed"
+        if error is not None or _turn_status_is_failed(params) or method == "turn/failed"
+        else "completed"
+        if vendor_status == "completed"
+        else "cancelled"
+        if vendor_status in {"interrupted", "cancelled"}
+        else None
+    )
+    before = read_bridge_state(bridge_dir) if bridge_dir is not None else None
+    bridge_revision = None
+    bridge_thread_id = None
     # Child threads share the app-server but have no on-disk bridge of their own.
     if bridge_dir is not None and not clear_active_turn_id_if_matches(
-        bridge_dir, terminal_turn_id
+        bridge_dir, terminal_turn_id, terminal_outcome=outcome
     ):
         if not _terminal_turn_boundary_matches_idle_bridge(bridge_dir, params, terminal_turn_id):
             return None
+        current = read_bridge_state(bridge_dir)
+        if current is not None and current.last_terminal_turn_id not in {None, terminal_turn_id}:
+            return None
+        if current is not None and current.last_terminal_turn_id == terminal_turn_id:
+            if current.last_terminal_outcome != outcome:
+                return None
+            bridge_revision = current.active_turn_revision
+            bridge_thread_id = current.thread_id
         source = f"{method}:recovered"
     else:
+        if bridge_dir is not None and before is not None:
+            current = read_bridge_state(bridge_dir)
+            if (
+                current is None
+                or current.thread_id != before.thread_id
+                or current.active_turn_revision != before.active_turn_revision + 1
+                or current.active_turn_id is not None
+            ):
+                return None
+            bridge_revision = current.active_turn_revision
+            bridge_thread_id = current.thread_id
         source = method
     # A failed turn carries ``turn.error`` (or an ``error`` item) even when
     # Codex reports it via ``turn/completed`` ("silent success"). Force
     # ``failed`` and attach the error so the reason is surfaced downstream.
-    error = _terminal_error_from_turn(params)
     if error is not None:
         _logger.info(
             "Codex forwarder forcing failed status from turn.error: turn_id=%s method=%s kind=%s",
@@ -8098,6 +8170,9 @@ def _terminal_turn_status_edge(
             turn_id=terminal_turn_id,
             source=f"{source}:turn-error",
             error=error,
+            terminal_outcome=outcome,
+            bridge_revision=bridge_revision,
+            bridge_thread_id=bridge_thread_id,
         )
     if _turn_status_is_failed(params):
         _logger.info(
@@ -8109,6 +8184,9 @@ def _terminal_turn_status_edge(
             status="failed",
             turn_id=terminal_turn_id,
             source=f"{source}:turn-failed",
+            terminal_outcome=outcome,
+            bridge_revision=bridge_revision,
+            bridge_thread_id=bridge_thread_id,
         )
     if method == "turn/completed":
         if _turn_items_are_empty(params):
@@ -8126,6 +8204,9 @@ def _terminal_turn_status_edge(
         status="idle" if method == "turn/completed" else "failed",
         turn_id=terminal_turn_id,
         source=source,
+        terminal_outcome=outcome,
+        bridge_revision=bridge_revision,
+        bridge_thread_id=bridge_thread_id,
     )
 
 
@@ -10675,6 +10756,10 @@ async def _post_status(
     input_id: str | None = None,
     recovered: bool = False,
     native_generation: int | None = None,
+    turn_completed: bool = False,
+    turn_outcome: str | None = None,
+    native_turn_generation: int | None = None,
+    is_current: Callable[[], bool] | None = None,
 ) -> bool:
     """
     Publish a native Codex status edge.
@@ -10699,8 +10784,14 @@ async def _post_status(
     :returns: None.
     """
     data: _JsonObject = {"status": status}
+    if turn_completed:
+        data["turn_completed"] = True
+    if turn_outcome is not None:
+        data["turn_outcome"] = turn_outcome
     if native_generation is not None:
         data["native_generation"] = native_generation
+    if native_turn_generation is not None:
+        data["native_turn_generation"] = native_turn_generation
     if turn_id is not None and turn_id != response_id:
         data["turn_id"] = turn_id
     if input_id is not None:
@@ -10726,6 +10817,7 @@ async def _post_status(
         # Terminal outcomes survive outages; transient status edges use bounded retries.
         max_attempts=None if status in {"idle", "failed"} else _POST_MAX_ATTEMPTS,
         timeout=_DURABLE_ITEM_POST_TIMEOUT_SECONDS,
+        **({"is_current": is_current} if is_current is not None else {}),
     )
     _log_failed_session_event_post("external_session_status", response)
     return response is not None and response.status_code < 400
@@ -10756,6 +10848,21 @@ async def _post_turn_status_edge(
     :returns: None.
     """
     if edge is None:
+        return
+
+    def is_current() -> bool:
+        if bridge_dir is None or edge.bridge_revision is None:
+            return True
+        current = read_bridge_state(bridge_dir)
+        return (
+            current is not None
+            and current.thread_id == edge.bridge_thread_id
+            and current.active_turn_revision == edge.bridge_revision
+            and current.last_terminal_turn_id == edge.turn_id
+            and current.last_terminal_outcome == edge.terminal_outcome
+        )
+
+    if not is_current():
         return
     _logger.info(
         "Codex forwarder publishing turn status: source=%s turn_id=%s status=%s",
@@ -10825,6 +10932,15 @@ async def _post_turn_status_edge(
             ),
             recovered=recovered,
             native_generation=native_generation,
+            native_turn_generation=edge.bridge_revision,
+            is_current=is_current,
+            turn_completed=(
+                edge.status == "idle"
+                and edge.turn_id is not None
+                and edge.terminal_outcome == "completed"
+                and (bridge_dir is None or edge.bridge_revision is not None)
+            ),
+            turn_outcome="cancelled" if edge.terminal_outcome == "cancelled" else None,
         )
         if delivered and forwarder_state is not None and edge.status == "failed":
             forwarder_state.turn_failure_surfaced = True
@@ -11769,6 +11885,7 @@ class _PostResult:
     may_have_been_delivered: bool = False
     transport_error: str | None = None
     rejection_reason: str | None = None
+    superseded: bool = False
 
 
 async def _post_session_event(
@@ -11779,6 +11896,7 @@ async def _post_session_event(
     data: _JsonObject,
     max_attempts: int | None = _POST_MAX_ATTEMPTS,
     timeout: float | None = None,
+    is_current: Callable[[], bool] | None = None,
 ) -> httpx.Response | None:
     """
     Post one Omnigent session event, tracking forward-sync health (#1120).
@@ -11804,6 +11922,7 @@ async def _post_session_event(
         data=data,
         max_attempts=max_attempts,
         timeout=timeout,
+        **({"is_current": is_current} if is_current is not None else {}),
     )
     return result.response
 
@@ -11816,6 +11935,7 @@ async def _post_session_event_result(
     data: _JsonObject,
     max_attempts: int | None = _POST_MAX_ATTEMPTS,
     timeout: float | None = None,
+    is_current: Callable[[], bool] | None = None,
 ) -> _PostResult:
     """
     Post one Omnigent session event and classify its outcome, tracking health.
@@ -11847,6 +11967,7 @@ async def _post_session_event_result(
             data=data,
             max_attempts=max_attempts,
             timeout=timeout,
+            **({"is_current": is_current} if is_current is not None else {}),
         )
     except DatabricksAuthError as exc:
         # An earlier retry may have reached the server before credentials failed.
@@ -11863,6 +11984,8 @@ async def _post_session_event_result(
                 reason="credential resolution failed before acknowledgement",
             )
         raise
+    if result.superseded:
+        return result
     response = result.response
     if response is not None and response.status_code < 400:
         _note_forward_success()
@@ -11914,6 +12037,7 @@ async def _post_session_event_inner(
     data: _JsonObject,
     max_attempts: int | None = _POST_MAX_ATTEMPTS,
     timeout: float | None = None,
+    is_current: Callable[[], bool] | None = None,
 ) -> _PostResult:
     """
     Post one Omnigent session event with bounded transient retries.
@@ -11970,6 +12094,8 @@ async def _post_session_event_inner(
         return _PostResult(response=None, rejection_reason=reason)
     attempt = 0
     while max_attempts is None or attempt < max_attempts:
+        if is_current is not None and not is_current():
+            return _PostResult(response=None, superseded=True)
         attempt += 1
         try:
             if timeout is None:

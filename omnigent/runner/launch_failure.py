@@ -347,6 +347,22 @@ _BUDGET_EXHAUSTED_FRAGMENTS = (
     "has reached its limit",
     "rate limit is set to 0",
 )
+
+
+def provider_billing_refusal(message: str) -> str | None:
+    """Recognize provider billing semantics without treating every 403 as billing."""
+    lowered = message.lower()
+    if "balance billing is disabled" in lowered or re.search(
+        r'"(?:code|type)"\s*:\s*"billing_disabled"', lowered
+    ):
+        return "billing_disabled"
+    if "plan exhausted" in lowered or re.search(
+        r'"(?:code|type)"\s*:\s*"plan_exhausted"', lowered
+    ):
+        return "plan_exhausted"
+    return None
+
+
 # Mid-stream upstream failures the gateway usually recovers from on its own;
 # the runner itself stays healthy, so the turn can be continued by the user.
 _TRANSIENT_UPSTREAM_FRAGMENTS = (
@@ -404,6 +420,8 @@ def classify_native_turn_error(code: str, message: str) -> str:
     if code == CODEX_COMPACTION_MODEL_FAILED:
         # Its budget text names the previous model's limit; the card explains it.
         return code
+    if provider_billing_refusal(message):
+        return "budget_exhausted"
     if code in {"codex_turn_error", "codex_reauth_required"} and is_codex_provider_auth_failure(
         message
     ):

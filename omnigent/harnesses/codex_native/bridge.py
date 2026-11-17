@@ -230,6 +230,8 @@ class CodexNativeBridgeState:
     pending_shell_parent_turn_id: str | None = None
     active_shell_turn_id: str | None = None
     active_turn_revision: int = 0
+    last_terminal_turn_id: str | None = None
+    last_terminal_outcome: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1441,6 +1443,14 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                     "pending_shell_parent_turn_id": state.pending_shell_parent_turn_id,
                     "active_shell_turn_id": state.active_shell_turn_id,
                     "active_turn_revision": state.active_turn_revision,
+                    **(
+                        {
+                            "last_terminal_turn_id": state.last_terminal_turn_id,
+                            "last_terminal_outcome": state.last_terminal_outcome,
+                        }
+                        if state.last_terminal_turn_id is not None
+                        else {}
+                    ),
                 },
                 handle,
                 sort_keys=True,
@@ -1472,19 +1482,19 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
                 state,
                 retry_inputs={**state.retry_inputs, **previous.retry_inputs},
                 retry_sources={**state.retry_sources, **previous.retry_sources},
+                last_terminal_turn_id=previous.last_terminal_turn_id,
+                last_terminal_outcome=previous.last_terminal_outcome,
             )
         current = previous
-        if current is not None and (
-            current.session_id == state.session_id
-            and current.thread_id == state.thread_id
-            and current.socket_path == state.socket_path
-            and current.codex_home == state.codex_home
-        ):
+        if current is not None and current.session_id == state.session_id:
             state = replace(
                 state,
                 active_turn_revision=max(
                     current.active_turn_revision
-                    + int(state.active_turn_id != current.active_turn_id),
+                    + int(
+                        (state.thread_id, state.active_turn_id)
+                        != (current.thread_id, current.active_turn_id)
+                    ),
                     state.active_turn_revision,
                 ),
             )
@@ -2109,6 +2119,15 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
             active_turn_revision=(
                 value if isinstance(value := raw.get("active_turn_revision"), int) else 0
             ),
+            last_terminal_turn_id=(
+                value if isinstance(value := raw.get("last_terminal_turn_id"), str) else None
+            ),
+            last_terminal_outcome=(
+                value
+                if isinstance(value := raw.get("last_terminal_outcome"), str)
+                and value in {"completed", "cancelled", "failed"}
+                else None
+            ),
         ),
         "ready",
     )
@@ -2437,6 +2456,12 @@ def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | Non
                 state,
                 thread_id=thread_id,
                 active_turn_id=active_turn_id,
+                last_terminal_turn_id=(
+                    state.last_terminal_turn_id if state.thread_id == thread_id else None
+                ),
+                last_terminal_outcome=(
+                    state.last_terminal_outcome if state.thread_id == thread_id else None
+                ),
                 retry_inputs=state.retry_inputs if state.thread_id == thread_id else {},
                 retry_sources=state.retry_sources if state.thread_id == thread_id else {},
                 cwd=state.cwd,
@@ -2450,6 +2475,7 @@ def clear_active_turn_id_if_matches(
     completed_turn_id: str | None,
     *,
     on_cleared: Callable[[], None] | None = None,
+    terminal_outcome: str | None = None,
 ) -> bool:
     """
     Clear the active Codex turn id if a terminal event matches it.
@@ -2514,10 +2540,46 @@ def clear_active_turn_id_if_matches(
                 active_turn_id=None,
                 active_shell_turn_id=None,
                 active_turn_revision=state.active_turn_revision + 1,
+                last_terminal_turn_id=completed_turn_id,
+                last_terminal_outcome=terminal_outcome,
             ),
         )
         _run_on_cleared()
         return True
+
+
+def record_resumed_terminal(
+    bridge_dir: Path,
+    observed: CodexNativeBridgeState,
+    turn_ids: list[str],
+    outcome: str,
+) -> CodexNativeBridgeState | None:
+    """Bind a resume terminal only if its history includes the latest known boundary."""
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is None or state != observed or not turn_ids:
+            return None
+        turn_id = turn_ids[-1]
+        if state.active_turn_id not in {None, turn_id}:
+            return None
+        if (
+            state.active_turn_id is None
+            and state.last_terminal_turn_id is not None
+            and state.last_terminal_turn_id not in turn_ids
+        ):
+            return None
+        if state.active_turn_id is None and state.last_terminal_turn_id == turn_id:
+            return state if state.last_terminal_outcome == outcome else None
+        updated = replace(
+            state,
+            active_turn_id=None,
+            active_shell_turn_id=None,
+            active_turn_revision=state.active_turn_revision + 1,
+            last_terminal_turn_id=turn_id,
+            last_terminal_outcome=outcome,
+        )
+        _write_bridge_state_unlocked(bridge_dir, updated)
+        return updated
 
 
 def set_helper_stop_pending(bridge_dir: Path, pending: bool) -> None:

@@ -11,6 +11,7 @@ import { sampleTotals, usageActivityFixture, usageIssuesFixture } from "./usageA
 import { boardAmount, sumUsage } from "./usageAmountData";
 import { usageChartPoints } from "./UsageCostChart";
 import { UsageCostCard, UsageErrorMark } from "./UsageAmounts";
+import { accountTone } from "./usageBoardSelect";
 
 const { fetchMock } = vi.hoisted(() => ({ fetchMock: vi.fn() }));
 const INFO = { usage_board_enabled: true } as ServerInfo;
@@ -447,4 +448,31 @@ it("does not compare a subset of account Previous against the selected total", a
     />,
   );
   expect(screen.getByText("Previous selected hourly series not available yet")).toBeTruthy();
+});
+
+it("shows a provider refusal despite a positive balance and preserves its provenance", async () => {
+  const account = {
+    ...usageBoardData().accounts[2],
+    state: "stopped",
+    source_type: "relay",
+    reason: "billing_disabled",
+    source: "sample-feeder",
+    source_at: 2_000_000,
+    mark: {
+      provider_refusal: {
+        source: "sample-session:sample-turn",
+        observed_at: 2_000_000,
+        resets_at: null,
+      },
+    },
+    balances: [{ id: "credit", remaining: 10, unit: "USD" }],
+    windows: [],
+  };
+  expect(accountTone(account, false)).toBe("crit");
+  render(<UsageErrorMark account={account} />);
+  expect(screen.getByText("Stopped")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: /provider stopped requests/ }));
+  expect(await screen.findByText("Billing is disabled")).toBeTruthy();
+  expect(screen.getByText("sample-session:sample-turn")).toBeTruthy();
+  expect(screen.getByText("Not provided")).toBeTruthy();
 });

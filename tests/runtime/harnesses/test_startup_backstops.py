@@ -16,6 +16,33 @@ from omnigent.startup_protocol import StartupAttemptRef
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("matched", [True, False])
+async def test_input_receipt_ack_distinguishes_live_and_retired_claim(matched):
+    app = _scaffold.HarnessApp()
+    asgi = app.build()
+    asgi.state.conversation_id = "session"
+    ctx = _scaffold.TurnContext("response", asyncio.Queue(), asyncio.Event(), "session")
+    app._in_flight["response"] = ctx
+    future = asyncio.get_running_loop().create_future()
+    if matched:
+        ctx._pending_input_claims["claim"] = future
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=asgi), base_url="http://harness"
+    ) as client:
+        response = await client.post(
+            "/v1/sessions/session/events",
+            json={
+                "type": "input_execution_result",
+                "claim_id": "claim",
+                "result": {"state": "accepted", "reason": "accepted"},
+            },
+        )
+    assert response.status_code == 204
+    assert response.headers["X-Input-Claim-Matched"] == str(matched).lower()
+    assert future.done() is matched
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["ready", "hang", "stop"])
 async def test_spawn_backstop_preserves_slow_live_process(monkeypatch, outcome):
     now = 0.0
@@ -168,8 +195,12 @@ async def test_input_claim_uses_remaining_deadline_and_stops(
         with pytest.raises(asyncio.CancelledError):
             await waiting
     elif outcome == "hang":
-        with pytest.raises(RuntimeError, match="input_execution_acceptance_unknown"):
+        with pytest.raises(RuntimeError, match="input_execution_acceptance_unknown") as caught:
             await waiting
+        assert (
+            _scaffold.HarnessApp()._build_error_detail(caught.value).code
+            == "input_execution_acceptance_unknown"
+        )
     else:
         # custom-lint: disable-next=sleep-then-assert -- inject a reply beyond the old deadline
         await asyncio.sleep(0.2)

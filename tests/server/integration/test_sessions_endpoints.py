@@ -7650,10 +7650,12 @@ async def test_publish_status_keeps_failed_sticky_against_trailing_idle(
 
 
 @pytest.mark.parametrize("turn_completed", [True, None], ids=["confirmed", "quiescence"])
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
 async def test_confirmed_turn_completion_clears_earlier_native_failure(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     turn_completed: bool | None,
+    harness: str,
 ) -> None:
     """
     A later turn's confirmed ``idle`` clears an earlier native turn failure.
@@ -7671,7 +7673,7 @@ async def test_confirmed_turn_completion_clears_earlier_native_failure(
     )
     agent = await create_test_agent(
         client,
-        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+        executor={"type": "omnigent", "config": {"harness": harness}},
     )
     session = await _create_session(client, agent["id"])
     session_id = session["id"]
@@ -7705,6 +7707,407 @@ async def test_confirmed_turn_completion_clears_earlier_native_failure(
         assert statuses == ["failed"]
         assert snapshot["status"] == "failed"
         assert snapshot["last_task_error"] is not None
+
+
+@pytest.mark.parametrize("outcome", ["completed", "interrupted", None])
+async def test_codex_producer_payload_recovers_only_confirmed_success(client, tmp_path, outcome):
+    from omnigent.harnesses.codex_native import forwarder as fwd
+    from omnigent.harnesses.codex_native.bridge import (
+        CodexNativeBridgeState,
+        update_active_turn_id,
+        write_bridge_state,
+    )
+    from tests.harnesses.codex_native.forwarder._support import _RecordingClient
+
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": "codex-native"}}
+    )
+    sid = (await _create_session(client, agent["id"]))["id"]
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id=sid,
+            thread_id="thread",
+            socket_path=str(tmp_path / "rpc.sock"),
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="failed",
+        ),
+    )
+
+    async def emit(turn, status):
+        params = {"threadId": "thread", "turn": {"id": turn}}
+        if status is not None:
+            params["turn"]["status"] = status
+        edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+        recorder = _RecordingClient()
+        await fwd._post_turn_status_edge(recorder, sid, edge, bridge_dir=tmp_path)
+        for url, body in recorder.posts:
+            response = await client.post(url, json=body)
+            assert response.status_code == 202, response.text
+        return edge, recorder.posts
+
+    await emit("failed", "failed")
+    assert (await client.get(f"/v1/sessions/{sid}")).json()["last_task_error"] is not None
+    update_active_turn_id(tmp_path, "next")  # admitted turn; its running post was lost
+    _, posts = await emit("next", outcome)
+    assert len(posts) == 1
+    data = posts[0][1]["data"]
+    assert (data.get("turn_completed") is True) is (outcome == "completed")
+    if outcome == "interrupted":
+        assert data.get("turn_outcome") == "cancelled"
+    snapshot = (await client.get(f"/v1/sessions/{sid}")).json()
+    assert (snapshot["last_task_error"] is None) is (outcome == "completed")
+
+
+async def test_codex_producer_rejects_old_success_after_new_failure(client, tmp_path):
+    from omnigent.harnesses.codex_native import forwarder as fwd
+    from omnigent.harnesses.codex_native.bridge import (
+        CodexNativeBridgeState,
+        update_active_turn_id,
+        write_bridge_state,
+    )
+    from tests.harnesses.codex_native.forwarder._support import _RecordingClient
+
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": "codex-native"}}
+    )
+    sid = (await _create_session(client, agent["id"]))["id"]
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id=sid,
+            thread_id="thread",
+            socket_path=str(tmp_path / "rpc.sock"),
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="old",
+        ),
+    )
+    old_params = {"threadId": "thread", "turn": {"id": "old", "status": "completed"}}
+    old_edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", old_params)
+    recorder = _RecordingClient()
+    await fwd._post_turn_status_edge(recorder, sid, old_edge, bridge_dir=tmp_path)
+    update_active_turn_id(tmp_path, "new")
+    failed = fwd._terminal_turn_status_edge(
+        tmp_path,
+        "turn/completed",
+        {
+            "threadId": "thread",
+            "turn": {"id": "new", "status": "failed"},
+        },
+    )
+    await fwd._post_turn_status_edge(recorder, sid, failed, bridge_dir=tmp_path)
+    for url, body in recorder.posts:
+        assert (await client.post(url, json=body)).status_code == 202
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id=sid,
+            thread_id="thread",
+            socket_path=str(tmp_path / "rpc.sock"),
+            codex_home=str(tmp_path / "codex-home"),
+        ),
+    )
+    # A new connection has no in-memory history; the bridge must retain its fence.
+    late = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", old_params)
+    replay = _RecordingClient()
+    await fwd._post_turn_status_edge(
+        replay, sid, late, bridge_dir=tmp_path, forwarder_state=fwd._CodexForwarderState()
+    )
+    await fwd._post_turn_status_edge(replay, sid, old_edge, bridge_dir=tmp_path)
+    assert replay.posts == []
+    assert (await client.get(f"/v1/sessions/{sid}")).json()["last_task_error"] is not None
+
+
+@pytest.mark.parametrize("park_at", ["request", "retry", "transport_retry"])
+async def test_codex_parked_success_cannot_erase_new_failure(
+    client, tmp_path, monkeypatch, park_at
+):
+    import asyncio
+
+    from omnigent.harnesses.codex_native import forwarder as fwd
+    from omnigent.harnesses.codex_native.bridge import (
+        CodexNativeBridgeState,
+        update_active_turn_id,
+        write_bridge_state,
+    )
+
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": "codex-native"}}
+    )
+    sid = (await _create_session(client, agent["id"]))["id"]
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id=sid,
+            thread_id="thread",
+            socket_path=str(tmp_path / "rpc.sock"),
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="A",
+        ),
+    )
+    parked, release = asyncio.Event(), asyncio.Event()
+    attempts = []
+    forwarded = []
+
+    async def forward(_sid, _router, body):
+        forwarded.append(body["data"])
+        return {"forwarded": True}
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner", forward
+    )
+
+    async def pause(_delay):
+        parked.set()
+        await release.wait()
+
+    monkeypatch.setattr(fwd, "_sleep", pause)
+
+    async def deliver(request):
+        body = json.loads(request.content)
+        attempts.append(body)
+        if body["data"]["response_id"] == "codex_A" and len(attempts) == 1:
+            if park_at == "transport_retry":
+                raise httpx.ReadError("lost response", request=request)
+            if park_at == "retry":
+                return httpx.Response(503)
+            parked.set()
+            await release.wait()
+        response = await client.post(request.url.path, json=body)
+        assert response.status_code == 202, response.text
+        return response
+
+    def terminal(turn, outcome):
+        return fwd._terminal_turn_status_edge(
+            tmp_path,
+            "turn/completed",
+            {"threadId": "thread", "turn": {"id": turn, "status": outcome}},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(deliver), base_url="http://test"
+    ) as producer:
+        task = asyncio.create_task(
+            fwd._post_turn_status_edge(
+                producer, sid, terminal("A", "completed"), bridge_dir=tmp_path
+            )
+        )
+        try:
+            async with asyncio.timeout(10):
+                await parked.wait()
+                update_active_turn_id(tmp_path, "B")
+                await fwd._post_turn_status_edge(
+                    producer, sid, terminal("B", "failed"), bridge_dir=tmp_path
+                )
+                failed = (await client.get(f"/v1/sessions/{sid}")).json()["last_task_error"]
+                assert failed is not None
+                release.set()
+                await task
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        assert len(attempts) == 2  # A's request or retry, then B; no stale retry POST.
+        for generation in [None, True, "3", -1, attempts[1]["data"]["native_turn_generation"]]:
+            conflicting = {
+                **attempts[0],
+                "data": {**attempts[0]["data"], "native_turn_generation": generation},
+            }
+            assert (
+                await client.post(f"/v1/sessions/{sid}/events", json=conflicting)
+            ).status_code == 202
+        # A request already in flight must also be safe after publisher reconstruction.
+        assert (
+            await client.post(f"/v1/sessions/{sid}/events", json=attempts[0])
+        ).status_code == 202
+        snapshot = (await client.get(f"/v1/sessions/{sid}")).json()
+        assert snapshot["status"] == "failed"
+        assert snapshot["last_task_error"] == failed
+        assert [data["response_id"] for data in forwarded] == ["codex_B"]
+        write_bridge_state(
+            tmp_path,
+            CodexNativeBridgeState(
+                session_id=sid,
+                thread_id="thread",
+                socket_path=str(tmp_path / "reconnected.sock"),
+                codex_home=str(tmp_path / "codex-home"),
+            ),
+        )
+        update_active_turn_id(tmp_path, "C")  # its running POST was lost
+        await fwd._post_turn_status_edge(
+            producer, sid, terminal("C", "completed"), bridge_dir=tmp_path
+        )
+        assert (await client.get(f"/v1/sessions/{sid}")).json()["last_task_error"] is None
+        # Identical retries may re-deliver to a runner, but an older failure cannot revive.
+        assert (
+            await client.post(f"/v1/sessions/{sid}/events", json=attempts[-1])
+        ).status_code == 202
+        forwarded_count = len(forwarded)
+        assert (
+            await client.post(f"/v1/sessions/{sid}/events", json=attempts[1])
+        ).status_code == 202
+        assert len(forwarded) == forwarded_count
+        assert (await client.get(f"/v1/sessions/{sid}")).json()["last_task_error"] is None
+        # A genuine thread error has no turn ID; it also invalidates C's old recovery proof.
+        current_success = attempts[-1]
+        assert (
+            await client.post(
+                f"/v1/sessions/{sid}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "failed", "output": "thread unavailable"},
+                },
+            )
+        ).status_code == 202
+        assert (
+            await client.post(f"/v1/sessions/{sid}/events", json=current_success)
+        ).status_code == 202
+        assert (await client.get(f"/v1/sessions/{sid}")).json()["last_task_error"] is not None
+
+
+@pytest.mark.parametrize("outcome", ["failed", "interrupted", "completed"])
+@pytest.mark.parametrize("missed_start", [False, True])
+@pytest.mark.parametrize("status_shape", ["string", "type", "status"])
+async def test_codex_resume_terminal_keeps_generation_fence(
+    client, tmp_path, monkeypatch, outcome, missed_start, status_shape
+):
+    from omnigent.harnesses.codex_native import forwarder as fwd
+    from omnigent.harnesses.codex_native.bridge import (
+        CodexNativeBridgeState,
+        update_active_turn_id,
+        write_bridge_state,
+    )
+    from tests.harnesses.codex_native.forwarder._support import _RecordingClient
+
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": "codex-native"}}
+    )
+    sid = (await _create_session(client, agent["id"]))["id"]
+    bridge = CodexNativeBridgeState(
+        session_id=sid,
+        thread_id="thread",
+        socket_path=str(tmp_path / "rpc.sock"),
+        codex_home=str(tmp_path / "codex-home"),
+        active_turn_id="A",
+    )
+    write_bridge_state(tmp_path, bridge)
+    forwarded = []
+
+    async def forward(_sid, _router, body):
+        forwarded.append(body["data"])
+        return {"forwarded": True}
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner", forward
+    )
+    a = {"id": "A", "status": "completed"}
+    recorder = _RecordingClient()
+    edge = fwd._terminal_turn_status_edge(
+        tmp_path, "turn/completed", {"threadId": "thread", "turn": a}
+    )
+    await fwd._post_turn_status_edge(recorder, sid, edge, bridge_dir=tmp_path)
+    url, old = recorder.posts[-1]
+    assert (await client.post(url, json=old)).status_code == 202
+    if not missed_start:
+        update_active_turn_id(tmp_path, "B")
+    # Reconstruct the bridge; B's live terminal notification never arrived.
+    from dataclasses import replace
+
+    from omnigent.harnesses.codex_native.bridge import read_bridge_state
+
+    current = read_bridge_state(tmp_path)
+    assert current is not None
+    write_bridge_state(tmp_path, replace(current, socket_path=str(tmp_path / "new.sock")))
+    b = {
+        "id": "B",
+        "status": outcome if status_shape == "string" else {status_shape: outcome},
+    }
+    if outcome == "failed":
+        b["error"] = {"message": "recovered failure"}
+    await fwd._post_resume_turn_status(
+        recorder, session_id=sid, bridge_dir=tmp_path, thread_id="thread", turns=[a, b]
+    )
+    recovered = recorder.posts[-1][1]
+    assert recovered["data"]["recovered"] is True
+    assert (await client.post(url, json=recovered)).status_code == 202
+    snapshot = (await client.get(f"/v1/sessions/{sid}")).json()
+    if outcome == "failed":
+        assert snapshot["status"] == "failed"
+        assert "recovered failure" in snapshot["last_task_error"]["message"]
+    elif outcome == "interrupted":
+        assert recovered["data"]["turn_outcome"] == "cancelled"
+        assert recovered["data"].get("turn_completed") is not True
+    else:
+        assert recovered["data"]["turn_completed"] is True
+    assert [x["response_id"] for x in forwarded] == ["codex_A", "codex_B"]
+    count = len(recorder.posts)
+    # Old snapshots cannot mint a fresh generation after B, even on reconnect.
+    await fwd._post_resume_turn_status(
+        recorder, session_id=sid, bridge_dir=tmp_path, thread_id="thread", turns=[a]
+    )
+    assert len(recorder.posts) == count
+    count = len(forwarded)
+    assert (await client.post(url, json=old)).status_code == 202
+    assert len(forwarded) == count
+    assert (await client.get(f"/v1/sessions/{sid}")).json()["last_task_error"] == snapshot[
+        "last_task_error"
+    ]
+
+
+async def test_native_unknown_send_guidance_uses_public_query_fields(client):
+    from omnigent.runner.tool_dispatch import _ChildMessageDeliveryUnknown, execute_tool
+    from omnigent.runtime import pending_inputs
+
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": "codex-native"}}
+    )
+    sid = (
+        await _create_session(client, agent["id"], labels={"omnigent.wrapper": "codex-native"})
+    )["id"]
+    attempt_ids = ["a" * 32, "b" * 32]
+    persisted_ids = []
+    for index, attempt_id in enumerate(attempt_ids):
+        content = [{"type": "input_text", "text": "identical message"}]
+        pending_inputs.record(sid, content, stable_id=attempt_id, background_titles_enabled=False)
+        body = {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {"role": "user", "content": content},
+                "response_id": f"native-turn-{index}",
+                "source_id": f"native:source:{index}",
+            },
+        }
+        response = await client.post(f"/v1/sessions/{sid}/events", json=body)
+        assert response.status_code == 202, response.text
+        persisted_ids.append(response.json()["item_id"])
+        assert (await client.post(f"/v1/sessions/{sid}/events", json=body)).json()[
+            "item_id"
+        ] == persisted_ids[-1]
+    handle = json.loads(_ChildMessageDeliveryUnknown(sid, attempt_ids[0]).handle())
+    info = json.loads(
+        await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": handle["conversation_id"]}),
+            server_client=client,
+            conversation_id=sid,
+        )
+    )
+    history = json.loads(
+        await execute_tool(
+            tool_name="sys_session_get_history",
+            arguments=json.dumps({"conversation_id": handle["conversation_id"]}),
+            server_client=client,
+            conversation_id=sid,
+        )
+    )
+    assert info["session_id"] == sid
+    actual = [item["id"] for item in history["items"] if item.get("text") == "identical message"]
+    assert set(actual) == set(persisted_ids)
+    assert not set(actual) & set(attempt_ids)
+    assert "conversation_id" in handle["message"]
+    assert "cannot confirm this specific input" in handle["message"]
 
 
 async def test_publish_status_tracks_in_flight_response_id(
