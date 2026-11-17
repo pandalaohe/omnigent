@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import wave
 from pathlib import Path
@@ -12,7 +13,7 @@ from typing import Any, Literal
 import httpx
 import openai
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from omnigent.llms import Client
 from omnigent.llms.errors import PermanentLLMError, RetryableLLMError
@@ -27,6 +28,26 @@ from omnigent.server.model_connections import (
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.server.voice_input import CLEANUP_OUTPUT_FORMAT, CLEANUP_RULES, VoiceInputSettings
+
+_logger = logging.getLogger(__name__)
+
+
+class _CleanupFailure(ValueError):
+    """Static categories safe to log without model or user content."""
+
+    def __init__(
+        self,
+        kind: Literal[
+            "status-not-completed",
+            "parse:fence",
+            "parse:prose",
+            "parse:field-type",
+            "parse:incomplete",
+            "model-declined",
+        ],
+    ) -> None:
+        super().__init__(kind)
+        self.kind = kind
 
 
 class CleanupRequest(BaseModel):
@@ -144,10 +165,27 @@ async def _run_cleanup(settings: VoiceInputSettings, text: str, llm_client: Any 
         **extra,
     )
     if getattr(response, "status", None) != "completed":
-        raise ValueError("Cleanup response did not complete")
-    result = CleanupResult.model_validate_json(extract_summary_text(response))
-    if not result.complete or not result.text.strip():
-        raise ValueError("Cleanup model reported an incomplete edit")
+        raise _CleanupFailure("status-not-completed")
+    output = extract_summary_text(response)
+    lines = output.strip().splitlines()
+    if len(lines) >= 3 and lines[0] in ("```", "```json") and lines[-1] == "```":
+        candidate = "\n".join(lines[1:-1]).strip()
+        if candidate.startswith("{") and candidate.endswith("}"):
+            output = candidate
+    try:
+        result = CleanupResult.model_validate_json(output)
+    except ValidationError as exc:
+        if output.lstrip().startswith("```"):
+            raise _CleanupFailure("parse:fence") from exc
+        if any(error["type"] == "json_invalid" for error in exc.errors(include_input=False)):
+            if not output.strip() or output.lstrip().startswith("{"):
+                raise _CleanupFailure("parse:incomplete") from exc
+            raise _CleanupFailure("parse:prose") from exc
+        raise _CleanupFailure("parse:field-type") from exc
+    if not result.complete:
+        raise _CleanupFailure("model-declined")
+    if not result.text.strip():
+        raise _CleanupFailure("parse:incomplete")
     return result.text
 
 
@@ -249,10 +287,23 @@ def create_voice_input_router(
                 async with asyncio.timeout(settings.timeout):
                     text = await _run_cleanup(settings, body.text, llm_client)
             except ConnectionUnavailable as exc:
+                _logger.warning("Voice cleanup failed (%s)", "provider-error")
                 raise HTTPException(409, "Selected cleanup provider unavailable") from exc
             except TimeoutError as exc:
+                _logger.warning("Voice cleanup failed (%s)", "timeout")
                 raise HTTPException(504, "Voice cleanup timed out") from exc
             except Exception as exc:
+                kind = (
+                    exc.kind
+                    if isinstance(exc, _CleanupFailure)
+                    else "timeout"
+                    if _test_error(exc, "unchecked") == "timeout"
+                    else "provider-error"
+                )
+                if kind == "model-declined":
+                    _logger.info("Voice cleanup not applied (%s)", kind)
+                else:
+                    _logger.warning("Voice cleanup failed (%s)", kind)
                 raise HTTPException(503, "Voice cleanup unavailable") from exc
         return {"text": text}
 

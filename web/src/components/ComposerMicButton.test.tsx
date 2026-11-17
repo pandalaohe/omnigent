@@ -1386,14 +1386,61 @@ describe("ComposerMicButton (server dictation)", () => {
     );
   });
 
-  it("on macOS, prefers server dictation over macOS Dictation", async () => {
+  it.each(["browser", "server", "third"] as const)(
+    "on macOS, honors the %s source when server dictation is available",
+    async (speech_source) => {
+      vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+        ...voiceApi.defaultVoiceInputSettings,
+        speech_source,
+      });
+      const startSystemDictation = vi.fn(async () => true);
+      await inElectronShell(
+        async () => {
+          await act(async () => {
+            render(<MacDesktopComposer info={DICTATION_INFO} />);
+          });
+          await clickMic();
+          if (speech_source === "browser") {
+            expect(startSystemDictation).toHaveBeenCalledTimes(1);
+            expect(screen.getByRole("textbox", { name: "Message" })).toHaveFocus();
+            expect(sessionStartMock).not.toHaveBeenCalled();
+          } else {
+            expect(sessionStartMock).toHaveBeenCalledTimes(1);
+            expect(startSystemDictation).not.toHaveBeenCalled();
+          }
+          expect(startSpy).not.toHaveBeenCalled();
+        },
+        { startSystemDictation },
+      );
+    },
+  );
+
+  it("stops an active server take before using a newly selected macOS source", async () => {
+    vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+      ...voiceApi.defaultVoiceInputSettings,
+      speech_source: "server",
+    });
     const startSystemDictation = vi.fn(async () => true);
     await inElectronShell(
       async () => {
-        render(<MacDesktopComposer info={DICTATION_INFO} />);
+        await act(async () => {
+          render(<MacDesktopComposer info={DICTATION_INFO} />);
+        });
         await clickMic();
         expect(sessionStartMock).toHaveBeenCalledTimes(1);
+        vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+          ...voiceApi.defaultVoiceInputSettings,
+          speech_source: "browser",
+        });
+        await act(async () => {
+          window.dispatchEvent(new Event(voiceApi.VOICE_INPUT_CHANGED_EVENT));
+        });
+        await clickMic();
+        expect(sessionStopMock).toHaveBeenCalledTimes(1);
         expect(startSystemDictation).not.toHaveBeenCalled();
+        await clickMic();
+        expect(startSystemDictation).toHaveBeenCalledTimes(1);
+        expect(sessionStartMock).toHaveBeenCalledTimes(1);
       },
       { startSystemDictation },
     );

@@ -139,8 +139,8 @@ export const ComposerMicButton = ({
 }: ComposerMicButtonProps) => {
   // Web Speech is primary wherever its constructor exists; a take that dies with
   // "network" falls back to the server for that take only (see handleError).
-  // Electron has the constructor but never a backend, so there only the server can serve,
-  // and on macOS a server without dictation hands the take to macOS Dictation.
+  // Electron has no Web Speech backend; browser-first prefers macOS Dictation
+  // when its bridge is available, otherwise the server handles the take.
   const [Ctor] = useState(getRecognitionCtor);
   const electron = isElectronShell();
   const [systemDictationBridge] = useState(supportsSystemDictation);
@@ -179,7 +179,7 @@ export const ComposerMicButton = ({
     systemDictationBridge &&
     inputRef !== undefined &&
     serverInfo !== "loading" &&
-    !serverAvailable;
+    (speechSource === "browser" || !serverAvailable);
   const canDictate = serverAvailable || (Ctor !== null && !electron) || systemDictation;
   // Mirrored into a ref so the mount-time recognition handlers (closed
   // over [Ctor, lang]) see the current probe result.
@@ -912,7 +912,12 @@ export const ComposerMicButton = ({
   }, [inputRef, reportError]);
 
   const toggle = useCallback(() => {
-    if (systemDictation && !serverAvailable) {
+    // Stop the current server take before applying a newly selected source.
+    if (sessionRef.current || serverBusyRef.current) {
+      void toggleServer();
+      return;
+    }
+    if (systemDictation) {
       activeTake?.cancel();
       activeTake = null;
       if (!questionCard) startMacDictation();
@@ -921,12 +926,6 @@ export const ComposerMicButton = ({
     if (!isListening && !serverBusyRef.current && !transitionRef.current) {
       if (activeTake?.owner !== ownerRef.current) activeTake?.cancel();
       activeTake = { owner: ownerRef.current, cancel: cancelTake };
-    }
-    // An active (or starting) server take is owned by the server path,
-    // whichever mode started it.
-    if (sessionRef.current || serverBusyRef.current) {
-      void toggleServer();
-      return;
     }
     if (!isListening && serverAvailable && speechSource !== "browser") {
       void toggleServer();
