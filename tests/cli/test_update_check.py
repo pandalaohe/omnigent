@@ -701,7 +701,7 @@ def test_read_wheel_info_preserves_requested_revision(
     assert info.vcs_url == expected
     assert info.commit_sha == _FAKE_COMMIT
     assert _build_upgrade_suggestion(info).command == (
-        f"uv tool install --reinstall{_UV_PY} {expected}"
+        f"uv tool install --reinstall-package omnigent{_UV_PY} {expected}"
     )
     from omnigent.update_check import _split_vcs_url
 
@@ -770,7 +770,7 @@ def test_read_wheel_info_repairs_redacted_ssh_user(
     Reproduces the SSH-redaction bug: uv recorded the SSH install URL with the
     user redacted to ``****``. We assert the repair survives all the
     way through ``_build_upgrade_suggestion`` into a runnable
-    ``uv tool install --reinstall git+ssh://git@…`` command. If the
+    ``uv tool install --reinstall-package omnigent git+ssh://git@…`` command. If the
     repair were dropped, ``info.vcs_url`` (and therefore the suggested
     command) would still contain ``****@`` and the user would hit
     ``Permission denied (publickey)`` when they confirmed the prompt.
@@ -804,7 +804,7 @@ def test_read_wheel_info_repairs_redacted_ssh_user(
     assert suggestion.runnable is True
     assert (
         suggestion.command
-        == f"uv tool install --reinstall{_UV_PY} git+ssh://git@github.com/omnigent-ai/omnigent.git"
+        == f"uv tool install --reinstall-package omnigent{_UV_PY} git+ssh://git@github.com/omnigent-ai/omnigent.git"
     )
 
 
@@ -898,9 +898,14 @@ def test_read_wheel_info_handles_corrupt_direct_url(
 @pytest.mark.parametrize(
     "installer,vcs_url,expected_substring,expected_runnable",
     [
-        # uv + git install — recommend ``uv tool install --reinstall``
+        # uv + git install — recommend a package-scoped reinstall
         # with the original URL so the user pulls a fresh commit.
-        ("uv", _FAKE_GIT_URL, f"uv tool install --reinstall{_UV_PY} {_FAKE_GIT_URL}", True),
+        (
+            "uv",
+            _FAKE_GIT_URL,
+            f"uv tool install --reinstall-package omnigent{_UV_PY} {_FAKE_GIT_URL}",
+            True,
+        ),
         # uv + registry install — ``uv tool upgrade`` resolves from the
         # configured index. The user doesn't need to remember the spec.
         ("uv", None, "uv tool upgrade omnigent", True),
@@ -1545,7 +1550,8 @@ def test_build_upgrade_suggestion_allow_prerelease() -> None:
         _build_upgrade_suggestion(
             _info("uv", vcs_url="git+https://x/omnigent.git"), allow_prerelease=True
         ).command
-        == f"uv tool install --reinstall{_UV_PY} git+https://x/omnigent.git --prerelease allow"
+        == f"uv tool install --reinstall-package omnigent{_UV_PY} "
+        "git+https://x/omnigent.git --prerelease allow"
     )
 
 
@@ -1581,31 +1587,31 @@ def _make_info(
 
 
 def test_build_upgrade_suggestion_preserves_uv_tool_extras() -> None:
-    """uv tool installs with extras use ``install --reinstall`` to keep them."""
+    """uv tool installs with extras use a package-scoped reinstall to keep them."""
     # No extras → plain uv tool upgrade.
     assert _build_upgrade_suggestion(_make_info("uv")).command == "uv tool upgrade omnigent"
     # With extras → reinstall with the PEP 508 spec.
     assert (
         _build_upgrade_suggestion(_make_info("uv", extras=("all",))).command
-        == f"uv tool install --reinstall{_UV_PY} omnigent[all]"
+        == f"uv tool install --reinstall-package omnigent{_UV_PY} omnigent[all]"
     )
     assert (
         _build_upgrade_suggestion(_make_info("uv", extras=("server", "all"))).command
-        == f"uv tool install --reinstall{_UV_PY} omnigent[all,server]"
+        == f"uv tool install --reinstall-package omnigent{_UV_PY} omnigent[all,server]"
     )
 
 
 def test_build_upgrade_suggestion_uv_target_version() -> None:
-    """A pinned target version produces ``install --reinstall`` with the spec."""
+    """A pinned target version uses a package-scoped reinstall with the spec."""
     assert (
         _build_upgrade_suggestion(_make_info("uv"), target_version="0.2.0").command
-        == f"uv tool install --reinstall{_UV_PY} omnigent==0.2.0"
+        == f"uv tool install --reinstall-package omnigent{_UV_PY} omnigent==0.2.0"
     )
     assert (
         _build_upgrade_suggestion(
             _make_info("uv", extras=("all",)), target_version="0.2.0"
         ).command
-        == f"uv tool install --reinstall{_UV_PY} omnigent==0.2.0[all]"
+        == f"uv tool install --reinstall-package omnigent{_UV_PY} omnigent==0.2.0[all]"
     )
 
 
@@ -1615,11 +1621,11 @@ def test_build_upgrade_suggestion_extra_overrides_win() -> None:
         _build_upgrade_suggestion(
             _make_info("uv", extras=("all",)), extra_overrides=("server",)
         ).command
-        == f"uv tool install --reinstall{_UV_PY} omnigent[all,server]"
+        == f"uv tool install --reinstall-package omnigent{_UV_PY} omnigent[all,server]"
     )
     assert (
         _build_upgrade_suggestion(_make_info("uv"), extra_overrides=("all",)).command
-        == f"uv tool install --reinstall{_UV_PY} omnigent[all]"
+        == f"uv tool install --reinstall-package omnigent{_UV_PY} omnigent[all]"
     )
 
 
@@ -1637,11 +1643,11 @@ def test_build_upgrade_suggestion_vcs_preserves_extras() -> None:
     git_url = "git+https://github.com/example-org/omnigent.git"
     assert (
         _build_upgrade_suggestion(_make_info("uv", vcs_url=git_url)).command
-        == f"uv tool install --reinstall{_UV_PY} {git_url}"
+        == f"uv tool install --reinstall-package omnigent{_UV_PY} {git_url}"
     )
     assert (
         _build_upgrade_suggestion(_make_info("uv", vcs_url=git_url, extras=("all",))).command
-        == f"uv tool install --reinstall{_UV_PY} {git_url}#egg=omnigent[all]"
+        == f"uv tool install --reinstall-package omnigent{_UV_PY} {git_url}#egg=omnigent[all]"
     )
 
 
@@ -2541,7 +2547,7 @@ def test_cli_upgrade_dry_run_uv_tool_with_extras(
     runner = CliRunner()
     result = runner.invoke(cli, ["upgrade", "--dry-run"])
     assert result.exit_code == 0
-    assert f"uv tool install --reinstall{_UV_PY} omnigent[all]" in result.output
+    assert f"uv tool install --reinstall-package omnigent{_UV_PY} omnigent[all]" in result.output
     assert "Would run:" in result.output
 
 

@@ -38,7 +38,7 @@ def _uv_registry_info() -> _InstalledWheelInfo:
 
 
 def _git_install_info() -> _InstalledWheelInfo:
-    """A git/VCS uv-tool install → ``uv tool install --reinstall git+…``."""
+    """A git/VCS uv-tool install → ``uv tool install --reinstall-package omnigent git+…``."""
     return _InstalledWheelInfo(
         install_time_epoch=0.0,
         installer="uv",
@@ -689,7 +689,8 @@ def test_upgrade_git_install_repulls_and_verifies_commit(
 
     assert result.exit_code == 0, result.output
     assert ran == [
-        f"uv tool install --reinstall{_UV_PY} git+https://github.com/omnigent-ai/omnigent.git"
+        f"uv tool install --reinstall-package omnigent{_UV_PY} "
+        "git+https://github.com/omnigent-ai/omnigent.git"
     ]
     assert "Updated to git bbbbbbbbb" in result.output
 
@@ -988,7 +989,7 @@ def test_upgrade_git_install_dry_run_prints_without_running(
     assert result.exit_code == 0, result.output
     assert "Detected installer: uv" in result.output
     assert "Detected extras: (none)" in result.output
-    assert f"Would run: uv tool install --reinstall{_UV_PY}" in result.output
+    assert f"Would run: uv tool install --reinstall-package omnigent{_UV_PY}" in result.output
     assert "Running:" not in result.output
 
 
@@ -1036,11 +1037,12 @@ def test_nightly_suggestion_shapes_per_installer() -> None:
         )
 
     uv = _build_nightly_upgrade_suggestion(info_for("uv"), version)
-    # ``--reinstall``, never ``--force``: uv's ``--force`` removes the working
-    # install before the replacement is built, and nightlies build from source,
-    # so a failed build would leave nothing behind.
+    # ``--reinstall-package omnigent``, never ``--force``: uv's ``--force``
+    # removes the working install before the replacement is built, and
+    # nightlies build from source, so a failed build would leave nothing
+    # behind.
     assert (uv.command, uv.runnable) == (
-        f"uv tool install --reinstall{_UV_PY} {spec}",
+        f"uv tool install --reinstall-package omnigent{_UV_PY} {spec}",
         True,
     )
     pipx = _build_nightly_upgrade_suggestion(info_for("pipx"), version)
@@ -1090,7 +1092,7 @@ def test_upgrade_nightly_installs_pinned_tag(
 
     assert result.exit_code == 0, result.output
     assert ran == [
-        f"uv tool install --reinstall{_UV_PY} "
+        f"uv tool install --reinstall-package omnigent{_UV_PY} "
         "git+https://github.com/omnigent-ai/omnigent@v0.2.0.dev20260804"
     ]
     assert "Upgraded to nightly v0.2.0.dev20260804" in result.output
@@ -1146,7 +1148,7 @@ def test_nightly_suggestion_preserves_and_unions_extras() -> None:
 
     assert suggestion.runnable
     assert suggestion.command == (
-        f"uv tool install --reinstall{_UV_PY} "
+        f"uv tool install --reinstall-package omnigent{_UV_PY} "
         "git+https://github.com/omnigent-ai/omnigent@v0.9.0.dev20260804#egg=omnigent[all,server]"
     )
 
@@ -1198,7 +1200,7 @@ def test_upgrade_nightly_dry_run_prints_without_running(
 
     assert result.exit_code == 0, result.output
     assert (
-        f"Would run: uv tool install --reinstall{_UV_PY} "
+        f"Would run: uv tool install --reinstall-package omnigent{_UV_PY} "
         "git+https://github.com/omnigent-ai/omnigent@v0.2.0.dev20260804" in result.output
     )
 
@@ -1219,8 +1221,10 @@ def test_nightly_uv_never_uses_destructive_force() -> None:
     uv's ``--force`` removes the tool environment (and the ``omni`` /
     ``omnigent`` executables) before the replacement is built. Nightlies build
     from source, so the build can fail, and then nothing is left to fall back
-    to. ``--reinstall`` performs the same registry-to-git hop and the same
-    tag-to-tag hop while keeping the working install until the new one exists.
+    to. ``--reinstall-package omnigent`` performs the same registry-to-git hop
+    and the same tag-to-tag hop while keeping the working install until the new
+    one exists, and refreshes only omnigent instead of its whole dependency
+    tree.
     """
     version = "0.9.0.dev20260804"
     for extras in ((), ("databricks",)):
@@ -1237,7 +1241,7 @@ def test_nightly_uv_never_uses_destructive_force() -> None:
             )
             command = _build_nightly_upgrade_suggestion(info, version).command
             assert "--force" not in command, command
-            assert command.startswith(f"uv tool install --reinstall{_UV_PY} ")
+            assert command.startswith(f"uv tool install --reinstall-package omnigent{_UV_PY} ")
             # Always the nightly tag, never the fork's recorded URL.
             assert f"git+https://github.com/omnigent-ai/omnigent@v{version}" in command
 

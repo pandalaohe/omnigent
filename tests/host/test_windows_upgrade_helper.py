@@ -157,7 +157,11 @@ def test_success_preserves_env_and_server(transaction, monkeypatch):
     assert helper.run(args) == 0
     assert not (tool / "old.txt").exists()
     assert not list(tool.parent.glob("*.previous-*"))
-    assert "--force" in commands[0][0]
+    install = commands[0][0]
+    assert install[1:3] == ["tool", "install"]
+    assert "--reinstall" not in install
+    assert install[install.index("--reinstall-package") + 1] == "omnigent"
+    assert "--force" in install
     assert commands[-1][0][-2:] == ["--server", args.server]
     assert all(env["PATH"] == "/opt/bin" and "VIRTUAL_ENV" not in env for _, env in commands)
     record = json.loads((root / "updates/last-upgrade.json").read_text())
@@ -577,7 +581,8 @@ def test_recovery_faults_are_journaled_and_do_not_skip_actions(transaction, monk
     assert state["recovery_result"] == "incomplete"
     assert state["recovery"]["recovery-" + failure].startswith("failed:")
     assert state["recovery_command"].startswith(
-        "& '/opt/bin/uv.exe' 'tool' 'install' '--reinstall' '--force' '--python' '3.12' "
+        "& '/opt/bin/uv.exe' 'tool' 'install' '--reinstall-package' 'omnigent' '--force' "
+        "'--python' '3.12' "
     )
     assert actions[:6] == [
         "stop-task",
@@ -673,6 +678,8 @@ def test_recovery_command_quotes_powershell_paths(transaction, monkeypatch):
     assert state["recovery_command"].startswith(
         "& '/opt/Tool Dir/O''Brien/uv.exe' 'tool' 'install'"
     )
+    assert "'--reinstall-package' 'omnigent'" in state["recovery_command"]
+    assert "'--reinstall'" not in state["recovery_command"]
     assert "'#egg" not in state["recovery_command"]
     assert state["recovery_command"].endswith("#egg=omnigent[all]'")
 
