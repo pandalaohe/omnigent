@@ -6506,11 +6506,11 @@ describe("Composer reply quotes", () => {
     expect(tooltipKeys(tooltip)).toEqual(["Esc"]);
   });
 
-  it.each(["transfer", "cleanup"])(
+  it.each(["transfer", "cleanup", "history round trip"])(
     "handles composer dictation %s without extra controls",
     async (scenario) => {
       let finishCleanup!: (result: { text: string }) => void;
-      if (scenario === "cleanup") {
+      if (scenario !== "transfer") {
         vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
           ...voiceApi.defaultVoiceInputSettings,
           model: "test-cleanup",
@@ -6552,8 +6552,13 @@ describe("Composer reply quotes", () => {
       onTestFinished(() => {
         vi.unstubAllGlobals();
       });
+      if (scenario === "history round trip") {
+        localStorage.setItem("omnigent:prompt-history:conv_test", JSON.stringify(["Older prompt"]));
+        onTestFinished(() => localStorage.removeItem("omnigent:prompt-history:conv_test"));
+      }
       renderWithTooltips(<Composer {...composerProps()} />);
-      fireEvent.change(textarea(), { target: { value: "typed prefix " } });
+      const initialText = scenario === "history round trip" ? "" : "typed prefix ";
+      if (initialText) fireEvent.change(textarea(), { target: { value: initialText } });
       await act(async () => {});
       fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
       act(() =>
@@ -6576,11 +6581,37 @@ describe("Composer reply quotes", () => {
       await act(async () =>
         fireEvent.click(screen.getByRole("button", { name: "Voice dictation" })),
       );
-      expect(textarea()).toHaveValue("typed prefix ");
+      expect(textarea()).toHaveValue(initialText);
       expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
         "aria-busy",
         "true",
       );
+      if (scenario === "history round trip") {
+        fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+        expect(textarea()).toHaveValue("Older prompt");
+        textarea().setSelectionRange(textarea().value.length, textarea().value.length);
+        fireEvent.keyDown(textarea(), { key: "ArrowDown" });
+        expect(textarea()).toHaveValue("");
+        await act(async () => finishCleanup({ text: "Stale voice." }));
+        expect(textarea()).toHaveValue("");
+        expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
+          "aria-busy",
+          "false",
+        );
+        vi.mocked(voiceApi.cleanupDictation).mockResolvedValueOnce({ text: "Fresh voice." });
+        fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+        act(() =>
+          recognizers[0]?.result?.({
+            resultIndex: 0,
+            results: [{ isFinal: true, 0: { transcript: "fresh voice" } }],
+          }),
+        );
+        await act(async () =>
+          fireEvent.click(screen.getByRole("button", { name: "Voice dictation" })),
+        );
+        expect(textarea()).toHaveValue("Fresh voice.");
+        return;
+      }
       const command = vi.fn(() => true);
       const descriptor = Object.getOwnPropertyDescriptor(document, "execCommand");
       Object.defineProperty(document, "execCommand", { configurable: true, value: command });

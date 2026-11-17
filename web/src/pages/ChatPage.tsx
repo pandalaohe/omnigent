@@ -3051,6 +3051,7 @@ function ComposerImpl(
     fullText,
     storedReplyDraft,
     activeTextId,
+    getDraftRevision,
     focusText,
     editText,
     replaceText,
@@ -3216,6 +3217,7 @@ function ComposerImpl(
     setValue,
     textareaRef,
     `${conversationId}:${activeTextId}`,
+    getDraftRevision,
   );
   const dictation = useDictationInsert(value, voiceCleanup.produce, textareaRef);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
@@ -5740,6 +5742,7 @@ function ComposerImpl(
                 onListeningChange={setDictating}
                 inputRef={textareaRef}
                 onTranscript={(text) => {
+                  if (!voiceCleanup.canInsert()) return;
                   dictation.appendFinal(text);
                   dirtyRef.current = true;
                   // Dictation is a user-driven edit — exit prompt-recall mode
@@ -5748,6 +5751,7 @@ function ComposerImpl(
                   if (commandError !== null) setCommandError(null);
                 }}
                 onInterim={(text) => {
+                  if (!voiceCleanup.canInsert()) return;
                   dictation.replaceInterim(text);
                   dirtyRef.current = true;
                   resetCursor();
