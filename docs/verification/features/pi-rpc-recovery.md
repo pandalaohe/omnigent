@@ -61,3 +61,17 @@ outcomes, queue duration and observed execution count. Record a case without a
 confirmed executor refusal as unverified for the refusal scenario. Separately
 check three fresh Codex SDK children accepting their first message; a Pi
 steering result does not establish the cause of a Codex first-turn failure.
+
+## Server reconnect with a retained runner
+
+The reconnect cases in `tests/runner/test_pi_rpc_lifecycle.py` reinitialize the
+same runner session both between turns and after tool authorization. The real
+Pi process must still read the marker file using the original scope. The same
+module checks full-tier transitions and harness/executor replacement; the
+bootstrap tests check process-identity loss and launch invalidation.
+
+After deployment, repeat with a disposable server and Pi RPC session: restart
+only the server while the runner stays alive. Expect the turn to continue after
+tunnel reconnection, without an authority-transport-lost exit. Record server and
+runner revisions, session ID, restart/reconnect times and the tool's outcome.
+This trial needs its own server restart authorization.

@@ -32,7 +32,15 @@ from tests.runtime.harnesses.test_process_manager import short_tmp_parent as sho
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "change", ["full-live", "full-reinitialize", "harness-replacement", "executor-replacement"]
+    "change",
+    [
+        "full-live",
+        "full-reinitialize",
+        "harness-replacement",
+        "executor-replacement",
+        "reconnect",
+        "reconnect-active",
+    ],
 )
 async def test_real_pi_tool_survives_tier_and_harness_changes(
     tmp_path, monkeypatch, short_tmp_parent, change
@@ -87,6 +95,8 @@ async def test_real_pi_tool_survives_tier_and_harness_changes(
             harness_override="pi",
         )
 
+        reconnect_on_tool = False
+
         class Server(NullServerClient):
             runtime_id = ""
             tier = "auto"
@@ -126,6 +136,7 @@ async def test_real_pi_tool_survives_tier_and_harness_changes(
                 return await super().get(url, **kwargs)
 
             async def post(self, url, **kwargs):
+                nonlocal reconnect_on_tool
                 body = kwargs.get("json", {})
                 if url.endswith("/policies/evaluate"):
                     data = body["event"]["data"]
@@ -147,6 +158,9 @@ async def test_real_pi_tool_survives_tier_and_harness_changes(
                         conversation_store=self,
                         runner_router=None,
                     )
+                    if reconnect_on_tool:
+                        reconnect_on_tool = False
+                        await initialize(reconnect=True)
                     return httpx.Response(
                         200,
                         json={
@@ -179,11 +193,18 @@ async def test_real_pi_tool_survives_tier_and_harness_changes(
             async def runner_client(*_args, **_kwargs):
                 return client
 
-            async def initialize(tier="auto", revision=1):
+            async def initialize(tier="auto", revision=1, *, reconnect=False):
                 body = json.loads(json.dumps(payload))
                 body["session_init"]["snapshot"]["labels"] = ConfirmedPermissionState(
-                    tier, revision, "blocked"
+                    tier, revision, "ready" if reconnect else "blocked"
                 ).labels("pi")
+                if reconnect:
+                    body["session_init"]["snapshot"]["labels"].update(
+                        {
+                            PERMISSION_RUNTIME_ID_LABEL_KEY: server.runtime_id,
+                            PERMISSION_CAPABILITY_LABEL_KEY: PERMISSION_CAPABILITY_VALUE,
+                        }
+                    )
                 response = await client.post("/v1/sessions", json=body)
                 assert response.status_code == 201, response.text
                 server.runtime_id = response.json()["permission_tier_runtime_id"]
@@ -232,6 +253,18 @@ async def test_real_pi_tool_survives_tier_and_harness_changes(
                     await initialize()
                     await read_marker("before")
                     first_pid = manager._entries[conv.id].process.pid
+                    if change.startswith("reconnect"):
+                        runtime = app.state.permission_tiers
+                        previous_scope = runtime.pi_scopes.parent_scope(conv.id)
+                        if change == "reconnect-active":
+                            reconnect_on_tool = True
+                        else:
+                            await initialize(reconnect=True)
+                        await read_marker("after-reconnect")
+                        assert not reconnect_on_tool
+                        assert previous_scope.status == "ready"
+                        assert runtime.pi_scopes.parent_scope(conv.id) is previous_scope
+                        assert manager._entries[conv.id].process.pid == first_pid
                     if change == "executor-replacement":
                         first_client = manager._entries[conv.id].client
                         previous_scope = app.state.permission_tiers.pi_scopes.parent_scope(conv.id)
