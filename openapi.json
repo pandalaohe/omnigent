@@ -7435,39 +7435,6 @@
         "title": "MessageData",
         "type": "object"
       },
-      "ModelProviderAliasesRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "expected_revision": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Expected Revision"
-          },
-          "pairs": {
-            "items": {
-              "items": {
-                "maxLength": 256,
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "maxItems": 64,
-            "title": "Pairs",
-            "type": "array"
-          }
-        },
-        "required": [
-          "pairs"
-        ],
-        "title": "ModelProviderAliasesRequest",
-        "type": "object"
-      },
       "ModelUsage": {
         "description": "Cumulative token/cost usage attributed to a single LLM model.\n\nOne value in the `usage_by_model` map on `SessionResponse` /\n`SessionUsageEvent`, keyed by the raw harness-reported model id\n(e.g. `\"claude-sonnet-4-6\"`, `\"databricks-gpt-5-5\"`). Counts are\nsummed over the session's subtree (itself + sub-agent descendants), so a\nparent folds in sub-agents that ran a different model. Token buckets\nmirror the flat per-session breakdown.",
         "properties": {
@@ -9522,38 +9489,6 @@
           "policy"
         ],
         "title": "ReplaceCliRetentionPolicyRequest",
-        "type": "object"
-      },
-      "ReplaceModelReferenceRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "from": {
-            "maxLength": 512,
-            "minLength": 1,
-            "title": "From",
-            "type": "string"
-          },
-          "mode": {
-            "enum": [
-              "model",
-              "provider"
-            ],
-            "title": "Mode",
-            "type": "string"
-          },
-          "to": {
-            "maxLength": 512,
-            "minLength": 1,
-            "title": "To",
-            "type": "string"
-          }
-        },
-        "required": [
-          "mode",
-          "from",
-          "to"
-        ],
-        "title": "ReplaceModelReferenceRequest",
         "type": "object"
       },
       "ReportModel": {
@@ -24887,106 +24822,6 @@
           }
         },
         "summary": "Report Quota"
-      }
-    },
-    "/v1/me/model-references": {
-      "get": {
-        "operationId": "check_v1_me_model_references_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Check V1 Me Model References Get",
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Check"
-      }
-    },
-    "/v1/me/model-references/aliases": {
-      "put": {
-        "operationId": "aliases_v1_me_model_references_aliases_put",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ModelProviderAliasesRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Aliases V1 Me Model References Aliases Put",
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Aliases"
-      }
-    },
-    "/v1/me/model-references/replace": {
-      "post": {
-        "operationId": "replace_v1_me_model_references_replace_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ReplaceModelReferenceRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Replace V1 Me Model References Replace Post",
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Replace"
       }
     },
     "/v1/me/preferences": {
