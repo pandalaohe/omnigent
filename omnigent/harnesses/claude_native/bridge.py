@@ -113,7 +113,7 @@ from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.models import model_metadata as _model_metadata
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.native.failure_telemetry import FailureContext
-from omnigent.permission_tiers.pi_private import redact_pi_authority
+from omnigent.permission_tiers.pi_private import pi_bridge_failure, redact_pi_authority
 from omnigent.pi_timeouts import BOOTSTRAP_CONTROL_TIMEOUT_S, CONTROL_TIMEOUT_S
 from omnigent.runtime.tool_call_deadline import ToolCallDeadline, bind_tool_call_deadline
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -9673,6 +9673,8 @@ _FILE_CHANGE_OBSERVER_TIMEOUT_S = 10.0
 
 # Five minutes is when a user watching an unresponsive Pi child would consider it stuck.
 _PI_CONTINUITY_STUCK_BACKSTOP_S = 5 * 60.0
+# Above the downstream MCP proxy's 7260-second read budget, with time to return its error.
+_PI_RPC_WAIT_BACKSTOP_S = 7290.0
 
 
 def _wait_for_pi_bootstrap_frame(
@@ -9702,6 +9704,41 @@ def _wait_for_pi_bootstrap_frame(
                 if future.done():
                     return future.result()
     finally:
+        future.cancel()
+
+
+def _wait_for_pi_rpc_result(
+    future: Future[_JsonObject],
+    loop: asyncio.AbstractEventLoop,
+    connection: socket.socket,
+    closed: threading.Event | None,
+) -> _JsonObject:
+    """Bound the relay waiter independently of the retained host operation."""
+    deadline = time.monotonic() + _PI_RPC_WAIT_BACKSTOP_S
+    try:
+        while True:
+            if future.done():
+                return future.result()
+            if closed is not None and closed.is_set():
+                raise ConnectionAbortedError("Pi RPC relay closed")
+            if loop.is_closed() or not loop.is_running():
+                raise ConnectionAbortedError("Pi RPC runner loop stopped")
+            try:
+                peer_gone = bool(select.select([connection], [], [], 0)[0])
+            except (OSError, ValueError):
+                raise ConnectionAbortedError("Pi RPC peer unavailable") from None
+            if peer_gone:
+                raise ConnectionAbortedError("Pi RPC peer disconnected")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Pi RPC reply backstop exceeded")
+            try:
+                return future.result(timeout=min(0.1, remaining))
+            except TimeoutError:
+                if future.done():
+                    return future.result()
+    finally:
+        # This cancels the proxy waiter; McpExecutionRegistry shields host execution.
         future.cancel()
 
 
@@ -9846,7 +9883,20 @@ def _tool_relay_handler_factory(
             self._send_json(response)
 
         def _handle_pi_rpc(self) -> None:
+            from omnigent.runner.pi_scope_relay import PiRpcExecutionError
+
             authorization = self.headers.get("Authorization")
+
+            def refuse(reason: str, status: HTTPStatus = HTTPStatus.FORBIDDEN) -> None:
+                # Fixed codes only: exceptions and frames can carry private authority.
+                _logger.warning("Pi RPC failed: path=/pi/rpc status=%d reason=%s", status, reason)
+                raw = json.dumps(pi_bridge_failure(reason)).encode("utf-8")
+                with contextlib.suppress(OSError):
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
 
             async def authenticate() -> None:
                 if pi_scope_relay is None:
@@ -9860,11 +9910,11 @@ def _tool_relay_handler_factory(
                 future.result(timeout=5.0)
             except Exception:  # noqa: BLE001 - no untrusted body decoding or fallback
                 future.cancel()
-                self.send_error(HTTPStatus.FORBIDDEN)
+                refuse("rpc_refused")
                 return
             payload = self._read_json_body()
             if payload is None or set(payload) != {"payload"} or pi_scope_relay is None:
-                self.send_error(HTTPStatus.BAD_REQUEST)
+                refuse("rpc_refused", HTTPStatus.BAD_REQUEST)
                 return
             result = asyncio.run_coroutine_threadsafe(
                 pi_scope_relay.execute_rpc(
@@ -9876,12 +9926,25 @@ def _tool_relay_handler_factory(
                 loop,
             )
             try:
-                response = result.result(timeout=_TOOL_CALL_TIMEOUT_S)
-                self._send_json(response)
-            except Exception:  # noqa: BLE001 - scoped transport errors contain no raw tool exception
-                result.cancel()
-                self.send_error(HTTPStatus.FORBIDDEN)
+                response = _wait_for_pi_rpc_result(result, loop, self.connection, closed)
+            except TimeoutError:
+                refuse("rpc_timeout")
                 return
+            except ValueError:
+                refuse("rpc_refused")
+                return
+            except PiRpcExecutionError:
+                refuse("rpc_execution_failed")
+                return
+            except Exception:  # noqa: BLE001 - scoped transport errors contain no raw tool exception
+                refuse("rpc_delivery_failed")
+                return
+            try:
+                self._send_json(response)
+            except Exception:  # noqa: BLE001 - do not expose result or exception text
+                _logger.warning(
+                    "Pi RPC failed: path=/pi/rpc reason=rpc_delivery_failed stage=reply"
+                )
 
         def do_POST(self) -> None:
             """
