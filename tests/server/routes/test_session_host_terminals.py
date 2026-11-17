@@ -70,13 +70,78 @@ def linked_app(monkeypatch):
 
     app.include_router(create_session_host_terminals_router(service), prefix="/v1")
 
-    def headers(user="owner", *, runner=False):
-        bearer = mint_session_token(user, key, 60, "accounts", browser_session=not runner)
+    def headers(user="owner", *, runner=False, browser=True):
+        bearer = mint_session_token(
+            user, key, 60, "accounts", browser_session=browser and not runner
+        )
         return {"Origin": "http://server", "Cookie": f"{config.session_cookie_name}={bearer}"}
 
     return SimpleNamespace(
         app=app, service=service, conn=conn, headers=headers, token=token, host=host
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "category",
+    [
+        "origin_untrusted",
+        "runner_credential",
+        "browser_session_missing",
+        "browser_account_mismatch",
+        "not_owner",
+        "admin_not_allowed",
+    ],
+)
+async def test_linked_terminal_refusal_logs_fixed_category(
+    linked_app, monkeypatch, caplog, category
+):
+    env = linked_app
+    headers = env.headers(browser=category != "browser_session_missing")
+    if category == "origin_untrusted":
+        headers["Origin"] = "https://untrusted.example"
+    if category == "runner_credential":
+        headers["Authorization"] = "Bearer synthetic-runner-credential"
+    if category == "browser_account_mismatch":
+        monkeypatch.setattr(env.service.auth, "browser_session_user_id", lambda _: "another-owner")
+    if category == "not_owner":
+        headers = env.headers("collaborator")
+    if category == "admin_not_allowed":
+        env.service.permissions.is_admin = lambda _: False
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(env.app), base_url="http://server"
+    ) as client:
+        with caplog.at_level("INFO"):
+            response = await client.post(
+                "/v1/sessions/session/host-terminals",
+                headers=headers,
+                json={"host_id": "host", "elevated": category == "admin_not_allowed"},
+            )
+    assert response.status_code == 403
+    assert f"terminal access refused category={category}" in caplog.text
+    assert headers["Cookie"] not in caplog.text
+    assert "synthetic-runner-credential" not in caplog.text
+    env.service.call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_cookie_can_authenticate_but_linked_inventory_requires_fresh_login(
+    linked_app, caplog
+):
+    env = linked_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(env.app), base_url="http://server"
+    ) as client:
+        with caplog.at_level("INFO"):
+            denied = await client.get(
+                "/v1/sessions/session/host-terminals", headers=env.headers(browser=False)
+            )
+        allowed = await client.get("/v1/sessions/session/host-terminals", headers=env.headers())
+    assert denied.status_code == 403
+    assert denied.headers["X-Omnigent-Auth-Recovery"] == "browser-session-required"
+    assert "terminal access refused category=browser_session_missing" in caplog.text
+    assert allowed.status_code == 200
+    env.service.list.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -582,7 +582,10 @@ async def test_ordinary_terminal_human_routes_reject_runner_credentials(
             with TestClient(auth_app).websocket_connect(path, headers=headers) as ws:
                 ws.send_bytes(b"echo denied")
                 ws.receive_bytes()
-        assert denied.value.code == 1008
+        assert denied.value.code == 4403
+        assert denied.value.reason == (
+            "browser_session_missing" if credential == "runner_cookie" else "runner_credential"
+        )
         bridge.assert_not_awaited()
     monkeypatch.setattr(
         "omnigent.runtime.get_runner_direct_attach_resolver",

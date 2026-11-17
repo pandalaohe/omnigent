@@ -36,6 +36,7 @@ import {
   type TerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
+import { canSignInForTerminal, signInForTerminal } from "@/lib/identity";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 import {
   isTerminalLaunching,
@@ -115,6 +116,16 @@ export const RECONNECT_STABLE_MS = 30_000;
 
 /** Closes an attach can get when it arrives before its shell exists. */
 const LAUNCH_REFUSAL_CODES: ReadonlySet<number> = new Set([4404, 4500]);
+
+const TERMINAL_REFUSAL_MESSAGES: Readonly<Record<string, string>> = {
+  origin_untrusted: "Open this terminal from a trusted server address.",
+  runner_credential: "Sign in through the web app to use this terminal.",
+  browser_session_missing: "Sign in again to use this terminal.",
+  browser_account_mismatch: "Sign in with the session owner's account.",
+  not_owner: "Only the session owner can control this terminal.",
+  admin_not_allowed: "Administrator terminal access is not allowed.",
+  access_denied: "Terminal access was denied.",
+};
 
 function isReconnectableTerminalClose(code: number): boolean {
   return (
@@ -1004,6 +1015,11 @@ export function TerminalView({
             resumeTarget={resumeTarget}
             resumePending={resumePending}
             resumeError={resumeError}
+            onSignedIn={() => {
+              reconnectAttemptsRef.current = 0;
+              disposeActiveSession();
+              setConnectAttempt((attempt) => attempt + 1);
+            }}
           />
         )}
       </div>
@@ -1028,6 +1044,7 @@ function StatusOverlay({
   resumeTarget,
   resumePending,
   resumeError,
+  onSignedIn,
 }: {
   state: ConnectionState;
   /** True while a new shell waits for its create before attaching. */
@@ -1038,7 +1055,36 @@ function StatusOverlay({
   resumeTarget: "session" | "sandbox";
   resumePending: boolean;
   resumeError: string | null;
+  onSignedIn: () => void;
 }) {
+  const [signInPending, setSignInPending] = useState(false);
+  const [signInError, setSignInError] = useState<string | null>(null);
+  const refusal =
+    state.kind === "closed" && state.code === 4403
+      ? TERMINAL_REFUSAL_MESSAGES[
+          Object.hasOwn(TERMINAL_REFUSAL_MESSAGES, state.reason) ? state.reason : "access_denied"
+        ]
+      : undefined;
+  const browserSessionMissing =
+    refusal !== undefined && state.kind === "closed" && state.reason === "browser_session_missing";
+  const needsSignIn = browserSessionMissing && canSignInForTerminal();
+  const refusalMessage =
+    browserSessionMissing && !needsSignIn
+      ? "Sign in again through this server's sign-in page to use this terminal."
+      : refusal;
+  const recoverSignIn = async () => {
+    setSignInPending(true);
+    setSignInError(null);
+    try {
+      const result = await signInForTerminal();
+      if (result === "redirecting") return;
+      if (result) onSignedIn();
+      else setSignInError("Sign-in was not completed. Try again.");
+    } catch {
+      setSignInError("Sign-in failed. Try again.");
+    }
+    setSignInPending(false);
+  };
   // Render outside the xterm container so close/error messages don't
   // pollute the scrollback buffer the way ANSI-escape writes would.
   return (
@@ -1059,8 +1105,27 @@ function StatusOverlay({
       )}
       {state.kind === "closed" && !reconnectPending && (
         <div className="flex flex-wrap items-center justify-center gap-2 px-3">
-          <span>Bridge closed: {state.reason}</span>
-          {onResume && (
+          <span role={refusal ? "status" : undefined}>
+            {refusalMessage ?? `Bridge closed: ${state.reason}`}
+          </span>
+          {needsSignIn && (
+            <Button
+              type="button"
+              size="xs"
+              variant="secondary"
+              disabled={signInPending}
+              onClick={() => void recoverSignIn()}
+              componentId="terminal.sign-in-again"
+            >
+              {signInPending ? "Signing in…" : "Sign in again"}
+            </Button>
+          )}
+          {signInError && needsSignIn && (
+            <span role="alert" className="basis-full text-center text-sm text-destructive">
+              {signInError}
+            </span>
+          )}
+          {onResume && !refusal && (
             <Button
               type="button"
               size="xs"
