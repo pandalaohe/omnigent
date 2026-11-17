@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from itertools import batched
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, delete, func, select, tuple_
+from sqlalchemy import CursorResult, SQLColumnExpression, delete, func, select, tuple_
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -14,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
+    SqlPreference,
     SqlUsagePriceAliases,
     SqlUsagePriceEvidence,
     SqlUsageSourceEvent,
@@ -22,9 +25,12 @@ from omnigent.db.db_models import (
     current_workspace_id,
 )
 from omnigent.db.utils import now_epoch, run_write_transaction
+from omnigent.quota_pace import QuotaTiers
 from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
+from omnigent.usage.contract import UsageAccountView, UsageWindowView
 from omnigent.usage.evidence import SourceEvent, SourceStatus
 from omnigent.usage.prices import PriceAliases, PriceEvidence
+from omnigent.usage.source_events import change_event_id
 from omnigent.usage.speed import SpeedPoint
 
 EVIDENCE_TABLES = (
@@ -261,32 +267,168 @@ class UsageEvidenceStore:
         return run_write_transaction(self.sessions._write_session(), "report_source_status", write)
 
     def insert_events(self, owner: str, events: Sequence[SourceEvent]) -> dict[str, int]:
-        def write(session: Session) -> dict[str, int]:
-            self._lock(session, owner)
-            accepted = 0
-            for event in events:
-                accepted += self._write(
-                    session,
-                    SqlUsageSourceEvent,
-                    {
-                        "workspace_id": current_workspace_id(),
-                        "owner_id": owner,
-                        "source": event.source,
-                        "event_id": event.id,
-                        "account_id": event.subject or "",
-                        "type": event.type,
-                        "time_utc": event.time_utc,
-                        "severity": event.severity,
-                        "data": event.data,
-                        "received_at": now_epoch(),
-                    },
-                    once=True,
-                )
-            return {"accepted": accepted, "duplicates": len(events) - accepted}
-
         return run_write_transaction(
-            self.sessions._write_session(), "archive_source_events", write
+            self.sessions._write_session(),
+            "archive_source_events",
+            lambda session: self.insert_events_in_session(session, owner, events),
         )
+
+    def insert_events_in_session(
+        self, session: Session, owner: str, events: Sequence[SourceEvent]
+    ) -> dict[str, int]:
+        self._lock(session, owner)
+        accepted = 0
+        for event in events:
+            accepted += self._write(
+                session,
+                SqlUsageSourceEvent,
+                {
+                    "workspace_id": current_workspace_id(),
+                    "owner_id": owner,
+                    "source": event.source,
+                    "event_id": event.id,
+                    "account_id": event.subject or "",
+                    "type": event.type,
+                    "time_utc": event.time_utc,
+                    "severity": event.severity,
+                    "data": event.data,
+                    "received_at": now_epoch(),
+                },
+                once=True,
+            )
+        return {"accepted": accepted, "duplicates": len(events) - accepted}
+
+    def report_log_scopes(self) -> list[tuple[int, str]]:
+        with self.sessions._read_session()("read_report_log_scopes") as session:
+            return list(
+                session.execute(
+                    select(SqlPreference.workspace_id, SqlPreference.user_id)
+                    .where(SqlPreference.key.startswith("usage.account.", autoescape=True))
+                    .distinct()
+                ).tuples()
+            )
+
+    def record_quota_tiers(
+        self, owner: str, accounts: Sequence[UsageAccountView], tiers: QuotaTiers, now: float
+    ) -> None:
+        desired: dict[str, tuple[str, UsageAccountView, UsageWindowView]] = {}
+        for account in accounts:
+            if account.freshness != "fresh":
+                continue
+            for window in account.windows:
+                remaining = window.remaining_pct
+                if remaining is None or window.past_reset:
+                    continue
+                state = (
+                    "error"
+                    if remaining < tiers.low_below_pct
+                    else "warn"
+                    if remaining < tiers.tight_below_pct
+                    else "recover"
+                )
+                desired[f"{account.id}:{window.id}"] = (state, account, window)
+        if not desired:
+            return
+        key = "usage.events.tiers"
+
+        def read_states(session: Session, *, lock: bool = False) -> dict[str, str]:
+            query = select(SqlPreference.value).where(
+                SqlPreference.workspace_id == current_workspace_id(),
+                SqlPreference.user_id == owner,
+                SqlPreference.key == key,
+            )
+            if lock:
+                query = query.with_for_update()
+            value = session.scalar(query)
+            return json.loads(value) if value is not None else {}
+
+        def changes(
+            states: dict[str, str],
+        ) -> dict[str, tuple[str, UsageAccountView, UsageWindowView]]:
+            return {
+                identity: value
+                for identity, value in desired.items()
+                if states.get(identity, "recover") != value[0]
+            }
+
+        with self.sessions._read_session()("read_quota_tier_changes") as session:
+            if not changes(read_states(session)):
+                return
+
+        def write(session: Session) -> None:
+            self._lock(session, owner)
+            # A locking re-read observes the winner even under MySQL repeatable read.
+            states = read_states(session, lock=True)
+            changed = changes(states)
+            if not changed:
+                return
+            events = []
+            for identity, (state, account, window) in changed.items():
+                states[identity] = state
+                events.append(
+                    SourceEvent.model_validate(
+                        {
+                            "specversion": "1.0",
+                            "id": change_event_id(),
+                            "source": f"quota:{account.id}",
+                            "subject": account.id,
+                            "type": f"tier_{window.id}",
+                            "severity": state,
+                            "time": datetime.fromtimestamp(now, UTC).isoformat(),
+                            "data": {
+                                "window": window.label,
+                                "remaining_pct": window.remaining_pct,
+                            },
+                        }
+                    )
+                )
+            self.insert_events_in_session(session, owner, events)
+            UsageSnapshotStore.write_in_session(session, owner, key, states)
+
+        run_write_transaction(self.sessions._write_session(), "record_quota_tier_changes", write)
+
+    @staticmethod
+    def _case_sensitive_event_type(session: Session) -> SQLColumnExpression[str]:
+        event_type = SqlUsageSourceEvent.type
+        dialect = session.get_bind().dialect.name
+        if dialect == "mysql":
+            return event_type.collate("utf8mb4_0900_bin")
+        if dialect == "sqlite":
+            return event_type.collate("BINARY")
+        return event_type
+
+    def event_neighbor(
+        self, owner: str, row: dict[str, Any], *, after: bool
+    ) -> dict[str, Any] | None:
+        table = SqlUsageSourceEvent
+        query = select(table).where(
+            *self.scope(table, owner),
+            table.account_id == (row["account"] or ""),
+            table.source == row["source"],
+            table.severity.in_(("error", "warn", "recover")),
+        )
+        later = (table.time_utc > row["time"]) | (
+            (table.time_utc == row["time"]) & (table.event_id > row["id"])
+        )
+        earlier = (table.time_utc < row["time"]) | (
+            (table.time_utc == row["time"]) & (table.event_id < row["id"])
+        )
+        query = (
+            query.where(later if after else earlier)
+            .order_by(
+                table.time_utc.asc() if after else table.time_utc.desc(),
+                table.event_id.asc() if after else table.event_id.desc(),
+            )
+            .limit(1)
+        )
+        with self.sessions._read_session()("pair_source_event") as session:
+            query = query.where(self._case_sensitive_event_type(session) == row["type"])
+            match = session.scalar(query)
+            return (
+                None
+                if match is None
+                else {"id": match.event_id, "time": match.time_utc, "severity": match.severity}
+            )
 
     def read_sources(self, owner: str, account: str | None = None) -> list[dict[str, Any]]:
         table = SqlUsageSourceStatus
@@ -322,6 +464,7 @@ class UsageEvidenceStore:
         severity: str | None = None,
         before: tuple[int, str, str] | None = None,
         limit: int = 50,
+        kind: str | None = None,
     ) -> tuple[list[dict[str, Any]], int | None, int]:
         table = SqlUsageSourceEvent
         query = select(table).where(*self.scope(table, owner))
@@ -333,6 +476,26 @@ class UsageEvidenceStore:
             if value is not None:
                 query = query.where(column == value)
         with self.sessions._read_session()("read_source_events") as session:
+            event_type = self._case_sensitive_event_type(session)
+            query = query.where(
+                ~(
+                    table.source.startswith("report:", autoescape=True)
+                    & (event_type == "cloudevent")
+                )
+            )
+            if kind == "disconnect":
+                query = query.where(event_type == "connection")
+            elif kind is not None:
+                query = query.where(
+                    event_type != "connection",
+                    table.severity.in_(
+                        {
+                            "error": ("error",),
+                            "warn": ("warn",),
+                            "update": ("info", "recover"),
+                        }[kind]
+                    ),
+                )
             filtered = query.subquery()
             oldest, stored = session.execute(
                 select(func.min(filtered.c.time_utc), func.count()).select_from(filtered)

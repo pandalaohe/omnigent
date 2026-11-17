@@ -4629,14 +4629,23 @@ def create_runner_app(
             spawn_env = None
 
         try:
-            permission_tiers.fence_start(
+            preserved_pi_scope = permission_tiers.fence_start(
                 init_context.envelope,
                 harness_name,
                 preserve_active_pi_scope=(
-                    harness_name == "pi-native"
-                    and resource_registry.terminal_registry is not None
-                    and resource_registry.terminal_registry.get_native(session_id, "pi", "main")
-                    is not None
+                    (
+                        harness_name == "pi-native"
+                        and resource_registry.terminal_registry is not None
+                        and resource_registry.terminal_registry.get_native(
+                            session_id, "pi", "main"
+                        )
+                        is not None
+                    )
+                    or (
+                        harness_name == "pi"
+                        and (bootstrap := _session_pi_bootstraps.get(session_id)) is not None
+                        and bootstrap[0] is process_manager.registered_client(session_id)
+                    )
                 ),
             )
             permission_startup_errors.pop(session_id, None)
@@ -5086,7 +5095,9 @@ def create_runner_app(
                 and init_context.envelope is not None
                 and PERMISSION_STATE_LABEL_KEY in init_context.envelope.snapshot.labels
             ):
-                await _bootstrap_pi_harness(session_id, init_harness_client, force=True)
+                await _bootstrap_pi_harness(
+                    session_id, init_harness_client, force=not preserved_pi_scope
+                )
             elif harness_name == "pi-native" and init_context.envelope is not None:
                 from omnigent.harnesses.pi_native.bridge import (
                     verify_pi_permission_installation,

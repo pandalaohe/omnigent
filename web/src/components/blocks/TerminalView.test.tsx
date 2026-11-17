@@ -8,6 +8,7 @@
 
 import type * as TerminalSessionModule from "./TerminalSession";
 import type * as TerminalsModule from "@/lib/terminals";
+import type * as IdentityModule from "@/lib/identity";
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode, act, useMemo, type ReactElement } from "react";
@@ -15,6 +16,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Toaster } from "@/components/ui/sonner";
 import { FileViewerContext, type OpenFileOptions } from "@/shell/FileViewerContext";
 import { toast } from "sonner";
+import { signInForTerminal } from "@/lib/identity";
+import * as capabilities from "@/lib/capabilities";
+import * as nativeBridge from "@/lib/nativeBridge";
 import {
   dispatchMobileAssistantAction,
   dispatchMobileAssistantButton,
@@ -98,6 +102,127 @@ const terminalSessionMock = vi.hoisted(() => ({
     isFocused: ReturnType<typeof vi.fn>;
   }[],
 }));
+
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  signInForTerminal: vi.fn(),
+}));
+
+describe("terminal access recovery", () => {
+  beforeEach(() => {
+    vi.spyOn(capabilities, "getCachedServerInfo").mockReturnValue({
+      ...capabilities.FALLBACK_SERVER_INFO,
+      login_url: "/login",
+    });
+    vi.spyOn(nativeBridge, "supportsSignInAgain").mockReturnValue(false);
+  });
+
+  it.each([
+    [null, false, false],
+    [" ", false, false],
+    ["/login", false, true],
+    [null, true, true],
+  ] as const)(
+    "offers recovery only when available (login=%s, bridge=%s)",
+    async (loginUrl, bridge, available) => {
+      vi.mocked(capabilities.getCachedServerInfo).mockReturnValue({
+        ...capabilities.FALLBACK_SERVER_INFO,
+        login_url: loginUrl,
+      });
+      vi.mocked(nativeBridge.supportsSignInAgain).mockReturnValue(bridge);
+      render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      act(() =>
+        terminalSessionMock.instances[0].onState({
+          kind: "closed",
+          code: 4403,
+          reason: "browser_session_missing",
+        }),
+      );
+      expect(screen.queryByRole("button", { name: "Sign in again" }) !== null).toBe(available);
+      expect(
+        screen.getByText(
+          available
+            ? "Sign in again to use this terminal."
+            : "Sign in again through this server's sign-in page to use this terminal.",
+        ),
+      ).toBeInTheDocument();
+      expect(screen.queryByTestId("terminal-reconnecting")).not.toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    ["origin_untrusted", "Open this terminal from a trusted server address."],
+    ["runner_credential", "Sign in through the web app to use this terminal."],
+    ["browser_session_missing", "Sign in again to use this terminal."],
+    ["browser_account_mismatch", "Sign in with the session owner's account."],
+    ["not_owner", "Only the session owner can control this terminal."],
+    ["admin_not_allowed", "Administrator terminal access is not allowed."],
+    ["access_denied", "Terminal access was denied."],
+    ["toString", "Terminal access was denied."],
+  ])("shows %s without reconnecting", async (reason, message) => {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    act(() => terminalSessionMock.instances[0].onState({ kind: "closed", code: 4403, reason }));
+    expect(screen.getByText(message)).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-reconnecting")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Sign in again" }) !== null).toBe(
+      reason === "browser_session_missing",
+    );
+  });
+
+  it("shows a cancelled sign-in and retries the terminal after successful sign-in", async () => {
+    vi.mocked(signInForTerminal).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    act(() =>
+      terminalSessionMock.instances[0].onState({
+        kind: "closed",
+        code: 4403,
+        reason: "browser_session_missing",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Sign in again" }));
+    expect(await screen.findByText("Sign-in was not completed. Try again.")).toBeInTheDocument();
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Sign in again" }));
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    expect(screen.getByText("Connecting…")).toBeInTheDocument();
+  });
+
+  it("waits for navigation without retrying an old cookie when sign-in redirects", async () => {
+    vi.mocked(signInForTerminal).mockResolvedValue("redirecting");
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    act(() =>
+      terminalSessionMock.instances[0].onState({
+        kind: "closed",
+        code: 4403,
+        reason: "browser_session_missing",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Sign in again" }));
+    expect(await screen.findByRole("button", { name: "Signing in…" })).toBeDisabled();
+    expect(terminalSessionMock.instances).toHaveLength(1);
+  });
+
+  it("shows a failed sign-in beside an enabled retry action", async () => {
+    vi.mocked(signInForTerminal).mockRejectedValue(new Error("sign-in transport failed"));
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    act(() =>
+      terminalSessionMock.instances[0].onState({
+        kind: "closed",
+        code: 4403,
+        reason: "browser_session_missing",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Sign in again" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Sign-in failed. Try again.");
+    expect(screen.getByRole("button", { name: "Sign in again" })).toBeEnabled();
+    expect(terminalSessionMock.instances).toHaveLength(1);
+  });
+});
 
 vi.mock("./TerminalSession", async (importOriginal) => ({
   // Keep the real module (isUnexpectedTerminalClose and friends) —

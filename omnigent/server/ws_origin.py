@@ -17,8 +17,8 @@ This module provides:
   ``require_trusted_origin`` dependency);
 - :class:`WebSocketOriginMiddleware` — an ASGI middleware that applies the
   policy to every WebSocket handshake *before* it reaches a route handler,
-  so the check runs before any ``websocket.accept()`` (per the rule in
-  ``.claude/skills/code-review/security-guidelines.md`` W1/W4);
+  so untrusted origins never reach a route handler. Terminal refusals
+  accept only to deliver a fixed close reason, without opening a PTY;
 - :data:`OMNIGENT_INTERNAL_WS_ORIGIN` — the sentinel ``Origin`` the
   project's own non-browser clients (runner, host/daemon, terminal-attach)
   set so the middleware allows them unambiguously.
@@ -48,6 +48,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from omnigent.process_logging import log_once
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.server.auth import local_single_user_enabled
+from omnigent.server.terminal_refusals import is_terminal_attach_path, log_terminal_refusal
 
 _logger = logging.getLogger(__name__)
 
@@ -293,9 +294,8 @@ class WebSocketOriginMiddleware:
     """ASGI middleware enforcing the WebSocket ``Origin`` policy.
 
     Wraps the downstream app and, for ``websocket``-typed scopes only,
-    rejects handshakes whose ``Origin`` is not permitted by
-    :func:`origin_allowed` — closing the connection before it
-    reaches a route handler (and thus before any ``websocket.accept()``).
+    rejects origins not permitted by :func:`origin_allowed` before they
+    reach a route handler. Terminal denials accept only to send a close reason.
     Non-WebSocket scopes and permitted handshakes pass through untouched.
 
     The server mode (``local_mode``) and the allowlist are read per
@@ -334,15 +334,19 @@ class WebSocketOriginMiddleware:
             await self._app(scope, receive, send)
             return
 
-        # Reject before the route runs: consume the initial
-        # ``websocket.connect`` then close without accepting. The client
-        # observes a failed handshake (close code, never an open socket).
+        # Never call the route on a denied origin. A terminal-only accept
+        # delivers the fixed refusal instead of an opaque browser error.
         await receive()
+        terminal_attach = is_terminal_attach_path(scope.get("path", ""))
+        if terminal_attach:
+            log_terminal_refusal("origin_untrusted")
+            await send({"type": "websocket.accept"})
         await send(
             {
                 "type": "websocket.close",
                 "code": FORBIDDEN_ORIGIN_CLOSE_CODE,
-                "reason": "forbidden origin",
+                "reason": "origin_untrusted" if terminal_attach else "forbidden origin",
             }
         )
-        _logger.warning("Rejected WebSocket handshake: forbidden origin %r", origin)
+        if not terminal_attach:
+            _logger.warning("Rejected WebSocket handshake: forbidden origin %r", origin)

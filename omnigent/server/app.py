@@ -2201,6 +2201,7 @@ def create_app(
         UsageEvidenceStore(conversation_store.storage_location),
         usage_evidence_retention_days(resolved_server_config),
     )
+    host_registry.connection_observer = usage_evidence_service.host_connection
     usage_price_source = UsagePriceSource(
         UsageSnapshotStore(conversation_store.storage_location),
         usage_hours_store,
@@ -2218,6 +2219,7 @@ def create_app(
         pool_store=UsagePoolStore(conversation_store.storage_location),
         pricing_store=UsagePricingStore(conversation_store.storage_location),
         quota_closing_store=UsageQuotaClosingStore(conversation_store.storage_location),
+        event_store=usage_evidence_service.store,
         mark_settings=usage_mark,
         agent_store=agent_store,
         agent_cache=agent_cache,
@@ -2537,6 +2539,7 @@ def create_app(
         usage_price_task: asyncio.Task[None] | None = None
         usage_evidence_task: asyncio.Task[None] | None = None
         if agent_quota_service.usage_enabled:
+            await asyncio.to_thread(usage_evidence_service.import_report_logs)
             usage_evidence_task = asyncio.create_task(
                 usage_evidence_service.run_retention(), name="usage-evidence-retention"
             )

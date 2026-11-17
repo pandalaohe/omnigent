@@ -377,12 +377,13 @@ export function subscribeFrameAuth(listener: () => void): () => void {
  * :returns: True if this call started the navigation, False if one was
  *     already under way.
  */
-function redirectToLogin(loginUrl: string): boolean {
+function redirectToLogin(loginUrl: string, forceReauth = false): boolean {
+  const reauth = forceReauth ? "&reauth=1" : "";
   if (isFramePath()) {
     const returnTo =
       withBasePath(stripBasePath(window.location.pathname).slice("/frame".length)) +
       window.location.search;
-    const url = `${withBasePath(loginUrl)}?return_to=${encodeURIComponent(returnTo)}`;
+    const url = `${withBasePath(loginUrl)}?return_to=${encodeURIComponent(returnTo)}${reauth}`;
     if (frameLoginUrl !== url) {
       frameLoginUrl = url;
       frameAuthListeners.forEach((listener) => listener());
@@ -392,8 +393,24 @@ function redirectToLogin(loginUrl: string): boolean {
   if (loginRedirectPending) return false;
   loginRedirectPending = true;
   const returnTo = encodeURIComponent(window.location.pathname + window.location.search);
-  window.location.href = `${withBasePath(loginUrl)}?return_to=${returnTo}`;
+  window.location.href = `${withBasePath(loginUrl)}?return_to=${returnTo}${reauth}`;
   return true;
+}
+
+function terminalLoginUrl(): string | null {
+  return (getCachedServerInfo()?.login_url ?? serverLoginUrl)?.trim() || null;
+}
+
+export function canSignInForTerminal(): boolean {
+  return supportsSignInAgain() || terminalLoginUrl() !== null;
+}
+
+/** Renew human browser authority without treating an old cookie as a fresh login. */
+export async function signInForTerminal(): Promise<boolean | "redirecting"> {
+  if (supportsSignInAgain()) return signInAgain();
+  const loginUrl = terminalLoginUrl();
+  if (!loginUrl) return false;
+  return redirectToLogin(loginUrl, true) ? "redirecting" : false;
 }
 
 /**

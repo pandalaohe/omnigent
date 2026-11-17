@@ -105,17 +105,15 @@ class PermissionTierRuntime:
         harness: str,
         *,
         preserve_active_pi_scope: bool = False,
-    ) -> None:
-        """Place a deny-safe cache before any tiered harness can launch."""
+    ) -> bool:
+        """Fence a launch, returning whether its active Pi authority was preserved."""
         if harness not in TIER_HARNESSES:
             if envelope is not None:
                 self.pi_scopes.invalidate(envelope.session_id)
                 self._harnesses.pop(envelope.session_id, None)
-            return
+            return False
         if envelope is None or not (envelope.snapshot.host_id or envelope.snapshot.runner_id):
             raise ValueError("Permission-tier startup requires a trusted host snapshot")
-        if self._leases.get(envelope.session_id):
-            raise ValueError("Permission-tier reinitialization requires idle tool execution")
         snapshot = envelope.snapshot
         host_id = permission_execution_host_id(
             host_id=snapshot.host_id, runner_id=snapshot.runner_id
@@ -134,10 +132,12 @@ class PermissionTierRuntime:
         ):
             raise PermissionTierEpochChanged("Permission runtime changed")
         path = self.state_path(envelope.session_id, harness, snapshot.labels)
-        previous = self._states.get(envelope.session_id)
+        previous = self.state(envelope.session_id)
         if (
             preserve_active_pi_scope
-            and harness == "pi-native"
+            and harness in ("pi", "pi-native")
+            and self._harnesses.get(envelope.session_id) == harness
+            and confirmed.status == "ready"
             and previous is not None
             and (
                 previous.session_id,
@@ -166,9 +166,11 @@ class PermissionTierRuntime:
                 ):
                     self._paths[envelope.session_id] = path
                     self._harnesses[envelope.session_id] = harness
-                    return
+                    return True
             except ValueError:
                 pass
+        if self._leases.get(envelope.session_id):
+            raise ValueError("Permission-tier reinitialization requires idle tool execution")
         fenced = HostPermissionState(
             session_id=envelope.session_id,
             host_id=host_id,
@@ -185,6 +187,7 @@ class PermissionTierRuntime:
         self._leases.pop(envelope.session_id, None)
         self._pi_control_paths.pop(envelope.session_id, None)
         self.pi_scopes.invalidate(envelope.session_id)
+        return False
 
     def install(
         self, envelope: RunnerSessionInitEnvelope | None, harness: str

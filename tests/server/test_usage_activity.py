@@ -1187,3 +1187,15 @@ async def test_routes_validate_dates_zones_scope_and_deployment_gate(service, mo
         service.usage_enabled = False
         assert (await client.get("/v1/me/usage/activity")).status_code == 404
         assert (await client.get("/v1/me/usage/issues")).status_code == 404
+
+
+def test_ten_reads_without_reports_keep_cost_receipt_time(service):
+    report(service)
+    service.hours_store.replace_rows(OWNER, "gateway", [ActivityEntryV2(hour=HOUR, tokens=100)])
+    readings = [service.activity(OWNER, now=NOW + delta)["accounts"] for delta in range(10)]
+    assert all(accounts for accounts in readings)
+    stamps = [
+        next(item for item in accounts if item["account"] == "gateway")["totals"]["last_at"]
+        for accounts in readings
+    ]
+    assert stamps == [int(NOW)] * 10

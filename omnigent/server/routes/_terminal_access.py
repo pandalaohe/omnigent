@@ -15,6 +15,7 @@ from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, auth_mode
 from omnigent.server.browser_approval import browser_action_user
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._origin import require_trusted_origin
+from omnigent.server.terminal_refusals import TerminalAccessDenied, terminal_refusal_category
 from omnigent.stores import ConversationStore
 
 
@@ -26,20 +27,29 @@ def require_terminal_human_control(
         if connection.headers.get("authorization") or connection.headers.get(
             RUNNER_TUNNEL_TOKEN_HEADER
         ):
-            raise HTTPException(403, "Runner credentials cannot use human terminal controls")
-        require_trusted_origin(cast(Request, connection))
+            raise TerminalAccessDenied(
+                "runner_credential", "Runner credentials cannot use human terminal controls"
+            )
+        _require_terminal_origin(connection)
         return
     require_terminal_browser_session(connection, auth_provider)
+
+
+def _require_terminal_origin(connection: HTTPConnection) -> None:
+    try:
+        require_trusted_origin(cast(Request, connection))
+    except HTTPException as exc:
+        raise TerminalAccessDenied("origin_untrusted", str(exc.detail)) from exc
 
 
 def require_terminal_browser_session(
     connection: HTTPConnection, auth_provider: AuthProvider | None
 ) -> None:
     """Keep browser consent and PTY access out of runner credentials."""
-    require_trusted_origin(cast(Request, connection))
+    _require_terminal_origin(connection)
     if connection.headers.get(RUNNER_TUNNEL_TOKEN_HEADER):
-        raise HTTPException(
-            status_code=403, detail="runner credentials cannot authorize admin terminal access"
+        raise TerminalAccessDenied(
+            "runner_credential", "runner credentials cannot authorize admin terminal access"
         )
     if auth_provider is None:
         return
@@ -55,11 +65,18 @@ def require_terminal_browser_session(
             )
             != user_id
         ):
-            raise HTTPException(403, "browser account does not match")
+            raise TerminalAccessDenied(
+                "browser_account_mismatch", "browser account does not match"
+            )
     except HTTPException as exc:
-        raise HTTPException(
-            status_code=403,
-            detail="a trusted human browser session is required",
+        category = terminal_refusal_category(exc)
+        if connection.headers.get("authorization") is not None:
+            category = "runner_credential"
+        elif exc.detail == "A trusted browser origin is required":
+            category = "origin_untrusted"
+        raise TerminalAccessDenied(
+            category,
+            "a trusted human browser session is required",
             headers=exc.headers,
         ) from exc
 

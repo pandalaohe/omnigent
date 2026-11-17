@@ -35,6 +35,7 @@ import { useUsageActivity } from "./usageActivityData";
 import { t } from "./usageText";
 import { UsageSummary } from "./UsageAmounts";
 import { UsageName } from "./UsageName";
+import { UsageEvents } from "./UsageEvents";
 
 /** The renewal a tile counts down to: the provider's date wins over the user's. */
 export function renewalOf(
@@ -304,6 +305,11 @@ export function UsageBoardPage() {
           })}
         </div>
       )}
+      <UsageEvents
+        accounts={accounts}
+        activity={activity.data}
+        enabled={info !== "loading" && info.usage_board_enabled === true}
+      />
     </UsageBoardFrame>
   );
 }

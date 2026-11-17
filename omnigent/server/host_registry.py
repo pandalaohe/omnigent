@@ -713,6 +713,14 @@ class HostRegistry:
         self.startup_admitter: (
             Callable[[HostConnection, str], Awaitable[StartupAttemptRef | None]] | None
         ) = None
+        self.connection_observer: Callable[[HostConnection, bool], None] | None = None
+
+    def _note_connection(self, conn: HostConnection, connected: bool) -> None:
+        if self.connection_observer is not None:
+            try:
+                self.connection_observer(conn, connected)
+            except Exception:
+                _logger.exception("Could not archive host connection change")
 
     @asynccontextmanager
     async def startup_registration(self, host_id: str) -> AsyncIterator[None]:
@@ -841,6 +849,8 @@ class HostRegistry:
             else:
                 self._interactive_shells.pop(host_id, None)
         self.restarts.connected(conn)
+        if old is None:
+            self._note_connection(conn, True)
         return conn
 
     def deregister(
@@ -876,6 +886,7 @@ class HostRegistry:
         # keeps the host row online, even though the host is now unreachable.
         removed.retirement_reason = "deregistered"
         self.restarts.disconnected(removed)
+        self._note_connection(removed, False)
         removed.outbound_queue.put_nowait(None)
         _fail_pending_imports(removed)
         _fail_pending_harness_startup(removed)

@@ -26,6 +26,12 @@ from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._terminal_access import require_terminal_browser_session
 from omnigent.server.routes.terminal_attach import _RunnerWSClosed, _shuttle_ws_frames
+from omnigent.server.terminal_refusals import (
+    TerminalAccessDenied,
+    TerminalRefusalRoute,
+    close_terminal_refusal,
+    terminal_refusal_category,
+)
 from omnigent.stores.host_store import Host
 from omnigent.stores.permission_store import PermissionStore
 
@@ -37,7 +43,7 @@ def create_host_terminals_router(
     runner_router: RunnerRouter,
     permission_store: PermissionStore | None = None,
 ) -> APIRouter:
-    router = APIRouter()
+    router = APIRouter(route_class=TerminalRefusalRoute)
 
     async def authorize(connection: Request | WebSocket) -> tuple[Host, HostConnection]:
         user = require_user(connection, auth_provider)
@@ -54,6 +60,10 @@ def create_host_terminals_router(
             )
         except HTTPException as exc:
             code = ErrorCode.NOT_FOUND if exc.status_code == 404 else ErrorCode.FORBIDDEN
+            if exc.status_code == 403:
+                raise TerminalAccessDenied(
+                    "not_owner", "Only the host owner may use this terminal"
+                ) from exc
             raise OmnigentError(str(exc.detail), code=code) from exc
         if runner_router.host_is_on_another_replica(host.host_id):
             raise OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
@@ -105,7 +115,7 @@ def create_host_terminals_router(
             if permission_store is not None and not await asyncio.to_thread(
                 permission_store.is_admin, host.user_id
             ):
-                raise OmnigentError("admin access required", code=ErrorCode.FORBIDDEN)
+                raise TerminalAccessDenied("admin_not_allowed", "admin access required")
             if "terminal_elevated_v1" not in conn.hello.capabilities:
                 raise OmnigentError("admin terminals are not enabled", code=ErrorCode.CONFLICT)
         runner_id = await service.runner(host, conn, launch=True)
@@ -144,14 +154,20 @@ def create_host_terminals_router(
         try:
             host, conn = await authorize(websocket)
             if websocket.query_params.get("read_only", "false").lower() != "false":
-                raise OmnigentError(
-                    "host terminal watchers are not supported", code=ErrorCode.FORBIDDEN
+                raise TerminalAccessDenied(
+                    "admin_not_allowed", "host terminal watchers are not supported"
                 )
             runner_id = await service.runner(host, conn, launch=False)
             session = service.tunnels.get(runner_id) if runner_id is not None else None
             if session is None:
                 raise OmnigentError("terminal not found", code=ErrorCode.NOT_FOUND)
-        except OmnigentError as exc:
+        except (OmnigentError, HTTPException) as exc:
+            if isinstance(exc, HTTPException) or exc.code in (
+                ErrorCode.FORBIDDEN,
+                ErrorCode.UNAUTHORIZED,
+            ):
+                await close_terminal_refusal(websocket, terminal_refusal_category(exc))
+                return
             await websocket.accept()
             code = {
                 ErrorCode.WRONG_REPLICA: 4400,

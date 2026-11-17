@@ -10,7 +10,25 @@ import {
 } from "@/components/ui/dialog";
 import { Switch } from "@/components/ui/switch";
 import { useSessionTerminalAccess } from "@/hooks/useSessionTerminalAccess";
-import { useTerminalAgentAccess, type TerminalInfo } from "@/hooks/useTerminals";
+import {
+  AGENT_TERMINAL_IDS,
+  useTerminalAgentAccess,
+  type TerminalInfo,
+} from "@/hooks/useTerminals";
+
+/**
+ * Whether *terminal* is the agent's own pane rather than a shell the user owns.
+ *
+ * The id list alone is not enough: a user shell may declare an agent
+ * terminal's name with a colliding session key (``claude`` + ``main`` reads as
+ * ``terminal_claude_main``). The runner's own classification decides when it is
+ * known — only ``harness`` is the agent's pane — and an older resource without
+ * an origin keeps the id rule.
+ */
+export function isAgentHarnessTerminal(terminal: TerminalInfo): boolean {
+  if (!AGENT_TERMINAL_IDS.has(terminal.id)) return false;
+  return terminal.origin === undefined || terminal.origin === "harness";
+}
 
 export function TerminalAgentAccess({
   conversationId,
@@ -19,6 +37,7 @@ export function TerminalAgentAccess({
   conversationId: string;
   terminal: TerminalInfo;
 }) {
+  if (isAgentHarnessTerminal(terminal)) return null;
   if (!terminal.elevated && terminal.agentTier === undefined) return null;
   return <TerminalAgentAccessControl conversationId={conversationId} terminal={terminal} />;
 }
