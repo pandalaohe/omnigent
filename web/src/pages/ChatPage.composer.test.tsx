@@ -6509,6 +6509,7 @@ describe("Composer reply quotes", () => {
   it.each(["transfer", "cleanup"])(
     "handles composer dictation %s without extra controls",
     async (scenario) => {
+      let finishCleanup!: (result: { text: string }) => void;
       if (scenario === "cleanup") {
         vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
           ...voiceApi.defaultVoiceInputSettings,
@@ -6519,7 +6520,11 @@ describe("Composer reply quotes", () => {
             voiceApi.defaultVoiceInputSettings,
           );
         });
-        vi.mocked(voiceApi.cleanupDictation).mockResolvedValueOnce({ text: "Dictated words." });
+        vi.mocked(voiceApi.cleanupDictation).mockReturnValueOnce(
+          new Promise((resolve) => {
+            finishCleanup = resolve;
+          }),
+        );
       }
       const recognizers: Record<string, (event?: unknown) => void>[] = [];
       vi.stubGlobal(
@@ -6571,6 +6576,19 @@ describe("Composer reply quotes", () => {
       await act(async () =>
         fireEvent.click(screen.getByRole("button", { name: "Voice dictation" })),
       );
+      expect(textarea()).toHaveValue("typed prefix ");
+      expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
+        "aria-busy",
+        "true",
+      );
+      const command = vi.fn(() => true);
+      const descriptor = Object.getOwnPropertyDescriptor(document, "execCommand");
+      Object.defineProperty(document, "execCommand", { configurable: true, value: command });
+      onTestFinished(() => {
+        if (descriptor) Object.defineProperty(document, "execCommand", descriptor);
+        else delete (document as Partial<Document>).execCommand;
+      });
+      await act(async () => finishCleanup({ text: "Dictated words." }));
       await waitFor(() => expect(textarea().value.toLowerCase()).toContain("dictated words"));
       await waitFor(() => expect(textarea()).toHaveValue("typed prefix Dictated words."));
       expect(voiceApi.cleanupDictation).toHaveBeenCalledWith(
@@ -6578,6 +6596,7 @@ describe("Composer reply quotes", () => {
         expect.any(AbortSignal),
       );
       expect(screen.queryByRole("button", { name: "Clean up voice" })).not.toBeInTheDocument();
+      expect(command).not.toHaveBeenCalled();
     },
   );
 

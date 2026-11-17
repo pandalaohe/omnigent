@@ -17,7 +17,6 @@ import { isElectronShell, startSystemDictation, supportsSystemDictation } from "
 import { cn } from "@/lib/utils";
 import { Loader2Icon, MicIcon, SquareIcon } from "lucide-react";
 import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
-import { flushSync } from "react-dom";
 
 // Local-only types; speech-input.tsx already augments Window globally.
 interface SpeechRecognitionLike {
@@ -92,8 +91,6 @@ export interface ComposerMicButtonProps {
   questionCard?: boolean;
   /** Runs after the complete take (including cleanup) was delivered. */
   onVoiceEnd?: () => void;
-  /** Guarded replacement of an original already inserted when listening ended. */
-  onCleanup?: (original: string, text: string) => void;
   onTranscript: (
     text: string,
     meta?: FinalMeta & { source?: "browser" | "server" | "third" },
@@ -139,7 +136,6 @@ export const ComposerMicButton = ({
   inputRef,
   questionCard = false,
   onVoiceEnd,
-  onCleanup,
 }: ComposerMicButtonProps) => {
   // Web Speech is primary wherever its constructor exists; a take that dies with
   // "network" falls back to the server for that take only (see handleError).
@@ -209,8 +205,33 @@ export const ComposerMicButton = ({
   const bufferTranscript = useCallback((text: string, meta?: FinalMeta, excluded = false) => {
     segmentsRef.current.push({ text, meta, excluded });
   }, []);
-  const onCleanupRef = useRef(onCleanup);
-  onCleanupRef.current = onCleanup;
+  const takeInputRef = useRef<{
+    field: HTMLTextAreaElement | null;
+    value: string | undefined;
+    edited: boolean;
+    onEdit: () => void;
+  } | null>(null);
+  const releaseTakeInput = useCallback(() => {
+    const target = takeInputRef.current;
+    target?.field?.removeEventListener("input", target.onEdit);
+    target?.field?.removeEventListener("change", target.onEdit);
+    takeInputRef.current = null;
+  }, []);
+  const captureTakeInput = useCallback(() => {
+    releaseTakeInput();
+    const field = inputRef?.current ?? null;
+    const target = {
+      field,
+      value: field?.value,
+      edited: false,
+      onEdit: () => {
+        target.edited = true;
+      },
+    };
+    field?.addEventListener("input", target.onEdit);
+    field?.addEventListener("change", target.onEdit);
+    takeInputRef.current = target;
+  }, [inputRef, releaseTakeInput]);
   const onInterimRef = useRef(onInterim);
   onInterimRef.current = onInterim;
   // Synced refs so the mount-time listeners call the latest callbacks.
@@ -324,6 +345,7 @@ export const ComposerMicButton = ({
   } | null>(null);
 
   const cancelTake = useCallback(() => {
+    releaseTakeInput();
     discardingRef.current = true;
     takeGenerationRef.current += 1;
     punctuationQueueRef.current = Promise.resolve();
@@ -339,7 +361,7 @@ export const ComposerMicButton = ({
       /* Already stopped. */
     }
     setIsListening(false);
-  }, []);
+  }, [releaseTakeInput]);
 
   useEffect(() => {
     if (isListening) {
@@ -365,12 +387,6 @@ export const ComposerMicButton = ({
         let output = text;
         let cleaned = segments.length > 0 && segments.every((segment) => segment.meta?.cleaned);
         const first = segments.findIndex((segment) => !segment.excluded && !segment.meta?.cleaned);
-        const replace = onCleanupRef.current;
-        const inserted = !!text && !!replace && cleanupEnabledRef.current && first !== -1;
-        if (inserted)
-          flushSync(() =>
-            onTranscriptRef.current(text, { raw, cleaned: false, cleanupHandled: true }),
-          );
         if (text && cleanupEnabledRef.current && first !== -1) {
           const prefix = segments
             .slice(0, first)
@@ -382,35 +398,26 @@ export const ComposerMicButton = ({
             .join(" ");
           const controller = new AbortController();
           cleanupAbortRef.current = controller;
-          const field = inputRef?.current;
-          const before = field?.value;
-          let edited = false;
-          const onEdit = () => {
-            edited = true;
-          };
-          field?.addEventListener("input", onEdit);
           try {
             const result = await cleanupDictation(suffix, controller.signal);
-            if (!edited && field?.value === before) {
-              output = [prefix, result.text].filter(Boolean).join(" ");
-              cleaned = true;
-            }
+            output = [prefix, result.text].filter(Boolean).join(" ");
+            cleaned = true;
           } catch {
             if (!controller.signal.aborted) showToast("Cleanup unavailable; original kept.");
-          } finally {
-            field?.removeEventListener("input", onEdit);
           }
         }
         if (
           !mountedRef.current ||
           discardingRef.current ||
           disabledRef.current ||
-          generation !== takeGenerationRef.current
+          generation !== takeGenerationRef.current ||
+          (takeInputRef.current &&
+            (takeInputRef.current.edited ||
+              takeInputRef.current.field !== (inputRef?.current ?? null) ||
+              takeInputRef.current.value !== inputRef?.current?.value))
         )
           return;
-        if (inserted) {
-          if (output !== text) onCleanupRef.current?.(text, output);
-        } else if (output) {
+        if (output) {
           // Cleanup is owned here for every mic; insertion adapters must not retry it.
           if (cleaned || cleanupEnabledRef.current)
             onTranscriptRef.current(output, { raw, cleaned, cleanupHandled: true });
@@ -418,13 +425,15 @@ export const ComposerMicButton = ({
         }
         onVoiceEndRef.current?.();
       }
-      if (generation === takeGenerationRef.current && activeTake?.owner === ownerRef.current)
-        activeTake = null;
     });
     void completion.finally(() => {
-      if (mountedRef.current && generation === takeGenerationRef.current) setProcessing(false);
+      if (generation === takeGenerationRef.current) {
+        releaseTakeInput();
+        if (activeTake?.owner === ownerRef.current) activeTake = null;
+        if (mountedRef.current) setProcessing(false);
+      }
     });
-  }, [isListening, connecting, inputRef]);
+  }, [isListening, connecting, inputRef, releaseTakeInput]);
 
   // Surface a failure both in the button (tooltip + red tint) and as a toast,
   // so a failed take is an explained error rather than a silent flash back to
@@ -474,6 +483,7 @@ export const ComposerMicButton = ({
       setIsListening(true);
       // Snapshot point: let the parent record the text so Esc can revert to it.
       onVoiceStartRef.current?.();
+      captureTakeInput();
     };
     // Restart the recognizer when it ends on its own mid-take. Returns false
     // when the take should end instead.
@@ -572,7 +582,7 @@ export const ComposerMicButton = ({
       recognition.stop();
       recognitionRef.current = null;
     };
-  }, [Ctor, electron, lang, reportError]);
+  }, [Ctor, electron, lang, reportError, captureTakeInput]);
 
   // Auto-stop if the composer goes disabled mid-dictation. Stops the
   // recognizer; the disabledRef guard in handleResult catches any final
@@ -581,6 +591,7 @@ export const ComposerMicButton = ({
   // composer can't accept text.
   useEffect(() => {
     if (!disabled) return;
+    releaseTakeInput();
     takeGenerationRef.current += 1;
     punctuationQueueRef.current = Promise.resolve();
     cleanupAbortRef.current?.abort();
@@ -601,7 +612,7 @@ export const ComposerMicButton = ({
       // .stop() on an already-stopped recognizer can throw in some
       // browsers; safe to ignore — the end event will reconcile state.
     }
-  }, [disabled, isListening]);
+  }, [disabled, isListening, releaseTakeInput]);
 
   // Release the mic if the component unmounts mid-take (e.g. the
   // new-chat dialog closes while dictating).
@@ -610,6 +621,7 @@ export const ComposerMicButton = ({
     const owner = ownerRef.current;
     return () => {
       mountedRef.current = false;
+      releaseTakeInput();
       discardingRef.current = true;
       if (activeTake?.owner === owner) activeTake = null;
       takeGenerationRef.current += 1;
@@ -619,7 +631,7 @@ export const ComposerMicButton = ({
       sessionRef.current?.cancel();
       sessionRef.current = null;
     };
-  }, []);
+  }, [releaseTakeInput]);
 
   // Second getUserMedia stream just for visualization — Web Speech API
   // hides its audio buffer. Chrome batches the permission to one prompt.
@@ -702,7 +714,14 @@ export const ComposerMicButton = ({
         sessionRef.current = null;
         const orderedWithWebTake = serverContinuesWebTakeRef.current;
         serverContinuesWebTakeRef.current = false;
-        const stopped = await session.stop();
+        let stopped: Awaited<ReturnType<DictationSession["stop"]>>;
+        try {
+          stopped = await session.stop();
+        } catch {
+          session.cancel();
+          reportError("Voice input failed. Please try again.");
+          stopped = { text: "" };
+        }
         const tail = (typeof stopped === "string" ? stopped : stopped.text).trim();
         if (
           !disabledRef.current &&
@@ -741,6 +760,7 @@ export const ComposerMicButton = ({
           segmentsRef.current = [];
           cleanupAbortRef.current?.abort();
           onVoiceStartRef.current?.();
+          captureTakeInput();
         }
         serverContinuesWebTakeRef.current = continueTake;
         serverOneStepRef.current = oneStepRef.current;
@@ -875,7 +895,7 @@ export const ComposerMicButton = ({
       setConnecting(false);
       serverBusyRef.current = false;
     },
-    [reportError, thirdSelected, electron, bufferTranscript],
+    [reportError, thirdSelected, electron, bufferTranscript, captureTakeInput],
   );
   toggleServerRef.current = toggleServer;
 
@@ -949,6 +969,7 @@ export const ComposerMicButton = ({
       // InvalidStateError from a double-call — drop the guard so the
       // user can try again, and let the next event reconcile state.
       transitionRef.current = false;
+      setProcessing(false);
       if (!isListening) webSpeechTakeRef.current = null;
     }
   }, [

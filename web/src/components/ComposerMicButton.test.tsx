@@ -1516,6 +1516,44 @@ it("shows processing from server stop through cleanup and clears it when the tex
   expect(onTranscript).toHaveBeenCalledWith("Clean words.", expect.any(Object));
 });
 
+it("waits for cleanup before writing a composer answer without an undo-to-raw entry", async () => {
+  vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+    ...voiceApi.defaultVoiceInputSettings,
+    model: "cleanup-model",
+  });
+  let finish!: (value: { text: string }) => void;
+  vi.mocked(voiceApi.cleanupDictation).mockReturnValue(
+    new Promise((resolve) => {
+      finish = resolve;
+    }),
+  );
+  render(<RegionVoiceComposer />);
+  await act(async () => {});
+  fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+  act(() => handlers.start?.({}));
+  act(() => handlers.result?.(resultEvent("unprocessed words")));
+  await finishBrowserTake();
+  expect(screen.getByRole("textbox", { name: "Region 0" })).toHaveValue("");
+  await act(async () => finish({ text: "Final words." }));
+  expect(screen.getByRole("textbox", { name: "Region 0" })).toHaveValue("Final words.");
+});
+
+it("ends processing and reports the error when stopping the server take throws", async () => {
+  vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
+    ...voiceApi.defaultVoiceInputSettings,
+    speech_source: "third",
+  });
+  sessionStopMock.mockRejectedValue(new Error("stop failed"));
+  render(<ComposerMicButton onTranscript={vi.fn()} />);
+  await act(async () => {});
+  const button = screen.getByRole("button", { name: "Voice dictation" });
+  await act(async () => fireEvent.click(button));
+  await act(async () => fireEvent.click(button));
+  expect(button).toHaveAttribute("aria-busy", "false");
+  expect(button).toHaveAttribute("aria-pressed", "false");
+  expect(showToastMock).toHaveBeenCalledWith("Voice input failed. Please try again.");
+});
+
 it("finishes a real question-card take before inserting, focusing and submitting its text", async () => {
   vi.mocked(voiceApi.getVoiceInputSettings).mockResolvedValue({
     ...voiceApi.defaultVoiceInputSettings,
@@ -1852,10 +1890,7 @@ function RegionVoiceComposer() {
       <ComposerMicButton
         inputRef={inputRef}
         onVoiceStart={voice.begin}
-        onVoiceEnd={() => void voice.end()}
-        onCleanup={voice.replaceFinal}
-        onTranscript={(text, meta) => {
-          voice.record(text, meta);
+        onTranscript={(text) => {
           dictation.appendFinal(text);
         }}
       />
@@ -1885,7 +1920,7 @@ it.each([false, true])(
     if (switchRegion) fireEvent.focus(screen.getByRole("textbox", { name: "Region 1" }));
     await act(async () => resolve({ text: "Cleaned region." }));
     expect(screen.getByRole("textbox", { name: "Region 0" })).toHaveValue(
-      switchRegion ? "region original" : "Cleaned region.",
+      switchRegion ? "" : "Cleaned region.",
     );
     expect(screen.getByRole("textbox", { name: "Region 1" })).toHaveValue("");
   },

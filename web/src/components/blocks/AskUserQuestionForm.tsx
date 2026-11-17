@@ -10,6 +10,7 @@ import {
   ChevronRightIcon,
   ImagePlusIcon,
   EraserIcon,
+  Undo2Icon,
   SquareIcon,
   XIcon,
 } from "lucide-react";
@@ -24,7 +25,6 @@ import {
   useState,
 } from "react";
 import { isKeyOwningOverlayOpen } from "@/lib/hotkeys";
-import { replaceDictatedText } from "@/lib/replaceDictatedText";
 import { Button } from "@/components/ui/button";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { QuestionDictationControls } from "@/components/QuestionDictationControls";
@@ -239,6 +239,7 @@ export function AskUserQuestionForm({
     draft?.customSelected ?? initial.customSelected,
   );
   const [customInputs, setCustomInputs] = useState(draft?.customInputs ?? initial.customInputs);
+  const [clearedInputs, setClearedInputs] = useState<Record<string, string>>({});
 
   const customInputsRef = useRef(customInputs);
   customInputsRef.current = customInputs;
@@ -288,6 +289,7 @@ export function AskUserQuestionForm({
   }, [customInputs, current]);
 
   const commitCustomText = (key: string, text: string, caret: number) => {
+    setClearedInputs((prev) => ({ ...prev, [key]: "" }));
     editRevisionRef.current[key] = (editRevisionRef.current[key] ?? 0) + 1;
     const next = { ...customInputsRef.current, [key]: text };
     customInputsRef.current = next;
@@ -462,6 +464,7 @@ export function AskUserQuestionForm({
   const handleCustomInput = (key: string, e: ChangeEvent<HTMLTextAreaElement>) => {
     if (submittingRef.current) return;
     const text = e.target.value;
+    setClearedInputs((prev) => ({ ...prev, [key]: "" }));
     editRevisionRef.current[key] = (editRevisionRef.current[key] ?? 0) + 1;
     customInputsRef.current = { ...customInputsRef.current, [key]: text };
     setCustomInputs(customInputsRef.current);
@@ -846,6 +849,8 @@ export function AskUserQuestionForm({
   const customRowId = `${currentKey}__custom`;
   const customRowChecked = customSelected[currentKey] ?? false;
   const customRowValue = customInputs[currentKey] ?? "";
+  const canRestore = !customRowValue && !!clearedInputs[currentKey];
+  const clearLabel = canRestore ? "Restore answer" : "Clear answer";
 
   return (
     <div
@@ -1059,22 +1064,22 @@ export function AskUserQuestionForm({
                   type="button"
                   size="icon-sm"
                   variant="ghost"
-                  aria-label="Clear answer"
-                  title="Clear answer"
-                  disabled={submitting || !customRowValue}
+                  aria-label={clearLabel}
+                  title={clearLabel}
+                  disabled={submitting || (!customRowValue && !canRestore)}
                   onClick={() => {
-                    replaceDictatedText(
-                      customInputRef.current,
-                      customRowValue,
-                      0,
-                      customRowValue.length,
-                      "",
-                    );
-                    commitCustomText(currentKey, "", 0);
+                    const restored = canRestore ? clearedInputs[currentKey]! : "";
+                    commitCustomText(currentKey, restored, restored.length);
+                    if (!canRestore)
+                      setClearedInputs((prev) => ({ ...prev, [currentKey]: customRowValue }));
                     customInputRef.current?.focus({ preventScroll: true });
                   }}
                 >
-                  <EraserIcon className="size-3.5" />
+                  {canRestore ? (
+                    <Undo2Icon className="size-3.5" />
+                  ) : (
+                    <EraserIcon className="size-3.5" />
+                  )}
                 </Button>
                 {!current.isSecret && (
                   <QuestionDictationControls
