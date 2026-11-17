@@ -68,7 +68,7 @@ it("shows rows needing attention by default and folds the rest behind show all",
   expect(screen.queryByRole("heading", { name: "Group stale" })).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: /1 more project with nothing needing/ }));
   expect(stored().scope).toBe("all");
-  expect(screen.getByRole("button", { name: "All rows", pressed: true })).toBeTruthy();
+  expect(screen.getByRole("radio", { name: "All rows", checked: true })).toBeTruthy();
 });
 
 it("pins a group into the attention view and unpins it in place", () => {

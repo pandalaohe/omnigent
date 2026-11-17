@@ -1552,22 +1552,18 @@ export function TaskBoardRoutes({
               </div>
             </>
           )}
-          <div className="tb-segment rt-scope" role="group" aria-label={t("routes.scope")}>
-            {(["attention", "all"] as const).map((value) => (
-              <Button
-                key={value}
-                size="sm"
-                variant={settings.scope === value ? "secondary" : "ghost"}
-                aria-pressed={settings.scope === value}
-                onClick={() => {
-                  updateSettings({ scope: value });
-                  setOpen(null);
-                }}
-              >
-                {t(`routes.scope.${value}`)}
-              </Button>
-            ))}
-          </div>
+          <Segmented
+            label={t("routes.scope")}
+            value={settings.scope}
+            onChange={(scope) => {
+              updateSettings({ scope });
+              setOpen(null);
+            }}
+            options={(["attention", "all"] as const).map((value) => ({
+              value,
+              label: t(`routes.scope.${value}`),
+            }))}
+          />
           <button
             type="button"
             className="rt-focus-toggle rt-pins-toggle"

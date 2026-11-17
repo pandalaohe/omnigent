@@ -1,8 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useParams } from "@/lib/routing";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
-import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
-import { Button } from "@/components/ui/button";
+import { UsageUnitControl } from "./UsageAmounts";
 import { UsageBoardFrame } from "./UsageBoardFrame";
 import { UsageRangeControl, usageRangeQuery } from "./UsageRangeControl";
 import { usageJson } from "./usagePriceSourceData";
@@ -58,21 +57,7 @@ export function UsageModelsPage() {
             ? `${formatShortDate(query.data.span.counted_from)} – ${formatShortDate(query.data.span.until)}`
             : "No usage in this range"}
         </p>
-        <div className="flex gap-1" role="group" aria-label="Usage measure">
-          {(["money", "tokens"] as const).map((unit) => (
-            <Button
-              key={unit}
-              size="sm"
-              variant={
-                board.unit === unit || (!board.unit && unit === "money") ? "secondary" : "ghost"
-              }
-              aria-pressed={tokens === (unit === "tokens")}
-              onClick={() => patchUsageBoardPreferences({ unit })}
-            >
-              {unit === "money" ? "Money" : "Tokens"}
-            </Button>
-          ))}
-        </div>
+        <UsageUnitControl />
       </div>
       {query.data?.models.length === 0 ? (
         <p className="py-8 text-sm text-muted-foreground">

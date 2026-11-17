@@ -1272,16 +1272,15 @@
 .tb-page .tb-status-items .tb-waiting strong {
   color: color-mix(in srgb, var(--warning) 72%, var(--foreground));
 }
-.tb-page .tb-view-tabs > button {
+.tb-page .tb-view-tabs [role="radio"] {
   height: 38px;
   padding: 0 13.5px;
   gap: 7px;
   font-size: 14.5px;
   font-weight: 500;
   border-radius: 8px;
-  color: var(--muted-foreground);
 }
-.tb-page .tb-view-tabs > button[aria-pressed="true"],
+
 .tb-page .tb-gear[aria-pressed="true"],
 .tb-page .tb-pin[aria-pressed="true"],
 .tb-page .tb-setting-chips button[aria-pressed="true"] {
@@ -1312,8 +1311,17 @@
     border-top: 1px solid var(--border);
     padding: 3.5px;
   }
-  .tb-page .tb-view-tabs > button {
+  .tb-page .tb-view-tabs > [role="radiogroup"] {
     flex: 1;
+    width: 100%;
+    flex-wrap: nowrap;
+    padding: 0;
+    gap: 0;
+    background: transparent;
+  }
+  .tb-page .tb-view-tabs [role="radio"] {
+    flex: 1;
+    min-width: 0;
     flex-direction: column;
     gap: 2px;
     height: 50.5px;

@@ -192,7 +192,7 @@ it("reads models for the selected account and remembered range, with a tokens sw
       ([path]) => path.includes("account=gateway") && path.includes("range=d30"),
     ),
   ).toBe(true);
-  fireEvent.click(screen.getByRole("button", { name: "Tokens" }));
+  fireEvent.click(screen.getByRole("radio", { name: "Tokens" }));
   await screen.findByText("1.5M");
   fireEvent.click(screen.getByRole("button", { name: "Usage range" }));
   fireEvent.click(screen.getByRole("button", { name: /^7 days/ }));

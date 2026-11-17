@@ -159,7 +159,7 @@ def test_signed_in_boards_and_ancestor_boundaries(browser: Browser, frame_origin
             expect(frame.get_by_role(role, name=name, exact=True)).to_be_visible()
             expect(frame.get_by_role("link", name="Sign in to Omnigent")).to_have_count(0)
             if path == "/frame/task-board":
-                frame.get_by_role("button", name="Routes", exact=True).click()
+                frame.get_by_role("radio", name="Routes", exact=True).click()
                 expect(
                     frame.get_by_role("heading", name="No tasks yet", exact=True)
                 ).to_be_visible()

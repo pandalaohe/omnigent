@@ -77,7 +77,7 @@ it("opens a provider named new, renders fixed columns and compact accessible sta
 it("clears filters, focuses the added model and removes an empty new row on blur", async () => {
   await page();
   fireEvent.change(screen.getByLabelText("Filter models"), { target: { value: "missing" } });
-  fireEvent.click(screen.getByRole("button", { name: "Needs attention" }));
+  fireEvent.click(screen.getByRole("radio", { name: "Needs attention" }));
   fireEvent.click(screen.getByRole("button", { name: "Add model" }));
   expect(screen.getByLabelText("Filter models")).toHaveValue("");
   const inputs = screen
@@ -158,7 +158,7 @@ it("refreshes new usage by stable key while preserving requested-id edits and ro
   expect(screen.queryByLabelText("Display name free")).toBeNull();
   expect(screen.getByRole("button", { name: "Used by 2 users" })).toBeVisible();
   expect(screen.getByRole("button", { name: "Remove provider" })).toBeDisabled();
-  fireEvent.click(screen.getByRole("button", { name: "In use" }));
+  fireEvent.click(screen.getByRole("radio", { name: "In use" }));
   expect(screen.getByLabelText("Display name speech")).toBeVisible();
 });
 
