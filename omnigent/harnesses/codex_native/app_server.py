@@ -3286,6 +3286,9 @@ class CodexNativeAppServer:
             config_source,
             inject_hooks=self.router_hooks_registered,
             extend_model_catalog=codex_extended_catalog_requested(self.env),
+            catalog_config_overrides=self.config_overrides,
+            catalog_profile=self.config_profile,
+            catalog_codex_version=codex_version,
             supported_efforts=CODEX_NATIVE_EFFORTS,
             minimal_config=minimal_config,
         )

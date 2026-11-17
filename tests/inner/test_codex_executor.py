@@ -7392,6 +7392,7 @@ def test_populate_codex_home_config_minimal_mode_keeps_only_provider_routing(
     (source / "AGENTS.md").write_text("global guidance")
     (source / "models.json").write_text('{"models": []}')
     (source / "config.toml").write_text(
+        'openai_base_url = "http://127.0.0.1:9876/codex/omnigent"\n'
         'model_provider = "Databricks"\n'
         '[model_providers.Databricks]\nname = "Databricks"\nbase_url = "https://example"\n'
         "[plugins.example]\nenabled = true\n"
@@ -7414,6 +7415,7 @@ def test_populate_codex_home_config_minimal_mode_keeps_only_provider_routing(
     assert "mcp_servers" not in config_text
     assert "marketplaces" not in config_text
     config = tomlkit.parse(config_text)
+    assert config["openai_base_url"] == "http://127.0.0.1:9876/codex/omnigent"
     assert config["profiles"]["work"]["model_catalog_json"] == str(source / "models.json")
 
 
