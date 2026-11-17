@@ -76,7 +76,7 @@ it.each(["user", "agent"] as const)(
   "keeps the control on a colliding id whose origin is %s",
   (origin) => {
     const view = mount({ ...collidingShell, origin, elevated: false, agentTier: "read_write" });
-    expect(screen.getByRole("group", { name: "Agent access" })).toBeInTheDocument();
+    expect(screen.getByRole("radiogroup", { name: "Agent access" })).toBeInTheDocument();
     view.dispose();
   },
 );
@@ -125,9 +125,9 @@ it("keeps a linked host shell's tier control and host badge", async () => {
     }),
   );
   const view = mount(terminal);
-  expect(screen.getByRole("group", { name: "Agent access" })).toBeInTheDocument();
+  expect(screen.getByRole("radiogroup", { name: "Agent access" })).toBeInTheDocument();
   expect(screen.getByText("Host A")).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "Read" }));
+  fireEvent.click(screen.getByRole("radio", { name: "Read" }));
   await waitFor(() =>
     expect(authenticatedFetch).toHaveBeenCalledWith(
       `/v1/sessions/session-a/host-terminals/host-a/${"a".repeat(32)}`,
