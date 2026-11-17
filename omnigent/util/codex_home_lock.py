@@ -21,6 +21,8 @@ from typing import Any, ParamSpec, TypeVar, cast
 _logger = logging.getLogger(__name__)
 _TIMEOUT = 15.0
 _POLL = 0.1
+_REPLACE_ATTEMPTS = 5
+_REPLACE_DELAY = 0.05
 _local = threading.local()
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -64,16 +66,25 @@ def _snapshots() -> dict[Path, bytes | None]:
     return _local.snapshots
 
 
+def _held_locks() -> set[Path]:
+    if not hasattr(_local, "held_locks"):
+        _local.held_locks = set()
+    return _local.held_locks
+
+
 @contextmanager
 def home_lock(config_path: Path) -> Iterator[None]:
     """Hold the publisher's exclusive lock, reentrant within one thread."""
     path = config_path.parent.resolve() / config_path.name
     snapshots = _snapshots()
-    if path in snapshots:
+    lock_path = path.parent / ".collab-generations" / "home.lock"
+    held = _held_locks()
+    if lock_path in held:
+        if path not in snapshots:
+            snapshots[path] = _read(path)
         yield
         return
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    lock_path = path.parent / ".collab-generations" / "home.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as handle:
         deadline = time.monotonic() + _TIMEOUT
@@ -99,15 +110,19 @@ def home_lock(config_path: Path) -> Iterator[None]:
             }
             handle.write((json.dumps(holder, sort_keys=True) + "\n").encode())
             handle.flush()
+            held.add(lock_path)
             snapshots[path] = _read(path)
             yield
         finally:
-            snapshots.pop(path, None)
+            held.discard(lock_path)
+            for key in tuple(snapshots):
+                if key.parent == path.parent:
+                    snapshots.pop(key)
             _lock(handle.fileno(), release=True)
 
 
 def config_writer(
-    argument: str, *, home: bool = False, busy: Any = None
+    argument: str, *, home: bool = False, busy: Any = None, required: bool = False
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Lock before reading and rerun a writer if its checked replacement conflicts."""
 
@@ -138,6 +153,10 @@ def config_writer(
                 )
             except HomeBusy:
                 _logger.warning("Codex home lock busy; retry on next sync")
+            if required:
+                raise HomeBusy(
+                    "Codex private-home configuration could not be published; retry this launch"
+                )
             return cast(R, busy(bound.arguments) if callable(busy) else busy)
 
         return wrapped
@@ -151,15 +170,28 @@ def replace_config(temporary: str | Path, path: Path) -> None:
     snapshots = _snapshots()
     if key not in snapshots:
         raise RuntimeError("Codex config replacement requires the home lock")
-    if _read(path) != snapshots[key]:
-        raise ConfigChanged
-    if snapshots[key] is None:
+    first_error: PermissionError | None = None
+    for attempt in range(_REPLACE_ATTEMPTS):
+        if _read(path) != snapshots[key]:
+            raise ConfigChanged
+        if snapshots[key] is None:
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                raise ConfigChanged from None
+            break
         try:
-            os.link(temporary, path)
-        except FileExistsError:
-            raise ConfigChanged from None
-    else:
-        os.replace(temporary, path)
+            os.replace(temporary, path)
+            break
+        except PermissionError as error:
+            # winerror identifies Windows access/sharing errors; POSIX errors propagate.
+            if getattr(error, "winerror", None) not in (5, 32):
+                raise
+            if first_error is None:
+                first_error = error
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise first_error from None
+            time.sleep(_REPLACE_DELAY)
     snapshots[key] = _read(path)
 
 

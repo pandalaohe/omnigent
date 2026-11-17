@@ -1,17 +1,26 @@
+import errno
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from omnigent.harnesses.codex_native.app_server import (
+    _build_native_codex_app_server_argv,
     _pin_codex_config_model,
     _sync_codex_developer_instructions,
 )
 from omnigent.harnesses.codex_native.bridge import _upsert_top_level_config_key
 from omnigent.harnesses.codex_native.launch_args import materialize_codex_config_profile
-from omnigent.inner.codex_executor import _sync_codex_role_defaults, _sync_codex_windows_sandbox
+from omnigent.inner.codex_executor import (
+    _populate_codex_home_config,
+    _sync_codex_role_defaults,
+    _sync_codex_windows_sandbox,
+    materialize_codex_provider_config,
+)
 from omnigent.util import codex_home_lock
 
 
@@ -104,6 +113,7 @@ def test_external_holder_waits_then_skips_and_next_sync_succeeds(tmp_path, monke
         text=True,
     )
     try:
+        assert child.stdout is not None
         assert child.stdout.readline().strip() == "held"
         monkeypatch.setattr(codex_home_lock, "_TIMEOUT", 0.02)
         sleeps = []
@@ -150,3 +160,143 @@ def test_windows_uses_msvcrt_byte_zero(monkeypatch, tmp_path):
         assert handle.tell() == 0
         codex_home_lock._windows_lock(handle.fileno(), release=True)
         assert calls == [(handle.fileno(), 2, 1), (handle.fileno(), 0, 1)]
+
+
+@pytest.mark.parametrize("failure", ["busy", "changed"])
+def test_provider_write_failure_refuses_credential_bearing_argv(tmp_path, monkeypatch, failure):
+    home = tmp_path / "private"
+    home.mkdir()
+    config = home / "config.toml"
+    config.write_text('model = "original"\n')
+    overrides = [
+        'model_provider="custom"',
+        'model_providers.custom.name="Custom"',
+        'model_providers.custom.base_url="https://provider.example/v1"',
+        'model_providers.custom.experimental_bearer_token="test-only-credential"',
+        'model_providers.custom.auth.command="test-only-auth-command"',
+    ]
+    held, release = threading.Event(), threading.Event()
+
+    def hold_home():
+        with codex_home_lock.home_lock(config):
+            held.set()
+            assert release.wait(5)
+
+    def build_argv():
+        safe = materialize_codex_provider_config(home, iter(overrides))
+        return _build_native_codex_app_server_argv(
+            codex_argv0="codex",
+            session_tag="test-session",
+            listen_url="unix:///opt/work/codex.sock",
+            config_overrides=safe,
+        )
+
+    argv = []
+    if failure == "busy":
+        monkeypatch.setattr(codex_home_lock, "_TIMEOUT", 0.01)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            holder = executor.submit(hold_home)
+            try:
+                assert held.wait(3)
+                with pytest.raises(codex_home_lock.HomeBusy, match=r"retry.*launch"):
+                    argv.extend(build_argv())
+            finally:
+                release.set()
+                holder.result(timeout=3)
+    else:
+        read_text = Path.read_text
+        edits = 0
+
+        def read_and_change(path, *args, **kwargs):
+            nonlocal edits
+            text = read_text(path, *args, **kwargs)
+            if path == config:
+                edits += 1
+                config.write_text(f'model = "concurrent-{edits}"\n')
+            return text
+
+        monkeypatch.setattr(Path, "read_text", read_and_change)
+        with pytest.raises(codex_home_lock.HomeBusy, match=r"retry.*launch"):
+            argv.extend(build_argv())
+        assert edits == 3
+    assert argv == []
+    assert "test-only-credential" not in config.read_bytes().decode()
+    assert "test-only-auth-command" not in config.read_bytes().decode()
+
+
+def test_plain_home_initialization_writes_nested_route_record(tmp_path, monkeypatch, caplog):
+    source, private, home = tmp_path / "source", tmp_path / "private", tmp_path / "home"
+    source.mkdir()
+    (source / "config.toml").write_text('model = "source"\n')
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(codex_home_lock, "_TIMEOUT", 0.01)
+    _populate_codex_home_config(private, source, minimal_config=False)
+    assert (private / ".omnigent-codex-route").read_text() == "none"
+    assert "lock busy" not in caplog.text
+
+
+@pytest.mark.parametrize("winerror", [5, 32])
+def test_windows_replace_retries_sharing_conflict(tmp_path, monkeypatch, winerror):
+    config = tmp_path / "config.toml"
+    config.write_text('model = "old"\n')
+    replace = codex_home_lock.os.replace
+    attempts, waits = [], []
+
+    def replace_with_reader(source, target):
+        attempts.append(target)
+        if len(attempts) <= 2:
+            error = PermissionError(errno.EACCES, "reader holds file")
+            monkeypatch.setattr(error, "winerror", winerror, raising=False)
+            raise error
+        replace(source, target)
+
+    monkeypatch.setattr(codex_home_lock.os, "replace", replace_with_reader)
+    monkeypatch.setattr(codex_home_lock.time, "sleep", waits.append)
+    with codex_home_lock.home_lock(config):
+        codex_home_lock.write_config(config, 'model = "new"\n')
+    assert config.read_text() == 'model = "new"\n'
+    assert len(attempts) == 3
+    assert waits == [0.05, 0.05]
+
+
+def test_windows_replace_rechecks_config_after_sharing_conflict(tmp_path, monkeypatch):
+    config = tmp_path / "config.toml"
+    config.write_text('openai_base_url = "https://old.example"\n')
+    concurrent = 'openai_base_url = "https://new.example"\n'
+    attempts = []
+
+    def replace_and_change(source, target):
+        attempts.append(target)
+        config.write_text(concurrent)
+        error = PermissionError(errno.EACCES, "reader holds file")
+        monkeypatch.setattr(error, "winerror", 32, raising=False)
+        raise error
+
+    monkeypatch.setattr(codex_home_lock.os, "replace", replace_and_change)
+    monkeypatch.setattr(codex_home_lock.time, "sleep", lambda seconds: None)
+    with codex_home_lock.home_lock(config), pytest.raises(codex_home_lock.ConfigChanged):
+        codex_home_lock.write_config(config, 'model = "stale-candidate"\n')
+    assert config.read_text() == concurrent
+    assert len(attempts) == 1
+
+
+@pytest.mark.parametrize("winerror, count", [(None, 1), (5, 5), (32, 5)])
+def test_replace_retry_bound_keeps_original(tmp_path, monkeypatch, winerror, count):
+    config = tmp_path / "config.toml"
+    original = 'model = "original"\n'
+    config.write_text(original)
+    errors = []
+
+    def fail_replace(source, target):
+        error = PermissionError(errno.EACCES, "file unavailable")
+        monkeypatch.setattr(error, "winerror", winerror, raising=False)
+        errors.append(error)
+        raise error
+
+    monkeypatch.setattr(codex_home_lock.os, "replace", fail_replace)
+    monkeypatch.setattr(codex_home_lock.time, "sleep", lambda seconds: None)
+    with codex_home_lock.home_lock(config), pytest.raises(PermissionError) as failure:
+        codex_home_lock.write_config(config, 'model = "candidate"\n')
+    assert config.read_text() == original
+    assert len(errors) == count
+    assert failure.value is errors[0]

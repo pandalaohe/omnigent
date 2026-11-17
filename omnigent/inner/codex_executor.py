@@ -1783,7 +1783,7 @@ def _populate_codex_home_config(
                 )
 
 
-@config_writer("codex_home", home=True, busy=lambda arguments: list(arguments["config_overrides"]))
+@config_writer("codex_home", home=True, required=True)
 def materialize_codex_provider_config(
     codex_home: Path,
     config_overrides: Iterable[str],
