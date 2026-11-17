@@ -113,8 +113,10 @@ export function QuestionDictationControls({
         setNotice("Draft changed; original kept.");
         return;
       }
-      if (result.text !== suffix)
-        apply(take, [prefix, result.text].filter(Boolean).join(" "), true);
+      if (result.text !== suffix) {
+        take.expected = apply(take, [prefix, result.text].filter(Boolean).join(" "), true);
+        take.revision = getRevision();
+      }
       setNotice("");
     } catch {
       if (aliveRef.current && !controller.signal.aborted)
@@ -129,12 +131,6 @@ export function QuestionDictationControls({
         questionCard
         disabled={disabled}
         className="!size-7"
-        onCleanup={(original, text) => {
-          const take = takeRef.current;
-          if (!aliveRef.current || !take || take.raw !== original || !matches(take)) return;
-          take.expected = apply(take, text, true);
-          take.revision = getRevision();
-        }}
         onVoiceStart={() => {
           abortRef.current?.abort();
           setNotice("");
@@ -180,8 +176,12 @@ export function QuestionDictationControls({
           takeRef.current = null;
         }}
         onVoiceEnd={() => {
-          if (!aliveRef.current || !takeRef.current?.raw) return;
-          if (mode !== "off") void clean();
+          const take = takeRef.current;
+          if (!aliveRef.current || !take?.raw) return;
+          void clean().finally(() => {
+            if (aliveRef.current && takeRef.current === take && matches(take))
+              inputRef.current?.focus({ preventScroll: true });
+          });
         }}
       />
       <span role="status" className="text-sm text-muted-foreground">

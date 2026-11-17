@@ -9,6 +9,7 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   ImagePlusIcon,
+  EraserIcon,
   SquareIcon,
   XIcon,
 } from "lucide-react";
@@ -23,6 +24,7 @@ import {
   useState,
 } from "react";
 import { isKeyOwningOverlayOpen } from "@/lib/hotkeys";
+import { replaceDictatedText } from "@/lib/replaceDictatedText";
 import { Button } from "@/components/ui/button";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { QuestionDictationControls } from "@/components/QuestionDictationControls";
@@ -1053,6 +1055,27 @@ export function AskUserQuestionForm({
                 />
               </div>
               <div className="flex flex-wrap items-center gap-2 pl-6">
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  aria-label="Clear answer"
+                  title="Clear answer"
+                  disabled={submitting || !customRowValue}
+                  onClick={() => {
+                    replaceDictatedText(
+                      customInputRef.current,
+                      customRowValue,
+                      0,
+                      customRowValue.length,
+                      "",
+                    );
+                    commitCustomText(currentKey, "", 0);
+                    customInputRef.current?.focus({ preventScroll: true });
+                  }}
+                >
+                  <EraserIcon className="size-3.5" />
+                </Button>
                 {!current.isSecret && (
                   <QuestionDictationControls
                     key={currentKey}

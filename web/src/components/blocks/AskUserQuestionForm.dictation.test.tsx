@@ -67,6 +67,52 @@ async function stop() {
 }
 
 describe("question-card dictated segments", () => {
+  it("selects and focuses the dictated answer instead of the default option, then submits it", async () => {
+    const onSubmit = vi.fn();
+    render(
+      <AskUserQuestionForm
+        questions={[
+          {
+            id: "answer",
+            question: "Choose",
+            multiSelect: false,
+            options: [{ label: "Default", description: "Preset" }],
+          },
+        ]}
+        onSubmit={onSubmit}
+        onReject={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("radio", { name: /Default/ })).toBeChecked();
+    await dictate("spoken answer");
+    await stop();
+    const field = screen.getByRole("textbox", { name: "Custom answer" });
+    expect(field).toHaveFocus();
+    expect(screen.getByRole("radio", { name: "Select custom answer" })).toBeChecked();
+    expect(screen.getByRole("radio", { name: /Default/ })).not.toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "Submit" }));
+    expect(onSubmit).toHaveBeenCalledWith({ answer: "Do not deploy /opt/work/app at 12:30." });
+  });
+
+  it("clears the answer in one click and rejects an outstanding cleanup", async () => {
+    let finish!: (value: { text: string }) => void;
+    vi.mocked(voiceApi.cleanupDictation).mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    renderCard();
+    await dictate("old words");
+    await stop();
+    const field = screen.getByRole("textbox", { name: "Custom answer" });
+    fireEvent.click(screen.getByRole("button", { name: "Clear answer" }));
+    expect(field).toHaveValue("");
+    expect(field).toHaveFocus();
+    await act(async () => finish({ text: "late cleanup" }));
+    expect(field).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Clear answer" })).toBeDisabled();
+  });
+
   it("replaces only the segment at the cursor with no extra buttons", async () => {
     const { onSubmit, onReject } = renderCard();
     const field = screen.getByRole("textbox", { name: "Custom answer" });

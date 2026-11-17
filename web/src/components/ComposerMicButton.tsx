@@ -196,6 +196,7 @@ export const ComposerMicButton = ({
   // first take cold-loads the model, up to ~40s). Shows a spinner so the click
   // isn't a dead-looking button until it flips to listening.
   const [connecting, setConnecting] = useState(false);
+  const [processing, setProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const sessionRef = useRef<DictationSession | null>(null);
@@ -329,6 +330,7 @@ export const ComposerMicButton = ({
     segmentsRef.current = [];
     cleanupAbortRef.current?.abort();
     webSpeechTakeRef.current = null;
+    setProcessing(false);
     sessionRef.current?.cancel();
     sessionRef.current = null;
     try {
@@ -349,7 +351,8 @@ export const ComposerMicButton = ({
     if (!wasListeningRef.current) return;
     wasListeningRef.current = false;
     const generation = takeGenerationRef.current;
-    void punctuationQueueRef.current.then(async () => {
+    if (!discardingRef.current) setProcessing(true);
+    const completion = punctuationQueueRef.current.then(async () => {
       if (
         mountedRef.current &&
         !discardingRef.current &&
@@ -418,6 +421,9 @@ export const ComposerMicButton = ({
       if (generation === takeGenerationRef.current && activeTake?.owner === ownerRef.current)
         activeTake = null;
     });
+    void completion.finally(() => {
+      if (mountedRef.current && generation === takeGenerationRef.current) setProcessing(false);
+    });
   }, [isListening, connecting, inputRef]);
 
   // Surface a failure both in the button (tooltip + red tint) and as a toast,
@@ -459,6 +465,7 @@ export const ComposerMicButton = ({
         return;
       }
       discardingRef.current = false;
+      setProcessing(false);
       takeGenerationRef.current += 1;
       punctuationQueueRef.current = Promise.resolve();
       segmentsRef.current = [];
@@ -578,6 +585,7 @@ export const ComposerMicButton = ({
     punctuationQueueRef.current = Promise.resolve();
     cleanupAbortRef.current?.abort();
     segmentsRef.current = [];
+    setProcessing(false);
     if (!isListening) return;
     if (sessionRef.current) {
       sessionRef.current.cancel();
@@ -689,6 +697,7 @@ export const ComposerMicButton = ({
       serverBusyRef.current = true;
       const session = sessionRef.current;
       if (session) {
+        setProcessing(true);
         const generation = takeGenerationRef.current;
         sessionRef.current = null;
         const orderedWithWebTake = serverContinuesWebTakeRef.current;
@@ -722,6 +731,7 @@ export const ComposerMicButton = ({
       }
       try {
         discardingRef.current = false;
+        setProcessing(false);
         interimRef.current = "";
         setConnecting(true);
         if (!continueTake) {
@@ -916,9 +926,11 @@ export const ComposerMicButton = ({
     transitionRef.current = true;
     try {
       if (isListening) {
+        setProcessing(true);
         webSpeechTakeRef.current = null;
         recognition.stop();
       } else {
+        setProcessing(false);
         const now = Date.now();
         webSpeechTakeRef.current = {
           lastSpeechAt: now,
@@ -1017,7 +1029,9 @@ export const ComposerMicButton = ({
   // Stable accessible name with aria-pressed signals toggle state to
   // screen readers. Error text takes over the tooltip when set.
   const a11yLabel = "Voice dictation";
-  const tooltip = error ?? (connecting ? "Starting voice input…" : a11yLabel);
+  const tooltip =
+    error ??
+    (processing ? "Processing voice input…" : connecting ? "Starting voice input…" : a11yLabel);
 
   return (
     <KeyboardShortcutTooltip
@@ -1033,7 +1047,7 @@ export const ComposerMicButton = ({
         aria-pressed={isListening}
         // While listening, Escape cancels dictation before page-wide shortcuts see it.
         data-escape-owner={isListening ? "" : undefined}
-        aria-busy={connecting}
+        aria-busy={connecting || processing}
         aria-label={a11yLabel}
         data-composer-action="microphone"
         data-server-dictation-available={serverAvailable}
@@ -1046,8 +1060,12 @@ export const ComposerMicButton = ({
           className,
         )}
       >
-        {connecting ? (
-          <Loader2Icon className="size-4 animate-spin" data-icon-size="16" aria-hidden />
+        {connecting || processing ? (
+          <Loader2Icon
+            className="size-4 animate-spin motion-reduce:animate-none"
+            data-icon-size="16"
+            aria-hidden
+          />
         ) : isListening ? (
           // Bars fade out and stop icon fades in on hover OR keyboard focus,
           // so keyboard users get the stop affordance without needing hover.
