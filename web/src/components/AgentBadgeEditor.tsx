@@ -1,3 +1,4 @@
+import { Segmented } from "@/components/ui/segmented";
 import { useEffect, useId, useState } from "react";
 
 import { Input } from "@/components/ui/input";
@@ -164,35 +165,20 @@ export function AgentBadgeEditor({
             />
             <div className="grid gap-2">
               <span className="text-sm">Text color</span>
-              <div role="group" aria-label="Text color mode" className="grid grid-cols-2 gap-2">
-                {[
-                  { label: "Follow theme", value: "theme" },
-                  { label: "Custom", value: "custom" },
-                ].map((mode) => (
-                  <button
-                    key={mode.value}
-                    type="button"
-                    aria-pressed={(textColor === "theme") === (mode.value === "theme")}
-                    onClick={() =>
-                      updateTextColor(
-                        mode.value === "theme"
-                          ? "theme"
-                          : textColor === "theme"
-                            ? "#e9d5ff"
-                            : textColor,
-                      )
-                    }
-                    className={cn(
-                      "min-h-11 rounded-lg border px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                      (textColor === "theme") === (mode.value === "theme")
-                        ? "border-foreground bg-accent text-foreground"
-                        : "border-border text-muted-foreground hover:bg-accent",
-                    )}
-                  >
-                    {mode.label}
-                  </button>
-                ))}
-              </div>
+              <Segmented
+                label="Text color mode"
+                value={textColor === "theme" ? "theme" : "custom"}
+                stretch
+                options={[
+                  { value: "theme", label: "Follow theme" },
+                  { value: "custom", label: "Custom" },
+                ]}
+                onChange={(mode) =>
+                  updateTextColor(
+                    mode === "theme" ? "theme" : textColor === "theme" ? "#e9d5ff" : textColor,
+                  )
+                }
+              />
               {textColor !== "theme" && (
                 <ColorField
                   label="Text color"

@@ -48,7 +48,7 @@ describe("AgentBadgeEditor", () => {
       borderColor: "#3b82f6",
       textColor: "#eeeeee",
     });
-    fireEvent.click(screen.getByRole("button", { name: "Follow theme" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Follow theme" }));
     expect(onChange).toHaveBeenLastCalledWith({
       label: "AI",
       borderColor: "#3b82f6",

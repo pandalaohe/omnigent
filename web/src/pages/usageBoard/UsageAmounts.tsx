@@ -1,3 +1,4 @@
+import { Segmented } from "@/components/ui/segmented";
 import { boardPath } from "@/lib/boardFrame";
 import { Link } from "@/lib/routing";
 import {
@@ -7,7 +8,6 @@ import {
   HistoryIcon,
   TriangleAlertIcon,
 } from "lucide-react";
-import { Button } from "@/components/ui/button";
 import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { cn } from "@/lib/utils";
@@ -26,24 +26,15 @@ import { FigureText } from "./UsageFigure";
 export function UsageUnitControl() {
   const tokens = useUsageContextPreferences().board.unit === "tokens";
   return (
-    <div
-      className="inline-flex items-center rounded-md bg-muted/40 p-0.5"
-      role="group"
-      aria-label="Usage measure"
-    >
-      {(["money", "tokens"] as const).map((unit) => (
-        <Button
-          key={unit}
-          size="sm"
-          variant={tokens === (unit === "tokens") ? "secondary" : "ghost"}
-          className="min-h-11 px-2 text-xs md:min-h-[30px] md:h-[30px]"
-          aria-pressed={tokens === (unit === "tokens")}
-          onClick={() => patchUsageBoardPreferences({ unit })}
-        >
-          {unit === "money" ? "Money" : "Tokens"}
-        </Button>
-      ))}
-    </div>
+    <Segmented
+      label="Usage measure"
+      value={tokens ? "tokens" : "money"}
+      options={[
+        { value: "money", label: "Money" },
+        { value: "tokens", label: "Tokens" },
+      ]}
+      onChange={(unit) => patchUsageBoardPreferences({ unit })}
+    />
   );
 }
 

@@ -331,31 +331,23 @@ export function CallingDefaultsSection() {
                   className="h-auto w-full rounded-none! bg-transparent p-0"
                 />
               ) : (
-                <div className="flex min-w-0 flex-wrap gap-2">
-                  {hostList.map((candidate) => {
-                    const selected = candidate.host_id === host?.host_id;
-                    const name = candidate.name || candidate.host_id;
-                    return (
-                      <Button
-                        key={candidate.host_id}
-                        type="button"
-                        variant={selected ? "secondary" : "outline"}
-                        size="sm"
-                        className="max-w-full"
-                        aria-pressed={selected}
-                        onClick={() => setSelectedHostId(candidate.host_id)}
-                        data-testid={`calling-defaults-host-${candidate.host_id}`}
-                      >
-                        <span className="min-w-0 truncate" title={name}>
-                          {name}
-                        </span>
-                        {candidate.status !== "online" && (
-                          <span className="shrink-0 text-xs text-muted-foreground">(offline)</span>
-                        )}
-                      </Button>
-                    );
-                  })}
-                </div>
+                <Segmented
+                  label="Host"
+                  value={host?.host_id ?? ""}
+                  onChange={setSelectedHostId}
+                  className="flex-wrap"
+                  options={hostList.map((candidate) => ({
+                    value: candidate.host_id,
+                    label: (
+                      <span className="min-w-0 truncate">
+                        {candidate.name || candidate.host_id}
+                        {candidate.status !== "online" ? " (offline)" : ""}
+                      </span>
+                    ),
+                    title: candidate.name || candidate.host_id,
+                    testId: `calling-defaults-host-${candidate.host_id}`,
+                  }))}
+                />
               )}
               {host && (
                 <div className="flex min-w-0 flex-col gap-2 rounded-md border p-3">

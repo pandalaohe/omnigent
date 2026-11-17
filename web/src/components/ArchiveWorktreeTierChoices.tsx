@@ -33,7 +33,7 @@ export function ArchiveWorktreeTierChoices({
           key={value}
           className={cn(
             "flex min-h-11 cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-ui md:min-h-9",
-            mode === value ? "border-primary bg-primary/5" : "border-border",
+            mode === value ? "border-foreground bg-primary/5" : "border-border",
             value === "yellow_too" && "text-destructive",
             disabled && "cursor-not-allowed opacity-60",
           )}

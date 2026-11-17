@@ -1,3 +1,4 @@
+import { Segmented } from "@/components/ui/segmented";
 import {
   CalendarRangeIcon,
   CheckIcon,
@@ -212,30 +213,19 @@ export function ArchiveLibraryToolbar({
             className="h-8 pl-8 text-xs"
           />
         </div>
-        <div className="flex shrink-0 rounded-md border bg-muted/20 p-0.5">
-          {(["title", "content"] as const).map((scope) => (
-            <Tooltip key={scope}>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  aria-pressed={value.searchScope === scope}
-                  className={cn(
-                    "h-6 rounded px-1.5 text-ui text-muted-foreground",
-                    value.searchScope === scope && "bg-background text-foreground shadow-sm",
-                  )}
-                  onClick={() => onChange({ searchScope: scope, searchQuery: "" })}
-                >
-                  {scope === "title" ? "Title" : "Content"}
-                </button>
-              </TooltipTrigger>
-              <TooltipContent>
-                {scope === "title"
-                  ? "Search only session titles."
-                  : "Search message and response content, then open the exact matching window."}
-              </TooltipContent>
-            </Tooltip>
-          ))}
-        </div>
+        <Segmented
+          label="Archive search scope"
+          value={value.searchScope}
+          options={(["title", "content"] as const).map((scope) => ({
+            value: scope,
+            label: scope === "title" ? "Title" : "Content",
+            title:
+              scope === "title"
+                ? "Search only session titles."
+                : "Search message and response content, then open the exact matching window.",
+          }))}
+          onChange={(searchScope) => onChange({ searchScope, searchQuery: "" })}
+        />
         <Popover>
           <Tooltip>
             <TooltipTrigger asChild>
@@ -351,32 +341,19 @@ export function ArchiveLibraryToolbar({
             className="w-[calc(100vw-1rem)] max-w-[20rem] space-y-3 p-3"
             data-testid="archive-date-popover"
           >
-            <div
-              role="group"
-              aria-label="Archive date dimension"
-              className="grid grid-cols-3 rounded-md border bg-muted/20 p-0.5"
-            >
-              {(
+            <Segmented
+              label="Archive date dimension"
+              value={value.dateField}
+              stretch
+              options={(
                 [
                   ["created_at", "Created"],
                   ["active_at", "Active"],
                   ["archived_at", "Archived"],
                 ] as const
-              ).map(([field, label]) => (
-                <button
-                  key={field}
-                  type="button"
-                  aria-pressed={value.dateField === field}
-                  className={cn(
-                    "h-7 rounded px-2 text-xs text-muted-foreground",
-                    value.dateField === field && "bg-background text-foreground shadow-sm",
-                  )}
-                  onClick={() => onChange({ dateField: field })}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
+              ).map(([field, label]) => ({ value: field, label }))}
+              onChange={(dateField) => onChange({ dateField })}
+            />
             <ArchiveDateRangePicker
               value={value.dateRange}
               onValueChange={(dateRange) => onChange({ dateRange })}

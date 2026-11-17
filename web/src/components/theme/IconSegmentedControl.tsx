@@ -69,9 +69,9 @@ export function IconSegmentedControl<T extends string>({
                     refs.current.get(next)?.focus();
                   }}
                   className={cn(
-                    "flex size-9 items-center justify-center rounded-md text-muted-foreground transition-colors",
+                    "flex size-9 items-center justify-center rounded-md text-muted-foreground transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
                     selected
-                      ? "bg-background text-foreground shadow-sm ring-1 ring-border"
+                      ? "bg-primary-cta text-primary-cta-foreground"
                       : "hover:bg-background/60 hover:text-foreground",
                   )}
                 >

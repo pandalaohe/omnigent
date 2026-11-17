@@ -1,3 +1,4 @@
+import { Segmented } from "@/components/ui/segmented";
 import { boardSourceColors } from "./taskBoardVisual";
 import {
   Fragment,
@@ -1473,24 +1474,24 @@ export function TaskBoardRoutes({
       data-route-level={mode === "order" ? "order" : level}
     >
       <div className="rt-toolbar">
-        <div className="tb-segment" role="group" aria-label={t("routes.mode")}>
-          {(["order", "time"] as const).map((value) => (
-            <Button
-              key={value}
-              size="sm"
-              variant={mode === value ? "secondary" : "ghost"}
-              aria-pressed={mode === value}
-              onClick={() => {
-                onMode(value);
-                setOpen(null);
-                hoverStore.set({ hover: null, hub: null });
-              }}
-            >
-              {value === "order" ? <RouteIcon size={15} /> : <ClockIcon size={15} />}{" "}
-              {t(`routes.${value}`)}
-            </Button>
-          ))}
-        </div>
+        <Segmented
+          label={t("routes.mode")}
+          value={mode}
+          onChange={(value) => {
+            onMode(value);
+            setOpen(null);
+            hoverStore.set({ hover: null, hub: null });
+          }}
+          options={(["order", "time"] as const).map((value) => ({
+            value,
+            label: (
+              <>
+                {value === "order" ? <RouteIcon size={15} /> : <ClockIcon size={15} />}
+                {t(`routes.${value}`)}
+              </>
+            ),
+          }))}
+        />
         <div className="rt-controls">
           {mode === "time" && (
             <>

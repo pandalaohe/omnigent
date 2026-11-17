@@ -89,9 +89,9 @@ describe("ArchiveDateRangePicker", () => {
     render(<PresetHarness />);
 
     expect(screen.getByLabelText("Archive day or date range")).toHaveValue("");
-    expect(screen.getByRole("button", { name: "Last 30 days" })).toHaveTextContent("<30d");
-    expect(screen.getByRole("button", { name: "Last 30 days" })).toHaveAttribute(
-      "aria-pressed",
+    expect(screen.getByRole("radio", { name: "Last 30 days" })).toHaveTextContent("<30d");
+    expect(screen.getByRole("radio", { name: "Last 30 days" })).toHaveAttribute(
+      "aria-checked",
       "true",
     );
   });
@@ -124,8 +124,8 @@ describe("ArchiveDateRangePicker", () => {
       target: { value: "20260901-20260904" },
     });
 
-    expect(screen.getByRole("button", { name: "Last 30 days" })).toHaveAttribute(
-      "aria-pressed",
+    expect(screen.getByRole("radio", { name: "Last 30 days" })).toHaveAttribute(
+      "aria-checked",
       "false",
     );
     expect(screen.getByLabelText("Archive day or date range")).toHaveValue("20260901-20260904");
@@ -138,8 +138,8 @@ describe("ArchiveDateRangePicker", () => {
       target: { value: "202609" },
     });
 
-    expect(screen.getByRole("button", { name: "Last 30 days" })).toHaveAttribute(
-      "aria-pressed",
+    expect(screen.getByRole("radio", { name: "Last 30 days" })).toHaveAttribute(
+      "aria-checked",
       "true",
     );
   });
@@ -165,11 +165,11 @@ describe("ArchiveDateRangePicker", () => {
       target: { value: "20260901-20260904" },
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Last 7 days" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Last 7 days" }));
 
     expect(screen.getByLabelText("Archive day or date range")).toHaveValue("");
-    expect(screen.getByRole("button", { name: "Last 7 days" })).toHaveAttribute(
-      "aria-pressed",
+    expect(screen.getByRole("radio", { name: "Last 7 days" })).toHaveAttribute(
+      "aria-checked",
       "true",
     );
   });

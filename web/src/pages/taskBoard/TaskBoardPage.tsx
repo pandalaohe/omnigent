@@ -1,3 +1,4 @@
+import { Segmented } from "@/components/ui/segmented";
 import { boardAttention } from "./boardAttentionData";
 import { TaskBoardAttention } from "./TaskBoardAttention";
 import { boardExitProps } from "@/lib/boardFrame";
@@ -127,39 +128,29 @@ function TaskBoardContent({
     <div className={`tb-page ${appearance.dark ? "dark" : ""}`} style={appearance.style}>
       <header className="tb-page-header">
         <nav className="tb-view-tabs" aria-label={t("board.views")}>
-          <Button
-            variant={preferences.view === "sessions" ? "secondary" : "ghost"}
-            aria-pressed={preferences.view === "sessions"}
-            onClick={() => updatePreferences({ view: "sessions" })}
-          >
-            <ListTreeIcon className="size-4" />
-            {t("view.sessions")}
-          </Button>
-          <Button
-            variant={preferences.view === "routes" ? "secondary" : "ghost"}
-            aria-pressed={preferences.view === "routes"}
-            onClick={() => updatePreferences({ view: "routes" })}
-          >
-            <RouteIcon className="size-4" />
-            {t("view.routes")}
-          </Button>
-          {(
-            [
-              ["log", ScrollTextIcon],
-              ["history", HistoryIcon],
-              ["today", CalendarDaysIcon],
-            ] as const
-          ).map(([view, Icon]) => (
-            <Button
-              key={view}
-              variant={preferences.view === view ? "secondary" : "ghost"}
-              aria-pressed={preferences.view === view}
-              onClick={() => updatePreferences({ view })}
-            >
-              <Icon className="size-4" />
-              {t(`view.${view}`)}
-            </Button>
-          ))}
+          <Segmented
+            label={t("board.views")}
+            className="flex-wrap"
+            value={preferences.view}
+            onChange={(view) => updatePreferences({ view })}
+            options={(
+              [
+                ["sessions", ListTreeIcon],
+                ["routes", RouteIcon],
+                ["log", ScrollTextIcon],
+                ["history", HistoryIcon],
+                ["today", CalendarDaysIcon],
+              ] as const
+            ).map(([value, Icon]) => ({
+              value,
+              label: (
+                <>
+                  <Icon className="size-4" />
+                  {t(`view.${value}`)}
+                </>
+              ),
+            }))}
+          />
         </nav>
         <div className="tb-header-controls">
           <BoardClock />

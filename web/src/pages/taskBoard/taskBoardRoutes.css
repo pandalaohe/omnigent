@@ -62,9 +62,9 @@
   font-size: 12.5px;
 }
 .rt-presets button[aria-pressed="true"] {
-  background: var(--card-solid);
-  color: var(--foreground);
-  box-shadow: 0 1px 4px #0002;
+  background: var(--primary-cta);
+  color: var(--primary-cta-foreground);
+  font-weight: 600;
 }
 .rt-zoom {
   gap: 2px;

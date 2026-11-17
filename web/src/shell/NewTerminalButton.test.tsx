@@ -134,10 +134,10 @@ describe("unified shell entry", () => {
     expect(screen.getByRole("option", { name: /Offline machine/ })).toBeDisabled();
     expect(screen.getByRole("option", { name: /Old machine.*update the host/ })).toBeDisabled();
     expect(
-      within(screen.getByRole("group", { name: "Initial agent access" })).getByRole("button", {
+      within(screen.getByRole("radiogroup", { name: "Initial agent access" })).getByRole("radio", {
         name: "Read & write",
       }),
-    ).toHaveAttribute("aria-pressed", "true");
+    ).toHaveAttribute("aria-checked", "true");
     fireEvent.click(screen.getByRole("button", { name: "Open shell" }));
     await waitFor(() =>
       expect(state.local).toHaveBeenCalledWith({
@@ -155,9 +155,9 @@ describe("unified shell entry", () => {
       target: { value: "host-b" },
     });
     fireEvent.click(screen.getByRole("checkbox", { name: "Administrator" }));
-    const group = within(screen.getByRole("group", { name: "Initial agent access" }));
-    expect(group.getByRole("button", { name: "Off" })).toHaveAttribute("aria-pressed", "true");
-    fireEvent.click(group.getByRole("button", { name: "Read" }));
+    const group = within(screen.getByRole("radiogroup", { name: "Initial agent access" }));
+    expect(group.getByRole("radio", { name: "Off" })).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(group.getByRole("radio", { name: "Read" }));
     fireEvent.click(screen.getByRole("button", { name: "Open shell" }));
     await waitFor(() =>
       expect(state.linked).toHaveBeenCalledWith({

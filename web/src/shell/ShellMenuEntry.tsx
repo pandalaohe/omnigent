@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { ReactNode } from "react";
 import { TerminalIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Segmented } from "@/components/ui/segmented";
 import { showToast } from "@/components/ui/toast";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -142,23 +143,15 @@ function ShellOptions({
       {reason && <p className="text-xs text-muted-foreground">{reason}</p>}
       <div className="flex flex-wrap items-center justify-between gap-2">
         <span>Agent access</span>
-        <div
-          role="group"
-          aria-label="Initial agent access"
-          className="inline-flex rounded-md border p-0.5"
-        >
-          {(["off", "read", "read_write"] as const).map((value) => (
-            <Button
-              key={value}
-              size="sm"
-              variant={tier === value ? "secondary" : "ghost"}
-              aria-pressed={tier === value}
-              onClick={() => setTier(value)}
-            >
-              {tierLabels[value]}
-            </Button>
-          ))}
-        </div>
+        <Segmented
+          label="Initial agent access"
+          value={tier}
+          onChange={setTier}
+          options={(["off", "read", "read_write"] as const).map((value) => ({
+            value,
+            label: tierLabels[value],
+          }))}
+        />
       </div>
       {admin && tier === "read_write" && (
         <p className="text-destructive">The agent can run administrator commands.</p>
@@ -238,8 +231,8 @@ export function ShellMenuEntry({
             </Button>
           </DialogTrigger>
           <DialogContent
-            className="max-h-[85dvh] overflow-y-auto rounded-b-none rounded-t-2xl"
-            style={{ top: "auto", bottom: 0, transform: "translateX(-50%)" }}
+            className="max-h-[85dvh] translate-y-0 overflow-y-auto rounded-b-none rounded-t-2xl"
+            style={{ top: "auto", bottom: 0 }}
           >
             <DialogTitle className="sr-only">Shell options</DialogTitle>
             <DialogDescription className="sr-only">

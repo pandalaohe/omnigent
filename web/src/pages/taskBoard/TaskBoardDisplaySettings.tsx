@@ -1,3 +1,4 @@
+import { Segmented } from "@/components/ui/segmented";
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { MonitorIcon, MoonIcon, SunIcon } from "lucide-react";
 import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
@@ -49,26 +50,26 @@ export function BoardAppearanceControls({
   return (
     <>
       {part !== "palette" && (
-        <div className="tb-segment" role="group" aria-label={t("display.theme")}>
-          {(
+        <Segmented
+          label={t("display.theme")}
+          value={preferences.theme}
+          onChange={(theme) => update({ theme })}
+          options={(
             [
               ["system", MonitorIcon],
               ["light", SunIcon],
               ["dark", MoonIcon],
             ] as const
-          ).map(([theme, Icon]) => (
-            <button
-              key={theme}
-              type="button"
-              aria-label={t(`display.${theme}`)}
-              title={t(`display.${theme}`)}
-              aria-pressed={preferences.theme === theme}
-              onClick={() => update({ theme })}
-            >
-              {labelled ? t(`display.${theme}`) : <Icon size={15} />}
-            </button>
-          ))}
-        </div>
+          ).map(([value, Icon]) => ({
+            value,
+            label: labelled ? (
+              t(`display.${value}`)
+            ) : (
+              <Icon size={15} aria-label={t(`display.${value}`)} />
+            ),
+            title: t(`display.${value}`),
+          }))}
+        />
       )}
       {part !== "theme" &&
         (PALETTES.length > COMBOBOX_OPTION_THRESHOLD ? (
@@ -169,32 +170,24 @@ export function TaskBoardDisplaySettings({
         <section>
           <h2>{t("display.opening")}</h2>
           <Row label={t("display.defaultView")} hint={t("display.nextOpen")}>
-            <div className="tb-segment">
-              {boardViews.map((view) => (
-                <button
-                  type="button"
-                  key={view}
-                  aria-pressed={preferences.defaultView === view}
-                  onClick={() => update({ defaultView: view })}
-                >
-                  {t(`view.${view}`)}
-                </button>
-              ))}
-            </div>
+            <Segmented
+              label={t("display.defaultView")}
+              value={preferences.defaultView}
+              onChange={(defaultView) => update({ defaultView })}
+              options={boardViews.map((value) => ({ value, label: t(`view.${value}`) }))}
+              className="flex-wrap"
+            />
           </Row>
           <Row label={t("display.defaultMode")} hint={t("display.nextOpen")}>
-            <div className="tb-segment">
-              {(["order", "time"] as const).map((mode) => (
-                <button
-                  type="button"
-                  key={mode}
-                  aria-pressed={preferences.defaultMode === mode}
-                  onClick={() => update({ defaultMode: mode })}
-                >
-                  {t(`routes.${mode}`)}
-                </button>
-              ))}
-            </div>
+            <Segmented
+              label={t("display.defaultMode")}
+              value={preferences.defaultMode}
+              onChange={(defaultMode) => update({ defaultMode })}
+              options={(["order", "time"] as const).map((value) => ({
+                value,
+                label: t(`routes.${value}`),
+              }))}
+            />
           </Row>
         </section>
         <section>
@@ -223,18 +216,15 @@ export function TaskBoardDisplaySettings({
             <BoardAppearanceControls preferences={preferences} update={update} part="palette" />
           </Row>
           <Row label={t("display.refresh")}>
-            <div className="tb-segment">
-              {[30, 60, 300, 0].map((refresh) => (
-                <button
-                  type="button"
-                  key={refresh}
-                  aria-pressed={preferences.refresh === refresh}
-                  onClick={() => update({ refresh })}
-                >
-                  {t(`display.refresh${refresh}`)}
-                </button>
-              ))}
-            </div>
+            <Segmented
+              label={t("display.refresh")}
+              value={String(preferences.refresh)}
+              onChange={(refresh) => update({ refresh: Number(refresh) })}
+              options={[30, 60, 300, 0].map((refresh) => ({
+                value: String(refresh),
+                label: t(`display.refresh${refresh}`),
+              }))}
+            />
           </Row>
         </section>
       </div>

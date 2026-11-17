@@ -420,7 +420,7 @@ export function TerminalKeySheet({
                         aria-label={label}
                         aria-pressed={draft.chord.code === code}
                         onClick={() => chooseCode(code)}
-                        className="min-h-11 min-w-0 rounded-md border border-border px-1 text-xs aria-pressed:border-primary aria-pressed:bg-primary/15"
+                        className="min-h-11 min-w-0 rounded-md border border-border px-1 text-xs aria-pressed:border-primary-cta aria-pressed:bg-primary-cta aria-pressed:text-primary-cta-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
                       >
                         {code === "Backspace" ? (
                           <DeleteIcon className="mx-auto size-4" aria-hidden />

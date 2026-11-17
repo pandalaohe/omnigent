@@ -57,8 +57,8 @@ function HostColorRow({ host, preferences }: { host: Host; preferences: HostColo
             title={entry.key}
             onClick={() => patchHostColor(host.host_id, entry.key)}
             className={cn(
-              "size-4 rounded-[4px] border border-black/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-              selected === entry.key && "ring-2 ring-ring ring-offset-1 ring-offset-card",
+              "size-4 rounded-[4px] border border-black/10 focus-visible:outline-none focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring",
+              selected === entry.key && "ring-2 ring-foreground ring-offset-1 ring-offset-card",
             )}
             style={{ backgroundColor: entry.hex }}
           />
