@@ -212,6 +212,7 @@ class UsageDelta:
     requests: int | None = None
     failed: int | None = None
     identities: list[bytes] = field(default_factory=list)
+    agent: str = ""
 
 
 @dataclass
@@ -267,6 +268,9 @@ class _Group:
             buckets,
             float(values.get("cost", 0)),
             identities=self.identities,
+            agent={"claude-code": "claude", "codex-cli": "codex", "gemini-cli": "gemini"}.get(
+                self.emitter.account, ""
+            ),
         )
 
 

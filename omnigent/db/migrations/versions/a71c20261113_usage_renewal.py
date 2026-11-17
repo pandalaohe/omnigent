@@ -17,8 +17,7 @@ def upgrade() -> None:
         batch.alter_column("allowance_usd", existing_type=sa.Numeric(38, 18), nullable=True)
 
 
-def downgrade() -> None:
-    connection = op.get_bind()
+def validated_downgrade_cards(connection):
     cards = sa.table(
         "usage_pricing_cards",
         sa.column("workspace_id", sa.BigInteger()),
@@ -40,6 +39,12 @@ def downgrade() -> None:
         compatible.append(
             (row["workspace_id"], row["owner_id"], row["card_id"], json.dumps(payload))
         )
+    return cards, compatible
+
+
+def downgrade() -> None:
+    connection = op.get_bind()
+    cards, compatible = validated_downgrade_cards(connection)
     for workspace, owner, card, payload in compatible:
         connection.execute(
             cards.update()

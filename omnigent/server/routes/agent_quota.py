@@ -39,6 +39,8 @@ from omnigent.server.usage_price_source import PriceSourceSelection, UsagePriceS
 from omnigent.stores.host_model_catalog_cache_store import HostModelCatalogCacheStore
 from omnigent.stores.host_store import HostStore
 from omnigent.usage.contract import (
+    UsageAnalysisHoursView,
+    UsageAnalysisV2View,
     UsageAnalysisView,
     UsageOverview,
     UsageReport,
@@ -123,6 +125,15 @@ async def _usage_report_body(request: Request) -> tuple[Any, dict[str, Any] | No
         ):
             payload["source"] = event["source"][:64]
     return payload, event
+
+
+AnalysisGroup = Literal["account", "pool", "model", "card", "host", "agent"]
+AnalysisRange = Literal["today", "d7", "d30", "d90", "custom"]
+AnalysisAccounts = Annotated[list[str] | None, Query(alias="account", max_length=64)]
+AnalysisModels = Annotated[list[str] | None, Query(alias="model", max_length=64)]
+AnalysisHosts = Annotated[list[str] | None, Query(alias="host", max_length=64)]
+AnalysisAgents = Annotated[list[str] | None, Query(alias="agent", max_length=64)]
+AnalysisIncludes = Annotated[list[Literal["previous", "rows"]] | None, Query(alias="include")]
 
 
 def _report_validation_detail(payload: Any, error: ValidationError) -> str:
@@ -621,25 +632,87 @@ def create_agent_quota_router(
                 payload["price_source"] = selected_failures
         return JSONResponse(payload, headers={"Cache-Control": "private, no-store"})
 
-    @router.get("/me/usage/analysis", response_model=UsageAnalysisView)
+    async def analysis_v2_response(request: Request, *, hours: bool = False) -> Response:
+        require_usage()
+        from fastapi.encoders import jsonable_encoder
+        from fastapi.responses import JSONResponse
+
+        from omnigent.usage.analysis_filters import AnalysisFilter
+        from omnigent.usage.analysis_presentation import display_values
+        from omnigent.usage.analysis_v2 import read_analysis_v2
+
+        owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        try:
+            filters = AnalysisFilter.parse(request.query_params, time.time())
+            if hours and filters.day is None:
+                raise ValueError("Use one selection format")
+            payload = await asyncio.to_thread(
+                read_analysis_v2,
+                service,
+                owner,
+                filters,
+                evidence=evidence_service,
+                hours_only=hours,
+            )
+            if hours:
+                payload = {
+                    name: payload[name]
+                    for name in ("filter", "span", "complete", "incomplete_reason", "approx")
+                } | {"hours": payload["hours"]}
+            return JSONResponse(
+                jsonable_encoder(display_values(payload)),
+                headers={"Cache-Control": "private, no-store"},
+            )
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            raise HTTPException(422, str(exc)) from None
+
+    @router.get("/me/usage/analysis/hours", response_model=UsageAnalysisHoursView)
+    async def read_analysis_hours(
+        request: Request,
+        _group: Annotated[AnalysisGroup, Query(alias="group")],
+        _range: Annotated[AnalysisRange, Query(alias="range")],
+        _day: Annotated[date, Query(alias="day")],
+        _tz: Annotated[str, Query(alias="tz")] = "UTC",
+        _account: AnalysisAccounts = None,
+        _model: AnalysisModels = None,
+        _host: AnalysisHosts = None,
+        _agent: AnalysisAgents = None,
+        _slot: Annotated[str | None, Query(alias="slot")] = None,
+        _include: AnalysisIncludes = None,
+    ) -> Response:
+        return await analysis_v2_response(request, hours=True)
+
+    @router.get("/me/usage/analysis", response_model=UsageAnalysisView | UsageAnalysisV2View)
     async def read_analysis(
         request: Request,
         range_key: Annotated[RangeKey, Query(alias="range")] = "d7",
         from_date: Annotated[date | None, Query(alias="from")] = None,
         to_date: Annotated[date | None, Query(alias="to")] = None,
         tz: str = "UTC",
-        account: str | None = None,
+        _account: AnalysisAccounts = None,
         pool: str | None = None,
-        model: str | None = None,
+        _model: AnalysisModels = None,
         card: str | None = None,
         dimension: Literal["account", "pool", "model", "card"] | None = None,
         selection: Annotated[str | None, Query(max_length=131072)] = None,
         exclude: Annotated[list[str] | None, Query(max_length=256)] = None,
         include_previous: bool = False,
+        group: AnalysisGroup | None = None,
+        _day: Annotated[str | None, Query(alias="day")] = None,
+        _slot: Annotated[str | None, Query(alias="slot")] = None,
+        _host: AnalysisHosts = None,
+        _agent: AnalysisAgents = None,
+        _include: AnalysisIncludes = None,
     ) -> Response:
+        """With group, v2 requires an explicit range and accepts repeated filters."""
         require_usage()
         from fastapi.responses import JSONResponse
 
+        if group is not None:
+            return await analysis_v2_response(request)
+
+        account = _account[-1] if _account else None
+        model = _model[-1] if _model else None
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         try:
             keys = json.loads(selection) if selection is not None else []

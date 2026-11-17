@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from itertools import batched
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, SQLColumnExpression, delete, func, select
+from sqlalchemy import CursorResult, SQLColumnExpression, delete, func, select, tuple_
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -151,6 +152,9 @@ class UsageEvidenceStore:
         end: float,
         account: str | None = None,
         model: str | None = None,
+        *,
+        keys: set[tuple[str, int, str]] | None = None,
+        include_aliases: bool = True,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         table = SqlUsagePriceEvidence
         query = select(table).where(
@@ -163,9 +167,19 @@ class UsageEvidenceStore:
         if model is not None:
             query = query.where(table.model == model)
         with self.sessions._read_session()("read_price_evidence") as session:
+            # Three binds per key plus scope/range predicates fit even SQLite's 999 limit.
+            queries = (
+                (
+                    query.where(tuple_(table.account_id, table.hour_utc, table.model).in_(batch))
+                    for batch in batched(keys, 250)
+                )
+                if keys is not None
+                else (query,)
+            )
             rows = [
                 {column.name: getattr(row, column.name) for column in table.__table__.columns}
-                for row in session.scalars(query)
+                for selected in queries
+                for row in session.scalars(selected)
             ]
             aliases = [
                 {
@@ -174,7 +188,11 @@ class UsageEvidenceStore:
                     "observed_at": row.observed_at,
                     "updated_at": row.updated_at,
                 }
-                for row in session.scalars(alias_query.order_by(SqlUsagePriceAliases.account_id))
+                for row in (
+                    session.scalars(alias_query.order_by(SqlUsagePriceAliases.account_id))
+                    if include_aliases
+                    else []
+                )
             ]
             return rows, aliases
 

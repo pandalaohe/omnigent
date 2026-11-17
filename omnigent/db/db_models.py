@@ -2057,6 +2057,43 @@ class SqlUsageHour(OmnigentBase):
     )
 
 
+class SqlUsageHourAgent(OmnigentBase):
+    """Optional agent measures; main-hour identities and valuation remain authoritative."""
+
+    __tablename__ = "usage_hour_agents"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    owner_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    hour_utc: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    model: Mapped[str] = mapped_column(String(128), primary_key=True, server_default="")
+    host_id: Mapped[str] = mapped_column(String(64), primary_key=True, server_default="")
+    basis: Mapped[str] = mapped_column(String(16), primary_key=True, server_default="unknown")
+    priced: Mapped[int] = mapped_column(SmallInteger, primary_key=True, server_default="0")
+    agent: Mapped[str] = mapped_column(String(32), primary_key=True)
+    input_tokens: Mapped[int | None] = mapped_column(BigInteger().evaluates_none(), nullable=True)
+    cached_tokens: Mapped[int | None] = mapped_column(BigInteger().evaluates_none(), nullable=True)
+    cache_write_tokens: Mapped[int | None] = mapped_column(
+        BigInteger().evaluates_none(), nullable=True
+    )
+    output_tokens: Mapped[int | None] = mapped_column(BigInteger().evaluates_none(), nullable=True)
+    total_tokens: Mapped[int | None] = mapped_column(BigInteger().evaluates_none(), nullable=True)
+    reasoning_tokens: Mapped[int | None] = mapped_column(
+        BigInteger().evaluates_none(), nullable=True
+    )
+    requests: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    failed: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cost_usd: Mapped[float | None] = mapped_column(Float().evaluates_none(), nullable=True)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        Index("ix_usage_hour_agents_owner_hour", "workspace_id", "owner_id", "hour_utc"),
+        CheckConstraint("priced IN (0, 1)", name="ck_usage_hour_agents_priced"),
+    )
+
+
 class SqlUsageAccountRelation(OmnigentBase):
     """
     SQLAlchemy model for the ``usage_account_relations`` table.

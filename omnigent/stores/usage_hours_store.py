@@ -17,11 +17,11 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, replace
 from typing import Any
 
-from sqlalchemy import and_, case, delete, func, or_, select
+from sqlalchemy import and_, case, delete, func, or_, select, tuple_
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -30,7 +30,7 @@ from sqlalchemy.sql.dml import Insert
 from sqlalchemy.sql.elements import ColumnElement
 
 from omnigent.db.account_authority import require_active_account
-from omnigent.db.db_models import SqlUsageHour, current_workspace_id
+from omnigent.db.db_models import SqlUsageHour, SqlUsageHourAgent, current_workspace_id
 from omnigent.db.utils import (
     NamedManagedSessionMaker,
     get_or_create_engine,
@@ -38,6 +38,13 @@ from omnigent.db.utils import (
     make_named_managed_session_maker,
     now_epoch,
     run_write_transaction,
+)
+from omnigent.stores.usage_agent_parts import (
+    KEY,
+    MEASURES,
+    increment_part,
+    part_values,
+    valid_parts,
 )
 from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
 from omnigent.usage.contract import ActivityEntryV2, ActivityHour, EntryOutcome, WriteOutcome
@@ -55,6 +62,10 @@ COUNTED_BASES = frozenset({"metered", "billed"})
 #: Bound for a pushed ``activity`` hour: a source clock can be wrong, and a
 #: future row would land in every "now" range.
 _ACTIVITY_MAX_AGE_S = 400 * 86_400
+
+
+class UsageReadLimit(ValueError):
+    """A bounded analysis read cannot claim a complete window."""
 
 
 @dataclass(frozen=True)
@@ -82,6 +93,15 @@ class HourRow:
     reasoning_tokens: int | None = None
     coverage: str | None = None
     price_ref: str | None = None
+    agent: str = ""
+    agent_parts: tuple[dict[str, Any], ...] = ()
+    agent_money_unknown: bool = False
+
+
+class HourChunk(list[HourRow]):
+    def __init__(self, rows: list[HourRow], scanned_count: int):
+        super().__init__(rows)
+        self.scanned_count = scanned_count
 
 
 @dataclass(frozen=True)
@@ -208,6 +228,7 @@ class UsageHoursStore:
         cost_usd: float,
         *,
         account_record: dict[str, Any] | None = None,
+        agent: str = "",
     ) -> None:
         """Atomically add normalized OTLP usage, preserving unknown counters."""
         self._increment(
@@ -224,6 +245,7 @@ class UsageHoursStore:
             None,
             cost_usd,
             account_record=account_record,
+            agent=agent,
         )
 
     def add_turn(
@@ -377,6 +399,19 @@ class UsageHoursStore:
                     continue
             for old in previous:
                 session.delete(old)
+            session.execute(
+                delete(SqlUsageHourAgent).where(
+                    SqlUsageHourAgent.workspace_id == current_workspace_id(),
+                    SqlUsageHourAgent.owner_id == owner,
+                    SqlUsageHourAgent.account_id == account_id,
+                    SqlUsageHourAgent.hour_utc == hours_of(row.hour),
+                    SqlUsageHourAgent.model == row.model,
+                    SqlUsageHourAgent.host_id == row.host,
+                    SqlUsageHourAgent.basis == "billed"
+                    if row.cost_basis == "billed"
+                    else SqlUsageHourAgent.basis != "billed",
+                )
+            )
             # A replacement may have the same primary key as the old row.
             session.flush()
             outcome.applied += 1
@@ -406,6 +441,27 @@ class UsageHoursStore:
                     updated_at=now,
                 )
             )
+            if row.agents:
+                parts = [part_values(part) for part in row.agents]
+                if not valid_parts(part_values(row), parts):
+                    outcome.warnings.append(EntryOutcome(**entry_key, reason="agents_over_total"))
+                else:
+                    for part, values in zip(row.agents, parts, strict=True):
+                        session.add(
+                            SqlUsageHourAgent(
+                                workspace_id=current_workspace_id(),
+                                owner_id=owner,
+                                account_id=account_id,
+                                hour_utc=hours_of(row.hour),
+                                model=row.model,
+                                host_id=row.host,
+                                basis=row.cost_basis,
+                                priced=int(row.cost_usd is not None),
+                                agent=part.agent,
+                                updated_at=now,
+                                **values,
+                            )
+                        )
         return outcome
 
     def delete_account(self, owner: str, account_id: str) -> None:
@@ -416,6 +472,13 @@ class UsageHoursStore:
 
             UsageEvidenceStore.delete_in_session(session, owner, account_id)
             session.execute(
+                delete(SqlUsageHourAgent).where(
+                    SqlUsageHourAgent.workspace_id == current_workspace_id(),
+                    SqlUsageHourAgent.owner_id == owner,
+                    SqlUsageHourAgent.account_id == account_id,
+                )
+            )
+            session.execute(
                 delete(SqlUsageHour).where(
                     SqlUsageHour.workspace_id == current_workspace_id(),
                     SqlUsageHour.owner_id == owner,
@@ -424,6 +487,38 @@ class UsageHoursStore:
             )
 
         run_write_transaction(self._write_session(), "delete_usage_account_hours", write)
+
+    def prune_hours(self, now: int, *, limit: int = 5000) -> int:
+        """Remove at most one transaction's expired child/main rows, child first."""
+        if not 1 <= limit <= 5000:
+            raise ValueError("prune limit must be between 1 and 5000")
+        cutoff = hours_of(now - _ACTIVITY_MAX_AGE_S)
+
+        def write(session: Session) -> int:
+            removed = 0
+            for table, names in ((SqlUsageHourAgent, (*KEY, "agent")), (SqlUsageHour, KEY)):
+                if removed == limit:
+                    break
+                columns = [getattr(table, name) for name in names]
+                keys = list(
+                    session.execute(
+                        select(*columns)
+                        .where(
+                            table.workspace_id == current_workspace_id(),
+                            table.hour_utc < cutoff,
+                        )
+                        .order_by(table.hour_utc)
+                        .limit(limit - removed)
+                    )
+                )
+                for offset in range(0, len(keys), 500):
+                    session.execute(
+                        delete(table).where(tuple_(*columns).in_(keys[offset : offset + 500]))
+                    )
+                removed += len(keys)
+            return removed
+
+        return run_write_transaction(self._write_session(), "prune_usage_hours", write)
 
     def fill_unpriced(
         self,
@@ -518,6 +613,106 @@ class UsageHoursStore:
                 SqlUsageHour.model,
             )
             return [_row_from_orm(row) for row in session.execute(query).scalars()]
+
+    def read_chunks(
+        self,
+        owner: str,
+        since_hour: int,
+        until_hour: float,
+        *,
+        account_ids: set[str] | None = None,
+        native_models: Mapping[str, tuple[bool, set[str]]] | None = None,
+        hosts: set[str] | None = None,
+        chunk_size: int = 2000,
+        include_agents: bool = True,
+    ) -> Iterator[list[HourRow]]:
+        """Keyset pages ending at hour boundaries; a dense hour is bounded separately."""
+        if not 1 <= chunk_size <= 2000:
+            raise ValueError("chunk_size must be between 1 and 2000")
+        cursor = since_hour
+        while cursor < until_hour:
+            with self._read_session()("read_usage_hour_chunk") as session:
+                query = select(SqlUsageHour).where(
+                    SqlUsageHour.workspace_id == current_workspace_id(),
+                    SqlUsageHour.owner_id == owner,
+                    SqlUsageHour.hour_utc >= cursor,
+                    SqlUsageHour.hour_utc < until_hour,
+                )
+                if account_ids is not None:
+                    filters: list[ColumnElement[bool]] = [SqlUsageHour.account_id.in_(account_ids)]
+                    for product, (default, exceptions) in (native_models or {}).items():
+                        filters.append(
+                            and_(
+                                SqlUsageHour.account_id == f"native:{product}",
+                                SqlUsageHour.model.not_in(exceptions)
+                                if default
+                                else SqlUsageHour.model.in_(exceptions),
+                            )
+                        )
+                    query = query.where(or_(*filters))
+                if hosts is not None:
+                    query = query.where(SqlUsageHour.host_id.in_(hosts))
+                query = query.order_by(
+                    *(
+                        getattr(SqlUsageHour, name)
+                        for name in (
+                            "hour_utc",
+                            "account_id",
+                            "model",
+                            "host_id",
+                            "basis",
+                            "priced",
+                        )
+                    )
+                )
+                found = list(session.scalars(query.limit(chunk_size + 1)))
+                scanned_count = len(found)
+                if not found:
+                    return
+                if len(found) > chunk_size:
+                    last_hour = found[-1].hour_utc
+                    found = [row for row in found if row.hour_utc < last_hour]
+                    if not found:
+                        found = list(
+                            session.scalars(
+                                query.where(SqlUsageHour.hour_utc == last_hour).limit(20001)
+                            )
+                        )
+                        scanned_count += len(found)
+                        if len(found) > 20000:
+                            raise UsageReadLimit("hour_over_limit")
+                cursor = found[-1].hour_utc + 3600
+                key_query = (
+                    query.where(SqlUsageHour.hour_utc < cursor)
+                    .with_only_columns(*(getattr(SqlUsageHour, name) for name in KEY))
+                    .order_by(None)
+                )
+                parts = (
+                    session.scalars(
+                        select(SqlUsageHourAgent).where(
+                            tuple_(*(getattr(SqlUsageHourAgent, name) for name in KEY)).in_(
+                                key_query
+                            )
+                        )
+                    )
+                    if include_agents
+                    else []
+                )
+                by_key: dict[tuple, list[dict[str, Any]]] = {}
+                for part in parts:
+                    by_key.setdefault(tuple(getattr(part, name) for name in KEY), []).append(
+                        {name: getattr(part, name) for name in (*MEASURES, "agent")}
+                    )
+                rows = [
+                    replace(
+                        _row_from_orm(row),
+                        agent_parts=tuple(
+                            by_key.get(tuple(getattr(row, name) for name in KEY), [])
+                        ),
+                    )
+                    for row in found
+                ]
+            yield HourChunk(rows, scanned_count)
 
     def read_bounded(
         self,
@@ -667,6 +862,7 @@ class UsageHoursStore:
         *,
         account_record: dict[str, Any] | None = None,
         price_ref: str | None = None,
+        agent: str = "",
     ) -> None:
         def write(session: Session) -> None:
             require_active_account(session, owner)
@@ -690,6 +886,31 @@ class UsageHoursStore:
             if account_record is not None:
                 UsageSnapshotStore.write_in_session(
                     session, owner, "usage.account." + account_id, account_record
+                )
+
+            if agent:
+                increment_part(
+                    session,
+                    dict(
+                        workspace_id=current_workspace_id(),
+                        owner_id=owner,
+                        account_id=account_id,
+                        hour_utc=hour,
+                        model=model,
+                        host_id=host_id,
+                        basis=basis,
+                        priced=int(priced),
+                        agent=agent,
+                        updated_at=now_epoch(),
+                        cost_usd=cost_usd,
+                        requests=requests,
+                        failed=failed,
+                        **{
+                            name: getattr(growth, name, None)
+                            for name in MEASURES
+                            if name not in {"cost_usd", "requests", "failed"}
+                        },
+                    ),
                 )
 
         run_write_transaction(self._write_session(), "add_usage_hour", write)

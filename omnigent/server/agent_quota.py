@@ -54,7 +54,7 @@ from omnigent.stores.usage_pool_store import (
 from omnigent.stores.usage_pricing_store import UsagePricingStore
 from omnigent.stores.usage_quota_closings import UsageQuotaClosingStore
 from omnigent.stores.usage_snapshot_store import UsageSnapshotStore
-from omnigent.usage.activity import MarkSettings, attributed_rows, error_mark, summarize, totals
+from omnigent.usage.activity import MarkSettings, attributed_rows
 from omnigent.usage.analysis import (
     MAX_ANALYSIS_ROWS,
     PoolProjection,
@@ -667,6 +667,7 @@ class AgentQuotaService:
                 delta.failed,
                 delta.cost,
                 account_record=record if self.snapshot_store is not None else None,
+                agent=delta.agent,
             )
             with self._lock:
                 self._accounts[key] = record
@@ -783,6 +784,7 @@ class AgentQuotaService:
             outcome.applied = written.applied
             outcome.held = written.held
             outcome.skipped = written.skipped
+            outcome.warnings = written.warnings
             for entry in outcome.held:
                 self._append_log(
                     owner,
@@ -1400,47 +1402,178 @@ class AgentQuotaService:
             )
             for key, view in views.items()
         }
-        since = min(
-            [int((now - 86400) // 3600) * 3600, *(prev.counted_from for _, prev in spans.values())]
-        )
-        rows = self.hours_store.read(owner, since, int(now) + 1) if self.hours_store else []
+        from omnigent.stores.usage_hours_store import UsageReadLimit
+        from omnigent.usage.activity_fold import ActivityFold, TotalsFold
+
+        selected_views = {
+            key: view for key, view in views.items() if account is None or key == account
+        }
+        folds = {
+            key: (ActivityFold(spans[key][0], zone), ActivityFold(spans[key][1], zone))
+            for key in selected_views
+        }
+        model_folds = {key: {} for key in selected_views}
+        host_folds = {key: {} for key in selected_views}
+        recent = {key: TotalsFold() for key in selected_views}
+        recent_failed = set()
+        seen = set()
+        meters = self._activity_meters(owner)
         hostless = self.hours_store.hostless_accounts(owner) if self.hours_store else set()
-        projected = attributed_rows(
-            rows, records, self._activity_meters(owner), list(views), hostless=hostless
+        intervals: list[tuple[int, float]] = [(int((now - 86400) // 3600) * 3600, int(now) + 1)]
+        intervals.extend(
+            (span.counted_from, span.until) for key in selected_views for span in spans[key]
         )
+        merged = []
+        for start, until in sorted(intervals):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], until))
+            else:
+                merged.append((start, until))
+        cohort, native_models = self._usage_cohort(
+            {account} if account is not None else None, records, meters, views
+        )
+        scanned = 0
+        for start, until in merged:
+            chunks = (
+                self.hours_store.read_chunks(
+                    owner,
+                    start,
+                    until,
+                    account_ids=cohort,
+                    native_models=native_models,
+                    include_agents=False,
+                )
+                if self.hours_store
+                else []
+            )
+            for rows in chunks:
+                scanned += getattr(rows, "scanned_count", len(rows))
+                if scanned > 400000:
+                    raise UsageReadLimit("scan_over_limit")
+                projected = attributed_rows(rows, records, meters, list(views), hostless=hostless)
+                for key, own in projected.items():
+                    if key not in selected_views:
+                        continue
+                    seen.add(key)
+                    current, previous = folds[key]
+                    current.add(own)
+                    previous.add(own)
+                    active = [
+                        row
+                        for row in own
+                        if int((now - 86400) // 3600) * 3600 <= row.hour_utc <= now
+                    ]
+                    recent[key].add(active)
+                    if any(
+                        row.hour_utc
+                        >= int(now // 3600) * 3600 - (self.mark_settings.recent_hours - 1) * 3600
+                        and (row.failed or 0) > 0
+                        for row in own
+                    ):
+                        recent_failed.add(key)
+                    if account is not None or include_models:
+                        for row in own:
+                            if current.span.counted_from <= row.hour_utc < current.span.until:
+                                for values, value in (
+                                    (model_folds[key], row.model),
+                                    (host_folds[key], row.host_id),
+                                ):
+                                    if value not in values:
+                                        values[value] = TotalsFold()
+                                    values[value].add([row])
         result = []
-        for key, view in views.items():
-            if account is not None and key != account:
+        for key, view in selected_views.items():
+            if key not in {item.id for item in overview.accounts} and key not in seen:
                 continue
-            if key not in {item.id for item in overview.accounts} and key not in projected:
-                continue
-            current, previous = spans[key]
-            own_rows = projected.get(key, [])
-            amount = summarize(own_rows, current, zone)
-            before = summarize(own_rows, previous, zone)
-            selected = [
-                row for row in own_rows if current.counted_from <= row.hour_utc < current.until
-            ]
-            mark = error_mark(own_rows, now, view.freshness == "fresh", self.mark_settings)
+            current, previous = folds[key]
+            before = previous.result()
+            counts = recent[key].result()
+            rate = counts["failure_pct"]
+            mark = None
+            if (
+                view.freshness == "fresh"
+                and key in recent_failed
+                and (counts["requests"] or 0) >= self.mark_settings.min_requests
+                and rate is not None
+                and rate >= self.mark_settings.notice_pct
+            ):
+                level = (
+                    "down"
+                    if rate >= self.mark_settings.down_pct
+                    else "serious"
+                    if rate >= self.mark_settings.serious_pct
+                    else "notice"
+                )
+                mark = {
+                    "level": level,
+                    "requests": counts["requests"],
+                    "failed": counts["failed"],
+                    "rate": rate,
+                }
             item = {
                 "account": key,
-                **amount,
+                **current.result(),
                 "error_mark": mark,
                 "previous": before if before["series"] else None,
             }
             if account is not None or include_models:
                 item["models"] = [
-                    {"model": model, **totals([row for row in selected if row.model == model])}
-                    for model in sorted({row.model for row in selected})
+                    {"model": value, **fold.result()}
+                    for value, fold in sorted(model_folds[key].items())
                 ]
                 item["hosts"] = [
-                    {"host_id": host, **totals([row for row in selected if row.host_id == host])}
-                    for host in sorted({row.host_id for row in selected})
+                    {"host_id": value, **fold.result()}
+                    for value, fold in sorted(host_folds[key].items())
                 ]
             result.append(item)
         return {"generated_at": now, "range": range_key, "tz": tz, "accounts": result}
 
-    def analysis(
+    @staticmethod
+    def _usage_cohort(requested, records, meters, views, relations=None):
+        if requested is None:
+            return None, {}
+        cohort = requested | {
+            item.account_id
+            for item in (relations or {}).values()
+            if item.parent_account_id in requested
+        }
+        linked = {}
+        for account_id, record in sorted(records.items()):
+            if record.get("product"):
+                linked.setdefault(str(record["product"]), account_id)
+        native_models = {}
+        for product in set(linked) | {product for product, _ in meters} | set(views):
+            default = linked.get(product, product)
+            default_selected = default in cohort
+            exceptions = set()
+            for (meter_product, model), matches in meters.items():
+                if meter_product != product or not matches:
+                    continue
+                meter = next(iter(matches)) if len(matches) == 1 else None
+                target = (
+                    meter
+                    if meter and (meter in records or meter in views or meter == product)
+                    else product
+                )
+                if (target in cohort) != default_selected:
+                    exceptions.add(model)
+            if default_selected or exceptions:
+                native_models[product] = (default_selected, exceptions)
+        return cohort, native_models
+
+    def analysis(self, owner: str, **options: Any) -> UsageAnalysisView:
+        result = self._analysis(owner, **options)
+        assert isinstance(result, UsageAnalysisView)
+        return result
+
+    def analysis_reader(self, owner: str, **options: Any):
+        from omnigent.usage.analysis import AnalysisReader
+
+        result = self._analysis(owner, stream=True, **options)
+        assert isinstance(result, AnalysisReader)
+        return result
+
+    def _analysis(
         self,
         owner: str,
         *,
@@ -1452,7 +1585,11 @@ class AgentQuotaService:
         account_ids: set[str] | None = None,
         now: float | None = None,
         previous: bool = False,
-    ) -> UsageAnalysisView:
+        stream: bool = False,
+        hosts: set[str] | None = None,
+        span_override: Span | None = None,
+        chunk_size: int = 2000,
+    ):
         """Read one bounded analysis window with serve pool attribution.
 
         The read reuses the same owner scope, attribution identities and
@@ -1514,13 +1651,17 @@ class AgentQuotaService:
         spans = {}
         for key, view in views.items():
             parent = relations[key].parent_account_id if key in relations else key
-            current_span, previous_span = range_spans(
-                range_key,
-                now,
-                zone,
-                from_date=from_date,
-                to_date=to_date,
-                period=views.get(parent, view).period,
+            current_span, previous_span = (
+                (span_override, span_override)
+                if span_override is not None
+                else range_spans(
+                    range_key,
+                    now,
+                    zone,
+                    from_date=from_date,
+                    to_date=to_date,
+                    period=views.get(parent, view).period,
+                )
             )
             spans[key] = previous_span if previous else current_span
         selected_spans = {
@@ -1536,46 +1677,201 @@ class AgentQuotaService:
                 max(value.until for value in selected_spans.values()),
             )
         else:
-            current_span, previous_span = range_spans(
-                range_key, now, zone, from_date=from_date, to_date=to_date
+            current_span, previous_span = (
+                (span_override, span_override)
+                if span_override is not None
+                else range_spans(range_key, now, zone, from_date=from_date, to_date=to_date)
             )
             span = previous_span if previous else current_span
+        if span_override is not None:
+            span = span_override
+            spans = dict.fromkeys(spans, span)
+            selected_spans = dict.fromkeys(selected_spans, span)
         since, until, _, clamped = bounded_span(span.requested_from, span.until)
         non_usage = {key for key, relation in relations.items() if relation.channel != "usage"}
         usage_records = {key: value for key, value in records.items() if key not in non_usage}
         meters = {
             key: matches - non_usage for key, matches in self._activity_meters(owner).items()
         }
-        cohort: set[str] | None = None
-        native_models: dict[str, tuple[bool, set[str]]] = {}
-        if requested is not None:
-            cohort = requested | {
-                item.account_id
-                for item in relations.values()
-                if item.parent_account_id in requested
-            }
-            linked: dict[str, str] = {}
-            for account_id, record in sorted(usage_records.items()):
-                if record.get("product"):
-                    linked.setdefault(str(record["product"]), account_id)
-            products = set(linked) | {product for product, _ in meters} | set(views)
-            for product in products:
-                default = linked.get(product, product)
-                default_selected = default in cohort
-                exceptions: set[str] = set()
-                for (meter_product, model), matches in meters.items():
-                    if meter_product != product or not matches:
-                        continue
-                    meter = next(iter(matches)) if len(matches) == 1 else None
-                    target = (
-                        meter
-                        if meter and (meter in records or meter in views or meter == product)
-                        else product
+        cohort, native_models = self._usage_cohort(
+            requested, usage_records, meters, views, relations
+        )
+        hostless = self.hours_store.hostless_accounts(owner) if self.hours_store else set()
+        cost_classes = (
+            self.pricing_store.class_defaults(owner, list(views.values()))
+            if self.pricing_store
+            else {}
+        )
+
+        def project(
+            rows,
+            truncated=False,
+            *,
+            span=span,
+            spans=spans,
+            selected_spans=selected_spans,
+            since=since,
+            clamped=clamped,
+        ):
+            projected = attributed_rows(
+                [row for row in rows if row.account_id not in non_usage],
+                usage_records,
+                meters,
+                list(views),
+                hostless=hostless - non_usage,
+            )
+            selected = [
+                replace(
+                    item,
+                    account_id=target,
+                    agent=item.account_id.removeprefix("native:") if stream else item.agent,
+                )
+                if item.account_id.startswith("native:")
+                else item
+                for target, group in projected.items()
+                for item in group
+            ]
+            selected.extend(
+                row for row in rows if row.account_id in non_usage and row.account_id in records
+            )
+            selected = [
+                row
+                for row in selected
+                if (row_span := spans.get(row.account_id, span)).counted_from
+                <= row.hour_utc
+                < row_span.until
+            ]
+            selected.sort(
+                key=lambda item: (item.hour_utc, item.account_id, item.model, item.host_id)
+            )
+            projection = attribute_rows(selected, relations, views)
+            if requested is not None:
+                # The filter names tiles and their proven destinations.
+                visible = [
+                    item
+                    for item in projection.rows
+                    if item.account_id in requested or item.parent_account_id in requested
+                ]
+                projection = PoolProjection(rows=visible, partial=projection.partial)
+            catalog = pool_catalog(list(relations.values()), views)
+            if requested is not None:
+                catalog = [item for item in catalog if item.parent_account_id in requested]
+            parents = sorted({item.parent_account_id for item in projection.rows})
+            projected_account_ids = sorted({item.account_id for item in projection.rows})
+            pool_keys = sorted(
+                {
+                    (item.parent_account_id, item.pool_id, item.account_id, item.channel)
+                    for item in projection.rows
+                    if item.pool_id is not None and (item.pool_money or item.pool_usage)
+                }
+            )
+            return UsageAnalysisView(
+                generated_at=now,
+                account_cost_classes=cost_classes,
+                range=range_key,
+                tz=tz,
+                span=AnalysisSpan(
+                    requested_from=span.requested_from,
+                    counted_from=since if clamped else span.counted_from,
+                    until=span.until,
+                    approx=span.approx or clamped,
+                ),
+                account_spans={
+                    key: AnalysisSpan(
+                        requested_from=value.requested_from,
+                        counted_from=max(since, value.counted_from),
+                        until=value.until,
+                        approx=value.approx or value.counted_from < since,
                     )
-                    if (target in cohort) != default_selected:
-                        exceptions.add(model)
-                if default_selected or exceptions:
-                    native_models[product] = (default_selected, exceptions)
+                    for key, value in selected_spans.items()
+                },
+                pool_catalog=catalog,
+                rows=[item.view() for item in projection.rows],
+                accounts=[
+                    AnalysisAccountTotal(
+                        account_id=value,
+                        totals=analysis_totals(
+                            [
+                                item.row
+                                for item in projection.rows
+                                if item.account_id == value and item.contributes_money
+                            ],
+                            [
+                                item.row
+                                for item in projection.rows
+                                if item.account_id == value and item.contributes_usage
+                            ],
+                        ),
+                    )
+                    for value in projected_account_ids
+                ],
+                parents=[
+                    AnalysisParentTotal(
+                        parent_account_id=value,
+                        totals=analysis_totals(
+                            projection.parent_money(value), projection.parent_usage(value)
+                        ),
+                    )
+                    for value in parents
+                ],
+                pools=[
+                    PoolTotalView(
+                        parent_account_id=parent,
+                        pool_id=cast(str, pool),
+                        account_id=account_id,
+                        channel=cast(str, channel),
+                        totals=analysis_totals(
+                            projection.pool_rows(
+                                parent, cast(str, pool), account_id, cast(str, channel)
+                            ),
+                            projection.pool_usage(
+                                parent, cast(str, pool), account_id, cast(str, channel)
+                            ),
+                        ),
+                    )
+                    for parent, pool, account_id, channel in pool_keys
+                ],
+                unmapped=projection.unmapped(),
+                truncated=truncated,
+                partial=projection.partial or clamped or truncated,
+                row_limit=MAX_ANALYSIS_ROWS,
+            )
+
+        if stream:
+            from omnigent.usage.analysis import AnalysisReader
+
+            def make_reader(read_span):
+                first, end, _, read_clamped = bounded_span(
+                    read_span.requested_from, read_span.until
+                )
+
+                def render(rows):
+                    return project(
+                        rows,
+                        span=read_span,
+                        spans=dict.fromkeys(spans, read_span),
+                        selected_spans=dict.fromkeys(selected_spans, read_span),
+                        since=first,
+                        clamped=read_clamped,
+                    )
+
+                def chunks(*, include_agents=True):
+                    if self.hours_store is not None:
+                        for rows in self.hours_store.read_chunks(
+                            owner,
+                            first,
+                            end,
+                            account_ids=cohort,
+                            native_models=native_models,
+                            hosts=hosts,
+                            chunk_size=chunk_size,
+                            include_agents=include_agents,
+                        ):
+                            yield render(rows), rows
+
+                return AnalysisReader(render([]), chunks, make_reader)
+
+            return make_reader(span)
         if self.hours_store is not None:
             rows, truncated = self.hours_store.read_bounded(
                 owner,
@@ -1585,126 +1881,9 @@ class AgentQuotaService:
                 account_ids=cohort,
                 native_models=native_models,
             )
-            hostless = self.hours_store.hostless_accounts(owner)
         else:
-            rows, truncated, hostless = [], False, set()
-        projected = attributed_rows(
-            [row for row in rows if row.account_id not in non_usage],
-            usage_records,
-            meters,
-            list(views),
-            hostless=hostless - non_usage,
-        )
-        selected = [
-            replace(item, account_id=target) if item.account_id.startswith("native:") else item
-            for target, group in projected.items()
-            for item in group
-        ]
-        selected.extend(
-            row for row in rows if row.account_id in non_usage and row.account_id in records
-        )
-        selected = [
-            row
-            for row in selected
-            if (row_span := spans.get(row.account_id, span)).counted_from
-            <= row.hour_utc
-            < row_span.until
-        ]
-        selected.sort(key=lambda item: (item.hour_utc, item.account_id, item.model, item.host_id))
-        projection = attribute_rows(selected, relations, views)
-        if requested is not None:
-            # The filter names tiles and their proven destinations.
-            visible = [
-                item
-                for item in projection.rows
-                if item.account_id in requested or item.parent_account_id in requested
-            ]
-            projection = PoolProjection(rows=visible, partial=projection.partial)
-        catalog = pool_catalog(list(relations.values()), views)
-        if requested is not None:
-            catalog = [item for item in catalog if item.parent_account_id in requested]
-        parents = sorted({item.parent_account_id for item in projection.rows})
-        projected_account_ids = sorted({item.account_id for item in projection.rows})
-        pool_keys = sorted(
-            {
-                (item.parent_account_id, item.pool_id, item.account_id, item.channel)
-                for item in projection.rows
-                if item.pool_id is not None and (item.pool_money or item.pool_usage)
-            }
-        )
-        return UsageAnalysisView(
-            generated_at=now,
-            account_cost_classes=self.pricing_store.class_defaults(owner, list(views.values()))
-            if self.pricing_store is not None
-            else {},
-            range=range_key,
-            tz=tz,
-            span=AnalysisSpan(
-                requested_from=span.requested_from,
-                counted_from=since if clamped else span.counted_from,
-                until=span.until,
-                approx=span.approx or clamped,
-            ),
-            account_spans={
-                key: AnalysisSpan(
-                    requested_from=value.requested_from,
-                    counted_from=max(since, value.counted_from),
-                    until=value.until,
-                    approx=value.approx or value.counted_from < since,
-                )
-                for key, value in selected_spans.items()
-            },
-            pool_catalog=catalog,
-            rows=[item.view() for item in projection.rows],
-            accounts=[
-                AnalysisAccountTotal(
-                    account_id=value,
-                    totals=analysis_totals(
-                        [
-                            item.row
-                            for item in projection.rows
-                            if item.account_id == value and item.contributes_money
-                        ],
-                        [
-                            item.row
-                            for item in projection.rows
-                            if item.account_id == value and item.contributes_usage
-                        ],
-                    ),
-                )
-                for value in projected_account_ids
-            ],
-            parents=[
-                AnalysisParentTotal(
-                    parent_account_id=value,
-                    totals=analysis_totals(
-                        projection.parent_money(value), projection.parent_usage(value)
-                    ),
-                )
-                for value in parents
-            ],
-            pools=[
-                PoolTotalView(
-                    parent_account_id=parent,
-                    pool_id=cast(str, pool),
-                    account_id=account_id,
-                    channel=cast(str, channel),
-                    totals=analysis_totals(
-                        projection.pool_rows(
-                            parent, cast(str, pool), account_id, cast(str, channel)
-                        ),
-                        projection.pool_usage(
-                            parent, cast(str, pool), account_id, cast(str, channel)
-                        ),
-                    ),
-                )
-                for parent, pool, account_id, channel in pool_keys
-            ],
-            unmapped=projection.unmapped(),
-            truncated=truncated,
-            partial=projection.partial or clamped or truncated,
-            row_limit=MAX_ANALYSIS_ROWS,
-        )
+            rows, truncated = [], False
+        return project(rows, truncated)
 
     def issues(
         self, owner: str, *, now: float | None = None, **range_options: Any

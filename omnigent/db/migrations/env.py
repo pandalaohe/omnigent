@@ -88,6 +88,8 @@ def _run_with_connection(connection: Connection) -> None:
         render_as_batch=True,  # required for SQLite ALTER TABLE support
     )
     with context.begin_transaction():
+        migration_context = context.get_context()
+        migration_context.opts["starting_heads"] = migration_context.get_current_heads()
         context.run_migrations()
 
 
