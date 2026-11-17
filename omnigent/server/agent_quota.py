@@ -996,6 +996,8 @@ class AgentQuotaService:
         record["report_log"] = entries[-200:]
         if self.event_store is not None:
             event = report_log_event(record["account_id"], entries[-1])
+            if event is None:
+                return
             if session is None:
                 self.event_store.insert_events(owner, [event])
             else:

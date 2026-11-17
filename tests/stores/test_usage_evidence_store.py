@@ -2,8 +2,10 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from threading import Barrier, local
 
 import pytest
+from sqlalchemy import event as sql_event
 from sqlalchemy import select, update
 
 from omnigent.db.db_models import SqlUsageHour, SqlUsageSourceStatus, workspace_scope
@@ -282,7 +284,10 @@ def test_report_log_import_replays_same_identity(db_uri):
         {
             "schema_version": 1,
             "account_id": "a",
-            "report_log": [entry],
+            "report_log": [
+                *({"kind": "cloudevent", "at": entry["at"] - delta} for delta in (3, 2, 1)),
+                entry,
+            ],
         },
     )
     service = UsageEvidenceService(UsageEvidenceStore(db_uri))
@@ -290,7 +295,9 @@ def test_report_log_import_replays_same_identity(db_uri):
     service.import_report_logs()
     assert service.read_events(OWNER)["stored"] == 1
     row = service.read_events(OWNER)["events"][0]
-    assert row["id"] == report_log_event("a", entry).id
+    expected = report_log_event("a", entry)
+    assert expected is not None
+    assert row["id"] == expected.id
     assert row["severity"] == "error" and row["type"] == "read_failed"
     assert row["data"] == entry
 
@@ -340,3 +347,101 @@ def test_host_registry_disconnect_reconnect_archives_one_episode(db_uri):
     errors = [row for row in page["events"] if row["severity"] == "error"]
     assert len(errors) == 1 and errors[0]["episode"] is not None
     assert second.host_id == first.host_id
+
+
+@pytest.mark.parametrize("kind", [None, "disconnect", "error", "warn", "update"])
+def test_kind_filters_preserve_connection_type_case(db_uri, kind):
+    store = UsageEvidenceStore(db_uri)
+    events = [
+        event(f"{name}-{severity}").model_copy(update={"type": name, "severity": severity})
+        for name in ("connection", "Connection")
+        for severity in ("error", "warn", "info")
+    ]
+    store.insert_events(OWNER, events)
+    rows, _, stored = store.read_events(OWNER, kind=kind)
+    expected = {
+        row.id
+        for row in events
+        if kind is None
+        or (kind == "disconnect" and row.type == "connection")
+        or (
+            kind in {"error", "warn", "update"}
+            and row.type == "Connection"
+            and row.severity == {"error": "error", "warn": "warn", "update": "info"}[kind]
+        )
+    }
+    assert {row["id"] for row in rows} == expected
+    assert stored == len(expected)
+
+
+def test_legacy_report_receipts_are_hidden_without_hiding_changes(db_uri):
+    store = UsageEvidenceStore(db_uri)
+    store.insert_events(
+        OWNER,
+        [
+            event("receipt").model_copy(update={"source": "report:a", "type": "cloudevent"}),
+            event("fault").model_copy(
+                update={"source": "report:a", "type": "read_failed", "severity": "error"}
+            ),
+            event("correction").model_copy(update={"source": "report:a", "type": "correction"}),
+        ],
+    )
+    assert {row["id"] for row in store.read_events(OWNER)[0]} == {"fault", "correction"}
+
+
+def test_unchanged_tiers_are_read_only_and_concurrent_changes_dedupe(db_uri):
+    from omnigent.quota_pace import QuotaTiers
+    from omnigent.usage.contract import UsageAccountView, UsageWindowView
+
+    store = UsageEvidenceStore(db_uri)
+    account = UsageAccountView(
+        id="a",
+        kind="account",
+        display_name="A",
+        state="ok",
+        freshness="fresh",
+        windows=[UsageWindowView(id="day", state="ok", kind="daily", remaining_pct=60)],
+    )
+    now = now_epoch()
+    engine = get_or_create_engine(db_uri)
+    dml = []
+    gate = None
+    worker = local()
+
+    def observe(_conn, _cursor, statement, parameters, context, _many):
+        if context.isinsert or context.isupdate or context.isdelete:
+            dml.append(statement)
+        values = parameters.values() if isinstance(parameters, dict) else parameters
+        if (
+            gate is not None
+            and not getattr(worker, "checked", False)
+            and context.compiled is not None
+            and context.compiled.statement.is_select
+            and "usage.events.tiers" in values
+        ):
+            worker.checked = True
+            gate.wait(timeout=30)
+
+    sql_event.listen(engine, "after_cursor_execute", observe)
+    try:
+        store.record_quota_tiers(OWNER, [account], QuotaTiers(), now)
+        assert dml == []
+        account.windows[0].remaining_pct = 40
+        gate = Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(
+                pool.map(
+                    lambda _: UsageEvidenceStore(db_uri).record_quota_tiers(
+                        OWNER, [account], QuotaTiers(), now
+                    ),
+                    range(2),
+                )
+            )
+        gate = None
+        assert store.read_events(OWNER)[2] == 1
+        dml.clear()
+        for _ in range(10):
+            UsageEvidenceStore(db_uri).record_quota_tiers(OWNER, [account], QuotaTiers(), now)
+        assert dml == []
+    finally:
+        sql_event.remove(engine, "after_cursor_execute", observe)

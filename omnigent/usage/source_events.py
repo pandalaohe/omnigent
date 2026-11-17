@@ -14,15 +14,17 @@ def change_event_id() -> str:
     return f"{time_ns():020d}{uuid4().hex[:12]}"
 
 
-def report_log_event(account: str, entry: dict[str, Any]) -> SourceEvent:
+def report_log_event(account: str, entry: dict[str, Any]) -> SourceEvent | None:
     kind, at = entry["kind"], entry["at"]
+    # An envelope receipt is not a source state change.
+    if kind == "cloudevent":
+        return None
     severity = {
         "read_failed": "error",
         "writer_conflict": "error",
         "rejected": "error",
         "import_rejected": "error",
         "correction": "info",
-        "cloudevent": "info",
     }.get(kind, "warn")
     return SourceEvent.model_validate(
         {

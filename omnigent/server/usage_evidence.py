@@ -62,8 +62,9 @@ class UsageEvidenceService:
                         self.report_events(
                             owner,
                             [
-                                report_log_event(account, entry)
+                                event
                                 for entry in record.get("report_log", [])
+                                if (event := report_log_event(account, entry)) is not None
                             ],
                         )
 
