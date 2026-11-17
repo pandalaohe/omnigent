@@ -484,7 +484,7 @@ async def test_injection_reservation_releases_only_definite_refusal(db_uri, outc
     from tests.stores.test_subagent_retry_store import _journal
 
     journal = _journal(db_uri, SqlAlchemyConversationStore(db_uri))
-    async with _receiver(journal, True) as receive:
+    async with _receiver(journal, True) as (receive, _resolve):
         main = InputExecutionClaim(input_id=uuid4().hex, turn_id="active")
         assert (await receive(main)).accepted
         injection = InputExecutionClaim(
@@ -583,7 +583,7 @@ async def test_live_injection_survives_long_turn_without_duplicate_delivery(
         serving = asyncio.create_task(server.serve(sockets=[sock]))
         try:
             await poll_until_async(lambda: server.started, timeout_s=5)
-            async with _receiver(journal, True) as receive:
+            async with _receiver(journal, True) as (receive, _resolve):
 
                 class Server(NullServerClient):
                     async def post(self, url, **kwargs):

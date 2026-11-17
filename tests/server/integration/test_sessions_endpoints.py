@@ -5864,11 +5864,9 @@ async def test_patch_session_rejects_invalid_reasoning_effort(
     """
     PATCH with an unsupported ``reasoning_effort`` value fails loud.
 
-    The route validates the body against
-    ``_SESSION_METADATA_REASONING_EFFORTS`` before any DB write, so the
-    request is rejected with a typed 400 and the session row is left
-    unchanged. Mirrors the POST-create validation contract — the two
-    write paths must reject the same set of values.
+    The route validates the body's effort against the effective harness
+    before any DB write. Rejection returns a typed 400 and leaves the
+    session row unchanged.
     """
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
@@ -5894,7 +5892,7 @@ async def test_patch_session_rejects_invalid_reasoning_effort(
     # Message surfaces the offending value and the supported set so
     # the caller can fix the request without reading server logs.
     assert "bogus" in error["message"]
-    assert "none, minimal, low, medium, high, xhigh, max" in error["message"]
+    assert "claude-sdk; supported values: low, medium, high, xhigh, max" in error["message"]
 
     # The DB row keeps the prior value — validation runs before any
     # write. If this assertion fails, the route mutated state on a
@@ -17914,10 +17912,9 @@ async def test_patch_session_effort_forwards_after_concurrent_silent_write(
         # skip injection (Claude has no slash for "use spawn default").
         # Before refactor, Omnigent would short-circuit and not POST at all.
         (True, "default", None, None),
-        # (4) Level in EFFORT_VALUES but not CLAUDE_EFFORTS (``none``,
-        # ``minimal``). After refactor Omnigent no longer filters — it
-        # forwards as-is, and the runner-side handler skips injection.
-        (True, "none", "none", "none"),
+        # Unsupported Claude levels are rejected before persistence or forwarding.
+        (True, "none", None, None),
+        (True, "minimal", None, None),
     ],
 )
 async def test_patch_reasoning_effort_forwards_effort_change_event(
@@ -17927,29 +17924,7 @@ async def test_patch_reasoning_effort_forwards_effort_change_event(
     expected_persisted: str | None,
     expected_event_effort: str | None,
 ) -> None:
-    """
-    PATCH effort always forwards an ``effort_change`` event to
-    runner ``/events`` — harness-agnostic on the Omnigent side.
-
-    Before the refactor, Omnigent server made a native-only POST to
-    ``/claude-native-effort`` and filtered out clear / unsupported
-    values. After the refactor:
-
-    * The POST target is the same generic ``/events`` route every
-      other harness event uses.
-    * The body is the new ``effort_change`` discriminator with the
-      persisted level (or ``None`` for clear) — runner-side dispatch
-      decides what to do with it.
-    * Omnigent server does not check ``_is_native_terminal_session``
-      and does not filter on level — every PATCH that changes effort
-      sends the event.
-
-    This parametrize subsumes four pre-refactor tests (the native
-    forward, non-native skip, clear skip, unsupported skip): each
-    case here was a separate test before, and each had its
-    "doesn't POST" / "POSTs to claude-native-effort" assertion
-    flipped to "POSTs effort_change to /events".
-    """
+    """Supported effort changes use /events; unsupported levels have no effects."""
 
     captured: list[_ForwardedEffort] = []
 
@@ -17993,6 +17968,18 @@ async def test_patch_reasoning_effort_forwards_effort_change_event(
             f"/v1/sessions/{session['id']}",
             json={"reasoning_effort": patch_effort},
         )
+        if patch_effort in {"none", "minimal"}:
+            assert resp.status_code == 400, resp.text
+            assert resp.json()["error"]["code"] == "invalid_input"
+            assert (
+                f"Effort '{patch_effort}' is not supported by claude-native"
+                in (resp.json()["error"]["message"])
+            )
+            after = await client.get(f"/v1/sessions/{session['id']}")
+            assert after.status_code == 200
+            assert after.json()["reasoning_effort"] == session["reasoning_effort"]
+            assert captured == []
+            return
         assert resp.status_code == 200, resp.text
         # PATCH response reflects the persisted level regardless of
         # forward status (the forward is best-effort).

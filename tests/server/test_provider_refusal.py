@@ -195,7 +195,16 @@ def test_refusal_is_scoped_for_candidates_but_shared_with_tile():
     assert state.quota_readings("owner", {}, 111) == {}
 
 
-def test_plain_codex_meter_candidate_matches_its_pinned_route():
+@pytest.mark.parametrize(
+    "refused_model,candidate_model,expected",
+    [
+        ("model", "model", "stop"),
+        ("official/model", "model", "unknown"),
+        ("official/model", "official/model", "stop"),
+        ("model", "official/model", "unknown"),
+    ],
+)
+def test_codex_meter_keeps_refusal_on_the_verbatim_route(refused_model, candidate_model, expected):
     from omnigent.server.session_choice import (
         ChoiceRequest,
         Link,
@@ -206,10 +215,14 @@ def test_plain_codex_meter_candidate_matches_its_pinned_route():
     )
 
     state = ChoiceState()
-    state.refusals[("owner", "codex-pro", provider_route("host", "agent", "official/model"))] = (
+    state.refusals[("owner", "codex-pro", provider_route("host", "agent", refused_model))] = (
         ProviderRefusal("billing_disabled", 100, None, "session", "turn")
     )
     readings = state.quota_readings("owner", {}, 101)
+    assert readings["codex-pro"].state == "stopped"
     request = ChoiceRequest("owner", "host", products={"agent": "codex"})
-    link = Link(agent="agent", model="model", meter="codex-pro")
-    assert candidate_lines(SessionChoice(), link, request, readings, {}, 101)[0][1].state == "stop"
+    link = Link(agent="agent", model=candidate_model, meter="codex-pro")
+    assert (
+        candidate_lines(SessionChoice(), link, request, readings, {}, 101)[0][1].state == expected
+    )
+    assert link.model == candidate_model

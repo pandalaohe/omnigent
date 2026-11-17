@@ -3484,6 +3484,7 @@ class _StubTerminalInstance:
         self.origin = "harness"
         self.elevated = False
         self.agent_access = True
+        self.agent_tier = "read_write"
         # ``None`` => the view uses the default environment id, so we
         # don't need to fabricate an OSEnvironment.
         self.os_env = None
@@ -3605,6 +3606,7 @@ async def test_terminal_launch_dispatch_emits_resource_created(
     assert event["resource"]["id"] == "terminal_zsh_s1"
     assert event["resource"]["type"] == "terminal"
     assert event["resource"]["metadata"]["terminal_name"] == "zsh"
+    assert event["resource"]["metadata"]["agent_tier"] == "read_write"
     # The instance was looked up from the registry to build the view.
     assert registry.get_calls == [("conv_emit", "zsh", "s1")]
 
@@ -16753,8 +16755,14 @@ async def test_sys_session_create_stamp_failure_fails_closed() -> None:
         "status": "failed",
         "error": "dispatch_stamp_failed",
         "detail": '500 {"error":"boom"}',
-        "guidance": "inspect this session before continuing. Do not create a "
-        "replacement; do not automatically resend the task.",
+        "guidance": (
+            "Inspect conversation_id with sys_session_get_info "
+            "(session_id, status, last_activity_at) and sys_session_get_history "
+            "(persisted items[].id). For native sessions, input_id is only "
+            "an attempt correlation ID; these reads cannot confirm this specific input. "
+            "Do not match identical messages by text. Do not create a replacement; "
+            "do not automatically resend the task."
+        ),
     }
     assert entry is None, "a failed stamp must not register the dispatch"
     assert ops == ["create", "patch"], "a failed stamp must not post the first message"
