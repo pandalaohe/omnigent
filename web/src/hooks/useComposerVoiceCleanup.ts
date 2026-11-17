@@ -14,6 +14,8 @@ interface Take {
   end: number;
   expected: string;
   revision: number;
+  draftRevision: number | undefined;
+  scope: string;
   field: HTMLTextAreaElement | null;
 }
 
@@ -23,6 +25,7 @@ export function useComposerVoiceCleanup(
   setDraft: (value: string) => void,
   inputRef: RefObject<HTMLTextAreaElement | null>,
   scope: string,
+  getDraftRevision?: () => number,
 ) {
   const live = useRef({ draft, revision: 0, scope });
   if (live.current.draft !== draft || live.current.scope !== scope) {
@@ -45,6 +48,8 @@ export function useComposerVoiceCleanup(
   const matches = (value: Take) =>
     live.current.draft === value.expected &&
     live.current.revision === value.revision &&
+    live.current.scope === value.scope &&
+    getDraftRevision?.() === value.draftRevision &&
     inputRef.current === value.field;
 
   useEffect(() => {
@@ -82,6 +87,7 @@ export function useComposerVoiceCleanup(
   };
   return {
     notice,
+    canInsert: () => take.current !== null && matches(take.current),
     invalidate: () => {
       live.current.revision++;
     },
@@ -95,6 +101,8 @@ export function useComposerVoiceCleanup(
         segments: [],
         expected: live.current.draft,
         revision: live.current.revision,
+        draftRevision: getDraftRevision?.(),
+        scope: live.current.scope,
         field: inputRef.current,
       };
     },
@@ -119,18 +127,19 @@ export function useComposerVoiceCleanup(
       current.end += text.length - original.length;
       current.expected = next;
       current.revision = live.current.revision;
+      current.draftRevision = getDraftRevision?.();
       current.field?.setSelectionRange(start + text.length, start + text.length);
     },
     produce: (value: string, region?: { start: number; text: string }) => {
       const current = take.current;
       if (
-        current &&
-        (!matches(current) ||
-          (region &&
-            current.start !== null &&
-            (region.start > current.end || region.start + region.text.length < current.start)))
+        !current ||
+        !matches(current) ||
+        (region &&
+          current.start !== null &&
+          (region.start > current.end || region.start + region.text.length < current.start))
       )
-        take.current = null;
+        return;
       const delta = value.length - live.current.draft.length;
       write(value);
       if (take.current && region) {
@@ -138,6 +147,7 @@ export function useComposerVoiceCleanup(
         take.current.end = Math.max(take.current.end + delta, region.start + region.text.length);
         take.current.expected = value;
         take.current.revision = live.current.revision;
+        take.current.draftRevision = getDraftRevision?.();
       }
     },
     discard: () => {

@@ -1,9 +1,10 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { useRef, useState } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import * as api from "@/lib/voiceInputApi";
 import { useComposerVoiceCleanup } from "./useComposerVoiceCleanup";
 import { useDictationInsert } from "./useDictationInsert";
+import { useReplyDraft } from "./useReplyDraft";
 
 vi.mock("@/lib/voiceInputApi", async (original) => ({
   ...(await original<typeof api>()),
@@ -51,6 +52,38 @@ async function start() {
   act(() => dictation.appendFinal("some words"));
   return { ...view, field };
 }
+it.each(["draft", "scope"])(
+  "rejects finalized voice after a programmatic %s round trip",
+  (change) => {
+    const { result, rerender } = renderHook(
+      ({ scope }) => {
+        const draft = useReplyDraft();
+        const inputRef = useRef<HTMLTextAreaElement | null>(null);
+        const guard = useComposerVoiceCleanup(
+          draft.value,
+          draft.setValue,
+          inputRef,
+          scope,
+          draft.getDraftRevision,
+        );
+        return { draft, voice: guard };
+      },
+      { initialProps: { scope: "one" } },
+    );
+    act(() => result.current.voice.begin());
+    if (change === "draft") {
+      act(() => {
+        result.current.draft.replaceText("recalled prompt");
+        result.current.draft.replaceText("");
+      });
+    } else {
+      rerender({ scope: "two" });
+      rerender({ scope: "one" });
+    }
+    act(() => result.current.voice.produce("stale voice", { start: 0, text: "stale voice" }));
+    expect(result.current.draft.value).toBe("");
+  },
+);
 it("cleans only the whole dictated segment including shared prefix characters and requests native undo", async () => {
   const { field } = await start();
   const command = vi.fn(() => true);

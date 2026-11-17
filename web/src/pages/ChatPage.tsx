@@ -1,4 +1,3 @@
-import { flushSync } from "react-dom";
 import { Input } from "@/components/ui/input";
 import {
   listCallingDefaultCatalogs,
@@ -3054,6 +3053,7 @@ function ComposerImpl(
     fullText,
     storedReplyDraft,
     activeTextId,
+    getDraftRevision,
     focusText,
     editText,
     replaceText,
@@ -3219,6 +3219,7 @@ function ComposerImpl(
     setValue,
     textareaRef,
     `${conversationId}:${activeTextId}`,
+    getDraftRevision,
   );
   const dictation = useDictationInsert(value, voiceCleanup.produce, textareaRef);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
@@ -5739,18 +5740,12 @@ function ComposerImpl(
                 enableHotkey
                 disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
                 onVoiceStart={voiceCleanup.begin}
-                onCleanup={voiceCleanup.replaceFinal}
                 onVoiceDiscard={voiceCleanup.discard}
-                onVoiceEnd={() => void voiceCleanup.end()}
                 onListeningChange={setDictating}
                 inputRef={textareaRef}
-                onTranscript={(text, meta) => {
-                  voiceCleanup.record(text, meta);
-                  if (meta?.cleaned && meta.raw && meta.raw !== text) {
-                    const raw = meta.raw;
-                    flushSync(() => dictation.appendFinal(raw));
-                    voiceCleanup.replaceFinal(raw, text);
-                  } else dictation.appendFinal(text);
+                onTranscript={(text) => {
+                  if (!voiceCleanup.canInsert()) return;
+                  dictation.appendFinal(text);
                   dirtyRef.current = true;
                   // Dictation is a user-driven edit — exit prompt-recall mode
                   // so ArrowUp/ArrowDown don't clobber the dictated text.
@@ -5758,16 +5753,12 @@ function ComposerImpl(
                   if (commandError !== null) setCommandError(null);
                 }}
                 onInterim={(text) => {
+                  if (!voiceCleanup.canInsert()) return;
                   dictation.replaceInterim(text);
                   dirtyRef.current = true;
                   resetCursor();
                 }}
               />
-              {voiceCleanup.notice && (
-                <span role="status" className="text-sm text-muted-foreground">
-                  {voiceCleanup.notice}
-                </span>
-              )}
               <TooltipProvider>
                 <Tooltip>
                   <TooltipTrigger asChild>
