@@ -419,6 +419,71 @@ def test_a_users_own_catalog_choice_wins(tmp_path: Path) -> None:
     assert config.read_text() == 'model_catalog_json = "/mine.json"\n'
 
 
+@pytest.mark.parametrize("provider", [None, "openai", "custom", "launch", "inline", "file"])
+def test_endpoint_catalog_is_not_replaced_by_smart_routing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str | None
+) -> None:
+    config = tmp_path / "config.toml"
+    original = 'openai_base_url = "http://127.0.0.1:9876/codex/omnigent"\n'
+    settings = {}
+    if provider == "launch":
+        settings["config_overrides"] = ['model_provider="custom"']
+    elif provider == "inline":
+        original += 'profile = "work"\n[profiles.work]\nmodel_provider = "custom"\n'
+    elif provider == "file":
+        settings["profile"] = "work"
+        (tmp_path / "work.config.toml").write_text('model_provider = "custom"\n')
+    elif provider is not None:
+        original += f'model_provider = "{provider}"\n'
+    config.write_text(original)
+    monkeypatch.setattr(codex_executor, "read_codex_model_catalog", lambda *args: _catalog())
+
+    written = write_codex_model_catalog(
+        tmp_path, codex_path="/bin/codex", source_home=tmp_path, **settings
+    )
+    if provider not in (None, "openai"):
+        assert written is not None
+        assert set_codex_model_catalog_path(config, written, source_home=tmp_path, **settings)
+    else:
+        assert written is None
+        assert not (tmp_path / "model_catalog.json").exists()
+        assert not set_codex_model_catalog_path(config, tmp_path / "cached.json")
+        assert config.read_text() == original
+
+
+@pytest.mark.parametrize("codex_version", [None, (0, 133, 0), (0, 134, 0)])
+@pytest.mark.parametrize("inline_provider", ["openai", "custom"])
+def test_profile_catalog_owner_matches_runtime_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    codex_version: tuple[int, int, int] | None,
+    inline_provider: str,
+) -> None:
+    file_provider = "custom" if inline_provider == "openai" else "openai"
+    config = tmp_path / "config.toml"
+    original = (
+        'openai_base_url = "http://127.0.0.1:9876/codex"\n'
+        f'[profiles.work]\nmodel_provider = "{inline_provider}"\n'
+    )
+    config.write_text(original)
+    (tmp_path / "work.config.toml").write_text(f'model_provider = "{file_provider}"\n')
+    monkeypatch.setattr(codex_executor, "read_codex_model_catalog", lambda *args: _catalog())
+    settings = {"profile": "work", "codex_version": codex_version}
+    written = write_codex_model_catalog(
+        tmp_path, codex_path="/bin/codex", source_home=tmp_path, **settings
+    )
+    effective_provider = inline_provider if codex_version == (0, 133, 0) else file_provider
+    if effective_provider == "custom":
+        assert written is not None
+        assert set_codex_model_catalog_path(config, written, source_home=tmp_path, **settings)
+    else:
+        assert written is None
+        assert not set_codex_model_catalog_path(
+            config, tmp_path / "cached.json", source_home=tmp_path, **settings
+        )
+        assert config.read_text() == original
+
+
 @pytest.mark.parametrize("wrapper", [False, True])
 def test_required_brokered_catalog_is_bundled_private_and_credential_free(
     tmp_path: Path,

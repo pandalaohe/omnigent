@@ -1490,6 +1490,9 @@ def _populate_codex_home_config(
     include_credentials: bool = True,
     required_brokered_probe: tuple[str, Path, OSEnvSpec] | None = None,
     runtime_bin: str | None = None,
+    catalog_config_overrides: Iterable[str] = (),
+    catalog_profile: str | None = None,
+    catalog_codex_version: tuple[int, int, int] | None = None,
 ) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
@@ -1547,7 +1550,11 @@ def _populate_codex_home_config(
     :param required_brokered_probe: Codex path, working directory, and active
         sandbox used to write a network-denied bundled catalog.
     :param runtime_bin: Selected snapshot offered to a configured wrapper.
+    :param catalog_config_overrides: Launch overrides used to choose the catalog owner.
+    :param catalog_profile: File profile selected by the native launch.
+    :param catalog_codex_version: Select inline versus file profiles as the launch does.
     """
+    catalog_config_overrides = tuple(catalog_config_overrides)
     config_existed = (target_dir / "config.toml").exists()
     if required_brokered_probe is not None:
         codex_path, cwd, os_env = required_brokered_probe
@@ -1732,7 +1739,7 @@ def _populate_codex_home_config(
             # its timeout. auth.json alone cannot supply these provider tables.
             source_config = tomlkit.parse(source_file.read_text())
             minimal_document = tomlkit.document()
-            for key in ("model_provider", "model_providers", "profiles"):
+            for key in ("openai_base_url", "model_provider", "model_providers", "profiles"):
                 if key in source_config:
                     minimal_document[key] = source_config[key]
             drop_usage_metrics_exporter(minimal_document)
@@ -1748,10 +1755,22 @@ def _populate_codex_home_config(
                 # Routed turns and spawns can land on an arm codex's bundled
                 # catalog has no entry for, which it then refuses client-side.
                 catalog_path = write_codex_model_catalog(
-                    target_dir, codex_path=_find_codex_cli(), source_home=source_dir
+                    target_dir,
+                    codex_path=_find_codex_cli(),
+                    source_home=source_dir,
+                    config_overrides=catalog_config_overrides,
+                    profile=catalog_profile,
+                    codex_version=catalog_codex_version,
                 )
                 if catalog_path is not None:
-                    set_codex_model_catalog_path(dest_path, catalog_path)
+                    set_codex_model_catalog_path(
+                        dest_path,
+                        catalog_path,
+                        config_overrides=catalog_config_overrides,
+                        profile=catalog_profile,
+                        source_home=source_dir,
+                        codex_version=catalog_codex_version,
+                    )
             if not config_existed and include_credentials and not minimal_config:
                 route_identity = _apply_codex_current_route(dest_path, source_home=source_dir)
                 _write_codex_config(
@@ -2550,11 +2569,58 @@ def _probe_codex_model_catalog(
     return cast(dict[str, Any], catalog)
 
 
+def _codex_endpoint_owns_catalog(
+    document: Mapping[str, object],
+    *,
+    config_overrides: Iterable[str] = (),
+    profile: str | None = None,
+    source_home: Path | None = None,
+    codex_version: tuple[int, int, int] | None = None,
+) -> bool:
+    """An overridden OpenAI endpoint supplies its own live model catalog."""
+    from omnigent.onboarding.codex_auth_readiness import effective_codex_model_provider
+
+    effective = dict(document)
+    overrides = {}
+    for override in config_overrides:
+        key, _, value = override.partition("=")
+        if key.strip() in {"model_provider", "openai_base_url", "profile"}:
+            try:
+                overrides.update(tomllib.loads(override))
+            except ValueError:
+                overrides[key.strip()] = value.strip()
+    selected_profile = profile or overrides.get("profile") or effective.get("profile")
+    if isinstance(selected_profile, str) and selected_profile:
+        profiles = effective.get("profiles")
+        overlay = profiles.get(selected_profile) if isinstance(profiles, Mapping) else None
+        if profile is not None and source_home is not None:
+            from omnigent.harnesses.codex_native.launch_args import codex_config_profile
+
+            codex_config_profile(["--profile", profile])
+            path = source_home / f"{profile}.config.toml"
+            if (codex_version is None or codex_version >= (0, 134, 0)) and path.is_file():
+                overlay = tomllib.loads(path.read_text(encoding="utf-8"))
+        if isinstance(overlay, Mapping):
+            effective.update(overlay)
+        effective.pop("profile", None)
+    effective.update(overrides)
+    effective.pop("profile", None)
+    base_url = effective.get("openai_base_url")
+    return (
+        isinstance(base_url, str)
+        and bool(base_url.strip())
+        and effective_codex_model_provider(effective) in (None, "openai")
+    )
+
+
 def write_codex_model_catalog(
     target_dir: Path,
     *,
     codex_path: str | None,
     source_home: Path,
+    config_overrides: Iterable[str] = (),
+    profile: str | None = None,
+    codex_version: tuple[int, int, int] | None = None,
 ) -> Path | None:
     """
     Give the session a model catalog its ``spawn_agent`` can route across.
@@ -2574,6 +2640,23 @@ def write_codex_model_catalog(
     :returns: The written catalog path, or ``None`` when nothing was written.
     """
     if codex_path is None:
+        return None
+    try:
+        config_path = target_dir / "config.toml"
+        document = (
+            tomllib.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+        )
+        endpoint_catalog = _codex_endpoint_owns_catalog(
+            document,
+            config_overrides=config_overrides,
+            profile=profile,
+            source_home=source_home,
+            codex_version=codex_version,
+        )
+    except (OSError, ValueError) as exc:
+        logger.warning("could not read catalog configuration (%s)", type(exc).__name__)
+        return None
+    if endpoint_catalog:
         return None
     catalog = read_codex_model_catalog(codex_path, source_home)
     if catalog is None:
@@ -2615,7 +2698,15 @@ def _write_codex_config(config_path: Path, text: str) -> bool:
     return True
 
 
-def set_codex_model_catalog_path(config_path: Path, catalog_path: Path) -> bool:
+def set_codex_model_catalog_path(
+    config_path: Path,
+    catalog_path: Path,
+    *,
+    config_overrides: Iterable[str] = (),
+    profile: str | None = None,
+    source_home: Path | None = None,
+    codex_version: tuple[int, int, int] | None = None,
+) -> bool:
     """
     Point the session's private ``config.toml`` at *catalog_path*.
 
@@ -2630,10 +2721,17 @@ def set_codex_model_catalog_path(config_path: Path, catalog_path: Path) -> bool:
     try:
         existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
         document = tomlkit.parse(existing) if existing else tomlkit.document()
+        endpoint_catalog = _codex_endpoint_owns_catalog(
+            document,
+            config_overrides=config_overrides,
+            profile=profile,
+            source_home=source_home,
+            codex_version=codex_version,
+        )
     except (OSError, ValueError) as exc:
         logger.warning("could not read %s (%s)", config_path, exc)
         return False
-    if "model_catalog_json" in document:
+    if "model_catalog_json" in document or endpoint_catalog:
         return False
     document["model_catalog_json"] = str(catalog_path)
     return _write_codex_config(config_path, tomlkit.dumps(document))
@@ -3779,6 +3877,7 @@ class _CodexAppServerSession:
             minimal_config=True if self._signer is not None else None,
             inject_hooks=router_bridge_dir is not None,
             extend_model_catalog=codex_extended_catalog_requested(self._env),
+            catalog_config_overrides=self._codex_config_overrides,
             include_credentials=self._signer is None,
             runtime_bin=self._env.get(CODEX_RUNTIME_BIN_ENV),
             required_brokered_probe=(
