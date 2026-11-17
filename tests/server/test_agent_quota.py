@@ -1340,3 +1340,132 @@ async def test_cloud_event_v2_report_and_partial_updates(db_uri, mode):
                 headers={"Content-Type": "application/cloudevents+json"},
             )
         ).status_code == 422
+
+
+def test_report_failure_is_archived_live_and_import_is_idempotent(db_uri):
+    from omnigent.server.usage_evidence import UsageEvidenceService
+    from omnigent.stores.usage_evidence_store import UsageEvidenceStore
+
+    service = service_with_store(db_uri)
+    evidence = UsageEvidenceService(UsageEvidenceStore(db_uri))
+    service.event_store = evidence.store
+    for schema in (1, 2):
+        payload = {
+            "schema_version": schema,
+            "observed_at": time.time(),
+            "status": "unavailable",
+            "windows": [],
+        }
+        report = (UsageReport if schema == 1 else UsageReportV2).model_validate(payload)
+        service.report_account(OWNER, f"account{schema}", report)
+    service.flush(force=True)
+    count = evidence.read_events(OWNER)["stored"]
+    assert count == 2
+    assert all(row["type"] == "read_failed" for row in evidence.read_events(OWNER)["events"])
+    evidence.import_report_logs()
+    evidence.import_report_logs()
+    assert evidence.read_events(OWNER)["stored"] == count
+
+
+@pytest.mark.parametrize("schema", [1, 2])
+def test_success_receipts_only_advance_header_times(db_uri, monkeypatch, schema):
+    from omnigent.server.usage_evidence import UsageEvidenceService
+    from omnigent.stores.usage_evidence_store import UsageEvidenceStore
+    from omnigent.stores.usage_hours_store import UsageHoursStore
+
+    service = service_with_store(db_uri)
+    evidence = UsageEvidenceService(UsageEvidenceStore(db_uri))
+    service.event_store = evidence.store
+    service.hours_store = UsageHoursStore(db_uri)
+    base = int(time.time())
+    times = []
+    for step in range(3):
+        now = base + step
+        monkeypatch.setattr(
+            "omnigent.stores.usage_hours_store.now_epoch", lambda observed=now: observed
+        )
+        report = (UsageReport if schema == 1 else UsageReportV2).model_validate(
+            {
+                "schema_version": schema,
+                "observed_at": now,
+                "fresh_until": now + 300,
+                "windows": [
+                    {
+                        "id": "day",
+                        "kind": "daily",
+                        "percent_used": 10,
+                        "window_minutes": 1440,
+                        "resets_at": base + 86400,
+                    }
+                ],
+                "activity": [{"hour": base // 3600 * 3600, "tokens": 100 + step}],
+            }
+        )
+        service.report_account(
+            OWNER,
+            "a",
+            report,
+            now=now,
+            event={
+                "id": str(step),
+                "source": "reader",
+                "type": "dev.omnigent.usage.report",
+            },
+        )
+        tile = next(row for row in service.overview(OWNER, now=now).accounts if row.id == "a")
+        activity = next(
+            row for row in service.activity(OWNER, now=now)["accounts"] if row["account"] == "a"
+        )
+        times.append((tile.read_at, activity["totals"]["last_at"]))
+    assert times == [(base + step, base + step) for step in range(3)]
+    assert evidence.read_events(OWNER)["stored"] == 0
+    service.flush(force=True)
+    evidence.import_report_logs()
+    evidence.import_report_logs()
+    assert evidence.read_events(OWNER)["stored"] == 0
+
+
+def test_repeated_overview_and_pool_reads_do_not_write(db_uri):
+    from omnigent.db.utils import get_or_create_engine
+    from omnigent.stores.usage_evidence_store import UsageEvidenceStore
+
+    service = service_with_store(db_uri)
+    service.event_store = UsageEvidenceStore(db_uri)
+    now = int(time.time())
+    service.report_account(
+        OWNER,
+        "a",
+        UsageReport.model_validate(
+            {
+                "observed_at": now,
+                "fresh_until": now + 300,
+                "windows": [
+                    {
+                        "id": "day",
+                        "percent_used": 90,
+                        "window_minutes": 1440,
+                        "resets_at": now + 86400,
+                    }
+                ],
+            }
+        ),
+        now=now,
+    )
+    context = QuotaContext(OWNER, HOST)
+    service.overview(OWNER, now=now)
+    service.pool_readings(context, now=now)
+    dml = []
+
+    def observe(_conn, _cursor, statement, _parameters, execution, _many):
+        if execution.isinsert or execution.isupdate or execution.isdelete:
+            dml.append(statement)
+
+    engine = get_or_create_engine(db_uri)
+    event.listen(engine, "after_cursor_execute", observe)
+    try:
+        for _ in range(3):
+            service.overview(OWNER, now=now)
+            service.pool_readings(context, now=now)
+        assert dml == []
+    finally:
+        event.remove(engine, "after_cursor_execute", observe)

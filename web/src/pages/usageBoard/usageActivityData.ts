@@ -6,6 +6,7 @@ import { USAGE_BOARD_POLL_MS } from "./usageBoardData";
 import { sumUsage } from "./usageAmountData";
 
 export interface UsageTotals {
+  last_at?: number | null;
   partial_rows?: number;
   cost_usd: number | null;
   counted_cost_usd: number;

@@ -8,18 +8,22 @@ import json
 import logging
 from collections import Counter
 from collections.abc import Sequence
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.db.utils import now_epoch
+from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.host_registry import HostConnection
 from omnigent.stores.usage_evidence_store import EVIDENCE_TABLES, UsageEvidenceStore
 from omnigent.usage.contract import UsageAnalysisView
 from omnigent.usage.evidence import EvidenceBody, Rejected, SourceEvent, SourceStatus
 from omnigent.usage.prices import PriceAliases, PriceEstimate, PriceEvidence, aggregate_prices
 from omnigent.usage.ranges import RangeKey, range_spans
+from omnigent.usage.source_events import change_event_id, report_log_event
 from omnigent.usage.speed import aggregate_speed
 
 logger = logging.getLogger(__name__)
@@ -29,6 +33,40 @@ class UsageEvidenceService:
     def __init__(self, store: UsageEvidenceStore, retention_days: int = 400) -> None:
         self.store = store
         self.retention_days = retention_days
+
+    def host_connection(self, conn: HostConnection, connected: bool) -> None:
+        with workspace_scope(conn.workspace_id):
+            self.report_events(
+                conn.owner or RESERVED_USER_LOCAL,
+                [
+                    SourceEvent.model_validate(
+                        {
+                            "specversion": "1.0",
+                            "id": change_event_id(),
+                            "source": f"host:{conn.host_id}",
+                            "type": "connection",
+                            "severity": "recover" if connected else "error",
+                            "time": datetime.now(UTC).isoformat(),
+                            "data": {"host": conn.hello.name},
+                        }
+                    )
+                ],
+            )
+
+    def import_report_logs(self) -> None:
+        for workspace, owner in self.store.report_log_scopes():
+            with workspace_scope(workspace):
+                for key, record in self.store.sessions.read(owner).items():
+                    if key.startswith("usage.account."):
+                        account = record.get("account_id") or key.removeprefix("usage.account.")
+                        self.report_events(
+                            owner,
+                            [
+                                event
+                                for entry in record.get("report_log", [])
+                                if (event := report_log_event(account, entry)) is not None
+                            ],
+                        )
 
     def attach_prices(self, owner: str, view: UsageAnalysisView) -> None:
         """Join exact account/hour/model evidence without relabelling native history."""
@@ -201,6 +239,7 @@ class UsageEvidenceService:
         severity: str | None = None,
         before: str | None = None,
         limit: int = 50,
+        kind: str | None = None,
     ) -> dict[str, Any]:
         cursor = None
         if before is not None:
@@ -221,7 +260,13 @@ class UsageEvidenceService:
             except (ValueError, TypeError, UnicodeError):
                 raise ValueError("Invalid event cursor") from None
         rows, oldest, stored = self.store.read_events(
-            owner, account=account, source=source, severity=severity, before=cursor, limit=limit
+            owner,
+            account=account,
+            source=source,
+            severity=severity,
+            before=cursor,
+            limit=limit,
+            kind=kind,
         )
         next_before = None
         if len(rows) > limit:
@@ -229,9 +274,25 @@ class UsageEvidenceService:
             next_before = base64.urlsafe_b64encode(
                 json.dumps([row["time"], row["source"], row["id"]], separators=(",", ":")).encode()
             ).decode()
+        events = []
+        for row in rows[:limit]:
+            row["episode"] = None
+            if row["severity"] in {"error", "warn", "recover"}:
+                neighbor = self.store.event_neighbor(
+                    owner, row, after=row["severity"] != "recover"
+                )
+                if row["severity"] == "recover":
+                    if neighbor is not None and neighbor["severity"] in {"error", "warn"}:
+                        continue
+                elif neighbor is not None and neighbor["severity"] == "recover":
+                    row["episode"] = {
+                        "recovered_at": neighbor["time"],
+                        "recover_event_id": neighbor["id"],
+                    }
+            events.append(row)
         return {
             "generated_at": now_epoch(),
-            "events": rows[:limit],
+            "events": events,
             "next_before": next_before,
             "earliest_time": oldest,
             "stored": stored,

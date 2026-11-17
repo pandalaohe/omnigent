@@ -139,9 +139,10 @@ def create_usage_evidence_router(
         severity: Severity | None = None,
         before: Annotated[str | None, Query(max_length=1024)] = None,
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
+        kind: Literal["error", "warn", "disconnect", "update"] | None = None,
     ) -> JSONResponse:
         return await call(
-            service.read_events, owner(request), account, source, severity, before, limit
+            service.read_events, owner(request), account, source, severity, before, limit, kind
         )
 
     return router
