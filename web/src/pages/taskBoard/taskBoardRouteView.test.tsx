@@ -68,7 +68,7 @@ it("shows rows needing attention by default and folds the rest behind show all",
   expect(screen.queryByRole("heading", { name: "Group stale" })).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: /1 more project with nothing needing/ }));
   expect(stored().scope).toBe("all");
-  expect(screen.getByRole("button", { name: "All rows", pressed: true })).toBeTruthy();
+  expect(screen.getByRole("radio", { name: "All rows", checked: true })).toBeTruthy();
 });
 
 it("pins a group into the attention view and unpins it in place", () => {
@@ -204,7 +204,7 @@ it("drops a hub highlight on a mode switch and once its station leaves the map",
   const highlight = () => view.container.querySelector(".rt-highlights");
   fireEvent.focus(view.container.querySelector(".rt-hub-badge")!);
   expect(highlight()).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "By time" }));
+  fireEvent.click(screen.getByRole("radio", { name: "By time" }));
   expect(highlight()).toBeNull();
   fireEvent.focus(view.container.querySelector(".rt-hub-badge")!);
   expect(highlight()).toBeTruthy();

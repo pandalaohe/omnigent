@@ -673,7 +673,9 @@ describe("SettingsPage", () => {
                 }
               : input.endsWith("/harnesses")
                 ? { data: [], capabilities_by_harness: {} }
-                : { preferences: { settings: {} } },
+                : input.endsWith("/model-connections")
+                  ? { connections: [], can_manage: false }
+                  : { preferences: { settings: {} } },
           ),
           { status: 200 },
         ),
@@ -1021,7 +1023,7 @@ describe("SettingsPage", () => {
       "data-testid",
       "settings-group-theme",
     );
-    expect(screen.getByTestId("terminal-theme-auto")).toHaveClass("size-9", "bg-background");
+    expect(screen.getByTestId("terminal-theme-auto")).toHaveClass("size-9");
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAccessibleName("Match app");
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
     expect(screen.getByTestId("terminal-theme-light")).toHaveAttribute("aria-checked", "false");
@@ -1037,7 +1039,7 @@ describe("SettingsPage", () => {
       "gap-0.5",
       "p-0.5",
     );
-    expect(screen.getByTestId("theme-system")).toHaveClass("size-9", "bg-background");
+    expect(screen.getByTestId("theme-system")).toHaveClass("size-9");
     expect(screen.getByTestId("theme-system")).toHaveAccessibleName("System");
     expect(screen.getByTestId("theme-system")).not.toHaveAttribute("title");
     expect(screen.getByTestId("theme-system").querySelector(".lucide-monitor")).toBeInTheDocument();
@@ -2367,7 +2369,7 @@ describe("SettingsPage", () => {
   it("debounces archive content search before issuing a new list query", async () => {
     mocks.conversations = [conv("conv_archived", { archived: true, title: "Searchable" })];
     renderPage("/settings/archived");
-    fireEvent.click(screen.getByRole("button", { name: "Content" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Content" }));
     const input = screen.getByRole("searchbox", {
       name: "Search archived conversation content",
     });
@@ -2778,7 +2780,7 @@ describe("SettingsPage", () => {
     renderPage("/settings/archived");
 
     expect(mocks.archivedFilters?.agePreset).toBe("lt30d");
-    fireEvent.click(screen.getByRole("button", { name: "Content" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Content" }));
 
     await waitFor(() => {
       const stored = JSON.parse(

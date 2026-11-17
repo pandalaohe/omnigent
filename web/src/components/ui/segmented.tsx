@@ -4,9 +4,16 @@ import { cn } from "@/lib/utils";
 
 export interface SegmentedProps<T extends string> {
   label: string;
-  options: readonly { value: T; label: ReactNode; title?: string; testId?: string }[];
+  options: readonly {
+    value: T;
+    label: ReactNode;
+    title?: string;
+    ariaLabel?: string;
+    testId?: string;
+  }[];
   value: T;
   onChange: (value: T) => void;
+  disabled?: boolean;
   stretch?: boolean;
   /** For a control that qualifies a value beside it, not the value itself. */
   quiet?: boolean;
@@ -21,6 +28,7 @@ export function Segmented<T extends string>({
   options,
   value,
   onChange,
+  disabled,
   stretch,
   quiet,
   fitHeight,
@@ -31,6 +39,7 @@ export function Segmented<T extends string>({
     <div
       role="radiogroup"
       aria-label={label}
+      aria-disabled={disabled}
       className={cn(
         "inline-flex max-w-full rounded-lg bg-muted p-1",
         quiet && "p-0.5",
@@ -48,27 +57,28 @@ export function Segmented<T extends string>({
           type="button"
           role="radio"
           aria-checked={value === option.value}
+          disabled={disabled}
           tabIndex={
             value === option.value || (!options.some((item) => item.value === value) && index === 0)
               ? 0
               : -1
           }
           title={option.title}
+          aria-label={option.ariaLabel}
           data-testid={option.testId}
           className={cn(
-            "inline-flex min-w-11 items-center justify-center rounded-md px-2 text-ui whitespace-normal wrap-anywhere outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring md:px-3",
+            "inline-flex min-w-11 items-center justify-center gap-1.5 rounded-md px-2 text-ui whitespace-normal wrap-anywhere outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:cursor-not-allowed disabled:opacity-60 md:px-3",
             fitHeight ? "min-h-0" : "min-h-11 md:min-h-8",
             stretch && "flex-1",
             value === option.value
-              ? quiet
-                ? "bg-background font-medium text-foreground shadow-xs dark:bg-foreground/15"
-                : "bg-primary-cta font-medium text-primary-cta-foreground"
+              ? "bg-primary-cta font-semibold text-primary-cta-foreground"
               : quiet
                 ? "text-muted-foreground hover:text-foreground"
                 : "text-foreground/90 hover:bg-foreground/10",
           )}
           onClick={() => onChange(option.value)}
           onKeyDown={(event) => {
+            if (disabled) return;
             const direction =
               event.key === "ArrowRight" || event.key === "ArrowDown"
                 ? 1

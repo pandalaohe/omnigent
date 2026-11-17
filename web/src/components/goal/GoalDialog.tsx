@@ -1,3 +1,4 @@
+import { Segmented } from "@/components/ui/segmented";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useCallback, useEffect, useState } from "react";
 import { CheckIcon, Loader2Icon, PauseCircleIcon, PlayCircleIcon, TargetIcon } from "lucide-react";
@@ -19,7 +20,6 @@ import {
   type Goal,
   type GoalStatusUpdate,
 } from "@/lib/goalApi";
-import { cn } from "@/lib/utils";
 import {
   canPauseGoal,
   canResumeGoal,
@@ -124,15 +124,6 @@ function GoalEditor({
   onModeChange,
 }: GoalEditorProps) {
   const showKeepCurrentMode = goal != null && !isGoalUserMode(goal.status);
-  const modeButtonClass = (selected: boolean) =>
-    cn(
-      "inline-flex min-h-9 flex-1 items-center justify-center gap-2 rounded-md px-3 text-ui font-medium transition-colors",
-      "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-      selected
-        ? "bg-background text-foreground shadow-sm"
-        : "text-muted-foreground hover:bg-background/60 hover:text-foreground",
-      (readOnly || busy) && "pointer-events-none opacity-50",
-    );
   return (
     <>
       <div className="space-y-1.5">
@@ -152,50 +143,50 @@ function GoalEditor({
 
       <div className="space-y-1.5">
         <label className="text-sm font-medium text-muted-foreground">Mode</label>
-        <div
-          role="radiogroup"
-          aria-label="Goal mode"
-          className="flex w-full gap-1 rounded-lg border border-border bg-muted/30 p-1"
-          data-testid="goal-mode"
-        >
-          {showKeepCurrentMode && (
-            <button
-              type="button"
-              role="radio"
-              aria-checked={modeDraft === "keep"}
-              className={modeButtonClass(modeDraft === "keep")}
-              disabled={readOnly || busy}
-              onClick={() => onModeChange("keep")}
-              data-testid="goal-mode-keep"
-            >
-              <CheckIcon className="size-3.5" />
-              <span>Keep current</span>
-            </button>
-          )}
-          <button
-            type="button"
-            role="radio"
-            aria-checked={modeDraft === "active"}
-            className={modeButtonClass(modeDraft === "active")}
+        <div data-testid="goal-mode">
+          <Segmented<GoalModeDraft>
+            label="Goal mode"
+            value={modeDraft}
+            onChange={onModeChange}
             disabled={readOnly || busy}
-            onClick={() => onModeChange("active")}
-            data-testid="goal-mode-active"
-          >
-            <PlayCircleIcon className="size-3.5" />
-            <span>Active</span>
-          </button>
-          <button
-            type="button"
-            role="radio"
-            aria-checked={modeDraft === "paused"}
-            className={modeButtonClass(modeDraft === "paused")}
-            disabled={readOnly || busy}
-            onClick={() => onModeChange("paused")}
-            data-testid="goal-mode-paused"
-          >
-            <PauseCircleIcon className="size-3.5" />
-            <span>Paused</span>
-          </button>
+            stretch
+            options={[
+              ...(showKeepCurrentMode
+                ? [
+                    {
+                      value: "keep" as const,
+                      label: (
+                        <>
+                          <CheckIcon className="size-3.5" />
+                          <span>Keep current</span>
+                        </>
+                      ),
+                      testId: "goal-mode-keep",
+                    },
+                  ]
+                : []),
+              {
+                value: "active",
+                label: (
+                  <>
+                    <PlayCircleIcon className="size-3.5" />
+                    <span>Active</span>
+                  </>
+                ),
+                testId: "goal-mode-active",
+              },
+              {
+                value: "paused",
+                label: (
+                  <>
+                    <PauseCircleIcon className="size-3.5" />
+                    <span>Paused</span>
+                  </>
+                ),
+                testId: "goal-mode-paused",
+              },
+            ]}
+          />
         </div>
       </div>
 
@@ -578,7 +569,7 @@ export function GoalDialog({
           </DialogTitle>
         </DialogHeader>
 
-        <div className="min-h-0 space-y-3 overflow-y-auto">
+        <div className="-m-1 min-h-0 space-y-3 overflow-y-auto p-1">
           <GoalSummary loading={loading} goal={goal} />
           <GoalEditor
             objective={state.objective}

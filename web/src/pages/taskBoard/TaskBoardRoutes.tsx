@@ -1,3 +1,4 @@
+import { Segmented } from "@/components/ui/segmented";
 import { boardSourceColors } from "./taskBoardVisual";
 import {
   Fragment,
@@ -1473,24 +1474,24 @@ export function TaskBoardRoutes({
       data-route-level={mode === "order" ? "order" : level}
     >
       <div className="rt-toolbar">
-        <div className="tb-segment" role="group" aria-label={t("routes.mode")}>
-          {(["order", "time"] as const).map((value) => (
-            <Button
-              key={value}
-              size="sm"
-              variant={mode === value ? "secondary" : "ghost"}
-              aria-pressed={mode === value}
-              onClick={() => {
-                onMode(value);
-                setOpen(null);
-                hoverStore.set({ hover: null, hub: null });
-              }}
-            >
-              {value === "order" ? <RouteIcon size={15} /> : <ClockIcon size={15} />}{" "}
-              {t(`routes.${value}`)}
-            </Button>
-          ))}
-        </div>
+        <Segmented
+          label={t("routes.mode")}
+          value={mode}
+          onChange={(value) => {
+            onMode(value);
+            setOpen(null);
+            hoverStore.set({ hover: null, hub: null });
+          }}
+          options={(["order", "time"] as const).map((value) => ({
+            value,
+            label: (
+              <>
+                {value === "order" ? <RouteIcon size={15} /> : <ClockIcon size={15} />}
+                {t(`routes.${value}`)}
+              </>
+            ),
+          }))}
+        />
         <div className="rt-controls">
           {mode === "time" && (
             <>
@@ -1551,22 +1552,18 @@ export function TaskBoardRoutes({
               </div>
             </>
           )}
-          <div className="tb-segment rt-scope" role="group" aria-label={t("routes.scope")}>
-            {(["attention", "all"] as const).map((value) => (
-              <Button
-                key={value}
-                size="sm"
-                variant={settings.scope === value ? "secondary" : "ghost"}
-                aria-pressed={settings.scope === value}
-                onClick={() => {
-                  updateSettings({ scope: value });
-                  setOpen(null);
-                }}
-              >
-                {t(`routes.scope.${value}`)}
-              </Button>
-            ))}
-          </div>
+          <Segmented
+            label={t("routes.scope")}
+            value={settings.scope}
+            onChange={(scope) => {
+              updateSettings({ scope });
+              setOpen(null);
+            }}
+            options={(["attention", "all"] as const).map((value) => ({
+              value,
+              label: t(`routes.scope.${value}`),
+            }))}
+          />
           <button
             type="button"
             className="rt-focus-toggle rt-pins-toggle"

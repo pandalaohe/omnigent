@@ -1,3 +1,4 @@
+import { Segmented } from "@/components/ui/segmented";
 import type { ReactNode } from "react";
 import { ChevronDown } from "lucide-react";
 import { t, formatDate, formatNumber } from "./taskBoardText";
@@ -83,20 +84,21 @@ export function ActivitySegments({
   onChange: (value: string) => void;
 }) {
   return (
-    <div className={small ? "seg seg-sm" : "seg"}>
-      {items.map(([id, label, icon]) => (
-        <button
-          type="button"
-          key={id}
-          className={value === id ? "on" : ""}
-          aria-pressed={value === id}
-          onClick={() => onChange(id)}
-        >
-          {icon}
-          {label}
-        </button>
-      ))}
-    </div>
+    <Segmented
+      label="Activity display"
+      value={value}
+      onChange={onChange}
+      quiet={small}
+      options={items.map(([optionValue, label, icon]) => ({
+        value: optionValue,
+        label: (
+          <>
+            {icon}
+            {label}
+          </>
+        ),
+      }))}
+    />
   );
 }
 export function ActivityPages({

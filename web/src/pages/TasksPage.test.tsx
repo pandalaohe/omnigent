@@ -432,11 +432,11 @@ describe("filtering + search", () => {
     renderPage();
     expect(screen.getAllByTestId("scheduled-task-row")).toHaveLength(2);
     expect(screen.getByLabelText("Filter automations")).toBeInTheDocument();
-    expect(screen.getByTestId("tasks-filter-all")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("tasks-filter-all")).toHaveAttribute("aria-checked", "true");
 
     fireEvent.click(screen.getByTestId("tasks-filter-paused"));
-    expect(screen.getByTestId("tasks-filter-all")).toHaveAttribute("aria-pressed", "false");
-    expect(screen.getByTestId("tasks-filter-paused")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("tasks-filter-all")).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByTestId("tasks-filter-paused")).toHaveAttribute("aria-checked", "true");
     let rows = screen.getAllByTestId("scheduled-task-row");
     expect(rows).toHaveLength(1);
     expect(within(rows[0]).getByText("Paused task")).toBeInTheDocument();
@@ -541,7 +541,7 @@ describe("automation view navigation", () => {
     expect(screen.getByRole("region", { name: "Automation templates" })).toBeInTheDocument();
     selectView("Your automations");
     expect(screen.getByTestId("tasks-search")).toHaveValue("Daily");
-    expect(screen.getByTestId("tasks-filter-paused")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("tasks-filter-paused")).toHaveAttribute("aria-checked", "true");
     expect(screen.getAllByTestId("scheduled-task-row")).toHaveLength(1);
   });
 
@@ -598,7 +598,7 @@ describe("after creating an automation", () => {
     fireEvent.click(screen.getByTestId("suggestion-trigger-jira"));
     fireEvent.click(screen.getByRole("button", { name: "Create setup" }));
 
-    expect(screen.getByTestId("tasks-filter-all")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("tasks-filter-all")).toHaveAttribute("aria-checked", "true");
     expect(screen.getByPlaceholderText(/search/i)).toHaveValue("");
   });
 });

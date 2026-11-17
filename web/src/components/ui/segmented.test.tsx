@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { Segmented } from "./segmented";
 
 afterEach(cleanup);
@@ -35,4 +35,28 @@ it("selects one option, preserves one tab stop and cycles arrows in both directi
   fireEvent.keyDown(tokens, { key: "ArrowLeft" });
   expect(percent).toHaveFocus();
   expect(percent).toHaveAttribute("aria-checked", "true");
+});
+
+it("keeps a disabled permission group from changing through click or arrow keys", () => {
+  const change = vi.fn();
+  render(
+    <Segmented
+      label="Agent access"
+      options={[
+        { value: "off", label: "Off" },
+        { value: "read", label: "Read" },
+      ]}
+      value="off"
+      onChange={change}
+      disabled
+    />,
+  );
+  const off = screen.getByRole("radio", { name: "Off" });
+  const read = screen.getByRole("radio", { name: "Read" });
+  expect(off).toBeDisabled();
+  expect(read).toBeDisabled();
+  fireEvent.click(read);
+  fireEvent.keyDown(off, { key: "ArrowRight" });
+  expect(change).not.toHaveBeenCalled();
+  expect(off).toHaveAttribute("aria-checked", "true");
 });

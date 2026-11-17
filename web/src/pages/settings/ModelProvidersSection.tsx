@@ -1,3 +1,4 @@
+import { Segmented } from "@/components/ui/segmented";
 import { useEffect, useState, type ReactNode } from "react";
 import {
   ArrowLeftIcon,
@@ -489,22 +490,16 @@ function ProviderEditor({
           placeholder="Filter models"
           onChange={(event) => setFilter(event.target.value)}
         />
-        {[
-          ["all", "All"],
-          ["used", "In use"],
-          ["attention", "Needs attention"],
-        ].map(([filterKey, label]) => (
-          <Button
-            key={filterKey}
-            type="button"
-            variant={statusFilter === filterKey ? "secondary" : "ghost"}
-            size="sm"
-            aria-pressed={statusFilter === filterKey}
-            onClick={() => setStatusFilter(filterKey)}
-          >
-            {label}
-          </Button>
-        ))}
+        <Segmented
+          label="Model status"
+          value={statusFilter}
+          onChange={setStatusFilter}
+          options={[
+            { value: "all", label: "All" },
+            { value: "used", label: "In use" },
+            { value: "attention", label: "Needs attention" },
+          ]}
+        />
       </div>
       <div className="max-h-[430px] overflow-auto rounded-lg border">
         <table className="w-full min-w-[560px] table-fixed text-ui">

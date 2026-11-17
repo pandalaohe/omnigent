@@ -1,3 +1,4 @@
+import { Segmented } from "@/components/ui/segmented";
 import {
   CalendarIcon,
   ChevronDownIcon,
@@ -210,7 +211,8 @@ function CalendarGrid({
                 aria-pressed={selected}
                 className={cn(
                   "h-8 rounded-md text-sm text-foreground hover:bg-accent",
-                  selected && "bg-primary/15 text-primary",
+                  selected &&
+                    "bg-primary-cta font-semibold text-primary-cta-foreground hover:bg-primary-cta",
                   anchor && sameDay(day, anchor) && "ring-2 ring-primary/50",
                 )}
                 onClick={() => pick(day)}
@@ -230,7 +232,8 @@ function CalendarGrid({
               aria-pressed={month.getMonth() === index}
               className={cn(
                 "h-10 rounded-md text-sm text-foreground hover:bg-accent",
-                month.getMonth() === index && "bg-primary/15 text-primary",
+                month.getMonth() === index &&
+                  "bg-primary-cta font-semibold text-primary-cta-foreground hover:bg-primary-cta",
               )}
               onClick={() => {
                 setMonth(new Date(month.getFullYear(), index, 1));
@@ -255,7 +258,8 @@ function CalendarGrid({
                 aria-pressed={month.getFullYear() === year}
                 className={cn(
                   "h-10 rounded-md text-sm text-foreground hover:bg-accent",
-                  month.getFullYear() === year && "bg-primary/15 text-primary",
+                  month.getFullYear() === year &&
+                    "bg-primary-cta font-semibold text-primary-cta-foreground hover:bg-primary-cta",
                 )}
                 onClick={() => {
                   setMonth(new Date(year, month.getMonth(), 1));
@@ -355,35 +359,20 @@ export function ArchiveDateRangePicker({
           <div className="flex min-w-0 items-center gap-1">
             <div className="min-w-0 flex-1">{input}</div>
             {onAgePresetChange && (
-              <div
-                className="flex shrink-0 items-center gap-1"
-                role="group"
-                aria-label="Date presets"
-              >
-                {ARCHIVE_DATE_PRESETS.map((preset) => (
-                  <Button
-                    key={preset.value}
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className={cn(
-                      "h-9 w-10 px-1 text-xs font-normal",
-                      agePreset === preset.value &&
-                        "border-primary/40 bg-primary/15 text-primary dark:bg-primary/15",
-                    )}
-                    aria-label={preset.ariaLabel}
-                    data-testid={`archive-date-preset-${preset.value}`}
-                    aria-pressed={agePreset === preset.value}
-                    onClick={() => {
-                      setDraft("");
-                      onValueChange("");
-                      onAgePresetChange(preset.value);
-                    }}
-                  >
-                    {preset.label}
-                  </Button>
-                ))}
-              </div>
+              <Segmented
+                label="Date presets"
+                value={agePreset}
+                quiet
+                options={ARCHIVE_DATE_PRESETS.map((preset) => ({
+                  ...preset,
+                  testId: `archive-date-preset-${preset.value}`,
+                }))}
+                onChange={(preset) => {
+                  setDraft("");
+                  onValueChange("");
+                  onAgePresetChange(preset);
+                }}
+              />
             )}
           </div>
           {invalid && (

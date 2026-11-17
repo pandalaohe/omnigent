@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
+import { Segmented } from "@/components/ui/segmented";
 import {
   Dialog,
   DialogContent,
@@ -60,37 +61,29 @@ function TerminalAgentAccessControl({
       <div className="shrink-0 border-b px-3 py-2 text-sm">
         <div className="flex flex-wrap items-center gap-2">
           <span className="font-medium">Agent access</span>
-          <div
-            role="group"
-            aria-label="Agent access"
-            className="inline-flex rounded-md border p-0.5"
-          >
-            {(["off", "read", "read_write"] as const).map((tier) => (
-              <Button
-                key={tier}
-                variant={terminal.agentTier === tier ? "secondary" : "ghost"}
-                size="sm"
-                aria-pressed={terminal.agentTier === tier}
-                disabled={
-                  !context.canManageAgentAccess ||
-                  !terminal.running ||
-                  !terminal.instanceId ||
-                  update.isPending
-                }
-                onClick={() =>
-                  update.mutate({
-                    terminalId: terminal.id,
-                    instanceId: terminal.instanceId!,
-                    tier,
-                    hostId: terminal.hostId,
-                    hostTerminalId: terminal.hostTerminalId,
-                  })
-                }
-              >
-                {labels[tier]}
-              </Button>
-            ))}
-          </div>
+          <Segmented
+            label="Agent access"
+            value={terminal.agentTier}
+            options={(["off", "read", "read_write"] as const).map((value) => ({
+              value,
+              label: labels[value],
+            }))}
+            disabled={
+              !context.canManageAgentAccess ||
+              !terminal.running ||
+              !terminal.instanceId ||
+              update.isPending
+            }
+            onChange={(tier) =>
+              update.mutate({
+                terminalId: terminal.id,
+                instanceId: terminal.instanceId!,
+                tier,
+                hostId: terminal.hostId,
+                hostTerminalId: terminal.hostTerminalId,
+              })
+            }
+          />
           {terminal.hostName && (
             <span className="rounded border px-1.5 text-xs text-muted-foreground">
               {terminal.hostName}

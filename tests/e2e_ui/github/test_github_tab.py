@@ -1626,8 +1626,8 @@ def test_changes_commits_view_lists_and_opens_a_commit(
     expect(panel.get_by_role("checkbox", name="Hide viewed")).to_be_visible()
     expect(panel.get_by_role("checkbox", name="Viewed src/app/main.py")).to_be_visible()
 
-    panel.get_by_role("group", name="Show changes or commits").get_by_role(
-        "button", name="Commits", exact=True
+    panel.get_by_role("radiogroup", name="Show changes or commits").get_by_role(
+        "radio", name="Commits", exact=True
     ).click()
     search = panel.get_by_role("searchbox", name="Search commits")
     expect(panel.get_by_text("2 commits", exact=True)).to_be_visible()

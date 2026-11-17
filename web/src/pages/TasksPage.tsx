@@ -1,3 +1,4 @@
+import { Segmented } from "@/components/ui/segmented";
 /**
  * Scheduled tasks page (`/tasks`) — the list of the user's recurring agent
  * tasks, a search + Active/Paused filter, a "New automation" button,
@@ -349,28 +350,18 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
               />
             </div>
             {hasAnyTasks && (
-              <div aria-label="Filter automations" className="flex items-center gap-1">
-                {FILTER_TABS.map((tab) => (
-                  <button
-                    key={tab.value}
-                    type="button"
-                    aria-pressed={filter === tab.value}
-                    data-testid={`tasks-filter-${tab.value}`}
-                    onClick={() => {
-                      trackClick(`tasks.filter_${tab.value}`, "button");
-                      setFilter(tab.value);
-                    }}
-                    className={cn(
-                      "rounded-md px-3 py-1 text-ui font-medium transition-colors",
-                      filter === tab.value
-                        ? "bg-muted text-foreground"
-                        : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
-                    )}
-                  >
-                    {tab.label}
-                  </button>
-                ))}
-              </div>
+              <Segmented
+                label="Filter automations"
+                value={filter}
+                options={FILTER_TABS.map((tab) => ({
+                  ...tab,
+                  testId: `tasks-filter-${tab.value}`,
+                }))}
+                onChange={(value) => {
+                  trackClick(`tasks.filter_${value}`, "button");
+                  setFilter(value);
+                }}
+              />
             )}
           </div>
 

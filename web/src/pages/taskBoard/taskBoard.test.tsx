@@ -498,7 +498,7 @@ it("keeps native sessions usable with no source and retries a failed source read
   report([]);
   fireEvent.click(within(error).getByRole("button", { name: "Try again" }));
   await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
-  fireEvent.click(screen.getByRole("button", { name: "Routes" }));
+  fireEvent.click(screen.getByRole("radio", { name: "Routes" }));
   expect(await screen.findByRole("heading", { name: "No tasks yet" })).toBeTruthy();
   expect(screen.getByRole("link", { name: "Manage task sources in Settings" })).toBeTruthy();
 });

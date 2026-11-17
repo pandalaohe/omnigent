@@ -150,7 +150,7 @@ it("lets an owner lower an ordinary shell to Read without a confirmation", async
   );
   const view = mount(terminal);
   expect(screen.queryByRole("switch")).toBeNull();
-  fireEvent.click(screen.getByRole("button", { name: "Read" }));
+  fireEvent.click(screen.getByRole("radio", { name: "Read" }));
   await waitFor(() =>
     expect(authenticatedFetch).toHaveBeenCalledWith(
       "/v1/sessions/session-a/resources/terminals/terminal_shell_key",

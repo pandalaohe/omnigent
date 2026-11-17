@@ -104,7 +104,10 @@ export function LevelMeter<T extends string>({
             data-effort-level={option.value}
             disabled={disabled}
             tabIndex={index === focusIndex ? 0 : -1}
-            className="flex min-h-11 min-w-11 flex-1 items-center rounded-md px-1 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 md:min-h-7 md:min-w-0"
+            className={cn(
+              "flex min-h-11 min-w-11 flex-1 items-center rounded-md border border-transparent px-1 outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:opacity-50 md:min-h-7 md:min-w-0",
+              selected === index && "border-foreground",
+            )}
             onClick={() => onChange(option.value)}
             onKeyDown={(event) => {
               if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
@@ -201,7 +204,10 @@ export function MenuLevelRow<T extends string>({
               data-testid={option.testId}
               data-effort-level={option.value}
               disabled={disabled}
-              className="flex min-h-11 min-w-11 flex-1 items-center rounded-md px-1 md:min-h-7 md:min-w-0"
+              className={cn(
+                "flex min-h-11 min-w-11 flex-1 items-center rounded-md border border-transparent px-1 md:min-h-7 md:min-w-0",
+                selected === index && "border-foreground",
+              )}
               onClick={(event) => {
                 event.stopPropagation();
                 onChange(option.value);

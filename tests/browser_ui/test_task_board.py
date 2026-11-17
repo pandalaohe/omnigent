@@ -318,7 +318,7 @@ def test_task_board_display_switch_and_source_list(
     waiting_detail.get_by_role("button", name="Close", exact=True).click()
     waiting.get_by_role("button", name="Close", exact=True).click()
     page.get_by_role("navigation", name="Board views").get_by_role(
-        "button", name="Routes", exact=True
+        "radio", name="Routes", exact=True
     ).click()
     region = page.get_by_role("region", name="Routes", exact=True)
     expect(region.get_by_role("heading", name="Version two")).to_be_visible()
@@ -357,7 +357,7 @@ def test_task_board_display_switch_and_source_list(
         relation = page.get_by_role("region", name="Related tasks", exact=True)
         expect(relation).to_contain_text("Predecessor / successor")
         relation.get_by_role("button", name="Close", exact=True).click()
-    page.get_by_role("button", name="By time", exact=True).click()
+    page.get_by_role("radio", name="By time", exact=True).click()
     expect(region.locator(".rt-axis")).to_be_visible()
     retry_stop = region.locator('.rt-stop[data-route-task="retry"]')
     retry_stop.click()
@@ -457,7 +457,7 @@ def test_task_board_display_switch_and_source_list(
         query["kind"] == ["any"] for query in board_session_queries
     )
     assert watch_frames and all(frame["type"] == "watch" for frame in watch_frames)
-    page.get_by_role("button", name="Log", exact=True).click()
+    page.get_by_role("radio", name="Log", exact=True).click()
     expect(
         page.get_by_role("region", name="Log").get_by_text("Keep confirmed chunks")
     ).to_be_visible()
@@ -473,9 +473,9 @@ def test_task_board_display_switch_and_source_list(
     expect(log_detail).to_be_visible()
     expect(log.get_by_text("Keep confirmed chunks")).to_be_visible()
     log_detail.get_by_role("button", name="Close", exact=True).click()
-    page.get_by_role("button", name="History", exact=True).click()
+    page.get_by_role("radio", name="History", exact=True).click()
     history = page.get_by_role("region", name="History", exact=True)
-    history.get_by_role("button", name="1 year", exact=True).click()
+    history.get_by_role("radio", name="1 year", exact=True).click()
     history.get_by_role("button", name=re.compile(r"\bexample\b")).click()
     history.get_by_role("button", name=re.compile("Earlier checks")).click()
     expect(history.get_by_text("Earlier recovery check", exact=True)).to_be_visible()
@@ -519,21 +519,21 @@ def test_task_board_display_switch_and_source_list(
     assert len(old_requests) == 2 and old_requests[1]["cursor"] == ["second-page"]
     history.get_by_role("button", name="Back to recent", exact=True).click()
     expect(history.get_by_text("Archived first check", exact=True)).to_have_count(0)
-    page.get_by_role("button", name="Today", exact=True).click()
+    page.get_by_role("radio", name="Today", exact=True).click()
     today = page.get_by_role("region", name="Today", exact=True)
     expect(today.get_by_role("heading", name=re.compile("Who worked today"))).to_be_visible()
     expect(today.get_by_text("Closed today", exact=True)).to_be_visible()
     expect(today.get_by_text("Task-linked commits", exact=True)).to_be_visible()
     page.get_by_role("button", name="Settings", exact=True).click()
     display = page.get_by_role("region", name="Settings", exact=True)
-    display.get_by_role("button", name="Dark" if theme == "dark" else "Light", exact=True).click()
-    display.get_by_role("button", name="Off", exact=True).click()
-    expect(display.get_by_role("button", name="Off", exact=True)).to_have_attribute(
-        "aria-pressed", "true"
+    display.get_by_role("radio", name="Dark" if theme == "dark" else "Light", exact=True).click()
+    display.get_by_role("radio", name="Off", exact=True).click()
+    expect(display.get_by_role("radio", name="Off", exact=True)).to_have_attribute(
+        "aria-checked", "true"
     )
-    assert display.get_by_role("button", name="Off", exact=True).evaluate(
+    assert display.get_by_role("radio", name="Off", exact=True).evaluate(
         "el => getComputedStyle(el).backgroundColor"
-    ) == ("rgb(24, 31, 37)" if theme == "dark" else "rgb(255, 255, 255)")
+    ) == ("rgb(232, 236, 240)" if theme == "dark" else "rgb(17, 23, 28)")
     assert display.locator(".tb-project-bullet").evaluate(
         "el => getComputedStyle(el).borderRadius === '50%' && "
         "getComputedStyle(el).backgroundColor === 'rgb(238, 53, 46)'"
@@ -542,7 +542,7 @@ def test_task_board_display_switch_and_source_list(
     display.get_by_label("Board window", exact=True).select_option("72")
     display.get_by_role("button", name=source_name, exact=True).click()
     page.get_by_role("navigation", name="Board views").get_by_role(
-        "button", name="Routes", exact=True
+        "radio", name="Routes", exact=True
     ).click()
     expect(page.get_by_role("heading", name="Version two")).to_have_count(0)
     page.get_by_role("button", name="Settings", exact=True).click()
@@ -583,7 +583,7 @@ def test_task_board_display_switch_and_source_list(
             assert measured["boardBottom"] >= measured["navTop"], measured
             navigation = page.get_by_role("navigation", name="Board views")
             expect(navigation).to_have_css("background-color", "rgb(24, 31, 37)")
-            navigation.get_by_role("button", name="Sessions", exact=True).click()
+            navigation.get_by_role("radio", name="Sessions", exact=True).click()
             expect(page.get_by_role("region", name="Sessions", exact=True)).to_be_visible()
     observed = datetime.now(UTC).isoformat()
     ref = {"source": "example", "uid": "observations"}

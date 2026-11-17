@@ -67,7 +67,7 @@ export function CardRadioGroup<T extends string>({
             }}
             className={themeCardClass(selected, compact, cardClassName)}
           >
-            {selected && !compact && <SelectedBadge />}
+            {selected && <SelectedBadge />}
             {item.body}
           </button>
         );
@@ -80,7 +80,7 @@ function SelectedBadge() {
   return (
     <span
       aria-hidden
-      className="absolute right-1.5 top-1.5 flex size-4 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-sm"
+      className="absolute right-1.5 top-1.5 flex size-4 items-center justify-center rounded-full bg-primary-cta text-primary-cta-foreground shadow-sm"
     >
       <CheckIcon className="size-3" />
     </span>
@@ -89,12 +89,12 @@ function SelectedBadge() {
 
 function themeCardClass(selected: boolean, compact: boolean, layout?: string) {
   return cn(
-    "relative flex rounded-lg border transition-[color,background-color,border-color,box-shadow]",
+    "relative flex rounded-lg border outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background transition-[color,background-color,border-color,box-shadow]",
     compact
-      ? "h-9 flex-1 flex-row items-center justify-center gap-2 px-3 whitespace-nowrap outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+      ? "min-h-11 md:min-h-9 flex-1 flex-row items-center justify-center gap-2 pl-3 pr-7 whitespace-nowrap"
       : "flex-col",
     selected
-      ? "border-primary bg-primary/5"
+      ? "border-foreground bg-primary/5"
       : "border-border hover:border-border-strong hover:bg-muted hover:shadow-sm",
     layout,
   );

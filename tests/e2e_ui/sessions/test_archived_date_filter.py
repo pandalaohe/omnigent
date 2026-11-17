@@ -52,7 +52,7 @@ def test_archive_date_presets_and_manual_override(page: Page, live_server: str) 
     expect(last_7_days).to_have_text("<7d")
     expect(last_30_days).to_have_text("<30d")
     expect(last_year).to_have_text("<1y")
-    expect(last_30_days).to_have_attribute("aria-pressed", "true")
+    expect(last_30_days).to_have_attribute("aria-checked", "true")
     expect(page.get_by_role("button", name="Today")).to_be_visible()
 
     with page.expect_request(
@@ -68,7 +68,7 @@ def test_archive_date_presets_and_manual_override(page: Page, live_server: str) 
     assert "archived_after" in manual_query
     assert "archived_before" in manual_query
     for preset in (last_7_days, last_30_days, last_year):
-        expect(preset).to_have_attribute("aria-pressed", "false")
+        expect(preset).to_have_attribute("aria-checked", "false")
 
     with page.expect_request(
         lambda request: (
@@ -80,4 +80,4 @@ def test_archive_date_presets_and_manual_override(page: Page, live_server: str) 
         last_7_days.click()
 
     expect(date_input).to_have_value("")
-    expect(last_7_days).to_have_attribute("aria-pressed", "true")
+    expect(last_7_days).to_have_attribute("aria-checked", "true")

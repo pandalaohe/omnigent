@@ -1,3 +1,4 @@
+import { Segmented } from "@/components/ui/segmented";
 import { boardPath } from "@/lib/boardFrame";
 // One account's settings. Reached only from its tile: the windows it shows, the
 // renewal countdown, and removing a reported source. Every change applies at
@@ -10,7 +11,6 @@ import { HelpTip } from "@/components/HelpTip";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { cn } from "@/lib/utils";
 import {
   patchUsageBoardPreferences,
   readUsageContextPreferences,
@@ -262,7 +262,6 @@ function WindowRow({
   // One window means nothing to choose: the row is absent.
   if (timed.length < 2) return null;
   const current = board.windows[account.id] ?? AUTO_WINDOW;
-  const picks = timed.filter((window) => window.id === current);
   const decided = pickWindow(
     { key: "", tag: null, windows: account.windows },
     account.deciding_window,
@@ -289,33 +288,17 @@ function WindowRow({
           the board; your pick comes back with it.
         </HelpTip>
       </span>
-      <div
-        className="inline-flex max-w-full flex-wrap gap-0.5 rounded-lg bg-muted p-0.5"
-        role="radiogroup"
-        aria-label="Window"
-      >
-        {options.map((option) => (
-          <button
-            key={option.id}
-            type="button"
-            title={option.label}
-            role="radio"
-            aria-checked={
-              current === option.id ||
-              (option.id === AUTO_WINDOW && picks.length === 0 && current === AUTO_WINDOW)
-            }
-            onClick={() => onPick(option.id)}
-            className={cn(
-              "min-h-7 min-w-0 max-w-full truncate rounded-md px-2 text-xs",
-              current === option.id
-                ? "bg-background font-medium text-foreground shadow-sm"
-                : "text-muted-foreground hover:text-foreground",
-            )}
-          >
-            <UsageName>{option.label}</UsageName>
-          </button>
-        ))}
-      </div>
+      <Segmented
+        label="Window"
+        className="flex-wrap"
+        value={current}
+        onChange={onPick}
+        options={options.map((option) => ({
+          value: option.id,
+          title: option.label,
+          label: <UsageName>{option.label}</UsageName>,
+        }))}
+      />
     </div>
   );
 }
