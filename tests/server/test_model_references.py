@@ -559,8 +559,9 @@ async def test_resume_members_use_their_own_host_and_keep_unknown_models(referen
     }
 
 
+@pytest.mark.parametrize("provider_rename", [True, False], ids=["explicit-alias", "no-alias"])
 async def test_library_launch_retains_lead_and_member_resolution_notes(
-    references_env, monkeypatch
+    references_env, monkeypatch, provider_rename
 ):
     from omnigent.member_snapshot import member_label_key, parse_member_entry
     from omnigent.server.library_agent_launch import LibraryAgentLaunch, launch_library_agent
@@ -568,6 +569,8 @@ async def test_library_launch_retains_lead_and_member_resolution_notes(
     from omnigent.server.routes._sessions import helpers
 
     env = references_env
+    if provider_rename:
+        env.prefs.patch_namespace(OWNER, ALIASES_NAMESPACE, {"pairs": [["old", "new"]]})
     bundle = build_agent_bundle(
         name="joint",
         include_llm=False,
@@ -613,8 +616,20 @@ async def test_library_launch_retains_lead_and_member_resolution_notes(
         catalog_store=env.catalogs,
     )
     saved = env.app.state.conversation_store.get_conversation(result.session_id)
-    assert saved.model_override == "new/x"
-    assert parse_member_entry(saved.labels[member_label_key("worker")])["model"] == "new/y"
+    member = parse_member_entry(saved.labels[member_label_key("worker")])
+    assert member is not None
+    if provider_rename:
+        assert saved.model_override == "new/x"
+        assert member["model"] == "new/y"
+    else:
+        assert saved.model_override is None
+        agent = env.app.state.agent_store.get(result.agent_id)
+        saved_spec = validate_agent_bundle(env.app.state.artifact_store.get(agent.bundle_location))
+        assert saved_spec.executor.model == "old/x"
+        assert member["model"] == "old/y"
+        assert "unavailable" not in member
+        assert any("trying it as unknown" in warning for warning in result.warnings)
     notes = notes_from_labels(saved.labels)
     assert {note["setting"] for note in notes} >= {"member:worker", "library_agent"}
+    assert {note["outcome"] for note in notes} == {"renamed" if provider_rename else "missing"}
     assert result.notes == notes
