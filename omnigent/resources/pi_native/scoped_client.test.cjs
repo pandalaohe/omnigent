@@ -51,6 +51,73 @@ test("untrusted endpoint postures fail before connection",async()=>{
  for(const endpoint of ["http://0.0.0.0:9000","http://example.test:9000","https://127.0.0.1:9000","http://127.0.0.1:9000/?next=remote"])
   await assert.rejects(connectAttestor({endpoint,credential:"fixture",brokerIncarnation:"epoch",launchEpoch:"launch"}));
 });
+test("bridge failures retain safe reasons and distinguish dispatch from delivery",async()=>{
+ const missing=await fixture().client.bridge(event,0);
+ assert.equal(missing.reason,"call_missing");
+ assert.match(missing.error,/not dispatched/);
+ const f=fixture({override:{rpc:async()=>{throw new Error(receipt);}}});
+ await f.client.evaluate(event,{},support);
+ const failed=await f.client.execute(event,{},()=>f.client.bridge(event,0));
+ assert.equal(failed.reason,"rpc_delivery_failed");
+ assert.match(failed.error,/may have run/);
+ assert.equal(JSON.stringify(failed).includes(receipt),false);
+ const g=fixture({override:{rpc:async()=>({error:receipt,reason:"rpc_refused"})}});
+ await g.client.evaluate(event,{},support);
+ const refused=await g.client.execute(event,{},()=>g.client.bridge(event,0));
+ assert.equal(refused.reason,"rpc_refused");
+ assert.match(refused.error,/not dispatched/);
+ assert.equal(JSON.stringify(refused).includes(receipt),false);
+});
+
+test("in-flight replies survive a revision change while further dispatch remains fenced",async()=>{
+ let deliver,calls=0;
+ const state={status:"ready",revision:3};
+ const f=fixture({state,override:{rpc:()=>{calls++;return new Promise(resolve=>deliver=resolve);}}});
+ await f.client.evaluate(event,{},support);
+ const pending=f.client.execute(event,{},()=>f.client.bridge(event,0));
+ await new Promise(resolve=>setImmediate(resolve));
+ state.revision=4;
+ deliver({result:"completed"});
+ assert.deepEqual(await pending,{result:"completed"});
+ const denied=await f.client.bridge(event,0);
+ assert.equal(denied.reason,"revision_changed");
+ assert.equal(calls,1);
+});
+
+test("oversized HTTP and TCP replies report execution and preserve the size cap",async t=>{
+ const http=require("node:http"),net=require("node:net");
+ const large=JSON.stringify({result:"x".repeat(1024*1024+1)});
+ let refusal=false;
+ const server=http.createServer((req,res)=>{
+  req.resume();
+  if(req.url==="/pi/bootstrap/watch") {res.writeHead(200);res.write(JSON.stringify({incarnation:"epoch",launch_epoch:"launch",live:true,revoked_scopes:[]})+"\n");}
+  else if(req.url==="/pi/rpc") {
+   if(refusal){res.writeHead(403);res.end(JSON.stringify({error:receipt,reason:"rpc_refused"}));}
+   else res.end(large);
+  }
+  else if(req.url==="/policies/evaluate") res.end(JSON.stringify({result:"POLICY_ACTION_ALLOW",permission_tier_binding:{call_id:"pi:"+crypto.createHash("sha256").update("scope\0A").digest("hex"),revision:3,arguments_digest:"0".repeat(64),pi_origin_receipt:receipt}}));
+  else res.end(JSON.stringify({executed:true}));
+ });
+ const tcp=net.createServer(socket=>socket.once("data",chunk=>socket.end(JSON.stringify({id:JSON.parse(chunk).id,result:large})+"\n")));
+ await Promise.all([new Promise(resolve=>server.listen(0,"127.0.0.1",resolve)),new Promise(resolve=>tcp.listen(0,"127.0.0.1",resolve))]);
+ t.after(()=>{server.closeAllConnections();server.close();tcp.close();});
+ const connection=await connectAttestor({endpoint:`http://127.0.0.1:${server.address().port}`,credential:"fixture",brokerIncarnation:"epoch",launchEpoch:"launch"});
+ t.after(()=>connection.close());
+ for(const port of [0,tcp.address().port]) {
+  const client=connection.client({scope,credential:"fixture"},"handle",()=>({status:"ready",revision:3}),async()=>support);
+  await client.evaluate(event,{},support);
+  const result=await client.execute(event,{},()=>client.bridge(event,port));
+  assert.equal(result.reason,"rpc_response_too_large");
+  assert.match(result.error,/command ran/);
+ }
+ refusal=true;
+ const client=connection.client({scope,credential:"fixture"},"handle",()=>({status:"ready",revision:3}),async()=>support);
+ await client.evaluate(event,{},support);
+ const denied=await client.execute(event,{},()=>client.bridge(event,0));
+ assert.equal(denied.reason,"rpc_refused");
+ assert.match(denied.error,/not dispatched/);
+ assert.equal(JSON.stringify(denied).includes(receipt),false);
+});
 test("a sealed client records its first cause once and gives recovery guidance",async()=>{
  const f=fixture();f.lose();f.client.seal();
  const verdict=await f.client.evaluate(event,{},support);

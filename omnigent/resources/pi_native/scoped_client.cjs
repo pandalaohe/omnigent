@@ -19,6 +19,18 @@ const fingerprint = event => JSON.stringify([event.toolName,event.input]);
 // Only fixed codes and elapsed time cross this boundary; never pass an event,
 // state, scope, response or exception (even through publicValue) to diagnostics.
 const diagnostic = () => {};
+const beforeDispatch = new Set(["call_missing","call_not_executing","signature_changed","transport_not_current",
+  "state_not_ready","revision_changed","transport_lost","scope_revoked","support_changed","state_changed",
+  "client_close","lifecycle_closing","installation_closed","explicit_seal","binding_unavailable","rpc_refused","rpc_configuration_invalid"]);
+const deliveryFailures = new Set(["rpc_delivery_failed","rpc_timeout","rpc_http_rejected","rpc_response_invalid","rpc_response_too_large","rpc_execution_failed"]);
+function bridgeFailure(reason) {
+  if(!beforeDispatch.has(reason)&&!deliveryFailures.has(reason))reason="rpc_delivery_failed";
+  const detail=beforeDispatch.has(reason)?"command was not dispatched by this bridge":
+    reason==="rpc_response_too_large"?"command ran, but its reply exceeded the 1 MiB limit":
+    "command may have run; check its outcome before retrying";
+  return {error:`Scoped Pi bridge unavailable (${reason}); ${detail}.`,reason};
+}
+function rpcError(reason) {return Object.assign(new Error("Scoped Pi transport unavailable"),{bridgeReason:reason});}
 function fileDiagnostic(directory) {
   const destination=path.join(directory,"scoped-pi.log");
   return record=>{
@@ -129,10 +141,15 @@ function createScopedClient({scope, transport, readState, recheck, report=diagno
   }
   async function bridge(event, port) {
     const call=calls.get(event.toolCallId);
-    if(!call || call.phase!=="executing" || call.signature!==fingerprint(event) || !current(call.revision))
-      return {error:"Scoped Pi bridge unavailable"};
-    try {return publicValue(await transport.rpc(port,metadata(call)));}
-    catch (_) {return {error:"Scoped Pi bridge unavailable"};}
+    const refusal=!call?"call_missing":call.phase!=="executing"?"call_not_executing":
+      call.signature!==fingerprint(event)?"signature_changed":unavailable(call.revision);
+    if(refusal)return bridgeFailure(refusal);
+    try {
+      const reply=await transport.rpc(port,metadata(call));
+      if(reply?.error)return bridgeFailure(reply.reason);
+      if(!reply || !Object.hasOwn(reply,"result"))return bridgeFailure("rpc_response_invalid");
+      return publicValue(reply);
+    } catch (error) {return bridgeFailure(error?.bridgeReason);}
   }
   return Object.freeze({evaluate,execute,finish,close,seal,bridge,project:publicValue});
 }
@@ -165,14 +182,22 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
       };
       const bytes=JSON.stringify(body);
       const req=http.request(new URL(route,url),{method:"POST",signal,headers:{authorization:`Bearer ${token}`,"content-type":"application/json","content-length":Buffer.byteLength(bytes)}},res=>{
-        if(res.statusCode!==200) {failure("http_rejected");res.resume();reject(new Error("Scoped Pi transport rejected"));return;}
-        let text="";
-        res.on("data",chunk=>{text+=chunk;if(text.length>1024*1024)res.destroy();});
-        res.on("end",()=>{try {const reply=JSON.parse(text);if(onResponse)onResponse(reply);resolve(reply);}catch(_){failure("response_invalid");reject(new Error("Scoped Pi transport response unavailable"));}});
-        res.on("error",()=>{failure("response_error");reject(new Error("Scoped Pi transport response unavailable"));});
+        if(res.statusCode!==200) {
+          failure("http_rejected");
+          if(route!=="/pi/rpc"){res.resume();reject(rpcError("rpc_http_rejected"));return;}
+        }
+        let text="",received=0;
+        res.setEncoding("utf8");
+        res.on("data",chunk=>{received+=Buffer.byteLength(chunk);if(received>1024*1024){reject(rpcError("rpc_response_too_large"));res.destroy();return;}text+=chunk;});
+        res.on("end",()=>{try {
+          const reply=JSON.parse(text);
+          if(res.statusCode!==200){resolve(bridgeFailure(reply?.reason||"rpc_http_rejected"));return;}
+          if(onResponse)onResponse(reply);resolve(reply);
+        }catch(_){failure("response_invalid");reject(rpcError("rpc_response_invalid"));}});
+        res.on("error",()=>{failure("response_error");reject(rpcError("rpc_delivery_failed"));});
       });
-      req.setTimeout(route==="/pi/bootstrap" ? 0 : route==="/policies/evaluate" || route==="/pi/rpc" ? 86400000 : 60000,()=>req.destroy());
-      req.on("error",()=>reject(new Error("Scoped Pi transport unavailable")));
+      req.setTimeout(route==="/pi/bootstrap" || route==="/pi/rpc" ? 0 : route==="/policies/evaluate" ? 86400000 : 60000,()=>{reject(rpcError("rpc_timeout"));req.destroy();});
+      req.on("error",()=>reject(rpcError("rpc_delivery_failed")));
       req.end(bytes);
 
       req.on("timeout",()=>failure("timeout"));
@@ -241,20 +266,21 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
         if(port===0||port===null||port===undefined)
           return request("/pi/rpc",{payload:JSON.stringify(metadata)},scopeCredential);
         return new Promise((resolve,reject)=>{
-          if(!Number.isInteger(port)||port<1||port>65535){reject(new Error("Scoped Pi bridge unavailable"));return;}
-          const id=crypto.randomUUID();let text="",settled=false;
+          if(!Number.isInteger(port)||port<1||port>65535){reject(rpcError("rpc_configuration_invalid"));return;}
+          const id=crypto.randomUUID();let text="",received=0,settled=false;
           const socket=net.createConnection({port,host:"127.0.0.1"});
-          const fail=()=>{if(!settled){settled=true;reject(new Error("Scoped Pi bridge unavailable"));}socket.destroy();};
+          socket.setEncoding("utf8");
+          const fail=(reason="rpc_delivery_failed")=>{if(!settled){settled=true;reject(rpcError(reason));}socket.destroy();};
           socket.on("connect",()=>socket.write(JSON.stringify({id,kind:"pi_scoped",credential:scopeCredential,payload:JSON.stringify(metadata)})+"\n"));
           socket.on("data",chunk=>{
+            received+=Buffer.byteLength(chunk);
+            if(received>1024*1024){fail("rpc_response_too_large");return;}
             text+=chunk;
-            if(text.length>1024*1024){fail();return;}
             const end=text.indexOf("\n");if(end<0)return;
-            try {const reply=JSON.parse(text.slice(0,end));if(reply.id!==id){fail();return;}settled=true;resolve(reply);socket.destroy();}
-            catch(_){fail();}
+            try {const reply=JSON.parse(text.slice(0,end));if(reply.id!==id){fail("rpc_response_invalid");return;}settled=true;resolve(reply);socket.destroy();}
+            catch(_){fail("rpc_response_invalid");}
           });
-          socket.on("error",fail);socket.on("close",()=>{if(!settled)fail();});
-          socket.setTimeout(86400000,fail);
+          socket.on("error",()=>fail());socket.on("close",()=>{if(!settled)fail();});
         });
       },
     }});
@@ -297,4 +323,4 @@ async function connectFromHandoff(locator, {timeoutMs=120000}={}) {
   return Object.freeze({connection,bridgeDir:descriptor.bridgeDir,statePath:descriptor.statePath});
 }
 
-module.exports={createScopedClient,connectAttestor,connectFromHandoff,publicValue,fileDiagnostic};
+module.exports={createScopedClient,connectAttestor,connectFromHandoff,publicValue,fileDiagnostic,bridgeFailure};

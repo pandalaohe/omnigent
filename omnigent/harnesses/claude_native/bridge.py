@@ -113,7 +113,7 @@ from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.models import model_metadata as _model_metadata
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.native.failure_telemetry import FailureContext
-from omnigent.permission_tiers.pi_private import redact_pi_authority
+from omnigent.permission_tiers.pi_private import pi_bridge_failure, redact_pi_authority
 from omnigent.pi_timeouts import BOOTSTRAP_CONTROL_TIMEOUT_S, CONTROL_TIMEOUT_S
 from omnigent.runtime.tool_call_deadline import ToolCallDeadline, bind_tool_call_deadline
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -9846,7 +9846,19 @@ def _tool_relay_handler_factory(
             self._send_json(response)
 
         def _handle_pi_rpc(self) -> None:
+            from omnigent.runner.pi_scope_relay import PiRpcExecutionError
+
             authorization = self.headers.get("Authorization")
+
+            def refuse(reason: str, status: HTTPStatus = HTTPStatus.FORBIDDEN) -> None:
+                # Fixed codes only: exceptions and frames can carry private authority.
+                _logger.warning("Pi RPC failed: path=/pi/rpc status=%d reason=%s", status, reason)
+                raw = json.dumps(pi_bridge_failure(reason)).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
 
             async def authenticate() -> None:
                 if pi_scope_relay is None:
@@ -9860,11 +9872,11 @@ def _tool_relay_handler_factory(
                 future.result(timeout=5.0)
             except Exception:  # noqa: BLE001 - no untrusted body decoding or fallback
                 future.cancel()
-                self.send_error(HTTPStatus.FORBIDDEN)
+                refuse("rpc_refused")
                 return
             payload = self._read_json_body()
             if payload is None or set(payload) != {"payload"} or pi_scope_relay is None:
-                self.send_error(HTTPStatus.BAD_REQUEST)
+                refuse("rpc_refused", HTTPStatus.BAD_REQUEST)
                 return
             result = asyncio.run_coroutine_threadsafe(
                 pi_scope_relay.execute_rpc(
@@ -9876,12 +9888,24 @@ def _tool_relay_handler_factory(
                 loop,
             )
             try:
-                response = result.result(timeout=_TOOL_CALL_TIMEOUT_S)
-                self._send_json(response)
+                # The downstream tool and approval gate own their deadlines.
+                response = result.result()
+            except ValueError:
+                refuse("rpc_refused")
+                return
+            except PiRpcExecutionError:
+                refuse("rpc_execution_failed")
+                return
             except Exception:  # noqa: BLE001 - scoped transport errors contain no raw tool exception
                 result.cancel()
-                self.send_error(HTTPStatus.FORBIDDEN)
+                refuse("rpc_delivery_failed")
                 return
+            try:
+                self._send_json(response)
+            except Exception:  # noqa: BLE001 - do not expose result or exception text
+                _logger.warning(
+                    "Pi RPC failed: path=/pi/rpc reason=rpc_delivery_failed stage=reply"
+                )
 
         def do_POST(self) -> None:
             """

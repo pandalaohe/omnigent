@@ -73,6 +73,66 @@ from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 from omnigent.server.schemas import ElicitationResult
 
 
+def test_generated_scoped_bridge_preserves_safe_delivery_failure():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the generated bridge consumer")
+    source = _generate_extension_js(
+        12345,
+        [{"name": "echo", "parameters": {"type": "object"}}],
+        "fixture",
+        scoped_bootstrap=True,
+    )
+    script = r"""
+const vm=require('node:vm');
+const reply={error:'Scoped Pi bridge reply unavailable; command may have run.',
+  reason:'rpc_delivery_failed'};
+const sandbox={module:{exports:{}},__filename:'bridge.cjs',require:name=>
+  name.endsWith('native_support.cjs')?{callScopedBridge:async()=>reply}:require(name)};
+vm.runInNewContext(process.argv[1],sandbox);
+let tool;
+sandbox.module.exports({on(){},registerTool(value){tool=value;}});
+tool.execute('call',{},undefined,undefined,{}).then(value=>process.stdout.write(JSON.stringify(value)));
+"""
+    result = subprocess.run(
+        [node, "-e", script, source], capture_output=True, text=True, timeout=5
+    )
+    assert result.returncode == 0, result.stderr
+    value = json.loads(result.stdout)
+    assert value["isError"] is True
+    failure = json.loads(value["content"][0]["text"])
+    assert failure["reason"] == "rpc_delivery_failed"
+    assert "may have run" in failure["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason", ["rpc_timeout", "rpc_refused", "rpc_execution_failed", "rpc_response_invalid"]
+)
+async def test_scoped_tcp_forward_retains_safe_rpc_failure(tmp_path, monkeypatch, reason):
+    client_type = httpx.AsyncClient
+
+    def respond(request):
+        assert request.extensions["timeout"]["read"] is None
+        if reason == "rpc_timeout":
+            raise httpx.ReadTimeout("private fixture authority")
+        if reason == "rpc_response_invalid":
+            return httpx.Response(200, content=b"not JSON")
+        return httpx.Response(403, json={"error": "private fixture authority", "reason": reason})
+
+    monkeypatch.setattr(
+        "omnigent.inner.pi_executor.httpx.AsyncClient",
+        lambda **kwargs: client_type(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    (tmp_path / "tool_relay.json").write_text(json.dumps({"url": "http://127.0.0.1:12345"}))
+    server = _ToolServer()
+    server._permission_bridge_dir = tmp_path
+    result = await server._forward_scoped_rpc("fixture", "{}")
+    assert result["reason"] == reason
+    assert "private fixture authority" not in json.dumps(result)
+    assert ("not dispatched" if reason == "rpc_refused" else "may have run") in result["error"]
+
+
 @pytest.mark.parametrize(
     ("method", "reply", "expected"),
     [

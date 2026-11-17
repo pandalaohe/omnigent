@@ -21,6 +21,26 @@ _PRIVATE_KEYS = frozenset(
 )
 
 
+def pi_bridge_failure(reason: object) -> dict[str, object]:
+    """Render only fixed diagnostics; never expose remote errors or private frames."""
+    before_dispatch = ("rpc_refused", "rpc_configuration_invalid")
+    if reason not in (
+        *before_dispatch,
+        "rpc_timeout",
+        "rpc_http_rejected",
+        "rpc_response_invalid",
+        "rpc_delivery_failed",
+        "rpc_execution_failed",
+    ):
+        reason = "rpc_delivery_failed"
+    detail = (
+        "command was not dispatched by this bridge"
+        if reason in before_dispatch
+        else "command may have run; check its outcome before retrying"
+    )
+    return {"error": f"Scoped Pi bridge unavailable ({reason}); {detail}.", "reason": reason}
+
+
 def redact_pi_authority(text: str) -> str:
     """Recognize tagged opaque capabilities across process/log boundaries."""
     return _FIELD.sub(

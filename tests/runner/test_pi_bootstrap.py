@@ -150,6 +150,57 @@ async def bind_ready(runtime, broker, relay, pid=None):
 
 
 @pytest.mark.asyncio
+async def test_scoped_rpc_outlives_legacy_dispatch_budget(attestor_relay, monkeypatch):
+    runtime, broker, relay, _source, _registry = attestor_relay
+    _actor, admission = await bind_ready(runtime, broker, relay)
+    monkeypatch.setitem(
+        relay._httpd.RequestHandlerClass._handle_pi_rpc.__globals__, "_TOOL_CALL_TIMEOUT_S", 0.01
+    )
+
+    async def execute(*_args):
+        await asyncio.sleep(0.2)
+        return {"result": {"stdout": "completed", "exit_code": 0}}
+
+    monkeypatch.setattr(PiScopeRelay, "execute_rpc", execute)
+    async with httpx.AsyncClient(base_url=relay._advertised_url, trust_env=False) as client:
+        response = await client.post(
+            "/pi/rpc",
+            headers={"Authorization": "Bearer " + admission.credential},
+            json={"payload": "{}"},
+        )
+    assert response.status_code == 200
+    assert response.json() == {"result": {"stdout": "completed", "exit_code": 0}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatched", [False, True])
+async def test_scoped_rpc_failure_codes_are_safe(attestor_relay, monkeypatch, caplog, dispatched):
+    from omnigent.runner.pi_scope_relay import PiRpcExecutionError
+
+    runtime, broker, relay, _source, _registry = attestor_relay
+    _actor, admission = await bind_ready(runtime, broker, relay)
+
+    async def execute(*_args):
+        error = PiRpcExecutionError if dispatched else ValueError
+        raise error("private fixture authority")
+
+    monkeypatch.setattr(PiScopeRelay, "execute_rpc", execute)
+    async with httpx.AsyncClient(base_url=relay._advertised_url, trust_env=False) as client:
+        response = await client.post(
+            "/pi/rpc",
+            headers={"Authorization": "Bearer " + admission.credential},
+            json={"payload": "{}"},
+        )
+    reason = "rpc_execution_failed" if dispatched else "rpc_refused"
+    assert response.status_code == 403
+    assert response.json()["reason"] == reason
+    assert ("may have run" if dispatched else "not dispatched") in response.json()["error"]
+    assert reason in caplog.text
+    assert "private fixture authority" not in response.text + caplog.text
+    assert admission.credential not in response.text + caplog.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "fault", ["none", "other-path", "missing-loaded", "changed-loaded", "changed-file"]
 )

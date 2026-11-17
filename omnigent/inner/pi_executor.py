@@ -104,7 +104,11 @@ from omnigent.models.pi_model_compatibility import (
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
 from omnigent.permission_tiers import plan_visible_tool_names
 from omnigent.permission_tiers.host import HOST_PERMISSION_STATE_FILE, read_host_permission_state
-from omnigent.permission_tiers.pi_private import public_pi_value, redact_pi_authority
+from omnigent.permission_tiers.pi_private import (
+    pi_bridge_failure,
+    public_pi_value,
+    redact_pi_authority,
+)
 from omnigent.permission_tiers.pi_tools import pi_permission_control_path
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.pi_timeouts import (
@@ -897,12 +901,12 @@ class _ToolServer:
             or not isinstance(payload, str)
             or self._permission_bridge_dir is None
         ):
-            return {"error": "scoped Pi transport unavailable"}
+            return cast(dict[str, Any], pi_bridge_failure("rpc_configuration_invalid"))
         try:
             relay = json.loads((self._permission_bridge_dir / "tool_relay.json").read_text())
             endpoint = relay.get("url") if isinstance(relay, dict) else None
             if not isinstance(endpoint, str):
-                return {"error": "scoped Pi transport unavailable"}
+                return cast(dict[str, Any], pi_bridge_failure("rpc_configuration_invalid"))
             parsed = _urlparse(endpoint)
             if (
                 parsed is None
@@ -915,24 +919,39 @@ class _ToolServer:
                 or parsed.query
                 or parsed.fragment
             ):
-                return {"error": "scoped Pi transport unavailable"}
+                return cast(dict[str, Any], pi_bridge_failure("rpc_configuration_invalid"))
             async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
                 response = await client.post(
                     endpoint.rstrip("/") + "/pi/rpc",
                     headers={"Authorization": "Bearer " + credential},
                     json={"payload": payload},
-                    timeout=_NATIVE_POLICY_APPROVAL_TIMEOUT_S,
+                    timeout=httpx.Timeout(None, connect=CONTROL_TIMEOUT_S),
                 )
             if response.status_code != 200:
-                return {"error": "scoped Pi transport unavailable"}
+                try:
+                    failure = response.json()
+                except ValueError:
+                    failure = {}
+                return cast(
+                    dict[str, Any],
+                    pi_bridge_failure(
+                        failure.get("reason", "rpc_http_rejected")
+                        if isinstance(failure, dict)
+                        else "rpc_http_rejected"
+                    ),
+                )
             result = response.json()
             return (
                 cast(dict[str, Any], public_pi_value(result))
                 if isinstance(result, dict)
-                else {"error": "scoped Pi transport unavailable"}
+                else cast(dict[str, Any], pi_bridge_failure("rpc_response_invalid"))
             )
+        except httpx.TimeoutException:
+            return cast(dict[str, Any], pi_bridge_failure("rpc_timeout"))
+        except ValueError:
+            return cast(dict[str, Any], pi_bridge_failure("rpc_response_invalid"))
         except Exception:  # noqa: BLE001 - do not export private frames or proxy exceptions
-            return {"error": "scoped Pi transport unavailable"}
+            return cast(dict[str, Any], pi_bridge_failure("rpc_delivery_failed"))
 
     def issue_pi_usage_token(self, session_id: str) -> str:
         token = secrets.token_urlsafe(32)
@@ -1617,7 +1636,8 @@ function callTool(toolName, args, callId, ctx) {{
     const support = require({json.dumps(str(scoped_support))});
     const event = {{toolCallId:callId, toolName, input:args}};
     return support.callScopedBridge(event, ctx, PORT).then(response => {{
-      const value = response.error ? {{error:"Scoped Pi bridge unavailable"}} : response.result;
+      const value = response.error
+        ? {{error:response.error,reason:response.reason}} : response.result;
       return {{content:[{{type:"text",text:JSON.stringify(value)}}],isError:!!response.error}};
     }});
   }}

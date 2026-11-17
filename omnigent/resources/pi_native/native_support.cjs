@@ -3,6 +3,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { pathToFileURL, fileURLToPath } = require("node:url");
 const nodeModule = require("node:module");
+const {bridgeFailure} = require("./scoped_client.cjs");
 
 // Generated parent/child extensions share actual SDK-object keys, not names or payload flags.
 const key = Symbol.for("omnigent.pi.native-support.v2");
@@ -650,7 +651,7 @@ async function evaluateNativeCall(event, ctx, support) {
 function callScopedBridge(event, ctx, port) {
   const record=store.bindings.get(ctx?.sessionManager);
   if(!record || record.closed || !record.isInstalled() || typeof record.scopedClient?.bridge!=="function")
-    return Promise.resolve({error:"Scoped Pi bridge unavailable"});
+    return Promise.resolve(bridgeFailure("binding_unavailable"));
   return record.scopedClient.bridge(event,port);
 }
 module.exports = {bindNativeSession, classifyNativeCall, requireNativeSession, prepareNativeSession, semanticAction, snapshot, loadPackageApi, getNativeState, closeNativeSession, hasScopedEvaluator, hasScopedClient, evaluateNativeCall, policyVerdict, createInputGuard, callScopedBridge};

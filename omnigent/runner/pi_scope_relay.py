@@ -32,6 +32,10 @@ class PiMcpExecution:
         }
 
 
+class PiRpcExecutionError(RuntimeError):
+    """The tool was dispatched, but its execution did not deliver a result."""
+
+
 _mcp_execution: ContextVar[PiMcpExecution | None] = ContextVar("pi_mcp_execution", default=None)
 
 
@@ -209,9 +213,11 @@ class PiScopeRelay:
         try:
             # No scheduling point between the live execution fence and dispatch entry.
             result = await tool_executor(name, arguments)
+            projected = public_pi_value(result)
+        except Exception:  # noqa: BLE001 - separate dispatch failures without exporting tool errors
+            raise PiRpcExecutionError("Pi RPC execution failed") from None
         finally:
             _mcp_execution.reset(token)
-        projected = public_pi_value(result)
         return {"result": projected}
 
     def _bound_call(
