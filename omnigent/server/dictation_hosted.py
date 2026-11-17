@@ -344,14 +344,13 @@ class _HostedStream:
                         if (
                             attempt
                             or not retryable
-                            or (
-                                self.deadline
-                                and self.deadline - time.monotonic() < self.timeout + 0.5
-                            )
+                            or (self.deadline and self.deadline <= time.monotonic())
                         ):
                             raise
                         with self.condition:
-                            self.condition.wait(timeout=0.5)
+                            # Stopping uses the remaining request budget without backoff.
+                            if self.deadline is None:
+                                self.condition.wait(timeout=0.5)
                             if self.cancelled:
                                 return
                 with self.condition:
@@ -361,14 +360,6 @@ class _HostedStream:
                 with self.condition:
                     if not self.cancelled:
                         self._lost(pcm)
-                        self.fatal = self.fatal or "third_party_failed"
-                        while self.queue:
-                            self._lost(self.queue.popleft())
-                        if self.voiced > 0:
-                            self._lost(bytes(self.audio))
-                        self.audio.clear()
-                        self.pending.clear()
-                        self.voiced = self.silent = 0
             finally:
                 with self.condition:
                     self.inflight = 0
