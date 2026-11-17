@@ -10,7 +10,11 @@ import {
 } from "@/components/ui/dialog";
 import { Switch } from "@/components/ui/switch";
 import { useSessionTerminalAccess } from "@/hooks/useSessionTerminalAccess";
-import { useTerminalAgentAccess, type TerminalInfo } from "@/hooks/useTerminals";
+import {
+  AGENT_TERMINAL_IDS,
+  useTerminalAgentAccess,
+  type TerminalInfo,
+} from "@/hooks/useTerminals";
 
 export function TerminalAgentAccess({
   conversationId,
@@ -19,6 +23,7 @@ export function TerminalAgentAccess({
   conversationId: string;
   terminal: TerminalInfo;
 }) {
+  if (AGENT_TERMINAL_IDS.has(terminal.id)) return null;
   if (!terminal.elevated && terminal.agentTier === undefined) return null;
   return <TerminalAgentAccessControl conversationId={conversationId} terminal={terminal} />;
 }

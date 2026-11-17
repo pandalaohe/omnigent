@@ -2,7 +2,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { TerminalAgentAccess } from "./TerminalAgentAccess";
-import { terminalsQueryKey, type TerminalInfo } from "@/hooks/useTerminals";
+import { AGENT_TERMINAL_IDS, terminalsQueryKey, type TerminalInfo } from "@/hooks/useTerminals";
+import { linkedTerminalInfo } from "@/hooks/useLinkedTerminals";
 import { authenticatedFetch } from "@/lib/identity";
 import type * as Identity from "@/lib/identity";
 
@@ -60,6 +61,48 @@ beforeEach(() => {
   vi.mocked(authenticatedFetch).mockReset();
 });
 afterEach(cleanup);
+it.each([...AGENT_TERMINAL_IDS])("keeps the harness terminal %s free of access controls", (id) => {
+  const view = mount({ ...root, id, elevated: false, agentTier: "read_write" });
+  expect(view.container).toBeEmptyDOMElement();
+  expect(authenticatedFetch).not.toHaveBeenCalled();
+  view.dispose();
+});
+
+it("keeps a linked host shell's tier control and host badge", async () => {
+  const terminal = linkedTerminalInfo({
+    terminal_id: "a".repeat(32),
+    host_id: "host-a",
+    host_name: "Host A",
+    elevated: false,
+    instance_id: "instance-a",
+    agent_tier: "read_write",
+  });
+  vi.mocked(authenticatedFetch).mockResolvedValue(
+    Response.json({
+      terminal_id: "a".repeat(32),
+      host_id: "host-a",
+      host_name: "Host A",
+      elevated: false,
+      instance_id: "instance-a",
+      agent_tier: "read",
+    }),
+  );
+  const view = mount(terminal);
+  expect(screen.getByRole("group", { name: "Agent access" })).toBeInTheDocument();
+  expect(screen.getByText("Host A")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Read" }));
+  await waitFor(() =>
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      `/v1/sessions/session-a/host-terminals/host-a/${"a".repeat(32)}`,
+      expect.objectContaining({
+        method: "PATCH",
+        body: '{"agent_tier":"read","instance_id":"instance-a"}',
+      }),
+    ),
+  );
+  view.dispose();
+});
+
 it("lets an owner lower an ordinary shell to Read without a confirmation", async () => {
   const terminal: TerminalInfo = { ...root, elevated: false, agentTier: "read_write" };
   vi.mocked(authenticatedFetch).mockResolvedValue(
