@@ -1935,7 +1935,10 @@ it("offers retry for retained failed audio without reopening the microphone", as
   await act(async () => fireEvent.click(button));
   const message = showToastMock.mock.calls.at(-1)?.[0];
   render(message);
+  const capture = vi.mocked(navigator.mediaDevices.getUserMedia);
+  capture.mockClear();
   await act(async () => fireEvent.click(screen.getByRole("button", { name: "Retry" })));
+  expect(capture).not.toHaveBeenCalled();
   expect(sessionRetryMock).toHaveBeenCalledOnce();
   expect(sessionStartMock).toHaveBeenCalledOnce();
   expect(onTranscript).toHaveBeenCalledWith("recovered words");

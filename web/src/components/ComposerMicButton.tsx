@@ -194,6 +194,7 @@ export const ComposerMicButton = ({
   // isn't a dead-looking button until it flips to listening.
   const [connecting, setConnecting] = useState(false);
   const [processing, setProcessing] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const sessionRef = useRef<DictationSession | null>(null);
@@ -357,6 +358,7 @@ export const ComposerMicButton = ({
     cleanupAbortRef.current?.abort();
     webSpeechTakeRef.current = null;
     setProcessing(false);
+    setRetrying(false);
     sessionRef.current?.cancel();
     sessionRef.current = null;
     serverBusyRef.current = false;
@@ -368,15 +370,7 @@ export const ComposerMicButton = ({
     setIsListening(false);
   }, [releaseTakeInput]);
 
-  useEffect(() => {
-    if (isListening) {
-      wasListeningRef.current = true;
-      return;
-    }
-    // A server fallback handshake pauses listening without ending the take.
-    if (connecting) return;
-    if (!wasListeningRef.current) return;
-    wasListeningRef.current = false;
+  const completeTake = useCallback(() => {
     const generation = takeGenerationRef.current;
     if (!discardingRef.current) setProcessing(true);
     const completion = punctuationQueueRef.current.then(async () => {
@@ -438,7 +432,17 @@ export const ComposerMicButton = ({
         if (mountedRef.current) setProcessing(false);
       }
     });
-  }, [isListening, connecting, inputRef, releaseTakeInput]);
+  }, [inputRef, releaseTakeInput]);
+
+  useEffect(() => {
+    if (isListening) {
+      wasListeningRef.current = true;
+      return;
+    }
+    if (connecting || !wasListeningRef.current) return;
+    wasListeningRef.current = false;
+    completeTake();
+  }, [isListening, connecting, completeTake]);
 
   // Surface a failure both in the button (tooltip + red tint) and as a toast,
   // so a failed take is an explained error rather than a silent flash back to
@@ -889,7 +893,7 @@ export const ComposerMicButton = ({
     sessionRef.current = session;
     serverBusyRef.current = true;
     setProcessing(true);
-    setIsListening(true);
+    setRetrying(true);
     void session
       .retry()
       .then((tail) => {
@@ -909,7 +913,8 @@ export const ComposerMicButton = ({
         if (generation !== takeGenerationRef.current) return;
         sessionRef.current = null;
         serverBusyRef.current = false;
-        setIsListening(false);
+        setRetrying(false);
+        completeTake();
       });
   };
 
@@ -1020,7 +1025,7 @@ export const ComposerMicButton = ({
   // Path-aware: a live server take is torn down via the DictationSession, a Web
   // Speech take via the recognizer.
   useEffect(() => {
-    if (!isListening) return;
+    if (!isListening && !retrying) return;
     const handler = (e: globalThis.KeyboardEvent): void => {
       // A focused question card owns Enter and Esc; the take keeps running in
       // the composer while the card decides what the key means.
@@ -1059,7 +1064,7 @@ export const ComposerMicButton = ({
     };
     window.addEventListener("keydown", handler, true);
     return () => window.removeEventListener("keydown", handler, true);
-  }, [isListening, toggle, questionCard]);
+  }, [isListening, retrying, toggle, questionCard]);
 
   if (questionCard && systemDictation) {
     return (

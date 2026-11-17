@@ -278,9 +278,8 @@ export class DictationSession {
   private readonly events: DictationSessionEvents;
   private ws: WebSocket;
   private readonly wholeTake: boolean;
-  private audio: ArrayBuffer[] = [];
-  private originalAudio: ArrayBuffer[] = [];
-  private hadFailure = false;
+  private audio: Int16Array<ArrayBuffer>[] = [];
+  private pendingFinals: DictationTail[] = [];
   private static retained: DictationSession | null = null;
   private readonly mediaStream: MediaStream;
   private readonly audioContext: AudioContext;
@@ -313,9 +312,7 @@ export class DictationSession {
         return;
       }
       if (this.wholeTake) {
-        const frame = msg.data.buffer.slice(0);
-        this.audio.push(frame);
-        this.originalAudio.push(frame);
+        this.audio.push(msg.data);
       }
       if (this.ws.readyState === WebSocket.OPEN) this.ws.send(msg.data.buffer);
     };
@@ -329,9 +326,11 @@ export class DictationSession {
       const event = parseDictationEvent(msg.data);
       if (event === null) return;
       if (event.type === "partial") this.events.onPartial(event.text);
-      else if (event.type === "final") this.events.onFinal(event.text, event);
-      else if (event.type === "processing" && this.stopResolve) clearTimeout(this.stopTimer);
-      else if (event.type === "stopped") this.resolveStop(event);
+      else if (event.type === "final") {
+        if (this.wholeTake) this.pendingFinals.push(event);
+        else this.events.onFinal(event.text, event);
+      } else if (event.type === "processing" && this.stopResolve) clearTimeout(this.stopTimer);
+      else if (event.type === "stopped") this.resolveStop(event, true);
       else if (event.type === "error") this.fail(event.message, event);
     };
     ws.onclose = () => {
@@ -352,7 +351,7 @@ export class DictationSession {
   static discardRetainedAudio(): void {
     if (this.retained) {
       this.retained.audio = [];
-      this.retained.originalAudio = [];
+      this.retained.pendingFinals = [];
     }
     this.retained = null;
   }
@@ -449,6 +448,7 @@ export class DictationSession {
     const ws = new WebSocket(buildDictationUrl());
     this.ws = ws;
     this.closed = false;
+    this.pendingFinals = [];
     try {
       await waitForReady(ws);
       if (this.closed) return { text: "" };
@@ -471,18 +471,16 @@ export class DictationSession {
   private retainFailedAudio(tail: DictationTail): void {
     if (!this.wholeTake || !tail.undelivered?.segments) {
       this.audio = [];
-      if (!this.hadFailure) this.originalAudio = [];
       return;
     }
-    this.hadFailure = true;
     if (!tail.retry_ranges) return;
-    const failed: ArrayBuffer[] = [];
+    const failed: Int16Array<ArrayBuffer>[] = [];
     let offset = 0;
     for (const frame of this.audio) {
       for (const [start, end] of tail.retry_ranges) {
         const first = Math.max(0, start - offset);
         const last = Math.min(frame.byteLength, end - offset);
-        if (last > first) failed.push(frame.slice(first, last));
+        if (last > first) failed.push(frame.subarray(first / 2, last / 2));
       }
       offset += frame.byteLength;
     }
@@ -516,7 +514,28 @@ export class DictationSession {
     this.stopTimer = setTimeout(() => this.resolveStop({ text: "" }), timeoutMs);
   }
 
-  private resolveStop(tail: DictationTail): void {
+  private resolveStop(value: DictationTail, commitFinals = false): void {
+    let tail = value;
+    if (this.wholeTake) {
+      if (commitFinals && this.pendingFinals.length) {
+        const parts = [...this.pendingFinals, tail];
+        tail = {
+          ...tail,
+          text: parts
+            .map((part) => part.text)
+            .filter(Boolean)
+            .join(" "),
+          raw: parts.some((part) => part.raw !== undefined)
+            ? parts
+                .map((part) => part.raw ?? part.text)
+                .filter(Boolean)
+                .join(" ")
+            : undefined,
+          cleaned: parts.every((part) => part.cleaned === true),
+        };
+      }
+      this.pendingFinals = [];
+    }
     this.retainFailedAudio(tail);
     clearTimeout(this.stopTimer);
     this.closed = true;

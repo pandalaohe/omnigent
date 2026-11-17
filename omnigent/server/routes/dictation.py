@@ -368,7 +368,11 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
                             return
                     else:
                         update = await asyncio.to_thread(finish_update)
-                    drain = getattr(handle, "drain_updates", None)
+                    drain = (
+                        None
+                        if getattr(handle, "whole_take", False)
+                        else getattr(handle, "drain_updates", None)
+                    )
                     updates = [update] + (await asyncio.to_thread(drain) if drain else [])
                     for completed in updates[:-1]:
                         if completed.finalized:

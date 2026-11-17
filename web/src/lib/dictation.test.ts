@@ -142,61 +142,77 @@ it("waits beyond the relay timer for a whole-take result", async () => {
   }
 });
 
-it("retains only failed PCM ranges for an explicit retry", async () => {
-  const sent: unknown[] = [];
-  const originalSocket = {
-    readyState: 1,
-    send: vi.fn(),
-    close: vi.fn(),
-    onmessage: null as ((msg: { data: string }) => void) | null,
-  };
-  const port = {
-    onmessage: null as ((msg: { data: Int16Array | null }) => void) | null,
-    postMessage: () => port.onmessage?.({ data: null }),
-  };
-  const take: DictationSession = Reflect.construct(DictationSession, [
-    { onPartial: vi.fn(), onFinal: vi.fn(), onError: vi.fn() },
-    originalSocket,
-    { getTracks: () => [{ stop: vi.fn() }] },
-    { state: "closed" },
-    { port },
-    true,
-  ]);
-  port.onmessage?.({ data: new Int16Array([1, 2, 3, 4]) });
-  const stopped = take.stop();
-  await Promise.resolve();
-  originalSocket.onmessage?.({
-    data: JSON.stringify({
-      type: "stopped",
-      text: "kept",
-      undelivered: { segments: 1, seconds: 0.000125 },
-      retry_ranges: [[2, 6]],
-    }),
-  });
-  await stopped;
-  let replayMessage: (data: string) => void = () => {};
-  vi.stubGlobal(
-    "WebSocket",
-    class {
-      static OPEN = 1;
-      readyState = 1;
-      onmessage = null as ((msg: { data: string }) => void) | null;
-      constructor() {
-        replayMessage = (data) => this.onmessage?.({ data });
-      }
-      send(data: unknown) {
-        sent.push(data);
-      }
-      close() {}
-    },
-  );
-  const retried = take.retry();
-  replayMessage('{"type":"ready","whole_take":true}');
-  await Promise.resolve();
-  await Promise.resolve();
-  expect(new Int16Array(sent[0] as ArrayBuffer)).toEqual(new Int16Array([2, 3]));
-  replayMessage('{"type":"stopped","text":"recovered"}');
-  await expect(retried).resolves.toMatchObject({ text: "recovered" });
-  await expect(take.retry()).resolves.toEqual({ text: "" });
-  take.cancel();
-});
+it.each([false, true])(
+  "retries only uncommitted PCM (disconnect before stopped: %s)",
+  async (disconnected) => {
+    const sent: unknown[] = [];
+    const delivered = vi.fn();
+    const originalSocket = {
+      readyState: 1,
+      send: vi.fn(),
+      close: vi.fn(),
+      onmessage: null as ((msg: { data: string }) => void) | null,
+      onclose: null as (() => void) | null,
+    };
+    const port = {
+      onmessage: null as ((msg: { data: Int16Array | null }) => void) | null,
+      postMessage: () => port.onmessage?.({ data: null }),
+    };
+    const take: DictationSession = Reflect.construct(DictationSession, [
+      { onPartial: vi.fn(), onFinal: delivered, onError: vi.fn() },
+      originalSocket,
+      { getTracks: () => [{ stop: vi.fn() }] },
+      { state: "closed" },
+      { port },
+      true,
+    ]);
+    const input = new Int16Array([1, 2, 3, 4]);
+    port.onmessage?.({ data: input });
+    const stopped = take.stop();
+    await Promise.resolve();
+    if (disconnected) {
+      originalSocket.onmessage?.({ data: '{"type":"final","text":"uncommitted prefix"}' });
+      expect(delivered).not.toHaveBeenCalled();
+      originalSocket.onclose?.();
+    } else {
+      originalSocket.onmessage?.({
+        data: JSON.stringify({
+          type: "stopped",
+          text: "kept",
+          undelivered: { segments: 1, seconds: 0.000125 },
+          retry_ranges: [[2, 6]],
+        }),
+      });
+    }
+    const first = await stopped;
+    if (disconnected) expect(first.text).toBe("");
+    let replayMessage: (data: string) => void = () => {};
+    vi.stubGlobal(
+      "WebSocket",
+      class {
+        static OPEN = 1;
+        readyState = 1;
+        onmessage = null as ((msg: { data: string }) => void) | null;
+        constructor() {
+          replayMessage = (data) => this.onmessage?.({ data });
+        }
+        send(data: unknown) {
+          sent.push(data);
+        }
+        close() {}
+      },
+    );
+    const retried = take.retry();
+    replayMessage('{"type":"ready","whole_take":true}');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(Array.from(sent[0] as Int16Array)).toEqual(disconnected ? [1, 2, 3, 4] : [2, 3]);
+    expect((sent[0] as Int16Array).buffer).toBe(input.buffer);
+    replayMessage('{"type":"final","text":"prefix"}');
+    expect(delivered).not.toHaveBeenCalled();
+    replayMessage('{"type":"stopped","text":"recovered"}');
+    await expect(retried).resolves.toMatchObject({ text: "prefix recovered" });
+    await expect(take.retry()).resolves.toEqual({ text: "" });
+    take.cancel();
+  },
+);

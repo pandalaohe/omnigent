@@ -3,22 +3,28 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import json
 import logging
 import math
 import os
+import tempfile
 import threading
 import time
 import wave
 from array import array
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 import openai
+from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
 
-from omnigent.server.dictation import DictationUpdate
+from omnigent.server.admin_list import resolve_data_dir
+from omnigent.server.dictation import DictationTakeError, DictationUpdate
 from omnigent.server.model_connections import (
     ResolvedConnection,
     resolve_connection,
@@ -169,6 +175,48 @@ def _transcribe(
     return parse_one_step(response.choices[0].message.content or "")
 
 
+_SPOOL_TTL_S = 24 * 60 * 60
+
+
+def _spool_root() -> Path:
+    root = resolve_data_dir() / "tmp" / "dictation"
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if root.is_symlink():
+        raise ValueError("Dictation temporary directory must not be a symlink")
+    return root
+
+
+def _sweep_spools(root: Path) -> None:
+    cutoff = time.time() - _SPOOL_TTL_S
+    for path in root.glob("take-*.pcm"):
+        try:
+            if path.is_symlink() or path.stat().st_mtime >= cutoff:
+                continue
+            lock = FileLock(str(path) + ".lock", mode=0o600)
+            with lock.acquire(timeout=0):
+                path.unlink(missing_ok=True)
+            Path(lock.lock_file).unlink(missing_ok=True)
+        except (OSError, FileLockTimeout):
+            continue
+
+
+@contextlib.contextmanager
+def _open_spool(root: Path):
+    with tempfile.NamedTemporaryFile(
+        mode="w+b", buffering=0, prefix="take-", suffix=".pcm", dir=root, delete=False
+    ) as audio:
+        try:
+            yield audio
+        finally:
+            audio.close()
+            Path(audio.name).unlink(missing_ok=True)
+
+
+def _frame_rms(frame: bytes) -> float:
+    samples = array("h", frame)
+    return math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+
+
 class _HostedStream:
     def __init__(self, engine: HostedTranscriptionEngine):
         self.engine = engine
@@ -196,11 +244,19 @@ class _HostedStream:
             http_client=httpx.Client(follow_redirects=False, timeout=self.timeout),
         )
         self.condition = threading.Condition()
-        self.queue: deque[bytes] = deque()
+        self.queue: deque[tuple[int, int]] = deque()
         self.results: deque[OneStepOutcome] = deque()
         self.pending = bytearray()
-        self.audio = bytearray()
-        self.rms: list[float] = []
+        root = _spool_root()
+        _sweep_spools(root)
+        self.spool_context = contextlib.ExitStack()
+        self.audio = self.spool_context.enter_context(_open_spool(root))
+        self.audio_path = Path(self.audio.name)
+        self.spool_lock = FileLock(str(self.audio_path) + ".lock", mode=0o600)
+        self.audio_bytes = 0
+        self.rms_bins = array("Q", [0]) * 32769
+        self.rms_count = 0
+        self.rms_max = 0.0
         self.connected_at = time.monotonic()
         self.first_frame_delay: float | None = None
         self.frames_received = 0
@@ -217,6 +273,7 @@ class _HostedStream:
         self.cancelled = False
         self.closed = False
         self.stopping = False
+        self.worker_failed = False
         self.processed_bytes = 0
         self.retry_ranges: list[tuple[int, int]] = []
         self.worker = threading.Thread(target=self._run, daemon=True, name="hosted-dictation")
@@ -228,22 +285,27 @@ class _HostedStream:
         self.lost_seconds += len(audio) / 32000
 
     def _segment(self) -> None:
-        data = bytes(self.audio) + bytes(self.pending[: len(self.pending) // 2 * 2])
-        self.audio.clear()
-        self.pending.clear()
+        length = self.audio_bytes // 2 * 2
         start = 0
-        remaining = math.ceil(len(data) / self.max_chunk_bytes)
+        remaining = math.ceil(length / self.max_chunk_bytes)
         while remaining > 1:
-            # Feasible cuts keep the fewest chunks; choose the quietest frame.
-            first = max(start + 640, len(data) - (remaining - 1) * self.max_chunk_bytes)
+            first = max(start + 640, length - (remaining - 1) * self.max_chunk_bytes)
             first = (first + 639) // 640
             last = (start + self.max_chunk_bytes) // 640
-            cut = min(range(first, last + 1), key=lambda i: (self.rms[i - 1], -i)) * 640
-            self.queue.append(data[start:cut])
+            best = (float("inf"), 0)
+            self.audio.seek((first - 1) * 640)
+            for frame_index in range(first, last + 1):
+                level = _frame_rms(self.audio.read(640))
+                best = min(best, (level, -frame_index))
+            cut = -best[1] * 640
+            self.queue.append((start, cut))
             start = cut
             remaining -= 1
-        if start < len(data):
-            self.queue.append(data[start:])
+        if start < length:
+            self.queue.append((start, length))
+        if len(self.pending) >= 2:
+            self._record_rms(bytes(self.pending[: len(self.pending) // 2 * 2]))
+        self.pending.clear()
 
     def _update(self, *, all_results: bool = False) -> DictationUpdate:
         values: list[OneStepOutcome] = []
@@ -256,7 +318,7 @@ class _HostedStream:
             partial="",
             finalized=" ".join(value.text for value in values) or None,
             finalized_raw=" ".join(value.raw or value.text for value in values)
-            if cleaned
+            if any(value.raw is not None for value in values)
             else None,
             finalized_cleaned=cleaned,
             undelivered={"segments": self.lost_segments, "seconds": round(self.lost_seconds, 2)},
@@ -270,27 +332,59 @@ class _HostedStream:
             if data and self.first_frame_delay is None:
                 self.first_frame_delay = time.monotonic() - self.connected_at
             self.frames_received += bool(data)
-            self.pending.extend(data)
-            while len(self.pending) >= 640:
-                frame = bytes(self.pending[:640])
-                del self.pending[:640]
-                samples = array("h", frame)
-                self.rms.append(
-                    math.sqrt(sum(sample * sample for sample in samples) / len(samples))
-                )
-                self.audio.extend(frame)
+            if self.audio.write(data) != len(data):
+                raise OSError("Incomplete dictation audio write")
+            self.audio_bytes += len(data)
+            offset = 0
+            if self.pending:
+                needed = min(640 - len(self.pending), len(data))
+                self.pending.extend(data[:needed])
+                offset = needed
+                if len(self.pending) == 640:
+                    self._record_rms(bytes(self.pending))
+                    self.pending.clear()
+            while offset + 640 <= len(data):
+                self._record_rms(data[offset : offset + 640])
+                offset += 640
+            self.pending.extend(data[offset:])
             return self._update()
+
+    def _record_rms(self, frame: bytes) -> None:
+        level = _frame_rms(frame)
+        self.rms_bins[min(32768, round(level))] += 1
+        self.rms_count += 1
+        self.rms_max = max(self.rms_max, level)
+
+    def _close_spool(self) -> None:
+        self.spool_context.close()
+        self.audio_path.unlink(missing_ok=True)
 
     def _call(self, pcm: bytes) -> OneStepOutcome:
         return _transcribe(self.engine, self.client, pcm, self.timeout)
 
     def _run(self) -> None:
+        try:
+            with self.spool_lock:
+                self._process()
+        except Exception:  # noqa: BLE001 - redact temporary storage failures
+            with self.condition:
+                self.worker_failed = self.cancelled = True
+                self.condition.notify_all()
+        finally:
+            with contextlib.suppress(OSError):
+                Path(self.spool_lock.lock_file).unlink(missing_ok=True)
+
+    def _process(self) -> None:
         while True:
             with self.condition:
                 self.condition.wait_for(lambda: self.cancelled or self.queue or self.stopping)
                 if self.cancelled or not self.queue:
                     return
-                pcm = self.queue.popleft()
+                start, end = self.queue.popleft()
+                self.audio.seek(start)
+                pcm = self.audio.read(end - start)
+                if len(pcm) != end - start:
+                    raise OSError("Incomplete dictation audio read")
                 self.inflight = len(pcm)
                 self.chunks_sent += 1
             try:
@@ -351,15 +445,21 @@ class _HostedStream:
         with self.condition:
             if self.stopping:
                 return self._update()
-            self.take_seconds = (len(self.audio) + len(self.pending) // 2 * 2) / 32000
-            self._segment()
+            self.take_seconds = self.audio_bytes // 2 * 2 / 32000
+            if not self.worker_failed:
+                self._segment()
             self.stopping = True
             self.condition.notify_all()
             self.condition.wait_for(
                 lambda: self.cancelled or (not self.queue and not self.inflight)
             )
             self._log_take("cancelled" if self.cancelled else "stopped")
-            return self._update()
+            self._close_spool()
+            if self.worker_failed:
+                raise DictationTakeError(
+                    "third_party_failed", {"segments": 1, "seconds": self.take_seconds}
+                )
+            return self._update(all_results=True)
 
     def drain_updates(self) -> list[DictationUpdate]:
         with self.condition:
@@ -375,23 +475,27 @@ class _HostedStream:
         if self.logged:
             return
         self.logged = True
-        levels = sorted(self.rms)
-        quantiles = [
-            round(levels[min(len(levels) - 1, int((len(levels) - 1) * q))], 2) if levels else 0
-            for q in (0.1, 0.5, 0.9)
-        ]
+        quantiles = []
+        for q in (0.1, 0.5, 0.9):
+            target = int((self.rms_count - 1) * q)
+            cumulative = 0
+            value = 0
+            for level, count in enumerate(self.rms_bins):
+                cumulative += count
+                if cumulative > target:
+                    value = level
+                    break
+            quantiles.append(value)
         _logger.info(
             "hosted dictation take %s",
             json.dumps(
                 {
                     "outcome": outcome,
-                    "take_seconds": getattr(
-                        self, "take_seconds", (len(self.audio) + len(self.pending)) / 32000
-                    ),
+                    "take_seconds": getattr(self, "take_seconds", self.audio_bytes / 32000),
                     "first_frame_delay_s": self.first_frame_delay,
                     "frames_received": self.frames_received,
                     "rms_p10_p50_p90": quantiles,
-                    "rms_max": round(max(levels, default=0), 2),
+                    "rms_max": round(self.rms_max, 2),
                     "chunks_sent": self.chunks_sent,
                     "requests": list(self.requests)
                     + (
@@ -419,7 +523,7 @@ class _HostedStream:
             if not self.stopping:
                 self._log_take("cancelled")
             self.closed = self.cancelled = True
-            self.audio.clear()
+            self._close_spool()
             self.pending.clear()
             self.queue.clear()
             self.condition.notify_all()

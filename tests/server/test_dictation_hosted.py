@@ -297,6 +297,7 @@ def test_disconnect_retains_capacity_until_blocked_transport_exits(monkeypatch):
                 assert socket.receive_json()["type"] == "processing"
                 assert entered.wait(timeout=1)
             assert close_returned.wait(timeout=1)
+            assert not take.audio_path.exists()
             take.worker.join(timeout=2.1)
             assert take.worker.is_alive()
             with client.websocket_connect("/v1/dictation/stream") as blocked:
@@ -375,3 +376,111 @@ def test_stop_retries_transient_failure_with_backoff(monkeypatch, failure):
         assert all(SPEECH * 20 in body for body in calls)
     finally:
         take.close()
+
+
+def test_take_spools_pcm_and_removes_file_after_delivery(tmp_path, monkeypatch):
+    monkeypatch.setattr(hosted, "_spool_root", lambda: tmp_path, raising=False)
+    take = stream(monkeypatch, lambda request: httpx.Response(200, json={"text": "kept"}))
+    try:
+        take.feed_pcm16(SPEECH * 100)
+        files = list(tmp_path.glob("take-*.pcm"))
+        assert len(files) == 1
+        assert files[0].stat().st_size == len(SPEECH) * 100
+        assert take.finish_update().finalized == "kept"
+        assert not files[0].exists()
+    finally:
+        take.close()
+
+
+def test_spool_sweep_skips_active_files_and_cleans_expired_orphans(tmp_path, monkeypatch):
+    import os
+
+    from filelock import FileLock, Timeout
+
+    monkeypatch.setattr(hosted, "_spool_root", lambda: tmp_path)
+    take = stream(monkeypatch, lambda request: httpx.Response(200, json={"text": "kept"}))
+    try:
+        take.feed_pcm16(SPEECH * 100)
+        path = next(tmp_path.glob("take-*.pcm"))
+
+        def leased():
+            try:
+                with FileLock(str(path) + ".lock").acquire(timeout=0):
+                    return False
+            except Timeout:
+                return True
+
+        poll_until(leased, timeout_s=1, interval_s=0.01)
+        orphan = tmp_path / "take-orphan.pcm"
+        orphan.write_bytes(SILENCE)
+        expired = time.time() - hosted._SPOOL_TTL_S - 1
+        os.utime(path, (expired, expired))
+        os.utime(orphan, (expired, expired))
+        hosted._sweep_spools(tmp_path)
+        assert path.exists()
+        assert not orphan.exists()
+        assert len(take.rms_bins) == 32769
+        assert take.rms_count == 100
+    finally:
+        take.close()
+        take.wait_closed()
+    assert not list(tmp_path.glob("take-*.pcm"))
+
+
+def test_hosted_route_delivers_mixed_cleanup_chunks_atomically(monkeypatch):
+    monkeypatch.setenv("OMNIGENT_DICTATION_HOSTED_MAX_AUDIO_BYTES", str(640 * 50 + 44))
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        body = (
+            {"raw": "first", "text": "First.", "complete": True}
+            if len(calls) == 1
+            else {"raw": "last", "text": "Last.", "complete": False}
+        )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": json.dumps(body)},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    take = stream(monkeypatch, handler, method="chat_audio")
+    with TestClient(hosted_app(take)) as client:
+        with client.websocket_connect("/v1/dictation/stream") as socket:
+            assert socket.receive_json()["type"] == "ready"
+            socket.send_bytes(SPEECH * 80)
+            socket.send_json({"type": "stop"})
+            assert socket.receive_json()["type"] == "processing"
+            result = socket.receive_json()
+            assert result["type"] == "stopped"
+            assert result["text"] == "First. last"
+            assert result["raw"] == "first last"
+            assert result["cleaned"] is False
+            assert not take.audio_path.exists()
+
+
+@pytest.mark.parametrize("operation", ["read", "write"])
+def test_spool_io_failure_is_explicit_and_removes_audio(monkeypatch, operation):
+    take = stream(monkeypatch, lambda request: httpx.Response(200, json={"text": "kept"}))
+    try:
+        if operation == "write":
+            monkeypatch.setattr(take.audio, "write", lambda data: 1)
+            with pytest.raises(OSError, match="Incomplete dictation audio write"):
+                take.feed_pcm16(SPEECH)
+        else:
+            take.feed_pcm16(SPEECH)
+            monkeypatch.setattr(take.audio, "read", lambda size: b"")
+            with pytest.raises(hosted.DictationTakeError) as error:
+                take.finish_update()
+            assert error.value.undelivered == {"segments": 1, "seconds": 0.02}
+    finally:
+        take.close()
+        take.wait_closed()
+    assert not take.audio_path.exists()
