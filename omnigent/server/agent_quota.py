@@ -44,6 +44,7 @@ from omnigent.stores.agent_store import AgentStore
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.usage_evidence_store import UsageEvidenceStore
 from omnigent.stores.usage_hours_store import UsageHoursStore
 from omnigent.stores.usage_pool_store import (
     UsagePoolConflictError,
@@ -84,6 +85,7 @@ from omnigent.usage.contract import (
 )
 from omnigent.usage.otlp import UsageDelta
 from omnigent.usage.ranges import RangeKey, Span, range_spans
+from omnigent.usage.source_events import report_log_event
 
 _logger = logging.getLogger(__name__)
 _DELETE = object()
@@ -216,6 +218,7 @@ class AgentQuotaService:
         pool_store: UsagePoolStore | None = None,
         pricing_store: UsagePricingStore | None = None,
         quota_closing_store: UsageQuotaClosingStore | None = None,
+        event_store: UsageEvidenceStore | None = None,
     ) -> None:
         self.conversations = conversation_store
         self.permissions = permission_store
@@ -228,6 +231,7 @@ class AgentQuotaService:
         self.pool_store = pool_store
         self.pricing_store = pricing_store
         self.quota_closing_store = quota_closing_store
+        self.event_store = event_store
         self.mark_settings = mark_settings or MarkSettings()
         self.agent_store = agent_store
         self.agent_cache = agent_cache
@@ -452,7 +456,7 @@ class AgentQuotaService:
                 with self._lock:
                     record = self._accounts.get(key, {})
                     if record.get("activity_writer") == "otlp":
-                        self._append_log(record, "writer_conflict", time.time())
+                        self._append_log(owner, record, "writer_conflict", time.time())
                         self._dirty[(key[0], owner, self._account_key(account_id))] = record
                         raise UsageWriterConflictError(
                             "writer_conflict: account uses OTLP activity"
@@ -546,7 +550,9 @@ class AgentQuotaService:
                     key = (current_workspace_id(), owner, account_id)
                     with self._lock:
                         record = self._accounts[key]
-                        self._append_log(record, "cloudevent", float(report.observed_at), **event)
+                        self._append_log(
+                            owner, record, "cloudevent", float(report.observed_at), **event
+                        )
                         record["source"] = event["source"][:64]
                         record["source_at"] = report.observed_at
             if (
@@ -593,7 +599,7 @@ class AgentQuotaService:
                 and int(entry["at"] // 86400) == int(now // 86400)
                 for entry in record.get("report_log", [])
             ):
-                self._append_log(record, kind, now, **({"metric": metric} if metric else {}))
+                self._append_log(owner, record, kind, now, metric=metric)
             self._accounts[key] = record
             self._dirty[(key[0], owner, self._account_key(account_id))] = record
 
@@ -624,7 +630,7 @@ class AgentQuotaService:
                 record.get("has_activity") or self.hours_store.has_activity(owner, delta.account)
             ):
                 with self._lock:
-                    self._append_log(record, "writer_conflict", time.time())
+                    self._append_log(owner, record, "writer_conflict", time.time())
                     self._accounts[key] = record
                     self._dirty[(key[0], owner, self._account_key(delta.account))] = record
                 raise UsageWriterConflictError(
@@ -749,7 +755,9 @@ class AgentQuotaService:
                 stored[name] = data[name]
                 section.update(read_at=observed, fresh_until=report.fresh_until)
             else:
-                self._append_log(record, "read_failed", observed, section=name)
+                self._append_log(
+                    owner, record, "read_failed", observed, section=name, session=session
+                )
             sections[name] = section
             if name == "windows":
                 windows_changed = True
@@ -776,11 +784,24 @@ class AgentQuotaService:
             outcome.held = written.held
             outcome.skipped = written.skipped
             for entry in outcome.held:
-                self._append_log(record, "lower_reread_held", observed, **entry.model_dump())
+                self._append_log(
+                    owner,
+                    record,
+                    "lower_reread_held",
+                    observed,
+                    session=session,
+                    **entry.model_dump(),
+                )
             for entry in entries:
                 if entry.correction and not entry.removed:
                     self._append_log(
-                        record, "correction", observed, hour=entry.hour, source=source
+                        owner,
+                        record,
+                        "correction",
+                        observed,
+                        hour=entry.hour,
+                        source=source,
+                        session=session,
                     )
             record["has_activity"] = True
             record["activity_writer"] = "report"
@@ -794,7 +815,7 @@ class AgentQuotaService:
         record["reset_marks"] = marks
         record["report"] = merged.stored()
         if event:
-            self._append_log(record, "cloudevent", observed, **event)
+            self._append_log(owner, record, "cloudevent", observed, session=session, **event)
         snapshot = None
         if windows_changed and record.get("product"):
             snapshot = {
@@ -913,7 +934,7 @@ class AgentQuotaService:
                         marks[window.id] = next_mark(marks.get(window.id), start, length)
                 record["reset_marks"] = marks
             else:
-                self._append_log(record, "read_failed", observed)
+                self._append_log(owner, record, "read_failed", observed)
             record["sections"] = {
                 "windows": {
                     name: record.get(name)
@@ -954,8 +975,16 @@ class AgentQuotaService:
         if product is not None and snapshot is not None:
             self._store_snapshot(owner, host_id, product, snapshot, now=now)
 
-    @staticmethod
-    def _append_log(record: dict[str, Any], kind: str, at: float, **details: Any) -> None:
+    def _append_log(
+        self,
+        owner: str,
+        record: dict[str, Any],
+        kind: str,
+        at: float,
+        *,
+        session: Session | None = None,
+        **details: Any,
+    ) -> None:
         entries = list(record.get("report_log") or [])
         if (
             not entries
@@ -965,6 +994,12 @@ class AgentQuotaService:
             _logger.warning("Usage source report: %s", kind)
         entries.append({"kind": kind, "at": at, **details})
         record["report_log"] = entries[-200:]
+        if self.event_store is not None:
+            event = report_log_event(record["account_id"], entries[-1])
+            if session is None:
+                self.event_store.insert_events(owner, [event])
+            else:
+                self.event_store.insert_events_in_session(session, owner, [event])
 
     def note_rejected(
         self,
@@ -1008,9 +1043,9 @@ class AgentQuotaService:
                 "report_log": [],
             }
             if format is None:
-                self._append_log(record, "rejected", now)
+                self._append_log(owner, record, "rejected", now)
             else:
-                self._append_log(record, "import_rejected", now, format=format)
+                self._append_log(owner, record, "import_rejected", now, format=format)
             self._accounts[key] = record
             self._dirty[(key[0], owner, self._account_key(account_id))] = record
 
@@ -1266,6 +1301,8 @@ class AgentQuotaService:
                     account.mark = marks.get(account.id)
             except Exception:
                 _logger.warning("Could not read usage error marks", exc_info=True)
+        if self.event_store is not None:
+            self.event_store.record_quota_tiers(owner, accounts, tiers, now)
         return UsageOverview(
             generated_at=now,
             tiers=asdict(tiers),

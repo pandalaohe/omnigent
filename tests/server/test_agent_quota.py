@@ -1340,3 +1340,28 @@ async def test_cloud_event_v2_report_and_partial_updates(db_uri, mode):
                 headers={"Content-Type": "application/cloudevents+json"},
             )
         ).status_code == 422
+
+
+def test_report_failure_is_archived_live_and_import_is_idempotent(db_uri):
+    from omnigent.server.usage_evidence import UsageEvidenceService
+    from omnigent.stores.usage_evidence_store import UsageEvidenceStore
+
+    service = service_with_store(db_uri)
+    evidence = UsageEvidenceService(UsageEvidenceStore(db_uri))
+    service.event_store = evidence.store
+    for schema in (1, 2):
+        payload = {
+            "schema_version": schema,
+            "observed_at": time.time(),
+            "status": "unavailable",
+            "windows": [],
+        }
+        report = (UsageReport if schema == 1 else UsageReportV2).model_validate(payload)
+        service.report_account(OWNER, f"account{schema}", report)
+    service.flush(force=True)
+    count = evidence.read_events(OWNER)["stored"]
+    assert count == 2
+    assert all(row["type"] == "read_failed" for row in evidence.read_events(OWNER)["events"])
+    evidence.import_report_logs()
+    evidence.import_report_logs()
+    assert evidence.read_events(OWNER)["stored"] == count

@@ -180,3 +180,121 @@ def test_daily_prune_covers_workspaces_and_last_confirmation(db_uri, confirmatio
             assert store.read_events(OWNER)[2] == 0
             expected = ["new", "old"] if confirmation_age_days == 0 else ["new"]
             assert [row["source"] for row in store.read_sources(OWNER)] == expected
+
+
+def test_episode_pairing_across_pages_and_out_of_order_arrival(db_uri):
+    store = UsageEvidenceStore(db_uri)
+    service = UsageEvidenceService(store)
+    now = now_epoch()
+
+    def change(id, at, severity, **values):
+        return event(id).model_copy(
+            update={
+                "time": datetime.fromtimestamp(at, UTC).isoformat(),
+                "severity": severity,
+                "type": "connection",
+                **values,
+            }
+        )
+
+    recovery = change("recover", now, "recover")
+    store.insert_events(OWNER, [recovery])
+    assert service.read_events(OWNER)["events"][0]["episode"] is None
+    fault = change("fault", now - 60, "error")
+    others = [change(str(i), now - i - 1, "info") for i in range(5)]
+    store.insert_events(OWNER, [fault, *others])
+    page1 = service.read_events(OWNER, limit=6)
+    assert len(page1["events"]) == 5
+    assert "recover" not in {row["id"] for row in page1["events"]}
+    page2 = service.read_events(OWNER, before=page1["next_before"], limit=6)
+    assert page2["events"][0]["episode"] == {
+        "recovered_at": now,
+        "recover_event_id": "recover",
+    }
+    assert page2["events"][0]["time"] == now - 60
+    store.insert_events(
+        OWNER,
+        [
+            change("other-type", now - 61, "error", type="tier_day"),
+            change("other-account", now - 61, "error", subject="different"),
+            change("other-source", now - 61, "error", source="/different"),
+        ],
+    )
+    rows = {row["id"]: row for row in service.read_events(OWNER)["events"]}
+    assert all(
+        rows[key]["episode"] is None for key in ("other-type", "other-account", "other-source")
+    )
+    filtered = service.read_events(OWNER, kind="disconnect", limit=2)
+    assert all(row["type"] == "connection" for row in filtered["events"])
+    assert filtered["next_before"] is not None
+
+
+def test_report_log_import_replays_same_identity(db_uri):
+    from omnigent.usage.source_events import report_log_event
+
+    snapshots = UsageSnapshotStore(db_uri)
+    entry = {"kind": "read_failed", "at": float(now_epoch()), "section": "windows"}
+    snapshots.write(
+        OWNER,
+        "usage.account.a",
+        {
+            "schema_version": 1,
+            "account_id": "a",
+            "report_log": [entry],
+        },
+    )
+    service = UsageEvidenceService(UsageEvidenceStore(db_uri))
+    service.import_report_logs()
+    service.import_report_logs()
+    assert service.read_events(OWNER)["stored"] == 1
+    row = service.read_events(OWNER)["events"][0]
+    assert row["id"] == report_log_event("a", entry).id
+    assert row["severity"] == "error" and row["type"] == "read_failed"
+    assert row["data"] == entry
+
+
+def test_quota_tier_changes_are_durable_and_edge_triggered(db_uri):
+    from omnigent.quota_pace import QuotaTiers
+    from omnigent.usage.contract import UsageAccountView, UsageWindowView
+
+    store = UsageEvidenceStore(db_uri)
+    account = UsageAccountView(
+        id="a", kind="account", display_name="A", state="ok", freshness="fresh"
+    )
+    now = now_epoch()
+    for remaining in (60, 40, 40, 10, 10, 60, 60):
+        account.windows = [
+            UsageWindowView(
+                id="day", label="Day", kind="rolling", state="ok", remaining_pct=remaining
+            )
+        ]
+        store.record_quota_tiers(OWNER, [account], QuotaTiers(), now)
+        now += 1
+    rows = UsageEvidenceService(store).read_events(OWNER)["events"]
+    assert [row["severity"] for row in rows] == ["error", "warn"]
+    assert rows[0]["episode"] is not None
+    assert store.read_events(OWNER)[2] == 3
+    # A new store instance sees the committed normal state, so reload adds nothing.
+    UsageEvidenceStore(db_uri).record_quota_tiers(OWNER, [account], QuotaTiers(), now)
+    assert store.read_events(OWNER)[2] == 3
+
+
+def test_host_registry_disconnect_reconnect_archives_one_episode(db_uri):
+    from omnigent.host.frames import HostHelloFrame
+    from omnigent.server.host_registry import HostRegistry
+
+    service = UsageEvidenceService(UsageEvidenceStore(db_uri))
+    registry = HostRegistry()
+    registry.connection_observer = service.host_connection
+    hello = HostHelloFrame(name="Workstation", version="0.1.0", frame_protocol_version=1)
+    first = registry.register("a" * 32, None, hello, OWNER)
+    assert registry.deregister(first.host_id, conn=first)
+    second = registry.register("a" * 32, None, hello, OWNER)
+    assert not registry.deregister(first.host_id, conn=first)
+    # A live socket replacement is not another connectivity transition.
+    registry.register("a" * 32, None, hello, OWNER)
+    page = service.read_events(OWNER, kind="disconnect")
+    assert page["stored"] == 3
+    errors = [row for row in page["events"] if row["severity"] == "error"]
+    assert len(errors) == 1 and errors[0]["episode"] is not None
+    assert second.host_id == first.host_id
