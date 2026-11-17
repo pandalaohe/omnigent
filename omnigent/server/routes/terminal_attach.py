@@ -99,6 +99,7 @@ from omnigent.server.routes._terminal_access import (
     require_terminal_host_owner,
     require_terminal_human_control,
 )
+from omnigent.server.terminal_refusals import close_terminal_refusal, terminal_refusal_category
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.terminals.conpty_bridge import bridge_terminal_to_websocket
@@ -149,22 +150,20 @@ def create_terminal_attach_router(
         websocket: WebSocket, session_id: str, read_only: bool
     ) -> None:
         if read_only:
-            raise WebSocketException(
-                code=1008, reason="admin terminals do not allow read-only watchers"
-            )
+            raise WebSocketException(code=1008, reason="admin_not_allowed")
         try:
             require_terminal_browser_session(websocket, auth_provider)
             if conversation_store is None:
                 if auth_provider is not None:
-                    raise WebSocketException(code=1008, reason="host ownership cannot be verified")
+                    raise WebSocketException(code=1008, reason="admin_not_allowed")
                 return
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
-                raise WebSocketException(code=1008, reason="session not found")
+                raise WebSocketException(code=1008, reason="admin_not_allowed")
             await require_terminal_host_owner(websocket, conv, auth_provider, conversation_store)
         except HTTPException as exc:
             raise WebSocketException(
-                code=1008, reason="not authorized for admin terminal attach"
+                code=1008, reason=terminal_refusal_category(exc, "admin_not_allowed")
             ) from exc
 
     @router.websocket("/sessions/{session_id}/resources/terminals/{terminal_id}/attach")
@@ -195,20 +194,27 @@ def create_terminal_attach_router(
             wait_for_terminal_entry_by_resource_id,
         )
 
-        user_id = await _authorize_terminal_attach(
-            websocket,
-            session_id=session_id,
-            read_only=read_only,
-            auth_provider=auth_provider,
-            permission_store=permission_store,
-            conversation_store=conversation_store,
-        )
+        try:
+            user_id = await _authorize_terminal_attach(
+                websocket,
+                session_id=session_id,
+                read_only=read_only,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+                conversation_store=conversation_store,
+            )
+        except WebSocketException as exc:
+            category = {
+                "authentication required": "browser_session_missing",
+                "not authorized": "not_owner",
+            }.get(exc.reason or "", "access_denied")
+            await close_terminal_refusal(websocket, category)
+            return
         try:
             require_terminal_human_control(websocket, auth_provider)
         except HTTPException as exc:
-            raise WebSocketException(
-                code=1008, reason="A browser session is required for terminal attach"
-            ) from exc
+            await close_terminal_refusal(websocket, terminal_refusal_category(exc))
+            return
         # WebSockets bypass the HTTP middleware that attributes debug-log rows
         # to the request's user; this handler task is per-connection.
         set_current_user_id(user_id)
@@ -258,7 +264,7 @@ def create_terminal_attach_router(
                 )
                 return
             except WebSocketException as exc:
-                await websocket.close(code=exc.code, reason=exc.reason or "not authorized")
+                await close_terminal_refusal(websocket, exc.reason or "admin_not_allowed")
                 return
             except Exception:  # noqa: BLE001 - fail closed before opening the relay.
                 await websocket.close(
@@ -371,7 +377,7 @@ def create_terminal_attach_router(
             try:
                 await authorize_elevated_attach(websocket, session_id, read_only)
             except WebSocketException as exc:
-                await websocket.close(code=exc.code, reason=exc.reason or "not authorized")
+                await close_terminal_refusal(websocket, exc.reason or "admin_not_allowed")
                 return
 
         from omnigent.runtime import telemetry
@@ -463,15 +469,6 @@ async def _authorize_terminal_attach(
             conversation_store,
         )
     except OmnigentError as exc:
-        _logger.info(
-            "Rejected terminal attach for session %s as user %s: %s",
-            session_id,
-            user_id,
-            exc,
-            extra=debug_event(
-                "attach_terminal_by_resource_id", session_id=session_id, phase="rejected"
-            ),
-        )
         raise WebSocketException(
             code=status.WS_1008_POLICY_VIOLATION,
             reason="not authorized",

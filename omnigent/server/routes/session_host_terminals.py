@@ -15,6 +15,7 @@ from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_run
 from omnigent.server.linked_host_terminals import LinkedHostTerminals
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._terminal_access import require_terminal_browser_session
+from omnigent.server.terminal_refusals import TerminalAccessDenied, TerminalRefusalRoute
 
 
 class SessionHostTerminalCreate(HostTerminalCreate):
@@ -22,20 +23,24 @@ class SessionHostTerminalCreate(HostTerminalCreate):
 
 
 def create_session_host_terminals_router(service: LinkedHostTerminals) -> APIRouter:
-    router = APIRouter()
+    router = APIRouter(route_class=TerminalRefusalRoute)
 
     async def authorize(request: Request, sid: str, *, agent: bool = False):
         conv = await service.conversation(sid)
         token = request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER)
         if agent or token:
             if not token or not conv.runner_id or token_bound_runner_id(token) != conv.runner_id:
-                raise HTTPException(403, "Only this session's bound runner may use this route")
+                raise TerminalAccessDenied(
+                    "runner_credential", "Only this session's bound runner may use this route"
+                )
             user = await service.agent_owner(conv)
         else:
             user = require_user(request, service.auth)
             require_terminal_browser_session(request, service.auth)
         if not await service.owns(user, conv):
-            raise HTTPException(403, "Only the session owner may use linked terminals")
+            raise TerminalAccessDenied(
+                "not_owner", "Only the session owner may use linked terminals"
+            )
         return user, conv
 
     @router.get("/sessions/{sid}/host-terminals")
@@ -61,7 +66,9 @@ def create_session_host_terminals_router(service: LinkedHostTerminals) -> APIRou
             if service.permissions is not None and (
                 user is None or not await asyncio.to_thread(service.permissions.is_admin, user)
             ):
-                raise HTTPException(403, "Admin terminals require an administrator")
+                raise TerminalAccessDenied(
+                    "admin_not_allowed", "Admin terminals require an administrator"
+                )
             if "terminal_elevated_v1" not in conn.hello.capabilities:
                 raise HTTPException(409, "Admin terminals are not enabled on this host")
         terminal = await service.call(

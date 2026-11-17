@@ -617,6 +617,30 @@ async def test_middleware_rejects_forbidden_origin_without_calling_route(
     ]
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1/sessions/session/resources/terminals/terminal_main/attach",
+        "/v1/hosts/host/terminals/shell/attach",
+    ],
+)
+async def test_terminal_origin_refusal_reaches_browser_without_calling_route(
+    monkeypatch, caplog, path
+):
+    monkeypatch.setenv(_LOCAL_ENV, "1")
+    downstream = _RecordingASGIApp()
+    scope = {**_ws_scope("https://untrusted.example"), "path": path}
+    with caplog.at_level("INFO"):
+        sent = await _drive_middleware(WebSocketOriginMiddleware(downstream), scope)
+    assert downstream.called is False
+    assert sent == [
+        {"type": "websocket.accept"},
+        {"type": "websocket.close", "code": 4403, "reason": "origin_untrusted"},
+    ]
+    assert "terminal access refused category=origin_untrusted" in caplog.text
+    assert "untrusted.example" not in caplog.text
+
+
 async def test_middleware_admits_loopback_origin(monkeypatch: pytest.MonkeyPatch) -> None:
     """A loopback origin in local mode reaches the downstream app.
 

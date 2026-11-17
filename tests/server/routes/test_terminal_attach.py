@@ -41,6 +41,7 @@ from omnigent.server._runner_ws_tunnel import (
     RunnerUnavailableWSError,
     make_tunnel_ws_factory,
 )
+from omnigent.server.accounts_config import AccountsConfig
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -49,11 +50,78 @@ from omnigent.server.auth import (
     UnifiedAuthProvider,
 )
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.oidc import mint_session_token
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
+from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.terminals import TerminalRegistry
 from omnigent.terminals.ws_common import WS_CLOSE_INTERNAL_ERROR, WS_CLOSE_WRONG_REPLICA
 from tests.debug_log_helpers import capture_debug_rows
 from tests.runner.helpers import make_test_terminal_instance
+
+
+@pytest.mark.parametrize(
+    "category",
+    [
+        "origin_untrusted",
+        "runner_credential",
+        "browser_session_missing",
+        "browser_account_mismatch",
+        "not_owner",
+        "access_denied",
+    ],
+)
+async def test_attach_refusal_is_visible_without_opening_runner(monkeypatch, caplog, category):
+    config = AccountsConfig(b"synthetic-terminal-browser-key", 8760, "http://test", None, 3600, 60)
+    auth = UnifiedAuthProvider("accounts", accounts_config=config)
+    cookie = mint_session_token(
+        "owner",
+        config.cookie_secret,
+        3600,
+        "accounts",
+        browser_session=category != "browser_session_missing",
+    )
+    headers = {"Origin": "http://test", "Cookie": f"{config.session_cookie_name}={cookie}"}
+    monkeypatch.setenv("OMNIGENT_WS_ALLOWED_ORIGINS", "http://test")
+    if category == "origin_untrusted":
+        headers["Origin"] = "https://untrusted.example"
+    if category == "runner_credential":
+        headers["Authorization"] = "Bearer synthetic-runner-credential"
+    if category == "browser_account_mismatch":
+        monkeypatch.setattr(auth, "browser_session_user_id", lambda _: "another-owner")
+    convs = _StubConversationStore()
+    convs.add("session")
+    permissions = _StubPermissionStore()
+    permissions.add_grant(
+        "owner", "session", LEVEL_READ if category == "not_owner" else LEVEL_OWNER
+    )
+    app = FastAPI()
+    app.add_middleware(WebSocketOriginMiddleware)
+    app.include_router(
+        create_terminal_attach_router(
+            auth_provider=None if category == "access_denied" else auth,
+            permission_store=permissions,
+            conversation_store=convs,
+        ),
+        prefix="/v1",
+    )
+    factory = _FakeRunnerWSFactory(_FakeRunnerWSConn())
+    set_runner_ws_factory(factory)
+    with caplog.at_level("INFO"), TestClient(app) as client:
+        # Receiving the close proves the category survives a real ASGI handshake.
+        with (
+            client.websocket_connect(
+                "/v1/sessions/session/resources/terminals/terminal_bash_main/attach",
+                headers=headers,
+            ) as ws,
+            pytest.raises(WebSocketDisconnect) as denied,
+        ):
+            ws.receive_bytes()
+    assert denied.value.code == 4403
+    assert denied.value.reason == category
+    assert factory.calls == []
+    assert f"terminal access refused category={category}" in caplog.text
+    assert cookie not in caplog.text
+    assert "synthetic-runner-credential" not in caplog.text
 
 
 class _StubPermissionStore:
@@ -167,7 +235,7 @@ def _seed_registry(
 
 @pytest.mark.parametrize("read_only", [False, True])
 def test_admin_local_attach_is_interactive_only(
-    app, server_registry, tmp_path, monkeypatch, read_only
+    app, server_registry, tmp_path, monkeypatch, read_only, caplog
 ):
     instance = _make_running_instance("bash", "admin", tmp_path)
     instance.elevated = True
@@ -183,11 +251,16 @@ def test_admin_local_attach_is_interactive_only(
         "omnigent.terminals.conpty_bridge.bridge_tmux_control_to_websocket", bridge
     )
     path = "/v1/sessions/admin_session/resources/terminals/terminal_bash_admin/attach"
-    with TestClient(app).websocket_connect(path + f"?read_only={str(read_only).lower()}") as ws:
+    with (
+        caplog.at_level("INFO"),
+        TestClient(app).websocket_connect(path + f"?read_only={str(read_only).lower()}") as ws,
+    ):
         if read_only:
             with pytest.raises(WebSocketDisconnect) as rejected:
                 ws.receive_bytes()
-            assert rejected.value.code == 1008
+            assert rejected.value.code == 4403
+            assert rejected.value.reason == "admin_not_allowed"
+            assert "terminal access refused category=admin_not_allowed" in caplog.text
         else:
             assert ws.receive_bytes() == b"owner attach"
     assert len(calls) == (0 if read_only else 1)
@@ -406,15 +479,17 @@ async def test_attach_terminal_rejects_unauthorized_user_before_runner_proxy() -
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach",
             headers={"X-Forwarded-Email": "bob@example.com"},
-        ):
-            pass
+        ) as ws:
+            ws.receive_bytes()
 
-    assert exc_info.value.code == 1008
+    assert exc_info.value.code == 4403
+    assert exc_info.value.reason == "not_owner"
     assert factory.calls == []
 
 
-async def test_attach_terminal_rejects_missing_identity_before_runner_proxy() -> None:
+async def test_attach_terminal_rejects_missing_identity_before_runner_proxy(monkeypatch) -> None:
     """Multi-user WebSocket attach requires an authenticated identity."""
+    monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
     conv_store = _StubConversationStore()
     conv_store.add("conv_alice")
     perm_store = _StubPermissionStore()
@@ -434,10 +509,11 @@ async def test_attach_terminal_rejects_missing_identity_before_runner_proxy() ->
     with pytest.raises(WebSocketDisconnect) as exc_info:
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach",
-        ):
-            pass
+        ) as ws:
+            ws.receive_bytes()
 
-    assert exc_info.value.code == 1008
+    assert exc_info.value.code == 4403
+    assert exc_info.value.reason == "browser_session_missing"
     assert factory.calls == []
 
 
@@ -531,9 +607,10 @@ async def test_attach_terminal_edit_grant_denied_write_allowed_read_only() -> No
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach",
             headers={"X-Forwarded-Email": "bob@example.com"},
-        ):
-            pass
-    assert exc_info.value.code == 1008
+        ) as ws:
+            ws.receive_bytes()
+    assert exc_info.value.code == 4403
+    assert exc_info.value.reason == "not_owner"
     assert interactive_factory.calls == []
 
     readonly_conn = _FakeRunnerWSConn(outgoing=[b"output"])
@@ -588,10 +665,11 @@ async def test_attach_terminal_read_grant_only_allows_read_only_proxy() -> None:
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach",
             headers={"X-Forwarded-Email": "viewer@example.com"},
-        ):
-            pass
+        ) as ws:
+            ws.receive_bytes()
 
-    assert exc_info.value.code == 1008
+    assert exc_info.value.code == 4403
+    assert exc_info.value.reason == "not_owner"
     assert interactive_factory.calls == []
 
 
