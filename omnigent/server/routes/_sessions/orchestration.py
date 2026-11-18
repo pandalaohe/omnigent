@@ -363,6 +363,7 @@ from omnigent.server.routes._sessions.helpers import (
     _message_text,
     _model_usage_bucket,
     _native_coding_agent_for_session,
+    _native_runner_response_events,
     _native_subagent_wrapper_labels_from_spec,
     _native_terminal_ensure_transport_error,
     _native_terminal_failure_from_runner_response,
@@ -788,7 +789,7 @@ async def _persist_answer_delivery_notice(
     text: str,
     conversation_store: ConversationStore,
     *,
-    status: Literal["waiting", "delivered", "expired", "undelivered"],
+    status: Literal["waiting", "delivered", "expired", "undelivered", "delivery_uncertain"],
 ) -> None:
     """
     Persist + publish one deduplicated delivery status for a card answer.
@@ -800,7 +801,7 @@ async def _persist_answer_delivery_notice(
     :param session_id: Session/conversation identifier.
     :param text: The ``[System: …]`` message, used for correlation.
     :param conversation_store: Store for the durable append.
-    :param status: Waiting, delivered, expired, or finally undelivered.
+    :param status: Delivery progress or the final outcome.
     """
     reference = _delivery_reference(text)
     subject = f"Answer to {reference}" if reference is not None else "An answer"
@@ -812,6 +813,7 @@ async def _persist_answer_delivery_notice(
             f"{subject} expired before reaching the agent; approval must be requested again."
         ),
         "undelivered": f"{subject} could not be delivered; re-ask.",
+        "delivery_uncertain": f"{subject} may have arrived. Check the terminal before resending.",
     }[status]
     notice_key = f"{code}:{reference or text}"
     stable_id = hashlib.sha256(notice_key.encode()).hexdigest()[:32]
@@ -852,6 +854,14 @@ _DELIVER_RETRY_INTERVAL_S = 120.0
 _DELIVER_RETRY_MAX_S = 1800.0
 
 
+class _NativeForwardReplyLost(HTTPException):
+    """The runner's response was lost, so the paste outcome still needs proof."""
+
+
+class _NativeDeliveryUncertain(RuntimeError):
+    """The runner may still deliver this input, so it must not be replayed."""
+
+
 async def _delivery_retry_sleep(seconds: float) -> None:
     """
     Indirection over :func:`asyncio.sleep` for the delivery retry backoff.
@@ -870,7 +880,7 @@ async def _deliver_with_retry(
     runner_router: RunnerRouter | None,
     persist_failure: bool = True,
     image_ids: list[str] | None = None,
-) -> bool:
+) -> bool | None:
     """
     Post one system message, retrying until it lands or the window elapses.
 
@@ -888,7 +898,8 @@ async def _deliver_with_retry(
     :param runner_router: Router used to resolve the session's bound runner.
     :param persist_failure: Whether an exhausted window records a visible
         undelivered-answer notice. Detached cards keep retrying themselves.
-    :returns: ``True`` when the message was dispatched, else ``False``.
+    :returns: ``True`` for confirmed delivery, ``False`` for failure, or ``None``
+        for an uncertain handoff that must not be replayed.
     """
     started = time.monotonic()
     attempt = 0
@@ -911,6 +922,11 @@ async def _deliver_with_retry(
                     runner_router=runner_router,
                     confirm_delivery=True,
                 )
+        except _NativeDeliveryUncertain:
+            await _persist_answer_delivery_notice(
+                session_id, text, conversation_store, status="delivery_uncertain"
+            )
+            return None
         except Exception:  # noqa: BLE001
             # Broad: a delivery failure must never crash the background
             # verdict handler.
@@ -5871,7 +5887,7 @@ async def _settle_undelivered_native_input(
     delivery_attempt_id: str | None = None,
     delivery_error: ErrorData | None = None,
     uncertain: bool = False,
-) -> None:
+) -> bool:
     """
     Settle a failed native turn's own queued web message.
 
@@ -5897,7 +5913,7 @@ async def _settle_undelivered_native_input(
         callers without one must supply both server identity fields.
     """
     if input_stable_id is None and (pending_id is None or delivery_attempt_id is None):
-        return
+        return False
     if input_stable_id is not None and delivery_error is None:
         # Restoring durable inputs regenerates their transient server identities.
         pending_id = None
@@ -5912,7 +5928,7 @@ async def _settle_undelivered_native_input(
         if value is not None
     }
     if input_attributes(identity) != identity:
-        return
+        return False
 
     async def defer_annotation(stable_id: str | None) -> bool:
         if stable_id is None or not isinstance(conversation_store, SqlAlchemyConversationStore):
@@ -5938,7 +5954,7 @@ async def _settle_undelivered_native_input(
         return False
 
     if delivery_error is None and await defer_annotation(input_stable_id):
-        return
+        return False
 
     def mark_rejected_input() -> str | None:
         return pending_inputs.mark_lifecycle(
@@ -5954,25 +5970,25 @@ async def _settle_undelivered_native_input(
 
     matched_pending_id = mark_rejected_input()
     if conversation_store is None:
-        return
+        return False
     if matched_pending_id is None and input_stable_id is not None:
         # A saved startup input submitted before a server restart is matched
         # only once restored.
         await restore_pending_inputs(conversation_store, session_id)
         matched_pending_id = mark_rejected_input()
     if matched_pending_id is None:
-        return
+        return False
     if delivery_error is None and input_stable_id is None:
         stable_id = pending_inputs.delivery_attributes_for(session_id, matched_pending_id).get(
             "input_stable_id"
         )
         if isinstance(stable_id, str) and await defer_annotation(stable_id):
-            return
+            return False
     drained = pending_inputs.resolve(
         session_id, matched_pending_id, hold=delivery_error is not None
     )
     if drained is None:
-        return
+        return False
     item = NewConversationItem(
         type="message",
         response_id=response_id or generate_task_id(),
@@ -5999,10 +6015,9 @@ async def _settle_undelivered_native_input(
                     type="error",
                     response_id=item.response_id,
                     data=delivery_error,
-                    stable_id=uuid.uuid5(
-                        uuid.NAMESPACE_URL,
-                        f"omnigent-native-input-error:{session_id}:{drained.delivery_attempt_id}",
-                    ).hex,
+                    stable_id=_runner_input_error_id(
+                        session_id, drained.pending_id, drained.delivery_attempt_id, uncertain
+                    ),
                 )
             )
         persisted = await asyncio.to_thread(conversation_store.append, session_id, items)
@@ -6013,7 +6028,7 @@ async def _settle_undelivered_native_input(
             extra={"session_id": session_id},
         )
         pending_inputs.restore(session_id, drained)
-        return
+        return False
     if not persisted[0].deduplicated:
         log_input_event(
             _logger,
@@ -6033,6 +6048,17 @@ async def _settle_undelivered_native_input(
     if delivery_error is not None:
         pending_inputs.release(session_id, drained)
         _publish_error_event(session_id, delivery_error)
+    return True
+
+
+def _runner_input_error_id(
+    session_id: str, pending_id: str, attempt_id: str | None, uncertain: bool
+) -> str:
+    # An uncertainty card also fences future attempts with the same pending ID.
+    kind, identity = ("uncertain", pending_id) if uncertain else ("error", attempt_id)
+    return uuid.uuid5(
+        uuid.NAMESPACE_URL, f"omnigent-native-input-{kind}:{session_id}:{identity}"
+    ).hex
 
 
 async def _settle_lost_runner_input(
@@ -6045,25 +6071,34 @@ async def _settle_lost_runner_input(
     claim_outcome: bool | None = None,
     expected_attempt_id: str | None = None,
     reported_error: ErrorData | None = None,
-) -> None:
-    async def settle() -> None:
+) -> bool:
+    async def settle() -> bool:
         async with _native_mirror_lock(session_id):
             remaining = pending_inputs.runner_lease_remaining(session_id, pending_id)
             claimed = pending_inputs.runner_input_is_claimed(session_id, pending_id)
-            if remaining is None or (expired and remaining > 0):
-                return
-            if claimed and not expired and claim_outcome is None:
-                return
-            uncertain = claimed if claim_outcome is None else claim_outcome
             attempt_id = pending_inputs.delivery_attributes_for(session_id, pending_id).get(
                 "delivery_attempt_id"
             )
-            if not isinstance(attempt_id, str) or (
-                expected_attempt_id is not None and attempt_id != expected_attempt_id
+            if expected_attempt_id is not None and (
+                remaining is None or attempt_id != expected_attempt_id
             ):
-                return
+                persisted = await asyncio.to_thread(
+                    conversation_store.get_item,
+                    session_id,
+                    _runner_input_error_id(
+                        session_id, pending_id, expected_attempt_id, claim_outcome is True
+                    ),
+                )
+                return persisted is not None and persisted.type == "error"
+            if remaining is None or (expired and remaining > 0):
+                return False
+            if claimed and not expired and claim_outcome is None:
+                return False
+            uncertain = claimed if claim_outcome is None else claim_outcome
+            if not isinstance(attempt_id, str):
+                return False
             error_code = "native_input_delivery_uncertain" if uncertain else code
-            await _settle_undelivered_native_input(
+            return await _settle_undelivered_native_input(
                 conversation_store,
                 session_id,
                 None,
@@ -6088,7 +6123,7 @@ async def _settle_lost_runner_input(
 
     task = asyncio.create_task(settle())
     try:
-        await asyncio.shield(task)
+        return await asyncio.shield(task)
     except asyncio.CancelledError:
         task.add_done_callback(lambda done: _log_detached_mirror_persist(session_id, done))
         raise
@@ -9331,15 +9366,24 @@ async def _forward_native_terminal_message(
         forward_deadline = event.get("input_admission_deadline") or _input_admission_deadline(
             body.data
         )
+        confirm = harness == "claude-native" and body.data.get("confirm_delivery") is True
+        forward_timeout = max(0.001, forward_deadline - time.time())
+        if confirm:
+            from omnigent.harnesses.claude_native.bridge import MESSAGE_READINESS_TIMEOUT_S
+
+            forward_timeout = max(forward_timeout, MESSAGE_READINESS_TIMEOUT_S)
         await claim_retry_forward(session_id, event, deadline=forward_deadline)
-        resp = await runner_client.post(
-            f"/v1/sessions/{session_id}/events?stream=true"
-            if harness == "claude-native" and body.data.get("confirm_delivery") is True
-            else f"/v1/sessions/{session_id}/events",
-            json=event,
-            timeout=max(0.001, forward_deadline - time.time()) + 5.0,
-            **forward_options,
-        )
+        forward_timeout += 5.0
+        # The websocket transport does not apply HTTPX's per-request timeout.
+        async with asyncio.timeout(forward_timeout if confirm else None):
+            resp = await runner_client.post(
+                f"/v1/sessions/{session_id}/events?stream=true"
+                if confirm
+                else f"/v1/sessions/{session_id}/events",
+                json=event,
+                timeout=forward_timeout,
+                **forward_options,
+            )
         _logger.info(
             "%s terminal message runner response: session=%s status=%s body=%s",
             display_name,
@@ -9348,7 +9392,7 @@ async def _forward_native_terminal_message(
             resp.text[:500],
             extra={"session_id": session_id},
         )
-    except (httpx.HTTPError, ConnectionError) as exc:
+    except (httpx.HTTPError, ConnectionError, TimeoutError) as exc:
         # WSTunnelTransport raises bare ConnectionError on tunnel close;
         # map it to the same 502 as an httpx transport failure so a
         # runner tunnel drop mid-forward doesn't escape as an opaque 500.
@@ -9359,7 +9403,12 @@ async def _forward_native_terminal_message(
             exc_info=True,
             extra={"session_id": session_id},
         )
-        raise HTTPException(
+        error_type = (
+            HTTPException
+            if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+            else _NativeForwardReplyLost
+        )
+        raise error_type(
             status_code=502,
             detail=f"{display_name} terminal message delivery failed",
         ) from exc
@@ -9378,18 +9427,29 @@ async def _forward_native_terminal_message(
             status_code=502,
             detail=f"{display_name} terminal message delivery failed ({resp.status_code})",
         )
+    supports_claim = resp.headers.get("X-Omnigent-Pending-Input-Claim") == "1"
+    runner_pending_id = event.get("pending_id")
     failure = _extract_claude_native_runner_failure(resp)
     if failure is not None:
+        if confirm and (
+            failure.uncertain
+            or (
+                not failure.undelivered
+                and isinstance(runner_pending_id, str)
+                and pending_inputs.runner_input_is_claimed(session_id, runner_pending_id)
+            )
+        ):
+            raise _NativeDeliveryUncertain(failure.message)
         _logger.warning(
             "%s terminal message forward failed in runner SSE for session=%s: %s",
             display_name,
             session_id,
-            failure,
+            failure.message,
             extra={"session_id": session_id},
         )
         raise HTTPException(
             status_code=502,
-            detail=f"{display_name} terminal message delivery failed: {failure}",
+            detail=f"{display_name} terminal message delivery failed: {failure.message}",
         )
     if body.data.get("peer_message_id"):
         with contextlib.suppress(ValueError):
@@ -9398,6 +9458,12 @@ async def _forward_native_terminal_message(
                 # Keep the durable peer record until the CLI transcript proves
                 # acceptance; a process-local buffer can vanish on restart.
                 raise HTTPException(status_code=502, detail="Peer message is buffered")
+    if confirm and not any(
+        frame.get("type") == "response.completed" for frame in _native_runner_response_events(resp)
+    ):
+        if supports_claim and isinstance(runner_pending_id, str):
+            pending_inputs.enable_runner_lease(session_id, runner_pending_id)
+        raise _NativeDeliveryUncertain("The runner did not confirm delivery.")
     # Native-terminal counterpart to the SDK path's turn_dispatched (same event
     # name so a session reads uniformly across harnesses); the message was
     # injected into the live terminal rather than dispatched as a discrete turn.
@@ -9415,7 +9481,7 @@ async def _forward_native_terminal_message(
             input_delivery,
         ),
     )
-    return resp.headers.get("X-Omnigent-Pending-Input-Claim") == "1"
+    return supports_claim
 
 
 async def _persist_session_event(
@@ -11199,48 +11265,74 @@ async def _dispatch_session_event_to_runner_impl(
         queues_message = (
             isinstance(content, list) and bool(content) and not opens_side_chat and not is_btw
         )
-        if queues_message and web_stable_id is not None:
-            repeated_pending_id = pending_inputs.pending_id_for_stable_id(
-                session_id, web_stable_id
-            )
-            if repeated_pending_id is not None:
-                # A client retry of a send the runner already received (its
-                # response was lost in flight). Forwarding it again would run
-                # the prompt twice; answer with the queued entry it already has.
-                _logger.info(
-                    "Native message %s is already queued for session=%s; not forwarding again",
-                    repeated_pending_id,
-                    session_id,
-                    extra={"session_id": session_id},
+        # Serialize re-admission with transcript matching and lease settlement.
+        # A settled stable id must never gain another right to paste.
+        admission_lock = (
+            _native_mirror_lock(session_id)
+            if claude_native and queues_message and web_stable_id is not None
+            else contextlib.nullcontext()
+        )
+        async with admission_lock:
+            if queues_message and web_stable_id is not None:
+                repeated_pending_id = pending_inputs.pending_id_for_stable_id(
+                    session_id, web_stable_id
                 )
-                log_input_event(
-                    _logger,
-                    "native_input_retry_deduplicated",
-                    session_id=session_id,
-                    attributes=pending_inputs.delivery_attributes_for(
-                        session_id, repeated_pending_id
+                if claude_native and repeated_pending_id is None:
+                    uncertain_id = _runner_input_error_id(
+                        session_id,
+                        pending_inputs.make_pending_id(session_id, web_stable_id),
+                        None,
+                        True,
+                    )
+                    settled = await asyncio.to_thread(
+                        conversation_store.get_item, session_id, uncertain_id
+                    )
+                    if (
+                        settled is not None
+                        and isinstance(settled.data, ErrorData)
+                        and (settled.data.code == "native_input_delivery_uncertain")
+                    ):
+                        return _SessionEventDispatchResult(item_id=settled.id, pending_id=None)
+                if repeated_pending_id is not None:
+                    # A client retry of a send the runner already received (its
+                    # response was lost in flight). Forwarding it again would run
+                    # the prompt twice; answer with the queued entry it already has.
+                    _logger.info(
+                        "Native message %s is already queued for session=%s; not forwarding again",
+                        repeated_pending_id,
+                        session_id,
+                        extra={"session_id": session_id},
+                    )
+                    log_input_event(
+                        _logger,
+                        "native_input_retry_deduplicated",
+                        session_id=session_id,
+                        attributes=pending_inputs.delivery_attributes_for(
+                            session_id, repeated_pending_id
+                        ),
+                    )
+                    return _SessionEventDispatchResult(
+                        item_id=None, pending_id=repeated_pending_id
+                    )
+            if startup_input is not None and not await startup_input.claim(
+                conversation_store, session_id
+            ):
+                return _SessionEventDispatchResult(item_id=None, pending_id=None, forwarded=False)
+            pending_id: str | None = (
+                pending_inputs.record(
+                    session_id,
+                    content,
+                    created_by=created_by,
+                    stable_id=web_stable_id,
+                    background_titles_enabled=background_titles_enabled,
+                    admission_id=usage_admission["admission_id"] if usage_admission else None,
+                    auto_retry=(
+                        guard.metadata if (guard := active_retry_dispatch()) is not None else None
                     ),
                 )
-                return _SessionEventDispatchResult(item_id=None, pending_id=repeated_pending_id)
-        if startup_input is not None and not await startup_input.claim(
-            conversation_store, session_id
-        ):
-            return _SessionEventDispatchResult(item_id=None, pending_id=None, forwarded=False)
-        pending_id: str | None = (
-            pending_inputs.record(
-                session_id,
-                content,
-                created_by=created_by,
-                stable_id=web_stable_id,
-                background_titles_enabled=background_titles_enabled,
-                admission_id=usage_admission["admission_id"] if usage_admission else None,
-                auto_retry=(
-                    guard.metadata if (guard := active_retry_dispatch()) is not None else None
-                ),
+                if queues_message
+                else None
             )
-            if queues_message
-            else None
-        )
         input_delivery = (
             pending_inputs.delivery_attributes_for(session_id, pending_id)
             if pending_id is not None
@@ -11436,8 +11528,16 @@ async def _dispatch_session_event_to_runner_impl(
             claimed = pending_id is not None and pending_inputs.runner_input_is_claimed(
                 session_id, pending_id
             )
+            lost_confirmation = isinstance(exc, _NativeForwardReplyLost) and (
+                body.data.get("confirm_delivery") is True and claude_native
+            )
             # The runner's claim proves receipt even if its forward reply was lost.
-            forwarded = forwarded or claimed
+            forwarded = (
+                forwarded
+                or claimed
+                or lost_confirmation
+                or isinstance(exc, _NativeDeliveryUncertain)
+            )
             log_input_event(
                 _logger,
                 "native_input_forward_finished",
@@ -11446,7 +11546,9 @@ async def _dispatch_session_event_to_runner_impl(
                 outcome="cancelled" if isinstance(exc, asyncio.CancelledError) else "error",
                 exception_type=type(exc).__name__,
             )
-            if not (claimed and isinstance(exc, HTTPException) and exc.status_code == 502):
+            if lost_confirmation:
+                raise _NativeDeliveryUncertain("The runner's delivery reply was lost.") from exc
+            if not (claimed and isinstance(exc, _NativeForwardReplyLost)):
                 raise
         finally:
             if pending_id is not None:
@@ -12809,7 +12911,7 @@ async def _relay_runner_stream_once(
                     )
                     if managed_failure and conversation_store is not None:
                         assert isinstance(pending_id, str) and isinstance(attempt_id, str)
-                        await _settle_lost_runner_input(
+                        settled = await _settle_lost_runner_input(
                             conversation_store,
                             session_id,
                             pending_id,
@@ -12824,11 +12926,12 @@ async def _relay_runner_stream_once(
                                 else None
                             ),
                         )
-                        # Publish the terminal edge without a second error card.
-                        error_item = None
-                        event.pop("error", None)
-                        if isinstance(failure_response := event.get("response"), dict):
-                            failure_response.pop("error", None)
+                        if settled:
+                            # Publish the terminal edge without a second error card.
+                            error_item = None
+                            event.pop("error", None)
+                            if isinstance(failure_response := event.get("response"), dict):
+                                failure_response.pop("error", None)
                     elif undelivered:
                         # The runner could not hand this turn to a native
                         # harness, so the web message it carried was never
@@ -14007,7 +14110,7 @@ async def _post_system_message(
                 else None
             ),
         )
-    except (httpx.HTTPError, OmnigentError):
+    except (httpx.HTTPError, HTTPException, OmnigentError):
         _logger.warning(
             "system message POST failed for session=%s",
             session_id,

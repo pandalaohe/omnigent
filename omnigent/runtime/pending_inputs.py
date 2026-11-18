@@ -380,7 +380,10 @@ def _evict_stale_locked(conversation_id: str, now: float) -> None:
     stale = [
         pid
         for pid, entry in entries.items()
-        if (entry.last_runner_renewal is None or entry.interrupted)
+        if (
+            entry.last_runner_renewal is None
+            or (entry.interrupted and entry.runner_claim_id is None)
+        )
         and now - entry.created_at > _TTL_S
     ]
     for pid in stale:
@@ -556,10 +559,14 @@ def renew_runner_inputs(
 
 
 def runner_lease_remaining(conversation_id: str, pending_id: str) -> float | None:
-    """Seconds until settlement, or None once the input is gone or interrupted."""
+    """Seconds until settlement. Stop still requires an outcome for claimed inputs."""
     with _lock:
         entry = _pending.get(conversation_id, {}).get(pending_id)
-        if entry is None or entry.interrupted or entry.last_runner_renewal is None:
+        if (
+            entry is None
+            or (entry.interrupted and entry.runner_claim_id is None)
+            or entry.last_runner_renewal is None
+        ):
             return None
         timeout = _CLAIMED_INPUT_TIMEOUT_S if entry.runner_claim_id is not None else _TTL_S
         return entry.last_runner_renewal + timeout - _now()

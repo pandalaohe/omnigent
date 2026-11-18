@@ -179,7 +179,7 @@ def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
         assert "session changed after the paste" in str(caught.value)
         verification = "owner_changed"
     else:
-        assert isinstance(caught.value, bridge.ClaudeMessageNotAccepted)
+        assert isinstance(caught.value, bridge.ClaudeDeliveryUnconfirmed)
         verification = "draft_still_present"
     records = [
         record
@@ -195,7 +195,7 @@ def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
 
 @pytest.mark.asyncio
 async def test_unconfirmed_terminal_refusal_remains_an_executor_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
     from omnigent.inner.executor import ExecutorError
@@ -215,18 +215,15 @@ async def test_unconfirmed_terminal_refusal_remains_an_executor_error(
         )
         executor = ClaudeNativeExecutor(bridge_dir=tmp_path)
         monkeypatch.setattr(executor, "_inject_prompt", refused)
-        with caplog.at_level(logging.ERROR):
-            events = [
-                event
-                async for event in executor.run_turn(
-                    [{"role": "user", "content": content}], [], ""
-                )
-            ]
+        events = [
+            event
+            async for event in executor.run_turn([{"role": "user", "content": content}], [], "")
+        ]
         assert len(events) == 1
         assert isinstance(events[0], ExecutorError)
         assert events[0].undelivered is False
-        assert events[0].code is None
-        assert any(record.levelno == logging.ERROR for record in caplog.records)
+        assert events[0].code == "claude_delivery_unconfirmed"
+        assert events[0].preserve_session
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == [
             pending_id
         ]

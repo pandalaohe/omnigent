@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -47,6 +48,18 @@ _TINY_PNG_B64 = (
 )
 _TINY_PNG_DATA_URI = f"data:image/png;base64,{_TINY_PNG_B64}"
 _TINY_PNG_BYTES = base64.b64decode(_TINY_PNG_B64)
+
+
+@pytest.fixture
+def advertised_claude_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_claude_turn_running", lambda *_: False)
+    bridge_dir = tmp_path / "bridge"
+    claude_bridge.write_tmux_target(
+        bridge_dir, socket_path=tmp_path / "tmux.sock", tmux_target="claude:0.0"
+    )
+    return bridge_dir
 
 
 async def test_stale_automatic_retry_never_pastes_and_returns_receipt(tmp_path, monkeypatch):
@@ -1850,10 +1863,10 @@ async def test_a_routed_first_message_switches_the_model_exactly_once(
 @pytest.mark.asyncio
 async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    advertised_claude_bridge: Path,
 ) -> None:
     """A readiness timeout cannot leave a failed turn's pane alive."""
-    bridge_dir = tmp_path / "bridge"
+    bridge_dir = advertised_claude_bridge
     killed: list[Path] = []
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
@@ -1864,7 +1877,7 @@ async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
     monkeypatch.setattr(
         claude_native_executor,
         "kill_session",
-        lambda bridge_dir_arg, *, timeout_s, expected_close=False: killed.append(bridge_dir_arg),
+        lambda bridge_dir_arg, **_kw: killed.append(bridge_dir_arg),
     )
 
     executor = ClaudeNativeExecutor(bridge_dir)
@@ -1883,9 +1896,37 @@ async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
 
 
 @pytest.mark.asyncio
+async def test_pre_paste_timeout_preserves_a_live_pane_with_an_unreadable_tracker(
+    monkeypatch: pytest.MonkeyPatch, advertised_claude_bridge: Path
+) -> None:
+    monkeypatch.setattr(claude_bridge, "_claude_turn_running", lambda *_: None)
+    monkeypatch.setattr(
+        claude_bridge, "_claude_pane_state", lambda *_: claude_bridge._ClaudePaneState(alive=True)
+    )
+
+    def fail_inject(*_args: object, **_kwargs: object) -> None:
+        raise ClaudePromptTimeout("terminal did not become ready")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda *_args, **_kwargs: pytest.fail("pane reaped"),
+    )
+    events = [
+        event
+        async for event in ClaudeNativeExecutor(advertised_claude_bridge).run_turn(
+            [{"role": "user", "content": "follow-up"}], [], ""
+        )
+    ]
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].undelivered and events[0].preserve_session
+
+
+@pytest.mark.asyncio
 async def test_run_turn_marks_its_timeout_reap_as_an_expected_close(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    advertised_claude_bridge: Path,
 ) -> None:
     """
     The runner must read the reap as Omnigent's close, not a terminal crash.
@@ -1900,16 +1941,14 @@ async def test_run_turn_marks_its_timeout_reap_as_an_expected_close(
         del bridge_dir_arg, content, timeout_s
         raise ClaudePromptTimeout("terminal did not become ready")
 
-    def record_kill(
-        bridge_dir_arg: Path, *, timeout_s: float, expected_close: bool = False
-    ) -> None:
-        del bridge_dir_arg, timeout_s
+    def record_kill(bridge_dir_arg: Path, *, expected_close: bool = False, **_kw: object) -> None:
+        del bridge_dir_arg
         kill_flags.append(expected_close)
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
     monkeypatch.setattr(claude_native_executor, "kill_session", record_kill)
 
-    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    executor = ClaudeNativeExecutor(advertised_claude_bridge)
     events = [
         event
         async for event in executor.run_turn(
@@ -1926,7 +1965,7 @@ async def test_run_turn_marks_its_timeout_reap_as_an_expected_close(
 @pytest.mark.asyncio
 async def test_run_turn_does_not_mark_a_pane_that_exited_on_its_own(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    advertised_claude_bridge: Path,
 ) -> None:
     """A pane that already exited was not closed by Omnigent, so its exit still counts."""
     kill_flags: list[bool] = []
@@ -1935,16 +1974,14 @@ async def test_run_turn_does_not_mark_a_pane_that_exited_on_its_own(
         del bridge_dir_arg, content, timeout_s
         raise ClaudeTerminalExited("terminal exited", exit_status="1")
 
-    def record_kill(
-        bridge_dir_arg: Path, *, timeout_s: float, expected_close: bool = False
-    ) -> None:
-        del bridge_dir_arg, timeout_s
+    def record_kill(bridge_dir_arg: Path, *, expected_close: bool = False, **_kw: object) -> None:
+        del bridge_dir_arg
         kill_flags.append(expected_close)
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
     monkeypatch.setattr(claude_native_executor, "kill_session", record_kill)
 
-    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    executor = ClaudeNativeExecutor(advertised_claude_bridge)
     [
         event
         async for event in executor.run_turn(
@@ -2104,12 +2141,11 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     prompt_pending = False
     killed: list[Path] = []
 
-    def run_tmux(socket_path: str, *args: str) -> None:
+    def run_tmux(args: list[str], **_kwargs: object) -> SimpleNamespace:
         nonlocal pane, enters, prompt_pending
-        del socket_path
-        if args[-1] == "Space" or (args[0] == "send-keys" and "-l" in args):
+        if args[-1] == "Space" or ("send-keys" in args and "-l" in args):
             pane = empty_composer
-        elif args[0] == "paste-buffer":
+        elif "paste-buffer" in args:
             pane = draft_composer
             prompt_pending = not submitted
         elif args[-1] == "Enter":
@@ -2118,6 +2154,7 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
             prompt_pending = refusal == "pending_prompt"
             if refusal == "capture_lost":
                 pane = ""
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     if refusal == "missing_target":
         wait_for_target = claude_bridge._wait_for_tmux_info
@@ -2135,7 +2172,7 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
         )
     monkeypatch.setattr(claude_bridge, "_restore_occupied_input", lambda *_a, **_k: None)
     monkeypatch.setattr(claude_bridge, "_wait_for_claude_prompt_ready", lambda *_a, **_k: None)
-    monkeypatch.setattr(claude_bridge, "_run_tmux", run_tmux)
+    monkeypatch.setattr("subprocess.run", run_tmux)
     monkeypatch.setattr(claude_bridge, "_capture_pane", lambda *_a: pane)
     monkeypatch.setattr(claude_bridge, "_has_approval_wait", lambda _bridge: prompt_pending)
     monkeypatch.setattr(claude_bridge, "_PASTE_SETTLE_S", 0.0)
@@ -2174,8 +2211,8 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
         "missing_target": "tmux target is not advertised",
     }[refusal]
     assert expected_detail in error.message
-    assert error.undelivered is (refusal in {"draft_persisted", "missing_target"} or not submitted)
-    if refusal == "capture_lost":
+    assert error.undelivered is (refusal == "missing_target")
+    if refusal != "missing_target":
         assert error.code == "claude_delivery_unconfirmed"
         assert error.preserve_session
 
@@ -2343,11 +2380,324 @@ async def test_delivery_watchdog_after_paste_reports_unconfirmed_and_preserves_p
 
 
 @pytest.mark.asyncio
+async def test_readiness_deadline_bounds_executor_lock_wait(
+    monkeypatch: pytest.MonkeyPatch, advertised_claude_bridge: Path
+) -> None:
+    executor = ClaudeNativeExecutor(advertised_claude_bridge)
+    monkeypatch.setattr(claude_bridge, "MESSAGE_READINESS_TIMEOUT_S", 0.01)
+    async with executor._inject_lock, asyncio.timeout(1):
+        events = [
+            event
+            async for event in executor.run_turn([{"role": "user", "content": "queued"}], [], "")
+        ]
+        assert executor._inject_lock.locked()
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].undelivered and "readiness wait expired" in events[0].message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "transcript-and-prompt",
+        "matching-hook",
+        "no-receipt",
+        "foreign-hook",
+        "stale-hook",
+        "tmux-unavailable",
+        "paste-timeout",
+    ],
+)
+async def test_hidden_composer_after_paste_settles_without_reaping_or_replaying(
+    monkeypatch: pytest.MonkeyPatch, advertised_claude_bridge: Path, outcome: str
+) -> None:
+    bridge_dir = advertised_claude_bridge
+    content = "review the change from this session"
+    native_id = "claude-session"
+    transcript = bridge_dir / "session.jsonl"
+    claude_bridge.record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": native_id,
+            "transcript_path": str(transcript),
+        },
+    )
+    now = 0.0
+    receipt_written = False
+    mutations: list[str] = []
+
+    def advance(delay: float) -> None:
+        nonlocal now
+        now += delay
+
+    def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        nonlocal receipt_written
+        pane = ""
+        if "capture-pane" in cmd:
+            if not mutations:
+                pane = "────────────────\n❯ \n────────────────\n"
+            elif (
+                outcome in {"matching-hook", "foreign-hook"} and not receipt_written and now >= 2.0
+            ):
+                receipt_written = True
+                claude_bridge.record_hook_event(
+                    bridge_dir,
+                    {
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": native_id,
+                        "prompt": content if outcome == "matching-hook" else "different text",
+                    },
+                )
+        elif cmd[-1] == "#{?pane_id,#{pane_dead} #{pane_dead_status},missing}":
+            return SimpleNamespace(
+                returncode=int(outcome == "tmux-unavailable"), stdout="0", stderr=""
+            )
+        elif "paste-buffer" in cmd:
+            mutations.append("paste")
+            if outcome == "paste-timeout":
+                raise subprocess.TimeoutExpired(cmd, timeout=3.0)
+        elif "load-buffer" in cmd and outcome == "stale-hook":
+            claude_bridge.record_hook_event(
+                bridge_dir,
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": native_id,
+                    "prompt": content,
+                },
+            )
+        elif cmd[-1] == "Enter":
+            mutations.append("submit")
+        return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+
+    def pending_prompt(_bridge: Path) -> bool:
+        nonlocal receipt_written
+        if not mutations or now < 2.0 or outcome != "transcript-and-prompt":
+            return False
+        if not receipt_written:
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "sessionId": native_id,
+                        "uuid": "receipt",
+                        "message": {"role": "user", "content": content},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            receipt_written = True
+        return True
+
+    async def allow_paste(_deadline: float) -> bool:
+        return True
+
+    monkeypatch.setattr(
+        claude_bridge,
+        "time",
+        SimpleNamespace(monotonic=lambda: now, sleep=advance, time=time.time),
+    )
+    monkeypatch.setattr(claude_bridge, "MESSAGE_READINESS_TIMEOUT_S", 3.0)
+    monkeypatch.setattr(claude_bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(claude_bridge, "has_pending_user_prompt", pending_prompt)
+    monkeypatch.setattr("subprocess.run", run)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda *_args, **_kwargs: pytest.fail("pane reaped"),
+    )
+    events = [
+        event
+        async for event in ClaudeNativeExecutor(bridge_dir).run_turn(
+            [{"role": "user", "content": content}],
+            [],
+            "",
+            config=ExecutorConfig(claim_native_delivery=allow_paste),
+        )
+    ]
+
+    assert mutations == ["paste"]
+    if outcome in {"matching-hook", "transcript-and-prompt"}:
+        assert receipt_written and now < 3.0
+        assert events == [TurnComplete(response=None)]
+    else:
+        if outcome != "paste-timeout":
+            assert now == pytest.approx(3.0, abs=0.3)
+        assert len(events) == 1 and isinstance(events[0], ExecutorError)
+        assert events[0].code == "native_input_delivery_uncertain"
+        assert events[0].preserve_session and not events[0].undelivered
+
+
+@pytest.mark.asyncio
+async def test_cancelled_delivery_cannot_reap_a_pane_advertised_during_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    started, release = threading.Event(), threading.Event()
+    kills: list[list[str]] = []
+
+    def inject() -> None:
+        started.set()
+        assert release.wait(5)
+        claude_bridge._check_injection_cancelled()
+
+    def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        if "kill-session" in cmd:
+            kills.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", run)
+    executor = ClaudeNativeExecutor(bridge_dir)
+    task = asyncio.create_task(executor._inject(inject))
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel()
+        claude_bridge.write_tmux_target(
+            bridge_dir, socket_path=tmp_path / "successor.sock", tmux_target="claude:0.0"
+        )
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    assert kills == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", ["socket", "native-session"])
+async def test_prompt_timeout_rechecks_ownership_when_reaping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    advertised_claude_bridge: Path,
+    replacement: str,
+) -> None:
+    bridge_dir = advertised_claude_bridge
+    claude_bridge.record_hook_event(
+        bridge_dir, {"hook_event_name": "SessionStart", "session_id": "first-native-session"}
+    )
+    executor = ClaudeNativeExecutor(bridge_dir)
+    reap = executor._reap_failed_turn
+    kills: list[list[str]] = []
+
+    def fail_inject(*_args: object, **_kwargs: object) -> None:
+        raise ClaudePromptTimeout("terminal did not become ready")
+
+    def replace_pane_and_reap(*args: Any, **kwargs: Any) -> str | None:
+        if replacement == "socket":
+            claude_bridge.write_tmux_target(
+                bridge_dir, socket_path=tmp_path / "successor.sock", tmux_target="claude:0.0"
+            )
+        else:
+            claude_bridge.record_hook_event(
+                bridge_dir,
+                {"hook_event_name": "SessionStart", "session_id": "successor-native-session"},
+            )
+        return reap(*args, **kwargs)
+
+    def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        if "kill-session" in cmd:
+            kills.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(executor, "_reap_failed_turn", replace_pane_and_reap)
+    monkeypatch.setattr("subprocess.run", run)
+    events = [
+        event async for event in executor.run_turn([{"role": "user", "content": "hello"}], [], "")
+    ]
+
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].undelivered
+    assert kills == []
+
+
+@pytest.mark.asyncio
+async def test_inband_cancellation_after_paste_reports_unconfirmed_to_runner(
+    monkeypatch: pytest.MonkeyPatch, advertised_claude_bridge: Path
+) -> None:
+    from omnigent.entities.subagent_retry import InputExecutionReceipt
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext, _format_sse_event
+    from omnigent.server.schemas import (
+        CreateResponseRequest,
+        HarnessStreamEvent,
+        InputExecutionClaimEvent,
+    )
+
+    events: asyncio.Queue[HarnessStreamEvent | None] = asyncio.Queue()
+    ctx = TurnContext("resp_example", events, asyncio.Event(), session_id="conv_example")
+    ctx._push_injection(
+        CreateResponseRequest(
+            model="example",
+            input="hello from the web",
+            injection_id="inj_example",
+            input_id="input_example",
+            input_admission_required=True,
+        )
+    )
+    loop = asyncio.get_running_loop()
+    pasted = asyncio.Event()
+    submits = 0
+
+    def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        nonlocal submits
+        if "capture-pane" in cmd:
+            return SimpleNamespace(
+                returncode=0, stdout="──────────────\n❯\n──────────────\n", stderr=""
+            )
+        if "paste-buffer" in cmd:
+            cancelled = claude_bridge._INJECTION_CANCEL_EVENT.get()
+            assert cancelled is not None
+            loop.call_soon_threadsafe(pasted.set)
+            assert cancelled.wait(3)
+        if cmd[-1] == "Enter":
+            submits += 1
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", run)
+    executor = ClaudeNativeExecutor(advertised_claude_bridge)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="main")
+    watcher = asyncio.create_task(adapter._watch_injections(ctx, executor))
+    try:
+        async with asyncio.timeout(2):
+            claim = await events.get()
+            assert isinstance(claim, InputExecutionClaimEvent)
+            assert claim.claim.boundary == "injection_reserve"
+            assert ctx._complete_input_claim(
+                claim.claim_id, InputExecutionReceipt(state="reserved", reason="reserved")
+            )
+            await pasted.wait()
+        watcher.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await watcher
+    finally:
+        if not watcher.done():
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+
+    assert submits == 0
+    event = events.get_nowait()
+    assert event is not None
+    frame = _format_sse_event(event).split(b"data: ", 1)[1]
+    payload = json.loads(frame)
+    assert payload["type"] == "injection.unconfirmed"
+    assert payload["injection_id"] == "inj_example"
+    assert events.empty()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("delivery", ["message", "steering", "model"])
 @pytest.mark.parametrize("watchdog", [False, True])
 async def test_cancelled_delivery_drains_worker_before_unlocking(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    advertised_claude_bridge: Path,
     delivery: str,
     watchdog: bool,
 ) -> None:
@@ -2369,7 +2719,7 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
         finally:
             finished.set()
 
-    def reap(bridge_dir: Path, *, timeout_s: float, expected_close: bool = False) -> None:
+    def reap(bridge_dir: Path, **_kwargs: object) -> None:
         assert finished.is_set()
         claude_bridge._check_injection_cancelled()
         reaped.append(bridge_dir)
@@ -2383,7 +2733,7 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
     monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
     monkeypatch.setattr(claude_native_executor, "inject_slash_command", inject)
     monkeypatch.setattr(claude_native_executor, "kill_session", reap)
-    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    executor = ClaudeNativeExecutor(advertised_claude_bridge)
     monkeypatch.setattr(
         executor, "_model_command_arg", lambda model: "sonnet" if delivery == "model" else None
     )
@@ -2422,7 +2772,7 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
             task.result()
         assert finished.is_set()
         assert not executor._inject_lock.locked()
-        assert reaped == [tmp_path / "bridge"]
+        assert reaped == [advertised_claude_bridge]
         assert commands == []
     finally:
         release.set()
@@ -2502,10 +2852,68 @@ async def test_live_steer_reports_an_unconfirmed_paste_as_ambiguous(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["pending-answer", "matching-hook-block"])
+async def test_post_enter_uncertainty_suppresses_runner_replay(
+    monkeypatch: pytest.MonkeyPatch, advertised_claude_bridge: Path, failure: str
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CreateResponseRequest
+
+    content = "keep the original input"
+    writes: list[str] = []
+
+    def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        if "paste-buffer" in cmd:
+            writes.append("paste")
+        if cmd[-1] == "Enter":
+            writes.append("enter")
+        draft = content if writes else ""
+        return SimpleNamespace(
+            returncode=0, stdout=f"────────────────\n❯ {draft}\n────────────────\n", stderr=""
+        )
+
+    def verify(*_args: object, **_kwargs: object) -> bool:
+        assert writes == ["paste", "enter"]
+        if failure == "pending-answer":
+            raise claude_bridge.ClaudeUserPromptPending("a new answer is required")
+        raise claude_bridge.ClaudeSubmitBlockedUnconfirmed("matching hook refusal")
+
+    monkeypatch.setattr(claude_bridge, "_verify_submit_accepted", verify)
+    monkeypatch.setattr(claude_bridge, "_PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("subprocess.run", run)
+    executor = ClaudeNativeExecutor(advertised_claude_bridge)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="session")
+    request = CreateResponseRequest(
+        model="m",
+        input=content,
+        injection_id="inj_uncertain",
+        input_stable_id="a" * 32,
+        input_admission_required=True,
+    )
+    ctx = SimpleNamespace(
+        session_id="session",
+        response_id="response",
+        cancelled=asyncio.Event(),
+        next_injection=AsyncMock(side_effect=[request, None]),
+        claim_input_execution=AsyncMock(return_value=True),
+        emit=Mock(),
+    )
+    await adapter._watch_injections(ctx, executor)
+
+    assert writes == ["paste", "enter"]
+    ctx.claim_input_execution.assert_awaited_once_with(request, boundary="injection_reserve")
+    ctx.emit.assert_called_once()
+    (marker,) = ctx.emit.call_args.args
+    assert (marker.type, marker.injection_id) == ("injection.unconfirmed", "inj_uncertain")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [ClaudePromptTimeout, ClaudeTerminalExited])
 async def test_run_turn_reports_reap_failure_with_prompt_timeout(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    advertised_claude_bridge: Path,
     failure: type[ClaudePromptTimeout],
 ) -> None:
     """A failed hard-stop remains visible beside the delivery error."""
@@ -2514,14 +2922,14 @@ async def test_run_turn_reports_reap_failure_with_prompt_timeout(
         del bridge_dir_arg, content, timeout_s
         raise failure("terminal did not become ready")
 
-    def fail_kill(bridge_dir_arg: Path, *, timeout_s: float, expected_close: bool = False) -> None:
-        del bridge_dir_arg, timeout_s, expected_close
+    def fail_kill(bridge_dir_arg: Path, **_kwargs: object) -> None:
+        del bridge_dir_arg
         raise RuntimeError("tmux kill failed")
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
     monkeypatch.setattr(claude_native_executor, "kill_session", fail_kill)
 
-    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    executor = ClaudeNativeExecutor(advertised_claude_bridge)
     events = [
         event
         async for event in executor.run_turn(
@@ -2540,7 +2948,7 @@ async def test_run_turn_reports_reap_failure_with_prompt_timeout(
 @pytest.mark.asyncio
 async def test_run_turn_ignores_missing_tmux_during_timeout_reap(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    advertised_claude_bridge: Path,
 ) -> None:
     """A pane that exited during readiness polling needs no cleanup error."""
 
@@ -2548,16 +2956,14 @@ async def test_run_turn_ignores_missing_tmux_during_timeout_reap(
         del bridge_dir_arg, content, timeout_s
         raise ClaudePromptTimeout("terminal did not become ready")
 
-    def absent_kill(
-        bridge_dir_arg: Path, *, timeout_s: float, expected_close: bool = False
-    ) -> None:
-        del bridge_dir_arg, timeout_s, expected_close
+    def absent_kill(bridge_dir_arg: Path, **_kwargs: object) -> None:
+        del bridge_dir_arg
         raise TmuxSessionNotAdvertised("not advertised")
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
     monkeypatch.setattr(claude_native_executor, "kill_session", absent_kill)
 
-    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    executor = ClaudeNativeExecutor(advertised_claude_bridge)
     events = [
         event
         async for event in executor.run_turn(

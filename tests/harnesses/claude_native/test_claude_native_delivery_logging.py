@@ -77,8 +77,9 @@ def test_delivery_diagnostics(
         if scenario == "cancelled":
             raise bridge.ClaudeInjectionCancelled(secret)
 
-    def run_tmux(socket: str, *args: str) -> None:
+    def run_tmux(command: list[str], **_kwargs: object) -> SimpleNamespace:
         nonlocal pane, enters
+        args = command[command.index(";") + 1 :] if ";" in command else command[3:]
         assert not any(
             getattr(record, "event_name", "").startswith("claude_native_")
             for record in caplog.records
@@ -91,11 +92,11 @@ def test_delivery_diagnostics(
             pane = "❯ " + content if scenario == "blank_line" else f"{rule}\n❯ {content}\n{rule}\n"
         if args[-1] == "Enter":
             enters += 1
-            if scenario in {"blank_line", "timeout"} or (scenario == "retry" and enters == 1):
-                return
-            pane = {"empty_capture": "", "missing_glyph": "terminal output"}.get(
-                scenario, empty_pane
-            )
+            if scenario not in {"blank_line", "timeout"} and (scenario != "retry" or enters > 1):
+                pane = {"empty_capture": "", "missing_glyph": "terminal output"}.get(
+                    scenario, empty_pane
+                )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(
         bridge,
@@ -110,7 +111,7 @@ def test_delivery_diagnostics(
     )
     monkeypatch.setattr(bridge, "_restore_occupied_input", lambda *_a, **_k: None)
     monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", ready)
-    monkeypatch.setattr(bridge, "_run_tmux", run_tmux)
+    monkeypatch.setattr("subprocess.run", run_tmux)
     monkeypatch.setattr(bridge, "_capture_pane", lambda *_a, **_k: pane)
     if scenario == "observation_error":
         monkeypatch.setattr(delivery_diagnostics, "_draft_observation", broken_observation)
@@ -147,8 +148,10 @@ def test_delivery_diagnostics(
             bridge.inject_user_message(tmp_path, content=content)
         else:
             expected = bridge.ClaudeInjectionCancelled if scenario == "cancelled" else RuntimeError
-            if scenario.startswith("pending_"):
+            if scenario == "pending_before_paste":
                 expected = bridge.ClaudeUserPromptPending
+            elif scenario == "pending_before_submit":
+                expected = bridge.ClaudeDeliveryUnconfirmed
             match = None
             if scenario == "empty_capture":
                 expected = bridge.ClaudeDeliveryUnconfirmed

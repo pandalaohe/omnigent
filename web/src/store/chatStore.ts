@@ -9212,34 +9212,56 @@ function recoveredPendingInputPatch(
   const isStillPending = (p: PendingUserMessage | undefined) =>
     p !== undefined && pendingById.has(p.pendingId ?? p.tempId);
   let state: PendingInputState = {
-    pendingUserMessages: syncPendingSendTimes(s.pendingUserMessages, pendingById),
+    pendingUserMessages: syncPendingSendTimes(
+      s.pendingUserMessages.filter(
+        (p) =>
+          serverInputs === undefined ||
+          !pendingAtReconnectStart.has(p.tempId) ||
+          p.sendingSinceMs === undefined ||
+          isStillPending(p),
+      ),
+      pendingById,
+    ),
     settledShellInputs: s.settledShellInputs,
   };
+  const eligible = (p: PendingUserMessage) =>
+    !p.initialDraft && pendingAtReconnectStart.has(p.tempId) && !isStillPending(p);
   for (const block of recovered) {
     if (isTerminalCommandInput(block) && block.ctx.itemId) {
       state = { ...state, ...settledShellInputPatch(state, block.ctx.itemId, block.input) };
-    } else if (block.type === "slash_command" && block.kind === "command") {
+      continue;
+    }
+    let at = -1;
+    if (block.type === "slash_command" && ["command", "skill"].includes(block.kind)) {
       const text = `/${block.name} ${block.arguments}`.replace(/\s+/g, " ").trim();
-      const at = state.pendingUserMessages.findIndex(
-        (p) => !p.initialDraft && !isStillPending(p) && messageContentText(p.content) === text,
+      at = state.pendingUserMessages.findIndex(
+        (p) => eligible(p) && messageContentText(p.content) === text,
       );
-      if (at >= 0)
-        state = {
-          ...state,
-          pendingUserMessages: state.pendingUserMessages.filter((_, i) => i !== at),
-        };
-    } else if (
-      block.type === "user_message" &&
-      !isSystemUserContent(block.content) &&
-      pendingAtReconnectStart.has(state.pendingUserMessages[0]?.tempId ?? "") &&
-      !isStillPending(state.pendingUserMessages[0]) &&
-      !state.settledShellInputs.some((entry) => entry.contentKey === contentKeyOf(block.content)) &&
-      !recovered.some(
-        (input) => isTerminalCommandInput(input) && isShellCommandBubble(block, input.input),
-      ) &&
-      !state.pendingUserMessages[0]?.initialDraft
-    ) {
-      state = { ...state, pendingUserMessages: state.pendingUserMessages.slice(1) };
+    } else if (block.type === "user_message" && !isSystemUserContent(block.content)) {
+      at = state.pendingUserMessages.findIndex(
+        (p) => eligible(p) && block.ctx.itemId && (p.stableId ?? p.tempId) === block.ctx.itemId,
+      );
+      if (
+        at < 0 &&
+        !state.settledShellInputs.some(
+          (entry) => entry.contentKey === contentKeyOf(block.content),
+        ) &&
+        !recovered.some(
+          (input) => isTerminalCommandInput(input) && isShellCommandBubble(block, input.input),
+        )
+      ) {
+        // Old mirrors have independent IDs. Match content to the queued head
+        // only, so an unrelated native input cannot consume a different send.
+        const head = state.pendingUserMessages[0];
+        if (head && eligible(head) && contentKeyOf(head.content) === contentKeyOf(block.content))
+          at = 0;
+      }
+    }
+    if (at >= 0) {
+      state = {
+        ...state,
+        pendingUserMessages: state.pendingUserMessages.filter((_, index) => index !== at),
+      };
     }
   }
   return state;

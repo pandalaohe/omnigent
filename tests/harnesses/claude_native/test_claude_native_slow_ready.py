@@ -197,7 +197,8 @@ def test_first_message_survives_slow_terminal_startup(
                 assert json.loads(delivered.read_text()) == [["prompt", "FIRST_PROMPT_DELIVERED"]]
                 assert bridge._claude_pane_state(str(socket_path), "main").alive
             elif startup.startswith("stale-"):
-                bridge.inject_user_message(bridge_dir, content="ONLY_NEW_INPUT", timeout_s=2.0)
+                # The injected budget now also covers draft clearing and submit verification.
+                bridge.inject_user_message(bridge_dir, content="ONLY_NEW_INPUT", timeout_s=8.0)
                 assert json.loads(delivered.read_text()) == [["prompt", "ONLY_NEW_INPUT"]]
                 bridge.inject_slash_command(bridge_dir, command="/effort high", timeout_s=2.0)
                 assert json.loads(delivered.read_text()) == [

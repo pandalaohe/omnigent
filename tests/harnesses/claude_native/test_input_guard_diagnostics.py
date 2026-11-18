@@ -42,7 +42,7 @@ class _Terminal:
         )
         monkeypatch.setattr(delivery_diagnostics, "time", bridge.time)
         monkeypatch.setattr(bridge, "_capture_pane", lambda *_: self.capture())
-        monkeypatch.setattr(bridge, "_run_tmux", self.run)
+        monkeypatch.setattr("subprocess.run", self.run)
         monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", lambda *_, **__: None)
         monkeypatch.setattr(bridge, "_clear_composer", lambda *_, **__: None)
         monkeypatch.setattr(
@@ -82,8 +82,10 @@ class _Terminal:
             return _PROMPT + _PRIVATE_TEXT
         return self.pane
 
-    def run(self, socket: str, *args: str) -> None:
-        self.commands.append(args)
+    def run(self, command: list[str], **_kwargs: object) -> SimpleNamespace:
+        args = tuple(command[command.index(";") + 1 :] if ";" in command else command[3:])
+        if args[0] in ("send-keys", "load-buffer", "paste-buffer"):
+            self.commands.append(args)
         if args[0] == "paste-buffer":
             self.pasted = True
             self.pane = _composer(_PRIVATE_TEXT)
@@ -93,6 +95,7 @@ class _Terminal:
             args[-1] == "Escape" or bridge._COMPOSER_KILL_TO_LINE_START in args[-1]
         ):
             self.pane = _composer()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
 
 @pytest.fixture
@@ -146,7 +149,7 @@ def test_recovered_surface_is_retained_when_a_later_submit_fails(
     terminal.clears_surface = True
     with (
         caplog.at_level("INFO", logger=delivery_diagnostics.__name__),
-        pytest.raises(bridge.ClaudeMessageNotAccepted),
+        pytest.raises(bridge.ClaudeDeliveryUnconfirmed),
     ):
         bridge.inject_user_message(terminal.directory, content=_PRIVATE_TEXT)
 
@@ -168,9 +171,10 @@ def test_pending_prompt_records_source_and_delivery_boundary(
 ) -> None:
     terminal.pending_source = source
     terminal.pending_after_paste = after_paste
+    expected = bridge.ClaudeDeliveryUnconfirmed if after_paste else bridge.ClaudeUserPromptPending
     with (
         caplog.at_level("INFO", logger=delivery_diagnostics.__name__),
-        pytest.raises(bridge.ClaudeUserPromptPending),
+        pytest.raises(expected),
     ):
         bridge.inject_user_message(terminal.directory, content=_PRIVATE_TEXT)
 
@@ -194,7 +198,7 @@ def test_rejected_submit_distinguishes_unchanged_and_growing_composers(
     terminal.newline_on_enter = newline_on_enter
     with (
         caplog.at_level("INFO", logger=delivery_diagnostics.__name__),
-        pytest.raises(bridge.ClaudeMessageNotAccepted),
+        pytest.raises(bridge.ClaudeDeliveryUnconfirmed),
     ):
         bridge.inject_user_message(terminal.directory, content=_PRIVATE_TEXT)
 
@@ -225,7 +229,7 @@ def test_composer_observation_failure_preserves_submit_refusal(
     monkeypatch.setattr(delivery_diagnostics, "record_submit_composer", broken_observation)
     with (
         caplog.at_level("INFO", logger=delivery_diagnostics.__name__),
-        pytest.raises(bridge.ClaudeMessageNotAccepted),
+        pytest.raises(bridge.ClaudeDeliveryUnconfirmed),
     ):
         bridge.inject_user_message(terminal.directory, content=_PRIVATE_TEXT)
 

@@ -861,18 +861,34 @@ async def test_native_paste_claim_uses_bound_server_and_replies_to_harness(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("blocked", [True, None], ids=["running", "tracker-unavailable"])
 async def test_followup_waits_for_claude_after_the_runner_slot_is_released(
     monkeypatch: pytest.MonkeyPatch,
+    blocked: bool | None,
 ) -> None:
     app, harness, _server = _build_app([_DELIVERED, _DELIVERED])
     sid = uuid.uuid4().hex
-    running = False
-    monkeypatch.setattr(claude_native_bridge, "has_running_turn", lambda _: running)
+    running: bool | None = None
+    bridge_dir = claude_native_bridge.bridge_dir_for_bridge_id("label-owned-bridge")
+    claude_native_bridge.write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    monkeypatch.setattr(claude_native_bridge, "_claude_turn_running", lambda *_: running)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda *_: claude_native_bridge._ClaudePaneState(alive=True),
+    )
     async with _runner_client(app) as client:
         await _create_session(client, sid)
         await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
         await _until(lambda: len(harness.posted_bodies) == 1 and sid not in app.state.active_turns)
-        running = True
+        claude_native_bridge.record_hook_event(
+            bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "native-session"}
+        )
+        running = blocked
         reply = await client.post(f"/v1/sessions/{sid}/events", json=_message("follow-up"))
         assert reply.json()["status"] == "buffered"
         assert sid not in app.state.active_turns

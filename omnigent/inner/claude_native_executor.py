@@ -23,6 +23,7 @@ from omnigent.harnesses.claude_native.bridge import (
     SWITCH_MODEL_DIALOG_HINT,
     ClaudeComposerNotCleared,
     ClaudeDeliveryClaimRefused,
+    ClaudeDeliveryOwner,
     ClaudeDeliveryUnconfirmed,
     ClaudeInputBoxOccupied,
     ClaudeMessageNotAccepted,
@@ -33,7 +34,6 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeUserPromptPending,
     KeepWarmBtwResult,
     TmuxSessionNotAdvertised,
-    _tmux_input_identity,
     cancellable_injection,
     claude_pane_ready,
     has_pending_user_prompt,
@@ -48,6 +48,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_active_session_id,
     read_claude_context_state,
     read_claude_status_model,
+    read_delivery_owner,
     read_launch_model,
     read_model_env,
     read_model_picker_values,
@@ -359,7 +360,14 @@ class ClaudeNativeExecutor(Executor):
         wanted_model_arg: str | None,
     ) -> None:
         """Apply a routed ``/model`` switch, then inject the message, in one lock hold."""
-        async with self._inject_lock:
+        try:
+            async with asyncio.timeout(message_readiness_remaining()):
+                await self._inject_lock.acquire()
+        except TimeoutError as exc:
+            raise ClaudeMessageNotAccepted(
+                "Claude's readiness wait expired before the message was typed."
+            ) from exc
+        try:
             self._require_active_session()
             context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
             context_path.unlink(missing_ok=True)
@@ -397,6 +405,8 @@ class ClaudeNativeExecutor(Executor):
                 prepare_submission(self._bridge_dir, native_idle=snapshot.idle, text=text)
                 await claim_execution()
             await self._inject_prompt(text, notices)
+        finally:
+            self._inject_lock.release()
 
     async def _hold_message(self, refusal: RuntimeError, deadline: float) -> bool:
         """
@@ -648,6 +658,7 @@ class ClaudeNativeExecutor(Executor):
                 delivery_claimed = await claim_native_delivery(deadline)
             return delivery_claimed
 
+        owner: ClaudeDeliveryOwner | None = None
         try:
             with (
                 telemetry.span("claude_native.inject"),
@@ -663,6 +674,7 @@ class ClaudeNativeExecutor(Executor):
             ):
                 hold_deadline: float | None = None
                 while True:
+                    owner = read_delivery_owner(self._bridge_dir)
                     try:
                         await self._inject_turn(text, notices, wanted_model, wanted_model_arg)
                         break
@@ -704,7 +716,7 @@ class ClaudeNativeExecutor(Executor):
                 exc_info=not clean_exit,
                 extra={"session_id": self._request_session_id},
             )
-            cleanup_error = self._reap_failed_turn()
+            cleanup_error = self._reap_failed_turn(owner)
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
@@ -717,8 +729,10 @@ class ClaudeNativeExecutor(Executor):
             )
             # The pane is still alive here: this turn's error reports the close,
             # so the runner must not also report the pane's exit as a failure.
-            running = await asyncio.to_thread(has_running_turn, self._bridge_dir)
-            cleanup_error = None if running else self._reap_failed_turn(expected_close=True)
+            running = await asyncio.to_thread(
+                has_running_turn, self._bridge_dir, unknown_is_busy=True
+            )
+            cleanup_error = None if running else self._reap_failed_turn(owner, expected_close=True)
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
@@ -793,8 +807,7 @@ class ClaudeNativeExecutor(Executor):
         """Drain cancelled delivery workers before releasing the pane's injection lock."""
         cancelled = threading.Event()
         paste_started = threading.Event()
-        active_session_id = read_active_session_id(self._bridge_dir)
-        tmux_identity = _tmux_input_identity(self._bridge_dir)
+        owner = read_delivery_owner(self._bridge_dir)
         with cancellable_injection(cancelled, paste_started=paste_started):
             worker = asyncio.create_task(asyncio.to_thread(operation))
         try:
@@ -811,21 +824,25 @@ class ClaudeNativeExecutor(Executor):
                     "Claude delivery was interrupted after the paste started. "
                     "The message may already be queued or running."
                 ) from None
-            if (
-                not await asyncio.to_thread(has_running_turn, self._bridge_dir)
-                and read_active_session_id(self._bridge_dir) == active_session_id
-                and (
-                    tmux_identity.get("socket_path") is None
-                    or _tmux_input_identity(self._bridge_dir) == tmux_identity
-                )
+            if not await asyncio.to_thread(
+                has_running_turn, self._bridge_dir, unknown_is_busy=True
             ):
-                self._reap_failed_turn()
+                self._reap_failed_turn(owner)
             raise
 
-    def _reap_failed_turn(self, *, expected_close: bool = False) -> str | None:
+    def _reap_failed_turn(
+        self, owner: ClaudeDeliveryOwner | None, *, expected_close: bool = False
+    ) -> str | None:
         """Kill the Claude pane before a delivery timeout becomes ``failed``."""
+        if owner is None:
+            return None
         try:
-            kill_session(self._bridge_dir, timeout_s=1.0, expected_close=expected_close)
+            kill_session(
+                self._bridge_dir,
+                timeout_s=1.0,
+                expected_close=expected_close,
+                expected_owner=owner,
+            )
         except TmuxSessionNotAdvertised:
             _logger.debug(
                 "claude-native: timed-out session already disappeared",

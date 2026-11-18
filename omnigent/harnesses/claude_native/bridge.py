@@ -181,12 +181,16 @@ def _cancellable_injection_lock(lock: threading.Lock | FileLock) -> Iterator[Non
     """Let cancelled queued writers exit while the active writer keeps its lock."""
     while True:
         _check_injection_cancelled()
+        interval = _INJECTION_LOCK_POLL_INTERVAL_S
+        if _message_readiness_deadline.get() is not None:
+            interval = min(interval, message_readiness_remaining())
         try:
-            if lock.acquire(timeout=_INJECTION_LOCK_POLL_INTERVAL_S):
+            if lock.acquire(timeout=interval):
                 break
         except FileLockTimeout:
             # Another process still owns the pane; retry after checking cancellation.
-            continue
+            pass
+        _check_message_readiness_budget()
     try:
         _check_injection_cancelled()
         yield
@@ -501,6 +505,7 @@ _DIALOG_FOOTER_RE = re.compile(
 _DIALOG_SCAN_TAIL_LINES = 15
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
+_CLAUDE_EXIT_DIAGNOSTIC_TIMEOUT_S = 0.5
 # A pane whose prompt has not rendered for this long is asked to repaint
 # (see :func:`_request_claude_repaint`), then again at the interval.
 _CLAUDE_REPAINT_AFTER_S = 5.0
@@ -908,7 +913,7 @@ class ClaudeUserPromptPending(RuntimeError):
 
 
 class ClaudeMessageNotAccepted(RuntimeError):
-    """The submitted draft remained in Claude's input box until the deadline."""
+    """Delivery was refused before the message could be submitted."""
 
 
 class ClaudeDeliveryUnconfirmed(RuntimeError):
@@ -923,7 +928,7 @@ class ClaudeComposerNotCleared(ClaudeMessageNotAccepted):
     """A draft left in Claude's input box could not be cleared, so nothing was sent."""
 
 
-class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
+class ClaudeSubmitBlockedUnconfirmed(ClaudeDeliveryUnconfirmed):
     """A fresh matching native refusal stops retries without proving web ownership."""
 
 
@@ -5472,6 +5477,9 @@ class _MessagePane:
     active_session_id: str | None
     native_session_id: str | None
     wrote_paste: bool = False
+    message_text: str | None = None
+    transcript_boundary: SubmitBoundary | None = None
+    hook_boundary: SubmitBoundary | None = None
 
     def check_owner(self) -> None:
         current = read_claude_session_id(self.bridge_dir)
@@ -5493,6 +5501,40 @@ class _MessagePane:
         # A cold pane can report its native ID for the first time during delivery.
         self.native_session_id = current
 
+    def capture_receipt_boundary(self) -> None:
+        """Start at the final protected boundary before invoking tmux paste-buffer."""
+        self.check_owner()
+        native_id = self.native_session_id
+        transcript = read_transcript_path(self.bridge_dir)
+        self.transcript_boundary = (
+            capture_submit_boundary(transcript, native_id)
+            if transcript is not None and native_id is not None
+            else None
+        )
+        self.hook_boundary = capture_submit_boundary(
+            self.bridge_dir / _HOOKS_FILE, native_id or ""
+        )
+
+    def read_receipt(self) -> bool | None:
+        """Read evidence for this paste, after verifying the pane still owns it."""
+        self.check_owner()
+        text = self.message_text
+        if not self.wrote_paste or text is None:
+            return None
+        transcript_receipt = None
+        if self.transcript_boundary is not None:
+            if _fresh_matching_hook_block(self.bridge_dir, self.transcript_boundary, text):
+                return False
+            transcript_receipt = _fresh_native_receipt(self.transcript_boundary, text)
+            if transcript_receipt is True:
+                return True
+        hook_receipt = (
+            _fresh_prompt_hook_receipt(self.hook_boundary, self.native_session_id, text)
+            if self.hook_boundary is not None and self.native_session_id is not None
+            else None
+        )
+        return transcript_receipt if hook_receipt is None else hook_receipt
+
 
 _MESSAGE_PANE: ContextVar[_MessagePane | None] = ContextVar("claude_message_pane", default=None)
 
@@ -5501,6 +5543,32 @@ def inject_user_message(bridge_dir: Path, *, content: str, timeout_s: float | No
     """Deliver a Claude message within the active or newly allocated readiness budget."""
     with message_readiness_budget(timeout_s):
         _inject_user_message(bridge_dir, content=content)
+
+
+@dataclass(frozen=True)
+class ClaudeDeliveryOwner:
+    """The advertised pane and conversations a delivery was allowed to clean up."""
+
+    socket_path: str
+    tmux_target: str
+    active_session_id: str | None
+    native_session_id: str | None
+
+
+def read_delivery_owner(bridge_dir: Path) -> ClaudeDeliveryOwner | None:
+    """A delivery without an advertised pane has no cleanup target."""
+    info = _tmux_input_identity(bridge_dir)
+    socket_path, tmux_target = info["socket_path"], info["tmux_target"]
+    if not isinstance(socket_path, str) or not socket_path:
+        return None
+    if not isinstance(tmux_target, str) or not tmux_target:
+        return None
+    return ClaudeDeliveryOwner(
+        socket_path,
+        tmux_target,
+        read_active_session_id(bridge_dir),
+        read_claude_session_id(bridge_dir),
+    )
 
 
 @delivery_diagnostics.trace_delivery(
@@ -5586,9 +5654,25 @@ def _inject_user_message(
     token = _MESSAGE_PANE.set(owner)
     try:
         _inject_user_message_into_pane(bridge_dir, content=content, info=info)
-    except (ClaudePromptTimeout, ClaudeTerminalExited):
-        owner.check_owner()
-        raise
+    except (RuntimeError, OSError) as exc:
+        if not owner.wrote_paste or isinstance(exc, ClaudeInjectionCancelled):
+            if isinstance(exc, ClaudePromptTimeout):
+                owner.check_owner()
+            raise
+        if owner.read_receipt() is True:
+            delivery_diagnostics.record_details(verification="native_recorded")
+            return
+        if isinstance(exc, ClaudeDeliveryUnconfirmed):
+            raise
+        detail = (
+            "Claude is waiting for an explicit answer. "
+            if isinstance(exc, ClaudeUserPromptPending)
+            else ""
+        )
+        raise ClaudeDeliveryUnconfirmed(
+            f"{detail}Delivery of the pasted message could not be confirmed. "
+            "It may already be queued or running. Inspect the terminal before retrying."
+        ) from exc
     finally:
         _MESSAGE_PANE.reset(token)
 
@@ -5773,16 +5857,12 @@ def _paste_and_submit(
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
     paste_tmux = _tmux_input_identity(bridge_dir)
     paste_native_session_id = read_claude_session_id(bridge_dir)
-    transcript_path = read_transcript_path(bridge_dir)
-    paste_boundary = (
-        capture_submit_boundary(transcript_path, paste_native_session_id)
-        if transcript_path is not None and paste_native_session_id is not None
-        else None
-    )
+    owner = _MESSAGE_PANE.get()
+    if owner is not None:
+        owner.message_text = text
 
     def owns_paste() -> bool:
         # The same terminal and native conversation still hold the original paste.
-        owner = _MESSAGE_PANE.get()
         if owner is not None:
             owner.check_owner()
         native_session_id = read_claude_session_id(bridge_dir)
@@ -5790,9 +5870,15 @@ def _paste_and_submit(
             paste_native_session_id is None or native_session_id == paste_native_session_id
         )
 
+    def read_receipt() -> bool | None:
+        return owner.read_receipt() if owner is not None else None
+
     draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
         bridge_dir, socket_path, tmux_target, text=text, needle=needle, tail_needle=tail_needle
     )
+    if read_receipt() is True:
+        delivery_diagnostics.record_details(verification="native_recorded")
+        return
     if needle and not draft_seen:
         delivery_diagnostics.record_draft(
             pane=pane,
@@ -5813,8 +5899,7 @@ def _paste_and_submit(
             tmux_target,
             needle=needle,
             tail_needle=tail_needle,
-            text=text,
-            boundary=paste_boundary,
+            read_receipt=read_receipt,
             owns_paste=owns_paste,
             bridge_dir=bridge_dir,
         )
@@ -5851,8 +5936,7 @@ def _paste_and_submit(
             tmux_target,
             needle=needle,
             tail_needle=tail_needle,
-            text=text,
-            boundary=paste_boundary,
+            read_receipt=read_receipt,
             owns_paste=owns_paste,
             bridge_dir=bridge_dir,
         )
@@ -5868,13 +5952,9 @@ def _paste_and_submit(
             "Inspect the terminal before retrying; the message may already have arrived."
         )
     delivery_diagnostics.set_stage("submitting")
-    transcript_path = read_transcript_path(bridge_dir)
-    native_session_id = read_claude_session_id(bridge_dir)
-    submit_boundary = (
-        capture_submit_boundary(transcript_path, native_session_id)
-        if transcript_path is not None and native_session_id is not None
-        else None
-    )
+    if read_receipt() is True:
+        delivery_diagnostics.record_details(verification="native_recorded")
+        return
     if message_readiness_remaining() <= 0:
         raise ClaudeDeliveryUnconfirmed(
             "Claude did not confirm this pasted message before the readiness wait expired. "
@@ -5903,11 +5983,12 @@ def _paste_and_submit(
             what="submitted message",
             bridge_dir=bridge_dir,
             wait_for_startup=startup_submit,
-            submit_boundary=submit_boundary,
+            submit_boundary=owner.transcript_boundary if owner is not None else None,
             submitted_text=text,
             retry_enter=not clipped_draft,
             require_evidence=True,
             check_owner=owns_paste,
+            read_receipt=read_receipt,
         )
     except ClaudeUserPromptPending as exc:
         # The Enter already went out, so the prompt may belong to this message's own turn.
@@ -5925,14 +6006,9 @@ def _paste_and_submit(
             state["accepted_input_tmux"] = tmux_info
             _write_json_file(bridge_dir / _STATE_FILE, state)
         return
-    if clipped_draft or _message_delivery_claim.get() is not None:
-        raise ClaudeDeliveryUnconfirmed(
-            "Claude did not confirm the submitted draft. It may already be queued or running. "
-            "Inspect the terminal before retrying."
-        )
-    raise ClaudeMessageNotAccepted(
-        "Claude Code did not accept the submitted message (the draft is still in the input box). "
-        "The message was not delivered."
+    raise ClaudeDeliveryUnconfirmed(
+        "Claude did not confirm delivery. The draft is still in the input box. "
+        "The message may already be queued or running. Inspect the terminal before retrying."
     )
 
 
@@ -5973,14 +6049,39 @@ def _fresh_native_receipt(boundary: SubmitBoundary, text: str) -> bool | None:
     return False if another_prompt_observed else None
 
 
+def _fresh_prompt_hook_receipt(
+    boundary: SubmitBoundary, native_session_id: str, text: str
+) -> bool | None:
+    """Match the original paste against a new parent UserPromptSubmit hook."""
+    expected = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    another_prompt_observed = False
+    for entry in read_fresh_submit_records(boundary):
+        payload = entry.get("payload")
+        if (
+            not isinstance(payload, dict)
+            or payload.get("hook_event_name") != "UserPromptSubmit"
+            or payload.get("session_id") != native_session_id
+            or payload.get("agent_id") is not None
+            or "admission_id" in payload
+        ):
+            continue
+        prompt = payload.get("prompt")
+        if not isinstance(prompt, str):
+            continue
+        normalized = _unwrap_pasted_content_markers(prompt)
+        if normalized.replace("\r\n", "\n").replace("\r", "\n").strip() == expected:
+            return True
+        another_prompt_observed = True
+    return False if another_prompt_observed else None
+
+
 def _wait_for_unobserved_paste(
     socket_path: str,
     tmux_target: str,
     *,
     needle: str,
     tail_needle: str,
-    text: str,
-    boundary: SubmitBoundary | None,
+    read_receipt: Callable[[], bool | None],
     owns_paste: Callable[[], bool],
     bridge_dir: Path,
 ) -> str | None:
@@ -5992,7 +6093,6 @@ def _wait_for_unobserved_paste(
     :returns: The capture showing the draft, or ``None`` when Claude recorded the paste.
     :raises ClaudeDeliveryUnconfirmed: Neither appeared; the paste must not be replayed.
     :raises ClaudeUserPromptPending: A question or permission request now holds the pane.
-    :raises ClaudeTerminalExited: The terminal exited before either appeared.
     """
     delivery_diagnostics.set_stage("waiting_for_paste_ack")
     deadline = _message_readiness_deadline.get()
@@ -6004,14 +6104,11 @@ def _wait_for_unobserved_paste(
         _check_injection_cancelled()
         if not owns_paste():
             break
-        if boundary is not None:
-            receipt = _fresh_native_receipt(boundary, text)
-            if receipt is True:
-                if owns_paste():
-                    delivery_diagnostics.record_details(verification="native_recorded")
-                    return None
-                break
-            another_prompt_observed = another_prompt_observed or receipt is False
+        receipt = read_receipt()
+        if receipt is True:
+            delivery_diagnostics.record_details(verification="native_recorded")
+            return None
+        another_prompt_observed = another_prompt_observed or receipt is False
         if has_pending_user_prompt(bridge_dir):
             raise ClaudeUserPromptPending(
                 "Claude is waiting for an explicit answer; message not sent."
@@ -6033,11 +6130,10 @@ def _wait_for_unobserved_paste(
             return pane
         if time.monotonic() >= next_liveness_probe:
             state = _claude_pane_state(socket_path, tmux_target)
-            if state.alive is False:
-                raise ClaudeTerminalExited(
+            if state.exited:
+                raise ClaudeDeliveryUnconfirmed(
                     "The Claude Code terminal exited before the pasted message was confirmed. "
-                    "Relaunch the terminal to continue this conversation.",
-                    exit_status=state.exit_status,
+                    "It may have arrived. Inspect the conversation before retrying."
                 )
             next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
@@ -6162,6 +6258,7 @@ def _verify_submit_accepted(
     retry_enter: bool = True,
     require_evidence: bool = False,
     check_owner: Callable[[], bool] | None = None,
+    read_receipt: Callable[[], bool | None] | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -6185,7 +6282,7 @@ def _verify_submit_accepted(
     :param tail_needle: End-of-draft marker from :func:`_submit_tail_needle`.
     :param bridge_dir: Bridge whose pending questions protect submit retries.
     :param wait_for_startup: Preserve the first draft through slow terminal startup.
-    :param submit_boundary: Native transcript boundary captured before Enter.
+    :param submit_boundary: Native transcript boundary captured before the paste.
     :param submitted_text: Full submitted text; a marker alone cannot identify a refusal.
     :param before_retry: Optional live idle guard before sending another Enter.
     :param retry_enter: Whether the original draft was observed with its prompt glyph.
@@ -6193,6 +6290,7 @@ def _verify_submit_accepted(
         nothing: acceptance then needs a mounted composer, a dialog of the started
         turn or a fresh native record of *submitted_text*.
     :param check_owner: Recheck that the message still belongs to the observed pane.
+    :param read_receipt: Read fresh native evidence from the original paste boundary.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     :raises ClaudeDeliveryUnconfirmed: With *require_evidence*, the draft left
@@ -6219,6 +6317,7 @@ def _verify_submit_accepted(
     if message_deadline is not None:
         deadline = message_deadline if wait_for_startup else min(deadline, message_deadline)
     draft_present = False
+    pane_exited = False
     while time.monotonic() < deadline:
         _check_injection_cancelled()
         time.sleep(max(0.0, min(_CLAUDE_READY_POLL_INTERVAL_S, deadline - time.monotonic())))
@@ -6250,12 +6349,7 @@ def _verify_submit_accepted(
                 "A hook blocked a matching prompt in Claude's terminal. Web message delivery "
                 "could not be confirmed; inspect the terminal before retrying."
             )
-        receipt = (
-            require_evidence
-            and submit_boundary is not None
-            and submitted_text is not None
-            and _fresh_native_receipt(submit_boundary, submitted_text) is True
-        )
+        receipt = read_receipt is not None and read_receipt() is True
         if receipt or (
             not draft_present
             and (_submit_left_composer(pane) if require_evidence else bool(pane.strip()))
@@ -6278,7 +6372,11 @@ def _verify_submit_accepted(
             return True
         now = time.monotonic()
         if (wait_for_startup or require_evidence) and now >= next_liveness_probe:
-            if _claude_pane_state(socket_path, tmux_target).alive is False:
+            pane_state = _claude_pane_state(socket_path, tmux_target)
+            if pane_state.exited or (not require_evidence and pane_state.alive is False):
+                if require_evidence:
+                    pane_exited = True
+                    break
                 if draft_present:
                     raise ClaudeMessageNotAccepted(
                         "Claude Code exited with the submitted draft still in the input box. "
@@ -6316,7 +6414,12 @@ def _verify_submit_accepted(
                 before_retry()
             if time.monotonic() >= deadline:
                 break
-            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            # The effective submit deadline also bounds the lock and the write.
+            token = _message_readiness_deadline.set(deadline)
+            try:
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            finally:
+                _message_readiness_deadline.reset(token)
             retries += 1
             delivery_diagnostics.record_details(retries=retries)
             last_enter = now
@@ -6330,6 +6433,11 @@ def _verify_submit_accepted(
         retries=retries,
         polls=polls,
     )
+    if require_evidence and pane_exited:
+        raise ClaudeDeliveryUnconfirmed(
+            "The Claude terminal exited before delivery of the pasted message could be "
+            "confirmed. Check the conversation before retrying."
+        )
     if require_evidence and not draft_present:
         if pane.strip():
             delivery_diagnostics.record_details(verification="unconfirmed_submit")
@@ -6461,6 +6569,7 @@ def kill_session(
     *,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
     expected_close: bool = False,
+    expected_owner: ClaudeDeliveryOwner | None = None,
 ) -> None:
     """
     Forcefully terminate the Claude tmux session via ``kill-session``.
@@ -6491,12 +6600,25 @@ def kill_session(
         turn itself (a delivery timeout). The runner then reads the exit
         as expected instead of a terminal crash; see
         :func:`pane_closed_by_omnigent`.
+    :param expected_owner: When cleaning up delivery, act only on this pane
+        while its bridge ownership still matches.
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in
         time, or if ``tmux kill-session`` fails for an unexpected reason.
     """
+    if expected_owner is not None:
+        with _bridge_metadata_write_lock(bridge_dir):
+            if read_delivery_owner(bridge_dir) == expected_owner:
+                _kill_tmux_session(
+                    expected_owner.socket_path, expected_owner.tmux_target, expected_close
+                )
+        return
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    private_dir = Path(info["socket_path"]).parent
+    _kill_tmux_session(info["socket_path"], info["tmux_target"], expected_close)
+
+
+def _kill_tmux_session(socket_path: str, tmux_target: str, expected_close: bool) -> None:
+    private_dir = Path(socket_path).parent
     markers = [private_dir / _OMNIGENT_KILL_FILE]
     if expected_close:
         markers.append(private_dir / _EXPECTED_CLOSE_FILE)
@@ -6505,10 +6627,10 @@ def kill_session(
             marker.touch()
     try:
         _run_tmux(
-            info["socket_path"],
+            socket_path,
             "kill-session",
             "-t",
-            info["tmux_target"],
+            tmux_target,
             allow_missing_target=True,
         )
     except RuntimeError:
@@ -6650,12 +6772,67 @@ def inject_slash_command(
             raise ValueError("auto_confirm needs the confirm_hint its dialog renders")
         dialog_hint = confirm_hint
     shares_message_budget = _message_readiness_deadline.get() is not None
+    active_session_id = read_active_session_id(bridge_dir) if shares_message_budget else None
+    native_session_id = read_claude_session_id(bridge_dir) if shares_message_budget else None
+    if shares_message_budget:
+        requested_session_id = os.environ.get(REQUEST_SESSION_ID_ENV_VAR, "").strip()
+        if (
+            requested_session_id
+            and active_session_id
+            and requested_session_id != active_session_id
+        ):
+            raise ClaudeMessageNotAccepted(
+                "Claude's session changed before the message was typed."
+            )
     info = _wait_for_tmux_info(
         bridge_dir, timeout_s=message_readiness_remaining() if shares_message_budget else timeout_s
     )
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
+    owner = (
+        _MessagePane(
+            bridge_dir,
+            socket_path,
+            tmux_target,
+            active_session_id,
+            native_session_id,
+        )
+        if shares_message_budget
+        else None
+    )
+    token = _MESSAGE_PANE.set(owner)
+    try:
+        _inject_slash_command_into_pane(
+            bridge_dir,
+            socket_path,
+            tmux_target,
+            command=command,
+            timeout_s=timeout_s,
+            ready_timeout_s=message_readiness_remaining()
+            if shares_message_budget
+            else ready_timeout_s,
+            dialog_hint=dialog_hint,
+            wait_for_startup=wait_for_startup,
+            require_idle=require_idle,
+        )
+        if owner is not None:
+            owner.check_owner()
+    finally:
+        _MESSAGE_PANE.reset(token)
 
+
+def _inject_slash_command_into_pane(
+    bridge_dir: Path,
+    socket_path: str,
+    tmux_target: str,
+    *,
+    command: str,
+    timeout_s: float,
+    ready_timeout_s: float | None,
+    dialog_hint: str | None,
+    wait_for_startup: bool,
+    require_idle: bool,
+) -> None:
     def check_idle() -> None:
         if (
             require_idle
@@ -6676,9 +6853,7 @@ def inject_slash_command(
         socket_path,
         tmux_target,
         timeout_s=timeout_s,
-        ready_timeout_s=message_readiness_remaining()
-        if shares_message_budget
-        else ready_timeout_s,
+        ready_timeout_s=ready_timeout_s,
     )
     check_idle()
     if has_pending_user_prompt(bridge_dir):
@@ -6950,12 +7125,15 @@ def _keep_warm_tmux_remaining_s() -> float | None:
     return max(0.0, deadline - time.monotonic())
 
 
-def _tmux_call_timeout_s() -> float:
-    """The next tmux subprocess's budget, clipped to a bound keep-warm deadline."""
+def _tmux_call_timeout_s(*, include_message_deadline: bool = True) -> float:
+    """Clip the next tmux subprocess to deadlines bound to this operation."""
     remaining = _keep_warm_tmux_remaining_s()
-    if remaining is None:
-        return _TMUX_SEND_TIMEOUT_S
-    return min(_TMUX_SEND_TIMEOUT_S, remaining)
+    timeout = (
+        min(_TMUX_SEND_TIMEOUT_S, remaining) if remaining is not None else _TMUX_SEND_TIMEOUT_S
+    )
+    if include_message_deadline and _message_readiness_deadline.get() is not None:
+        timeout = min(timeout, message_readiness_remaining())
+    return timeout
 
 
 def _keep_warm_poll_timeout(own_timeout_s: float) -> float:
@@ -7635,11 +7813,8 @@ def _run_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) 
     import subprocess
 
     _check_injection_cancelled()
-    timeout = _tmux_call_timeout_s()
-    if timeout <= 0.0:
-        # Past the bound keep-warm deadline: no key may go out after it.
-        raise RuntimeError(f"tmux command timed out after {timeout}s")
     operation = args[0] if args else ""
+    timeout = 0.0
     if operation == "send-keys" and "-t" in args:
         target = args[args.index("-t") + 1]
         args = ("copy-mode", "-q", "-t", target, ";", *args)
@@ -7654,11 +7829,23 @@ def _run_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) 
             _check_injection_cancelled()
             if owner is not None:
                 owner.check_owner()
+                if (
+                    operation == "send-keys"
+                    and args[-1] == "Enter"
+                    and owner.read_receipt() is True
+                ):
+                    return
+            if operation == "paste-buffer" and owner is not None:
+                _require_protected_draft_clear(owner.bridge_dir, socket_path, owner.tmux_target)
+                owner.capture_receipt_boundary()
+                _check_injection_cancelled()
+            bounds_input = operation in ("send-keys", "paste-buffer", "load-buffer")
+            if bounds_input:
+                _check_message_readiness_budget()
+            timeout = _tmux_call_timeout_s(include_message_deadline=bounds_input)
+            if timeout <= 0.0:
+                raise RuntimeError(f"tmux command timed out after {timeout}s")
             if operation == "paste-buffer":
-                if owner is not None:
-                    _require_protected_draft_clear(
-                        owner.bridge_dir, socket_path, owner.tmux_target
-                    )
                 # Once tmux is invoked the outcome can be ambiguous, including on timeout.
                 paste_started = _INJECTION_PASTE_STARTED.get()
                 if paste_started is not None:
@@ -7851,6 +8038,9 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
     import subprocess
 
     _check_injection_cancelled()
+    timeout = _tmux_call_timeout_s()
+    if timeout <= 0.0:
+        return _ClaudePaneState(None)
     try:
         proc = subprocess.run(
             [
@@ -7866,7 +8056,7 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
             check=False,
             capture_output=True,
             text=True,
-            timeout=_TMUX_SEND_TIMEOUT_S,
+            timeout=timeout,
         )
     except (subprocess.SubprocessError, OSError):
         return _ClaudePaneState(None)
@@ -8154,7 +8344,15 @@ def _user_prompt_visible(pane: str) -> bool:
     else:
         region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
     # Narrow panes wrap the decision footer across captured lines.
-    footer = " ".join(region.split())
+    footer = " ".join(" ".join(region.splitlines()[-3:]).split())
+    selector = re.search(r"(?m)^[ \t│]*❯[ \t]+\d+[.)][ \t]+", region)
+    permission_choice = re.search(r"(?m)^[ \t│]*(?:❯[ \t]*)?\d+[.)][ \t]+(?:Yes|No)\b", region)
+    # Some consent cards use unnumbered choices and a confirmation footer.
+    permission_controls = (selector is not None and permission_choice is not None) or (
+        "Enter to confirm" in footer
+        and "Esc to cancel" in footer
+        and re.search(r"(?m)^[ \t│]*❯[ \t]+(?:Yes|No)\b", region) is not None
+    )
     # A short pane can clip the plan decision's footer entirely.
     plan_region = "\n".join(lines[rules[-1] + 1 :]) if rules else ""
     plan_exit = re.search(
@@ -8167,10 +8365,13 @@ def _user_prompt_visible(pane: str) -> bool:
     return (
         _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT)
         or (plan_exit is not None and "❯" in plan_exit.group())
-        or "Do you want to " in region
-        or "Yes, and don't ask again" in region
         or (
-            any(hint in footer for hint in ("Enter to select", "Enter to submit"))
+            permission_controls
+            and ("Do you want to " in region or "Yes, and don't ask again" in region)
+        )
+        or (
+            (bool(rules) or selector is not None)
+            and any(hint in footer for hint in ("Enter to select", "Enter to submit"))
             and "Esc to cancel" in footer
         )
     )
@@ -8231,15 +8432,24 @@ def has_pending_user_prompt(bridge_dir: Path) -> bool:
     return pending
 
 
-def has_running_turn(bridge_dir: Path) -> bool:
-    """Check whether Claude still owns the pane for a running turn."""
+def has_running_turn(bridge_dir: Path, *, unknown_is_busy: bool = False) -> bool:
+    """Check for a running turn, optionally reserving an unverified live pane."""
     info = _read_json_file(bridge_dir / _TMUX_FILE)
     if not isinstance(info, dict):
         return False
     socket_path, target = info.get("socket_path"), info.get("tmux_target")
     if not isinstance(socket_path, str) or not isinstance(target, str):
         return False
-    return _claude_turn_running(bridge_dir, socket_path, target) is True
+    running = _claude_turn_running(bridge_dir, socket_path, target)
+    if running is not None:
+        return running
+    return unknown_is_busy and _claude_pane_state(socket_path, target).alive is not False
+
+
+def claude_pane_has_accepted_input(bridge_dir: Path) -> bool:
+    """Check whether this advertised pane has accepted input since launch."""
+    advertised = _tmux_input_identity(bridge_dir)
+    return advertised == _read_json_file(bridge_dir / _STATE_FILE).get("accepted_input_tmux")
 
 
 def input_box_reads_clear(bridge_dir: Path, *, repaint: bool = False) -> bool:
@@ -9477,12 +9687,8 @@ def _wait_for_claude_prompt_ready(
     polls = 0
     empty_polls = 0
     repaint_requests = 0
-    # Keep the last non-empty capture the loop actually saw, not a fresh
-    # capture taken after the deadline. A post-timeout re-capture can show
-    # a different (often healthier-looking) frame than any decision the
-    # loop made — e.g. the input box repainting just as the turn settles —
-    # which misrepresents why the gate failed. Attaching what was observed
-    # while it mattered keeps the error honest.
+    # Keep the last non-empty capture from the wait. Only a confirmed exit
+    # can attach a fresh capture after the deadline, as exit diagnostics.
     last_nonempty = ""
     exited_status: str | None = None
     pane_gone = False
@@ -9509,16 +9715,15 @@ def _wait_for_claude_prompt_ready(
         else:
             empty_polls += 1
         tall_draft = _occupied_tall_draft(pane)
+        if tall_draft and not waited_on_tall_draft and bridge_dir is not None:
+            # A torn capture during resize must not erase evidence of an occupied composer.
+            _set_protected_draft(bridge_dir, socket_path, tmux_target, protect=True)
         if _claude_prompt_rendered(pane) and not tall_draft:
-            if waited_on_tall_draft and bridge_dir is not None:
-                _set_protected_draft(bridge_dir, socket_path, tmux_target, protect=True)
             if bridge_dir is not None:
                 _require_protected_draft_clear(bridge_dir, socket_path, tmux_target, pane=pane)
             return
         # Confirm a draft across two captures, before any overlay dismissal.
         if tall_draft and waited_on_tall_draft:
-            if bridge_dir is not None:
-                _set_protected_draft(bridge_dir, socket_path, tmux_target, protect=True)
             raise ClaudeInputBoxOccupied(
                 f"Claude Code's input box is occupied by {_SCROLLED_DRAFT_SURFACE}, so the "
                 "message was not delivered. Open the terminal, dismiss it, then resend your "
@@ -9644,6 +9849,27 @@ def _wait_for_claude_prompt_ready(
     # with no box point at Claude never rendering the prompt (a boot crash,
     # e.g. a ``JSON Parse error``, whose text the tail then surfaces).
     waited_s = time.monotonic() - started
+    owner = _MESSAGE_PANE.get()
+    if (
+        not pane_gone
+        and _message_readiness_deadline.get() is not None
+        and message_readiness_remaining() == 0.0
+        and (owner is None or not owner.wrote_paste)
+    ):
+        # A spent readiness budget also blocks tmux reads. Allow a short,
+        # read-only exit diagnosis even if preflight consumed the whole wait.
+        token = _message_readiness_deadline.set(
+            time.monotonic() + _CLAUDE_EXIT_DIAGNOSTIC_TIMEOUT_S
+        )
+        try:
+            state = _claude_pane_state(socket_path, tmux_target)
+            if state.exited:
+                pane_gone = True
+                exited_status = state.exit_status
+                if not last_nonempty:
+                    last_nonempty = _capture_pane(socket_path, tmux_target)
+        finally:
+            _message_readiness_deadline.reset(token)
     if pane_gone:
         # A readiness timeout's poll counts describe a box that never mounted,
         # which reads as a rendering bug. A pane tmux no longer reports is a

@@ -8004,11 +8004,14 @@ def create_runner_app(
 
     def _claude_input_blocked(bridge_dir: Path) -> bool:
         from omnigent.harnesses.claude_native.bridge import (
+            claude_pane_has_accepted_input,
             has_pending_user_prompt,
             has_running_turn,
         )
 
-        return has_running_turn(bridge_dir) or has_pending_user_prompt(bridge_dir)
+        return has_running_turn(
+            bridge_dir, unknown_is_busy=claude_pane_has_accepted_input(bridge_dir)
+        ) or has_pending_user_prompt(bridge_dir)
 
     async def _pending_claude_prompt_bridge_dir(session_id: str) -> Path | None:
         """Return the bridge whose turn, question or approval currently owns input."""
@@ -11245,7 +11248,7 @@ def create_runner_app(
                                     # up-front spinner; drop the executor's own duplicate
                                     # so the web renders a single compaction spinner.
                                     continue
-                                if _evt_type == "injection.consumed":
+                                if _evt_type in {"injection.consumed", "injection.unconfirmed"}:
                                     _inj_id = event.get("injection_id")
                                     _buf = _session_message_buffers.get(conv_id)
                                     if _inj_id is not None and _buf:
@@ -11256,6 +11259,8 @@ def create_runner_app(
                                             _m for _m in _buf if _m.get("injection_id") != _inj_id
                                         ]
                                         _session_message_buffers[conv_id] = _remaining
+                                        if _evt_type == "injection.unconfirmed":
+                                            continue
                                         await _restore_pending_session_attachments(conv_id)
                                         for _m in _consumed:
                                             _pending_id = _m.get("pending_id")

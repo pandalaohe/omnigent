@@ -21314,6 +21314,64 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("clears a settled annotation timer while retaining an unrelated pending input", async () => {
+    const id = "conv_annotation_gap";
+    const old = [gapUser("pre", 0)];
+    const annotation = {
+      pending_id: "pending_annotation",
+      content: [{ type: "input_text" as const, text: "annotation" }],
+      sending_since_ms: 1710000000000,
+    };
+    const queued = {
+      pending_id: "pending_queued",
+      content: [{ type: "input_text" as const, text: "next" }],
+    };
+    seedSession(id, old);
+    seedPendingInputs(id, [queued, annotation]);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    const keep = { tempId: "queued", pendingId: queued.pending_id, content: queued.content };
+    useChatStore.setState({
+      conversationId: id,
+      abortController: controller,
+      blocks: itemsToBlocks(old),
+      isNativeTerminalSession: true,
+      pendingUserMessages: [
+        keep,
+        {
+          tempId: "annotation",
+          pendingId: annotation.pending_id,
+          content: annotation.content,
+          sendingSinceMs: annotation.sending_since_ms,
+        },
+      ],
+    });
+    const loop = startStreamPump(id, controller, setState, getState);
+    await drainAsync();
+
+    seedPendingInputs(id, [queued]);
+    seedSessionItems(id, [
+      ...old,
+      {
+        id: "annotation_refused",
+        type: "error",
+        response_id: "resp_annotation",
+        status: "completed",
+        created_at: 1710000001,
+        source: "execution",
+        code: "native_input_lease_expired",
+        message: "The message was not delivered.",
+      },
+    ]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(useChatStore.getState().pendingUserMessages).toEqual([keep]);
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
+    await drainAsync(2);
+    await loop;
+  });
+
   it.each([
     { path: "ordinary backfill", gapLength: 5 },
     { path: "the fresh-window fallback", gapLength: 100 },
