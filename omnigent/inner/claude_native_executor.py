@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.harnesses.claude_native.bridge import (
+    _SCROLLED_DRAFT_SURFACE,
     BRIDGE_DIR_ENV_VAR,
     CLAUDE_FRAMEWORK_CONTEXT_FILE,
     MANAGED_SANDBOX_SIGN_IN_REMEDY,
@@ -31,6 +32,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeUserPromptPending,
     KeepWarmBtwResult,
     TmuxSessionNotAdvertised,
+    _tmux_input_identity,
     cancellable_injection,
     claude_pane_ready,
     has_pending_user_prompt,
@@ -493,6 +495,10 @@ class ClaudeNativeExecutor(Executor):
             surface,
             extra={"session_id": self._request_session_id},
         )
+        if surface == _SCROLLED_DRAFT_SURFACE:
+            return await self._poll_until(
+                deadline, lambda: claude_pane_ready(self._bridge_dir, require_empty=True)
+            )
         return await self._poll_until(deadline, lambda: claude_pane_ready(self._bridge_dir))
 
     async def _wait_for_answer(self, deadline: float) -> bool:
@@ -749,7 +755,10 @@ class ClaudeNativeExecutor(Executor):
     async def _inject(self, operation: Callable[[], None]) -> None:
         """Drain cancelled delivery workers before releasing the pane's injection lock."""
         cancelled = threading.Event()
-        with cancellable_injection(cancelled):
+        paste_started = threading.Event()
+        active_session_id = read_active_session_id(self._bridge_dir)
+        tmux_identity = _tmux_input_identity(self._bridge_dir)
+        with cancellable_injection(cancelled, paste_started=paste_started):
             worker = asyncio.create_task(asyncio.to_thread(operation))
         try:
             await asyncio.shield(worker)
@@ -760,7 +769,16 @@ class ClaudeNativeExecutor(Executor):
                     await asyncio.shield(worker)
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 worker.result()
-            self._reap_failed_turn()
+            if paste_started.is_set():
+                raise ClaudeDeliveryUnconfirmed(
+                    "Claude delivery was interrupted after the paste started. "
+                    "The message may already be queued or running."
+                ) from None
+            if read_active_session_id(self._bridge_dir) == active_session_id and (
+                tmux_identity.get("socket_path") is None
+                or _tmux_input_identity(self._bridge_dir) == tmux_identity
+            ):
+                self._reap_failed_turn()
             raise
 
     def _reap_failed_turn(self, *, expected_close: bool = False) -> str | None:

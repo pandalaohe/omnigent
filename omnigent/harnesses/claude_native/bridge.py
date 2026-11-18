@@ -148,6 +148,9 @@ _logger = logging.getLogger(__name__)
 _INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
     "claude_native_injection_cancel_event", default=None
 )
+_INJECTION_PASTE_STARTED: ContextVar[threading.Event | None] = ContextVar(
+    "claude_native_injection_paste_started", default=None
+)
 _INJECTION_LOCKS_GUARD = threading.Lock()
 _INJECTION_LOCKS: dict[str, threading.Lock] = {}
 _INJECTION_LOCK_POLL_INTERVAL_S = 0.1
@@ -496,6 +499,7 @@ _PASTE_COMMIT_TIMEOUT_S = 5.0
 # at 20s was recorded as a 10s failure). The slow-accept log below now
 # records real recovery times, so tune this from that distribution.
 _SUBMIT_VERIFY_TIMEOUT_S = 20.0
+_SUBMIT_STARTUP_TIMEOUT_S = 180.0
 # How long the draft may verifiably sit unaccepted before a warning is
 # logged that the TUI is slow (delivery keeps retrying). Also the point
 # past which a recovery is logged with its elapsed time — the signal
@@ -886,12 +890,16 @@ class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
 
 
 @contextlib.contextmanager
-def cancellable_injection(cancel_event: threading.Event) -> Iterator[None]:
+def cancellable_injection(
+    cancel_event: threading.Event, *, paste_started: threading.Event | None = None
+) -> Iterator[None]:
     """Bind a cancellation flag inherited by this delivery's ``asyncio.to_thread`` worker."""
     token = _INJECTION_CANCEL_EVENT.set(cancel_event)
+    paste_token = _INJECTION_PASTE_STARTED.set(paste_started)
     try:
         yield
     finally:
+        _INJECTION_PASTE_STARTED.reset(paste_token)
         _INJECTION_CANCEL_EVENT.reset(token)
 
 
@@ -5414,7 +5422,41 @@ def write_tmux_target(
     }
     if pid is not None:
         payload["pid"] = pid
-    _write_json_file(bridge_dir / _TMUX_FILE, payload)
+    with _bridge_metadata_write_lock(bridge_dir):
+        _write_json_file(bridge_dir / _TMUX_FILE, payload)
+
+
+@dataclass
+class _MessagePane:
+    bridge_dir: Path
+    socket_path: str
+    tmux_target: str
+    active_session_id: str | None
+    native_session_id: str | None
+    wrote_paste: bool = False
+
+    def check_owner(self) -> None:
+        current = read_claude_session_id(self.bridge_dir)
+        if (
+            _tmux_input_identity(self.bridge_dir)
+            != {"socket_path": self.socket_path, "tmux_target": self.tmux_target}
+            or read_active_session_id(self.bridge_dir) != self.active_session_id
+            or (self.native_session_id is not None and current != self.native_session_id)
+        ):
+            if self.wrote_paste:
+                delivery_diagnostics.record_details(verification="owner_changed")
+                raise ClaudeDeliveryUnconfirmed(
+                    "Claude's session changed after the paste started. "
+                    "Inspect the terminal before retrying."
+                )
+            raise ClaudeMessageNotAccepted(
+                "Claude's session changed before the message was typed."
+            )
+        # A cold pane can report its native ID for the first time during delivery.
+        self.native_session_id = current
+
+
+_MESSAGE_PANE: ContextVar[_MessagePane | None] = ContextVar("claude_message_pane", default=None)
 
 
 @delivery_diagnostics.trace_delivery(
@@ -5492,7 +5534,31 @@ def inject_user_message(
         prompt-history search after the reclaim; nothing was typed.
     """
     delivery_diagnostics.set_stage("waiting_for_tmux")
+    active_session_id = read_active_session_id(bridge_dir)
+    requested_session_id = os.environ.get(REQUEST_SESSION_ID_ENV_VAR, "").strip()
+    if requested_session_id and active_session_id and requested_session_id != active_session_id:
+        raise ClaudeMessageNotAccepted("Claude's session changed before the message was typed.")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    owner = _MessagePane(
+        bridge_dir,
+        info["socket_path"],
+        info["tmux_target"],
+        active_session_id,
+        read_claude_session_id(bridge_dir),
+    )
+    token = _MESSAGE_PANE.set(owner)
+    try:
+        _inject_user_message_into_pane(bridge_dir, content=content, timeout_s=timeout_s, info=info)
+    except (ClaudePromptTimeout, ClaudeTerminalExited):
+        owner.check_owner()
+        raise
+    finally:
+        _MESSAGE_PANE.reset(token)
+
+
+def _inject_user_message_into_pane(
+    bridge_dir: Path, *, content: str, timeout_s: float, info: dict[str, str]
+) -> None:
     delivery_diagnostics.set_stage("restoring_input")
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
@@ -5644,6 +5710,9 @@ def _paste_and_submit(
 
     def owns_paste() -> bool:
         # The same terminal and native conversation still hold the original paste.
+        owner = _MESSAGE_PANE.get()
+        if owner is not None:
+            owner.check_owner()
         native_session_id = read_claude_session_id(bridge_dir)
         return _tmux_input_identity(bridge_dir) == paste_tmux and (
             paste_native_session_id is None or native_session_id == paste_native_session_id
@@ -5652,8 +5721,7 @@ def _paste_and_submit(
     draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
         bridge_dir, socket_path, tmux_target, text=text, needle=needle, tail_needle=tail_needle
     )
-    waited_for_paste = bool(needle) and not draft_seen and not has_pending_user_prompt(bridge_dir)
-    if waited_for_paste:
+    if needle and not draft_seen:
         delivery_diagnostics.record_draft(
             pane=pane,
             needle=needle,
@@ -5663,6 +5731,11 @@ def _paste_and_submit(
             polls=polls,
             empty_captures=empty_captures,
         )
+        delivery_diagnostics.set_stage("checking_pending_prompt")
+        if has_pending_user_prompt(bridge_dir):
+            raise ClaudeUserPromptPending(
+                "Claude is waiting for an explicit answer; message not sent."
+            )
         observed = _wait_for_unobserved_paste(
             socket_path,
             tmux_target,
@@ -5757,6 +5830,7 @@ def _paste_and_submit(
             submitted_text=text,
             retry_enter=not clipped_draft,
             require_evidence=True,
+            check_owner=owns_paste,
         )
     except ClaudeUserPromptPending as exc:
         # The Enter already went out, so the prompt may belong to this message's own turn.
@@ -5766,6 +5840,10 @@ def _paste_and_submit(
         ) from exc
     if accepted:
         with _bridge_metadata_write_lock(bridge_dir):
+            if not owns_paste():
+                raise ClaudeDeliveryUnconfirmed(
+                    "Claude's session changed before delivery was confirmed."
+                )
             state = _read_json_file(bridge_dir / _STATE_FILE)
             state["accepted_input_tmux"] = tmux_info
             _write_json_file(bridge_dir / _STATE_FILE, state)
@@ -5889,9 +5967,10 @@ def _wait_for_unobserved_paste(
 
 def _submit_left_composer(pane: str) -> bool:
     """Positive evidence after Enter: a mounted composer, or a dialog of the started turn."""
+    if _occupied_tall_draft(pane):
+        return False
     return (
         (_composer_row(pane) is not None and not _history_search_footer_shown(pane))
-        or bool(_unframed_prompt_row(pane))
         or _terminal_dialog_headline(pane) is not None
         or _user_prompt_visible(pane)
     )
@@ -5938,16 +6017,24 @@ def _paste_and_await_draft(
                 _paste_payload_bytes(text if current_guard() is not None else text + "\n")
             )
         _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
-        _run_tmux(
-            socket_path,
-            "paste-buffer",
-            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
-            "-d",  # drop the buffer after pasting (no stale copies server-side)
-            "-b",
-            "omnigent-paste",
-            "-t",
-            tmux_target,
-        )
+        try:
+            protected = _require_protected_draft_clear(bridge_dir, socket_path, tmux_target)
+            _run_tmux(
+                socket_path,
+                "paste-buffer",
+                "-p",  # bracketed-paste markers — the TUI keeps newlines as data
+                "-d",  # drop the buffer after pasting (no stale copies server-side)
+                "-b",
+                "omnigent-paste",
+                "-t",
+                tmux_target,
+            )
+        except (ClaudeInputBoxOccupied, ClaudeMessageNotAccepted, ClaudeDeliveryUnconfirmed):
+            with contextlib.suppress(RuntimeError, OSError):
+                _run_tmux(socket_path, "delete-buffer", "-b", "omnigent-paste")
+            raise
+        if protected:
+            _set_protected_draft(bridge_dir, socket_path, tmux_target, protect=False)
         delivery_diagnostics.record_details(paste_sent=True)
     finally:
         if paste_path is not None:
@@ -5990,6 +6077,7 @@ def _verify_submit_accepted(
     before_retry: Callable[[], None] | None = None,
     retry_enter: bool = True,
     require_evidence: bool = False,
+    check_owner: Callable[[], bool] | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -6003,8 +6091,7 @@ def _verify_submit_accepted(
     Enter retries back off exponentially (each retry into a stalled TUI
     queues in the pty and replays on recovery, so fewer is safer).
     Later submissions fail after :data:`_SUBMIT_VERIFY_TIMEOUT_S`. The first
-    submission waits for actual acceptance while the terminal remains alive;
-    a rendered composer alone does not prove startup hooks have finished.
+    submission has a longer startup budget while the terminal remains alive.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
@@ -6020,6 +6107,7 @@ def _verify_submit_accepted(
     :param require_evidence: A pane merely lacking the draft (a repaint frame) proves
         nothing: acceptance then needs a mounted composer, a dialog of the started
         turn or a fresh native record of *submitted_text*.
+    :param check_owner: Recheck that the message still belongs to the observed pane.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     :raises ClaudeDeliveryUnconfirmed: With *require_evidence*, the draft left
@@ -6038,10 +6126,19 @@ def _verify_submit_accepted(
     pane = ""
     next_liveness_probe = start + _CLAUDE_LIVENESS_POLL_INTERVAL_S
     absent_since: float | None = None
-    while wait_for_startup or time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
+    deadline = start + (
+        _SUBMIT_STARTUP_TIMEOUT_S if wait_for_startup else _SUBMIT_VERIFY_TIMEOUT_S
+    )
+    draft_present = False
+    while time.monotonic() < deadline:
         _check_injection_cancelled()
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
+        if check_owner is not None and not check_owner():
+            raise ClaudeDeliveryUnconfirmed(
+                "Claude's session changed before delivery was confirmed."
+            )
+        draft_present = _draft_in_input_box(pane, needle, tail_needle=tail_needle)
         polls += 1
         delivery_diagnostics.record_submit_composer(pane=pane, box_reader=_composer_box)
         if (
@@ -6051,7 +6148,7 @@ def _verify_submit_accepted(
             and _fresh_matching_hook_block(bridge_dir, submit_boundary, submitted_text)
         ):
             delivery_diagnostics.record_verification(
-                draft_still_present=_draft_in_input_box(pane, needle, tail_needle=tail_needle),
+                draft_still_present=draft_present,
                 pane=pane,
                 needle=needle,
                 prompt_glyph=_CLAUDE_PROMPT_GLYPH,
@@ -6064,25 +6161,16 @@ def _verify_submit_accepted(
                 "A hook blocked a matching prompt in Claude's terminal. Web message delivery "
                 "could not be confirmed; inspect the terminal before retrying."
             )
-        # An empty capture can be a repaint or failed tmux read. It proves
-        # neither that the draft cleared nor that another Enter is safe.
-        if not pane.strip():
-            continue
         receipt = (
             require_evidence
             and submit_boundary is not None
             and submitted_text is not None
             and _fresh_native_receipt(submit_boundary, submitted_text) is True
         )
-        draft_left = receipt or not _draft_in_input_box(pane, needle, tail_needle=tail_needle)
-        if draft_left and require_evidence and not receipt and not _submit_left_composer(pane):
-            # A repaint frame lacks the draft and the composer alike: keep watching.
-            absent_since = time.monotonic() if absent_since is None else absent_since
-            if time.monotonic() - absent_since >= _SUBMIT_VERIFY_TIMEOUT_S:
-                break
-            continue
-        absent_since = None
-        if draft_left:
+        if receipt or (
+            not draft_present
+            and (_submit_left_composer(pane) if require_evidence else bool(pane.strip()))
+        ):
             delivery_diagnostics.record_verification(
                 draft_still_present=False,
                 pane=pane,
@@ -6100,15 +6188,22 @@ def _verify_submit_accepted(
                 )
             return True
         now = time.monotonic()
-        if wait_for_startup and now >= next_liveness_probe:
+        if (wait_for_startup or require_evidence) and now >= next_liveness_probe:
             if _claude_pane_state(socket_path, tmux_target).alive is False:
-                if _draft_in_input_box(pane, needle):
+                if draft_present:
                     raise ClaudeMessageNotAccepted(
                         "Claude Code exited with the submitted draft still in the input box. "
                         "The message was not delivered."
                     )
-                raise RuntimeError("Claude Code exited before submission could be confirmed.")
+                break
             next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
+        if not draft_present:
+            # Capture failure and repaint both lack evidence, even during startup.
+            absent_since = now if absent_since is None else absent_since
+            if now - absent_since >= _SUBMIT_VERIFY_TIMEOUT_S:
+                break
+            continue
+        absent_since = None
         if not warned and now - start >= _SUBMIT_SLOW_ACCEPT_WARN_S:
             warned = True
             _logger.warning(
@@ -6122,6 +6217,7 @@ def _verify_submit_accepted(
             )
         if (
             retry_enter
+            and not _occupied_tall_draft(pane)
             and _draft_in_input_box(pane, needle)
             and now - last_enter >= retry_interval
         ):
@@ -6134,7 +6230,7 @@ def _verify_submit_accepted(
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
     delivery_diagnostics.record_verification(
-        draft_still_present=_draft_in_input_box(pane, needle, tail_needle=tail_needle),
+        draft_still_present=draft_present,
         pane=pane,
         needle=needle,
         prompt_glyph=_CLAUDE_PROMPT_GLYPH,
@@ -6142,17 +6238,18 @@ def _verify_submit_accepted(
         retries=retries,
         polls=polls,
     )
+    if require_evidence and not draft_present:
+        if pane.strip():
+            delivery_diagnostics.record_details(verification="unconfirmed_submit")
+        raise ClaudeDeliveryUnconfirmed(
+            "Delivery of the pasted message could not be confirmed. "
+            "It may already be queued or running. Inspect the terminal before retrying."
+        )
     if not pane.strip():
         raise RuntimeError(
             f"Claude Code {what} delivery could not be confirmed within "
             f"{_SUBMIT_VERIFY_TIMEOUT_S}s because terminal capture is unavailable. "
             "Inspect the terminal before retrying; the message may already have been delivered."
-        )
-    if require_evidence and not _draft_in_input_box(pane, needle, tail_needle=tail_needle):
-        delivery_diagnostics.record_details(verification="unconfirmed_submit")
-        raise ClaudeDeliveryUnconfirmed(
-            "Claude did not confirm this pasted message. It may already be queued or running. "
-            "Inspect the terminal before retrying."
         )
     return False
 
@@ -6500,7 +6597,10 @@ def inject_slash_command(
     check_idle()
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     try:
+        protected = _require_protected_draft_clear(bridge_dir, socket_path, tmux_target)
         _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
+        if protected:
+            _set_protected_draft(bridge_dir, socket_path, tmux_target, protect=False)
         # Same delivery hazards as inject_user_message: a coalesced or dropped
         # Enter leaves the command drafted while the persisted session value
         # claims it applied. Wait for the command to render, submit, verify it
@@ -7435,13 +7535,33 @@ def _run_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) 
         args = ("copy-mode", "-q", "-t", target, ";", *args)
     cmd = ["tmux", "-S", socket_path, *args]
     try:
-        proc = subprocess.run(
-            cmd,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        owner = _MESSAGE_PANE.get() if operation in ("send-keys", "paste-buffer") else None
+        with (
+            _cancellable_injection_lock(native_bridge_common._bridge_dir_lock(owner.bridge_dir))
+            if owner is not None
+            else contextlib.nullcontext()
+        ):
+            _check_injection_cancelled()
+            if owner is not None:
+                owner.check_owner()
+            if operation == "paste-buffer":
+                if owner is not None:
+                    _require_protected_draft_clear(
+                        owner.bridge_dir, socket_path, owner.tmux_target
+                    )
+                # Once tmux is invoked the outcome can be ambiguous, including on timeout.
+                paste_started = _INJECTION_PASTE_STARTED.get()
+                if paste_started is not None:
+                    paste_started.set()
+                if owner is not None:
+                    owner.wrote_paste = True
+            proc = subprocess.run(
+                cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
     except subprocess.TimeoutExpired as exc:
         delivery_diagnostics.record_tmux_failure(operation, timeout_s=timeout)
         raise RuntimeError(f"tmux command timed out after {timeout}s") from exc
@@ -7838,7 +7958,7 @@ def _request_claude_repaint(
     return signalled
 
 
-def claude_pane_ready(bridge_dir: Path) -> bool:
+def claude_pane_ready(bridge_dir: Path, *, require_empty: bool = False) -> bool:
     """
     Report whether the Claude pane is showing a usable input box right now.
 
@@ -7854,6 +7974,7 @@ def claude_pane_ready(bridge_dir: Path) -> bool:
     Never raises: an unadvertised pane or a torn capture is "not ready yet".
 
     :param bridge_dir: Bridge directory path.
+    :param require_empty: Require a complete, empty chat composer after a clipped draft.
     :returns: ``True`` when the pane renders the chat input box.
     """
     payload = _read_json_file(bridge_dir / _TMUX_FILE)
@@ -7864,6 +7985,8 @@ def claude_pane_ready(bridge_dir: Path) -> bool:
     if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
         return False
     pane = _capture_pane(socket_path, tmux_target)
+    if require_empty:
+        return _chat_composer_empty(pane)
     if _MODEL_PICKER_OPEN_HINT in pane:
         return False
     if any(text in pane for text in _CONFIRM_DIALOG_HINTS):
@@ -7909,11 +8032,17 @@ def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
 
 def _user_prompt_visible(pane: str) -> bool:
     """Recognize a native decision dialog, excluding text above a mounted composer."""
-    if not pane.strip() or _composer_row(pane) is not None:
+    clipped = _occupied_tall_draft(pane)
+    if not pane.strip() or (not clipped and _composer_row(pane) is not None):
         return False
     lines = [line for line in pane.splitlines() if line.strip()]
     rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
-    region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
+    if clipped:
+        # The rule above the mode footer is the closing edge. Everything above
+        # it may be draft text, including sentences that look like permissions.
+        region = "\n".join(lines[_composer_frame_rule_indices(lines)[-1] + 1 :])
+    else:
+        region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
     # Narrow panes wrap the decision footer across captured lines.
     footer = " ".join(region.split())
     # A short pane can clip the plan decision's footer entirely.
@@ -8256,7 +8385,11 @@ def _restore_occupied_input(
             nothing_typed=True,
         )
         if _occupied_tall_draft(pane):
-            return None  # Let the readiness gate confirm the draft without sending keys.
+            if bridge_dir is not None:
+                _set_protected_draft(bridge_dir, socket_path, tmux_target, protect=True)
+            return _SCROLLED_DRAFT_SURFACE
+        if bridge_dir is not None:
+            _require_protected_draft_clear(bridge_dir, socket_path, tmux_target, pane=pane)
         btw_visible = _btw_overlay_present(pane)
         if btw_visible and _keep_warm_btw_overlay_present(pane):
             if bridge_dir is None or not _dismiss_keep_warm_btw_overlay(
@@ -8559,6 +8692,48 @@ def _composer_reads_clear(box: _ComposerBox | None) -> bool:
     return box is not None and box.framed and not any(row.strip() for row in box.rows[1:])
 
 
+def _chat_composer_empty(pane: str) -> bool:
+    box = _composer_box(pane)
+    return (
+        box is not None
+        and _composer_reads_clear(box)
+        and box.rows[0].strip() == _CLAUDE_PROMPT_GLYPH
+        and not _history_search_footer_shown(pane)
+    )
+
+
+def _set_protected_draft(
+    bridge_dir: Path, socket_path: str, tmux_target: str, *, protect: bool
+) -> None:
+    identity = {"socket_path": socket_path, "tmux_target": tmux_target}
+    with _bridge_metadata_write_lock(bridge_dir):
+        if _tmux_input_identity(bridge_dir) != identity:
+            return
+        state = _read_json_file(bridge_dir / _STATE_FILE)
+        if protect:
+            state["protected_draft_tmux"] = identity
+        else:
+            state.pop("protected_draft_tmux", None)
+        _write_json_file(bridge_dir / _STATE_FILE, state)
+
+
+def _require_protected_draft_clear(
+    bridge_dir: Path, socket_path: str, tmux_target: str, *, pane: str | None = None
+) -> bool:
+    """Fence a previously clipped draft until the same pane shows an empty chat composer."""
+    identity = {"socket_path": socket_path, "tmux_target": tmux_target}
+    if _read_json_file(bridge_dir / _STATE_FILE).get("protected_draft_tmux") != identity:
+        return False
+    if pane is None:
+        pane = _capture_pane(socket_path, tmux_target)
+    if not _chat_composer_empty(pane):
+        raise ClaudeInputBoxOccupied(
+            "Claude Code's input box still holds a draft. Clear it in the terminal to continue.",
+            surface=_SCROLLED_DRAFT_SURFACE,
+        )
+    return True
+
+
 def _first_non_blank(lines: list[str], start: int, end: int) -> int:
     """Return the index of the first non-blank line in ``lines[start:end]``, else *end*."""
     return next((idx for idx in range(start, end) if lines[idx].strip()), end)
@@ -8631,6 +8806,8 @@ def _clear_composer(socket_path: str, tmux_target: str, *, bridge_dir: Path) -> 
     """
     # Space returns focus from the footer to the input box. The clear also
     # removes the space when the input box already held focus.
+    if _require_protected_draft_clear(bridge_dir, socket_path, tmux_target):
+        return
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
     repainted = False
     round_no = 0
@@ -8950,23 +9127,8 @@ def _clipped_draft_matches(pane: str, tail_needle: str) -> bool:
 
 
 def _occupied_tall_draft(pane: str) -> bool:
-    """A mounted composer holding a clipped draft of any text; a visible glyph may be a menu."""
-    return _clipped_draft_rows(pane) is not None and not any(
-        line.lstrip().startswith(_CLAUDE_PROMPT_GLYPH) for line in pane.splitlines()
-    )
-
-
-def _unframed_prompt_row(pane: str) -> str:
-    """Allow a prompt clipped to the top row, excluding menu selections."""
-    first = pane.partition("\n")[0].strip()
-    if (
-        first.startswith(_CLAUDE_PROMPT_GLYPH)
-        and not re.match(r"❯\s+\d+[.)]\s", first)
-        and not any(_is_box_rule(line) for line in pane.splitlines())
-        and not _user_prompt_visible(pane)
-    ):
-        return first
-    return ""
+    """A mounted composer holding a clipped draft irrespective of earlier transcript rows."""
+    return _clipped_draft_rows(pane) is not None
 
 
 def _draft_in_input_box(pane: str, needle: str, *, tail_needle: str = "") -> bool:
@@ -8997,6 +9159,8 @@ def _draft_in_input_box(pane: str, needle: str, *, tail_needle: str = "") -> boo
     """
     if _history_search_footer_shown(pane):
         return False
+    if _occupied_tall_draft(pane):
+        return _clipped_draft_matches(pane, tail_needle)
     rows = _composer_rows(pane)
     first_row = rows[0].strip() if rows else ""
     if rows and _CLAUDE_PROMPT_GLYPH in rows[0]:
@@ -9005,9 +9169,7 @@ def _draft_in_input_box(pane: str, needle: str, *, tail_needle: str = "") -> boo
         tail = "\n".join([first_row[len(_SHELL_MODE_GLYPH) :], *rows[1:]])
         needle = needle.removeprefix(_SHELL_MODE_GLYPH)
     else:
-        if _clipped_draft_matches(pane, tail_needle):
-            return True
-        tail = _unframed_prompt_row(pane).removeprefix(_CLAUDE_PROMPT_GLYPH)
+        return False
     if _PASTED_PLACEHOLDER_PREFIX in tail:
         return True
     # The hint is not a draft, but a short needle such as "to" or "a" matches its words.
@@ -9225,11 +9387,17 @@ def _wait_for_claude_prompt_ready(
             last_nonempty = pane
         else:
             empty_polls += 1
-        if _claude_prompt_rendered(pane):
+        tall_draft = _occupied_tall_draft(pane)
+        if _claude_prompt_rendered(pane) and not tall_draft:
+            if waited_on_tall_draft and bridge_dir is not None:
+                _set_protected_draft(bridge_dir, socket_path, tmux_target, protect=True)
+            if bridge_dir is not None:
+                _require_protected_draft_clear(bridge_dir, socket_path, tmux_target, pane=pane)
             return
         # Confirm a draft across two captures, before any overlay dismissal.
-        tall_draft = _occupied_tall_draft(pane)
         if tall_draft and waited_on_tall_draft:
+            if bridge_dir is not None:
+                _set_protected_draft(bridge_dir, socket_path, tmux_target, protect=True)
             raise ClaudeInputBoxOccupied(
                 f"Claude Code's input box is occupied by {_SCROLLED_DRAFT_SURFACE}, so the "
                 "message was not delivered. Open the terminal, dismiss it, then resend your "

@@ -2097,7 +2097,9 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    pane = "❯ "
+    empty_composer = "──────\n❯ \n──────\n"
+    draft_composer = "──────\n❯ review this function\n──────\n"
+    pane = empty_composer
     enters = 0
     prompt_pending = False
     killed: list[Path] = []
@@ -2105,12 +2107,10 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     def run_tmux(socket_path: str, *args: str) -> None:
         nonlocal pane, enters, prompt_pending
         del socket_path
-        if args[-1] == "Space":
-            pane = "──────\n❯ \n──────\n"
-        elif args[0] == "send-keys" and "-l" in args:
-            pane = "❯ "
+        if args[-1] == "Space" or (args[0] == "send-keys" and "-l" in args):
+            pane = empty_composer
         elif args[0] == "paste-buffer":
-            pane = "❯ review this function"
+            pane = draft_composer
             prompt_pending = not submitted
         elif args[-1] == "Enter":
             # The draft stays visible, so submit verification looks to retry.
@@ -2160,7 +2160,7 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
 
     if refusal == "draft_persisted":
         assert enters >= 1
-        assert pane == "❯ review this function"
+        assert pane == draft_composer
     else:
         assert enters == int(submitted)
     assert killed == []
@@ -2170,11 +2170,14 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     expected_detail = {
         "pending_prompt": "waiting for an explicit answer",
         "draft_persisted": "draft is still in the input box",
-        "capture_lost": "delivery could not be confirmed",
+        "capture_lost": "Delivery of the pasted message could not be confirmed.",
         "missing_target": "tmux target is not advertised",
     }[refusal]
     assert expected_detail in error.message
     assert error.undelivered is (refusal in {"draft_persisted", "missing_target"} or not submitted)
+    if refusal == "capture_lost":
+        assert error.code == "claude_delivery_unconfirmed"
+        assert error.preserve_session
 
 
 @pytest.mark.asyncio
@@ -2287,6 +2290,56 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
     assert (records[0].levelno == logging.ERROR) is expect_error_level
     # A traceback only earns its place when something actually broke.
     assert bool(records[0].exc_info) is expect_error_level
+
+
+@pytest.mark.asyncio
+async def test_delivery_watchdog_after_paste_reports_unconfirmed_and_preserves_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_PASTE_SETTLE_S", 0.0)
+    claude_bridge.write_tmux_target(
+        bridge_dir, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="claude:0.0"
+    )
+    visible = "────────────────\n❯\n────────────────\n"
+    loop = asyncio.get_running_loop()
+    reaped: list[Path] = []
+    submits = 0
+    watchdog = asyncio.timeout(3)
+
+    def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        nonlocal visible, submits
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=visible, stderr="")
+        if "paste-buffer" in cmd:
+            visible = "────────────────\n❯ hello from the web\n────────────────\n"
+        if cmd[-1] == "Enter":
+            submits += 1
+            visible = ""
+            loop.call_soon_threadsafe(watchdog.reschedule, loop.time())
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", run)
+    monkeypatch.setattr(
+        claude_native_executor, "kill_session", lambda directory, **_kw: reaped.append(directory)
+    )
+    async with watchdog:
+        try:
+            events = [
+                event
+                async for event in ClaudeNativeExecutor(bridge_dir).run_turn(
+                    [{"role": "user", "content": "hello from the web"}], [], ""
+                )
+            ]
+        finally:
+            assert reaped == [], "The watchdog reaped the pane after typing began."
+
+    assert submits == 1
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].code == "claude_delivery_unconfirmed"
+    assert events[0].preserve_session and not events[0].undelivered
 
 
 @pytest.mark.asyncio

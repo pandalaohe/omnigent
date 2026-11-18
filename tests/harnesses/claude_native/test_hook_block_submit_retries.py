@@ -60,6 +60,7 @@ def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
 ) -> None:
     native_session_id = "11111111-2222-4333-8444-555555555555"
     content = "BLOCKME identical web or Terminal text"
+    bridge.write_tmux_target(tmp_path, socket_path=Path("/unused/socket"), tmux_target="main")
     transcript = tmp_path / "native.jsonl"
     transcript.write_text('{"type":"system","content":"prefix"}\n')
     bridge.record_hook_event(
@@ -100,20 +101,25 @@ def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
     elapsed = 0.0
     pane = _composer_pane()
     enters = 0
+    pastes = 0
+    rotated = False
 
     def sleep(seconds: float) -> None:
         nonlocal elapsed
         elapsed += seconds
 
-    def run_tmux(_socket: str, *args: str) -> None:
-        nonlocal pane, enters
-        if args[0] == "paste-buffer":
+    def run_tmux(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        nonlocal pane, enters, pastes
+        stdout = "0" if "list-panes" in cmd else ""
+        result = SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        if "paste-buffer" in cmd:
+            pastes += 1
             pane = _composer_pane(content)
-        if args[-1] != "Enter":
-            return
+        if cmd[-1] != "Enter":
+            return result
         enters += 1
         if scenario == "stale":
-            return
+            return result
         if enters == 1:
             if scenario == "replaced-file":
                 replacement = tmp_path / "replacement"
@@ -121,17 +127,24 @@ def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
                 replacement.replace(transcript)
             elif scenario == "rewritten-prefix":
                 transcript.write_bytes(transcript.read_bytes().replace(b"prefix", b"edited"))
-            elif scenario == "owner-rotation":
-                bridge.record_hook_event(
-                    tmp_path,
-                    {
-                        "hook_event_name": "SessionStart",
-                        "session_id": "rotated-session",
-                        "transcript_path": str(transcript),
-                    },
-                )
         with transcript.open("a") as handle:
             handle.write(serialized)
+        return result
+
+    def capture(*_args: object) -> str:
+        nonlocal rotated
+        if scenario == "owner-rotation" and enters and not rotated:
+            # The SessionStart arrives after the tmux write released its metadata lock.
+            rotated = True
+            bridge.record_hook_event(
+                tmp_path,
+                {
+                    "hook_event_name": "SessionStart",
+                    "session_id": "rotated-session",
+                    "transcript_path": str(transcript),
+                },
+            )
+        return pane
 
     monkeypatch.setattr(
         bridge,
@@ -139,15 +152,10 @@ def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
         SimpleNamespace(monotonic=lambda: elapsed, sleep=sleep, time=lambda: elapsed),
     )
     monkeypatch.setattr(delivery_diagnostics, "time", bridge.time)
-    monkeypatch.setattr(bridge, "_run_tmux", run_tmux)
-    monkeypatch.setattr(bridge, "_capture_pane", lambda *_args: pane)
+    monkeypatch.setattr("subprocess.run", run_tmux)
+    monkeypatch.setattr(bridge, "_capture_pane", capture)
     monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", lambda *_args, **_kw: None)
     monkeypatch.setattr(bridge, "_restore_occupied_input", lambda *_args, **_kw: None)
-    monkeypatch.setattr(
-        bridge,
-        "_wait_for_tmux_info",
-        lambda *_args, **_kw: {"socket_path": "/unused/socket", "tmux_target": "main"},
-    )
     monkeypatch.setattr(bridge, "_PASTE_SETTLE_S", 0)
     monkeypatch.setattr(bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 20)
     state = bridge._read_json_file(tmp_path / bridge._STATE_FILE)
@@ -160,12 +168,19 @@ def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
     ):
         bridge.inject_user_message(tmp_path, content=content)
 
-    assert enters == (1 if stops else 5), str(caught.value)
+    assert pastes == 1
+    assert enters == (1 if stops or scenario == "owner-rotation" else 5), str(caught.value)
     if stops:
         assert type(caught.value).__name__ == "ClaudeSubmitBlockedUnconfirmed"
         assert "could not be confirmed" in str(caught.value)
+        verification = "hook_block_unowned"
+    elif scenario == "owner-rotation":
+        assert type(caught.value) is bridge.ClaudeDeliveryUnconfirmed
+        assert "session changed after the paste" in str(caught.value)
+        verification = "owner_changed"
     else:
         assert isinstance(caught.value, bridge.ClaudeMessageNotAccepted)
+        verification = "draft_still_present"
     records = [
         record
         for record in caplog.records
@@ -174,9 +189,7 @@ def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
     assert len(records) == 1
     assert records[0].attributes["outcome"] == "error"
     assert records[0].attributes["delivery_outcome"] == "unknown"
-    assert records[0].attributes["verification"] == (
-        "hook_block_unowned" if stops else "draft_still_present"
-    )
+    assert records[0].attributes["verification"] == verification
     assert content not in records[0].getMessage()
 
 

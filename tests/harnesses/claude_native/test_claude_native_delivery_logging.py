@@ -52,7 +52,9 @@ def test_delivery_diagnostics(
         secret = "/private-customer-command"
     content = "\n" + secret if scenario == "blank_line" else secret
     elapsed = 0.0
-    pane = "❯ "
+    rule = "──────"
+    empty_pane = f"{rule}\n❯ \n{rule}\n"
+    pane = empty_pane
     enters = 0
     pending_checks = 0
 
@@ -81,19 +83,19 @@ def test_delivery_diagnostics(
             getattr(record, "event_name", "").startswith("claude_native_")
             for record in caplog.records
         )
-        if args[-1] == "Space":
-            pane = "──────\n❯ \n──────\n"
-        elif args[0] == "send-keys" and "-l" in args:
-            pane = "❯ "
+        if args[-1] == "Space" or (args[0] == "send-keys" and "-l" in args):
+            pane = empty_pane
         if args[0] == "paste-buffer":
             if scenario == "transport_error":
                 raise RuntimeError(secret)
-            pane = "❯ " + content
+            pane = "❯ " + content if scenario == "blank_line" else f"{rule}\n❯ {content}\n{rule}\n"
         if args[-1] == "Enter":
             enters += 1
             if scenario in {"blank_line", "timeout"} or (scenario == "retry" and enters == 1):
                 return
-            pane = {"empty_capture": "", "missing_glyph": "terminal output"}.get(scenario, "❯ ")
+            pane = {"empty_capture": "", "missing_glyph": "terminal output"}.get(
+                scenario, empty_pane
+            )
 
     monkeypatch.setattr(
         bridge,
@@ -146,7 +148,10 @@ def test_delivery_diagnostics(
             expected = bridge.ClaudeInjectionCancelled if scenario == "cancelled" else RuntimeError
             if scenario.startswith("pending_"):
                 expected = bridge.ClaudeUserPromptPending
-            match = "capture is unavailable" if scenario == "empty_capture" else None
+            match = None
+            if scenario == "empty_capture":
+                expected = bridge.ClaudeDeliveryUnconfirmed
+                match = r"^Delivery of the pasted message could not be confirmed\."
             with pytest.raises(expected, match=match):
                 bridge.inject_user_message(tmp_path, content=content)
 
@@ -181,7 +186,7 @@ def test_delivery_diagnostics(
 
     if scenario == "observation_error":
         assert enters == 1
-        assert pane == "❯ "
+        assert pane == empty_pane
         assert attrs["submit_sent"] is True
     if scenario == "unknown_command":
         assert enters == 2
@@ -200,22 +205,24 @@ def test_delivery_diagnostics(
 
     if scenario in {"normal", "empty_capture"}:
         assert attrs["draft_queued_placeholder_visible"] is False
-        assert attrs["draft_prompt_row_framed"] is False
+        assert attrs["draft_prompt_row_framed"] is True
         assert attrs["draft_polls"] == 1
         assert attrs["draft_empty_captures"] == 0
         assert attrs["draft_wait_ms"] == 0
-        assert attrs["draft_pane_rows"] == 1
+        assert attrs["draft_pane_rows"] == 3
         assert attrs["draft_pane_max_columns"] == len("❯ " + secret)
         assert attrs["submit_polls"] == (6 if scenario == "empty_capture" else 1)
         assert attrs["submit_wait_ms"] == (60 if scenario == "empty_capture" else 10)
-        assert attrs["submit_pane_rows"] == (0 if scenario == "empty_capture" else 1)
-        assert attrs["submit_pane_max_columns"] == (0 if scenario == "empty_capture" else 2)
+        assert attrs["submit_pane_rows"] == (0 if scenario == "empty_capture" else 3)
+        assert attrs["submit_pane_max_columns"] == (
+            0 if scenario == "empty_capture" else len(rule)
+        )
         assert attrs["submit_capture_empty"] == (scenario == "empty_capture")
         assert attrs["stage_verifying_submit_ms"] == (60 if scenario == "empty_capture" else 10)
         assert attrs["elapsed_ms"] == (80 if scenario == "empty_capture" else 30)
         if scenario == "empty_capture":
             assert attrs["submit_sent"] is True
-            assert attrs["error_type"] == "RuntimeError"
+            assert attrs["error_type"] == "ClaudeDeliveryUnconfirmed"
             assert enters == 1
 
     if scenario == "empty_capture":

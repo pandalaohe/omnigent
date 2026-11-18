@@ -12,9 +12,11 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from omnigent.harnesses.claude_native import bridge
 from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     ClaudeComposerNotCleared,
@@ -93,8 +95,8 @@ class _Pane:
             return True
         return False
 
-    def claude_pane_ready(self, bridge_dir: Path) -> bool:
-        del bridge_dir
+    def claude_pane_ready(self, bridge_dir: Path, *, require_empty: bool = False) -> bool:
+        del bridge_dir, require_empty
         return not self._still_refusing()
 
     def _still_refusing(self) -> bool:
@@ -410,6 +412,65 @@ async def test_a_message_an_occupied_input_box_refused_waits_for_chat_input(
     assert pane.polls == 3, "The hold ends on the first poll that finds chat input."
     assert pane.repaints == 0, "Leaving the mode is the person's step; no repaint is asked."
     assert pane.kills == 0, "A held message must not reap the pane."
+
+
+@pytest.mark.asyncio
+async def test_held_tall_draft_survives_resize_until_user_clears_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge.write_tmux_target(
+        bridge_dir, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="claude:0.0"
+    )
+    rule = "─" * 44
+    clipped = f"  first visible line\n  old draft tail\n{rule}\n  ? for shortcuts\n"
+    empty = f"{rule}\n❯\n{rule}\n"
+    expanded = f"{rule}\n❯ the old draft\n{rule}\n"
+    visible = clipped
+    commands: list[str] = []
+    loop = asyncio.get_running_loop()
+    expanded_captured = asyncio.Event()
+    monkeypatch.setattr(claude_native_executor, "_MESSAGE_HOLD_POLL_S", 0.005)
+    monkeypatch.setattr(bridge, "_PASTE_SETTLE_S", 0.0)
+
+    def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        nonlocal visible
+        if "capture-pane" in cmd:
+            frame = visible
+            if frame == expanded:
+                loop.call_soon_threadsafe(expanded_captured.set)
+            return SimpleNamespace(returncode=0, stdout=frame, stderr="")
+        if "paste-buffer" in cmd:
+            commands.append("paste")
+            visible = f"{rule}\n❯ hello from the web\n{rule}\n"
+        if "send-keys" in cmd:
+            commands.append(cmd[-1])
+            if cmd[-1] == "Enter":
+                visible = empty
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", run)
+    executor = ClaudeNativeExecutor(bridge_dir)
+    task = asyncio.create_task(_run(tmp_path, executor))
+    try:
+        async with asyncio.timeout(3):
+            while not executor._holding_message:
+                await asyncio.sleep(0.005)
+            visible = expanded
+            await expanded_captured.wait()
+            # Give the hold several polls to detect an erroneous write while the draft is visible.
+            await asyncio.sleep(0.05)  # custom-lint: disable=sleep-then-assert -- No writes.
+            assert commands == []
+            assert executor._holding_message
+            visible = empty
+            assert await task == [TurnComplete(response=None)]
+        assert commands == ["paste", "Enter"]
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

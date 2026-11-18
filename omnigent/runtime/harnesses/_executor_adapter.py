@@ -1106,6 +1106,9 @@ class ExecutorAdapter(HarnessApp):
                 # Turn completion may cancel settlement after the executor accepted.
                 if accepted:
                     _emit_injection_consumed(ctx, injection)
+            watcher = asyncio.current_task()
+            if outcome == "executor_ambiguous" and watcher is not None and watcher.cancelling():
+                raise asyncio.CancelledError
             if not accepted:
                 _logger.warning(
                     "inner executor refused in-band injection "
