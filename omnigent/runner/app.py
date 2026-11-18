@@ -2687,6 +2687,40 @@ def create_runner_app(
                 _abandoned_input_executions[key] = claim
             raise
 
+    async def _claim_native_delivery(session_id: str, frame: InputExecutionClaimEvent) -> bool:
+        claim = frame.claim
+        deadline = claim.admission_deadline
+        while (
+            deadline is not None
+            and claim.delivery_attempt_id is not None
+            and time.time() < deadline
+            and claim.turn_id == _live_response_id.get(session_id)
+            and claim.input_id in _turn_pending_ids.get(session_id, ())
+        ):
+            try:
+                response = await server_client.post(
+                    f"/v1/sessions/{session_id}/pending-inputs/{claim.input_id}/claim",
+                    params={
+                        "claim_id": frame.claim_id,
+                        "attempt_id": claim.delivery_attempt_id,
+                    },
+                    timeout=min(5, max(0.001, deadline - time.time())),
+                )
+                if response.is_success:
+                    decision = response.json()
+                    return (
+                        isinstance(decision, dict)
+                        and decision.get("claimed") is True
+                        and time.time() < deadline
+                        and claim.turn_id == _live_response_id.get(session_id)
+                    )
+                if response.status_code < 500:
+                    return False
+            except (httpx.HTTPError, ValueError, RuntimeError, ConnectionError):
+                pass
+            await asyncio.sleep(min(1, max(0, deadline - time.time())))
+        return False
+
     async def _relay_input_execution_claim_impl(
         harness_client: httpx.AsyncClient, session_id: str, event: object
     ) -> None:
@@ -2695,6 +2729,22 @@ def create_runner_app(
         try:
             frame = InputExecutionClaimEvent.model_validate(event)
         except ValueError:
+            return
+        if frame.claim.boundary == "native_delivery":
+            claimed = await _claim_native_delivery(session_id, frame)
+            reply = await harness_client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "input_execution_result",
+                    "claim_id": frame.claim_id,
+                    "result": {
+                        "state": "accepted" if claimed else "refused",
+                        "reason": "native_delivery_claim",
+                    },
+                },
+                timeout=5,
+            )
+            reply.raise_for_status()
             return
         key = (session_id, frame.claim.input_id)
         expected = _input_execution_claims.get(key, ...)
@@ -5546,15 +5596,39 @@ def create_runner_app(
                 queue = asyncio.Queue()
                 _session_event_queues[session_id] = queue
             heartbeat_frame = b'data: {"type": "session.heartbeat"}\n\n'
+            loop = asyncio.get_running_loop()
+            # Replay queued terminal edges before reconciling ownership on a reconnect.
+            backlog = queue.qsize()
+            next_heartbeat = loop.time()
             yield heartbeat_frame
             while True:
+                if backlog == 0 and loop.time() >= next_heartbeat:
+                    active = sorted(_turn_pending_ids.get(session_id, ()))
+                    queued = [
+                        pending_id
+                        for body in _session_message_buffers.get(session_id, ())
+                        if isinstance(pending_id := body.get("pending_id"), str)
+                    ]
+                    frame = {
+                        "type": "session.heartbeat",
+                        "active_pending_ids": active,
+                        "queued_pending_ids": queued,
+                    }
+                    next_heartbeat = loop.time() + _SESSION_STREAM_HEARTBEAT_S
+                    yield f"data: {json.dumps(frame)}\n\n".encode()
                 try:
                     event = await asyncio.wait_for(
-                        queue.get(), timeout=_SESSION_STREAM_HEARTBEAT_S
+                        queue.get(),
+                        timeout=(
+                            _SESSION_STREAM_HEARTBEAT_S
+                            if backlog
+                            else max(0.001, next_heartbeat - loop.time())
+                        ),
                     )
                 except TimeoutError:
-                    yield heartbeat_frame
+                    backlog = 0
                     continue
+                backlog = max(0, backlog - 1)
                 if event is None:
                     break
                 # Drop inferred edges queued before a reconnect until the new server accepts them.
@@ -7928,14 +8002,23 @@ def create_runner_app(
         )
         return bridge_dir_for_bridge_id(bridge_id)
 
+    def _claude_input_blocked(bridge_dir: Path) -> bool:
+        from omnigent.harnesses.claude_native.bridge import (
+            claude_pane_has_accepted_input,
+            has_pending_user_prompt,
+            has_running_turn,
+        )
+
+        return has_running_turn(
+            bridge_dir, unknown_is_busy=claude_pane_has_accepted_input(bridge_dir)
+        ) or has_pending_user_prompt(bridge_dir)
+
     async def _pending_claude_prompt_bridge_dir(session_id: str) -> Path | None:
-        """Return the bridge whose question or approval currently owns input."""
+        """Return the bridge whose turn, question or approval currently owns input."""
         if _session_harness_name(session_id) != "claude-native":
             return None
-        from omnigent.harnesses.claude_native.bridge import has_pending_user_prompt
-
         bridge_dir = await _claude_prompt_bridge_dir(session_id)
-        if await asyncio.to_thread(has_pending_user_prompt, bridge_dir):
+        if await asyncio.to_thread(_claude_input_blocked, bridge_dir):
             return bridge_dir
         return None
 
@@ -7959,8 +8042,6 @@ def create_runner_app(
             return
 
         async def _wait_for_prompt() -> None:
-            from omnigent.harnesses.claude_native.bridge import has_pending_user_prompt
-
             resolved_dir = bridge_dir
             warned = False
             try:
@@ -7988,7 +8069,7 @@ def create_runner_app(
                     try:
                         if resolved_dir is None:
                             resolved_dir = await _claude_prompt_bridge_dir(session_id)
-                        pending = await asyncio.to_thread(has_pending_user_prompt, resolved_dir)
+                        pending = await asyncio.to_thread(_claude_input_blocked, resolved_dir)
                     except HTTPException:
                         await asyncio.sleep(_CLAUDE_PENDING_PROMPT_POLL_S)
                         continue
@@ -9983,6 +10064,7 @@ def create_runner_app(
             harness_body["input_generation"] = msg_body["input_generation"]
         for admission_field in (
             "input_admission_required",
+            "pending_input_claim_required",
             "retry_guard",
             "auto_retry",
             "input_admission_deadline",
@@ -11166,7 +11248,7 @@ def create_runner_app(
                                     # up-front spinner; drop the executor's own duplicate
                                     # so the web renders a single compaction spinner.
                                     continue
-                                if _evt_type == "injection.consumed":
+                                if _evt_type in {"injection.consumed", "injection.unconfirmed"}:
                                     _inj_id = event.get("injection_id")
                                     _buf = _session_message_buffers.get(conv_id)
                                     if _inj_id is not None and _buf:
@@ -11177,6 +11259,8 @@ def create_runner_app(
                                             _m for _m in _buf if _m.get("injection_id") != _inj_id
                                         ]
                                         _session_message_buffers[conv_id] = _remaining
+                                        if _evt_type == "injection.unconfirmed":
+                                            continue
                                         await _restore_pending_session_attachments(conv_id)
                                         for _m in _consumed:
                                             _pending_id = _m.get("pending_id")
@@ -11702,6 +11786,15 @@ def create_runner_app(
         conversation_id: str,
         request: Request,
         stream: bool = Query(default=False),
+    ) -> Response:
+        response = await _post_session_events(conversation_id, request, stream)
+        response.headers["X-Omnigent-Pending-Input-Claim"] = "1"
+        return response
+
+    async def _post_session_events(
+        conversation_id: str,
+        request: Request,
+        stream: bool,
     ) -> Response:
         if process_manager is None:
             return JSONResponse(
@@ -12284,7 +12377,7 @@ def create_runner_app(
                                 "detail": (
                                     "Message buffered until the Databricks sign-in completes."
                                     if _message_held_for_sign_in(conversation_id)
-                                    else "Message buffered until the pending prompt is resolved."
+                                    else "Message buffered until the Claude terminal is available."
                                 ),
                             },
                         )

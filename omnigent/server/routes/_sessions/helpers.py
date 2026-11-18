@@ -25,6 +25,7 @@ from collections.abc import (
     Callable,
     Coroutine,
     Iterable,
+    Iterator,
     Mapping,
     Sequence,
 )
@@ -9088,25 +9089,9 @@ async def _persist_native_policy_notice(
         _publish_error_event(session_id, error)
 
 
-def _extract_claude_native_runner_failure(resp: httpx.Response) -> str | None:
-    """
-    Return a harness failure message from a runner SSE response.
-
-    Runner ``POST /v1/sessions/{id}/events`` returns HTTP 200 for a
-    syntactically valid harness stream even when the harness emits
-    ``response.failed``. Claude-native Omnigent forwarding must treat that
-    as failed injection, otherwise the web UI would believe a message
-    reached the terminal when ``tmux send-keys`` actually failed.
-
-    :param resp: Completed runner response.
-    :returns: Failure message, or ``None`` when no failure event is
-        present.
-    """
-    content_type = resp.headers.get("content-type", "")
-    text = resp.text
-    if "text/event-stream" not in content_type and "response.failed" not in text:
-        return None
-    for frame in text.split("\n\n"):
+def _native_runner_response_events(resp: httpx.Response) -> Iterator[dict[str, Any]]:
+    """Read the SSE frames carried by an ordinary runner POST response."""
+    for frame in resp.text.split("\n\n"):
         data_lines = [
             line.removeprefix("data:").strip()
             for line in frame.splitlines()
@@ -9118,17 +9103,40 @@ def _extract_claude_native_runner_failure(resp: httpx.Response) -> str | None:
             payload = json.loads("\n".join(data_lines))
         except json.JSONDecodeError:
             continue
-        if not isinstance(payload, dict) or payload.get("type") != "response.failed":
+        if isinstance(payload, dict):
+            yield payload
+
+
+class _NativeRunnerFailure(NamedTuple):
+    message: str
+    uncertain: bool = False
+    undelivered: bool = False
+
+
+def _extract_claude_native_runner_failure(resp: httpx.Response) -> _NativeRunnerFailure | None:
+    """Read the runner SSE's claim about whether a failed input reached the pane."""
+    for payload in _native_runner_response_events(resp):
+        if payload.get("type") != "response.failed":
             continue
         error = payload.get("error")
+        if error is None and isinstance(response := payload.get("response"), dict):
+            error = response.get("error")
         if isinstance(error, dict):
+            uncertain = error.get("code") in (
+                "claude_delivery_unconfirmed",
+                "native_input_delivery_uncertain",
+            )
             message = error.get("message") or error.get("detail")
-            if isinstance(message, str) and message:
-                return message
-            return json.dumps(error, sort_keys=True)
+            return _NativeRunnerFailure(
+                message
+                if isinstance(message, str) and message
+                else json.dumps(error, sort_keys=True),
+                uncertain=uncertain,
+                undelivered=error.get("undelivered") is True,
+            )
         if isinstance(error, str) and error:
-            return error
-        return "runner reported response.failed"
+            return _NativeRunnerFailure(error)
+        return _NativeRunnerFailure("runner reported response.failed")
     return None
 
 

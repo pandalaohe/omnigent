@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
-from omnigent.runtime import session_stream
+from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
+from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+from omnigent.runtime import pending_inputs, session_stream
 from omnigent.server.routes._sessions import orchestration
+from omnigent.server.routes.sessions import routes_hooks
+from omnigent.server.schemas import SessionEventInput
+from omnigent.stores.conversation_store import DetachedCard
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.server.helpers import start_session_stream_collector
 
@@ -53,6 +62,406 @@ class _NaturalEofStream(httpx.AsyncByteStream):
     async def __aiter__(self) -> AsyncIterator[bytes]:
         for frame in self.frames:
             yield frame
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expires", [False, True])
+async def test_runner_pending_input_reconciles_or_expires(db_uri, monkeypatch, expires):
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation().id
+    now = 0.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    pending_id = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "queued"}], runner_managed=True
+    )
+    pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_accepted")
+    for now in range(60, 661, 60):
+        await orchestration._reconcile_runner_input_leases(
+            store,
+            session_id,
+            {"active_pending_ids": [], "queued_pending_ids": [pending_id]},
+            set(),
+        )
+    assert pending_inputs.snapshot_for(session_id)[0]["pending_id"] == pending_id
+    assert "sending_since_ms" not in pending_inputs.snapshot_for(session_id)[0]
+    assert pending_inputs.runner_lease_remaining(session_id, pending_id) == 600
+    await orchestration._reconcile_runner_input_leases(
+        store, session_id, {"active_pending_ids": [pending_id], "queued_pending_ids": []}, set()
+    )
+    assert "sending_since_ms" in pending_inputs.snapshot_for(session_id)[0]
+    if expires:
+        now += 601
+        assert not pending_inputs.claim_runner_input(session_id, pending_id, "lapsed_before_watch")
+        await orchestration._watch_runner_input_lease(store, session_id, pending_id)
+    else:
+        await orchestration._reconcile_runner_input_leases(
+            store,
+            session_id,
+            {"active_pending_ids": [], "queued_pending_ids": []},
+            pending_inputs.runner_accepted_ids(session_id),
+        )
+    assert pending_inputs.snapshot_for(session_id) == []
+    message, error = store.list_items(session_id).data
+    assert message.type == "message"
+    assert error.type == "error"
+    assert "not delivered" in error.data.model_dump()["message"]
+    assert not pending_inputs.claim_runner_input(session_id, pending_id, "late_claim")
+
+
+@pytest.mark.asyncio
+async def test_claimed_input_survives_reconnect_and_expires_as_uncertain(db_uri, monkeypatch):
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation().id
+    now = 0.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    pending_id = pending_inputs.record(session_id, [{"type": "input_text", "text": "hello"}])
+    pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_accepted")
+    pending_inputs.enable_runner_lease(session_id, pending_id)
+    assert pending_inputs.claim_runner_input(session_id, pending_id, "first")
+    assert pending_inputs.claim_runner_input(session_id, pending_id, "first")
+    assert not pending_inputs.claim_runner_input(session_id, pending_id, "second")
+
+    now = 601.0
+    await orchestration._reconcile_runner_input_leases(
+        store, session_id, {"active_pending_ids": [], "queued_pending_ids": []}, {pending_id}
+    )
+    assert not store.list_items(session_id).data
+    assert pending_inputs.runner_lease_remaining(session_id, pending_id) == 119
+
+    now = 721.0
+    assert not pending_inputs.claim_runner_input(session_id, pending_id, "first")
+    await orchestration._watch_runner_input_lease(store, session_id, pending_id)
+
+    assert not pending_inputs.snapshot_for(session_id)
+    message, error = store.list_items(session_id).data
+    assert message.type == "message"
+    assert error.data.model_dump()["code"] == "native_input_delivery_uncertain"
+    assert "may have arrived" in error.data.model_dump()["message"]
+
+
+@pytest.mark.asyncio
+async def test_replaying_a_settled_stable_id_cannot_gain_another_paste_claim(db_uri, monkeypatch):
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(harness_override="claude-native")
+    stable_id = "a" * 32
+    content = [{"type": "input_text", "text": "same text"}]
+    now = 0.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    pending_id = pending_inputs.record(conv.id, content, stable_id=stable_id, runner_managed=True)
+    attempt_id = pending_inputs.delivery_attributes_for(conv.id, pending_id)["delivery_attempt_id"]
+    assert pending_inputs.claim_runner_input(conv.id, pending_id, "original")
+    now = 721.0
+    await orchestration._watch_runner_input_lease(store, conv.id, pending_id)
+
+    async def forward(_client, session_id, _conv, _body, *, input_delivery, **_kwargs):
+        assert pending_inputs.claim_runner_input(
+            session_id,
+            pending_id,
+            "replay",
+            expected_attempt_id=input_delivery["delivery_attempt_id"],
+        )
+        return True
+
+    runner_forward = AsyncMock(side_effect=forward)
+    monkeypatch.setattr(orchestration, "_forward_native_terminal_message", runner_forward)
+    try:
+        result = await orchestration._dispatch_session_event_to_runner_impl(
+            conv.id,
+            conv,
+            SessionEventInput(
+                type="message", data={"role": "user", "content": content, "stable_id": stable_id}
+            ),
+            store,
+            AsyncMock(),
+            agent_name=None,
+            file_store=None,
+            artifact_store=None,
+            native_terminal_ready=True,
+        )
+        late_mirror = pending_inputs.resolve_matching_text(conv.id, "same text")
+        assert late_mirror.matched is None
+        assert not pending_inputs.claim_runner_input(
+            conv.id, pending_id, "late-original", expected_attempt_id=attempt_id
+        )
+        assert result.item_id is not None and result.pending_id is None
+        item = store.get_item(conv.id, result.item_id)
+        assert (
+            item is not None
+            and item.data.model_dump()["code"] == "native_input_delivery_uncertain"
+        )
+        runner_forward.assert_not_awaited()
+    finally:
+        pending_inputs.resolve(conv.id, pending_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "confirmed",
+        "refused",
+        "reply-lost",
+        "unconfirmed",
+        "no-terminal-edge",
+        "mirror-before-reply-loss",
+    ],
+)
+async def test_system_delivery_waits_for_the_runner_outcome(db_uri, monkeypatch, outcome):
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(harness_override="claude-native")
+    posted: list[dict] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.url.query == b"stream=true"
+        posted.append(json.loads(request.content))
+        pending_id = posted[-1]["pending_id"]
+        assert pending_inputs.claim_runner_input(conv.id, pending_id, "original")
+        if outcome == "mirror-before-reply-loss":
+            assert pending_inputs.resolve_matching_text(conv.id, "Answer to the card").matched
+        if outcome in {"reply-lost", "mirror-before-reply-loss"}:
+            raise httpx.ReadError("reply lost")
+        payload = {"type": "response.completed"}
+        if outcome == "no-terminal-edge":
+            payload = {"type": "response.in_progress"}
+        if outcome == "refused":
+            payload = {
+                "type": "response.failed",
+                "error": {"message": "paste refused", "undelivered": True},
+            }
+        if outcome == "unconfirmed":
+            payload = {
+                "type": "response.failed",
+                "error": {
+                    "code": "native_input_delivery_uncertain",
+                    "message": "may have arrived",
+                },
+            }
+        return httpx.Response(
+            200,
+            text=f"data: {json.dumps(payload)}\n\n",
+            headers={"content-type": "text/event-stream", "X-Omnigent-Pending-Input-Claim": "1"},
+        )
+
+    monkeypatch.setattr(orchestration, "_ensure_runner_relay", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        orchestration,
+        "_ensure_native_terminal_ready",
+        AsyncMock(return_value=orchestration._NativeTerminalEnsureOutcome(error=None)),
+    )
+    monkeypatch.setattr(orchestration, "_watch_runner_input_lease", AsyncMock())
+    monkeypatch.setattr(orchestration, "_DELIVER_RETRY_MAX_S", 0.0)
+    timeouts: list[float] = []
+
+    async def record_timeout(request: httpx.Request) -> None:
+        timeouts.append(request.extensions["timeout"]["read"])
+
+    async with httpx.AsyncClient(
+        base_url="http://runner",
+        transport=httpx.MockTransport(respond),
+        event_hooks={"request": [record_timeout]},
+    ) as client:
+        monkeypatch.setattr(orchestration, "_get_runner_client", AsyncMock(return_value=client))
+        try:
+            delivered = await orchestration._deliver_with_retry(
+                conv.id,
+                "Answer to the card",
+                conversation_store=store,
+                runner_router=None,
+                persist_failure=False,
+            )
+            assert timeouts == [pytest.approx(605.0)]
+            assert delivered is {"confirmed": True, "refused": False}.get(outcome)
+            notices = store.list_items(conv.id).data
+            if delivered is None:
+                assert [item.data.model_dump().get("code") for item in notices] == [
+                    "answer_delivery_uncertain"
+                ]
+            else:
+                assert not notices
+        finally:
+            for body in posted:
+                pending_inputs.resolve(conv.id, body["pending_id"])
+
+
+@pytest.fixture
+async def replaced_runner_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[httpx.AsyncClient]:
+    registry = TunnelRegistry()
+    runner_id = "runner-test"
+    hello = HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[])
+    original = registry.register(runner_id, AsyncMock(), hello)
+    send = registry.send_text
+    replaced: list[RunnerSession] = []
+
+    async def replace_before_send(session: RunnerSession, data: str) -> None:
+        (request,) = session.in_flight.values()
+        replacement = registry.register(runner_id, AsyncMock(), hello)
+        replaced.append(replacement)
+        try:
+            await send(session, data)
+        finally:
+            # The registry also aborts the unused response waiter on replacement.
+            if request.head_future.done() and not request.head_future.cancelled():
+                request.head_future.exception()
+
+    monkeypatch.setattr(registry, "send_text", replace_before_send)
+    monkeypatch.setattr(orchestration, "_ensure_runner_relay", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        orchestration,
+        "_ensure_native_terminal_ready",
+        AsyncMock(return_value=orchestration._NativeTerminalEnsureOutcome(error=None)),
+    )
+    async with httpx.AsyncClient(
+        base_url="http://runner", transport=WSTunnelTransport(registry, runner_id)
+    ) as client:
+        monkeypatch.setattr(orchestration, "_get_runner_client", AsyncMock(return_value=client))
+        yield client
+
+    assert len(replaced) == 1
+    assert original.outbound_queue.get_nowait() is None  # Writer retirement marker.
+    assert original.outbound_queue.empty()
+    assert replaced[0].outbound_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_answered_card_keeps_retrying_after_tunnel_replacement_before_enqueue(
+    db_uri, monkeypatch: pytest.MonkeyPatch, replaced_runner_client: httpx.AsyncClient
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation(harness_override="claude-native").id
+    text = "[System: answers to your question card #q1]"
+    now = int(time.time())
+    card = DetachedCard(
+        elicitation_id="answered-card",
+        session_id=session_id,
+        kind="question",
+        state="answered",
+        mirror=False,
+        params={},
+        payload={"qid": "q1"},
+        grant_key=None,
+        verdict={"action": "accept", "content": {"Question": "Answer"}},
+        delivery_text=text,
+        created_at=now,
+        expires_at=now + 60,
+    )
+    store.add_detached_card(card)
+    backoff = AsyncMock(side_effect=asyncio.CancelledError)
+    monkeypatch.setattr(orchestration, "_delivery_retry_sleep", backoff)
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await routes_hooks._deliver_card_verdict(
+                card, text, granted=False, conversation_store=store, runner_router=None
+            )
+        backoff.assert_awaited_once_with(orchestration._DELIVER_RETRY_BACKOFFS_S[0])
+        (retained,) = store.list_detached_cards()
+        assert retained.elicitation_id == card.elicitation_id
+        assert retained.state == "answered"
+        assert retained.delivery_text == text
+        assert not pending_inputs.snapshot_for(session_id)
+    finally:
+        for entry in pending_inputs.snapshot_for(session_id):
+            pending_inputs.resolve(session_id, entry["pending_id"])
+
+
+@pytest.mark.asyncio
+async def test_confirmed_forward_treats_tunnel_replacement_before_enqueue_as_unsent(
+    db_uri, monkeypatch: pytest.MonkeyPatch, replaced_runner_client: httpx.AsyncClient
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation(harness_override="claude-native").id
+    monkeypatch.setattr(orchestration, "_DELIVER_RETRY_MAX_S", 0.0)
+
+    try:
+        delivered = await orchestration._deliver_with_retry(
+            session_id,
+            "Answer to the card",
+            conversation_store=store,
+            runner_router=None,
+            persist_failure=False,
+        )
+        assert delivered is False
+        assert not store.list_items(session_id).data
+        assert not pending_inputs.snapshot_for(session_id)
+    finally:
+        for entry in pending_inputs.snapshot_for(session_id):
+            pending_inputs.resolve(session_id, entry["pending_id"])
+
+
+@pytest.mark.asyncio
+async def test_interrupted_claim_preserves_uncertainty_report(db_uri):
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation().id
+    pending_id = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "in flight"}], runner_managed=True
+    )
+    attempt_id = pending_inputs.delivery_attributes_for(session_id, pending_id)[
+        "delivery_attempt_id"
+    ]
+    assert pending_inputs.claim_runner_input(session_id, pending_id, "original")
+    pending_inputs.mark_interrupted(session_id, [pending_id])
+    try:
+        failure = {
+            "type": "response.failed",
+            "response": {"id": "resp_terminal"},
+            "pending_id": pending_id,
+            "delivery_attempt_id": attempt_id,
+            "error": {"code": "native_input_delivery_uncertain", "message": "may have arrived"},
+        }
+        async with httpx.AsyncClient(
+            base_url="http://runner",
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(
+                    200, text=f"data: {json.dumps(failure)}\n\ndata: [DONE]\n\n"
+                )
+            ),
+        ) as client:
+            await asyncio.wait_for(
+                orchestration._relay_runner_stream(session_id, client, store), timeout=3
+            )
+        assert not pending_inputs.runner_input_is_claimed(session_id, pending_id)
+        assert [
+            item.data.model_dump().get("code")
+            for item in store.list_items(session_id).data
+            if item.type == "error"
+        ] == ["native_input_delivery_uncertain"]
+    finally:
+        pending_inputs.resolve(session_id, pending_id)
+        orchestration._session_status_cache.pop(session_id, None)
+        orchestration._session_active_response_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_lapsed_annotation_keeps_explicit_retry_and_records_error(db_uri, monkeypatch):
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation().id
+    now = 0.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    stable_id = "a" * 32
+    deferred: list[tuple[str, str]] = []
+    monkeypatch.setattr(store, "annotation_receipt_for_item", lambda *args: object())
+    monkeypatch.setattr(
+        store,
+        "defer_unsubmitted_annotation",
+        lambda session, item, *, runner_reported: deferred.append((session, item)),
+    )
+    pending_id = pending_inputs.record(
+        session_id,
+        [{"type": "input_text", "text": "annotation"}],
+        stable_id=stable_id,
+        runner_managed=True,
+    )
+    now = 601.0
+    await orchestration._watch_runner_input_lease(store, session_id, pending_id)
+
+    assert deferred == [(session_id, stable_id)]
+    assert not pending_inputs.snapshot_for(session_id)
+    (error,) = store.list_items(session_id).data
+    assert error.type == "error"
+    assert "not delivered" in error.data.model_dump()["message"]
 
 
 @pytest.fixture

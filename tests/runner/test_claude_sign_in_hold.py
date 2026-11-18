@@ -808,6 +808,97 @@ async def test_held_message_is_sent_after_a_failed_bridge_lookup(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("claimed", [True, False])
+async def test_native_paste_claim_uses_bound_server_and_replies_to_harness(
+    monkeypatch: pytest.MonkeyPatch, claimed: bool
+) -> None:
+    sid = uuid.uuid4().hex
+    pending_id = f"pending_{'a' * 32}"
+    attempt_id = "b" * 32
+    claim_frame = _sse(
+        {
+            "type": "input.execution.claim",
+            "claim_id": "c" * 32,
+            "claim": {
+                "input_id": pending_id,
+                "turn_id": "resp_2",
+                "boundary": "native_delivery",
+                "delivery_attempt_id": attempt_id,
+                "admission_deadline": time.time() + 3,
+            },
+        }
+    )
+    app, harness, server = _build_app([[_DELIVERED[0], claim_frame, _DELIVERED[1]]])
+    endpoint = f"/v1/sessions/{sid}/pending-inputs/{pending_id}/claim"
+    calls: list[dict[str, str]] = []
+    original_post = server.post
+
+    async def post(url: str, **kwargs: Any) -> Any:
+        if url != endpoint:
+            return await original_post(url, **kwargs)
+        calls.append(kwargs["params"])
+        return httpx.Response(200, json={"claimed": claimed})
+
+    monkeypatch.setattr(server, "post", post)
+    async with _runner_client(app) as client:
+        await _create_session(client, sid)
+        response = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                **_message("hello"),
+                "pending_id": pending_id,
+                "pending_input_claim_required": True,
+                "delivery_attempt_id": attempt_id,
+            },
+        )
+        assert response.headers["X-Omnigent-Pending-Input-Claim"] == "1"
+        await _until(lambda: bool(harness.posted_bodies) and sid not in app.state.active_turns)
+
+    assert harness.posted_bodies[0]["pending_input_claim_required"] is True
+    assert calls == [{"claim_id": "c" * 32, "attempt_id": attempt_id}]
+    (result,) = [e for e in harness.patched_events if e["type"] == "input_execution_result"]
+    assert result["result"]["state"] == ("accepted" if claimed else "refused")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked", [True, None], ids=["running", "tracker-unavailable"])
+async def test_followup_waits_for_claude_after_the_runner_slot_is_released(
+    monkeypatch: pytest.MonkeyPatch,
+    blocked: bool | None,
+) -> None:
+    app, harness, _server = _build_app([_DELIVERED, _DELIVERED])
+    sid = uuid.uuid4().hex
+    running: bool | None = None
+    bridge_dir = claude_native_bridge.bridge_dir_for_bridge_id("label-owned-bridge")
+    claude_native_bridge.write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    monkeypatch.setattr(claude_native_bridge, "_claude_turn_running", lambda *_: running)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda *_: claude_native_bridge._ClaudePaneState(alive=True),
+    )
+    async with _runner_client(app) as client:
+        await _create_session(client, sid)
+        await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
+        await _until(lambda: len(harness.posted_bodies) == 1 and sid not in app.state.active_turns)
+        claude_native_bridge.record_hook_event(
+            bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "native-session"}
+        )
+        running = blocked
+        reply = await client.post(f"/v1/sessions/{sid}/events", json=_message("follow-up"))
+        assert reply.json()["status"] == "buffered"
+        assert sid not in app.state.active_turns
+        assert len(harness.posted_bodies) == 1
+        running = False
+        await _until(lambda: len(harness.posted_bodies) == 2 and sid not in app.state.active_turns)
+    assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "follow-up"]
+
+
+@pytest.mark.asyncio
 async def test_held_message_is_sent_when_the_queue_drains_prompt_check_fails(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

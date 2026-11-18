@@ -61,6 +61,10 @@ _logger = logging.getLogger(__name__)
 _connection_generations = count(1)
 
 
+class TunnelRequestNotSent(ConnectionError):
+    """The tunnel rejected the request before accepting an outbound frame."""
+
+
 class WebSocketLike(Protocol):
     """Minimal WebSocket protocol used by the registry + transport.
 
@@ -735,7 +739,7 @@ class TunnelRegistry:
         """Allocate reassembly state for a new outgoing request.
 
         :raises KeyError: If the runner isn't online.
-        :raises ConnectionError: If the requested connection has been replaced.
+        :raises TunnelRequestNotSent: If the requested connection has been replaced.
         :raises ValueError: If a request with this ``req_id`` is
             already in flight on this runner. req_ids must be unique
             per session.
@@ -746,7 +750,7 @@ class TunnelRegistry:
             if session is None:
                 raise KeyError(runner_id)
             if generation is not None and session.generation != generation:
-                raise ConnectionError("runner tunnel changed before request was sent")
+                raise TunnelRequestNotSent("runner tunnel changed before request was sent")
             if req_id in session.in_flight:
                 raise ValueError(f"req_id {req_id!r} already in flight on runner {runner_id!r}")
             state = RequestState(
@@ -920,7 +924,9 @@ class TunnelRegistry:
             try:
                 with self._lock:
                     if self._sessions.get(session.runner_id) is not session:
-                        raise ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
+                        raise TunnelRequestNotSent(
+                            f"runner {session.runner_id!r} tunnel was replaced"
+                        )
                     frame = OutboundFrame(
                         data, queued_at=session.diagnostics.timestamp(), app_ping_ts=app_ping_ts
                     )

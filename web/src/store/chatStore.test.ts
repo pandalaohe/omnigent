@@ -726,7 +726,13 @@ function seedPendingElicitations(id: string, events: Record<string, unknown>[]):
 
 function seedPendingInputs(
   id: string,
-  inputs: { pending_id: string; content: unknown[]; created_by?: string }[],
+  inputs: {
+    pending_id: string;
+    content: unknown[];
+    created_by?: string;
+    stable_id?: string;
+    sending_since_ms?: number;
+  }[],
 ): void {
   sessionPendingInputs.set(id, inputs);
 }
@@ -2111,6 +2117,23 @@ describe("chatStore — switchTo", () => {
     ]);
   });
 
+  it("replays the server send time for a native message waiting for delivery", async () => {
+    seedSession("conv_native", []);
+    const waiting = {
+      pending_id: "pending_waiting",
+      content: [{ type: "input_text", text: "waiting" }],
+      sending_since_ms: 1710000000000,
+    };
+    seedPendingInputs("conv_native", [waiting]);
+
+    await useChatStore.getState().switchTo("conv_native");
+
+    expect(useChatStore.getState().pendingUserMessages[0]).toMatchObject({
+      tempId: "pending_waiting",
+      sendingSinceMs: waiting.sending_since_ms,
+    });
+  });
+
   it.each([
     [[{ pending_id: "pending_first", content: [{ type: "input_text", text: "first" }] }], true],
     [[], false],
@@ -2136,16 +2159,12 @@ describe("chatStore — switchTo", () => {
   );
 
   it("drops a snapshot pending_input whose message already committed (no resume re-inject)", async () => {
-    // Regression: a native pending_inputs entry whose message DID
-    // round-trip into history (or a ghost the TUI never accepted that
-    // lingers until its server-side TTL) must NOT replay as a second
-    // bubble on a cold-load resume — that is the "initial prompt got
-    // re-injected on resume" report. The committed item is the single
-    // source of truth; the stale pending copy is dropped.
-    seedSession("conv_native", [userMessage("resp1", "the initial prompt")]);
+    const committed = userMessage("resp1", "the initial prompt");
+    seedSession("conv_native", [committed]);
     seedPendingInputs("conv_native", [
       {
         pending_id: "pending_stale",
+        stable_id: committed.id,
         content: [{ type: "input_text", text: "the initial prompt" }],
       },
       {
@@ -2163,22 +2182,25 @@ describe("chatStore — switchTo", () => {
     ]);
   });
 
-  it("keeps a pending_input matching a committed message that the transcript reformatted", async () => {
-    // The native transcript can prepend markers/blockquotes, so the
-    // committed text is a superset of the POSTed text. Containment (not
-    // equality) still dedupes it, so the optimistic bubble doesn't
-    // double up with the reformatted committed copy.
-    seedSession("conv_native", [userMessage("resp1", "[Attached: a.png]\n\nthe initial prompt")]);
+  it("keeps a new pending input whose text is already in history", async () => {
+    seedSession("conv_native", [userMessage("resp1", "continue")]);
     seedPendingInputs("conv_native", [
       {
-        pending_id: "pending_stale",
-        content: [{ type: "input_text", text: "the initial prompt" }],
+        pending_id: "pending_new",
+        stable_id: "new_input",
+        content: [{ type: "input_text", text: "continue" }],
       },
     ]);
 
     await useChatStore.getState().switchTo("conv_native");
 
-    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([
+      {
+        tempId: "pending_new",
+        stableId: "new_input",
+        content: [{ type: "input_text", text: "continue" }],
+      },
+    ]);
   });
 
   it("keeps an image-only pending_input that has no text to dedupe on", async () => {
@@ -21247,6 +21269,105 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const last = sinks[1]!;
     last.push("data: [DONE]\n\n");
     last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it.each([
+    { path: "ordinary backfill", gapLength: 5 },
+    { path: "the fresh-window fallback", gapLength: 100 },
+  ])("recovers the sending timer by pending id through $path", async ({ gapLength }) => {
+    const id = `conv_timer_${gapLength}`;
+    const preGap = Array.from({ length: 30 }, (_, i) => gapUser("pre", i));
+    const pending = {
+      pending_id: "pending_followup",
+      content: [{ type: "input_text" as const, text: "gap 0" }],
+    };
+    seedSession(id, preGap);
+    seedPendingInputs(id, [pending]);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: id,
+      abortController: controller,
+      blocks: itemsToBlocks(preGap.slice(-SESSION_HISTORY_PAGE_SIZE)),
+      pendingUserMessages: [{ tempId: pending.pending_id, content: pending.content }],
+    });
+    const loop = startStreamPump(id, controller, setState, getState);
+    await drainAsync();
+
+    const since = 1710000000000;
+    seedPendingInputs(id, [{ ...pending, sending_since_ms: since }]);
+    seedSessionItems(id, [
+      ...preGap,
+      ...Array.from({ length: gapLength }, (_, i) => gapUser("gap", i)),
+    ]);
+    sinks[0]!.error();
+    await drainAsync();
+
+    expect(useChatStore.getState().pendingUserMessages).toMatchObject([
+      { tempId: pending.pending_id, sendingSinceMs: since },
+    ]);
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("clears a settled annotation timer while retaining an unrelated pending input", async () => {
+    const id = "conv_annotation_gap";
+    const old = [gapUser("pre", 0)];
+    const annotation = {
+      pending_id: "pending_annotation",
+      content: [{ type: "input_text" as const, text: "annotation" }],
+      sending_since_ms: 1710000000000,
+    };
+    const queued = {
+      pending_id: "pending_queued",
+      content: [{ type: "input_text" as const, text: "next" }],
+    };
+    seedSession(id, old);
+    seedPendingInputs(id, [queued, annotation]);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    const keep = { tempId: "queued", pendingId: queued.pending_id, content: queued.content };
+    useChatStore.setState({
+      conversationId: id,
+      abortController: controller,
+      blocks: itemsToBlocks(old),
+      isNativeTerminalSession: true,
+      pendingUserMessages: [
+        keep,
+        {
+          tempId: "annotation",
+          pendingId: annotation.pending_id,
+          content: annotation.content,
+          sendingSinceMs: annotation.sending_since_ms,
+        },
+      ],
+    });
+    const loop = startStreamPump(id, controller, setState, getState);
+    await drainAsync();
+
+    seedPendingInputs(id, [queued]);
+    seedSessionItems(id, [
+      ...old,
+      {
+        id: "annotation_refused",
+        type: "error",
+        response_id: "resp_annotation",
+        status: "completed",
+        created_at: 1710000001,
+        source: "execution",
+        code: "native_input_lease_expired",
+        message: "The message was not delivered.",
+      },
+    ]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(useChatStore.getState().pendingUserMessages).toEqual([keep]);
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
     await drainAsync(2);
     await loop;
   });

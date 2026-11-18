@@ -2723,28 +2723,28 @@ class _ScriptedInjectionExecutor:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("outcome", "consumed", "logged"),
+    ("outcome", "marker_type", "logged"),
     [
-        (True, True, "executor_accepted"),
-        (False, False, "executor_refused"),
-        (None, True, "executor_ambiguous"),
-        (RuntimeError("socket closed before sending"), False, "error"),
+        (True, "injection.consumed", "executor_accepted"),
+        (False, None, "executor_refused"),
+        (None, "injection.unconfirmed", "executor_ambiguous"),
+        (RuntimeError("socket closed before sending"), None, "error"),
     ],
     ids=["accepted", "refused", "ambiguous", "error"],
 )
-async def test_watch_injections_marks_ambiguous_delivery_consumed(
+async def test_watch_injections_marks_ambiguous_delivery_unconfirmed(
     outcome: bool | BaseException | None,
-    consumed: bool,
+    marker_type: str | None,
     logged: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """An injection the harness may already hold is marked consumed, so it is never resent."""
+    """An unconfirmed marker suppresses replay without claiming delivery."""
     import asyncio as _aio
     import logging
 
     from omnigent.inner.executor import InjectionDeliveryAmbiguous
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
-    from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
+    from omnigent.server.schemas import CreateResponseRequest
 
     executor = _ScriptedInjectionExecutor(
         InjectionDeliveryAmbiguous("reply lost") if outcome is None else outcome
@@ -2778,8 +2778,9 @@ async def test_watch_injections_marks_ambiguous_delivery_consumed(
         if getattr(record, "event_name", None) == "native_input_steering_finished"
     ]
     assert finished == [logged]
-    markers = [event for event in ctx.emitted if isinstance(event, InjectionConsumedEvent)]
-    assert [marker.injection_id for marker in markers] == (["inj_x"] if consumed else [])
+    assert [(event.type, event.injection_id) for event in ctx.emitted] == (
+        [(marker_type, "inj_x")] if marker_type is not None else []
+    )
 
 
 @pytest.mark.asyncio

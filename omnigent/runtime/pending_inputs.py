@@ -133,6 +133,7 @@ from omnigent.native.input_diagnostics import input_attributes, log_input_event
 # vendor-TUI-never-accepted-the-message ghost; long enough that a slow
 # transcript round-trip on a busy session still drains normally.
 _TTL_S: float = 600.0
+_CLAIMED_INPUT_TIMEOUT_S = 720.0
 
 # Hard cap on unheld queued entries per conversation, enforced by
 # :func:`record`: the oldest unheld entries are evicted when a new one would
@@ -264,6 +265,9 @@ class DrainedInput:
     uncertain: bool = False
     injected_prefix: str | None = None
     auto_retry: AutoRetryMetadata | None = None
+    last_runner_renewal: float | None = None
+    runner_claim_id: str | None = None
+    sending_since_ms: int | None = None
 
 
 @dataclass
@@ -332,6 +336,9 @@ class _Entry:
     # resolved at construction time rather than bound at class def.
     created_at: float = field(default_factory=lambda: _now())
     held: bool = False
+    last_runner_renewal: float | None = None
+    runner_claim_id: str | None = None
+    sending_since_ms: int | None = None
     uncertain: bool = False
     interrupted: bool = False
     input_enqueued_at_ms: int | None = field(default_factory=lambda: int(time.time() * 1000))
@@ -369,7 +376,16 @@ def _evict_stale_locked(conversation_id: str, now: float) -> None:
     entries = _pending.get(conversation_id)
     if entries is None:
         return
-    stale = [pid for pid, entry in entries.items() if now - entry.created_at > _TTL_S]
+    # Runner-owned entries are settled through the undelivered path.
+    stale = [
+        pid
+        for pid, entry in entries.items()
+        if (
+            entry.last_runner_renewal is None
+            or (entry.interrupted and entry.runner_claim_id is None)
+        )
+        and now - entry.created_at > _TTL_S
+    ]
     for pid in stale:
         entries.pop(pid, None)
     if not entries:
@@ -396,6 +412,7 @@ def record(
     admission_id: str | None = None,
     injected_prefix: str | None = None,
     auto_retry: AutoRetryMetadata | None = None,
+    runner_managed: bool = False,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -449,11 +466,110 @@ def record(
             admission_id=admission_id,
             injected_prefix=injected_prefix,
             auto_retry=auto_retry,
+            last_runner_renewal=_now() if runner_managed else None,
         )
         entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
         _evict_beyond_cap(entries)
     return pending_id
+
+
+def runner_accepted_ids(conversation_id: str) -> set[str]:
+    """Capture already-forwarded ids before opening a runner stream."""
+    with _lock:
+        return {
+            entry.pending_id
+            for entry in _pending.get(conversation_id, {}).values()
+            if entry.last_runner_renewal is not None
+            and entry.runner_claim_id is None
+            and not entry.interrupted
+            and entry.last_delivery_stage not in {"server_queued", "forward_requested"}
+        }
+
+
+def enable_runner_lease(conversation_id: str, pending_id: str) -> None:
+    """Activate lease settlement after a claim-capable runner accepts the forward."""
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        if entry is not None and not entry.held and not entry.interrupted:
+            if entry.last_runner_renewal is None:
+                entry.last_runner_renewal = entry.created_at
+
+
+def claim_runner_input(
+    conversation_id: str, pending_id: str, claim_id: str, *, expected_attempt_id: str | None = None
+) -> bool:
+    """Grant one runner attempt the right to paste while its lease is live."""
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        if entry is None or entry.held or entry.interrupted:
+            return False
+        if expected_attempt_id is not None and entry.delivery_attempt_id != expected_attempt_id:
+            return False
+        now = _now()
+        last_renewal = entry.last_runner_renewal
+        if last_renewal is None:
+            last_renewal = entry.created_at
+        if entry.runner_claim_id is not None:
+            return (
+                entry.runner_claim_id == claim_id and now - last_renewal < _CLAIMED_INPUT_TIMEOUT_S
+            )
+        if now - last_renewal >= _TTL_S:
+            return False
+        entry.runner_claim_id = claim_id
+        entry.last_runner_renewal = now
+        entry.sending_since_ms = entry.input_enqueued_at_ms
+        return True
+
+
+def runner_input_is_claimed(conversation_id: str, pending_id: str) -> bool:
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        return entry is not None and entry.runner_claim_id is not None
+
+
+def renew_runner_inputs(
+    conversation_id: str, held_ids: set[str], active_ids: set[str]
+) -> dict[str, int | None]:
+    """Renew the runner's live inputs and return their current sending timestamps."""
+    now = _now()
+    sending: dict[str, int | None] = {}
+    with _lock:
+        entries = _pending.get(conversation_id, {})
+        for pending_id in held_ids:
+            entry = entries.get(pending_id)
+            if (
+                entry is None
+                or entry.held
+                or entry.interrupted
+                or entry.last_runner_renewal is None
+            ):
+                continue
+            if entry.runner_claim_id is not None:
+                sending[pending_id] = entry.sending_since_ms
+                continue
+            if now - entry.last_runner_renewal >= _TTL_S:
+                continue
+            entry.last_runner_renewal = now
+            entry.sending_since_ms = (
+                entry.input_enqueued_at_ms if pending_id in active_ids else None
+            )
+            sending[pending_id] = entry.sending_since_ms
+    return sending
+
+
+def runner_lease_remaining(conversation_id: str, pending_id: str) -> float | None:
+    """Seconds until settlement. Stop still requires an outcome for claimed inputs."""
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        if (
+            entry is None
+            or (entry.interrupted and entry.runner_claim_id is None)
+            or entry.last_runner_renewal is None
+        ):
+            return None
+        timeout = _CLAIMED_INPUT_TIMEOUT_S if entry.runner_claim_id is not None else _TTL_S
+        return entry.last_runner_renewal + timeout - _now()
 
 
 def set_injected_prefix(conversation_id: str, pending_id: str, prefix: str) -> bool:
@@ -479,7 +595,11 @@ def _evict_beyond_cap(entries: dict[str, _Entry]) -> None:
 
     :param entries: One conversation's ``{pending_id: entry}`` map.
     """
-    unheld = [pid for pid, entry in entries.items() if not entry.held]
+    unheld = [
+        pid
+        for pid, entry in entries.items()
+        if not entry.held and entry.last_runner_renewal is None
+    ]
     excess = len(unheld) - _MAX_ENTRIES_PER_CONVERSATION
     if excess <= 0:
         return
@@ -807,7 +927,10 @@ def resolve_oldest_for_mirrored_text(
             (
                 pid
                 for pid, entry in entries.items()
-                if not entry.held and not entry.interrupted and entry.auto_retry is None
+                if not entry.held
+                and not entry.interrupted
+                and entry.auto_retry is None
+                and entry.last_runner_renewal is None
             ),
             None,
         )
@@ -915,6 +1038,9 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         admission_id=drained.admission_id,
         injected_prefix=drained.injected_prefix,
         auto_retry=drained.auto_retry,
+        last_runner_renewal=drained.last_runner_renewal,
+        runner_claim_id=drained.runner_claim_id,
+        sending_since_ms=drained.sending_since_ms,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -999,7 +1125,9 @@ def resolve_matching_text(
         ordered = [
             (pid, entry)
             for pid, entry in entries.items()
-            if not entry.held and entry.auto_retry is None
+            if not entry.held
+            and entry.auto_retry is None
+            and (entry.last_runner_renewal is None or entry.runner_claim_id is not None)
         ]
         texts = [
             _shell_command_text(entry.content)
@@ -1045,7 +1173,13 @@ def resolve_matching_text(
         # a queue that overflowed after a rolled-back append never yields an
         # unbounded append downstream. The matched entry itself always drains.
         skipped_entries = (
-            [] if shell_command else ordered[:match_index][:_MAX_ENTRIES_PER_CONVERSATION]
+            []
+            if shell_command
+            else [
+                (pid, entry)
+                for pid, entry in ordered[:match_index]
+                if entry.runner_claim_id is None
+            ][:_MAX_ENTRIES_PER_CONVERSATION]
         )
         matched_id, matched_entry = ordered[match_index]
         for pending_id, entry in [*skipped_entries, (matched_id, matched_entry)]:
@@ -1130,6 +1264,12 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
             {
                 "pending_id": entry.pending_id,
                 "content": copy.deepcopy(entry.content),
+                **({"stable_id": entry.stable_id} if entry.stable_id is not None else {}),
+                **(
+                    {"sending_since_ms": entry.sending_since_ms}
+                    if entry.sending_since_ms is not None
+                    else {}
+                ),
                 **({"created_by": entry.created_by} if entry.created_by is not None else {}),
                 **(
                     {"auto_retry": entry.auto_retry.model_dump(mode="json")}
@@ -1145,6 +1285,9 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
 def _drained_input(entry: _Entry) -> DrainedInput:
     """Copy a pending entry into the public drained shape."""
     return DrainedInput(
+        last_runner_renewal=entry.last_runner_renewal,
+        runner_claim_id=entry.runner_claim_id,
+        sending_since_ms=entry.sending_since_ms,
         pending_id=entry.pending_id,
         content=copy.deepcopy(entry.content),
         created_by=entry.created_by,

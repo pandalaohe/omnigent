@@ -1460,6 +1460,7 @@ class CreateResponseRequest(BaseModel):
     startup_attempt: SkipJsonSchema[StartupAttemptRef | None] = None
     startup_required: SkipJsonSchema[bool] = False
     input_admission_required: SkipJsonSchema[bool] = False
+    pending_input_claim_required: SkipJsonSchema[bool] = False
     input_id: SkipJsonSchema[str | None] = None
     retry_guard: SkipJsonSchema[RetryExecutionGuard | None] = None
     auto_retry: SkipJsonSchema[AutoRetryMetadata | None] = Field(
@@ -4943,6 +4944,14 @@ class SessionModelOptionsEvent(_SSEEventBase):
     conversation_id: str
 
 
+class SessionInputSendingEvent(_SSEEventBase):
+    """The runner is delivering a pending input, or has queued it (null)."""
+
+    type: Literal["session.input.sending"]
+    pending_id: str
+    since_ms: int | None
+
+
 class SessionInputConsumedPayload(BaseModel):
     """
     Inner payload of a :class:`SessionInputConsumedEvent`.
@@ -5333,6 +5342,13 @@ class InjectionConsumedEvent(_SSEEventBase):
     """
 
     type: Literal["injection.consumed"]
+    injection_id: str
+
+
+class InjectionUnconfirmedEvent(_SSEEventBase):
+    """Runner-only marker to suppress replay without recording delivery."""
+
+    type: Literal["injection.unconfirmed"] = "injection.unconfirmed"
     injection_id: str
 
 
@@ -6237,6 +6253,7 @@ ServerStreamEvent = Annotated[
     | SessionMcpStartupEvent
     | SessionModelOptionsEvent
     | SessionInputConsumedEvent
+    | SessionInputSendingEvent
     | SessionInterruptedEvent
     | SessionCreatedEvent
     | SessionSupersededEvent
@@ -6469,6 +6486,7 @@ class InputExecutionClaimEvent(_SSEEventBase):
 HarnessStreamEvent = (
     ServerStreamEvent
     | InjectionConsumedEvent
+    | InjectionUnconfirmedEvent
     | SDKPeerReceiptEvent
     | PolicyEvaluationRequestEvent
     | SubagentStartedEvent

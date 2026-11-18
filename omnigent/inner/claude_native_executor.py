@@ -15,12 +15,16 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.harnesses.claude_native.bridge import (
+    _SCROLLED_DRAFT_SURFACE,
     BRIDGE_DIR_ENV_VAR,
     CLAUDE_FRAMEWORK_CONTEXT_FILE,
     MANAGED_SANDBOX_SIGN_IN_REMEDY,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
     ClaudeComposerNotCleared,
+    ClaudeDeliveryClaimRefused,
+    ClaudeDeliveryOwner,
+    ClaudeDeliveryUnconfirmed,
     ClaudeInputBoxOccupied,
     ClaudeMessageNotAccepted,
     ClaudePromptTimeout,
@@ -33,14 +37,18 @@ from omnigent.harnesses.claude_native.bridge import (
     cancellable_injection,
     claude_pane_ready,
     has_pending_user_prompt,
+    has_running_turn,
     inject_slash_command,
     inject_user_message,
     input_box_reads_clear,
     is_auth_slash_command,
     kill_session,
+    message_readiness_budget,
+    message_readiness_remaining,
     read_active_session_id,
     read_claude_context_state,
     read_claude_status_model,
+    read_delivery_owner,
     read_launch_model,
     read_model_env,
     read_model_picker_values,
@@ -55,6 +63,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    InjectionDeliveryAmbiguous,
     Message,
     TextChunk,
     ToolSpec,
@@ -100,9 +109,7 @@ _STALE_SESSION_MESSAGE = (
     "open the latest conversation and retry."
 )
 
-# Hold refusals raised before typing until the person answers or frees the box.
-# Report the result before the server's 600 s pending-input lifetime ends.
-_MESSAGE_HOLD_S = 8 * 60.0
+# Poll refusals raised before typing until the person answers or frees the box.
 _MESSAGE_HOLD_POLL_S = 1.0
 # How often a message held for the input box asks Claude Code to repaint it.
 _INPUT_BOX_REPAINT_INTERVAL_S = 10.0
@@ -206,6 +213,9 @@ class ClaudeNativeExecutor(Executor):
         try:
             async with self._inject_lock:
                 await self._inject_prompt(text, framework_notices(content))
+        except ClaudeDeliveryUnconfirmed as exc:
+            # Claude may already hold the paste; returning it to the runner would replay it.
+            raise InjectionDeliveryAmbiguous(str(exc)) from exc
         except RuntimeError:
             return False
         return True
@@ -349,45 +359,38 @@ class ClaudeNativeExecutor(Executor):
         wanted_model: str | None,
         wanted_model_arg: str | None,
     ) -> None:
-        """Apply a routed ``/model`` switch, then inject the message, in one lock hold."""
-        async with self._inject_lock:
-            self._require_active_session()
-            context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
-            context_path.unlink(missing_ok=True)
-            if wanted_model_arg is not None:
-                # Accepted trade-off: ``/model <id>`` also saves the
-                # pick as the person's global default for new Claude
-                # sessions. Runs to completion before the message
-                # inject below (same lock), so its confirm Enter can't
-                # race the message.
-                await self._inject(
-                    partial(
-                        inject_slash_command,
-                        self._bridge_dir,
-                        command=f"/model {wanted_model_arg}",
-                        auto_confirm=True,
-                        confirm_hint=SWITCH_MODEL_DIALOG_HINT,
-                        wait_for_startup=True,
-                    )
+        """Apply a routed ``/model`` switch and send the message under the injection lock."""
+        self._require_active_session()
+        context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
+        context_path.unlink(missing_ok=True)
+        if wanted_model_arg is not None:
+            # The switch also updates Claude's global default. Keep its
+            # confirmation Enter inside the same lock as the message.
+            await self._inject(
+                partial(
+                    inject_slash_command,
+                    self._bridge_dir,
+                    command=f"/model {wanted_model_arg}",
+                    auto_confirm=True,
+                    confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+                    wait_for_startup=True,
                 )
-                # Track the routed id, not the alias: the next turn's
-                # comparison is against what routing asked for.
-                self._applied_model = wanted_model
-            from omnigent.native.auto_retry import (
-                claim_execution,
-                current_guard,
-                get_snapshot,
-                prepare_submission,
             )
+            # Track the routed id, not the alias sent in the command.
+            self._applied_model = wanted_model
+        from omnigent.native.auto_retry import (
+            claim_execution,
+            current_guard,
+            get_snapshot,
+            prepare_submission,
+        )
 
-            guard = current_guard()
-            if guard is not None:
-                snapshot = await asyncio.to_thread(
-                    get_snapshot, self._bridge_dir, guard.session_id
-                )
-                prepare_submission(self._bridge_dir, native_idle=snapshot.idle, text=text)
-                await claim_execution()
-            await self._inject_prompt(text, notices)
+        guard = current_guard()
+        if guard is not None:
+            snapshot = await asyncio.to_thread(get_snapshot, self._bridge_dir, guard.session_id)
+            prepare_submission(self._bridge_dir, native_idle=snapshot.idle, text=text)
+            await claim_execution()
+        await self._inject_prompt(text, notices)
 
     async def _hold_message(self, refusal: RuntimeError, deadline: float) -> bool:
         """
@@ -488,6 +491,10 @@ class ClaudeNativeExecutor(Executor):
             surface,
             extra={"session_id": self._request_session_id},
         )
+        if surface == _SCROLLED_DRAFT_SURFACE:
+            return await self._poll_until(
+                deadline, lambda: claude_pane_ready(self._bridge_dir, require_empty=True)
+            )
         return await self._poll_until(deadline, lambda: claude_pane_ready(self._bridge_dir))
 
     async def _wait_for_answer(self, deadline: float) -> bool:
@@ -624,12 +631,59 @@ class ClaudeNativeExecutor(Executor):
         # ``/model`` only accepts this session's picker values, aliases, and
         # custom slot; anything else is ignored and the pane keeps its model.
         wanted_model_arg = self._model_command_arg(wanted_model)
+        claim_native_delivery = config.claim_native_delivery if config is not None else None
+        loop = asyncio.get_running_loop()
+        delivery_claimed = False
+
+        async def claim_delivery(deadline: float) -> bool:
+            nonlocal delivery_claimed
+            assert claim_native_delivery is not None
+            if not delivery_claimed:
+                delivery_claimed = await claim_native_delivery(deadline)
+            return delivery_claimed
+
+        cleanup_error = None
+        preserve_timed_out_pane = False
         try:
-            with telemetry.span("claude_native.inject"):
+            with (
+                telemetry.span("claude_native.inject"),
+                message_readiness_budget(
+                    claim=(
+                        lambda deadline: asyncio.run_coroutine_threadsafe(
+                            claim_delivery(deadline), loop
+                        )
+                    )
+                    if claim_native_delivery is not None
+                    else None
+                ),
+            ):
                 hold_deadline: float | None = None
                 while True:
                     try:
-                        await self._inject_turn(text, notices, wanted_model, wanted_model_arg)
+                        try:
+                            async with asyncio.timeout(message_readiness_remaining()):
+                                await self._inject_lock.acquire()
+                        except TimeoutError as exc:
+                            raise ClaudeMessageNotAccepted(
+                                "Claude's readiness wait expired before the message was typed."
+                            ) from exc
+                        owner: ClaudeDeliveryOwner | None = None
+                        try:
+                            owner = read_delivery_owner(self._bridge_dir)
+                            await self._inject_turn(text, notices, wanted_model, wanted_model_arg)
+                        except ClaudePromptTimeout as exc:
+                            # The bridge classifies post-paste failures before they reach cleanup.
+                            exited = isinstance(exc, ClaudeTerminalExited)
+                            preserve_timed_out_pane = not exited and await asyncio.to_thread(
+                                has_running_turn, self._bridge_dir, unknown_is_busy=True
+                            )
+                            if not preserve_timed_out_pane:
+                                cleanup_error = await self._reap_before_unlock(
+                                    owner, expected_close=not exited
+                                )
+                            raise
+                        finally:
+                            self._inject_lock.release()
                         break
                     except (
                         ClaudeUserPromptPending,
@@ -640,10 +694,18 @@ class ClaudeNativeExecutor(Executor):
                         if not _can_hold_refusal(exc):
                             raise
                         if hold_deadline is None:
-                            hold_deadline = asyncio.get_running_loop().time() + _MESSAGE_HOLD_S
+                            hold_deadline = loop.time() + message_readiness_remaining()
                         if not await self._hold_message(exc, hold_deadline):
                             raise
                         wanted_model_arg = self._model_command_arg(wanted_model)
+        except ClaudeDeliveryClaimRefused as exc:
+            yield ExecutorError(
+                message=str(exc),
+                code="native_input_claim_refused",
+                undelivered=True,
+                preserve_session=True,
+            )
+            return
         except NativeRetryRejected as exc:
             yield ExecutorError(
                 message=exc.reason, code=exc.reason, undelivered=True, preserve_session=True
@@ -661,7 +723,6 @@ class ClaudeNativeExecutor(Executor):
                 exc_info=not clean_exit,
                 extra={"session_id": self._request_session_id},
             )
-            cleanup_error = self._reap_failed_turn()
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
@@ -672,13 +733,12 @@ class ClaudeNativeExecutor(Executor):
                 "claude-native: prompt delivery to harness timed out",
                 extra={"session_id": self._request_session_id},
             )
-            # The pane is still alive here: this turn's error reports the close,
-            # so the runner must not also report the pane's exit as a failure.
-            cleanup_error = self._reap_failed_turn(expected_close=True)
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
-            yield ExecutorError(message=message, undelivered=True)
+            yield ExecutorError(
+                message=message, undelivered=True, preserve_session=preserve_timed_out_pane
+            )
             return
         except ClaudeSignInPending as exc:
             # The pane is parked on a launcher sign-in the person finishes from
@@ -715,6 +775,19 @@ class ClaudeNativeExecutor(Executor):
             )
             yield ExecutorError(message=describe_exception(exc), undelivered=True)
             return
+        except ClaudeDeliveryUnconfirmed as exc:
+            yield ExecutorError(
+                message=str(exc),
+                code=(
+                    "native_input_delivery_uncertain"
+                    if delivery_claimed
+                    else "claude_delivery_unconfirmed"
+                ),
+                title="Claude delivery is unconfirmed",
+                remediation="Inspect the terminal before sending this message again.",
+                preserve_session=True,
+            )
+            return
         except (TmuxSessionNotAdvertised, ClaudeMessageNotAccepted) as exc:
             # The terminal may still launch, or its unsent draft may be recoverable.
             _logger.warning(
@@ -735,7 +808,9 @@ class ClaudeNativeExecutor(Executor):
     async def _inject(self, operation: Callable[[], None]) -> None:
         """Drain cancelled delivery workers before releasing the pane's injection lock."""
         cancelled = threading.Event()
-        with cancellable_injection(cancelled):
+        paste_started = threading.Event()
+        owner = read_delivery_owner(self._bridge_dir)
+        with cancellable_injection(cancelled, paste_started=paste_started):
             worker = asyncio.create_task(asyncio.to_thread(operation))
         try:
             await asyncio.shield(worker)
@@ -746,13 +821,49 @@ class ClaudeNativeExecutor(Executor):
                     await asyncio.shield(worker)
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 worker.result()
-            self._reap_failed_turn()
+            if paste_started.is_set():
+                raise ClaudeDeliveryUnconfirmed(
+                    "Claude delivery was interrupted after the paste started. "
+                    "The message may already be queued or running."
+                ) from None
+            if not await asyncio.to_thread(
+                has_running_turn, self._bridge_dir, unknown_is_busy=True
+            ):
+                await self._reap_before_unlock(owner)
             raise
 
-    def _reap_failed_turn(self, *, expected_close: bool = False) -> str | None:
-        """Kill the Claude pane before a delivery timeout becomes ``failed``."""
+    async def _reap_before_unlock(
+        self, owner: ClaudeDeliveryOwner | None, *, expected_close: bool = False
+    ) -> str | None:
+        """Keep the pane's injection lock until the off-loop cleanup has finished."""
+        if owner is None:
+            return None
+        worker = asyncio.create_task(
+            asyncio.to_thread(self._reap_failed_turn, owner, expected_close=expected_close)
+        )
         try:
-            kill_session(self._bridge_dir, timeout_s=1.0, expected_close=expected_close)
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            while not worker.done():
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.shield(worker)
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                worker.result()
+            raise
+
+    def _reap_failed_turn(
+        self, owner: ClaudeDeliveryOwner | None, *, expected_close: bool = False
+    ) -> str | None:
+        """Kill the Claude pane before a delivery timeout becomes ``failed``."""
+        if owner is None:
+            return None
+        try:
+            kill_session(
+                self._bridge_dir,
+                timeout_s=1.0,
+                expected_close=expected_close,
+                expected_owner=owner,
+            )
         except TmuxSessionNotAdvertised:
             _logger.debug(
                 "claude-native: timed-out session already disappeared",

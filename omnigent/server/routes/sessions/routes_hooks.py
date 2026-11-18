@@ -592,7 +592,7 @@ _RESTORE_PUBLISH_TIMEOUT_S = 30.0
 _CARD_RETRY_INTERVAL_S = 120.0
 
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by server-minted globally unique elicitation IDs
-_pending_delivery_tasks: dict[str, asyncio.Task[bool]] = {}
+_pending_delivery_tasks: dict[str, asyncio.Task[bool | None]] = {}
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by server-minted globally unique elicitation IDs
 _grant_delivery_tasks: dict[str, asyncio.Task[None]] = {}
 # custom-lint: disable-next=workspace-scoped-cache -- server-minted globally unique elicitation IDs
@@ -757,6 +757,12 @@ async def _deliver_card_verdict(
                 )
             except TimeoutError:
                 continue
+            if delivered is None:
+                while not await _write_card_record(
+                    conversation_store.delete_detached_card, card.elicitation_id
+                ):
+                    await asyncio.sleep(_CARD_RETRY_INTERVAL_S)
+                return
             if not delivered:
                 await _persist_answer_delivery_notice(
                     card.session_id, text, conversation_store, status="waiting"
@@ -1228,7 +1234,7 @@ def _start_background_delivery(
     if elicitation_id is not None:
         _pending_delivery_tasks[elicitation_id] = task
 
-        def _forget_pending(done: asyncio.Task[bool]) -> None:
+        def _forget_pending(done: asyncio.Task[bool | None]) -> None:
             if _pending_delivery_tasks.get(elicitation_id) is done:
                 _pending_delivery_tasks.pop(elicitation_id, None)
 
