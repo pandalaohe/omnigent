@@ -198,14 +198,29 @@ def _process_boundary(
     token_ok=True,
     wrong_key_rejected=True,
     service_failures=None,
+    locked_result_action=None,
 ):
     calls = []
+    locked_result = None
+
+    if locked_result_action is not None:
+        unlink = Path.unlink
+
+        def unlink_result(path, *args, **kwargs):
+            if path == locked_result:
+                raise PermissionError("synthetic locked result file")
+            return unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", unlink_result)
 
     def run(argv, **kwargs):
+        nonlocal locked_result
         calls.append((argv, kwargs))
         code, output = 0, b""
         if "-Action" in argv:
             action = argv[argv.index("-Action") + 1]
+            if action == locked_result_action:
+                locked_result = Path(argv[argv.index("-ResultPath") + 1])
             failure = (service_failures or {}).get(action)
             if failure is not None:
                 code = 1
@@ -312,6 +327,48 @@ def test_install_cli_reports_service_failure(
     ]
     assert len(set(receipts)) == 3
     assert all(not receipt.exists() for receipt in receipts)
+
+
+def test_install_preserves_service_diagnostic_with_locked_result(enrolled, monkeypatch):
+    from omnigent.cli import cli
+
+    monkeypatch.setattr("omnigent._platform.IS_WINDOWS", True)
+    enrolled.key.unlink()
+    enrolled.key.with_suffix(".pub").unlink()
+    calls = _process_boundary(
+        monkeypatch,
+        enrolled,
+        service_failures={"Install": "sshd -t: invalid configuration"},
+        locked_result_action="Install",
+    )
+
+    result = CliRunner().invoke(cli, ["host", "admin-terminal", "install"], input="y\n")
+
+    assert result.exit_code == 1
+    assert "Install failed at sshd -t: invalid configuration" in result.output
+    assert [argv[argv.index("-Action") + 1] for argv, _ in calls if "-Action" in argv] == [
+        "Preflight",
+        "Install",
+        "Remove",
+    ]
+    assert not enrolled.key.exists() and not enrolled.key.with_suffix(".pub").exists()
+
+
+def test_remove_cleans_local_keys_with_locked_result(enrolled, monkeypatch):
+    from omnigent.cli import cli
+
+    monkeypatch.setattr("omnigent._platform.IS_WINDOWS", True)
+    known_hosts = enrolled.key.parent / "known_hosts"
+    known_hosts.touch()
+    calls = _process_boundary(monkeypatch, enrolled, locked_result_action="Remove")
+
+    result = CliRunner().invoke(cli, ["host", "admin-terminal", "remove"], input="y\n")
+
+    assert result.exit_code == 0, result.output
+    assert [argv[argv.index("-Action") + 1] for argv, _ in calls] == ["CheckOwned", "Remove"]
+    assert not enrolled.key.exists()
+    assert not enrolled.key.with_suffix(".pub").exists()
+    assert not known_hosts.exists()
 
 
 @pytest.mark.parametrize("operation", ["install", "remove"])

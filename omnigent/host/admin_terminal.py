@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import tempfile
@@ -90,7 +91,9 @@ def _service(action: str, launcher: WindowsSshLauncher, *, enrollment_id: str = 
             "this command does not change persistent execution policy."
         )
     finally:
-        result_path.unlink(missing_ok=True)
+        # Keep the service outcome authoritative if the result file is locked.
+        with contextlib.suppress(OSError):
+            result_path.unlink(missing_ok=True)
 
 
 def _check_launcher(launcher: WindowsSshLauncher) -> None:
