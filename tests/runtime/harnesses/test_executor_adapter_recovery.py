@@ -141,6 +141,49 @@ async def test_turn_end_consumes_accepted_injection_during_settlement_wait() -> 
         await asyncio.gather(task, return_exceptions=True)
 
 
+async def test_watch_injections_marks_reserved_enqueue_error_unconfirmed() -> None:
+    from omnigent.entities.subagent_retry import InputExecutionReceipt
+    from omnigent.server.schemas import InjectionUnconfirmedEvent, InputExecutionClaimEvent
+
+    enqueue_attempted = asyncio.Event()
+
+    class FailingExecutor(_FakeExecutor):
+        async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
+            enqueue_attempted.set()
+            raise RuntimeError("enqueue failed after reservation")
+
+    executor = FailingExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = _ctx("resp_enqueue_error")
+    ctx._push_injection(
+        CreateResponseRequest(
+            model="agent",
+            input="follow-up",
+            injection_id="inj_enqueue_error",
+            input_id="d" * 32,
+            input_admission_required=True,
+        )
+    )
+    watcher = asyncio.create_task(adapter._watch_injections(ctx, executor))
+    try:
+        async with asyncio.timeout(3):
+            reserve = await ctx._event_queue.get()
+            assert isinstance(reserve, InputExecutionClaimEvent)
+            assert reserve.claim.boundary == "injection_reserve"
+            assert ctx._complete_input_claim(
+                reserve.claim_id, InputExecutionReceipt(state="reserved", reason="reserved")
+            )
+            await enqueue_attempted.wait()
+        # The watcher handles the exception before awaiting its next injection.
+        emitted = []
+        while not ctx._event_queue.empty():
+            emitted.append(ctx._event_queue.get_nowait())
+        assert emitted == [InjectionUnconfirmedEvent(injection_id="inj_enqueue_error")]
+    finally:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+
+
 @pytest.mark.parametrize("steering_outcome", ["executor_accepted", "executor_refused", "error"])
 async def test_main_turn_and_steering_use_their_own_input_identity(
     steering_outcome: str, caplog: pytest.LogCaptureFixture

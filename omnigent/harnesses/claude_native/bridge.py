@@ -503,6 +503,7 @@ _DIALOG_FOOTER_RE = re.compile(
 )
 # Lines scanned for a dialog when no box rule anchors the region.
 _DIALOG_SCAN_TAIL_LINES = 15
+_API_KEY_CONSENT_HEADLINE = "Detected a custom API key in your environment"
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
 _CLAUDE_EXIT_DIAGNOSTIC_TIMEOUT_S = 0.5
@@ -914,6 +915,10 @@ class ClaudeUserPromptPending(RuntimeError):
 
 class ClaudeMessageNotAccepted(RuntimeError):
     """Delivery was refused before the message could be submitted."""
+
+
+class _MessageReadinessExpired(ClaudeMessageNotAccepted):
+    """The write budget expired before a terminal operation could start."""
 
 
 class ClaudeDeliveryUnconfirmed(RuntimeError):
@@ -5793,7 +5798,7 @@ def _claim_message_delivery() -> None:
 
 def _check_message_readiness_budget() -> None:
     if message_readiness_remaining() <= 0:
-        raise ClaudeMessageNotAccepted(
+        raise _MessageReadinessExpired(
             "Claude's readiness wait expired before the message was typed."
         )
 
@@ -6007,9 +6012,10 @@ def _paste_and_submit(
             state["accepted_input_tmux"] = tmux_info
             _write_json_file(bridge_dir / _STATE_FILE, state)
         return
+    # Keep automatic replay fenced after Enter, even when the full draft is visible.
     raise ClaudeDeliveryUnconfirmed(
-        "Claude did not confirm delivery. The draft is still in the input box. "
-        "The message may already be queued or running. Inspect the terminal before retrying."
+        "Claude did not accept the submitted message. The draft is still in the input box. "
+        "Inspect the draft in the terminal before submitting it."
     )
 
 
@@ -6149,11 +6155,13 @@ def _submit_left_composer(pane: str) -> bool:
     """Positive evidence after Enter: a mounted composer, or a dialog of the started turn."""
     if _occupied_tall_draft(pane):
         return False
-    return (
-        (_composer_row(pane) is not None and not _history_search_footer_shown(pane))
-        or _terminal_dialog_headline(pane) is not None
-        or _user_prompt_visible(pane)
-    )
+    if _composer_row(pane) is not None and not _history_search_footer_shown(pane):
+        return True
+    headline = _terminal_dialog_headline(pane)
+    # The startup card can cover a draft before Claude records the prompt.
+    if headline == _API_KEY_CONSENT_HEADLINE:
+        return False
+    return headline is not None or _user_prompt_visible(pane)
 
 
 def _paste_and_await_draft(
@@ -6292,8 +6300,8 @@ def _verify_submit_accepted(
         turn or a fresh native record of *submitted_text*.
     :param check_owner: Recheck that the message still belongs to the observed pane.
     :param read_receipt: Read fresh native evidence from the original paste boundary.
-    :returns: ``True`` when the draft left the input box (accepted),
-        ``False`` when it is still there after the full window.
+    :returns: ``True`` when delivery is confirmed. With *require_evidence*,
+        ``False`` means the complete draft remains visible after the verify window.
     :raises ClaudeDeliveryUnconfirmed: With *require_evidence*, the draft left
         without any such evidence; the message may already be queued or running.
     :raises ClaudeSubmitBlockedUnconfirmed: A fresh matching refusal appeared;
@@ -6322,6 +6330,9 @@ def _verify_submit_accepted(
     while (remaining := deadline - time.monotonic()) > 0:
         _check_injection_cancelled()
         time.sleep(min(_CLAUDE_READY_POLL_INTERVAL_S, remaining))
+        if require_evidence and time.monotonic() >= deadline:
+            # A capture skipped at the deadline would look like a failed pane read.
+            break
         pane = _capture_pane(socket_path, tmux_target)
         if check_owner is not None and not check_owner():
             raise ClaudeDeliveryUnconfirmed(
@@ -6419,12 +6430,18 @@ def _verify_submit_accepted(
             token = _message_readiness_deadline.set(deadline)
             try:
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            except _MessageReadinessExpired:
+                # The lock wait consumed the remaining budget without sending a key.
+                break
             finally:
                 _message_readiness_deadline.reset(token)
             retries += 1
             delivery_diagnostics.record_details(retries=retries)
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
+    if read_receipt is not None and read_receipt() is True:
+        delivery_diagnostics.record_details(verification="native_recorded")
+        return True
     delivery_diagnostics.record_verification(
         draft_still_present=draft_present,
         pane=pane,
@@ -6439,7 +6456,9 @@ def _verify_submit_accepted(
             "The Claude terminal exited before delivery of the pasted message could be "
             "confirmed. Check the conversation before retrying."
         )
-    if require_evidence and not draft_present:
+    if require_evidence and not (
+        draft_present and submitted_text is not None and _full_draft_visible(pane, submitted_text)
+    ):
         if pane.strip():
             delivery_diagnostics.record_details(verification="unconfirmed_submit")
         raise ClaudeDeliveryUnconfirmed(
@@ -7845,9 +7864,9 @@ def _run_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) 
                 owner.capture_receipt_boundary()
                 _check_injection_cancelled()
             bounds_input = operation in ("send-keys", "paste-buffer", "load-buffer")
+            timeout = _tmux_call_timeout_s(include_message_deadline=bounds_input)
             if bounds_input:
                 _check_message_readiness_budget()
-            timeout = _tmux_call_timeout_s(include_message_deadline=bounds_input)
             if timeout <= 0.0:
                 raise RuntimeError(f"tmux command timed out after {timeout}s")
             if operation == "paste-buffer":
@@ -9536,6 +9555,23 @@ def _draft_in_input_box(pane: str, needle: str, *, tail_needle: str = "") -> boo
     )
 
 
+def _full_draft_visible(pane: str, submitted_text: str) -> bool:
+    """Check the complete framed draft rather than its marker or a paste placeholder."""
+    box = _composer_box(pane)
+    if box is None or not box.framed or _occupied_tall_draft(pane):
+        return False
+    first_row = box.rows[0].lstrip()
+    if not first_row.startswith(_CLAUDE_PROMPT_GLYPH):
+        return False
+    visible = "\n".join([first_row.removeprefix(_CLAUDE_PROMPT_GLYPH), *box.rows[1:]])
+    expected = _comparable_draft_text(submitted_text)
+    return (
+        bool(expected)
+        and _PASTED_PLACEHOLDER_PREFIX not in visible
+        and _comparable_draft_text(visible) == expected
+    )
+
+
 def _comparable_draft_text(text: str) -> str:
     """
     Reduce draft text to the characters a pane capture can be matched on.
@@ -9620,7 +9656,7 @@ def _terminal_dialog_headline(pane: str) -> str | None:
     last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
     region = lines[last_rule + 1 :] if last_rule is not None else lines[-_DIALOG_SCAN_TAIL_LINES:]
     if _api_key_consent_visible("\n".join(line.strip(" \t│") for line in region)):
-        return "Detected a custom API key in your environment"
+        return _API_KEY_CONSENT_HEADLINE
     footer = next((line for line in reversed(region) if _DIALOG_FOOTER_RE.search(line)), None)
     if footer is None:
         return None

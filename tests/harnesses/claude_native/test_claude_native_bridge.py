@@ -7894,11 +7894,11 @@ def test_inject_user_message_ignores_rows_below_an_unclosed_input_box(
     assert tui["enters"] == 1, f"Expected one submit Enter, got {tui['enters']}."
 
 
-@pytest.mark.parametrize("capture_lost", [False, True], ids=["draft-remains", "capture-lost"])
+@pytest.mark.parametrize("final_frame", ["draft-remains", "capture-lost", "partial-draft"])
 def test_inject_user_message_raises_when_draft_never_submits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capture_lost: bool,
+    final_frame: str,
 ) -> None:
     """
     Injection fails loud when the draft never leaves the input box.
@@ -7925,6 +7925,7 @@ def test_inject_user_message_raises_when_draft_never_submits(
         bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "claude-session"}
     )
 
+    content = "fix the flaky test and verify the result"
     tui = {"pane": _composer_pane(), "enters": 0}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
@@ -7941,23 +7942,32 @@ def test_inject_user_message_raises_when_draft_never_submits(
         """
         del kwargs
         if "capture-pane" in cmd:
-            pane = "" if capture_lost and tui["enters"] else tui["pane"]
+            pane = tui["pane"]
+            if tui["enters"]:
+                if final_frame == "capture-lost":
+                    pane = ""
+                elif final_frame == "partial-draft":
+                    pane = _composer_pane(content[: claude_native_bridge._DRAFT_NEEDLE_MAX_CHARS])
             return SimpleNamespace(returncode=0, stdout=pane, stderr="")
         if "paste-buffer" in cmd:
-            tui["pane"] = _composer_pane("fix the flaky test")
+            tui["pane"] = _composer_pane(content)
         if cmd[-1] == "Enter":
             tui["enters"] += 1
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    error_message = "could not be confirmed" if capture_lost else "draft is still in the input box"
+    error_message = (
+        "draft is still in the input box"
+        if final_frame == "draft-remains"
+        else "could not be confirmed"
+    )
     with pytest.raises(claude_native_bridge.ClaudeDeliveryUnconfirmed, match=error_message):
-        inject_user_message(bridge_dir, content="fix the flaky test", timeout_s=0.3)
-    if capture_lost:
+        inject_user_message(bridge_dir, content=content, timeout_s=0.3)
+    if final_frame == "capture-lost":
         assert tui["enters"] == 1
 
 
-def test_stalled_tui_backs_off_enter_retries_and_leaves_delivery_unconfirmed(
+def test_stalled_tui_backs_off_enter_retries_and_preserves_the_full_draft(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7967,8 +7977,8 @@ def test_stalled_tui_backs_off_enter_retries_and_leaves_delivery_unconfirmed(
     Every Enter sent while the TUI is unresponsive queues in the pty and
     replays when the TUI recovers; a fixed 1s cadence piles up dozens of
     them over the verify window. The retries must back off exponentially
-    (capped), so the eventual replay burst stays small. With no confirmation
-    by the deadline, the paste may still have reached Claude.
+    (capped), so the eventual replay burst stays small. When the full draft
+    remains at the deadline, it stays in the composer for the person to submit.
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(
@@ -8015,7 +8025,7 @@ def test_stalled_tui_backs_off_enter_retries_and_leaves_delivery_unconfirmed(
 
     monkeypatch.setattr("subprocess.run", _fake_run)
     with pytest.raises(
-        claude_native_bridge.ClaudeDeliveryUnconfirmed, match="may already be queued or running"
+        claude_native_bridge.ClaudeDeliveryUnconfirmed, match="draft is still in the input box"
     ):
         inject_user_message(bridge_dir, content="fix the flaky test", timeout_s=0.5)
 
@@ -8270,13 +8280,12 @@ def test_retry_enter_rechecks_local_deadline_after_metadata_lock(
 
     monkeypatch.setattr(bridge.native_bridge_common, "_bridge_dir_lock", metadata_lock)
     monkeypatch.setattr("subprocess.run", run)
-    with pytest.raises(RuntimeError) as raised:
+    with pytest.raises(bridge.ClaudeDeliveryUnconfirmed, match="draft is still in the input box"):
         inject_user_message(bridge_dir, content=content, timeout_s=2.0)
 
     assert len(enters) == 1
     assert retry_lock_timeouts == [pytest.approx(0.03)]
     assert clock.now > enters[0] + 0.3
-    assert isinstance(raised.value, bridge.ClaudeDeliveryUnconfirmed)
 
 
 def test_message_deadline_is_checked_after_the_final_pre_paste_capture(
@@ -16807,9 +16816,16 @@ _TRUST_DIALOG_PANE = """\
 _DIALOG_ECHO_ABOVE_COMPOSER_PANE = _MCP_APPROVAL_DIALOG_PANE + _READY_PANE
 
 
-@pytest.mark.parametrize("real_consent", [False, True], ids=["old-output", "clipped-api-key"])
-def test_permission_controls_belong_to_one_live_card(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_consent: bool
+@pytest.mark.parametrize(
+    ("real_consent", "matching_receipt"),
+    [
+        pytest.param(False, False, id="old-output"),
+        pytest.param(True, False, id="clipped-api-key"),
+        pytest.param(True, True, id="clipped-api-key-with-receipt"),
+    ],
+)
+def test_clipped_api_key_card_requires_a_matching_receipt_to_confirm_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_consent: bool, matching_receipt: bool
 ) -> None:
     bridge = claude_native_bridge
     monkeypatch.setattr(bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.3)
@@ -16823,11 +16839,35 @@ def test_permission_controls_belong_to_one_live_card(
     pane = (
         _API_KEY_DIALOG_PANE.rsplit("  Enter to confirm", 1)[0] if real_consent else echoed_output
     )
+    transcript = tmp_path / "session.jsonl"
+
+    def write_receipt(_now: float) -> None:
+        if matching_receipt and "submit" in mutations and not transcript.exists():
+            record = {
+                "type": "user",
+                "sessionId": "claude-session",
+                "uuid": "user-1",
+                "message": {"role": "user", "content": content},
+            }
+            transcript.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
     bridge_dir, mutations, _clock = _scripted_paste_tui(
-        monkeypatch, tmp_path, lambda *_: _composer_pane(content), after_submit=pane
+        monkeypatch,
+        tmp_path,
+        lambda *_: _composer_pane(content),
+        after_submit=pane,
+        on_capture=write_receipt,
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript),
+        },
     )
 
-    if real_consent:
+    if matching_receipt:
         inject_user_message(bridge_dir, content=content)
     else:
         with pytest.raises(bridge.ClaudeDeliveryUnconfirmed):
