@@ -7058,23 +7058,200 @@ def test_inject_user_message_submits_a_clipped_draft_once(
         assert mutations == ["paste", "submit"]
 
 
+_CLIPPED_FOOTER = (
+    "  [Model] │ workspace\n  Context 158k/1.0M\n  ✓ Bash ×13\n  -- INSERT -- ⏵⏵ auto mode on\n"
+)
+
+
+def _scripted_paste_tui(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    after_paste: Callable[[int, float], str],
+    *,
+    after_submit: str | None = None,
+    on_capture: Callable[[float], None] | None = None,
+) -> tuple[Path, list[str], _VirtualClock]:
+    """Fake one Claude pane: an idle composer, then scripted frames after the paste.
+
+    :param after_paste: Frame for the Nth capture after the first paste at a virtual time.
+    :param after_submit: Frame after the first Enter; defaults to an empty composer.
+    :param on_capture: Side effect run on every capture, e.g. writing a transcript record.
+    :returns: The bridge directory, the recorded mutations and the clock.
+    """
+    bridge = claude_native_bridge
+    clock = _VirtualClock()
+    monkeypatch.setattr(bridge, "time", clock)
+    monkeypatch.setattr(bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(bridge, "_TMUX_READY_TIMEOUT_S", 1.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=_TEST_TMUX_SOCKET, tmux_target="claude:0.0")
+    mutations: list[str] = []
+    captures_after_paste = [0]
+
+    def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        if "capture-pane" in cmd:
+            if on_capture is not None:
+                on_capture(clock.monotonic())
+            visible = _composer_pane()
+            if "submit" in mutations:
+                visible = _composer_pane() if after_submit is None else after_submit
+            elif "paste" in mutations:
+                captures_after_paste[0] += 1
+                visible = after_paste(captures_after_paste[0], clock.monotonic())
+            return SimpleNamespace(returncode=0, stdout=visible, stderr="")
+        if "paste-buffer" in cmd:
+            mutations.append("paste")
+        if cmd[-1] == "Enter":
+            mutations.append("submit")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", run)
+    return bridge_dir, mutations, clock
+
+
+def test_inject_user_message_waits_for_a_late_paste_without_replaying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A paste the TUI shows after the draft wait is submitted once, never pasted again."""
+    content = "please review the attached change"
+    bridge_dir, mutations, _clock = _scripted_paste_tui(
+        monkeypatch,
+        tmp_path,
+        lambda _n, now: _composer_pane(content) if now >= 2.0 else _composer_pane(),
+    )
+
+    inject_user_message(bridge_dir, content=content)
+
+    assert mutations == ["paste", "submit"]
+
+
+def test_inject_user_message_accepts_a_late_paste_the_tui_submitted_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh native record of the original paste settles delivery without Enter or replay."""
+    content = "please review the attached change"
+    transcript = tmp_path / "session.jsonl"
+    record = {
+        "type": "user",
+        "sessionId": "claude-session",
+        "uuid": "user-1",
+        "message": {"role": "user", "content": content},
+    }
+
+    def write_receipt(now: float) -> None:
+        if now >= 1.5 and not transcript.exists():
+            transcript.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    bridge_dir, mutations, _clock = _scripted_paste_tui(
+        monkeypatch, tmp_path, lambda _n, _now: _composer_pane(), on_capture=write_receipt
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript),
+        },
+    )
+
+    inject_user_message(bridge_dir, content=content)
+
+    assert mutations == ["paste"]
+
+
+def test_inject_user_message_does_not_report_a_repaint_frame_as_delivered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A frame without the draft and without a composer proves nothing after Enter."""
+    content = "please review the attached change"
+    bridge_dir, mutations, _clock = _scripted_paste_tui(
+        monkeypatch,
+        tmp_path,
+        lambda _n, _now: _composer_pane(content),
+        after_submit="Repainting…\n",
+    )
+
+    with pytest.raises(claude_native_bridge.ClaudeDeliveryUnconfirmed):
+        inject_user_message(bridge_dir, content=content)
+
+    assert mutations == ["paste", "submit"]
+
+
+_SLASH_MENU_PANE = (
+    "──────────────────────────────\n"
+    "❯ /\n"
+    "──────────────────────────────\n"
+    "  /help        Show help and available commands\n"
+    "  /hooks       Manage hook configurations\n"
+)
+
+
 @pytest.mark.parametrize(
-    "replay_captures,recovered_draft",
-    [(8, ""), (25, ""), (8, "unfinished terminal edit")],
-    ids=["composer-returned", "still-replaying", "nonempty-composer"],
+    "frame",
+    [
+        pytest.param(
+            lambda n, content: _composer_pane(content) if n == 1 else _composer_pane(),
+            id="cleared-before-enter",
+        ),
+        pytest.param(
+            lambda n, content: _composer_pane(content) if n == 1 else _SLASH_MENU_PANE,
+            id="slash-menu-before-enter",
+        ),
+        pytest.param(
+            lambda _n, content: f"❯ {content}\n  ⎿  done\n{_composer_pane()}",
+            id="old-echo-above-empty-composer",
+        ),
+    ],
+)
+def test_inject_user_message_never_submits_without_the_current_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, frame: Callable[[int, str], str]
+) -> None:
+    """Enter needs the draft in the composer right before it, whatever its shape."""
+    content = "please review the attached change"
+    bridge_dir, mutations, _clock = _scripted_paste_tui(
+        monkeypatch, tmp_path, lambda n, _now: frame(n, content)
+    )
+
+    with pytest.raises(claude_native_bridge.ClaudeDeliveryUnconfirmed):
+        inject_user_message(bridge_dir, content=content)
+
+    assert mutations == ["paste"]
+
+
+def test_inject_user_message_confirms_a_clipped_draft_ending_in_a_short_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scrolled draft whose last line is too short alone is matched across lines."""
+    rule = "─" * 52
+    pane = f"  in the next report, include the counts\n  OK\n{rule}\n{_CLIPPED_FOOTER}"
+    content = "Please finish verifying the change.\nin the next report, include the counts\nOK"
+    bridge_dir, mutations, _clock = _scripted_paste_tui(
+        monkeypatch, tmp_path, lambda _n, _now: pane
+    )
+
+    inject_user_message(bridge_dir, content=content)
+
+    assert mutations == ["paste", "submit"]
+
+
+@pytest.mark.parametrize(
+    "replay_captures,recovered_draft,late_draft",
+    [(8, "", True), (25, "", True), (8, "", False), (8, "unfinished terminal edit", False)],
+    ids=["composer-returned", "still-replaying", "never-visible", "nonempty-composer"],
 )
 def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     replay_captures: int,
     recovered_draft: str,
+    late_draft: bool,
 ) -> None:
     """
     A paste that lands while a resumed TUI is still replaying must not be submitted blind.
 
-    The first paste is dropped while replaying; the composer may return before
-    the paste wait ends. Delivery pastes once more and presses Enter only after
-    the draft is visible in the input box.
+    The first paste may remain unobserved while Claude replays its transcript.
+    Continue observing it without pasting again or pressing an unverified Enter.
+    A late draft receives one Enter; a draft that never shows is left unconfirmed.
     """
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
@@ -7114,7 +7291,11 @@ def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
                 tui["replay_captures"] += 1
                 if tui["replay_captures"] > replay_captures:
                     tui["replaying"] = False
-                    tui["pane"] = _composer_pane(recovered_draft)
+                    tui["pane"] = (
+                        pasted_pane
+                        if late_draft and tui["pastes"] == 1
+                        else _composer_pane(recovered_draft)
+                    )
                 else:
                     return SimpleNamespace(returncode=0, stdout=replay_pane, stderr="")
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
@@ -7147,13 +7328,21 @@ def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
         assert tui["enter_saw_draft"] == []
         assert tui["pane"] == _composer_pane(recovered_draft)
         return
+    if not late_draft:
+        with pytest.raises(claude_native_bridge.ClaudeDeliveryUnconfirmed):
+            inject_user_message(
+                bridge_dir, content="Task: ship the paste submit fix and verify\n" * 8
+            )
+        assert tui["pastes"] == 1
+        assert tui["enter_saw_draft"] == []
+        return
     inject_user_message(bridge_dir, content="Task: ship the paste submit fix and verify\n" * 8)
 
     assert tui["enter_saw_draft"] == [True], (
         "An Enter was pressed while the composer was not showing the draft: "
         f"{tui['enter_saw_draft']}"
     )
-    assert tui["pastes"] == 2, "The message should be pasted again once the composer is back."
+    assert tui["pastes"] == 1, "The original paste must never be pasted again."
     assert tui["pane"] == _composer_pane(), "The message was left unsent in the input box."
 
 
@@ -18326,18 +18515,17 @@ def _post_turn_pane(draft: str = "") -> str:
     )
 
 
-def test_inject_user_message_placeholder_paste_never_matched_does_not_raise(
+def test_inject_user_message_placeholder_paste_never_matched_is_left_unconfirmed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A large paste whose needle never appears submits without raising.
+    """A large paste whose draft is never identified is reported unconfirmed, not submitted.
 
     The live input box only ever shows an empty ``❯`` row (the large paste
     collapsed to a ``[Pasted text]`` placeholder that this fake omits), so
-    ``_draft_in_input_box`` never matches the needle and the paste-commit
-    poll window expires.  The helper must fall through and submit rather
-    than hard-fail. No UserPromptSubmit hook is required to acknowledge
-    this submission; its absence must not mark a running CLI as failed.
+    ``_draft_in_input_box`` never matches the needle. The paste may still be
+    accepted late, so an Enter or a second paste could submit it twice; the
+    delivery ends unconfirmed with the pane left for inspection.
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(
@@ -18375,9 +18563,10 @@ def test_inject_user_message_placeholder_paste_never_matched_does_not_raise(
 
     monkeypatch.setattr("subprocess.run", _fake_run)
 
-    # Must not raise: the placeholder paste falls through to a submit.
-    inject_user_message(bridge_dir, content=large_prompt)
-    assert enter_calls, "expected at least one submit Enter"
+    # Never identified: the paste may still land late, so no blind Enter and no replay.
+    with pytest.raises(claude_native_bridge.ClaudeDeliveryUnconfirmed):
+        inject_user_message(bridge_dir, content=large_prompt)
+    assert enter_calls == []
 
 
 def test_inject_user_message_whitespace_only_content_submits_blind(

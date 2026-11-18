@@ -56,6 +56,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    InjectionDeliveryAmbiguous,
     Message,
     TextChunk,
     ToolSpec,
@@ -207,6 +208,9 @@ class ClaudeNativeExecutor(Executor):
         try:
             async with self._inject_lock:
                 await self._inject_prompt(text, framework_notices(content))
+        except ClaudeDeliveryUnconfirmed as exc:
+            # Claude may already hold the paste; returning it to the runner would replay it.
+            raise InjectionDeliveryAmbiguous(str(exc)) from exc
         except RuntimeError:
             return False
         return True
@@ -718,7 +722,11 @@ class ClaudeNativeExecutor(Executor):
             return
         except ClaudeDeliveryUnconfirmed as exc:
             yield ExecutorError(
-                message=describe_exception(exc), undelivered=True, preserve_session=True
+                message=str(exc),
+                code="claude_delivery_unconfirmed",
+                title="Claude delivery is unconfirmed",
+                remediation="Inspect the terminal before sending this message again.",
+                preserve_session=True,
             )
             return
         except (TmuxSessionNotAdvertised, ClaudeMessageNotAccepted) as exc:

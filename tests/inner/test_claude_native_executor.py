@@ -30,7 +30,13 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
-from omnigent.inner.executor import ExecutorConfig, ExecutorError, TextChunk, TurnComplete
+from omnigent.inner.executor import (
+    ExecutorConfig,
+    ExecutorError,
+    InjectionDeliveryAmbiguous,
+    TextChunk,
+    TurnComplete,
+)
 from omnigent.inner.native_attachments import attachment_cache_dir
 from omnigent.llms.context_window import ModelPricing
 
@@ -2411,8 +2417,35 @@ async def test_run_turn_does_not_reap_unrelated_runtime_error(
     assert killed == []
     assert isinstance(events[0], ExecutorError)
     assert events[0].message == str(error)
-    assert events[0].undelivered is isinstance(error, ClaudeDeliveryUnconfirmed)
+    # An unconfirmed paste may already be queued or running: never requeue it.
+    assert events[0].undelivered is False
     assert events[0].preserve_session is isinstance(error, ClaudeDeliveryUnconfirmed)
+    if isinstance(error, ClaudeDeliveryUnconfirmed):
+        assert events[0].code == "claude_delivery_unconfirmed"
+        assert events[0].title == "Claude delivery is unconfirmed"
+        assert events[0].remediation
+
+
+@pytest.mark.asyncio
+async def test_live_steer_reports_an_unconfirmed_paste_as_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A live-steered paste Claude may hold must not return to the runner for replay."""
+    attempts: list[str] = []
+
+    def unconfirmed(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, timeout_s
+        attempts.append(content)
+        raise ClaudeDeliveryUnconfirmed("Claude did not confirm this pasted message")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", unconfirmed)
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+
+    with pytest.raises(InjectionDeliveryAmbiguous):
+        await executor.enqueue_session_message("session", "keep the original input")
+
+    assert attempts == ["keep the original input"]
 
 
 @pytest.mark.asyncio
