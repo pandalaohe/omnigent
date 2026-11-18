@@ -16518,6 +16518,43 @@ async def test_input_sending_reaches_public_session_stream(client: httpx.AsyncCl
     assert frames == [{"sequence_number": None, **event} for event in events]
 
 
+async def test_native_paste_claim_is_bound_to_runner_and_attempt(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.runtime import pending_inputs
+
+    agent = await create_test_agent(client)
+    session_id = (await _create_session(client, agent["id"]))["id"]
+    binding = "test-delivery-binding"
+    assert SqlAlchemyConversationStore(db_uri).set_runner_id(
+        session_id, token_bound_runner_id(binding)
+    )
+    pending_id = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "hello"}], runner_managed=True
+    )
+    endpoint = f"/v1/sessions/{session_id}/pending-inputs/{pending_id}/claim"
+    attempt_id = pending_inputs.delivery_attributes_for(session_id, pending_id)[
+        "delivery_attempt_id"
+    ]
+
+    async def claim(token: str, attempt: str, nonce: str) -> httpx.Response:
+        return await client.post(
+            endpoint,
+            params={"attempt_id": attempt, "claim_id": nonce},
+            headers={RUNNER_TUNNEL_TOKEN_HEADER: token},
+        )
+
+    try:
+        assert isinstance(attempt_id, str)
+        assert (await claim("other-binding", attempt_id, "one")).status_code == 403
+        assert (await claim(binding, "other-attempt", "one")).json() == {"claimed": False}
+        assert (await claim(binding, attempt_id, "one")).json() == {"claimed": True}
+        assert (await claim(binding, attempt_id, "two")).json() == {"claimed": False}
+    finally:
+        pending_inputs.resolve(session_id, pending_id)
+
+
 @pytest.mark.parametrize("entry", ["legacy-scalar", "sdk-scalar", "tombstone"])
 async def test_codex_approval_mode_stream_omits_absent_observation_projections(
     client: httpx.AsyncClient,

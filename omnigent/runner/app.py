@@ -2706,13 +2706,16 @@ def create_runner_app(
                     },
                     timeout=min(5, max(0.001, deadline - time.time())),
                 )
-                if response.status_code < 500:
+                if response.is_success:
+                    decision = response.json()
                     return (
-                        response.is_success
-                        and response.json().get("claimed") is True
+                        isinstance(decision, dict)
+                        and decision.get("claimed") is True
                         and time.time() < deadline
                         and claim.turn_id == _live_response_id.get(session_id)
                     )
+                if response.status_code < 500:
+                    return False
             except (httpx.HTTPError, ValueError, RuntimeError, ConnectionError):
                 pass
             await asyncio.sleep(min(1, max(0, deadline - time.time())))

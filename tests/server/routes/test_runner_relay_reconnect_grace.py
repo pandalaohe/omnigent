@@ -82,6 +82,7 @@ async def test_runner_pending_input_reconciles_or_expires(db_uri, monkeypatch, e
     assert "sending_since_ms" in pending_inputs.snapshot_for(session_id)[0]
     if expires:
         now += 601
+        assert not pending_inputs.claim_runner_input(session_id, pending_id, "lapsed_before_watch")
         await orchestration._watch_runner_input_lease(store, session_id, pending_id)
     else:
         await orchestration._reconcile_runner_input_leases(

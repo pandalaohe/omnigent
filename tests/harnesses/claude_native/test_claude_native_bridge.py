@@ -22,7 +22,7 @@ import threading
 import time
 import unicodedata
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -7056,6 +7056,30 @@ def test_inject_user_message_submits_a_clipped_draft_once(
     else:
         inject_user_message(bridge_dir, content=content)
         assert mutations == ["paste", "submit"]
+
+
+def test_refused_server_claim_does_not_paste(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = claude_native_bridge
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    mutations: list[str] = []
+
+    def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=_composer_pane(), stderr="")
+        mutations.append(" ".join(cmd))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    result: Future[bool] = Future()
+    result.set_result(False)
+    monkeypatch.setattr("subprocess.run", run)
+
+    with bridge.message_readiness_budget(1, claim=lambda _deadline: result):
+        with pytest.raises(bridge.ClaudeDeliveryClaimRefused):
+            inject_user_message(bridge_dir, content="one message")
+
+    assert not any("paste-buffer" in cmd or "send-keys" in cmd for cmd in mutations)
 
 
 @pytest.mark.parametrize("recovers", [True, False])
