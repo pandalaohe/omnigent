@@ -86,34 +86,62 @@ def choice_settings_snapshot(app, owner):
         raise HTTPException(409, {"code": "session_choice_configuration"}) from None
 
 
-async def _close_drain_locks(app, owner, *, pools=(), route=None, host=None, agent=None):
+async def _flush_drain_closures(app, owner) -> bool:
+    """Acknowledge observed closures only after the owner-scoped delete commits."""
+    state = state_for(app)
+    pending = state.pending_drain_closures.get(owner)
+    if not pending:
+        return True
     prefs = getattr(app.state, "user_preferences_store", None)
-    if prefs is None:
-        return
     try:
-        groups = await asyncio.to_thread(read_provider_groups, prefs, owner) if pools else {}
-        closed_pools = {canonical_pool(pool, groups) for pool in pools}
-        await asyncio.to_thread(
-            prefs.close_choice_drain_locks,
-            owner,
-            lambda lock: (
-                (not closed_pools or canonical_pool(lock.pool, groups) in closed_pools)
-                and (route is None or lock.route == route)
-                and (host is None or lock.host_id == host)
-                and (agent is None or lock.saved_link.agent_id == agent)
-            ),
-        )
+        if prefs is not None:
+            await asyncio.to_thread(
+                prefs.close_choice_drain_locks,
+                owner,
+                lambda lock: any(matches(lock) for _, matches in pending),
+            )
     except Exception:
         _logger.exception("Could not clear session choice drain locks for %s", owner)
+        return False
+    state.quota_rejections.update(receipt for receipt, _ in pending if receipt is not None)
+    del state.pending_drain_closures[owner]
+    return True
 
 
-async def _apply_drain_delta(app, owner, snapshot, *, drops=(), admitted=None) -> bool:
+async def _close_drain_locks(
+    app, owner, *, observed_at, receipt=None, pools=(), route=None, host=None, agent=None, drops=()
+) -> bool:
+    prefs = getattr(app.state, "user_preferences_store", None)
+    groups = await asyncio.to_thread(read_provider_groups, prefs, owner) if pools else {}
+    closed_pools = {canonical_pool(pool, groups) for pool in pools}
+
+    def matches(lock: DrainLock) -> bool:
+        if drops:
+            # PUT may have carried the same lock into a newer settings revision.
+            return lock.model_copy(update={"settings_revision": ""}) in observed_locks
+        return (
+            lock.since <= observed_at
+            and (not closed_pools or canonical_pool(lock.pool, groups) in closed_pools)
+            and (route is None or lock.route == route)
+            and (host is None or lock.host_id == host)
+            and (agent is None or lock.saved_link.agent_id == agent)
+        )
+
+    observed_locks = tuple(drop.model_copy(update={"settings_revision": ""}) for drop in drops)
+    state_for(app).pending_drain_closures.setdefault(owner, []).append((receipt, matches))
+    if await _flush_drain_closures(app, owner):
+        return True
+    # Retry a transient write failure before relying on in-process redelivery.
+    return await _flush_drain_closures(app, owner)
+
+
+async def _persist_admitted_drain(app, owner, snapshot, admitted) -> bool:
     prefs = getattr(app.state, "user_preferences_store", None)
     if prefs is None:
         return False
     try:
         return await asyncio.to_thread(
-            prefs.apply_drain_lock_delta, owner, snapshot, drops=drops, admitted=admitted
+            prefs.apply_drain_lock_delta, owner, snapshot, admitted=admitted
         )
     except Exception:
         _logger.exception("Could not persist session choice drain locks for %s", owner)
@@ -576,15 +604,21 @@ async def record_quota_exhaustion(
     # Older forwarders omit turn ids; deduplicate their exact rejection instead.
     identity = (session.id, response_id or hashlib.sha256(message.encode()).hexdigest())
     async with admission_locks.hold(f"owner:{owner}"):
+        await _flush_drain_closures(app, owner)
         if identity in state.quota_rejections:
+            return
+        if any(receipt == identity for receipt, _ in state.pending_drain_closures.get(owner, ())):
             return
         if reason is None:
             assert until is not None
-            state.quota_rejections.add(identity)
             key = (owner, pool)
             state.exhausted[key] = max(state.exhausted.get(key, 0), until)
             if until > now:
-                await _close_drain_locks(app, owner, pools=(pool,))
+                await _close_drain_locks(
+                    app, owner, observed_at=now, receipt=identity, pools=(pool,)
+                )
+            else:
+                state.quota_rejections.add(identity)
             return
         if (
             not from_runner
@@ -610,9 +644,10 @@ async def record_quota_exhaustion(
             or attempt[2] <= state.provider_recoveries.get(key, float("-inf"))
         ):
             return
-        state.quota_rejections.add(identity)
         state.refusals[key] = ProviderRefusal(reason, now, until, session.id, identity[1])
-        await _close_drain_locks(app, owner, pools=(pool,), route=route)
+        await _close_drain_locks(
+            app, owner, observed_at=now, receipt=identity, pools=(pool,), route=route
+        )
 
 
 async def record_provider_recovery(
@@ -734,7 +769,13 @@ async def observe_external_admission(
         )
         pending = ExternalRefusal(scope, rule, until, states)
     async with admission_locks.hold(f"owner:{owner}"):
+        await _flush_drain_closures(app, owner)
         if identity in choice_state.quota_rejections:
+            return
+        if any(
+            receipt == identity
+            for receipt, _ in choice_state.pending_drain_closures.get(owner, ())
+        ):
             return
         terminal = state.terminal_status(key) if response_id else status
         if terminal is not None and terminal != "failed":
@@ -747,9 +788,9 @@ async def observe_external_admission(
         state.pending.pop(key, None)
         if pending is not None:
             state.exclusions[scope] = pending
-            # Retain the receipt after expiry so redelivery cannot restart the window.
-            choice_state.quota_rejections.add(identity)
-            await _close_drain_locks(app, owner, host=rule.host, agent=rule.agent)
+            await _close_drain_locks(
+                app, owner, observed_at=now, receipt=identity, host=rule.host, agent=rule.agent
+            )
 
 
 def external_route_inputs(app, owner, host, now):
@@ -1217,6 +1258,7 @@ class CreateChoice:
     owner: str
     snapshot: SessionChoiceSnapshot
     drain_lock: DrainLock | None = None
+    committed_drain: bool = False
 
     async def persisted(self, app: Any, session: Conversation) -> None:
         if app.state.permission_store is not None:
@@ -1229,7 +1271,16 @@ class CreateChoice:
         if self.drain_lock is not None and session.labels.get(SLOT_LABEL, "").startswith(
             "admitted@"
         ):
-            await _apply_drain_delta(app, self.owner, self.snapshot, admitted=self.drain_lock)
+            self.committed_drain = await _persist_admitted_drain(
+                app, self.owner, self.snapshot, self.drain_lock
+            )
+            if self.committed_drain:
+                link = self.choice.link
+                assert link is not None
+                self.choice = replace(
+                    self.choice,
+                    reason=f"{self.choice.reason}. Started draining {link.model or link.agent_id}",
+                )
         await self.stack.aclose()
 
     def labels(self, now: float, *, host_load_held: bool = False) -> dict[str, str]:
@@ -1275,9 +1326,20 @@ async def admit_create(
         yield None
         return
     pin = override.get("pin") if isinstance(override, dict) else None
+    named = bool(body.agent_id and (body.user_named or body.choice_reason))
     async with AsyncExitStack() as stack:
         await stack.enter_async_context(app.state.child_cap_locks.hold(f"owner:{owner}"))
+        state = state_for(app)
         settings, snapshot = await asyncio.to_thread(choice_settings_snapshot, app, owner)
+        if (
+            active_on(settings, host)
+            and not named
+            and pin is None
+            and owner in state.pending_drain_closures
+        ):
+            if not await _flush_drain_closures(app, owner):
+                raise HTTPException(503, {"code": "session_choice_unavailable"})
+            settings, snapshot = await asyncio.to_thread(choice_settings_snapshot, app, owner)
         revision = snapshot.revision
         if not active_on(settings, host):
             yield None
@@ -1305,10 +1367,8 @@ async def admit_create(
         readings, running, floors = await asyncio.to_thread(inputs, app, settings, request, now)
         request = await authorize_agents(app, request)
 
-        named = bool(body.agent_id and (body.user_named or body.choice_reason))
         if named:
             request = replace(request, preview=True)
-        state = state_for(app)
         try:
             plan = state.select(
                 settings,
@@ -1326,9 +1386,11 @@ async def admit_create(
             _logger.exception("Session selection failed")
             raise HTTPException(409, {"code": "session_choice_unavailable"}) from None
         if not named and pin is None and plan.drops:
-            await _apply_drain_delta(app, owner, snapshot, drops=plan.drops)
+            if not await _close_drain_locks(app, owner, observed_at=now, drops=plan.drops):
+                raise HTTPException(503, {"code": "session_choice_unavailable"})
         if not named and pin is None and request.exclude:
-            await _close_drain_locks(app, owner, pools=request.exclude)
+            if not await _close_drain_locks(app, owner, observed_at=now, pools=request.exclude):
+                raise HTTPException(503, {"code": "session_choice_unavailable"})
         if named:
             from omnigent.server.routes._sessions.helpers import (
                 _resolve_harness_impl,

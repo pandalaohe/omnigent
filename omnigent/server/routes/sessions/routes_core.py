@@ -2864,12 +2864,9 @@ def register_core_routes(
         # from the runner's finally, the relay's resource.created
         # self-heal, or the host-launch-failure path below.
         from omnigent.server.session_choice import SLOT_LABEL
-        from omnigent.server.session_choice_runtime import choice_record
 
-        if conv is not None:
-            resp.session_choice = choice_record(conv)
-            if conv.labels.get(SLOT_LABEL, "").startswith("queued@"):
-                hold = hold or HostLoadHold(conv.labels[SLOT_LABEL].split("@")[1], time.time())
+        if conv is not None and conv.labels.get(SLOT_LABEL, "").startswith("queued@"):
+            hold = hold or HostLoadHold(conv.labels[SLOT_LABEL].split("@")[1], time.time())
         _terminal_first_create = (
             hold is None
             and conv is not None

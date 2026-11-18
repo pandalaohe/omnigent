@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Iterable, Iterator, Mapping, MutableMapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Self, overload
 
@@ -1378,7 +1378,8 @@ def plan_choice(
                 locked_positions[key] = slot
 
     drop_note = "".join(
-        f". Drain lock ended for {lock.saved_link.model or lock.saved_link.agent_id}"
+        f". Drain target {lock.saved_link.model or lock.saved_link.agent_id}"
+        " is closed for this pick"
         for lock in drops
     )
     skipped: list[Skipped] = []
@@ -1487,7 +1488,7 @@ def plan_choice(
         new_lock = None
         reason = "First eligible tier, weighted choice" + drop_note
         if locked_positions.get(key) == slot:
-            reason += f". Using drain lock for {link.model or link.agent_id}"
+            reason += f". Continuing to drain {link.model or link.agent_id}"
         elif (
             drain_locks is not None
             and key not in locked_positions
@@ -1508,8 +1509,6 @@ def plan_choice(
                 route=provider_route(request.host, link.agent_id, link.model),
             )
             new_lock = revalidate_drain_locks(settings, (proposed,), settings_revision).get(key)
-            if new_lock is not None:
-                reason += f". Drain lock selected for {link.model or link.agent_id}"
         return ChoicePlan(
             Choice(
                 "pick",
@@ -1643,6 +1642,9 @@ class ChoiceState:
         self.cooldowns: dict[tuple[str, str], float] = {}
         self.exhausted: dict[tuple[str, str], float] = {}
         self.quota_rejections: set[tuple[str, str]] = set()
+        self.pending_drain_closures: dict[
+            str, list[tuple[tuple[str, str] | None, Callable[[DrainLock], bool]]]
+        ] = {}
         self.refusals: dict[tuple[str, str, str], ProviderRefusal] = {}
         self.provider_attempts: dict[tuple[str, str, str, str], tuple[str, int, float]] = {}
         self.provider_recoveries: dict[tuple[str, str, str], float] = {}
@@ -1724,8 +1726,17 @@ class ChoiceState:
         return result
 
     def saved(self, owner: str, settings: SessionChoice) -> None:
+        # A head's mode cannot affect routing, even when editing it detaches the preset copy.
         current = {
-            (owner, host, work_type, index): tier
+            (owner, host, work_type, index): tuple(
+                row.model_copy(
+                    update={
+                        "adjusted": False,
+                        "links": (_saved_link_identity(row.links[0]), *row.links[1:]),
+                    }
+                )
+                for row in tier
+            )
             for host, types in settings.hosts.items()
             for work_type, tiers in types.items()
             for index, tier in enumerate(tiers)
