@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -545,13 +546,19 @@ class _InjectionHarnessClient(_ScriptedHarnessClient):
     complete immediately.
     """
 
-    def __init__(self, *, block_turn: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        block_turn: int = 0,
+        injection_frame: Callable[[dict[str, Any]], Awaitable[str | None]] | None = None,
+    ) -> None:
         """Block the stream of ``block_turn``; every other turn completes."""
         super().__init__([])
         self._block_turn = block_turn
         self.inject_gate = asyncio.Event()
         self.finish_gate = asyncio.Event()
         self._streams = 0
+        self._injection_frame = injection_frame
 
     def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
         """Record the turn body; gate the blocked turn's consumption and end."""
@@ -580,9 +587,15 @@ class _InjectionHarnessClient(_ScriptedHarnessClient):
                     for body in list(client.patched_events):
                         injection_id = body.get("injection_id")
                         if injection_id:
-                            yield _sse(
-                                {"type": "injection.consumed", "injection_id": injection_id}
+                            frame = (
+                                await client._injection_frame(body)
+                                if client._injection_frame is not None
+                                else _sse(
+                                    {"type": "injection.consumed", "injection_id": injection_id}
+                                )
                             )
+                            if frame is not None:
+                                yield frame
                     await client.finish_gate.wait()
                 yield _sse({"type": "response.completed", "response": {"id": f"resp_{turn}"}})
 
@@ -630,6 +643,92 @@ async def test_injected_request_binds_to_the_running_turn() -> None:
     ]
     # Never a second follow-up.
     assert len(_events_of_type(server, "message")) == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_drops_only_unconfirmed_injection_without_recording_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
+    from omnigent.inner.executor import InjectionDeliveryAmbiguous
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext, _format_sse_event
+    from omnigent.server.schemas import CreateResponseRequest, HarnessStreamEvent
+
+    unconfirmed = "@executor handle the unresolved request"
+    executor = ClaudeNativeExecutor(tmp_path)
+
+    async def ambiguous(_session_key: str, _content: object) -> bool:
+        raise InjectionDeliveryAmbiguous("Claude may already hold the message")
+
+    monkeypatch.setattr(executor, "enqueue_session_message", ambiguous)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="main")
+
+    async def injection_frame(body: dict[str, Any]) -> str | None:
+        if body.get("pending_id") != "pending_uncertain":
+            return None
+        events: asyncio.Queue[HarnessStreamEvent | None] = asyncio.Queue()
+        ctx = TurnContext("resp_0", events, asyncio.Event(), session_id=PARENT)
+        ctx._push_injection(
+            CreateResponseRequest(
+                model="example", input=unconfirmed, injection_id=body["injection_id"]
+            )
+        )
+        watcher = asyncio.create_task(adapter._watch_injections(ctx, executor))
+        try:
+            event = await asyncio.wait_for(events.get(), timeout=5)
+            assert event is not None
+            return _format_sse_event(event).decode()
+        finally:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+
+    harness = _InjectionHarnessClient(injection_frame=injection_frame)
+    server = _MemberServerClient()
+    app, _pm, _harness = _build_app(server, harness_client=harness)
+
+    async def post_with_pending_id(client: httpx.AsyncClient, text: str) -> httpx.Response:
+        return await client.post(
+            f"/v1/sessions/{PARENT}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_joint_lead",
+                "content": [{"type": "input_text", "text": text}],
+                "pending_id": "pending_uncertain",
+            },
+        )
+
+    async with _runner_client(app) as client:
+        try:
+            await _seed_session(client, labels=_member_labels())
+            assert (await _post_message(client, "start the work")).status_code == 202
+            await _wait_until(lambda: app.state.live_response_id.get(PARENT) == "resp_0")
+            history = list(runner_app._session_histories_ref.get(PARENT, []))
+
+            assert (await post_with_pending_id(client, unconfirmed)).json()["status"] == "buffered"
+            assert (await _post_message(client, "keep this queued")).json()["status"] == "buffered"
+            _, other = app.state.session_message_buffers[PARENT]
+            harness.inject_gate.set()
+            await _wait_until(lambda: app.state.session_message_buffers.get(PARENT) == [other])
+
+            assert runner_app._session_histories_ref.get(PARENT, []) == history
+            assert runner_app.list_member_obligations(PARENT) == []
+            assert _events_of_type(server, "injection.unconfirmed") == []
+            # The dropped copy's pending ID must not be attached to the live turn.
+            probe = await post_with_pending_id(client, "a separate input for the pending ID check")
+            assert probe.json()["status"] == "buffered"
+        finally:
+            harness.inject_gate.set()
+            harness.finish_gate.set()
+        await _wait_until(lambda: len(harness.posted_bodies) >= 2)
+        await _wait_for_turn_end(app)
+
+    assert len(harness.posted_bodies) == 2
+    replayed_texts = _ordered_user_texts(harness.posted_bodies[1])
+    assert "keep this queued" in replayed_texts
+    assert unconfirmed not in replayed_texts
+    assert _events_of_type(server, "message") == []
 
 
 @pytest.mark.asyncio

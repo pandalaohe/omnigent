@@ -8138,6 +8138,35 @@ def test_first_submit_waits_for_acceptance_but_next_submit_is_bounded(
     assert pastes == 4
 
 
+def test_first_submit_never_retries_after_cold_start_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = claude_native_bridge
+    monkeypatch.setattr(bridge, "_PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.10)
+    monkeypatch.setattr(bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.125)
+    monkeypatch.setattr(bridge, "_SUBMIT_RETRY_INTERVAL_S", 0.29)
+    content = "a draft that stays present throughout startup"
+    draft = _composer_pane(content)
+    submit_frames: list[float] = []
+
+    def record_capture(now: float) -> None:
+        if "submit" in mutations:
+            submit_frames.append(now)
+            assert len(submit_frames) <= 2, "the visible draft outlived the message deadline"
+
+    bridge_dir, mutations, clock = _scripted_paste_tui(
+        monkeypatch, tmp_path, lambda *_: draft, after_submit=draft, on_capture=record_capture
+    )
+
+    with pytest.raises(bridge.ClaudeDeliveryUnconfirmed):
+        inject_user_message(bridge_dir, content=content, timeout_s=0.30)
+
+    assert submit_frames == pytest.approx([0.125, 0.25])
+    assert clock.now == pytest.approx(0.30)
+    assert mutations == ["paste", "submit"]
+
+
 @pytest.mark.parametrize("startup", [True, False])
 def test_first_message_model_pick_waits_through_slow_submit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, startup: bool
@@ -16776,6 +16805,46 @@ _TRUST_DIALOG_PANE = """\
 
 # The same dialog text scrolled into the transcript above a live input box.
 _DIALOG_ECHO_ABOVE_COMPOSER_PANE = _MCP_APPROVAL_DIALOG_PANE + _READY_PANE
+
+
+@pytest.mark.parametrize("real_consent", [False, True], ids=["old-output", "clipped-api-key"])
+def test_permission_controls_belong_to_one_live_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_consent: bool
+) -> None:
+    bridge = claude_native_bridge
+    monkeypatch.setattr(bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.3)
+    content = "please review the attached change"
+    echoed_output = (
+        "❯ 9. run the next step\n"
+        "  ⎿ Do you want to deploy?\n"
+        "    2. Yes, in a separate example\n"
+        "End of explanation\n"
+    )
+    pane = (
+        _API_KEY_DIALOG_PANE.rsplit("  Enter to confirm", 1)[0] if real_consent else echoed_output
+    )
+    bridge_dir, mutations, _clock = _scripted_paste_tui(
+        monkeypatch, tmp_path, lambda *_: _composer_pane(content), after_submit=pane
+    )
+
+    if real_consent:
+        inject_user_message(bridge_dir, content=content)
+    else:
+        with pytest.raises(bridge.ClaudeDeliveryUnconfirmed):
+            inject_user_message(bridge_dir, content=content)
+
+    assert mutations == ["paste", "submit"]
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: pane)
+    assert bridge.has_pending_user_prompt(bridge_dir) is real_consent
+    if real_consent:
+        assert (
+            bridge._terminal_dialog_headline(pane)
+            == "Detected a custom API key in your environment"
+        )
+        with pytest.raises(bridge.ClaudeUserPromptPending) as pending:
+            inject_user_message(bridge_dir, content="keep this out of the decision card")
+        assert pending.value.nothing_typed
+        assert mutations == ["paste", "submit"]
 
 
 @pytest.mark.parametrize(
