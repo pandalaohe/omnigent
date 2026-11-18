@@ -53,8 +53,9 @@ _QUOTA_RESET = re.compile(
 )
 _QUOTA_PROTECTION_RESET = re.compile(
     r"(?:\bquota\s+protection\b|额度保护)"
-    r"[^\r\n;；|｜\"'“”‘’`]{0,2048}?"
-    r"(?:\breset\s*[:：]|重置(?:\s*/\s*reset\s*[:：])?\s*[:：]?)\s*"
+    r"(?:[^\r\n.;。!?！？;；|｜\"'“”‘’`]|(?<=\d)\.(?=\d)){0,120}?"
+    r"(?:\breset\s*[:：]|重置(?:\s*/\s*reset\s*[:：])?\s*[:：]?)"
+    r"[^\S\r\n]*"
     r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))",
     re.IGNORECASE,
 )
@@ -71,6 +72,8 @@ def quota_reset_at(message: str, now: float) -> float | None:
             for value, unit in zip(match.groups(), (86400, 3600, 60, 1), strict=True)
         )
         return now + seconds if 0 < seconds <= 366 * 86400 else None
+    if "cc switch" not in message.casefold():
+        return None
     protection = _QUOTA_PROTECTION_RESET.search(message)
     if protection is None:
         return None

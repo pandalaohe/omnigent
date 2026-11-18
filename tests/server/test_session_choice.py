@@ -1004,28 +1004,60 @@ def test_explicit_provider_quota_reset(message, seconds):
             "2026-11-22T03:19:03+00:00",
         ),
         (
-            "unexpected status 403 Forbidden: Codex quota protection: weekly "
-            "98.00% ≥ 98% (reset: 2026-11-22T03:19:03Z)",
+            "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
+            "cause: Codex quota protection: weekly 98.00% ≥ 98% "
+            "(reset: 2026-11-22T03:19:03Z)",
             "2026-11-22T03:19:03+00:00",
         ),
         (
-            "unexpected status 403 Forbidden: cause: Codex quota protection: weekly; "
-            "detail: retry later; reset: 2026-11-22T03:19:03Z",
+            "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
+            "cause: Codex quota protection: weekly 98.00% ≥ 98% "
+            "(reset: 2027-11-19T03:19:03+00:00)",
+            "2027-11-19T03:19:03+00:00",
+        ),
+        (
+            "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
+            "cause: Codex quota protection: weekly; detail: retry later; "
+            "reset: 2026-11-22T03:19:03Z",
             None,
         ),
         (
-            "unexpected status 403 Forbidden: cause: Codex 官方额度保护: 每周\n"
-            "重置: 2026-11-22T03:19:03Z",
+            "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
+            "cause: Codex 官方额度保护: 每周\n重置: 2026-11-22T03:19:03Z",
             None,
         ),
         (
-            "unexpected status 403 Forbidden: "
+            "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
+            "cause: Codex 官方额度保护: 每周 98.00% ≥ 98%（重置:\n"
+            "2026-11-22T03:19:03Z）",
+            None,
+        ),
+        (
+            "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
             '{"cause":"Codex quota protection: weekly","reset":"2026-11-22T03:19:03Z"}',
             None,
         ),
         (
-            "unexpected status 403 Forbidden: Codex quota protection: weekly "
-            "(reset: 2026-11-22T03:19:03)",
+            "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
+            "cause: Codex quota protection: weekly (reset: 2026-11-22T03:19:03)",
+            None,
+        ),
+        (
+            "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
+            "cause: Codex quota protection: weekly. "
+            "Account metadata reset: 2026-11-22T03:19:03Z",
+            None,
+        ),
+        (
+            "unexpected status 500 Internal Server Error: upstream returned "
+            '"unexpected status 403 Forbidden: Codex quota protection: weekly '
+            '98.00% ≥ 98% (reset: 2026-11-22T03:19:03Z)"',
+            None,
+        ),
+        (
+            "unexpected status 403 Forbidden: Other Provider local proxy failed ... "
+            "cause: Codex quota protection: weekly 98.00% ≥ 98% "
+            "(reset: 2026-11-22T03:19:03Z)",
             None,
         ),
         (
@@ -1033,13 +1065,13 @@ def test_explicit_provider_quota_reset(message, seconds):
             None,
         ),
         (
-            "unexpected status 403 Forbidden: quota protection: weekly "
-            "(reset: 2026-11-18T03:19:02+00:00)",
+            "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
+            "cause: Codex quota protection: weekly (reset: 2026-11-18T03:19:02+00:00)",
             None,
         ),
         (
-            "unexpected status 403 Forbidden: quota protection: weekly "
-            "(reset: 2027-11-20T03:19:03+00:00)",
+            "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
+            "cause: Codex quota protection: weekly (reset: 2027-11-20T03:19:03+00:00)",
             None,
         ),
     ],

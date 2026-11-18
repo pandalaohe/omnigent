@@ -485,8 +485,9 @@ async def quota_runner(choice_env, monkeypatch):
             "2026-11-22T03:19:03+00:00",
         ),
         (
-            "unexpected status 403 Forbidden: Codex quota protection: weekly "
-            "98.00% ≥ 98% (reset: 2026-11-22T03:19:03Z)",
+            "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
+            "cause: Codex quota protection: weekly 98.00% ≥ 98% "
+            "(reset: 2026-11-22T03:19:03Z)",
             "2026-11-22T03:19:03+00:00",
         ),
     ],
