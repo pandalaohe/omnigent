@@ -2782,6 +2782,7 @@ async def _send_prompt(
         _dispatch_session_event_to_runner,
         _ensure_runner_session_initialized,
     )
+    from omnigent.server.session_succession import scheduled_send_lock
 
     with fire_stage("runner_start", session_id=conv.id):
         try:
@@ -2794,26 +2795,32 @@ async def _send_prompt(
             raise
     with fire_stage("prompt_prepare", session_id=conv.id):
         agent_revision = await _agent_revision(deps, conv)
-        if task.continues_session:
-            await asyncio.to_thread(_check_continued_successor, deps, task, conv.id)
     with fire_stage("prompt_send", session_id=conv.id):
-        dispatch_id = uuid.uuid4().hex
-        log_delivery(
-            "scheduled_run_prompt_dispatch_started", session_id=conv.id, dispatch_id=dispatch_id
+        send_lock = (
+            scheduled_send_lock(conv.id) if task.continues_session else contextlib.nullcontext()
         )
-        result = await _dispatch_session_event_to_runner(
-            conv.id,
-            conv,
-            _prompt_event(run_prompt_text(task)),
-            deps.conversation_store,
-            runner_client,
-            agent_name=None,
-            file_store=deps.file_store,
-            artifact_store=deps.artifact_store,
-            created_by=task.user_id or RESERVED_USER_LOCAL,
-            runner_router=deps.runner_router,
-            agent_revision=agent_revision,
-        )
+        async with send_lock:
+            if task.continues_session:
+                await asyncio.to_thread(_check_continued_successor, deps, task, conv.id)
+            dispatch_id = uuid.uuid4().hex
+            log_delivery(
+                "scheduled_run_prompt_dispatch_started",
+                session_id=conv.id,
+                dispatch_id=dispatch_id,
+            )
+            result = await _dispatch_session_event_to_runner(
+                conv.id,
+                conv,
+                _prompt_event(run_prompt_text(task)),
+                deps.conversation_store,
+                runner_client,
+                agent_name=None,
+                file_store=deps.file_store,
+                artifact_store=deps.artifact_store,
+                created_by=task.user_id or RESERVED_USER_LOCAL,
+                runner_router=deps.runner_router,
+                agent_revision=agent_revision,
+            )
         if result.accepted:
             log_prompt_sent(conv.id, dispatch_id=dispatch_id)
         else:

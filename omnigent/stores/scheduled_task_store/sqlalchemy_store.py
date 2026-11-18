@@ -314,12 +314,6 @@ def retarget_continued_tasks_in_session(
 
 def _require_unsuperseded_target(session: Session, session_id: str) -> None:
     workspace_id = current_workspace_id()
-    # Match the conversation-first lock order in the handover transaction.
-    session.execute(
-        select(SqlConversation.id)
-        .where(SqlConversation.workspace_id == workspace_id, SqlConversation.id == session_id)
-        .with_for_update()
-    )
     successor_id = session.scalar(
         select(SqlConversationLabel.value)
         .where(
@@ -386,19 +380,38 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
     # ── Scheduled tasks ──────────────────────────────────────────
 
-    def _write_binding(
-        self, name: str, session_id: str | None, write: Callable[[Session], _WriteResult]
+    def _write_with_target_lock(
+        self,
+        name: str,
+        session_id: str | None,
+        write: Callable[[Session], _WriteResult],
+        *,
+        reject_superseded: bool = True,
     ) -> _WriteResult:
         if session_id is None:
             return run_write_transaction(self._session_immediate, name, write)
+
+        def lock_target(session: Session) -> None:
+            # Handover also takes the conversation lock before writing the task.
+            session.execute(
+                select(SqlConversation.id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == session_id,
+                )
+                .with_for_update()
+            )
+            if reject_superseded:
+                _require_unsuperseded_target(session, session_id)
+
         if self._conversation_session_immediate is not None:
             # In split-DB mode hold the AP lock through the metadata commit.
             with self._conversation_session_immediate(name) as conversation_session:
-                _require_unsuperseded_target(conversation_session, session_id)
+                lock_target(conversation_session)
                 return run_write_transaction(self._session_immediate, name, write)
 
         def locked_write(session: Session) -> _WriteResult:
-            _require_unsuperseded_target(session, session_id)
+            lock_target(session)
             return write(session)
 
         return run_write_transaction(self._session_immediate, name, locked_write)
@@ -473,7 +486,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             session.flush()
             return _to_entity(row)
 
-        return self._write_binding(
+        return self._write_with_target_lock(
             "insert_task", session_id if session_mode == "continue" else None, write
         )
 
@@ -835,7 +848,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             session.flush()
             return _to_entity(row)
 
-        return self._write_binding(
+        return self._write_with_target_lock(
             "update_task", session_id if isinstance(session_id, str) else None, write
         )
 
@@ -952,7 +965,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 session, old_id, new_id, user_id=user_id, generation=generation
             )
 
-        self._write_binding("retarget_continued_sessions", new_id, write)
+        self._write_with_target_lock("retarget_continued_sessions", new_id, write)
 
     def delete(self, scheduled_task_id: str) -> bool:
         """Hide the task, then remove history in bounded transactions, preserving live claims."""
@@ -1147,7 +1160,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             session.flush()
             return _run_to_entity(row)
 
-        return run_write_transaction(self._session_immediate, "insert_task_run", write)
+        return self._write_with_target_lock(
+            "insert_task_run",
+            archived_target.task.session_id if archived_target is not None else None,
+            write,
+            reject_superseded=False,
+        )
 
     def list_inbox_failures(
         self,
@@ -1998,4 +2016,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             _purge_finished_deleted_task(session, task, row)
             return result
 
-        return run_write_transaction(self._session_immediate, "finish_startup", write)
+        return self._write_with_target_lock(
+            "finish_startup",
+            archived_target.task.session_id if archived_target is not None else None,
+            write,
+            reject_superseded=False,
+        )

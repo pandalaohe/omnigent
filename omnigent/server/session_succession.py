@@ -21,13 +21,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from weakref import WeakValueDictionary
 
 import httpx
 
 from omnigent.db.utils import generate_task_id, now_epoch
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation, ErrorData, MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import MCP_SELECTION_PREFIX
@@ -70,6 +73,10 @@ _PEER_UNDELIVERED_STATES: tuple[str, ...] = ("pending", "queued", "held")
 # triggers remain after it gives up.
 _RETRY_BACKOFFS_S: tuple[float, ...] = (2.0, 4.0, 8.0, 16.0, 30.0)
 
+_scheduled_send_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScopedCache(
+    WeakValueDictionary
+)
+
 # One resumer lock per receipt; a phase is never run concurrently in-process.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by server-generated uuid4 receipt id
 _resumer_locks: dict[str, asyncio.Lock] = {}
@@ -77,6 +84,38 @@ _resumer_locks: dict[str, asyncio.Lock] = {}
 _retry_attempts: dict[str, int] = {}
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by server-generated uuid4 receipt id
 _retry_tasks: dict[str, asyncio.Task[None]] = {}
+
+
+def scheduled_send_lock(session_id: str) -> asyncio.Lock:
+    """Order continued sends and succession moves on this server process."""
+    return _scheduled_send_locks.setdefault(session_id, asyncio.Lock())
+
+
+async def commit_succession_move(
+    store: ConversationStore,
+    old_id: str,
+    new_id: str,
+    receipt_id: str,
+    *,
+    reverse_of: bool,
+    allow_empty: bool,
+) -> None:
+    async def move() -> None:
+        async with AsyncExitStack() as locks:
+            # An undo can also change the target's forward link.
+            for session_id in sorted({old_id, new_id}):
+                await locks.enter_async_context(scheduled_send_lock(session_id))
+            await asyncio.to_thread(
+                store.reassign_live_children,
+                old_id,
+                new_id,
+                receipt_id,
+                reverse_of=reverse_of,
+                allow_empty=allow_empty,
+            )
+
+    # Cancelling the HTTP waiter cannot stop a move already running in a thread.
+    await asyncio.shield(move())
 
 
 class _SuccessionParked(RuntimeError):

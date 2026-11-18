@@ -58,7 +58,7 @@ from omnigent.server.routes._sessions.helpers import (
     _resolve_harness,
 )
 from omnigent.server.schemas import SessionHandoverRequest, SessionSuccessionRequest
-from omnigent.server.session_succession import advance_succession
+from omnigent.server.session_succession import advance_succession, commit_succession_move
 from omnigent.stores import AgentStore
 from omnigent.stores.conversation_store import (
     HANDOVER_ITEM_LABEL_KEY,
@@ -565,8 +565,8 @@ def register_succession_routes(
         if receipt is None:
             receipt_id = uuid4().hex
             try:
-                await asyncio.to_thread(
-                    conversation_store.reassign_live_children,
+                await commit_succession_move(
+                    conversation_store,
                     session_id,
                     target_id,
                     receipt_id,
