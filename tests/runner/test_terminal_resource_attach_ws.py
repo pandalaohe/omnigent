@@ -68,6 +68,8 @@ def _seed_registry(
 def _patch_control_attach(
     monkeypatch: pytest.MonkeyPatch,
     on_attach: Callable[[str, str, bool], None],
+    *,
+    expected_browser_resize: bool = False,
 ) -> None:
     """Patch the control bridge at the runner route boundary."""
 
@@ -77,10 +79,12 @@ def _patch_control_attach(
         socket_path: str,
         tmux_target: str,
         read_only: bool,
+        browser_resize: bool = False,
         on_client_interaction: object = None,
         on_input: object = None,
     ) -> None:
         del websocket, on_client_interaction, on_input
+        assert browser_resize is expected_browser_resize
         on_attach(socket_path, tmux_target, read_only)
         raise RuntimeError("bridge stopped")
 
@@ -162,11 +166,23 @@ def test_runner_resource_attach_ignores_obsolete_transport_query(
     assert calls == [(str(tmp_path / "bash-s1.sock"), "main", False)]
 
 
-def test_runner_resource_attach_passes_read_only_to_control_bridge(
+@pytest.mark.parametrize(
+    "query, headers, expected_browser_resize",
+    [
+        ("", {}, False),
+        ("", {"origin": "omnigent://internal"}, False),
+        ("&browser_resize=true", {}, True),
+        ("", {"origin": "http://localhost"}, True),
+    ],
+    ids=["legacy-native", "native", "relayed-browser", "direct-browser"],
+)
+def test_runner_resource_attach_passes_client_options_to_control_bridge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    query: str,
+    headers: dict[str, str],
+    expected_browser_resize: bool,
 ) -> None:
-    """``?read_only=true`` reaches the control bridge."""
     registry = TerminalRegistry()
     _seed_registry(registry, "conv_abc", _make_running_instance("bash", "s1", tmp_path))
     app = create_runner_app(
@@ -174,11 +190,17 @@ def test_runner_resource_attach_passes_read_only_to_control_bridge(
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
     calls: list[tuple[str, str, bool]] = []
-    _patch_control_attach(monkeypatch, lambda *args: calls.append(args))
+    _patch_control_attach(
+        monkeypatch,
+        lambda *args: calls.append(args),
+        expected_browser_resize=expected_browser_resize,
+    )
 
     with pytest.raises(RuntimeError, match="bridge stopped"):
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?read_only=true"
+            + query,
+            headers=headers,
         ):
             pass
 

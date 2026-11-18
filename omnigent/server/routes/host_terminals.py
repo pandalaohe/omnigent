@@ -16,6 +16,7 @@ from omnigent.entities.host_terminal import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import CAP_HOST_TERMINALS
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.server._runner_ws_tunnel import _TunneledWSConn
@@ -178,11 +179,13 @@ def create_host_terminals_router(
             await websocket.close(code=code, reason=str(exc))
             return
         await websocket.accept()
+        browser_resize = websocket.headers.get("origin") not in (None, OMNIGENT_INTERNAL_WS_ORIGIN)
+        browser_resize_query = "?browser_resize=true" if browser_resize else ""
         try:
             async with _TunneledWSConn(
                 registry=service.tunnels,
                 session=session,
-                runner_path=f"/v1/host-terminals/{terminal_id}/attach",
+                runner_path=f"/v1/host-terminals/{terminal_id}/attach{browser_resize_query}",
             ) as runner_ws:
                 await _shuttle_ws_frames(websocket, runner_ws)
         except _RunnerWSClosed as exc:

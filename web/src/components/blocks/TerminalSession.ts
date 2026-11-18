@@ -35,6 +35,10 @@ import { attachImeHeuristic, type Detached } from "./imeAnchor";
 import { parseTmuxRepliesMessage, suppressRepliesTmuxSends } from "./TerminalQueryReplies";
 
 const TERMINAL_BOLD_WEIGHT_OFFSET = 300;
+// Smallest grid the tmux bridge forwards (control_bridge.MIN_FORWARDED_COLS/ROWS).
+// The rendered grid is kept at least this large so it cannot diverge from the pane.
+const MIN_FORWARDED_COLS = 20;
+const MIN_FORWARDED_ROWS = 5;
 
 export type StickyState = TerminalStickyState;
 export type StickyModifiers = TerminalStickyModifiers;
@@ -691,6 +695,7 @@ export function touchScrollPayload(
  * close the WS, dispose the terminal.
  */
 export class TerminalSession {
+  private readonly container: HTMLElement;
   private readonly term: Terminal;
   private readonly fit: FitAddon;
   private readonly ws: WebSocket;
@@ -700,6 +705,7 @@ export class TerminalSession {
   private readonly osc52Dispose: { dispose: () => void };
   /** Drops xterm's replies to the queries tmux answers, once the runner lists them. */
   private queryReplies: { dispose: () => void } | null = null;
+  private tmuxBacked = false;
   private readonly codexPalette: CodexTerminalPalette | null;
   private readonly onClipboardRequest?: TerminalClipboardListener;
   /** Whether this visible, interactive attach may write the local clipboard. */
@@ -770,6 +776,7 @@ export class TerminalSession {
     adaptCodexPalette = false,
     onFileLink?: TerminalFileLinkListener,
   ) {
+    this.container = container;
     this.codexPalette = adaptCodexPalette ? new CodexTerminalPalette() : null;
     this.clipboardEnabled = clipboardEnabled;
     this.focusOnConnect = focusOnConnect;
@@ -887,7 +894,12 @@ export class TerminalSession {
           const tmuxAnswers = parseTmuxRepliesMessage(ev.data);
           if (tmuxAnswers !== null) {
             this.queryReplies?.dispose();
-            this.queryReplies = suppressRepliesTmuxSends(this.term, tmuxAnswers);
+            this.queryReplies =
+              tmuxAnswers.size > 0 ? suppressRepliesTmuxSends(this.term, tmuxAnswers) : null;
+            if (!this.tmuxBacked) {
+              this.tmuxBacked = true;
+              this.sendResize();
+            }
           }
           // Unknown text frames stay ignored for protocol forward compatibility.
         }
@@ -1264,12 +1276,32 @@ export class TerminalSession {
     };
   }
 
+  /**
+   * Whether the container is laid out. Under a `display:none` ancestor it has no
+   * box and the fit addon measures its `100%` width as 100px — a few bogus columns.
+   * Browsers without `checkVisibility` fall back to the element's client rects.
+   */
+  private hasLayoutBox(): boolean {
+    if (typeof this.container.checkVisibility === "function") {
+      return this.container.checkVisibility();
+    }
+    return this.container.getClientRects().length > 0;
+  }
+
   private sendResize(): void {
     if (this.ws.readyState !== WebSocket.OPEN) return;
+    // Keep the last real size while hidden; the ResizeObserver re-fits once
+    // the surface is laid out again.
+    if (!this.hasLayoutBox()) return;
     try {
       this.fit.fit();
     } catch {
       return;
+    }
+    if (this.tmuxBacked) {
+      const cols = Math.max(this.term.cols, MIN_FORWARDED_COLS);
+      const rows = Math.max(this.term.rows, MIN_FORWARDED_ROWS);
+      if (cols !== this.term.cols || rows !== this.term.rows) this.term.resize(cols, rows);
     }
     const { cols, rows } = this.term;
     // Skip a no-op resize: the WS-open handler and the ResizeObserver both

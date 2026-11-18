@@ -735,6 +735,8 @@ describe("TerminalSession", () => {
     const states: ConnectionState[] = [];
     const container = document.createElement("div");
     document.body.appendChild(container);
+    // jsdom has neither checkVisibility nor layout; report the container as laid out.
+    container.checkVisibility = () => true;
     const session = new TerminalSession(
       container,
       "ws://localhost/attach",
@@ -1316,6 +1318,92 @@ describe("TerminalSession", () => {
       (m) => typeof m === "string" && m.includes('"type":"resize"'),
     );
     expect(resizeFrames).toHaveLength(1);
+    session.dispose();
+  });
+
+  it("does not send a resize while the container has no layout box", () => {
+    // WHY: under a display:none ancestor the fit addon measures ~100px and reports a
+    // few columns; forwarding that would shrink the shared tmux pane under a TUI
+    // mid-boot. The send must wait until the surface is laid out, then send once.
+    const { socket, session, container } = makeSession();
+    const observer = FakeResizeObserver.instances[0];
+    const fitSpy = vi.spyOn((session as unknown as { fit: { fit: () => void } }).fit, "fit");
+    let laidOut = false;
+    container.checkVisibility = () => laidOut;
+    const resizeFrames = () =>
+      socket.sent.filter((m) => typeof m === "string" && m.includes('"type":"resize"'));
+
+    socket.open();
+    observer.cb();
+    expect(fitSpy).not.toHaveBeenCalled();
+    expect(resizeFrames()).toHaveLength(0);
+
+    laidOut = true;
+    observer.cb();
+    expect(fitSpy).toHaveBeenCalledTimes(1);
+    expect(resizeFrames()).toHaveLength(1);
+    session.dispose();
+  });
+
+  it("falls back to client rects when checkVisibility is unavailable", () => {
+    // WHY: older WebKit lacks checkVisibility; a display:none container still has
+    // no client rects there, so the hidden guard must keep working.
+    const { socket, session, container } = makeSession();
+    const observer = FakeResizeObserver.instances[0];
+    (container as { checkVisibility?: unknown }).checkVisibility = undefined;
+    let rects: DOMRect[] = [];
+    container.getClientRects = () => rects as unknown as DOMRectList;
+    const resizeFrames = () =>
+      socket.sent.filter((m) => typeof m === "string" && m.includes('"type":"resize"'));
+
+    socket.open();
+    observer.cb();
+    expect(resizeFrames()).toHaveLength(0);
+
+    rects = [{ width: 800, height: 600 } as DOMRect];
+    observer.cb();
+    expect(resizeFrames()).toHaveLength(1);
+    session.dispose();
+  });
+
+  it("clamps a fitted grid once the bridge identifies itself as tmux", () => {
+    // WHY: the bridge drops resizes under 20x5, so a visible container that fits
+    // smaller would otherwise render a grid narrower than the pane it shows.
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    const fit = (session as unknown as { fit: { fit: () => void } }).fit;
+    vi.spyOn(fit, "fit").mockImplementation(() => term.resize(10, 3));
+
+    socket.open();
+    socket.emit("message", { data: JSON.stringify({ type: "tmux-replies", queries: [] }) });
+
+    expect([term.cols, term.rows]).toEqual([20, 5]);
+    const frame = socket.sent
+      .filter((m) => typeof m === "string" && m.includes('"type":"resize"'))
+      .at(-1);
+    expect(frame).toBe(JSON.stringify({ type: "resize", cols: 20, rows: 5 }));
+    session.dispose();
+  });
+
+  it("keeps a narrow ConPTY grid before and after receiving PTY info", () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    const fit = (session as unknown as { fit: { fit: () => void } }).fit;
+    let fittedCols = 18;
+    vi.spyOn(fit, "fit").mockImplementation(() => term.resize(fittedCols, 4));
+
+    socket.open();
+    expect([term.cols, term.rows]).toEqual([18, 4]);
+    socket.emit("message", {
+      data: JSON.stringify({ type: "pty_info", windows_pty: { backend: "conpty", build: 26300 } }),
+    });
+    fittedCols = 17;
+    FakeResizeObserver.instances[0].cb();
+
+    expect([term.cols, term.rows]).toEqual([17, 4]);
+    expect(
+      socket.sent.filter((m) => typeof m === "string" && m.includes('"type":"resize"')),
+    ).toEqual([18, 17].map((cols) => JSON.stringify({ type: "resize", cols, rows: 4 })));
     session.dispose();
   });
 

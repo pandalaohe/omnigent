@@ -48,6 +48,7 @@ from omnigent.runner.app_support import (
     _ResourceType,
     _SpecEntry,
 )
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runner.native import (
     _COST_POPUP_REPOP_TASKS,
     _REPL_TERMINAL_NAME,
@@ -1371,6 +1372,10 @@ def register_resource_routes(
             websocket,
             entry.instance,
             read_only=read_only,
+            browser_resize=(
+                websocket.headers.get("origin") not in (None, OMNIGENT_INTERNAL_WS_ORIGIN)
+                or websocket.query_params.get("browser_resize") == "true"
+            ),
             on_client_interaction=entry.instance.note_client_interaction,
             on_input=entry.instance.note_input,
         )

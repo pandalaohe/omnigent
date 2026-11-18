@@ -73,6 +73,8 @@ from omnigent.terminals.ws_common import (
 _logger = logging.getLogger(__name__)
 
 __all__ = [
+    "MIN_FORWARDED_COLS",
+    "MIN_FORWARDED_ROWS",
     "bridge_tmux_control_to_websocket",
     "unescape_control_output",
 ]
@@ -117,6 +119,12 @@ _CONTROL_STDOUT_BUFFER_LIMIT: Final[int] = 16 * 1024 * 1024
 # pane TUI (e.g. Codex) trusts that over its own $TERM; without pinning it the
 # client inherits the runner's TERM, which can be a non-interactive ``dumb``.
 _WEB_TERMINAL_TERM: Final[str] = "xterm-256color"
+
+# Resize floor, mirrored by MIN_FORWARDED_COLS/ROWS in web/.../TerminalSession.ts.
+# A hidden (display:none) terminal fits to a few bogus columns; forwarding that
+# would shrink the shared pane under a TUI mid-boot, so sub-floor sizes are dropped.
+MIN_FORWARDED_COLS: Final[int] = 20
+MIN_FORWARDED_ROWS: Final[int] = 5
 
 # Closing the socket is best-effort: the browser may already be gone. Starlette
 # raises ``RuntimeError`` once a close frame has been sent and
@@ -631,6 +639,7 @@ async def bridge_tmux_control_to_websocket(
     socket_path: str,
     tmux_target: str,
     read_only: bool,
+    browser_resize: bool = False,
     on_client_interaction: Callable[[], None] | None = None,
     on_input: Callable[[], None] | None = None,
     reader_done: asyncio.Event | None = None,
@@ -647,6 +656,7 @@ async def bridge_tmux_control_to_websocket(
     :param tmux_target: The ``-t`` target string identifying the session.
     :param read_only: When ``True``, drop inbound binary input frames and
         attach with ``ignore-size`` so the viewer can't resize the pane.
+    :param browser_resize: Drop spurious sizes reported by hidden browser terminals.
     :param on_client_interaction: Optional callback fired on every client
         interaction (connect, disconnect, each input/resize frame) so the
         idle watcher can discount client-driven repaints.
@@ -674,8 +684,10 @@ async def bridge_tmux_control_to_websocket(
     # Sent before any pane output so no query reaches the browser first, and
     # probed before the capture so nothing slow sits between capture and attach.
     tmux_answers = await tmux_answered_queries(tmux, {"TERM": _WEB_TERMINAL_TERM})
-    if tmux_answers is not None:
-        message = json.dumps({"type": "tmux-replies", "queries": sorted(tmux_answers)})
+    # Browser clients also use this frame to identify tmux, even if the
+    # query probe failed and there are no replies to suppress.
+    if browser_resize or tmux_answers is not None:
+        message = json.dumps({"type": "tmux-replies", "queries": sorted(tmux_answers or ())})
         with contextlib.suppress(RuntimeError, WebSocketDisconnect):
             await websocket.send_text(message)
 
@@ -903,6 +915,16 @@ async def bridge_tmux_control_to_websocket(
                             cols = int(ctl["cols"])
                             rows = int(ctl["rows"])
                         except (KeyError, TypeError, ValueError):
+                            continue
+                        if browser_resize and (
+                            cols < MIN_FORWARDED_COLS or rows < MIN_FORWARDED_ROWS
+                        ):
+                            _logger.debug(
+                                "ignoring %dx%d resize below the usable floor target=%s",
+                                cols,
+                                rows,
+                                tmux_target,
+                            )
                             continue
                         await _send_command(f"refresh-client -C {cols}x{rows}\n".encode())
                 elif data is not None and not read_only:

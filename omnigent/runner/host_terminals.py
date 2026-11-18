@@ -211,6 +211,7 @@ def create_host_terminal_app(
             websocket,
             instance,
             read_only=False,
+            browser_resize=websocket.query_params.get("browser_resize") == "true",
             on_input=instance.note_input,
         )
 
