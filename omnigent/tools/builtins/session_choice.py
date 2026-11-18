@@ -66,7 +66,7 @@ class SysSessionChoiceReadTool(_ChoiceTool):
     tool_description = (
         "Read your session choice document and revision: work types, per-host tiers, "
         "preset fallback chains, explicit Agent/Host/Model limit rules, legacy pool limits, "
-        "ability order and supported document capabilities."
+        "ability order, supported document capabilities, and active drain locks."
     )
 
 

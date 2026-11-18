@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import replace
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -25,6 +26,7 @@ from omnigent.server.session_choice import (
     holds_slot,
     model_family,
     parse_session_choice,
+    plan_choice,
     pool_of_session,
     quota_reset_at,
     resolve_limit_rules,
@@ -485,6 +487,7 @@ async def test_route_passes_proof_only_to_fresh_owner_scoped_server_plan(db_uri)
     from fastapi import FastAPI
 
     from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.server.child_cap import ChildCapLocks
     from omnigent.server.routes.session_choice import create_session_choice_router
     from tests.server.test_user_preferences import _HeaderAuthProvider
 
@@ -497,6 +500,7 @@ async def test_route_passes_proof_only_to_fresh_owner_scoped_server_plan(db_uri)
         return plan
 
     app = FastAPI()
+    app.state.child_cap_locks = ChildCapLocks()
     app.include_router(
         create_session_choice_router(store, _HeaderAuthProvider(), conversion_plan=fresh),
         prefix="/v1",
@@ -740,6 +744,46 @@ async def test_api_registered_owner_scoped_revision_and_field_errors(db_uri, tmp
 
 
 @pytest.mark.asyncio
+async def test_fallback_mode_round_trips_without_changing_return_copies(db_uri, tmp_path):
+    app = _preferences_app(db_uri, tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        url = "/v1/me/session-choice"
+        headers = {"X-Test-User": OWNER}
+        value: dict[str, Any] = document()
+        preset = value["presets"][0]["links"]
+        row = value["hosts"]["host-a"]["implementation"][0][0]["links"]
+        for links in (preset, row):
+            links.append({"agent": "alternate", "model": "example-fallback"})
+        initial = (await client.get(url, headers=headers)).json()
+
+        async def put(revision):
+            return await client.put(
+                url, headers=headers, json={"settings": value, "expected_revision": revision}
+            )
+
+        base = (await put(initial["revision"])).json()
+        for return_mode in ("return", None):
+            for links in (preset, row):
+                links[1]["fallbackMode"] = return_mode
+            returned = await put(base["revision"])
+            assert returned.status_code == 200, returned.text
+            assert returned.json() == base
+        for links in (preset, row):
+            links[1]["fallbackMode"] = "drain"
+        drained = await put(base["revision"])
+        assert drained.status_code == 200, drained.text
+        saved = (await client.get(url, headers=headers)).json()
+        assert saved["revision"] != base["revision"]
+        assert saved["settings"]["presets"][0]["links"][1]["fallbackMode"] == "drain"
+        assert saved["settings"]["hosts"]["host-a"]["implementation"][0][0]["adjusted"] is False
+        assert saved["runtime"] == {"settingsRevision": saved["revision"], "drainLocks": []}
+        row[1]["fallbackMode"] = "sideways"
+        assert (await put(saved["revision"])).status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_floor_controls_and_preview_use_owner_tiles_without_changing_document(
     db_uri, tmp_path
 ):
@@ -955,6 +999,267 @@ def pick(
         counters if counters is not None else {},
         now=now,
     )
+
+
+def fallback_table(*, second_mode="drain", third_mode="return", **changes):
+    links = [
+        {"agent": "official", "model": "gpt-official", "meter": "pool-0"},
+        {
+            "agent": "alternate",
+            "model": "gpt-alternate",
+            "meter": "pool-1",
+            "fallbackMode": second_mode,
+        },
+        {"agent": "other", "model": "claude-other", "meter": "pool-2", "fallbackMode": third_mode},
+    ]
+    return table(tiers=[[{"links": links}]], **changes)
+
+
+def test_drain_matches_route_reconciliation_sequence():
+    settings = fallback_table()
+    revision = choice_revision(choice_document(settings))
+    request = ChoiceRequest(OWNER, "host-a")
+    locks = {}
+    steps = [
+        ((0,), "pool-1", True, False),
+        ((), "pool-1", False, False),
+        ((0, 1), "pool-2", False, True),
+        ((0,), "pool-1", True, False),
+        ((), "pool-1", False, False),
+        ((1,), "pool-0", False, True),
+        ((), "pool-0", False, False),
+    ]
+    for index, (closed, expected, sets, drops) in enumerate(steps):
+        readings = {f"pool-{n}": reading(f"pool-{n}", used=100) for n in closed}
+        counters = {}
+        result = plan_choice(
+            settings,
+            "work",
+            request,
+            readings,
+            {},
+            {},
+            {},
+            counters,
+            now=NOW + index,
+            drain_locks=locks,
+            settings_revision=revision,
+        )
+        assert counters == {}
+        assert result.choice.pool == expected
+        assert bool(result.lock) == sets
+        assert bool(result.drops) == drops
+        for lock in result.drops:
+            assert locks.pop(lock.key) == lock
+        if result.lock:
+            locks[result.lock.key] = result.lock
+        if locks and not sets:
+            assert "Using drain lock" in result.choice.reason
+            assert next(iter(locks.values())).since < NOW + index
+
+
+def test_drain_uses_reserve_but_ignores_busy_and_return():
+    limits = {"pool-0": {"maxRunning": 1, "reserve": {"mode": "total", "window": "7d", "pct": 20}}}
+    settings = fallback_table(limits=limits)
+    request = ChoiceRequest(OWNER, "host-a")
+    busy = plan_choice(
+        settings,
+        "work",
+        request,
+        {},
+        {"pool-0": ("running",)},
+        {},
+        {},
+        {},
+        now=NOW,
+        drain_locks={},
+    )
+    assert busy.choice.pool == "pool-1" and busy.lock is None
+    assert busy.choice.skipped[0].why == "busy"
+    reserved = {"pool-0": reading(used=90)}
+    drained = plan_choice(
+        settings, "work", request, reserved, {}, {}, {}, {}, now=NOW, drain_locks={}
+    )
+    assert drained.choice.skipped[0].why == "reserve" and drained.lock is not None
+    for returned_readings, expected in ((reserved, "pool-1"), ({}, "pool-0")):
+        returned = plan_choice(
+            fallback_table(second_mode="return", limits=limits),
+            "work",
+            request,
+            returned_readings,
+            {},
+            {},
+            {},
+            {},
+            now=NOW,
+            drain_locks={},
+        )
+        assert returned.choice.pool == expected and returned.lock is None
+
+
+def test_drain_keeps_request_filtered_lock_until_actual_closure():
+    settings = fallback_table(third_mode="drain", limits={"pool-2": {"maxRunning": 1}})
+    request = ChoiceRequest(OWNER, "host-a")
+    stopped = {f"pool-{n}": reading(f"pool-{n}", used=100) for n in (0, 1)}
+    first = plan_choice(
+        settings, "work", request, stopped, {}, {}, {}, {}, now=NOW, drain_locks={}
+    )
+    lock = first.lock
+    assert lock is not None and first.choice.pool == "pool-2"
+    readings = {"pool-0": stopped["pool-0"]}
+
+    def retry(request, *, running=None, cooldowns=None, extra_readings=None):
+        return plan_choice(
+            settings,
+            "work",
+            request,
+            readings | (extra_readings or {}),
+            running or {},
+            {},
+            cooldowns or {},
+            {},
+            now=NOW + 1,
+            drain_locks={lock.key: lock},
+        )
+
+    caller_filter = replace(request, differ_family=model_family("claude-other"))
+    busy = {"pool-2": ("running",)}
+    preview = replace(request, preview=True, exclude=("pool-2",))
+    for result, skipped in (
+        (retry(request, running=busy), "busy"),
+        (retry(caller_filter), "same_family"),
+        (retry(preview), "excluded"),
+    ):
+        assert result.choice.pool == "pool-1"
+        assert result.choice.skipped[0].why == skipped
+        assert result.drops == () and result.lock is None
+    assert retry(request).choice.pool == "pool-2"
+    for result in (
+        retry(request, running=busy, cooldowns={"pool-2": NOW + 40}),
+        retry(caller_filter, extra_readings={"pool-2": reading("pool-2", used=100)}),
+        retry(replace(request, link_exclusions={"other": NOW + 40})),
+    ):
+        assert result.choice.pool == "pool-1"
+        assert result.drops == (lock,)
+        assert result.lock is not None and result.lock.pool == "pool-1"
+
+
+def test_drain_lock_save_validates_saved_rows_and_preserves_since(db_uri):
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    document = cast(dict[str, Any], choice_document(fallback_table()))
+    original = document["hosts"]["host-a"]["work"][0][0]["links"]
+    document["hosts"]["host-a"]["work"].append(
+        [{"links": [{"agent": "different-head"}, original[1]]}]
+    )
+    saved = save(store, document)
+    snapshot = store.session_choice_snapshot(OWNER)
+    planned = plan_choice(
+        parse_session_choice(saved["settings"]),
+        "work",
+        ChoiceRequest(OWNER, "host-a"),
+        {"pool-0": reading(used=100)},
+        {},
+        {},
+        {},
+        {},
+        now=NOW,
+        drain_locks=snapshot.locks,
+        settings_revision=snapshot.revision,
+    )
+    lock = planned.lock
+    assert lock is not None
+
+    def replace_links(links, *, other_row=None, swap=False):
+        changed = deepcopy(saved["settings"])
+        tiers = changed["hosts"]["host-a"]["work"]
+        tiers[0][0]["links"] = links
+        if other_row is not None:
+            tiers[1][0]["links"] = other_row
+        if swap:
+            tiers.reverse()
+        return save(store, changed)
+
+    assert store.apply_drain_lock_delta(OWNER, snapshot, admitted=lock)
+    assert store.session_choice_snapshot(OWNER).revision == snapshot.revision
+    swap_inside_row = replace_links([original[0], original[2], original[1]])
+    after = store.session_choice_snapshot(OWNER)
+    assert after.locks[lock.key].since == NOW
+    assert after.locks[lock.key].settings_revision == swap_inside_row["revision"]
+
+    for links, other_row, swap in (
+        (original, None, True),
+        ([{"agent": "preset-head"}, *original[1:]], None, False),
+        ([*original, original[1]], None, False),
+        (original, original, False),
+        ([original[1], original[0], original[2]], None, False),
+        ([original[0], {**original[1], "fallbackMode": "return"}, original[2]], None, False),
+    ):
+        save(store, saved["settings"])
+        current = store.session_choice_snapshot(OWNER)
+        current_lock = lock.model_copy(update={"settings_revision": current.revision})
+        store.apply_drain_lock_delta(OWNER, current, admitted=current_lock)
+        assert store.session_choice_snapshot(OWNER).locks
+        replace_links(links, other_row=other_row, swap=swap)
+        assert store.session_choice_snapshot(OWNER).locks == {}
+        save(store, saved["settings"])
+        assert store.session_choice_snapshot(OWNER).revision == current.revision
+        assert not store.apply_drain_lock_delta(OWNER, current, admitted=current_lock)
+        assert store.session_choice_snapshot(OWNER).locks == {}
+
+
+def test_drain_proposal_belongs_to_weighted_winner():
+    settings = cast(dict[str, Any], choice_document(fallback_table()))
+    tier = settings["hosts"]["host-a"]["work"][0]
+    other = deepcopy(tier[0])
+    other["weight"] = 4
+    other["links"][1].update(agent="weighted", model="gpt-weighted", meter="pool-3")
+    tier.append(other)
+    plan = plan_choice(
+        parse_session_choice(settings),
+        "work",
+        ChoiceRequest(OWNER, "host-a"),
+        {"pool-0": reading(used=100)},
+        {},
+        {},
+        {},
+        {},
+        now=NOW,
+        drain_locks={},
+    )
+    assert plan.choice.pool == "pool-3"
+    assert plan.lock is not None and plan.lock.key == ("host-a", "work", 0, 1)
+
+
+def test_drain_lock_merges_simultaneous_owner_host_writes(db_uri):
+    settings = cast(dict[str, Any], choice_document(fallback_table()))
+    settings["hosts"]["host-b"] = deepcopy(settings["hosts"]["host-a"])
+    store = SqlAlchemyUserPreferencesStore(db_uri)
+    save(store, settings)
+    snapshot = store.session_choice_snapshot(OWNER)
+
+    def admit(host):
+        plan = plan_choice(
+            parse_session_choice(snapshot.document),
+            "work",
+            ChoiceRequest(OWNER, host),
+            {"pool-0": reading(used=100)},
+            {},
+            {},
+            {},
+            {},
+            now=NOW,
+            drain_locks=snapshot.locks,
+            settings_revision=snapshot.revision,
+        )
+        assert plan.lock is not None
+        return store.apply_drain_lock_delta(OWNER, snapshot, admitted=plan.lock)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert all(executor.map(admit, ("host-a", "host-b")))
+    after = SqlAlchemyUserPreferencesStore(db_uri).session_choice_snapshot(OWNER)
+    assert set(after.locks) == {("host-a", "work", 0, 0), ("host-b", "work", 0, 0)}
+    assert after.revision == snapshot.revision
+    assert store.session_choice_snapshot("other@example.test").locks == {}
 
 
 def test_exhausted_without_reset_is_skipped_without_an_invented_until():

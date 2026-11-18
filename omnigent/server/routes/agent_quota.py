@@ -261,7 +261,7 @@ def create_agent_quota_router(
         result = await asyncio.to_thread(
             service.tile_lines, owner, settings=settings, choice_state=state_for(request.app)
         )
-        result["savedRevision"] = saved["revision"]
+        result["savedRevision"] = saved.revision
         result["limitsVaryByCandidate"] = bool(
             settings.schema_version == 2 and settings.limit_rules
         )
@@ -283,7 +283,7 @@ def create_agent_quota_router(
                 model,
                 include_running=running,
             )
-            result["scoped"]["savedRevision"] = saved["revision"]
+            result["scoped"]["savedRevision"] = saved.revision
         if running:
             readings = await asyncio.to_thread(service.pool_readings, QuotaContext(owner, None))
             products = await asyncio.to_thread(session_products, request.app, settings)

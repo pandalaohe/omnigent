@@ -20,7 +20,6 @@ from omnigent.server.session_choice import (
     _filter_link,
     active_on,
     candidate_lines,
-    choice_revision,
     ordered_links,
     parse_session_choice,
     pool_limits,
@@ -29,25 +28,18 @@ from omnigent.server.session_choice import (
     rule_limits,
 )
 from omnigent.server.session_choice_runtime import context_request, inputs
+from omnigent.server.user_preferences_store import SessionChoiceSnapshot
 
 
 def read_preview_settings(store, owner, *, draft=None):
     """Bind explanations to the exact revision read, with visible configuration errors."""
-    saved: dict[str, Any] = (
-        store.session_choice(owner)
-        if store is not None
-        else {"settings": None, "revision": choice_revision(None)}
-    )
+    saved = store.session_choice_snapshot(owner) if store is not None else SessionChoiceSnapshot()
     if draft is not None:
         return parse_session_choice(draft), saved
-    if saved.get("configurationError"):
-        raise HTTPException(
-            409, {"code": "session_choice_configuration", **saved["configurationError"]}
-        )
+    if error := saved.configuration_error:
+        raise HTTPException(409, {"code": "session_choice_configuration", **error})
     return (
-        parse_session_choice(saved["settings"])
-        if saved["settings"] is not None
-        else SessionChoice()
+        parse_session_choice(saved.document) if saved.document is not None else SessionChoice()
     ), saved
 
 

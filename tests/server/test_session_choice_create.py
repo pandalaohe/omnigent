@@ -78,6 +78,240 @@ async def create(env, **changes):
     )
 
 
+@pytest.fixture
+def drain_choice_env(choice_env):
+    env = choice_env
+    head, alternate = (preset["links"][0] for preset in env.settings["presets"])
+    env.settings["hosts"][HOST]["work"] = [
+        [{"links": [head, {**alternate, "fallbackMode": "drain"}]}]
+    ]
+    env.prefs.replace_session_choice(
+        RESERVED_USER_LOCAL,
+        env.settings,
+        env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
+    )
+    return env
+
+
+@pytest.mark.asyncio
+async def test_admitted_drain_survives_state_restart_and_preview_is_read_only(drain_choice_env):
+    import httpx
+    from fastapi import FastAPI
+
+    from omnigent.server.routes.session_choice import create_session_choice_router
+    from omnigent.server.session_choice import FloorOff, state_for
+
+    env = drain_choice_env
+    now = time.time()
+    state_for(env.app).exhausted[(RESERVED_USER_LOCAL, "pool-0")] = now + 60
+    before = env.prefs.session_choice_snapshot(RESERVED_USER_LOCAL)
+    child = await create(env)
+    assert child.status_code == 201, child.text
+    assert child.json()["session_choice"]["pool"] == "pool-1"
+    assert "Drain lock selected" in child.json()["session_choice"]["reason"]
+    env.app.state.session_choice_states.clear()
+    env.prefs.set_choice_floor_off(RESERVED_USER_LOCAL, "pool-1", FloorOff("manual", {}))
+
+    app = FastAPI()
+    app.state = env.app.state
+    app.include_router(create_session_choice_router(env.prefs, None), prefix="/v1")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        url = "/v1/me/session-choice"
+        settings = await client.get(url)
+        assert settings.status_code == 200, settings.text
+        envelope = settings.json()
+        runtime = envelope["runtime"]
+        assert runtime["settingsRevision"] == envelope["revision"] == before.revision
+        [lock] = runtime["drainLocks"]
+        assert set(lock) == {
+            "hostId",
+            "workType",
+            "tierIndex",
+            "rowPosition",
+            "savedLink",
+            "rowIdentity",
+            "settingsRevision",
+            "since",
+        }
+        assert lock["savedLink"]["fallbackMode"] == "drain"
+        body = {"host_id": HOST, "work_type": "work"}
+        preview = await client.post(f"{url}/preview", json=body)
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["pool"] == "pool-1"
+        one_off = await client.post(f"{url}/preview", json={**body, "exclude": ["pool-1"]})
+        assert one_off.status_code == 200, one_off.text
+        assert one_off.json()["pool"] == "pool-0"
+        assert (await client.get(url)).json()["runtime"] == runtime
+    assert state_for(env.app).cooldowns == {}
+    line = env.app.state.agent_quota_service.session_choice_line(env.parent)
+    assert "Draining: test-model (work) until it closes." in line
+    assert "Use up: pool-1." in line
+    next_child = await create(env)
+    assert next_child.status_code == 201, next_child.text
+    assert next_child.json()["session_choice"]["pool"] == "pool-1"
+
+
+@pytest.mark.asyncio
+async def test_drain_writes_only_after_admission_and_db_failure_preserves_create(
+    drain_choice_env, monkeypatch
+):
+    from omnigent.server.session_choice import state_for
+    from omnigent.stores.conversation_store import NameAlreadyExistsError
+
+    env = drain_choice_env
+    state = state_for(env.app)
+    now = time.time()
+    state.exhausted[(RESERVED_USER_LOCAL, "pool-0")] = now + 60
+    state.exhausted[(RESERVED_USER_LOCAL, "pool-1")] = now + 60
+    held = await create(env)
+    assert held.status_code == 201, held.text
+    assert held.json()["session_choice"]["outcome"] == "hold"
+    assert env.prefs.session_choice_snapshot(RESERVED_USER_LOCAL).locks == {}
+    del state.exhausted[(RESERVED_USER_LOCAL, "pool-1")]
+    named = await create(
+        env,
+        agent_id=env.agents[1]["id"],
+        model_override="test-model",
+        user_named=True,
+    )
+    assert named.status_code == 201, named.text
+    assert env.prefs.session_choice_snapshot(RESERVED_USER_LOCAL).locks == {}
+
+    def conflict(*args, **kwargs):
+        raise NameAlreadyExistsError("session title already exists")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(env.store, "create_conversation", conflict)
+        failed = await create(env)
+    assert failed.status_code == 409, failed.text
+    assert env.prefs.session_choice_snapshot(RESERVED_USER_LOCAL).locks == {}
+
+    def write_failure(*args, **kwargs):
+        raise OSError("test lock write failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(env.prefs, "apply_drain_lock_delta", write_failure)
+        created = await create(env)
+    assert created.status_code == 201, created.text
+    assert env.store.get_conversation(created.json()["id"]) is not None
+    assert env.prefs.session_choice_snapshot(RESERVED_USER_LOCAL).locks == {}
+
+
+@pytest.mark.asyncio
+async def test_stale_create_cannot_restore_drain_after_settings_saved(
+    drain_choice_env, monkeypatch
+):
+    from omnigent.server.session_choice import state_for
+
+    env = drain_choice_env
+    owner = RESERVED_USER_LOCAL
+    state_for(env.app).exhausted[(owner, "pool-0")] = time.time() + 60
+    original = env.prefs.session_choice_snapshot
+    before = original(owner)
+    changed = json.loads(json.dumps(before.document))
+    changed["hosts"][HOST]["work"][0][0]["links"][1].pop("fallbackMode")
+    saved = []
+
+    def read_then_save(user):
+        snapshot = original(user)
+        if not saved:
+            saved.append(env.prefs.replace_session_choice(user, changed, snapshot.revision))
+            saved.append(
+                env.prefs.replace_session_choice(user, snapshot.document, saved[0]["revision"])
+            )
+        return snapshot
+
+    monkeypatch.setattr(env.prefs, "session_choice_snapshot", read_then_save)
+    child = await create(env)
+    assert child.status_code == 201, child.text
+    assert child.json()["session_choice"]["pool"] == "pool-1"
+    assert len(saved) == 2
+    after = original(owner)
+    assert after.revision == before.revision
+    assert after.locks == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal", ["billing-restart", "billing-recovery", "reset-mark", "router"])
+async def test_feedback_ends_drain_before_another_pick(drain_choice_env, monkeypatch, signal):
+    from omnigent.server.session_choice import state_for
+    from omnigent.server.session_choice_runtime import (
+        observe_external_admission,
+        record_provider_recovery,
+        record_quota_exhaustion,
+    )
+
+    env = drain_choice_env
+    owner = RESERVED_USER_LOCAL
+    if signal == "router":
+        env.settings["externalAdmission"] = [
+            {
+                "host": HOST,
+                "agent": env.agents[1]["id"],
+                "admittedByRouter": True,
+                "refusalPrefix": "router-refused",
+                "exhaustionCode": "all_closed",
+                "routeTiles": ["pool-1"],
+            }
+        ]
+        env.prefs.replace_session_choice(
+            owner, env.settings, env.prefs.session_choice(owner)["revision"]
+        )
+    now = time.time()
+    state_for(env.app).exhausted[(owner, "pool-0")] = now + 60
+    child = await create(env)
+    assert child.status_code == 201, child.text
+    session = env.store.get_conversation(child.json()["id"])
+    assert env.prefs.session_choice_snapshot(owner).locks
+
+    if signal == "router":
+        await observe_external_admission(
+            env.app,
+            session,
+            "[router-refused:all_closed clears_at=-]",
+            actor=None,
+            from_runner=True,
+            response_id="rejected",
+            status="failed",
+        )
+        assert state_for(env.app).external_admission.exclusions
+    elif signal == "reset-mark":
+        await record_quota_exhaustion(
+            env.app,
+            session,
+            "Individual quota reached. Resets in 20m",
+            actor=None,
+            from_runner=True,
+            response_id="rejected",
+        )
+        assert state_for(env.app).exhausted[(owner, "pool-1")] > now
+    else:
+        attempt = {"from_runner": True, "response_id": "rejected", "input_generation": 1}
+        await record_provider_recovery(env.app, session, started=True, **attempt)
+        await record_quota_exhaustion(
+            env.app,
+            session,
+            "HTTP 403 balance billing is disabled for this key",
+            actor=None,
+            **attempt,
+        )
+        assert state_for(env.app).refusals
+    assert not env.prefs.session_choice_snapshot(owner).locks
+    if signal == "billing-recovery":
+        monkeypatch.setattr("omnigent.server.session_choice_runtime.time.time", lambda: now + 61)
+        recovery = {"from_runner": True, "response_id": "recovered", "input_generation": 2}
+        await record_provider_recovery(env.app, session, started=True, **recovery)
+        await record_provider_recovery(env.app, session, **recovery)
+        assert not state_for(env.app).refusals
+    else:
+        env.app.state.session_choice_states.clear()
+    recovered = await create(env)
+    assert recovered.status_code == 201, recovered.text
+    assert recovered.json()["session_choice"]["pool"] == "pool-0"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("prefix", ["krill", "ccs-krill"])
 @pytest.mark.parametrize("limit", ["busy", "reserve", "stop"])
@@ -1498,26 +1732,24 @@ async def test_ask_explains_each_blocked_candidate_from_locked_snapshot(choice_e
             CHOICE_LABEL: json.dumps({"pool": "pool-1"}),
         },
     )
-    original = env.prefs.session_choice
+    original = env.prefs.session_choice_snapshot
     captured = []
 
     def read_then_save(owner):
         snapshot = original(owner)
         if not captured:
-            captured.append(snapshot["revision"])
+            captured.append(snapshot.revision)
             changed = json.loads(json.dumps(env.settings))
             changed["limitRules"][0].update(id="later", maxRunning=9)
-            env.prefs.replace_session_choice(owner, changed, snapshot["revision"])
+            env.prefs.replace_session_choice(owner, changed, snapshot.revision)
         return snapshot
 
-    monkeypatch.setattr(env.prefs, "session_choice", read_then_save)
+    monkeypatch.setattr(env.prefs, "session_choice_snapshot", read_then_save)
     response = await create(env)
     assert response.status_code == 409, response.text
     detail = response.json()["detail"]
     assert detail["outcome"] == "ask" and detail["code"] == "session_choice_ask"
-    assert (
-        detail["savedRevision"] == saved["revision"] != original(RESERVED_USER_LOCAL)["revision"]
-    )
+    assert detail["savedRevision"] == saved["revision"] != original(RESERVED_USER_LOCAL).revision
     assert "agent" not in detail and detail["pool"] is None and detail["tier"] is None
     assert "effectiveLimits" not in detail and "legacyChecks" not in detail
     skipped = {item["link"]["agent"]: item for item in detail["skipped"]}
@@ -1551,19 +1783,19 @@ async def test_admission_receipt_binds_locked_revision_sources_and_legacy(
         env.prefs.session_choice(RESERVED_USER_LOCAL)["revision"],
     )
     occupied(env)
-    original = env.prefs.session_choice
+    original = env.prefs.session_choice_snapshot
     captured = []
 
     def read_then_save(owner):
         snapshot = original(owner)
         if not captured:
-            captured.append(snapshot["revision"])
+            captured.append(snapshot.revision)
             changed = json.loads(json.dumps(env.settings))
             changed["limitRules"][0].update(id="later", maxRunning=7)
-            env.prefs.replace_session_choice(owner, changed, snapshot["revision"])
+            env.prefs.replace_session_choice(owner, changed, snapshot.revision)
         return snapshot
 
-    monkeypatch.setattr(env.prefs, "session_choice", read_then_save)
+    monkeypatch.setattr(env.prefs, "session_choice_snapshot", read_then_save)
     changes = (
         {}
         if mode == "automatic"
@@ -1583,7 +1815,7 @@ async def test_admission_receipt_binds_locked_revision_sources_and_legacy(
     receipt = data["session_choice"]
     assert receipt["savedRevision"] == saved["revision"]
     assert captured == [saved["revision"]]
-    assert original(RESERVED_USER_LOCAL)["revision"] != receipt["savedRevision"]
+    assert original(RESERVED_USER_LOCAL).revision != receipt["savedRevision"]
     cap = receipt["effectiveLimits"]["maxRunning"]
     assert (cap["value"], cap["sourceRuleId"], cap["runningCount"], cap["reservedCount"]) == (
         3,
@@ -1623,7 +1855,7 @@ async def test_v2_fault_never_selects_unchecked_first_link(choice_env, monkeypat
             raise RuntimeError("Unavailable input")
 
         if fault == "prefs":
-            monkeypatch.setattr(env.prefs, "session_choice", fail)
+            monkeypatch.setattr(env.prefs, "session_choice_snapshot", fail)
         elif fault == "running":
             monkeypatch.setattr("omnigent.server.session_choice_runtime.running_pools", fail)
         else:

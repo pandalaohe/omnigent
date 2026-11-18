@@ -6,9 +6,9 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Iterator, Mapping, MutableMapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Annotated, Any, Literal, Self
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Self, overload
 
 from pydantic import (
     BaseModel,
@@ -19,6 +19,7 @@ from pydantic import (
     SerializerFunctionWrapHandler,
     StrictBool,
     StrictStr,
+    field_validator,
     model_serializer,
     model_validator,
 )
@@ -85,6 +86,14 @@ class Link(_DocumentModel):
     effort: StrictStr | None = None
     meter: StrictStr | None = None
     max_running: PositiveInt | None = None
+    fallback_mode: Literal["drain", "return"] | None = None
+
+    @field_validator("fallback_mode")
+    @classmethod
+    def canonical_fallback_mode(
+        cls, value: Literal["drain", "return"] | None
+    ) -> Literal["drain"] | None:
+        return None if value == "return" else value
 
     @model_validator(mode="after")
     def no_meter_limit(self) -> Self:
@@ -405,6 +414,91 @@ def choice_document(settings: SessionChoice) -> dict[str, object]:
 def choice_revision(value: object) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+DrainLockKey = tuple[str, str, int, int]
+
+
+def _saved_link_identity(link: Link) -> Link:
+    return link.model_copy(update={"fallback_mode": None})
+
+
+def row_identity(row: Row) -> str:
+    return choice_revision(
+        sorted(
+            choice_revision(
+                _saved_link_identity(link).model_dump(
+                    mode="json", by_alias=True, exclude_none=True
+                )
+            )
+            for link in row.links
+        )
+    )
+
+
+class DrainLock(_DocumentModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    host_id: str
+    work_type: str
+    tier_index: int
+    row_position: int
+    saved_link: Link
+    row_identity: str
+    settings_revision: str
+    since: float
+    # Keep the admitted candidate's pool and route for asynchronous closure reports.
+    pool: str
+    route: str
+
+    @property
+    def key(self) -> DrainLockKey:
+        return self.host_id, self.work_type, self.tier_index, self.row_position
+
+    def payload(self) -> dict[str, Any]:
+        return self.model_dump(
+            mode="json", by_alias=True, exclude_none=True, exclude={"pool", "route"}
+        )
+
+
+def drain_position(row: Row, saved_link: Link) -> int | None:
+    matches = [
+        index
+        for index, link in enumerate(row.links)
+        if _saved_link_identity(link) == _saved_link_identity(saved_link)
+    ]
+    if len(matches) == 1 and matches[0] > 0 and row.links[matches[0]].fallback_mode == "drain":
+        return matches[0]
+    return None
+
+
+def revalidate_drain_locks(
+    settings: SessionChoice, locks: Iterable[DrainLock], revision: str, *, project: bool = False
+) -> dict[DrainLockKey, DrainLock]:
+    result = {}
+    for lock in locks:
+        tiers = settings.hosts.get(lock.host_id, {}).get(lock.work_type, ())
+        matches = [
+            (index, position, row)
+            for index, tier in enumerate(tiers)
+            for position, row in enumerate(tier)
+            if row_identity(row) == lock.row_identity
+        ]
+        if len(matches) != 1:
+            continue
+        index, position, row = matches[0]
+        if not project and (index, position) != (lock.tier_index, lock.row_position):
+            continue
+        if drain_position(row, lock.saved_link) is not None:
+            updated = lock.model_copy(
+                update={
+                    "settings_revision": revision,
+                    "tier_index": index,
+                    "row_position": position,
+                }
+            )
+            result[updated.key] = updated
+    return result
 
 
 def normalize_rows(
@@ -867,18 +961,13 @@ def check_candidate_limits(
         )
     ):
         return Skipped(link, "identity_unavailable")
-    lines = candidate_lines(settings, link, request, readings, floor_off, now)
-    stopped = next((line for _, line in lines if line.state == "stop"), None)
-    if stopped:
-        return Skipped(link, "stop", stopped.clears_at)
+    failure = _quota_failure(
+        settings, work_type, link, request, readings, floor_off, now, user_named=user_named
+    )
+    if failure is not None:
+        return failure
     if user_named:
         return None
-    for state, reason in (("exhausted", "exhausted"), ("warn", "reserve")):
-        for limits, line in lines:
-            if line.state == state and (
-                state != "warn" or work_type.id not in limits.reserve_exempt
-            ):
-                return Skipped(link, reason, line.clears_at)
     product = request.products.get(link.agent_id, link.agent_id)
     pool = pool_of(link, product, request.provider_groups)
     legacy = pool_limits(settings, link, product, request.provider_groups)
@@ -922,6 +1011,28 @@ def check_candidate_limits(
                 return Skipped(link, "count_unavailable")
             if len(ids) >= limits.max_running:
                 return Skipped(link, "busy", now, ids)
+    return None
+
+
+def _quota_failure(
+    settings: SessionChoice,
+    work_type: WorkType,
+    link: Link,
+    request: ChoiceRequest,
+    readings: Mapping[str, UsageAccountView],
+    floor_off: Mapping[str, FloorOff],
+    now: float,
+    *,
+    user_named: bool = False,
+) -> Skipped | None:
+    lines = candidate_lines(settings, link, request, readings, floor_off, now)
+    states = (("stop", "stop"), ("exhausted", "exhausted"), ("warn", "reserve"))
+    for state, reason in states[:1] if user_named else states:
+        for limits, line in lines:
+            if line.state == state and (
+                state != "warn" or work_type.id not in limits.reserve_exempt
+            ):
+                return Skipped(link, reason, line.clears_at)
     return None
 
 
@@ -1176,7 +1287,14 @@ def _filter_link(
     )
     if failure is not None:
         return failure
-    until = max(
+    until = _pool_cooldown(pool, request, cooldowns)
+    if until > now:
+        return Skipped(link, "cooldown", until)
+    return None
+
+
+def _pool_cooldown(pool: str, request: ChoiceRequest, cooldowns: Mapping[str, float]) -> float:
+    return max(
         (
             value
             for key, value in cooldowns.items()
@@ -1184,12 +1302,39 @@ def _filter_link(
         ),
         default=0,
     )
-    if until > now:
-        return Skipped(link, "cooldown", until)
-    return None
 
 
-def choose(
+def link_closed(
+    settings: SessionChoice,
+    work_type: WorkType,
+    link: Link,
+    request: ChoiceRequest,
+    readings: Mapping[str, UsageAccountView],
+    floor_off: Mapping[str, FloorOff],
+    cooldowns: Mapping[str, float],
+    now: float,
+) -> bool:
+    """Evaluate shared closure independently of this request's skipped reason."""
+    link = _candidate_link(settings, link, request)
+    pool = pool_of(
+        link, request.products.get(link.agent_id, link.agent_id), request.provider_groups
+    )
+    return (
+        (request.link_exclusions or {}).get(link.agent_id, 0) > now
+        or _pool_cooldown(pool, request, cooldowns) > now
+        or _quota_failure(settings, work_type, link, request, readings, floor_off, now) is not None
+    )
+
+
+@dataclass(frozen=True)
+class ChoicePlan:
+    choice: Choice
+    credits: Mapping[CounterKey, float] = field(default_factory=dict)
+    drops: tuple[DrainLock, ...] = ()
+    lock: DrainLock | None = None
+
+
+def plan_choice(
     settings: SessionChoice,
     work_type: str | None,
     request: ChoiceRequest,
@@ -1197,10 +1342,12 @@ def choose(
     running: Mapping[str, tuple[str, ...]],
     floor_off: Mapping[str, FloorOff],
     cooldowns: Mapping[str, float],
-    counters: MutableMapping[CounterKey, float],
+    counters: Mapping[CounterKey, float],
     *,
     now: float,
-) -> Choice:
+    drain_locks: Mapping[DrainLockKey, DrainLock] | None = None,
+    settings_revision: str = "",
+) -> ChoicePlan:
     work, flags = resolve_work_type(settings, work_type)
     if request.named_agent:
         flags += (f"named_no_reason:{request.named_agent}",)
@@ -1208,12 +1355,46 @@ def choose(
     if request.pin is not None:
         preset = next((p for p in settings.presets if p.id == request.pin), None)
         tiers = ((Row(preset=preset.id, links=preset.links),),) if preset else ()
+        drain_locks = None
+
+    def closed(link: Link) -> bool:
+        return link_closed(settings, work, link, request, readings, floor_off, cooldowns, now)
+
+    drops = []
+    locked_positions = {}
+    if drain_locks:
+        scoped = (
+            lock
+            for lock in drain_locks.values()
+            if (lock.host_id, lock.work_type) == (request.host, work.id)
+        )
+        for key, lock in revalidate_drain_locks(settings, scoped, settings_revision).items():
+            row = tiers[key[2]][key[3]]
+            slot = drain_position(row, lock.saved_link)
+            assert slot is not None
+            if closed(row.links[slot]):
+                drops.append(lock)
+            else:
+                locked_positions[key] = slot
+
+    drop_note = "".join(
+        f". Drain lock ended for {lock.saved_link.model or lock.saved_link.agent_id}"
+        for lock in drops
+    )
     skipped: list[Skipped] = []
     survivors: list[tuple[int, int, Row, Link, int]] = []
+    winner_slots: dict[DrainLockKey, int] = {}
     warnings: tuple[str, ...] = ()
     for index, tier in enumerate(tiers):
         for position, row in enumerate(tier):
-            for link in (_candidate_link(settings, item, request) for item in row.links):
+            key = (request.host, work.id, index, position)
+            locked = locked_positions.get(key)
+            slots = range(len(row.links))
+            order = (
+                slots if locked is None else (locked, *(slot for slot in slots if slot != locked))
+            )
+            for slot in order:
+                link = _candidate_link(settings, row.links[slot], request)
                 evidence = link._model_resolution
                 if evidence and evidence.outcome in {"substituted", "missing"}:
                     from omnigent.server.model_resolution import ResolutionNote
@@ -1234,6 +1415,7 @@ def choose(
                     skipped.append(failure)
                 else:
                     survivors.append((index, position, row, link, len(tier) - position))
+                    winner_slots[key] = slot
                     break
         if survivors and settings.strategy == "drain":
             break
@@ -1284,10 +1466,10 @@ def choose(
             weight = row.weight or default_weight
             weighted.append((counters.get(key, 0) + weight, key, weight, link))
         picked = max(weighted, key=lambda item: item[0])
+        credits = {}
         if not request.preview:
-            for credit, key, _, _ in weighted:
-                counters[key] = credit
-            counters[picked[1]] -= sum(item[2] for item in weighted)
+            credits = {key: credit for credit, key, _, _ in weighted}
+            credits[picked[1]] -= sum(item[2] for item in weighted)
         link = picked[3]
         pool = pool_of(
             link, request.products.get(link.agent_id, link.agent_id), request.provider_groups
@@ -1298,18 +1480,53 @@ def choose(
         else:
             state = reading.state if reading is not None else None
         warnings += (f"{pool} may not last until its reset",) if state == "low" else ()
-        return Choice(
-            "pick",
-            work.id,
-            link,
-            tier_index + 1,
-            pool,
-            "First eligible tier, weighted choice",
-            tuple(skipped),
-            flags,
-            warnings,
-            notes=model_notes(link, request),
-            work_types=tuple(w.id for w in settings.work_types),
+        key = picked[1][1:]
+        slot = winner_slots[key]
+        row = tiers[key[2]][key[3]]
+        saved_link = row.links[slot]
+        new_lock = None
+        reason = "First eligible tier, weighted choice" + drop_note
+        if locked_positions.get(key) == slot:
+            reason += f". Using drain lock for {link.model or link.agent_id}"
+        elif (
+            drain_locks is not None
+            and key not in locked_positions
+            and slot > 0
+            and saved_link.fallback_mode == "drain"
+            and all(closed(earlier) for earlier in row.links[:slot])
+        ):
+            proposed = DrainLock(
+                host_id=request.host,
+                work_type=work.id,
+                tier_index=key[2],
+                row_position=key[3],
+                saved_link=saved_link,
+                row_identity=row_identity(row),
+                settings_revision=settings_revision,
+                since=now,
+                pool=pool,
+                route=provider_route(request.host, link.agent_id, link.model),
+            )
+            new_lock = revalidate_drain_locks(settings, (proposed,), settings_revision).get(key)
+            if new_lock is not None:
+                reason += f". Drain lock selected for {link.model or link.agent_id}"
+        return ChoicePlan(
+            Choice(
+                "pick",
+                work.id,
+                link,
+                tier_index + 1,
+                pool,
+                reason,
+                tuple(skipped),
+                flags,
+                warnings,
+                notes=model_notes(link, request),
+                work_types=tuple(w.id for w in settings.work_types),
+            ),
+            credits,
+            tuple(drops),
+            new_lock,
         )
     holdable = [
         item
@@ -1329,34 +1546,63 @@ def choose(
             for row in rows
             if any(_candidate_link(settings, link, request) == first.link for link in row.links)
         )
-        return Choice(
-            "hold",
+        return ChoicePlan(
+            Choice(
+                "hold",
+                work.id,
+                first.link,
+                tier,
+                pool,
+                first.why + drop_note,
+                tuple(skipped),
+                flags,
+                warnings,
+                notes=model_notes(first.link, request),
+                clears_at=first.until,
+                work_types=tuple(w.id for w in settings.work_types),
+            ),
+            drops=tuple(drops),
+        )
+    return ChoicePlan(
+        Choice(
+            "ask",
             work.id,
-            first.link,
-            tier,
-            pool,
-            first.why,
+            None,
+            None,
+            None,
+            (
+                "Choose a model for this Codex route"
+                if any(item.why == "model_unavailable" for item in skipped)
+                else "No eligible link"
+            )
+            + drop_note,
             tuple(skipped),
             flags,
             warnings,
-            notes=model_notes(first.link, request),
-            clears_at=first.until,
             work_types=tuple(w.id for w in settings.work_types),
-        )
-    return Choice(
-        "ask",
-        work.id,
-        None,
-        None,
-        None,
-        "Choose a model for this Codex route"
-        if any(item.why == "model_unavailable" for item in skipped)
-        else "No eligible link",
-        tuple(skipped),
-        flags,
-        warnings,
-        work_types=tuple(w.id for w in settings.work_types),
+        ),
+        drops=tuple(drops),
     )
+
+
+def choose(
+    settings: SessionChoice,
+    work_type: str | None,
+    request: ChoiceRequest,
+    readings: Mapping[str, UsageAccountView],
+    running: Mapping[str, tuple[str, ...]],
+    floor_off: Mapping[str, FloorOff],
+    cooldowns: Mapping[str, float],
+    counters: MutableMapping[CounterKey, float],
+    *,
+    now: float,
+) -> Choice:
+    """Compatibility entry point for callers using the selector without runtime locks."""
+    plan = plan_choice(
+        settings, work_type, request, readings, running, floor_off, cooldowns, counters, now=now
+    )
+    counters.update(plan.credits)
+    return plan.choice
 
 
 @dataclass(frozen=True)
@@ -1493,6 +1739,7 @@ class ChoiceState:
         self.tiers = {key: tier for key, tier in self.tiers.items() if key[0] != owner}
         self.tiers.update(current)
 
+    @overload
     def select(
         self,
         settings: SessionChoice,
@@ -1503,7 +1750,36 @@ class ChoiceState:
         floor_off: Mapping[str, FloorOff],
         *,
         now: float,
-    ) -> Choice:
+    ) -> Choice: ...
+
+    @overload
+    def select(
+        self,
+        settings: SessionChoice,
+        work_type: str | None,
+        request: ChoiceRequest,
+        readings: Mapping[str, UsageAccountView],
+        running: Mapping[str, tuple[str, ...]],
+        floor_off: Mapping[str, FloorOff],
+        *,
+        now: float,
+        drain_locks: Mapping[DrainLockKey, DrainLock],
+        settings_revision: str,
+    ) -> ChoicePlan: ...
+
+    def select(
+        self,
+        settings: SessionChoice,
+        work_type: str | None,
+        request: ChoiceRequest,
+        readings: Mapping[str, UsageAccountView],
+        running: Mapping[str, tuple[str, ...]],
+        floor_off: Mapping[str, FloorOff],
+        *,
+        now: float,
+        drain_locks: Mapping[DrainLockKey, DrainLock] | None = None,
+        settings_revision: str = "",
+    ) -> Choice | ChoicePlan:
         readings = self.quota_readings(request.owner, readings, now, request.provider_groups)
         if request.link_exclusions is None:
             request = replace(
@@ -1530,7 +1806,7 @@ class ChoiceState:
             for (owner, pool), until in self.cooldowns.items()
             if owner == request.owner
         }
-        return choose(
+        plan = plan_choice(
             settings,
             work_type,
             request,
@@ -1540,7 +1816,11 @@ class ChoiceState:
             cooldowns,
             counters,
             now=now,
+            drain_locks=drain_locks,
+            settings_revision=settings_revision,
         )
+        counters.update(plan.credits)
+        return plan.choice if drain_locks is None else plan
 
 
 def state_for(app: Any) -> ChoiceState:

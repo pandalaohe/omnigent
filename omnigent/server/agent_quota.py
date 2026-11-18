@@ -2581,6 +2581,16 @@ class AgentQuotaService:
                 parts.append("Use up: " + ", ".join(use_up) + ".")
             if released:
                 parts.append("Floor off: " + ", ".join(released) + " until reset.")
+            if self.preferences is not None:
+                snapshot = self.preferences.session_choice_snapshot(context.owner_id)
+                if snapshot.revision == choice_revision(choice_document(settings)):
+                    draining = dict.fromkeys(
+                        f"{lock.saved_link.model or lock.saved_link.agent_id} ({lock.work_type})"
+                        for key, lock in sorted(snapshot.locks.items())
+                        if lock.host_id == host
+                    )
+                    if draining:
+                        parts.append("Draining: " + ", ".join(draining) + " until it closes.")
             return " ".join(parts)
         except Exception:
             _logger.warning(

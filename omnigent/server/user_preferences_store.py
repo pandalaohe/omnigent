@@ -49,7 +49,14 @@ from omnigent.models.model_reference import (
     canonical_model,
 )
 from omnigent.server.auth import RESERVED_USER_LOCAL
-from omnigent.server.session_choice import SessionChoice
+from omnigent.server.session_choice import (
+    DrainLock,
+    DrainLockKey,
+    SessionChoice,
+    choice_revision,
+    parse_session_choice,
+    revalidate_drain_locks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +98,8 @@ USER_PREFERENCE_NAMESPACES = frozenset(
 # "never initialized" from an explicit all-defaults envelope.
 _SETTINGS_KEY_PREFIX = "settings."
 _ENVELOPE_VERSION_KEY = f"{_SETTINGS_KEY_PREFIX}version"
+_DRAIN_LOCKS_KEY = "session_choice.drain_locks"
+_DRAIN_LOCKS_MAX_BYTES = 2 * 1024 * 1024
 
 PreferencesEnvelope: TypeAlias = dict[str, Any]
 
@@ -2054,6 +2063,61 @@ def _require_user_row(session: Session, user_id: str, create_if_missing: bool) -
         raise UserPreferencesUserNotFoundError(user_id)
 
 
+@dataclass(frozen=True)
+class SessionChoiceSnapshot:
+    document: Any = None
+    generation: int = 0
+    locks: Mapping[DrainLockKey, DrainLock] = field(default_factory=dict)
+
+    @property
+    def revision(self) -> str:
+        return choice_revision(self.document)
+
+    @property
+    def configuration_error(self) -> dict[str, Any] | None:
+        return _choice_configuration_error(self.document)
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "settingsRevision": self.revision,
+            "drainLocks": [lock.payload() for _, lock in sorted(self.locks.items())],
+        }
+
+
+def _drain_lock_state(raw: bytes | None) -> tuple[int, dict[DrainLockKey, DrainLock]]:
+    if raw is None:
+        return 0, {}
+    document = json.loads(decode(raw, max_decoded_bytes=_DRAIN_LOCKS_MAX_BYTES) or "{}")
+    locks = [DrainLock.model_validate(value) for value in document["locks"]]
+    return document["generation"], {lock.key: lock for lock in locks}
+
+
+def _read_choice_snapshot(session: Session, user_id: str) -> SessionChoiceSnapshot:
+    collab_key = _settings_key(SESSION_COLLAB_NAMESPACE)
+    # One SELECT gives a consistent snapshot even at READ COMMITTED.
+    rows = dict(
+        session.execute(
+            select(SqlPreference.key, type_coerce(SqlPreference.value, LargeBinary)).where(
+                SqlPreference.workspace_id == current_workspace_id(),
+                SqlPreference.user_id == user_id,
+                SqlPreference.key.in_((collab_key, _DRAIN_LOCKS_KEY)),
+            )
+        )
+        .tuples()
+        .all()
+    )
+    collab = (
+        json.loads(decode(rows[collab_key], max_decoded_bytes=USER_PREFERENCES_MAX_BYTES) or "{}")
+        if collab_key in rows
+        else {}
+    )
+    document = collab.get("sessionChoice") if isinstance(collab, dict) else None
+    generation, locks = _drain_lock_state(rows.get(_DRAIN_LOCKS_KEY))
+    revision = choice_revision(document)
+    active = {key: lock for key, lock in locks.items() if lock.settings_revision == revision}
+    return SessionChoiceSnapshot(document, generation, active)
+
+
 class SqlAlchemyUserPreferencesStore:
     """SQLAlchemy repository for current-user preferences.
 
@@ -2382,17 +2446,86 @@ class SqlAlchemyUserPreferencesStore:
             self._write_session, "transform_user_preferences_namespace", write
         )
 
-    def session_choice(self, user_id: str) -> dict[str, Any]:
-        from omnigent.server.session_choice import choice_revision
+    def session_choice_snapshot(self, user_id: str) -> SessionChoiceSnapshot:
+        with self._session("read_session_choice") as session:
+            return _read_choice_snapshot(session, user_id)
 
-        envelope = self.get(user_id)
-        collab = (envelope or {}).get("settings", {}).get(SESSION_COLLAB_NAMESPACE)
-        value = collab.get("sessionChoice") if isinstance(collab, dict) else None
-        result = {"settings": value, "revision": choice_revision(value)}
-        error = _choice_configuration_error(value)
+    def session_choice(self, user_id: str, *, include_runtime: bool = False) -> dict[str, Any]:
+        snapshot = self.session_choice_snapshot(user_id)
+        result = {"settings": snapshot.document, "revision": snapshot.revision}
+        error = snapshot.configuration_error
         if error is not None:
             result["configurationError"] = error
+        if include_runtime:
+            result["runtime"] = snapshot.payload()
         return result
+
+    def _write_drain_locks(self, session, user_id, generation, locks):
+        self._upsert_row(
+            session,
+            user_id=user_id,
+            key=_DRAIN_LOCKS_KEY,
+            value=_encode_value(
+                {
+                    "generation": generation,
+                    "locks": [
+                        lock.model_dump(mode="json", by_alias=True, exclude_none=True)
+                        for lock in locks.values()
+                    ],
+                }
+            ),
+        )
+
+    def _merge_drain_locks(self, user_id, transform) -> bool:
+        def write(session: Session) -> bool:
+            account = lock_account(session, user_id)
+            if account is not None and account.deleted_at is not None:
+                return False
+            self._upsert_row(
+                session,
+                user_id=user_id,
+                key=_ENVELOPE_VERSION_KEY,
+                value=_encode_value(USER_PREFERENCE_VERSION),
+            )
+            snapshot = _read_choice_snapshot(session, user_id)
+            changed = transform(snapshot)
+            if changed != snapshot.locks:
+                self._write_drain_locks(session, user_id, snapshot.generation, changed)
+                return True
+            return False
+
+        return run_write_transaction(
+            self._write_session, "merge_session_choice_drain_locks", write
+        )
+
+    def apply_drain_lock_delta(
+        self,
+        user_id: str,
+        read: SessionChoiceSnapshot,
+        *,
+        drops: tuple[DrainLock, ...] = (),
+        admitted: DrainLock | None = None,
+    ) -> bool:
+        def merge(current: SessionChoiceSnapshot) -> Mapping[DrainLockKey, DrainLock]:
+            if current.generation != read.generation or current.revision != read.revision:
+                return current.locks
+            locks = dict(current.locks)
+            for lock in drops:
+                if locks.get(lock.key) == lock:
+                    del locks[lock.key]
+            if admitted is not None and admitted.key not in locks:
+                locks[admitted.key] = admitted
+            return locks
+
+        return self._merge_drain_locks(user_id, merge)
+
+    def close_choice_drain_locks(self, user_id: str, matches: Callable[[DrainLock], bool]) -> None:
+        self._merge_drain_locks(
+            user_id,
+            lambda snapshot: {
+                key: lock for key, lock in snapshot.locks.items() if not matches(lock)
+            },
+        )
 
     def choice_floor_off(self, user_id: str) -> dict[str, Any]:
         from omnigent.server.session_choice import FloorOff
@@ -2470,9 +2603,7 @@ class SqlAlchemyUserPreferencesStore:
         from omnigent.server.session_choice import (
             ChoiceRevisionConflict,
             choice_document,
-            choice_revision,
             normalize_rows,
-            parse_session_choice,
         )
 
         incoming = parse_session_choice(value) if value is not None else None
@@ -2509,6 +2640,7 @@ class SqlAlchemyUserPreferencesStore:
                     stored = parse_session_choice(previous)
             corrected: list[str] = []
             document = None
+            normalized = SessionChoice()
             if incoming is not None:
                 normalized, corrected = normalize_rows(incoming, stored)
                 if conversion_proof is not None:
@@ -2529,6 +2661,16 @@ class SqlAlchemyUserPreferencesStore:
                 collab.pop("sessionChoice", None)
             settings[SESSION_COLLAB_NAMESPACE] = collab
             validated = _assemble_envelope(settings)
+            revision = choice_revision(document)
+            if revision != expected_revision:
+                runtime = _read_choice_snapshot(session, user_id)
+                locks = revalidate_drain_locks(
+                    normalized,
+                    runtime.locks.values(),
+                    revision,
+                )
+                # A content hash can return to its previous value after two saves.
+                self._write_drain_locks(session, user_id, runtime.generation + 1, locks)
             self._upsert_row(
                 session,
                 user_id=user_id,
@@ -2539,7 +2681,7 @@ class SqlAlchemyUserPreferencesStore:
             )
             return {
                 "settings": document,
-                "revision": choice_revision(document),
+                "revision": revision,
                 "corrected": corrected,
             }
 
