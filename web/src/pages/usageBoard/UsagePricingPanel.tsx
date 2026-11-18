@@ -2,13 +2,17 @@ import { nanoid } from "nanoid";
 import { cloneElement, useId, useState, type ReactElement } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation } from "@/lib/routing";
-import { boardPath } from "@/lib/boardFrame";
+import { boardExitProps, boardPath } from "@/lib/boardFrame";
 import { Button } from "@/components/ui/button";
 import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
 import type { UsageAccountView } from "./usageBoardData";
 import { usageJson } from "./usagePriceSourceData";
 import { UsageName } from "./UsageName";
+import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
+import { formatMoney } from "./usageBoardFormat";
+import type { UsageAccountActivity } from "./usageActivityData";
+import { t } from "./usageText";
 import {
   CURRENCIES,
   COST_CLASSES,
@@ -1028,24 +1032,66 @@ function DecimalField({
   );
 }
 
-export function UsagePricingSummary({ accountId }: { accountId: string }) {
+export function UsagePricingSummary({
+  accountId,
+  accounts,
+  amounts,
+}: {
+  accountId?: string;
+  accounts?: UsageAccountView[];
+  amounts?: UsageAccountActivity[];
+}) {
+  const board = useUsageContextPreferences().board;
+  const ids = new Set(accountId ? [accountId] : accounts?.map(({ id }) => id));
+  const single = accountId ?? (accounts?.length === 1 ? accounts[0].id : undefined);
+  const amountsById = new Map(amounts?.map((amount) => [amount.account, amount]));
   const query = usePricingBaseline();
   const cards =
-    query.data?.cards.filter((card) => (card.parent_account_id ?? card.target_id) === accountId) ??
-    [];
-  const kind = query.data ? accountCostClass(query.data, accountId) : null;
-  if (kind === "free" || kind === "metered") return null;
+    query.data?.cards.filter((card) => ids.has(card.parent_account_id ?? card.target_id)) ?? [];
+  const kind = query.data && single ? accountCostClass(query.data, single) : null;
+  if (accountId && (kind === "free" || kind === "metered")) return null;
   return (
     <section className="usage-card">
       <div className="flex items-center justify-between">
-        <h2 className="usage-card-title">Card pricing</h2>
+        <h2 className="usage-card-title">{t("overviewPricing")}</h2>
         <Link
           className="inline-flex min-h-11 items-center text-xs underline"
-          to={boardPath(`/usage/board/${encodeURIComponent(accountId)}/settings#usage-pricing`)}
+          to={
+            single
+              ? boardPath(`/usage/board/${encodeURIComponent(single)}/settings#usage-pricing`)
+              : "/settings/general#usage-settings"
+          }
+          {...(!single ? boardExitProps() : {})}
         >
-          Edit pricing
+          {t("overviewEditPricing")}
         </Link>
       </div>
+      {accounts?.map((account) => {
+        const fee = board.fees?.[account.id];
+        if (fee === undefined) return null;
+        const activity = amountsById.get(account.id);
+        const spanDays = activity
+          ? (activity.span.until - activity.span.requested_from) / 86400
+          : null;
+        const equivalent = spanDays === null ? null : (fee * spanDays) / 30;
+        const cost = activity?.totals.cost_usd;
+        return (
+          <div key={account.id} className="usage-row flex-wrap">
+            <UsageName className="flex-1">{account.display_name}</UsageName>
+            <span>
+              {t("overviewMonthlyFee")} {formatMoney(fee)}
+            </span>
+            {equivalent !== null ? (
+              <span>
+                {t("overviewPeriodFee")} {formatMoney(equivalent)}
+              </span>
+            ) : null}
+            {equivalent && cost != null ? (
+              <span>{t("overviewDollarBuys", { amount: formatMoney(cost / equivalent) })}</span>
+            ) : null}
+          </div>
+        );
+      })}
       {cards.length ? (
         cards.map((card) => (
           <div

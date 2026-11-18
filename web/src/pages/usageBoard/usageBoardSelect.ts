@@ -93,6 +93,15 @@ export function accountTone(account: UsageAccountView, stale: boolean): UsageTon
 }
 
 /** A renewal in whole days, for the tile's footer. */
+/** The provider's renewal date wins over the stored preference. */
+export function renewalOf(
+  account: Pick<UsageAccountView, "renews_at">,
+  stored: number | undefined,
+): { at: number; official: boolean } | null {
+  if (account.renews_at !== null) return { at: account.renews_at * 1000, official: true };
+  return stored === undefined ? null : { at: stored, official: false };
+}
+
 export function daysUntil(epochMs: number | null | undefined, now = Date.now()): number | null {
   if (epochMs === null || epochMs === undefined || !Number.isFinite(epochMs)) return null;
   return Math.max(0, Math.ceil((epochMs - now) / 86_400_000));

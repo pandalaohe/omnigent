@@ -2,6 +2,7 @@ import type {
   UsageAccountActivity,
   UsageActivity,
   UsageIssues,
+  UsageSpan,
   UsageTotals,
 } from "./usageActivityData";
 import { sumUsage } from "./usageAmountData";
@@ -30,108 +31,142 @@ export function sampleTotals(
   };
 }
 
+const HOUR = 3600;
+const DAY = 24 * HOUR;
+const fixtureAccounts = ["codex", "claude", "litellm", "grok", "pi"];
+const empty = sampleTotals(null, null);
+
+function hourlyRows(account: string, index: number, from: number, until: number) {
+  if (account === "grok") return [];
+  const length = Math.max(0, Math.ceil((until - from) / HOUR));
+  return Array.from({ length }, (_, offset) => {
+    const at = from + offset * HOUR;
+    const hour = Math.floor(at / HOUR);
+    const profile = (((hour * 19 + index * 3) % 17) + 17) % 17;
+    const value = sampleTotals(
+      ((index + 1) * (profile + 4)) / 128,
+      11000 + profile * 4000,
+      account === "litellm"
+        ? {
+            requests: 5,
+            failed: profile === 0 ? 1 : 0,
+            failure_pct: profile === 0 ? 20 : 0,
+            reasons: profile === 0 ? { timeout: 1 } : {},
+            unpriced: profile === 0 ? 1 : 0,
+          }
+        : {},
+    );
+    return { at, ...value, last_at: at, metered: index < 2 ? empty : value };
+  });
+}
+
+function fixtureTotals(rows: ReturnType<typeof hourlyRows>): UsageTotals {
+  return {
+    ...sumUsage(rows),
+    last_at: rows.at(-1)?.at ?? null,
+    metered: sumUsage(rows.map((row) => row.metered)),
+  };
+}
+
+function fixtureSeries(
+  rows: ReturnType<typeof hourlyRows>,
+  span: UsageSpan,
+  bucketUnit?: "hour" | "day",
+) {
+  if (
+    bucketUnit === "hour" ||
+    (bucketUnit === undefined && span.until - span.requested_from <= 48 * HOUR)
+  )
+    return rows;
+  const buckets = new Map<number, typeof rows>();
+  for (const row of rows) {
+    const date = new Date(row.at * 1000);
+    date.setHours(0, 0, 0, 0);
+    if (bucketUnit === undefined && span.until - span.requested_from > 45 * DAY)
+      date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
+    const at = date.getTime() / 1000;
+    const bucket = buckets.get(at) ?? [];
+    bucket.push(row);
+    buckets.set(at, bucket);
+  }
+  return [...buckets].map(([at, bucket]) => ({ at, ...fixtureTotals(bucket) }));
+}
+
+function fixtureSpan(requested_from: number, until: number): UsageSpan {
+  const counted_from = Math.floor(requested_from / HOUR) * HOUR;
+  return { requested_from, counted_from, until, approx: counted_from !== requested_from };
+}
+
 export function usageActivityFixture(
   params = new URLSearchParams(),
   now = Date.now() / 1000,
+  { bucketUnit }: { bucketUnit?: "hour" | "day" } = {},
 ): UsageActivity {
   const range = params.get("range") ?? "d7";
   const midnight = (days: number) => {
-    const day = new Date(now * 1000);
-    day.setHours(0, 0, 0, 0);
-    day.setDate(day.getDate() - days);
-    return day.getTime() / 1000;
+    const date = new Date(now * 1000);
+    date.setHours(0, 0, 0, 0);
+    date.setDate(date.getDate() - days);
+    return date.getTime() / 1000;
+  };
+  const localDate = (input: string | null, next = false) => {
+    const date = new Date(`${input}T00:00:00`);
+    if (next) date.setDate(date.getDate() + 1);
+    return date.getTime() / 1000;
   };
   const start =
-    range === "today"
-      ? midnight(0)
-      : range === "h24"
-        ? now - 86400
-        : range === "d30"
-          ? midnight(29)
-          : range === "d90"
-            ? midnight(89)
-            : range === "period"
-              ? now - 30 * 86400
-              : range === "custom"
-                ? new Date(`${params.get("from")}T00:00:00`).getTime() / 1000
-                : midnight(6);
-  const until =
-    range === "custom" && params.get("to")
-      ? Math.min(now, new Date(`${params.get("to")}T00:00:00`).getTime() / 1000 + 86400)
-      : now;
-  const empty = sampleTotals(null, null);
-  const accounts: UsageAccountActivity[] = ["codex", "claude", "litellm", "grok", "pi"].map(
-    (account, index) => {
-      const from = range === "period" && account === "codex" ? now - 3 * 86400 : start;
-      const counted = Math.floor(from / 3600) * 3600;
-      const length = until - counted;
-      const hourly = length <= 48 * 3600;
-      const n = hourly
-        ? Math.max(1, Math.ceil(length / 3600))
-        : Math.max(1, Math.ceil(length / 86400));
-      const series =
-        account === "grok"
-          ? []
-          : Array.from({ length: n }, (_, bucket) => {
-              const cost = (index + 1) * (0.3 + (bucket % 4) * 0.15);
-              const value = sampleTotals(
-                cost,
-                300000 + bucket * 10000,
-                account === "litellm"
-                  ? {
-                      requests: 60,
-                      failed: 15,
-                      failure_pct: 25,
-                      reasons: { timeout: 10, gateway: 5 },
-                      unpriced: bucket === 0 ? 1 : 0,
-                    }
-                  : {},
-              );
-              return {
-                at: counted + bucket * (hourly ? 3600 : 86400),
-                ...value,
-                metered: index < 2 ? empty : value,
-              };
-            });
-      const totals = sumUsage(series);
-      totals.metered = sumUsage(series.map((point) => point.metered));
-      const previousSeries = series.map((point) => {
-        const value = sampleTotals((point.cost_usd ?? 0) * 0.8, point.tokens);
-        return { at: point.at - length, ...value, metered: index < 2 ? empty : value };
-      });
-      const previousTotals = sumUsage(previousSeries);
-      previousTotals.metered = sumUsage(previousSeries.map((point) => point.metered));
-      return {
+    {
+      today: midnight(0),
+      h24: now - DAY,
+      d7: midnight(6),
+      d30: midnight(29),
+      d90: midnight(89),
+      period: now - 30 * DAY,
+      custom: localDate(params.get("from")),
+    }[range] ?? midnight(6);
+  const until = range === "custom" ? Math.min(now, localDate(params.get("to"), true)) : now;
+  const accounts: UsageAccountActivity[] = fixtureAccounts.flatMap((account, index) => {
+    if (params.get("account") && params.get("account") !== account) return [];
+    const current = fixtureSpan(
+      range === "period" && account === "codex" ? now - 3 * DAY : start,
+      until,
+    );
+    const elapsed = Math.ceil((current.until - current.counted_from) / HOUR) * HOUR;
+    const yesterday = new Date(now * 1000);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const prior =
+      range === "today"
+        ? fixtureSpan(midnight(1), yesterday.getTime() / 1000)
+        : fixtureSpan(current.counted_from - elapsed, current.counted_from);
+    const rows = hourlyRows(account, index, current.counted_from, current.until);
+    const previousRows = hourlyRows(account, index, prior.counted_from, prior.until);
+    const mark = index < 2 ? "~" : account === "litellm" ? "≥" : current.approx ? "≈" : null;
+    const totals = fixtureTotals(rows);
+    return [
+      {
         account,
-        span: { requested_from: from, counted_from: counted, until, approx: from !== counted },
-        mark: index < 2 ? "~" : account === "litellm" ? "≥" : from !== counted ? "≈" : null,
+        span: current,
+        mark,
         totals,
-        series,
-        previous: previousSeries.length
+        series: fixtureSeries(rows, current, bucketUnit),
+        previous: previousRows.length
           ? {
-              span: {
-                requested_from: counted - length,
-                counted_from: counted - length,
-                until: counted,
-                approx: false,
-              },
-              mark: index < 2 ? "~" : null,
-              totals: previousTotals,
-              series: previousSeries,
+              span: prior,
+              mark,
+              totals: fixtureTotals(previousRows),
+              series: fixtureSeries(previousRows, prior, bucketUnit),
             }
           : null,
-        models: series.length ? [{ model: index < 2 ? "model-a" : "model-b", ...totals }] : [],
-        hosts: series.length ? [{ host_id: "h1", ...totals }] : [],
-      };
-    },
-  );
+        models: rows.length ? [{ model: index < 2 ? "model-a" : "model-b", ...totals }] : [],
+        hosts: rows.length ? [{ host_id: "h1", ...totals }] : [],
+      },
+    ];
+  });
   return {
     generated_at: now,
     range,
     tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    accounts: accounts.filter(
-      (item) => !params.get("account") || item.account === params.get("account"),
-    ),
+    accounts,
   };
 }
 

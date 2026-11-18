@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Link } from "@/lib/routing";
+import { Link, useSearchParams } from "@/lib/routing";
 import { boardPath } from "@/lib/boardFrame";
 import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
@@ -41,15 +41,20 @@ const compact = (value: number | null) =>
 
 export function UsageCostPage() {
   const board = useUsageContextPreferences().board;
-  const range = ["today", "d7", "d30", "d90"].includes(board.range?.key ?? "")
-    ? board.range!
-    : { key: "d30" as const };
+  const [search, setSearch] = useSearchParams();
+  const linkedRange = search.get("range");
+  const rangeKey = linkedRange ?? board.range?.key;
+  const range = {
+    key: rangeKey === "today" || rangeKey === "d7" || rangeKey === "d90" ? rangeKey : "d30",
+  } as const;
   const overview = useUsageOverview(true);
   const analysis = useUsageAnalysis(range);
   const [dimension, setDimension] = useState<AnalysisDimension | "card">("account");
   const [picks, setPicks] = useState<Partial<Record<AnalysisDimension | "card", string[] | null>>>(
     {},
   );
+  const linkedAccounts = search.getAll("account");
+  const accountPick = linkedAccounts.length ? linkedAccounts : null;
   const [cardSort, setCardSort] = useState({ key: "paid", direction: -1 });
   const [sort, setSort] = useState<{
     key: "api" | "paid" | "tokens" | "payback" | "failure";
@@ -85,7 +90,8 @@ export function UsageCostPage() {
       (model) => ({ key: model, name: model || "Unknown model" }),
     );
   }, [dimension, visible, analysis.data, names, rows, board.hidden]);
-  const pick = picks[dimension];
+  const pick =
+    picks[dimension] === undefined && dimension === "account" ? accountPick : picks[dimension];
   const all = pick == null;
   const keys = all
     ? items.map((item) => item.key)
@@ -94,7 +100,7 @@ export function UsageCostPage() {
     dimension,
     keys,
     hidden: board.hidden,
-    enabled: !!analysis.data,
+    enabled: !!analysis.data && (!accountPick || !!overview.data),
   });
   const presentation = selected.data?.presentation;
   const selectedRows = useMemo(
@@ -173,7 +179,14 @@ export function UsageCostPage() {
               key={key}
               title={label}
               aria-pressed={range.key === key}
-              onClick={() => patchUsageBoardPreferences({ range: { key } })}
+              onClick={() => {
+                patchUsageBoardPreferences({ range: { key } });
+                if (linkedRange) {
+                  const next = new URLSearchParams(search);
+                  next.set("range", key);
+                  setSearch(next, { replace: true });
+                }
+              }}
             >
               {label}
             </button>
@@ -198,7 +211,7 @@ export function UsageCostPage() {
               setPicks({
                 ...picks,
                 [dimension]: toggleAnalysisPick(
-                  picks[dimension] ?? null,
+                  pick ?? null,
                   item.key,
                   items.map((value) => value.key),
                 ),

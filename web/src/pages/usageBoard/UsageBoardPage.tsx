@@ -1,333 +1,169 @@
+import { Link, useSearchParams } from "@/lib/routing";
 import { boardExitProps, boardPath } from "@/lib/boardFrame";
-// The Usage board: one band of tiles per group, each tile a ring per window.
-// Display only — every setting lives in Settings or the account's own settings
-// page, reached from a tile. Arranging (groups and hand order) is the one edit
-// on this page, and it is a mode the visitor opens and closes.
-
-import { useState } from "react";
-import { Link, useNavigate } from "@/lib/routing";
-import {
-  CheckIcon,
-  ChevronDownIcon,
-  ChevronRightIcon,
-  ChevronUpIcon,
-  LayoutGridIcon,
-  ListIcon,
-  MoveIcon,
-  PlusIcon,
-  SettingsIcon,
-  TrashIcon,
-} from "lucide-react";
+import { SettingsIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { cn } from "@/lib/utils";
-import { patchUsageBoardPreferences, type UsageBoardBand } from "@/lib/usageContextPreferences";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
-import { QuotaFloorControl } from "@/pages/settings/sessionChoice/QuotaFloorControl";
-
+import { UsageAccountQuota } from "./UsageAccountPage";
+import {
+  overviewRange,
+  UsageAccountCost,
+  UsageOverviewHosts,
+  useOverviewCostReads,
+} from "./UsageAccountCost";
 import { UsageBoardFrame } from "./UsageBoardFrame";
-import { boardBands, moveTile, seedBands } from "./usageBoardLayout";
-import { UsageTile } from "./UsageTile";
-import { useUsageOverview, type UsageAccountView } from "./usageBoardData";
-import { useUsageActivity } from "./usageActivityData";
-import { t } from "./usageText";
-import { UsageSummary } from "./UsageAmounts";
-import { UsageName } from "./UsageName";
 import { UsageEvents } from "./UsageEvents";
+import { UsageModelPoolsLink } from "./UsageModelPoolsLink";
+import { UsageName } from "./UsageName";
+import { UsagePricingSummary } from "./UsagePricingPanel";
+import { UsageRing } from "./UsageRing";
+import { useUsageOverview, type UsageAccountView } from "./usageBoardData";
+import { formatPercentReading, formatTimeLeft, windowName } from "./usageBoardFormat";
+import { boardBands } from "./usageBoardLayout";
+import { isStale } from "./usageBoardSelect";
+import { t } from "./usageText";
 
-/** The renewal a tile counts down to: the provider's date wins over the user's. */
-export function renewalOf(
-  account: Pick<UsageAccountView, "renews_at">,
-  stored: number | undefined,
-): { at: number; official: boolean } | null {
-  if (account.renews_at !== null) return { at: account.renews_at * 1000, official: true };
-  if (stored !== undefined) return { at: stored, official: false };
-  return null;
+function tightest(account: UsageAccountView) {
+  const windows = account.windows.filter((window) => !window.past_reset);
+  return (
+    windows.reduce<(typeof windows)[number] | null>((best, window) => {
+      if (window.remaining_pct === null) return best;
+      return window.remaining_pct < (best?.remaining_pct ?? Infinity) ? window : best;
+    }, null) ??
+    windows.find((window) => window.id === account.deciding_window) ??
+    windows[0] ??
+    null
+  );
 }
 
 export function UsageBoardPage() {
-  const info = useServerInfo();
-  const preferences = useUsageContextPreferences();
-  const board = preferences.board;
-  const overview = useUsageOverview(info !== "loading" && info.usage_board_enabled === true);
-  const activity = useUsageActivity(
-    undefined,
-    info !== "loading" && info.usage_board_enabled === true,
-    { key: "period" },
+  const board = useUsageContextPreferences().board;
+  const overview = useUsageOverview(true);
+  const [search] = useSearchParams();
+  const accounts = boardBands(board, overview.data?.accounts ?? []).flatMap(
+    (band) => band.accounts,
   );
-  const navigate = useNavigate();
-  const [arranging, setArranging] = useState(false);
-  const accounts = overview.data?.accounts ?? [];
-  const bands = boardBands(board, accounts);
-  const total = accounts.length;
+  const account = accounts.find((item) => item.id === search.get("account"));
+  const settings = account
+    ? boardPath(`/usage/board/${encodeURIComponent(account.id)}/settings`)
+    : "/settings/general#usage-settings";
+  const reads = useOverviewCostReads(account?.id, accounts.length > 0);
+  const shown = account ? [account] : accounts;
+  const selectedRange = overviewRange(search.get("range"));
 
-  function update(patch: Parameters<typeof patchUsageBoardPreferences>[0]) {
-    patchUsageBoardPreferences(patch);
-  }
-
-  function changeBands(next: UsageBoardBand[]) {
-    update({ bands: next });
-  }
-
-  function toggleBand(id: string) {
-    changeBands(
-      seedBands(board, accounts).map((band) =>
-        band.id === id ? { ...band, open: !band.open } : band,
-      ),
-    );
-  }
-
-  function addBand() {
-    changeBands([
-      ...seedBands(board, accounts),
-      { id: `g${Date.now().toString(36)}`, name: "New group", accounts: [], open: true },
-    ]);
-  }
-
-  function renameBand(id: string, name: string) {
-    changeBands(
-      seedBands(board, accounts).map((band) => (band.id === id ? { ...band, name } : band)),
-    );
-  }
-
-  function moveBand(id: string, direction: -1 | 1) {
-    const existing = seedBands(board, accounts);
-    const index = existing.findIndex((band) => band.id === id);
-    const target = index + direction;
-    if (index < 0 || target < 0 || target >= existing.length) return;
-    const next = [...existing];
-    const [band] = next.splice(index, 1);
-    next.splice(target, 0, band);
-    changeBands(next);
-  }
-
-  function removeBand(id: string) {
-    changeBands(seedBands(board, accounts).filter((band) => band.id !== id));
-  }
-
-  function nudgeTile(accountId: string, direction: -1 | 1) {
-    changeBands(moveTile(seedBands(board, accounts), accounts, board, accountId, direction));
+  function selectAccount(id?: string) {
+    const next = new URLSearchParams(search);
+    if (id) next.set("account", id);
+    else next.delete("account");
+    return { search: next.toString() };
   }
 
   return (
     <UsageBoardFrame
-      title="Usage board"
+      title={t("boardTitle")}
       generatedAt={overview.data?.generated_at}
       loading={overview.isPending}
-      error={overview.error ?? activity.error}
+      error={overview.error}
       actions={
-        <details className="usage-tools">
-          <summary>{t("boardTools")}</summary>
-          <div>
-            {arranging ? (
-              <>
-                <Button variant="outline" size="sm" onClick={addBand} className="gap-1.5">
-                  <PlusIcon className="size-3.5" aria-hidden="true" />
-                  Group
-                </Button>
-                <Button size="sm" onClick={() => setArranging(false)} className="gap-1.5">
-                  <CheckIcon className="size-3.5" aria-hidden="true" />
-                  Done
-                </Button>
-              </>
-            ) : (
-              <>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  aria-label="Arrange groups and order"
-                  title="Arrange"
-                  onClick={() => {
-                    // Arranging needs the ring view: a compact row has no room for
-                    // handles, and switching here is one line instead of a second
-                    // arrangement layout.
-                    update({ bands: seedBands(board, accounts), density: "std" });
-                    setArranging(true);
-                  }}
-                >
-                  <MoveIcon className="size-4" aria-hidden="true" />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  aria-label={board.density === "std" ? "Compact view" : "Rings view"}
-                  title={board.density === "std" ? "Compact view" : "Rings view"}
-                  onClick={() => update({ density: board.density === "std" ? "mini" : "std" })}
-                >
-                  {board.density === "std" ? (
-                    <ListIcon className="size-4" aria-hidden="true" />
-                  ) : (
-                    <LayoutGridIcon className="size-4" aria-hidden="true" />
-                  )}
-                </Button>
-                <Button variant="ghost" size="icon" asChild aria-label="Usage board settings">
-                  <Link {...boardExitProps()} to="/settings/general#usage-settings">
-                    <SettingsIcon className="size-4" aria-hidden="true" />
-                  </Link>
-                </Button>
-              </>
-            )}
-          </div>
-        </details>
+        <Button variant="ghost" size="icon" asChild aria-label={t("overviewSettings")}>
+          <Link {...(account ? {} : boardExitProps())} to={settings}>
+            <SettingsIcon className="size-4" aria-hidden="true" />
+          </Link>
+        </Button>
       }
     >
-      {!arranging ? (
-        <UsageSummary
-          accountIds={accounts
-            .filter((account) => !board.hidden.includes(account.id))
-            .map((account) => account.id)}
-        />
-      ) : null}
-      {!arranging && total === 0 ? (
-        <EmptyBoard />
-      ) : (
-        <div className="usage-bands">
-          {bands.map((band, index) => {
-            const open = band.open || arranging;
-            // An empty group is only worth a row while it is being arranged.
-            if (band.accounts.length === 0 && !arranging) return null;
-            return (
-              <section
-                key={band.id}
-                className={cn(
-                  "usage-band",
-                  arranging && "outline-dashed outline-1 outline-foreground/30 -outline-offset-1",
-                )}
-                data-testid="usage-band"
-                data-band={band.id}
-              >
-                <div className="usage-band-head">
-                  {arranging ? (
-                    <Input
-                      aria-label={`Group name for ${band.name}`}
-                      title={band.name}
-                      value={band.name}
-                      onChange={(event) => renameBand(band.id, event.target.value)}
-                      className="h-7 max-w-[260px] flex-1 text-ui font-medium"
-                    />
-                  ) : (
-                    <button
-                      type="button"
-                      className="usage-band-title"
-                      aria-expanded={open}
-                      onClick={() => toggleBand(band.id)}
-                    >
-                      {open ? (
-                        <ChevronDownIcon className="size-3.5 shrink-0" aria-hidden="true" />
-                      ) : (
-                        <ChevronRightIcon className="size-3.5 shrink-0" aria-hidden="true" />
-                      )}
-                      <UsageName>{band.name}</UsageName>
-                    </button>
-                  )}
-                  <span className="usage-band-count">{band.accounts.length}</span>
-                  {arranging ? (
-                    <span className="ml-auto flex items-center">
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="size-7"
-                        aria-label={`Move group ${band.name} up`}
-                        disabled={index === 0}
-                        onClick={() => moveBand(band.id, -1)}
-                      >
-                        <ChevronUpIcon className="size-3.5" aria-hidden="true" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="size-7"
-                        aria-label={`Move group ${band.name} down`}
-                        disabled={index === bands.length - 1}
-                        onClick={() => moveBand(band.id, 1)}
-                      >
-                        <ChevronDownIcon className="size-3.5" aria-hidden="true" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="size-7"
-                        aria-label={`Remove group ${band.name}`}
-                        disabled={band.accounts.length > 0}
-                        onClick={() => removeBand(band.id)}
-                      >
-                        <TrashIcon className="size-3.5" aria-hidden="true" />
-                      </Button>
-                    </span>
-                  ) : null}
-                </div>
-                {open ? (
-                  <div
-                    className={cn(
-                      "usage-tiles",
-                      board.density === "mini" ? "usage-tiles-compact" : "",
-                    )}
-                  >
-                    {band.accounts.map((account) => (
-                      <UsageTile
-                        key={account.id}
-                        account={account}
-                        pinnedWindowId={board.windows[account.id]}
-                        renewal={renewalOf(account, board.renewals[account.id])}
-                        density={board.density}
-                        arrange={arranging}
-                        shownModel={preferences.shownModels?.[account.id]}
-                        floorControl={
-                          !arranging && (
-                            <QuotaFloorControl
-                              tile={account.id}
-                              label={account.display_name}
-                              account={account}
-                            />
-                          )
-                        }
-                        amount={activity.data?.accounts.find((item) => item.account === account.id)}
-                        onOpenGroup={(group) =>
-                          navigate(
-                            boardPath(
-                              `/usage/board/${encodeURIComponent(account.id)}?focus=${encodeURIComponent(group)}`,
-                            ),
-                          )
-                        }
-                        tokens={board.unit === "tokens"}
-                        onOpen={() =>
-                          navigate(boardPath(`/usage/board/${encodeURIComponent(account.id)}`))
-                        }
-                        onMove={(direction) => nudgeTile(account.id, direction)}
-                      />
-                    ))}
-                  </div>
-                ) : null}
-              </section>
-            );
-          })}
-        </div>
-      )}
-      <UsageEvents
-        accounts={accounts}
-        activity={activity.data}
-        enabled={info !== "loading" && info.usage_board_enabled === true}
-      />
-    </UsageBoardFrame>
-  );
-}
-
-function EmptyBoard() {
-  return (
-    <div className="flex flex-col items-center gap-2 rounded-[11px] border border-dashed border-border px-6 py-10 text-center">
-      <p className="text-sm font-medium">Nothing on the board yet</p>
-      <p className="max-w-sm text-xs text-muted-foreground">
-        Turn an account on under <span className="font-medium text-foreground">On board</span> in
-        Settings, or connect a source so its first report adds a tile. Claude and Codex appear once
-        a host has read them.
-      </p>
-      <Button variant="outline" size="sm" asChild className="mt-1">
-        <Link {...boardExitProps()} to="/settings/general#usage-settings">
-          Open settings
+      <nav className="usage-overview-accounts" aria-label={t("overviewAccounts")}>
+        <Link to={selectAccount()} aria-current={!account ? "true" : undefined}>
+          {t("overviewAll")}
         </Link>
-      </Button>
-    </div>
+        {accounts.map((item) => (
+          <Link
+            key={item.id}
+            to={selectAccount(item.id)}
+            aria-current={account === item ? "true" : undefined}
+          >
+            <UsageRing window={tightest(item)} size={18} stale={isStale(item)} />
+            <UsageName>{item.display_name}</UsageName>
+          </Link>
+        ))}
+      </nav>
+      {accounts.length ? (
+        <div data-testid="usage-overview">
+          <div className="usage-account-heading">
+            <h2 className="usage-account-name">
+              {account?.display_name ?? t("overviewAllAccounts")}
+            </h2>
+            {account?.plan ? <p className="usage-caption usage-wrap">{account.plan}</p> : null}
+          </div>
+          <div className="usage-overview">
+            <div className="usage-overview-column">
+              {account ? (
+                <UsageAccountQuota account={account} />
+              ) : (
+                <section className="usage-card">
+                  <h2 className="usage-card-title">{t("overviewQuota")}</h2>
+                  <ul className="usage-overview-quota">
+                    {accounts.map((item) => {
+                      const window = tightest(item);
+                      return (
+                        <li key={item.id}>
+                          <Link className="usage-row" to={selectAccount(item.id)}>
+                            <UsageRing
+                              window={window}
+                              size={54}
+                              showName={false}
+                              stale={isStale(item)}
+                            />
+                            <span className="min-w-0 flex-1">
+                              <UsageName className="font-semibold">{item.display_name}</UsageName>
+                              <span className="usage-caption block">
+                                {window ? windowName(window) : t("overviewNoQuota")}
+                              </span>
+                            </span>
+                            {window && !isStale(item) ? (
+                              <span className="usage-caption text-right">
+                                {window.remaining_pct === null
+                                  ? null
+                                  : t("overviewRemaining", {
+                                      percent: formatPercentReading(window.remaining_pct),
+                                    })}
+                                {window.time_left_s !== null ? (
+                                  <span className="block">
+                                    {formatTimeLeft(window.time_left_s)}
+                                  </span>
+                                ) : null}
+                              </span>
+                            ) : null}
+                          </Link>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </section>
+              )}
+              <UsageOverviewHosts accounts={shown} query={reads[selectedRange]} />
+              <UsageEvents
+                key={account?.id}
+                accounts={accounts}
+                account={account?.id}
+                activity={reads.period.data}
+              />
+            </div>
+            <div className="usage-overview-column">
+              <UsageAccountCost account={account} accounts={shown} reads={reads} />
+              <div className="usage-overview-meta">
+                <UsagePricingSummary accounts={shown} amounts={reads.period.data?.accounts} />
+                <section className="usage-card">
+                  <h2 className="usage-card-title">{t("overviewUsedIn")}</h2>
+                  <UsageModelPoolsLink />
+                </section>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <p className="usage-card usage-caption">{t("overviewEmpty")}</p>
+      )}
+    </UsageBoardFrame>
   );
 }

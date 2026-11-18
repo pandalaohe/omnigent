@@ -1,6 +1,6 @@
 """Usage composition and navigation through the built SPA boundary."""
 
-import json
+import re
 import time
 from urllib.parse import parse_qs, urlparse
 
@@ -18,9 +18,10 @@ def browser_context_args(browser_context_args):
     return {**browser_context_args, "has_touch": True}
 
 
-@pytest.mark.parametrize("width", [1280, 900, 390])
-def test_usage_ranges_pools_and_navigation(
-    page: Page, appearance_url: str, browser_contract: BrowserContract, width: int
+@pytest.mark.parametrize("width", [1280, 390])
+@pytest.mark.parametrize("prefix", ["", "/frame"])
+def test_usage_overview_geometry_and_navigation(
+    page: Page, appearance_url: str, browser_contract: BrowserContract, width: int, prefix: str
 ):
     now = time.time()
     window = {
@@ -62,7 +63,7 @@ def test_usage_ranges_pools_and_navigation(
         "windows": [window, {**window, "id": "other", "group": "Pool B", "percent_used": 22.25}],
         "hosts": [],
     }
-    # 50 accounts, 365 daily points and four quota windows per account.
+    # Enough accounts to exercise the one-line account chooser at every width.
     accounts = [
         {
             **account,
@@ -102,26 +103,32 @@ def test_usage_ranges_pools_and_navigation(
 
     def activity(request):
         params = parse_qs(urlparse(request.url).query)
-        ranges.append(params["range"][0])
+        range_key = params["range"][0]
+        ranges.append(range_key)
+        account_id = params.get("account", [None])[0]
+        bucket = 3600 if range_key == "today" else 86400
         return {
-            "range": params["range"][0],
+            "range": range_key,
             "generated_at": now,
             "tz": "UTC",
             "accounts": [
                 {
                     "account": item["id"],
                     "span": {
-                        "requested_from": now - 365 * 86400,
-                        "counted_from": now - 365 * 86400,
+                        "requested_from": now - 4 * bucket,
+                        "counted_from": now - 4 * bucket,
                         "until": now,
                         "approx": False,
                     },
-                    "mark": None,
+                    "mark": "~",
                     "totals": totals,
                     "previous": None,
-                    "series": [{"at": now - day * 86400, **totals} for day in range(365)],
+                    "series": [{"at": now - bucket, **totals}],
+                    "models": [{"model": "Example model", **totals}],
+                    "hosts": [{"host_id": "example-host", **totals}],
                 }
                 for item in accounts
+                if account_id is None or item["id"] == account_id
             ],
         }
 
@@ -130,6 +137,14 @@ def test_usage_ranges_pools_and_navigation(
         "/v1/me/usage/analysis",
         {
             "generated_at": now,
+            "complete": True,
+            "classes": {
+                "basis": "price_table_estimate",
+                "items": [],
+                "unpriced_tokens": {"input": 500},
+                "unsplit_tokens": 1000,
+                "unsplit_cost": {"low": "0.00", "high": None},
+            },
             "rows": [],
             "pool_catalog": [],
             "pools": [],
@@ -148,115 +163,58 @@ def test_usage_ranges_pools_and_navigation(
             "cards": [],
         },
     )
+    browser_contract.json("/v1/me/usage/events", {"events": [], "next_before": None})
+    browser_contract.json("/v1/me/usage/sources", {"sources": []})
     page.set_viewport_size({"width": width, "height": 900})
-    started = time.perf_counter()
-    page.goto(appearance_url + "/frame/usage/board")
-    expect(page.get_by_test_id("usage-tile")).to_have_count(50)
-    board_geometry = {
-        '[data-testid="usage-tile"]': 50,
-        '[data-testid="usage-ring"]': 198,
-        "[data-usage-label]": 99,
-        "[data-usage-amount]": 0,
-    }
-    assert_usage_geometry(page, board_geometry)
-    summary = page.get_by_role("region", name="Usage summary")
-    expect(summary.get_by_text("$617.00")).to_have_count(4)
-    # The target question glyph must not inherit a full-height button row.
-    assert summary.locator(".usage-summary-tip").first.bounding_box()["height"] == 16
-    usable_ms = (time.perf_counter() - started) * 1000
-    assert set(ranges) == {"period", "d30", "today", "h24", "d7"}
-    assert len(ranges) == 5
-    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
-    expect(page.get_by_role("status")).to_contain_text("API valuation unavailable")
-    expect(page.get_by_role("status")).to_be_visible()
-    expect(page.get_by_test_id("usage-tile").nth(1)).to_have_attribute("data-tone", "ok")
-    expect(
-        page.get_by_test_id("usage-tile")
-        .nth(1)
-        .locator('.usage-satellite [data-testid="usage-ring"]')
-    ).to_have_attribute("data-tone", "crit")
-    geometry = page.evaluate("""() => {
-      const box=s=>document.querySelector(s).getBoundingClientRect().toJSON();
-      const style=s=>getComputedStyle(document.querySelector(s));
-      return {head:box('.usage-top h1'),nav:box('.usage-tabs'),age:box('.usage-data-age'),
-        regular:box('[data-account="plan-1"]'),wide:box('[data-account="plan-0"]'),
-        tilesDisplay:style('.usage-tiles').display,gap:style('.usage-tiles').gap,
-        minHeight:style('[data-account="plan-1"]').minHeight,
-        padding:style('.usage-surface').paddingLeft,
-        columns:style('.usage-tiles').gridTemplateColumns};
-    }""")
-    assert geometry["tilesDisplay"] == "grid"
-    assert geometry["gap"] == "8px"
-    assert geometry["regular"]["width"] >= 164
-    if width < 600:
-        assert geometry["padding"] == "12px"
-        assert len(geometry["columns"].split()) == 2
-    else:
-        assert geometry["wide"]["width"] > geometry["regular"]["width"]
-    # Large figure, blank summary padding and native keyboard activation all open Analysis.
-    for activation in ["figure", "whitespace", "keyboard"]:
-        summary = page.get_by_role("region", name="Usage summary")
-        link = summary.get_by_role("link", name="Open usage analysis")
-        if activation == "figure":
-            summary.scroll_into_view_if_needed()
-            figure = summary.locator(".usage-summary-big").bounding_box()
-            anchor = link.bounding_box()
-            link.click(
-                position={
-                    "x": figure["x"] + figure["width"] / 2 - anchor["x"],
-                    "y": figure["y"] + figure["height"] / 2 - anchor["y"],
-                }
-            )
-        elif activation == "whitespace":
-            summary.scroll_into_view_if_needed()
-            rect = summary.bounding_box()
-            anchor = link.bounding_box()
-            link.tap(
-                position={
-                    "x": rect["x"] + rect["width"] / 2 - anchor["x"],
-                    "y": rect["y"] + rect["height"] - 4 - anchor["y"],
-                }
-            )
-        else:
-            link.focus()
-            page.keyboard.press("Enter")
-        expect(page).to_have_url(appearance_url + "/frame/usage/board/cost")
-        expect(page.locator(".ua-kpi")).to_have_count(5)
-        assert_usage_geometry(
-            page, {'[data-testid="usage-ring"]': 0, ".ua-kpi": 5, '[role="table"]': 1}
-        )
-        page.get_by_role("link", name="Usage", exact=True).click()
-        expect(page.get_by_test_id("usage-tile")).to_have_count(50)
-        assert_usage_geometry(page, board_geometry)
-    summary.get_by_role("button", name="All accounts · 30-day reported cost details").click()
-    expect(page.get_by_test_id("usage-tip-card")).to_be_visible()
-    page.keyboard.press("Escape")
-    first = page.get_by_test_id("usage-tile").first
-    expect(first.get_by_role("link", name="Example plan 0 Pool B", exact=True)).to_have_attribute(
-        "href", "/frame/usage/board/plan-0?focus=Pool%20B"
+    overview_url = appearance_url + prefix + "/usage/board"
+    page.goto(overview_url)
+    overview = page.get_by_test_id("usage-overview")
+    chooser = page.get_by_role("navigation", name="Usage accounts")
+    expect(chooser.get_by_role("link")).to_have_count(51)
+    expect(chooser.get_by_role("link", name="All", exact=True)).to_have_attribute(
+        "aria-current", "true"
     )
-    first.get_by_role("link", name="Example plan 0 Pool B", exact=True).focus()
+    expect(overview.get_by_text("$617.00", exact=True).first).to_be_visible()
+    assert sorted(ranges) == ["d30", "d7", "period", "today"]
+    assert_usage_geometry(
+        page,
+        {
+            ".usage-overview-accounts a": 51,
+            ".usage-overview-quota li": 50,
+            ".usage-overview-cells button": 4,
+            ".usage-chart-plot": 1,
+            ".usage-tiles": 0,
+        },
+    )
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    codex = chooser.get_by_role("link", name="Example plan 0", exact=True)
+    codex.focus()
     page.keyboard.press("Enter")
-    expect(page).to_have_url(appearance_url + "/frame/usage/board/plan-0?focus=Pool%20B")
-    page.get_by_role("link", name="Usage", exact=True).click(timeout=5000)
-    expect(page.get_by_test_id("usage-tile")).to_have_count(50)
-    page.get_by_text("Board tools", exact=True).click()
-    expect(page.get_by_role("button", name="Compact view")).to_be_visible()
-    page.get_by_role("link", name="Analysis", exact=True).click()
-    expect(page).to_have_url(appearance_url + "/frame/usage/board/cost")
+    expect(page).to_have_url(overview_url + "?account=plan-0")
+    expect(overview.get_by_role("heading", name="Example plan 0", exact=True)).to_be_visible()
+    expect(overview.get_by_text("$12.34", exact=True).first).to_be_visible()
+    expect(page.get_by_test_id("usage-chart-now").locator("b")).to_have_text("$12.34")
+    overview.get_by_text("Cost composition", exact=True).click()
+    expect(overview.get_by_text("Unpriced / Unsplit", exact=True)).to_be_visible()
+    assert_usage_geometry(
+        page,
+        {
+            "[data-usage-window]": 4,
+            ".usage-overview-cells button": 4,
+            ".usage-chart-plot": 1,
+            ".usage-overview-stack": 1,
+        },
+    )
+    cost = overview.get_by_role("region", name="Cost", exact=True)
+    cost.get_by_role("button", name="Token", exact=True).click()
+    expect(page.get_by_test_id("usage-chart-now").locator("b")).to_have_text("1.00M")
+    cost.get_by_role("button", name=re.compile("^Today")).click()
+    expect(cost.get_by_text("Per hour", exact=True)).to_be_visible()
+    analysis = cost.get_by_role("link", name=re.compile("^View in Analysis"))
+    analysis.press("Enter")
+    expect(page).to_have_url(
+        appearance_url + prefix + "/usage/board/cost?range=today&account=plan-0"
+    )
     expect(page.get_by_role("link", name="Analysis", exact=True)).to_have_attribute(
         "aria-current", "page"
-    )
-    print(
-        json.dumps(
-            {
-                "width": width,
-                "accounts": 50,
-                "daily_points": 18250,
-                "usable_ms": round(usable_ms),
-                "navigation": page.evaluate(
-                    "performance.getEntriesByType('navigation')[0].toJSON()"
-                ),
-            }
-        )
     )

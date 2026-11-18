@@ -17,8 +17,9 @@ USAGE_GEOMETRY = """expected => {
     inner.bottom <= outer.bottom + 1;
   const describe = el => `${el.tagName}.${el.className?.baseVal ?? el.className}: ` +
     el.textContent?.trim().slice(0, 80);
-  // Only the Models table deliberately scrolls horizontally.
-  const horizontalScrollRegions = '.usage-surface .overflow-x-auto:has(> table)';
+  // The Models table and the overview account chooser intentionally scroll.
+  const horizontalScrollRegions = '.usage-surface .overflow-x-auto:has(> table), ' +
+    '.usage-overview-accounts';
   const verticalScroller = style => ['auto', 'scroll'].includes(style.overflowY);
   const horizontalScroller = (el, style) => el.matches(horizontalScrollRegions) &&
     ['auto', 'scroll'].includes(style.overflowX);

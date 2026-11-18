@@ -58,26 +58,30 @@ beforeEach(() => {
               partial: false,
               truncated: false,
             }
-          : url.pathname.endsWith("/activity")
-            ? activity
-            : url.pathname.endsWith("/issues")
-              ? usageIssuesFixture(activity)
-              : url.pathname.endsWith("/models")
-                ? {
-                    account: "litellm",
-                    display_name: "LiteLLM",
-                    range: "d7",
-                    span: null,
-                    models: [
-                      {
-                        id: "model-a",
-                        sources: [],
-                        pricing: null,
-                        usage: sampleTotals(1, 1000),
-                      },
-                    ],
-                  }
-                : overview,
+          : url.pathname.endsWith("/events")
+            ? { events: [], next_before: null }
+            : url.pathname.endsWith("/sources")
+              ? { sources: [] }
+              : url.pathname.endsWith("/activity")
+                ? activity
+                : url.pathname.endsWith("/issues")
+                  ? usageIssuesFixture(activity)
+                  : url.pathname.endsWith("/models")
+                    ? {
+                        account: "litellm",
+                        display_name: "LiteLLM",
+                        range: "d7",
+                        span: null,
+                        models: [
+                          {
+                            id: "model-a",
+                            sources: [],
+                            pricing: null,
+                            usage: sampleTotals(1, 1000),
+                          },
+                        ],
+                      }
+                    : overview,
       ),
     );
   });
@@ -323,11 +327,11 @@ it("keeps hidden accounts out of analysis picks and item rows", async () => {
   expect(screen.queryByRole("button", { name: "LiteLLM" })).toBeNull();
 });
 
-it("takes the summary tap to Cost, then its failure row to ranged Issues blocks", async () => {
+it("opens Analysis from overview cost and reaches ranged Issues", async () => {
   mount("/usage/board");
-  const summary = await screen.findByRole("region", { name: "Usage summary" });
+  const summary = await screen.findByRole("region", { name: "Cost" });
   await waitFor(() => expect(summary.textContent).toContain("$"));
-  fireEvent.click(within(summary).getByRole("link", { name: "Open usage analysis" }));
+  fireEvent.click(within(summary).getByRole("link", { name: "View in Analysis" }));
   await screen.findByRole("heading", { name: "Usage board", level: 1 });
   await screen.findByRole("table", { name: "Each item" });
   fireEvent.click(screen.getByText("Analysis tools"));
