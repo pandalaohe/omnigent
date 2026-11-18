@@ -192,6 +192,36 @@ test("continuity EOF records its cause before later denials and never logs a pri
  assert.equal(records.at(-1).cause,"transport_lost");
  assert.equal(JSON.stringify(records).includes(receipt),false);
 });
+test("watch buffer limits each frame and unfinished tail",async t=>{
+ const http=require("node:http"),{PassThrough}=require("node:stream");
+ const frame={incarnation:"epoch",launch_epoch:"launch",live:true,revoked_scopes:[]};
+ const oversized=JSON.stringify({...frame,padding:"a".repeat(16384)});
+ for(const [name,chunk,exceedsLimit] of [
+  ["coalesced valid frames",(JSON.stringify(frame)+"\n").repeat(256),false],
+  ["oversized complete frame",oversized+"\n",true],
+  ["oversized unfinished tail",oversized,true],
+ ])await t.test(name,async t=>{
+  assert.ok(chunk.length>16384);
+  const records=[],response=new PassThrough(),request=new PassThrough();
+  response.statusCode=200;
+  t.after(()=>{response.destroy();request.destroy();});
+  t.mock.method(http,"get",(_url,_options,receive)=>{
+   queueMicrotask(()=>{receive(response);response.write(chunk);});
+   return request;
+  });
+  const connected=connectAttestor({endpoint:"http://127.0.0.1:1234",credential:"fixture",
+   brokerIncarnation:"epoch",launchEpoch:"launch",report:r=>records.push(r)});
+  if(exceedsLimit) {
+   await assert.rejects(connected,/Scoped Pi continuity unavailable/);
+   assert.deepEqual(records,[{event:"continuity_lost",cause:"watch_buffer_limit"}]);
+  } else {
+   const connection=await connected;
+   t.after(()=>connection.close());
+   assert.deepEqual(records,[{event:"continuity_ready"}]);
+   assert.equal(response.destroyed,false);
+  }
+ });
+});
 test("denial diagnostics distinguish state, attestation, policy and binding without private values",async()=>{
  for(const [options,branch,stage] of [
   [{state:{status:"blocked",revision:3}},"not_current","initial"],

@@ -209,9 +209,9 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
     let text="";
     res.on("data",chunk=>{
       text+=chunk;
-      if(text.length>16384){res.destroy();lose("watch_buffer_limit");return;}
       let end;
       while((end=text.indexOf("\n"))!==-1){
+        if(end>16384){res.destroy();lose("watch_buffer_limit");return;}
         const line=text.slice(0,end);text=text.slice(end+1);
         try {
           const frame=JSON.parse(line);
@@ -224,6 +224,7 @@ async function connectAttestor({endpoint,credential,brokerIncarnation,launchEpoc
         }
         catch(_){lose("watch_frame_invalid");}
       }
+      if(text.length>16384){res.destroy();lose("watch_buffer_limit");}
     });
     res.on("close",()=>lose("watch_close"));res.on("end",()=>lose("watch_end"));res.on("error",()=>lose("watch_error"));
   });
