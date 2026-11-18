@@ -6,6 +6,132 @@ import type {
   UsageTotals,
 } from "./usageActivityData";
 import { sumUsage } from "./usageAmountData";
+import type { AnalysisFilter, AnalysisValue, UsageAnalysisV2 } from "./usageAnalysisData";
+
+export function usageAnalysisV2Fixture(
+  params: URLSearchParams,
+  now = Math.floor(Date.now() / 1000),
+): UsageAnalysisV2 {
+  const dimensions = ["account", "model", "host", "agent"] as const;
+  const filter: AnalysisFilter = {
+    range: params.get("range") as AnalysisFilter["range"],
+    group: params.get("group") as AnalysisFilter["group"],
+    account: params.getAll("account").sort(),
+    model: params.getAll("model").sort(),
+    host: params.getAll("host").sort(),
+    agent: params.getAll("agent").sort(),
+    tz: params.get("tz") ?? "UTC",
+    day: params.get("day"),
+    slot: params.get("slot"),
+    from: params.get("from"),
+    to: params.get("to"),
+  };
+  const current = [
+    {
+      account: "claude",
+      model: "Sonnet",
+      host: "east",
+      agent: "claude",
+      tokens: 100,
+      requests: 10,
+      failed: 0,
+    },
+    {
+      account: "litellm",
+      model: "GPT",
+      host: "west",
+      agent: "codex",
+      tokens: 300,
+      requests: 30,
+      failed: 3,
+    },
+  ];
+  const restricted = !!(
+    filter.host.length ||
+    filter.agent.length ||
+    filter.model.length ||
+    filter.slot
+  );
+  const cost = (n: number): AnalysisValue => ({
+    state: "exact",
+    low: String(n),
+    high: String(n),
+    currency: "USD",
+    reason: null,
+    formatted: { low: n.toFixed(2), high: n.toFixed(2) },
+  });
+  const valueUnknown: AnalysisValue = {
+    state: "unknown",
+    low: null,
+    high: null,
+    currency: null,
+    reason: "shared_payment_cannot_be_split_by_filter",
+  };
+  const aggregate = (rows: typeof current, paid = !restricted) => {
+    const tokens = rows.reduce((sum, row) => sum + row.tokens, 0);
+    return {
+      tokens,
+      requests: rows.reduce((sum, row) => sum + row.requests, 0),
+      failed: rows.reduce((sum, row) => sum + row.failed, 0),
+      last_at: rows.length ? now : null,
+      coverage: "complete" as const,
+      api_value: cost(tokens / 50),
+      paid: paid ? cost(tokens / 100) : valueUnknown,
+      payback: paid ? { ...cost(2), currency: null } : valueUnknown,
+    };
+  };
+  const apply = (ignore?: (typeof dimensions)[number]) =>
+    current.filter((row) =>
+      dimensions.every(
+        (key) => key === ignore || !filter[key].length || filter[key].includes(row[key]),
+      ),
+    );
+  const facet = (dimension: (typeof dimensions)[number]) =>
+    apply(dimension).map((row) => ({
+      key: row[dimension],
+      selected: filter[dimension].includes(row[dimension]),
+      ...aggregate([row], !restricted && dimension === "account"),
+    }));
+  const span = { requested_from: now - 3600, counted_from: now - 3600, until: now };
+  const totals = aggregate(apply());
+  const series = [{ at: now - 3600, ...totals }];
+  return {
+    generated_at: now,
+    span,
+    totals,
+    series,
+    complete: true,
+    incomplete_reason: null,
+    approx: false,
+    filter,
+    tz: filter.tz,
+    facets: {
+      account: facet("account"),
+      model: facet("model"),
+      host: facet("host"),
+      agent: facet("agent"),
+    },
+    groups: facet(dimensions.find((key) => key === filter.group) ?? "account"),
+    heat: [{ slot: "2-14", ...aggregate(apply()) }],
+    days: [],
+    hours: [],
+    rows: [],
+    rows_truncated: false,
+    classes: {
+      basis: "price_table_estimate",
+      items: [],
+      unpriced_tokens: {},
+      unsplit_tokens: 0,
+      unsplit_cost: { low: "0", high: "0" },
+    },
+    cache_savings: { state: "unknown" },
+    previous: {
+      span: { requested_from: now - 7200, counted_from: now - 7200, until: now - 3600 },
+      totals,
+      series: [{ at: now - 7200, ...totals }],
+    },
+  };
+}
 
 /** Neutral, explicit billing inputs shared by the tests and operable demo. */
 export function sampleTotals(

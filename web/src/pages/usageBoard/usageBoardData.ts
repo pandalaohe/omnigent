@@ -109,8 +109,8 @@ export class UsageBoardUnavailableError extends Error {
   }
 }
 
-async function readOverview(): Promise<UsageOverview> {
-  const response = await authenticatedFetch("/v1/me/usage");
+async function readOverview(signal: AbortSignal): Promise<UsageOverview> {
+  const response = await authenticatedFetch("/v1/me/usage", { signal });
   if (response.status === 404) throw new UsageBoardUnavailableError();
   if (!response.ok) {
     throw new Error(`Usage read failed (${response.status})`);
@@ -118,16 +118,19 @@ async function readOverview(): Promise<UsageOverview> {
   return (await response.json()) as UsageOverview;
 }
 
-export function useUsageOverview(enabled: boolean) {
+export function useUsageOverview(enabled: boolean, live = true) {
   return useQuery({
     queryKey: ["usageBoard", "overview"],
-    queryFn: readOverview,
+    queryFn: ({ signal }) => readOverview(signal),
     enabled,
     // Poll while the tab is visible; a hidden tab keeps the last reading and
     // refetches once when it comes back.
-    refetchInterval: () => (document.visibilityState === "visible" ? USAGE_BOARD_POLL_MS : false),
-    refetchOnWindowFocus: true,
-    staleTime: 0,
+    refetchInterval: live
+      ? () => (document.visibilityState === "visible" ? USAGE_BOARD_POLL_MS : false)
+      : false,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: live,
+    staleTime: live ? 0 : 300_000,
     retry: false,
   });
 }

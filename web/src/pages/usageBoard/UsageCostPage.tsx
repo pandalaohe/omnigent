@@ -1,323 +1,398 @@
-import { useMemo, useState } from "react";
-import { Link, useSearchParams } from "@/lib/routing";
-import { boardPath } from "@/lib/boardFrame";
-import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
+import { useEffect } from "react";
+import { Link, useLocation, useNavigate, useSearchParams } from "@/lib/routing";
+import { boardExitProps, boardPath } from "@/lib/boardFrame";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { UsageBoardFrame } from "./UsageBoardFrame";
 import { useUsageOverview } from "./usageBoardData";
 import {
-  analysisKey,
-  analysisTotals,
-  poolKey,
-  toggleAnalysisPick,
-  useUsageAnalysis,
-  type AnalysisDimension,
+  AnalysisFilterMismatch,
   analysisValueText,
+  useUsageAnalysisV2,
+  type AnalysisValue,
+  type UsageAnalysisV2,
 } from "./usageAnalysisData";
 import {
-  UsageAnalysisShares,
-  UsageAnalysisFailures,
-  UsageAnalysisTable,
+  AnalysisV2Items,
+  AnalysisV2Shares,
+  exactCost,
+  paymentRestricted,
+  paymentRestriction,
+  v2Failure,
+  v2Requests,
+  v2Tokens,
 } from "./UsageAnalysisAmounts";
-import { UsageAnalysisChart } from "./UsageCostChart";
-import { AnalysisPanel, AnalysisUnknown } from "./UsageAnalysisPanel";
 import {
-  AnalysisCards,
-  AnalysisComparisons,
-  AnalysisPayback,
-  AnalysisClosings,
-  AnalysisHeatmap,
+  V2Composition,
+  V2Cumulative,
+  V2Heatmap,
+  V2Hosts,
+  V2Payback,
+  V2QuotaClosings,
 } from "./UsageAnalysisDetails";
+import { AnalysisSection, AnalysisSectionState, AnalysisUnknown } from "./UsageAnalysisPanel";
+import { analysisSections, UsageAnalysisRail } from "./UsageAnalysisRail";
+import {
+  analysisDimensions,
+  filterFromQuery,
+  toQuery,
+  toggleAnalysisValue,
+  type FilterDimension,
+  type PageFilter,
+} from "./usageAnalysisFilters";
+import { formatRingPercent, formatUsageValue } from "./usageBoardFormat";
 import "./usageAnalysis.css";
-import { UsageName } from "./UsageName";
-import { moneyText } from "./UsageAccountMoney";
-
-const compact = (value: number | null) =>
-  value === null
-    ? "Unknown"
-    : new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 2 }).format(
-        value,
-      );
 
 export function UsageCostPage() {
-  const board = useUsageContextPreferences().board;
   const [search, setSearch] = useSearchParams();
-  const linkedRange = search.get("range");
-  const rangeKey = linkedRange ?? board.range?.key;
-  const range = {
-    key: rangeKey === "today" || rangeKey === "d7" || rangeKey === "d90" ? rangeKey : "d30",
-  } as const;
-  const overview = useUsageOverview(true);
-  const analysis = useUsageAnalysis(range);
-  const [dimension, setDimension] = useState<AnalysisDimension | "card">("account");
-  const [picks, setPicks] = useState<Partial<Record<AnalysisDimension | "card", string[] | null>>>(
-    {},
-  );
-  const linkedAccounts = search.getAll("account");
-  const accountPick = linkedAccounts.length ? linkedAccounts : null;
-  const [cardSort, setCardSort] = useState({ key: "paid", direction: -1 });
-  const [sort, setSort] = useState<{
-    key: "api" | "paid" | "tokens" | "payback" | "failure";
-    direction: number;
-  }>({ key: "api", direction: -1 });
-  const visible = useMemo(
-    () => overview.data?.accounts.filter((account) => !board.hidden.includes(account.id)) ?? [],
-    [overview.data, board.hidden],
-  );
-  const names = useMemo(
-    () => new Map(visible.map((account) => [account.id, account.display_name])),
-    [visible],
-  );
-  const rows = useMemo(
-    () => analysis.data?.rows.filter((row) => names.has(row.parent_account_id)) ?? [],
-    [analysis.data, names],
-  );
-  const items = useMemo(() => {
-    if (dimension === "card")
-      return (analysis.data?.pricing?.cards ?? [])
-        .filter((card) => !board.hidden.includes(card.parent_account_id ?? ""))
-        .map((card) => ({ key: card.id, name: card.name }));
-    if (dimension === "account")
-      return visible.map((account) => ({ key: account.id, name: account.display_name }));
-    if (dimension === "pool")
-      return (analysis.data?.pool_catalog ?? [])
-        .filter((pool) => names.has(pool.parent_account_id))
-        .map((pool) => ({
-          key: poolKey(pool.parent_account_id, pool.pool_id),
-          name: pool.display_name,
-        }));
-    return [...new Set(rows.filter((row) => row.contributes_usage).map((row) => row.model))].map(
-      (model) => ({ key: model, name: model || "Unknown model" }),
-    );
-  }, [dimension, visible, analysis.data, names, rows, board.hidden]);
-  const pick =
-    picks[dimension] === undefined && dimension === "account" ? accountPick : picks[dimension];
-  const all = pick == null;
-  const keys = all
-    ? items.map((item) => item.key)
-    : pick.filter((key) => items.some((item) => item.key === key));
-  const selected = useUsageAnalysis(range, {
-    dimension,
-    keys,
-    hidden: board.hidden,
-    enabled: !!analysis.data && (!accountPick || !!overview.data),
+  const location = useLocation();
+  const navigate = useNavigate();
+  const legacyPath = location.pathname.endsWith("/cost");
+  const raw = location.search.slice(1);
+  const filter = filterFromQuery(search);
+  const canonical = toQuery(filter, search).toString();
+  useEffect(() => {
+    if (legacyPath) {
+      navigate(
+        {
+          pathname: location.pathname.replace(/\/cost$/, "/analysis"),
+          search: canonical,
+          hash: location.hash,
+        },
+        { replace: true },
+      );
+    } else if (raw !== canonical) {
+      setSearch(canonical, { replace: true });
+    }
+  }, [canonical, legacyPath, location.hash, location.pathname, navigate, raw, setSearch]);
+  const overview = useUsageOverview(!legacyPath, false);
+  const hidden = useUsageContextPreferences().board.hidden;
+  const visibleAccounts = overview.data?.accounts.filter(({ id }) => !hidden.includes(id)) ?? [];
+  const accountKeys = visibleAccounts.map(({ id }) => id);
+  const accounts = new Map(visibleAccounts.map(({ id, display_name }) => [id, display_name]));
+  const scopedAccounts = filter.account.length
+    ? filter.account.filter((id) => !hidden.includes(id))
+    : accountKeys;
+  const awaitScope = !!hidden.length && !filter.account.length && !overview.data;
+  const invalidScope =
+    !!hidden.length && !awaitScope && (scopedAccounts.length === 0 || scopedAccounts.length > 64);
+  const effectiveFilter = hidden.length ? { ...filter, account: scopedAccounts } : filter;
+  const reading = useUsageAnalysisV2(effectiveFilter, {
+    enabled: !legacyPath && !awaitScope && !invalidScope,
+    keepResults: true,
   });
-  const presentation = selected.data?.presentation;
-  const selectedRows = useMemo(
-    () =>
-      dimension === "card"
-        ? []
-        : (presentation?.rows ??
-          rows.filter((row) => keys.includes(analysisKey(row, dimension) ?? ""))),
-    [rows, keys, dimension, presentation],
+  const outdated = reading.error instanceof AnalysisFilterMismatch;
+  const previousAccounts = reading.data?.filter.account;
+  const placeholderMayIncludeHidden =
+    reading.isPlaceholderData &&
+    hidden.length > 0 &&
+    (!previousAccounts?.length || previousAccounts.some((key) => hidden.includes(key)));
+  const result =
+    outdated || awaitScope || invalidScope || placeholderMayIncludeHidden
+      ? undefined
+      : reading.data;
+  const updating = !!result && reading.isPlaceholderData;
+  const resultGroup =
+    analysisDimensions.find((group) => group === result?.filter.group) ?? filter.group;
+  const groupFilter = { ...filter, group: resultGroup };
+  const showAccount = (item: UsageAnalysisV2["groups"][number]) =>
+    typeof item.key === "string" && !hidden.includes(item.key);
+  const data =
+    result && hidden.length
+      ? {
+          ...result,
+          facets: { ...result.facets, account: result.facets.account.filter(showAccount) },
+          groups: resultGroup === "account" ? result.groups.filter(showAccount) : result.groups,
+        }
+      : result;
+  const hosts = new Map(
+    visibleAccounts.flatMap((account) =>
+      (account.hosts ?? []).map((host) => [host.host_id, host] as const),
+    ),
   );
-  const partial = presentation
-    ? presentation.partial || selected.data?.partial || selected.data?.truncated
-    : analysis.data?.partial || analysis.data?.truncated;
-  const totals = analysisTotals(selectedRows, partial);
-  const selectedItems = items
-    .filter((item) => keys.includes(item.key))
-    .map((item) => ({
-      ...item,
-      projection: presentation?.items.find((value) => value.key === item.key)?.projection,
-      rows:
-        dimension === "card"
-          ? []
-          : selectedRows.filter((row) => analysisKey(row, dimension) === item.key),
-    }));
+  function name(dimension: FilterDimension, key: string) {
+    if (dimension === "account") return accounts.get(key) ?? (key || "No account");
+    if (dimension === "host") return hosts.get(key)?.name ?? (key || "No host");
+    return key || (dimension === "agent" ? "Untagged" : "No model");
+  }
+  function change(next: PageFilter) {
+    const query = toQuery(next, search).toString();
+    if (query !== raw) setSearch(query, { preventScrollReset: true });
+  }
+  function toggle(dimension: FilterDimension, value: string) {
+    change(toggleAnalysisValue(filter, dimension, value));
+  }
+
   return (
     <UsageBoardFrame
       title="Cost"
-      generatedAt={analysis.data?.generated_at}
-      loading={analysis.isPending || overview.isPending}
-      error={selected.error ?? analysis.error ?? overview.error}
+      generatedAt={data?.generated_at}
       actions={
         <details>
           <summary>Analysis tools</summary>
           <div className="flex flex-wrap gap-3">
             <Link to={boardPath("/usage/board/issues")}>Issues</Link>
-            <Link to="/usage">Sessions</Link>
-            <Link to={"/settings/general#usage-settings"} aria-label="Analysis settings">
-              Settings
+            <Link to="/usage" {...boardExitProps()}>
+              Sessions
             </Link>
           </div>
         </details>
       }
     >
-      <div className="ua-controls">
-        <div className="ua-segment" role="group" aria-label="Group by">
-          {(
-            [
-              ["account", "Account"],
-              ["pool", "Pool"],
-              ["model", "Model"],
-              ["card", "Card"],
-            ] as const
-          ).map(([key, label]) => (
-            <button
-              type="button"
-              key={key}
-              title={label}
-              aria-pressed={dimension === key}
-              onClick={() => setDimension(key)}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-        <div className="ua-segment" role="group" aria-label="Time range">
-          {(
-            [
-              ["today", "Today"],
-              ["d7", "7 days"],
-              ["d30", "30 days"],
-              ["d90", "90 days"],
-            ] as const
-          ).map(([key, label]) => (
-            <button
-              type="button"
-              key={key}
-              title={label}
-              aria-pressed={range.key === key}
-              onClick={() => {
-                patchUsageBoardPreferences({ range: { key } });
-                if (linkedRange) {
-                  const next = new URLSearchParams(search);
-                  next.set("range", key);
-                  setSearch(next, { replace: true });
-                }
-              }}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-      </div>
-      <div className="ua-picks" role="group" aria-label="Select items">
-        <button
-          type="button"
-          aria-pressed={all}
-          onClick={() => setPicks({ ...picks, [dimension]: null })}
-        >
-          All
-        </button>
-        {items.map((item) => (
-          <button
-            type="button"
-            key={item.key}
-            title={item.name}
-            aria-pressed={!all && keys.includes(item.key)}
-            onClick={() =>
-              setPicks({
-                ...picks,
-                [dimension]: toggleAnalysisPick(
-                  pick ?? null,
-                  item.key,
-                  items.map((value) => value.key),
-                ),
-              })
-            }
-          >
-            <UsageName>{item.name}</UsageName>
-          </button>
-        ))}
-      </div>
-      {!all && !keys.length ? (
-        <p role="status">Selected items are unavailable in this range. Choose items or All.</p>
+      <UsageAnalysisRail
+        filter={filter}
+        facets={data?.facets}
+        accounts={accountKeys}
+        label={name}
+        onChange={change}
+        showSections={!!data}
+      />
+      {outdated ? (
+        <p className="ua-v2-status" role="alert">
+          服务器版本不支持这个筛选
+        </p>
       ) : null}
-      {dimension === "card" ? (
-        <AnalysisCards
-          data={presentation}
-          sort={cardSort}
-          onSort={(key) =>
-            setCardSort({ key, direction: cardSort.key === key ? -cardSort.direction : -1 })
-          }
-        />
-      ) : (
-        <>
-          {!items.length ? <p role="status">No usage in this range.</p> : null}
-          <div className="ua-kpis">
-            {[
-              ...(presentation?.projection.show_money === false
-                ? []
-                : [
-                    [
-                      "At API price",
-                      moneyText(presentation?.projection.api_value),
-                      "Subscription and prepaid usage",
-                    ],
-                    [
-                      presentation?.projection.spend_estimated ? "Spend · estimated" : "Spend",
-                      moneyText(presentation?.projection.spend),
-                      "Pay as you go",
-                    ],
-                    [
-                      "Paid",
-                      analysisValueText(presentation?.projection.paid),
-                      "Configured FX · selected payments",
-                    ],
-                  ]),
-              [
-                "Token",
-                compact(totals.tokens),
-                partial ? "Partial source coverage" : "Reported tokens",
-              ],
-              ...(presentation?.projection.show_payback === false
-                ? []
-                : [
-                    [
-                      "Payback",
-                      analysisValueText(presentation?.projection.payback, "ratio"),
-                      `Known-paid ${presentation?.projection.payback.coverage?.known_paid ?? 0}/${presentation?.projection.payback.coverage?.total_items ?? 0}`,
-                    ],
-                  ]),
-            ].map(([label, value, caption]) => (
-              <div className="ua-kpi" key={label}>
-                <span>{label}</span>
-                <strong data-unknown={value === "Unknown" || undefined}>{value}</strong>
-                <small>{caption}</small>
-              </div>
-            ))}
-          </div>
-          <div className="ua-main">
-            <AnalysisPanel title="Cumulative" caption="Reported tokens">
-              <UsageAnalysisChart
-                rows={selectedRows}
-                span={analysis.data?.span}
-                unknown={totals.tokens === null}
-                previousUnavailable={range.key !== "d90"}
-                previous={range.key === "d90" ? null : presentation?.previous}
-                paidSeries={presentation?.paid_series}
-              />
-            </AnalysisPanel>
-            <AnalysisComparisons data={presentation} ninety={range.key === "d90"} />
-          </div>
-          <UsageAnalysisTable
-            items={selectedItems}
-            incomplete={!!partial}
-            sort={sort}
-            onSort={(key) => setSort({ key, direction: sort.key === key ? -sort.direction : -1 })}
-          />
-          <div className="ua-cards">
-            {presentation?.projection.show_payback !== false ? (
-              <AnalysisPayback
-                items={selectedItems.filter((item) => item.projection?.show_payback !== false)}
-              />
+      {reading.error && !outdated ? (
+        <p className="ua-v2-status" role="alert">
+          Usage could not be read. {reading.error.message}
+        </p>
+      ) : null}
+      {awaitScope && overview.error ? (
+        <p className="ua-v2-status" role="alert">
+          The accounts on your board could not be read.
+        </p>
+      ) : null}
+      {invalidScope ? (
+        <p className="ua-v2-status" role="status">
+          {scopedAccounts.length
+            ? "Choose up to 64 accounts to analyse."
+            : "No selected accounts are on your board."}
+        </p>
+      ) : null}
+      {(reading.isPending || placeholderMayIncludeHidden) &&
+      !invalidScope &&
+      !(awaitScope && overview.error) ? (
+        <p className="ua-v2-status" role="status">
+          Reading your usage…
+        </p>
+      ) : null}
+      {updating ? (
+        <p className="sr-only" role="status">
+          Updating usage. Showing previous results.
+        </p>
+      ) : null}
+      <AnalysisSectionState>
+        {data ? (
+          <div className="ua-v2-results" data-testid="analysis-results" aria-busy={updating}>
+            {!data.complete ? (
+              <p className="ua-v2-status" role="status">
+                Only part of this range was returned.
+              </p>
             ) : null}
-            <AnalysisClosings data={presentation} names={names} model={dimension === "model"} />
-            <UsageAnalysisShares rows={selectedRows} incomplete={!!partial} />
-            <UsageAnalysisFailures items={selectedItems} incomplete={!!partial} />
-            <AnalysisHeatmap
-              rows={selectedRows}
-              partial={!!partial}
-              timezone={analysis.data?.tz ?? Intl.DateTimeFormat().resolvedOptions().timeZone}
+            {!updating && data.complete && filter.day && filter.slot && !data.totals.last_at ? (
+              <p className="ua-v2-status" role="status">
+                这一天没有这个时段的用量
+              </p>
+            ) : null}
+            <AnalysisTotals data={data} filter={filter} />
+            <V2Cumulative data={data} />
+            <AnalysisComparison data={data} restricted={paymentRestricted(filter)} />
+            <AnalysisV2Items data={data} filter={groupFilter} label={name} toggle={toggle} />
+            <V2Hosts
+              data={data}
+              filter={effectiveFilter}
+              hosts={hosts}
+              onHost={(key) => toggle("host", key)}
             />
-            <AnalysisPanel title="Cache savings">
-              <AnalysisUnknown reason="Not available yet · price evidence" />
-            </AnalysisPanel>
+            <AnalysisV2Shares data={data} filter={filter} />
+            <V2Composition data={data} />
+            <AnalysisSection id="failures" title={analysisSections.failures} folded>
+              <p>
+                {percent(v2Failure(data.totals))}{" "}
+                <span className="usage-caption">
+                  {v2Requests(data.totals.failed)} failed / {v2Requests(data.totals.requests)}{" "}
+                  requests
+                </span>
+              </p>
+              <FailureBreakdown data={data} filter={groupFilter} label={name} />
+            </AnalysisSection>
+            <V2Heatmap
+              data={data}
+              selected={filter.slot}
+              onSlot={(slot) => change({ ...filter, slot: filter.slot === slot ? null : slot })}
+            />
+            <AnalysisSection id="payback" title={analysisSections.payback} folded>
+              {paymentRestricted(filter) ? (
+                <PaymentUnknown />
+              ) : (
+                <V2Payback
+                  data={data}
+                  filter={{ ...effectiveFilter, group: resultGroup }}
+                  names={accounts}
+                />
+              )}
+            </AnalysisSection>
+            <AnalysisSection id="remaining" title={analysisSections.remaining} folded>
+              {paymentRestricted(filter) ? (
+                <AnalysisUnknown reason="Closing observations are only available by account and date." />
+              ) : (
+                <V2QuotaClosings filter={effectiveFilter} names={accounts} />
+              )}
+            </AnalysisSection>
+            <AnalysisSection id="savings" title={analysisSections.savings} folded>
+              <AnalysisUnknown reason="No cache savings projection is available." />
+            </AnalysisSection>
           </div>
-        </>
-      )}
+        ) : null}
+      </AnalysisSectionState>
     </UsageBoardFrame>
+  );
+}
+
+function PaymentUnknown() {
+  return (
+    <div className="ua-unknown">
+      <strong>未知</strong>
+      <small>{paymentRestriction}</small>
+    </div>
+  );
+}
+
+function percent(value: number | null) {
+  return value === null ? "Unknown" : `${formatRingPercent(value)}%`;
+}
+
+function FailureBreakdown({
+  data,
+  filter,
+  label,
+}: {
+  data: UsageAnalysisV2;
+  filter: PageFilter;
+  label: (dimension: FilterDimension, key: string) => string;
+}) {
+  const active = filter[filter.group];
+  const rows = data.groups
+    .flatMap((item) => {
+      const rate = v2Failure(item);
+      if (
+        rate === null ||
+        typeof item.key !== "string" ||
+        (active.length && !active.includes(item.key))
+      )
+        return [];
+      return [{ key: item.key, rate }];
+    })
+    .sort((left, right) => right.rate - left.rate)
+    .slice(0, 5);
+  return rows.length ? (
+    <dl className="ua-v2-metrics">
+      {rows.map(({ key, rate }) => (
+        <div key={key}>
+          <dt>{label(filter.group, key)}</dt>
+          <dd>{percent(rate)}</dd>
+        </div>
+      ))}
+    </dl>
+  ) : null;
+}
+
+function delta(current: number | null, previous: number | null | undefined) {
+  if (current === null || previous == null || previous <= 0) return "Previous period · —";
+  const change = (current / previous - 1) * 100;
+  return `Previous period · ${change > 0 ? "+" : ""}${percent(change)}`;
+}
+
+function comparable(value: AnalysisValue, previous: AnalysisValue | undefined) {
+  return previous?.currency === value.currency ? exactCost(previous) : null;
+}
+
+function AnalysisComparison({ data, restricted }: { data: UsageAnalysisV2; restricted: boolean }) {
+  const now = data.totals;
+  const previous = data.complete ? data.previous?.totals : undefined;
+  const oldApi = comparable(now.api_value, previous?.api_value);
+  const newApi = exactCost(now.api_value);
+  const oldPaid = comparable(now.paid, previous?.paid);
+  const newPaid = exactCost(now.paid);
+  const sameUsage =
+    oldApi !== null && newApi !== null && previous?.tokens && now.tokens !== null
+      ? newApi - now.tokens * (oldApi / previous.tokens)
+      : null;
+  const sameSpend =
+    !restricted && oldPaid && newPaid && previous?.tokens && now.tokens !== null
+      ? (now.tokens / newPaid / (previous.tokens / oldPaid) - 1) * 100
+      : null;
+  return (
+    <AnalysisSection id="compare" title={analysisSections.compare} folded>
+      <dl className="ua-v2-metrics">
+        <div>
+          <dt>Same usage · at API price</dt>
+          <dd>
+            {sameUsage === null
+              ? "Unknown"
+              : `${sameUsage < 0 ? "Less" : sameUsage > 0 ? "More" : "Same"} · ${formatUsageValue(Math.abs(sameUsage), now.api_value.currency)}`}
+          </dd>
+        </div>
+        <div>
+          <dt>Same spend · tokens per amount paid</dt>
+          <dd>
+            {restricted ? (
+              <PaymentUnknown />
+            ) : sameSpend === null ? (
+              "Unknown"
+            ) : (
+              `${sameSpend > 0 ? "+" : ""}${percent(sameSpend)}`
+            )}
+          </dd>
+        </div>
+      </dl>
+    </AnalysisSection>
+  );
+}
+
+function AnalysisTotals({ data, filter }: { data: UsageAnalysisV2; filter: PageFilter }) {
+  const totals = data.totals;
+  const previous = data.complete ? data.previous?.totals : undefined;
+  const restricted = paymentRestricted(filter);
+  return (
+    <AnalysisSection id="totals" title={analysisSections.totals}>
+      <div className="ua-kpis">
+        <div className="ua-kpi">
+          <span>At API price</span>
+          <strong>{analysisValueText(totals.api_value)}</strong>
+          <small>
+            {delta(exactCost(totals.api_value), comparable(totals.api_value, previous?.api_value))}
+          </small>
+        </div>
+        <div className="ua-kpi">
+          <span>Paid</span>
+          {restricted ? (
+            <PaymentUnknown />
+          ) : (
+            <>
+              <strong>{analysisValueText(totals.paid)}</strong>
+              <small>
+                {delta(exactCost(totals.paid), comparable(totals.paid, previous?.paid))}
+              </small>
+            </>
+          )}
+        </div>
+        <div className="ua-kpi">
+          <span>Token · {v2Requests(totals.requests)} requests</span>
+          <strong>{v2Tokens(totals.tokens)}</strong>
+          <small>{delta(totals.tokens, previous?.tokens)}</small>
+        </div>
+        <div className="ua-kpi">
+          <span>Payback</span>
+          {restricted ? (
+            <PaymentUnknown />
+          ) : (
+            <>
+              <strong>{analysisValueText(totals.payback, "ratio")}</strong>
+              <small>{delta(exactCost(totals.payback), exactCost(previous?.payback))}</small>
+            </>
+          )}
+        </div>
+      </div>
+    </AnalysisSection>
   );
 }

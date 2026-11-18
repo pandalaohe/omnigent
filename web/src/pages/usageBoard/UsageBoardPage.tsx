@@ -141,7 +141,12 @@ export function UsageBoardPage() {
                   </ul>
                 </section>
               )}
-              <UsageOverviewHosts accounts={shown} query={reads[selectedRange]} />
+              <UsageOverviewHosts
+                accounts={shown}
+                account={account?.id}
+                range={selectedRange}
+                query={reads[selectedRange]}
+              />
               <UsageEvents
                 key={account?.id}
                 accounts={accounts}

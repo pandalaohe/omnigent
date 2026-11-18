@@ -7,7 +7,12 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
 import { UsageBoardRoute } from "./UsageBoardRoute";
 import { usageBoardData } from "./usageBoardFixtures";
-import { sampleTotals, usageActivityFixture, usageIssuesFixture } from "./usageActivityFixtures";
+import {
+  sampleTotals,
+  usageActivityFixture,
+  usageAnalysisV2Fixture,
+  usageIssuesFixture,
+} from "./usageActivityFixtures";
 import { boardAmount, sumUsage } from "./usageAmountData";
 import { usageChartPoints } from "./UsageCostChart";
 import { UsageCostCard, UsageErrorMark } from "./UsageAmounts";
@@ -33,62 +38,64 @@ beforeEach(() => {
     };
     return new Response(
       JSON.stringify(
-        url.pathname.endsWith("/analysis")
-          ? {
-              generated_at: activity.generated_at,
-              span: activity.accounts[0].span,
-              pool_catalog: [],
-              rows: activity.accounts.flatMap((item) =>
-                item.series.map((point) => ({
-                  account_id: item.account,
-                  parent_account_id: item.account,
-                  model: item.models?.[0]?.model ?? "",
-                  hour: point.at,
-                  tokens: point.tokens,
-                  requests: point.requests,
-                  failed: point.failed,
-                  contributes_usage: true,
-                  contributes_money: true,
-                  coverage: "complete",
-                  reason: null,
-                  attributed: false,
-                  pool_id: null,
-                })),
-              ),
-              partial: false,
-              truncated: false,
-            }
-          : url.pathname.endsWith("/events")
-            ? { events: [], next_before: null }
-            : url.pathname.endsWith("/sources")
-              ? { sources: [] }
-              : url.pathname.endsWith("/activity")
-                ? activity
-                : url.pathname.endsWith("/issues")
-                  ? usageIssuesFixture(activity)
-                  : url.pathname.endsWith("/models")
-                    ? {
-                        account: "litellm",
-                        display_name: "LiteLLM",
-                        range: "d7",
-                        span: null,
-                        models: [
-                          {
-                            id: "model-a",
-                            sources: [],
-                            pricing: null,
-                            usage: sampleTotals(1, 1000),
-                          },
-                        ],
-                      }
-                    : overview,
+        url.pathname.endsWith("/analysis") && url.searchParams.has("group")
+          ? usageAnalysisV2Fixture(url.searchParams)
+          : url.pathname.endsWith("/analysis")
+            ? {
+                generated_at: activity.generated_at,
+                span: activity.accounts[0].span,
+                pool_catalog: [],
+                rows: activity.accounts.flatMap((item) =>
+                  item.series.map((point) => ({
+                    account_id: item.account,
+                    parent_account_id: item.account,
+                    model: item.models?.[0]?.model ?? "",
+                    hour: point.at,
+                    tokens: point.tokens,
+                    requests: point.requests,
+                    failed: point.failed,
+                    contributes_usage: true,
+                    contributes_money: true,
+                    coverage: "complete",
+                    reason: null,
+                    attributed: false,
+                    pool_id: null,
+                  })),
+                ),
+                partial: false,
+                truncated: false,
+              }
+            : url.pathname.endsWith("/events")
+              ? { events: [], next_before: null }
+              : url.pathname.endsWith("/sources")
+                ? { sources: [] }
+                : url.pathname.endsWith("/activity")
+                  ? activity
+                  : url.pathname.endsWith("/issues")
+                    ? usageIssuesFixture(activity)
+                    : url.pathname.endsWith("/models")
+                      ? {
+                          account: "litellm",
+                          display_name: "LiteLLM",
+                          range: "d7",
+                          span: null,
+                          models: [
+                            {
+                              id: "model-a",
+                              sources: [],
+                              pricing: null,
+                              usage: sampleTotals(1, 1000),
+                            },
+                          ],
+                        }
+                      : overview,
       ),
     );
   });
 });
 afterEach(cleanup);
 
-function mount(path = "/usage/board/cost") {
+function mount(path = "/usage/board/analysis") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
@@ -97,6 +104,7 @@ function mount(path = "/usage/board/cost") {
           <Routes>
             <Route path="/usage/board" element={<UsageBoardRoute />} />
             <Route path="/usage/board/cost" element={<UsageBoardRoute view="cost" />} />
+            <Route path="/usage/board/analysis" element={<UsageBoardRoute view="cost" />} />
             <Route path="/usage/board/issues" element={<UsageBoardRoute view="issues" />} />
             <Route
               path="/usage/board/:accountId/issues"
@@ -319,12 +327,16 @@ it("shows empty Issues only after a successful empty read", async () => {
   expect(screen.getByText("No source issues in this range.")).toBeTruthy();
 });
 
-it("keeps hidden accounts out of analysis picks and item rows", async () => {
+it("keeps hidden accounts out of the Analysis request and rows", async () => {
   patchUsageBoardPreferences({ hidden: ["litellm", "pi"] });
   mount();
   const list = await screen.findByRole("table", { name: "Each item" });
   expect(within(list).queryByText("LiteLLM")).toBeNull();
-  expect(screen.queryByRole("button", { name: "LiteLLM" })).toBeNull();
+  expect(
+    fetchMock.mock.calls
+      .filter(([path]) => path.includes("/analysis?"))
+      .map(([path]) => new URL(path, "https://app.example.test").searchParams.getAll("account")),
+  ).toEqual([["claude", "codex", "grok"]]);
 });
 
 it("opens Analysis from overview cost and reaches ranged Issues", async () => {
@@ -385,7 +397,7 @@ it("reports a failed activity read and does not fetch while the user switch is o
       : new Response(JSON.stringify(usageBoardData())),
   );
   mount();
-  await screen.findByText("Hours unavailable");
+  expect(await screen.findByRole("alert")).toHaveTextContent("Hours unavailable");
   cleanup();
   fetchMock.mockClear();
   patchUsageBoardPreferences({ enabled: false });

@@ -10,6 +10,7 @@ from playwright.sync_api import Page, expect
 from tests.browser_ui.conftest import BrowserContract
 from tests.browser_ui.test_sessions_appearance import appearance_features as appearance_features
 from tests.browser_ui.test_sessions_appearance import appearance_url as appearance_url
+from tests.browser_ui.test_usage_analysis_selection import analysis_payload
 from tests.browser_ui.usage_geometry import assert_usage_geometry
 
 
@@ -83,6 +84,7 @@ def test_usage_overview_geometry_and_navigation(
         {**window, "id": "month", "group": None, "state": "ok", "percent_used": 1.09},
     ]
     browser_contract.json("/v1/info", {"usage_board_enabled": True, "features": {}})
+    browser_contract.json("/v1/model-connections", [])
     browser_contract.json("/v1/me/usage", {"generated_at": now, "accounts": accounts})
     ranges = []
     totals = {
@@ -133,9 +135,12 @@ def test_usage_overview_geometry_and_navigation(
         }
 
     browser_contract.json("/v1/me/usage/activity", activity)
-    browser_contract.json(
-        "/v1/me/usage/analysis",
-        {
+
+    def analysis_response(request):
+        params = parse_qs(urlparse(request.url).query, keep_blank_values=True)
+        if params.get("include") == ["previous"]:
+            return analysis_payload(params, int(now))
+        return {
             "generated_at": now,
             "complete": True,
             "classes": {
@@ -149,8 +154,9 @@ def test_usage_overview_geometry_and_navigation(
             "pool_catalog": [],
             "pools": [],
             "span": {"requested_from": now - 86400, "counted_from": now - 86400, "until": now},
-        },
-    )
+        }
+
+    browser_contract.json("/v1/me/usage/analysis", analysis_response)
     browser_contract.json(
         "/v1/me/usage/pricing-baseline",
         {
@@ -213,8 +219,21 @@ def test_usage_overview_geometry_and_navigation(
     analysis = cost.get_by_role("link", name=re.compile("^View in Analysis"))
     analysis.press("Enter")
     expect(page).to_have_url(
-        appearance_url + prefix + "/usage/board/cost?range=today&account=plan-0"
+        appearance_url + prefix + "/usage/board/analysis?range=today&account=plan-0"
     )
     expect(page.get_by_role("link", name="Analysis", exact=True)).to_have_attribute(
         "aria-current", "page"
     )
+    page.go_back()
+    host = overview.get_by_role("region", name="Hosts").get_by_role(
+        "link", name=re.compile("^example-host")
+    )
+    host.press("Enter")
+    expect(page).to_have_url(
+        appearance_url
+        + prefix
+        + "/usage/board/analysis?range=today&account=plan-0&host=example-host"
+    )
+    expect(
+        page.get_by_role("button", name="Remove Host: example-host", exact=True)
+    ).to_be_visible()

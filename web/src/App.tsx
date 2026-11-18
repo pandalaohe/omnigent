@@ -222,6 +222,7 @@ function AppRoutes({ basename }: AppProps) {
           <Route path={`${prefix}/frame/task-board`} element={<TaskBoardPage />} />
           <Route path={`${prefix}/frame/usage/board`} element={<UsageBoardPage />} />
           <Route path={`${prefix}/frame/usage/board/cost`} element={<UsageBoardCostPage />} />
+          <Route path={`${prefix}/frame/usage/board/analysis`} element={<UsageBoardCostPage />} />
           <Route path={`${prefix}/frame/usage/board/issues`} element={<UsageBoardIssuesPage />} />
           <Route
             path={`${prefix}/frame/usage/board/:accountId/issues`}
@@ -298,6 +299,7 @@ function AppRoutes({ basename }: AppProps) {
             <>
               <Route path={`${prefix}/usage/board`} element={<UsageBoardPage />} />
               <Route path={`${prefix}/usage/board/cost`} element={<UsageBoardCostPage />} />
+              <Route path={`${prefix}/usage/board/analysis`} element={<UsageBoardCostPage />} />
               <Route path={`${prefix}/usage/board/issues`} element={<UsageBoardIssuesPage />} />
               <Route
                 path={`${prefix}/usage/board/:accountId/issues`}
