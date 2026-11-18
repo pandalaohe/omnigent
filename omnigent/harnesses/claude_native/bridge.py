@@ -8193,9 +8193,9 @@ def _restore_occupied_input(
     the web-UI message wins the pane. The exception is a shell-mode box
     holding a typed command, which Escape leaves in shell mode: that command
     is cleared from the box instead (see :func:`_shell_mode_draft`), the way
-    an unsent chat draft is cleared before a paste. So is a draft taller than
-    the pane, which scrolls the box's glyph row out of view
-    (:func:`_scrolled_draft_rows`).
+    an unsent chat draft is cleared before a paste. A clipped draft with a
+    composer footer goes straight to the readiness gate, which can hold the
+    message without editing the draft.
 
     Questions and permission prompts require an explicit answer. A person's
     ``/btw`` receives only Escape, preserving its history; keep-warm's panel
@@ -8230,9 +8230,9 @@ def _restore_occupied_input(
     :param bridge_dir: Bridge whose live permission hooks protect the native prompt.
     :param timeout_s: Seconds to keep dismissing, e.g. ``1.5``. ``None`` uses
         :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S`.
-    :returns: ``None`` once the input box is free (or the capture is torn);
-        otherwise the :func:`_occupying_surface` description of what is
-        still on screen, for the caller to refuse to type into.
+    :returns: ``None`` if the input box is free, the capture is torn, or a
+        clipped draft needs confirmation by the readiness gate. Otherwise,
+        the :func:`_occupying_surface` description of what is still on screen.
     :raises ClaudeTerminalDialog: If a side chat cannot be confirmed closed
         within its dismissal bound. Escapes may have been sent, but no
         message or command was delivered; the terminal remains available.
@@ -8255,6 +8255,8 @@ def _restore_occupied_input(
             ),
             nothing_typed=True,
         )
+        if _occupied_tall_draft(pane):
+            return None  # Let the readiness gate confirm the draft without sending keys.
         btw_visible = _btw_overlay_present(pane)
         if btw_visible and _keep_warm_btw_overlay_present(pane):
             if bridge_dir is None or not _dismiss_keep_warm_btw_overlay(
@@ -8908,27 +8910,50 @@ def _submit_cross_line_tail(content: str) -> str:
     return tail if len(tail) >= _MIN_TAIL_NEEDLE_CHARS else ""
 
 
-def _clipped_draft_matches(pane: str, tail_needle: str) -> bool:
-    """Look for a clipped draft ending at the composer's actual closing rule."""
+def _clipped_draft_rows(pane: str) -> tuple[list[str], bool] | None:
+    """Return a clipped draft's visible rows above the composer's actual closing rule.
+
+    The draft is taller than the composer: its prompt row scrolled away, or the
+    opening rule collapsed to ``─── ↑ N more ───``. Only a column-0 closing rule
+    with the composer's own footer under it (no dialog footer) qualifies.
+
+    :returns: ``(rows, collapsed)``, or ``None`` when the pane has no such composer.
+    """
     lines = pane.splitlines()
     rules = _composer_frame_rule_indices(lines)
     if not rules or _box_rule_start(lines[rules[-1]]) != 0:
-        return False
+        return None
     closing_rule = rules[-1]
     footer = [line.strip() for line in lines[closing_rule + 1 :] if line.strip()]
     if not footer or not footer[-1].startswith(("-- INSERT --", "⏵⏵", "? for shortcuts")):
-        return False
+        return None
     if any(_DIALOG_FOOTER_RE.search(line) for line in footer):
-        return False
+        return None
     opening_rule = rules[-2] if len(rules) >= 2 else -1
     collapsed = opening_rule >= 0 and bool(_CLIPPED_DRAFT_RULE_RE.fullmatch(lines[opening_rule]))
     if opening_rule >= 0 and not collapsed:
-        return False
+        return None
     rows = [line for line in lines[opening_rule + 1 : closing_rule] if line.strip()]
     if not rows or any(not row.startswith("  ") for row in rows):
+        return None
+    return rows, collapsed
+
+
+def _clipped_draft_matches(pane: str, tail_needle: str) -> bool:
+    """Look for a clipped draft ending at the composer's actual closing rule."""
+    found = _clipped_draft_rows(pane)
+    if found is None:
         return False
+    rows, collapsed = found
     target = _comparable_draft_text(tail_needle)
     return _comparable_draft_text("".join(rows)).endswith(target) if target else collapsed
+
+
+def _occupied_tall_draft(pane: str) -> bool:
+    """A mounted composer holding a clipped draft of any text; a visible glyph may be a menu."""
+    return _clipped_draft_rows(pane) is not None and not any(
+        line.lstrip().startswith(_CLAUDE_PROMPT_GLYPH) for line in pane.splitlines()
+    )
 
 
 def _unframed_prompt_row(pane: str) -> str:
@@ -9141,6 +9166,9 @@ def _wait_for_claude_prompt_ready(
         A launcher password prompt on two consecutive polls is reported the
         same way; an installation prompt is reported as awaiting an answer,
         so the delivery holds the message for it.
+    :raises ClaudeInputBoxOccupied: If the composer holds a draft taller than
+        itself (:func:`_occupied_tall_draft`) on two consecutive polls. Nothing
+        was typed; the draft is neither cleared nor submitted and the pane stays.
     :raises ClaudeSignInPending: If a launcher sign-in prompt (an address to
         open, often with a device code) holds the pane on two consecutive
         polls. Raised within a poll interval with the link attached, so the
@@ -9180,6 +9208,7 @@ def _wait_for_claude_prompt_ready(
     waited_on_sign_in = False
     waited_on_password = False
     waited_on_install = False
+    waited_on_tall_draft = False
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
@@ -9198,9 +9227,20 @@ def _wait_for_claude_prompt_ready(
             empty_polls += 1
         if _claude_prompt_rendered(pane):
             return
+        # Confirm a draft across two captures, before any overlay dismissal.
+        tall_draft = _occupied_tall_draft(pane)
+        if tall_draft and waited_on_tall_draft:
+            raise ClaudeInputBoxOccupied(
+                f"Claude Code's input box is occupied by {_SCROLLED_DRAFT_SURFACE}, so the "
+                "message was not delivered. Open the terminal, dismiss it, then resend your "
+                "message.",
+                surface=_SCROLLED_DRAFT_SURFACE,
+            )
+        waited_on_tall_draft = tall_draft
         remaining = hard_deadline - time.monotonic()
         if (
-            bridge_dir is not None
+            not tall_draft
+            and bridge_dir is not None
             and remaining > 0
             and _occupying_surface(pane) == _OVERLAY_SURFACE
             and (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
@@ -9292,7 +9332,7 @@ def _wait_for_claude_prompt_ready(
             )
         waited_on_sign_in = waiting_on_sign_in
         now = time.monotonic()
-        if now >= next_repaint:
+        if not tall_draft and now >= next_repaint:
             # Output from another process can hide a live composer until
             # Claude Code repaints.
             if _request_claude_repaint(socket_path, tmux_target, bridge_dir):

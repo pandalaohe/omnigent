@@ -388,15 +388,17 @@ async def test_stopping_a_turn_held_for_the_input_box_keeps_the_pane(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("surface", ["shell mode", "the prompt-history search"])
+@pytest.mark.parametrize(
+    "surface", ["shell mode", "the prompt-history search", "a draft taller than the terminal"]
+)
 async def test_a_message_an_occupied_input_box_refused_waits_for_chat_input(
     pane: _Pane, tmp_path: Path, surface: str
 ) -> None:
     """
     The turn holds the message until the box takes chat input again, then delivers it once.
 
-    Shell mode or the prompt-history search owns the box when the message arrives;
-    nothing was typed, so the refusal is a wait rather than a failed turn.
+    The box was occupied when the message arrived. Since nothing was typed,
+    the message can still be delivered when the box becomes available.
     """
     pane.refusals = [ClaudeInputBoxOccupied(_SHELL_MODE, surface=surface)]
 

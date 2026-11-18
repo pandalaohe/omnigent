@@ -7292,6 +7292,73 @@ def test_inject_user_message_submits_the_live_clipped_draft_once(
 
 
 @pytest.mark.parametrize(
+    "pane",
+    [
+        _LIVE_CLIPPED_PANE,
+        "  earlier line\n  end of draft\n──────\n  ? for shortcuts\n",
+        "─── ↑ 7 more ───────────────────────────────────────\n"
+        "  mention ❯ and Esc to cancel\n"
+        "  end of draft\n"
+        "────────────────────────────────────────────────────\n"
+        "  ⏵⏵ auto mode on\n",
+    ],
+    ids=["insert-mode-live-pane", "short-footer", "collapsed-with-dismissal-text"],
+)
+def test_a_tall_draft_before_paste_is_an_occupied_input_box(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pane: str
+) -> None:
+    """Fake a pane that already shows *pane* before any paste; record every tmux mutation."""
+    bridge = claude_native_bridge
+    monkeypatch.setattr(bridge, "time", _VirtualClock())
+    monkeypatch.setattr(bridge, "_TMUX_READY_TIMEOUT_S", 1.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=_TEST_TMUX_SOCKET, tmux_target="claude:0.0")
+    mutations: list[list[str]] = []
+
+    def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if "display-message" in cmd:
+            return SimpleNamespace(returncode=0, stdout="0 ", stderr="")
+        if any(op in cmd for op in ("send-keys", "paste-buffer", "load-buffer", "kill-session")):
+            mutations.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", run)
+
+    with pytest.raises(claude_native_bridge.ClaudeInputBoxOccupied) as caught:
+        inject_user_message(bridge_dir, content="a new message from the web")
+
+    assert caught.value.surface == claude_native_bridge._SCROLLED_DRAFT_SURFACE
+    assert mutations == []
+
+
+def test_a_tall_draft_shape_with_a_dialog_footer_is_still_not_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dialog footer under the rule rules out the composer: not ready, not occupied."""
+    pane = _LIVE_CLIPPED_PANE.replace(
+        "  -- INSERT --", "  Enter to confirm · Esc to cancel\n  -- INSERT --"
+    )
+    assert not claude_native_bridge._occupied_tall_draft(pane)
+    bridge = claude_native_bridge
+    monkeypatch.setattr(bridge, "time", _VirtualClock())
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda cmd, **_kw: SimpleNamespace(
+            returncode=0, stdout=pane if "capture-pane" in cmd else "0 ", stderr=""
+        ),
+    )
+
+    with pytest.raises((bridge.ClaudePromptTimeout, bridge.ClaudeTerminalDialog)) as caught:
+        bridge._wait_for_claude_prompt_ready(
+            str(_TEST_TMUX_SOCKET), "claude:0.0", timeout_s=1.0, extend_for_slow_boot=False
+        )
+
+    assert not isinstance(caught.value, bridge.ClaudeInputBoxOccupied)
+
+
+@pytest.mark.parametrize(
     "replay_captures,recovered_draft,late_draft",
     [(8, "", True), (25, "", True), (8, "", False), (8, "unfinished terminal edit", False)],
     ids=["composer-returned", "still-replaying", "never-visible", "nonempty-composer"],
@@ -15037,43 +15104,32 @@ _TALL_DRAFT = "\n".join(f"STALE {idx}" for idx in range(30))
 
 @pytest.mark.parametrize("cursor", [0, len(_TALL_DRAFT)], ids=["cursor-at-start", "cursor-at-end"])
 @pytest.mark.parametrize(
-    ("inject", "expected"),
+    "inject",
     [
-        (
-            lambda bridge_dir: inject_user_message(bridge_dir, content="hello from the web"),
-            "hello from the web",
-        ),
-        (
-            lambda bridge_dir: claude_native_bridge.inject_slash_command(
-                bridge_dir, command="/effort high"
-            ),
-            "/effort high",
+        lambda bridge_dir: inject_user_message(bridge_dir, content="hello from the web"),
+        lambda bridge_dir: claude_native_bridge.inject_slash_command(
+            bridge_dir, command="/effort high"
         ),
     ],
     ids=["web-message", "slash-command"],
 )
-def test_a_draft_taller_than_the_pane_is_cleared_before_delivery(
+def test_a_draft_taller_than_the_pane_is_preserved_before_delivery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cursor: int,
     inject: Callable[[Path], None],
-    expected: str,
 ) -> None:
-    """
-    A draft too tall for the pane is cleared, not waited on as an overlay.
-
-    Claude Code keeps the bottom of its screen in view, so the draft scrolls
-    the box's opening rule and ``❯`` row off the top. Read as "no input box",
-    the readiness gate waited out its budget and the turn failed as a
-    terminal that never became ready.
-    """
+    """The box holds a draft even after its opening rule and prompt scroll away."""
     bridge_dir = _picker_bridge_dir(tmp_path)
     composer = _EditableComposer(_TALL_DRAFT, cursor=cursor, pane_rows=10)
     composer.install(monkeypatch)
 
-    inject(bridge_dir)
+    with pytest.raises(claude_native_bridge.ClaudeInputBoxOccupied):
+        inject(bridge_dir)
 
-    assert [text.strip() for text in composer.submitted] == [expected]
+    assert composer.text == _TALL_DRAFT
+    assert composer.cursor == cursor
+    assert composer.submitted == []
 
 
 @pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
