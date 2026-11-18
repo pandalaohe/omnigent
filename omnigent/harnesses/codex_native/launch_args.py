@@ -1051,34 +1051,33 @@ def validate_codex_config_profile_state(codex_home: Path) -> None:
     _profile_base(state_path, current)
 
 
-@config_writer("codex_home", home=True)
-def materialize_codex_config_profile(
-    codex_home: Path,
+@dataclass(frozen=True)
+class CodexProfileConfig:
+    rendered: dict[str, Any]
+    base: dict[str, Any]
+    current: dict[str, Any]
+    merged: dict[str, Any]
+
+
+def compute_codex_profile_config(
+    config_path: Path,
+    state_path: Path | None,
     source_home: Path,
     profile: str | None,
     *,
     codex_version: tuple[int, int, int] | None,
-) -> None:
-    """Fold the selected user profile into the private user layer, below project/CLI.
-
-    Codex app-server has no file-profile selector. Preserve the base separately
-    so switching/removing a profile on restart is reversible. Private TUI edits
-    survive profile removal; selected profiles still take precedence over them.
-    Journal atomic file replacements so interrupted updates can be retried.
-    Never modify the source home.
-    """
-    state_path = codex_home / ".omnigent-config-profile.toml"
-    if profile is None and not state_path.exists():
-        return
-    if codex_home.resolve() == source_home.resolve():
-        raise ValueError("Codex profiles require a private CODEX_HOME")
-    config_path = codex_home / "config.toml"
+) -> CodexProfileConfig:
+    """Compute the private user layer and its journal contents without writing either."""
     current = (
         tomlkit.parse(config_path.read_text()) if config_path.exists() else tomlkit.document()
     )
     current_config = current.unwrap()
     current_instructions = current_config.pop("developer_instructions", _MISSING)
-    base = _profile_base(state_path, current_config) if state_path.exists() else current_config
+    base = (
+        _profile_base(state_path, current_config)
+        if state_path is not None and state_path.exists()
+        else current_config
+    )
     merged = copy.deepcopy(base)
     if profile is not None:
         if codex_config_profile(["--profile", profile]) != profile:
@@ -1103,9 +1102,39 @@ def materialize_codex_config_profile(
     )
     if effective_instructions is not _MISSING:
         rendered_config["developer_instructions"] = effective_instructions
-    rendered = tomlkit.dumps(rendered_config)
-    pending_state = tomlkit.dumps({"base": base, "applied": current_config, "pending": merged})
-    final_state = tomlkit.dumps({"base": base, "applied": merged})
+    return CodexProfileConfig(rendered_config, base, current_config, merged)
+
+
+@config_writer("codex_home", home=True)
+def materialize_codex_config_profile(
+    codex_home: Path,
+    source_home: Path,
+    profile: str | None,
+    *,
+    codex_version: tuple[int, int, int] | None,
+) -> None:
+    """Fold the selected user profile into the private user layer, below project/CLI.
+
+    Codex app-server has no file-profile selector. Preserve the base separately
+    so switching/removing a profile on restart is reversible. Private TUI edits
+    survive profile removal; selected profiles still take precedence over them.
+    Journal atomic file replacements so interrupted updates can be retried.
+    Never modify the source home.
+    """
+    state_path = codex_home / ".omnigent-config-profile.toml"
+    if profile is None and not state_path.exists():
+        return
+    if codex_home.resolve() == source_home.resolve():
+        raise ValueError("Codex profiles require a private CODEX_HOME")
+    config_path = codex_home / "config.toml"
+    config = compute_codex_profile_config(
+        config_path, state_path, source_home, profile, codex_version=codex_version
+    )
+    rendered = tomlkit.dumps(config.rendered)
+    pending_state = tomlkit.dumps(
+        {"base": config.base, "applied": config.current, "pending": config.merged}
+    )
+    final_state = tomlkit.dumps({"base": config.base, "applied": config.merged})
     with config_journal(state_path):
         _write_private_config(state_path, pending_state)
         _write_private_config(config_path, rendered)

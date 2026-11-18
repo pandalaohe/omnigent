@@ -1314,6 +1314,8 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
         session_id: str | None = None,
         model_provider: str | None = None,
         rollout_path: Path | None = None,
+        codex_home: Path | None = None,
+        codex_path: str | None = None,
     ) -> None:
         """
         No-op thread preload.
@@ -1678,6 +1680,8 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         session_id: str | None = None,
         model_provider: str | None = None,
         rollout_path: Path | None = None,
+        codex_home: Path | None = None,
+        codex_path: str | None = None,
     ) -> None:
         """
         Refuse the resume the way a stale writer-lock holder does.
@@ -2181,6 +2185,8 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         session_id: str | None = None,
         model_provider: str | None = None,
         rollout_path: Path | None = None,
+        codex_home: Path | None = None,
+        codex_path: str | None = None,
     ) -> None:
         """
         Refuse the resume with the parametrized error payload.

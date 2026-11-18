@@ -50,11 +50,13 @@ from omnigent.harnesses.claude_native.main import (
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
     CodexNativeAppServer,
+    NativeCodexLaunch,
     apply_codex_thread_permissions,
     build_codex_native_server,
     build_codex_remote_args,
     client_for_transport,
     codex_remote_resume_omits_permission_args,
+    codex_rollout_model_provider,
     codex_session_meta_model_provider,
     codex_terminal_env,
     native_codex_launch_base_url,
@@ -1258,7 +1260,7 @@ async def _prepare_codex_terminal(
                 external_session_id=thread_id,
                 codex_home=codex_home,
                 workspace=Path.cwd().resolve(),
-                model_provider=codex_session_meta_model_provider(_codex_launch),
+                model_provider=_codex_launch,
                 codex_path=command,
                 terminal_launch_args=codex_args,
             )
@@ -1319,6 +1321,8 @@ async def _prepare_codex_terminal(
                     agent_pid=app_server.agent_pid,
                     session_id=session_id,
                     rollout_path=resume_rollout,
+                    codex_home=codex_home,
+                    codex_path=command,
                 )
                 write_bridge_state(
                     bridge_dir,
@@ -1979,6 +1983,43 @@ def _clone_codex_rollout(
     return target
 
 
+def _codex_rollout_provider_and_version(path: Path) -> tuple[str, str | None] | None:
+    """
+    Return the provider a rollout's first ``session_meta`` record already pins.
+
+    Rebuilding a rollout from server history must not relabel a thread's
+    provider: codex resolves the provider on ``thread/resume`` from that first
+    record. Only the first line is read, and any unreadable, malformed, or
+    differently shaped record fails closed to the caller's launch provider.
+
+    :param path: Candidate rollout JSONL path.
+    :returns: The non-empty ``session_meta.payload.model_provider`` string
+        and any stamped CLI version, or ``None`` for an absent or invalid provider.
+    """
+    try:
+        with path.open("rb") as handle:
+            line = handle.readline()
+        record = json.loads(line)
+        if not isinstance(record, dict) or record.get("type") != "session_meta":
+            return None
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        provider = payload.get("model_provider")
+        version = payload.get("cli_version")
+    except Exception as exc:  # noqa: BLE001
+        # Advisory metadata only: this must never block resume.
+        _logger.warning(
+            "Could not read Codex rollout provider (%s while %s); using the launch default",
+            type(exc).__name__,
+            "reading line 0",
+        )
+        return None
+    if not isinstance(provider, str) or not provider.strip():
+        return None
+    return provider, version if isinstance(version, str) else None
+
+
 async def _ensure_local_codex_resume_rollout(
     client: httpx.AsyncClient,
     *,
@@ -1986,7 +2027,7 @@ async def _ensure_local_codex_resume_rollout(
     external_session_id: str,
     codex_home: Path,
     workspace: Path,
-    model_provider: str,
+    model_provider: str | NativeCodexLaunch,
     codex_path: str | None,
     terminal_launch_args: Sequence[str] | None = None,
 ) -> Path:
@@ -2016,11 +2057,9 @@ async def _ensure_local_codex_resume_rollout(
     :param workspace: Resolved directory Codex will run in, e.g.
         ``Path("/home/me/repo")``. Pass an already-resolved path so
         structural rollout cwd fields match the terminal cwd.
-    :param model_provider: Provider id this session's launch routes through,
-        e.g. ``"omnigent_databricks"`` (see
-        :func:`omnigent.harnesses.codex_native.app_server.codex_session_meta_model_provider`).
-        Written into ``session_meta`` so codex's thread-store backfill can
-        resolve the provider when it indexes the rollout.
+    :param model_provider: Resolved launch for deriving the provider id on
+        demand, or an already resolved id. A valid provider on the target
+        rollout takes precedence and skips version probing.
     :param codex_path: Codex CLI executable used to stamp the real
         ``cli_version`` into ``session_meta``, e.g. ``"/usr/local/bin/codex"``.
         ``None`` (or an unparseable version probe) falls back to ``"0.0.0"`` —
@@ -2065,19 +2104,36 @@ async def _ensure_local_codex_resume_rollout(
     items = await resolve_session_item_file_references(client, session_id=session_id, items=items)
     items = _codex_items_with_attachment_references(items, bridge_dir=codex_home.parent)
     target = _codex_resume_rollout_path(codex_home, external_session_id)
-    cli_version = None
-    if codex_path is not None:
-        from omnigent.inner.codex_executor import _codex_cli_version
+    # The existing rollout's provider is server-authoritative history too: a
+    # rebuild from launch defaults would make ``thread/resume`` config-load
+    # fail (or silently reroute) for a thread started on another provider.
+    existing_meta = _codex_rollout_provider_and_version(target)
+    if existing_meta is not None:
+        provider, cli_version = existing_meta
+    else:
+        provider = (
+            model_provider
+            if isinstance(model_provider, str)
+            else await codex_rollout_model_provider(
+                model_provider,
+                codex_home=codex_home,
+                terminal_launch_args=terminal_launch_args or (),
+                codex_path=codex_path,
+            )
+        )
+        cli_version = None
+        if codex_path is not None:
+            from omnigent.inner.codex_executor import _codex_cli_version
 
-        version_tuple = await _codex_cli_version(codex_path)
-        if version_tuple is not None:
-            cli_version = ".".join(str(part) for part in version_tuple)
+            version_tuple = await _codex_cli_version(codex_path)
+            if version_tuple is not None:
+                cli_version = ".".join(str(part) for part in version_tuple)
     records = _codex_rollout_records_from_session_items(
         items,
         session_id=session_id,
         external_session_id=external_session_id,
         cwd=workspace,
-        model_provider=model_provider,
+        model_provider=provider,
         cli_version=cli_version or "0.0.0",
         terminal_launch_args=terminal_launch_args,
     )

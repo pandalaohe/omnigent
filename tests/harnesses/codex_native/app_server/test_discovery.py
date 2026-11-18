@@ -27,6 +27,7 @@ from tests.harnesses.codex_native.app_server._support import (
     _disable_codex_startup_rpc,
     _test_app_server,
 )
+from tests.harnesses.codex_native.session._support import _write_source_rollout
 
 
 async def test_discover_codex_model_options_strips_secrets_and_stops_process(
@@ -1175,6 +1176,12 @@ async def test_provider_attribution_uses_effective_codex_config_and_cleans_up(
     from omnigent.harnesses.codex_native import app_server
 
     home = tmp_path / "private-home"
+    rollout = _write_source_rollout(
+        codex_home=home,
+        thread_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+        source_cwd="/stale/cwd",
+    )
+    rollout_before = rollout.read_bytes()
     inherited = {
         "Inherited.Provider": {
             "base_url": "https://workspace.cloud.databricks.com/ai-gateway/codex/v1",
@@ -1236,6 +1243,7 @@ async def test_provider_attribution_uses_effective_codex_config_and_cleans_up(
     )
     client.close.assert_awaited_once()
     stopped.assert_awaited_once_with(discovery)
+    assert rollout.read_bytes() == rollout_before
     text = (home / "config.toml").read_text()
     providers = tomllib.loads(text)["model_providers"]
     assert providers["local"]["auth"] == {"command": "local-secret-helper"}

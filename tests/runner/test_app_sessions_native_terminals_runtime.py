@@ -554,6 +554,14 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     from omnigent.runner import tool_dispatch
     from omnigent.runner.native import orchestration
 
+    async def _codex_version(*_args: Any, **_kwargs: Any) -> tuple[int, int, int] | None:
+        return version
+
+    monkeypatch.setattr(codex_app_mod, "_find_codex_cli", lambda: "/opt/codex/bin/codex")
+    monkeypatch.setattr(codex_app_mod, "_native_codex_cli_version", _codex_version)
+    monkeypatch.setattr("omnigent.inner.codex_executor._codex_cli_version", _codex_version)
+    monkeypatch.setattr(codex_app_mod, "snapshot_codex_binary", lambda executable, **_: executable)
+
     session_id = "76cbdcbbf84d4149b2a7d7441b6966c1"
     monkeypatch.setitem(
         runner_app_mod._session_peer_messaging_enabled_ref, session_id, peer_enabled
@@ -574,6 +582,15 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     bridge_id = _ROTATED_BRIDGE_ID if rotated else session_id
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(bridge_id)
     session_dir = codex_native_bridge.bridge_dir_for_bridge_id(session_id)
+    if provider_profile is None:
+        session_codex_home = codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)
+        session_codex_home.mkdir(parents=True, exist_ok=True)
+        (session_codex_home / "config.toml").write_text(
+            'model_provider = "custom"\n'
+            "[model_providers.custom]\n"
+            'base_url = "https://provider.invalid/v1"\n',
+            encoding="utf-8",
+        )
     session_labels: dict[str, str] = (
         {codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: bridge_id} if rotated else {}
     )
@@ -840,6 +857,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         model_provider: str | None = None,
         permission_profile: str | None = None,
         rollout_path: Path | None = None,
+        codex_home: Path | None = None,
+        codex_path: str | None = None,
     ) -> Any:
         """
         Record preloading of the known Codex thread.
@@ -984,6 +1003,11 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert ("sys_session_send" in startup_tool_names) is peer_enabled
     expected_codex_home = codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)
     assert app_server.codex_home == expected_codex_home
+    rollout = next(expected_codex_home.glob(f"sessions/**/rollout-*-{thread_id}.jsonl"))
+    first_record = json.loads(rollout.read_text(encoding="utf-8").splitlines()[0])
+    assert first_record["payload"]["model_provider"] == (
+        "omnigent_databricks" if provider_profile else "custom"
+    )
     # The terminal-reuse check reads the app-server's stop record from this directory.
     assert remembered_dir == bridge_dir
     if rotated:
@@ -1412,6 +1436,8 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         model_provider: str | None = None,
         permission_profile: str | None = None,
         rollout_path: Path | None = None,
+        codex_home: Path | None = None,
+        codex_path: str | None = None,
     ) -> None:
         """
         Record preloading of the cloned Codex thread.
@@ -1726,6 +1752,8 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         model_provider: str | None = None,
         permission_profile: str | None = None,
         rollout_path: Path | None = None,
+        codex_home: Path | None = None,
+        codex_path: str | None = None,
     ) -> None:
         """:param transport: App-server URL. :param loaded_thread_id: Resumed thread."""
         assert terminal_launch_args is None
@@ -5745,6 +5773,8 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         model_provider: str | None = None,
         permission_profile: str | None = None,
         rollout_path: Path | None = None,
+        codex_home: Path | None = None,
+        codex_path: str | None = None,
     ) -> None:
         """
         Accept preloading of the known Codex thread.
@@ -5995,6 +6025,8 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
         model_provider: str | None = None,
         permission_profile: str | None = None,
         rollout_path: Path | None = None,
+        codex_home: Path | None = None,
+        codex_path: str | None = None,
     ) -> None:
         """Accept preloading of the known Codex thread."""
         del transport, loaded_thread_id, terminal_launch_args

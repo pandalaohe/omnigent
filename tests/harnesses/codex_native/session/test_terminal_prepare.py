@@ -187,6 +187,7 @@ async def test_prepare_codex_terminal_resumes_with_launch_provider(
     from omnigent.harnesses.codex_native.launch_args import CodexWorkspaceProfile
 
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)
     server = SimpleNamespace(
         start=AsyncMock(),
         close=AsyncMock(),
@@ -199,6 +200,20 @@ async def test_prepare_codex_terminal_resumes_with_launch_provider(
     rollout = _write_source_rollout(
         codex_home=tmp_path / "codex-home", thread_id="thread_test", source_cwd=str(tmp_path)
     )
+    if expected_provider is None:
+        from omnigent.harnesses.codex_native.bridge import (
+            bridge_dir_for_bridge_id,
+            codex_home_for_bridge_dir,
+        )
+
+        session_codex_home = codex_home_for_bridge_dir(bridge_dir_for_bridge_id("conv_test"))
+        session_codex_home.mkdir(parents=True, exist_ok=True)
+        (session_codex_home / "config.toml").write_text(
+            'model_provider = "custom"\n'
+            "[model_providers.custom]\n"
+            'base_url = "https://provider.invalid/v1"\n',
+            encoding="utf-8",
+        )
     later_records = rollout.read_bytes().split(b"\n", 1)[1]
     resumes: list[dict[str, Any]] = []
 
@@ -236,7 +251,6 @@ async def test_prepare_codex_terminal_resumes_with_launch_provider(
         async def close(self) -> None:
             """:returns: None."""
 
-    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)
     monkeypatch.setattr(
         codex_native,
         "_fetch_codex_session",
@@ -276,6 +290,11 @@ async def test_prepare_codex_terminal_resumes_with_launch_provider(
         )
 
     assert [resume.get("modelProvider") for resume in resumes] == [expected_provider, "Databricks"]
+    ensure_rollout = codex_native._ensure_local_codex_resume_rollout
+    assert ensure_rollout.await_args is not None
+    assert ensure_rollout.await_args.kwargs["model_provider"] == NativeCodexLaunch(
+        overrides, "test-model", profile
+    )
     session_meta, rest = rollout.read_bytes().split(b"\n", 1)
     assert json.loads(session_meta)["payload"]["model_provider"] == "Databricks"
     assert rest == later_records

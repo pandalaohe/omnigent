@@ -780,6 +780,131 @@ def test_rollout_records_keep_function_call_namespace() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_preserves_existing_model_provider(
+    tmp_path: Path,
+) -> None:
+    """Rebuilding history never changes a valid thread provider to the launch default."""
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    codex_home = tmp_path / "codex-home"
+    existing = _write_source_rollout(
+        codex_home=codex_home, thread_id=thread_id, source_cwd="/stale/cwd"
+    )
+    records = [json.loads(line) for line in existing.read_text().splitlines()]
+    records[0]["payload"]["model_provider"] = "custom"
+    existing.write_text("".join(json.dumps(record) + "\n" for record in records))
+    before = existing.read_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/files"):
+            return httpx.Response(200, json={"data": [], "has_more": False})
+        return httpx.Response(200, json={"data": [], "has_more": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        rollout = await codex_native._ensure_local_codex_resume_rollout(
+            client,
+            session_id="conv_codex",
+            external_session_id=thread_id,
+            codex_home=codex_home,
+            workspace=(tmp_path / "workspace").resolve(),
+            model_provider="openai",
+            codex_path=None,
+        )
+
+    rebuilt = [json.loads(line) for line in rollout.read_text().splitlines()]
+    assert [record["type"] for record in rebuilt] == ["session_meta"]
+    assert rebuilt[0]["payload"]["model_provider"] == "custom"
+    backups = list(rollout.parent.glob(f"{rollout.name}.omnigent-backup-*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == before
+
+
+def test_rollout_session_meta_provider_ignores_invalid_utf8_after_first_line(
+    tmp_path: Path,
+) -> None:
+    """A valid line-0 provider survives malformed bytes in later rollout records."""
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_bytes(
+        b'{"type":"session_meta","payload":{"model_provider":"custom"}}\n'
+        b'{"type":"response_item","payload":{"text":"\xff"}}\n'
+    )
+
+    assert codex_native._codex_rollout_provider_and_version(rollout) == ("custom", None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "existing_metadata",
+    ["new", "missing", "corrupt", "deeply-nested-corrupt", "wrong-type", "wrong-record"],
+)
+async def test_ensure_local_codex_resume_rollout_uses_session_config_provider(
+    tmp_path: Path, existing_metadata: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """New and metadata-less rebuilt rollouts use the session's effective provider."""
+    from omnigent.harnesses.codex_native.app_server import (
+        NativeCodexLaunch,
+        codex_session_meta_model_provider,
+    )
+
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        'model_provider = "custom"\n'
+        "[model_providers.custom]\n"
+        'base_url = "https://provider.invalid/v1"\n',
+        encoding="utf-8",
+    )
+    if existing_metadata != "new":
+        existing = _write_source_rollout(
+            codex_home=codex_home, thread_id=thread_id, source_cwd="/stale/cwd"
+        )
+        if existing_metadata == "corrupt":
+            existing.write_bytes(b"{not-json}\n")
+        elif existing_metadata == "deeply-nested-corrupt":
+            existing.write_bytes(b"[" * 10000 + b'"line-zero-private-content"\n')
+        elif existing_metadata != "missing":
+            records = [json.loads(line) for line in existing.read_text().splitlines()]
+            if existing_metadata == "wrong-record":
+                records[0]["type"] = "response_item"
+                records[0]["payload"]["model_provider"] = "other-provider"
+            else:
+                records[0]["payload"]["model_provider"] = 42
+            existing.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [], "has_more": False})
+
+    launch = NativeCodexLaunch(config_overrides=[], model=None, profile=None)
+    provider = codex_session_meta_model_provider(launch, codex_home=codex_home)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        rollout = await codex_native._ensure_local_codex_resume_rollout(
+            client,
+            session_id="conv_codex",
+            external_session_id=thread_id,
+            codex_home=codex_home,
+            workspace=(tmp_path / "workspace").resolve(),
+            model_provider=provider,
+            codex_path=None,
+        )
+
+    records = [json.loads(line) for line in rollout.read_text().splitlines()]
+    assert records[0]["payload"]["model_provider"] == "custom"
+    if existing_metadata == "deeply-nested-corrupt":
+        warnings = [
+            record.message
+            for record in caplog.records
+            if "Could not read Codex rollout provider" in record.message
+        ]
+        assert len(warnings) == 1
+        assert "RecursionError while reading line 0" in warnings[0]
+        assert "line-zero-private-content" not in caplog.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("backup_fails", [False, True])
 async def test_ensure_local_codex_resume_rollout_refreshes_existing_from_server(
     tmp_path: Path,

@@ -863,6 +863,16 @@ _PROVIDER_MISMATCH = {
     },
 }
 
+_PROVIDER_POLICY_CONFLICT = {
+    "code": -32600,
+    "message": "provider policy conflict",
+    "data": {
+        "type": "modelProviderPolicyConflict",
+        "modelProvider": "custom",
+        "requiredModelProvider": "openai",
+    },
+}
+
 
 @pytest.mark.parametrize(
     ("error", "has_rollout"),
@@ -1036,6 +1046,77 @@ def test_preload_codex_thread_retries_provider_mismatch_once(
     assert fake_client.closed is (retry_refused or not retain_client)
 
 
+def test_preload_codex_thread_retries_provider_policy_conflict_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A managed-policy conflict restamps and retries once with its required provider."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    rollout.write_text('{"type":"session_meta","payload":{"model_provider":"custom"}}\n')
+    refusal = codex_native_app_server.CodexAppServerResponseError(_PROVIDER_POLICY_CONFLICT)
+    fake_client = _ScriptedResumeClient([refusal])
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    assert (
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+                model_provider="custom",
+                rollout_path=rollout,
+            )
+        )
+        is None
+    )
+
+    assert [method for method, _params in fake_client.requests] == ["thread/resume"] * 2
+    first, retry = (params for _method, params in fake_client.requests)
+    assert first["modelProvider"] == "custom"
+    assert retry == {**first, "modelProvider": "openai"}
+    assert json.loads(rollout.read_text())["payload"]["model_provider"] == "openai"
+    assert fake_client.closed
+
+
+@pytest.mark.parametrize("required_provider", [None, "", 7])
+def test_preload_codex_thread_surfaces_policy_conflict_without_usable_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    required_provider: object,
+) -> None:
+    """A policy conflict without a usable required provider propagates unchanged."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    original = b'{"type":"session_meta","payload":{"model_provider":"custom"}}\n'
+    rollout.write_bytes(original)
+    data = {
+        "type": "modelProviderPolicyConflict",
+        "modelProvider": "custom",
+        "requiredModelProvider": required_provider,
+    }
+    refusal = codex_native_app_server.CodexAppServerResponseError(
+        {**_PROVIDER_POLICY_CONFLICT, "data": data}
+    )
+    fake_client = _ScriptedResumeClient([refusal])
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    with pytest.raises(codex_native_app_server.CodexAppServerResponseError) as raised:
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+                model_provider="custom",
+                rollout_path=rollout,
+            )
+        )
+
+    assert raised.value is refusal
+    assert [method for method, _params in fake_client.requests] == ["thread/resume"]
+    assert rollout.read_bytes() == original
+    assert fake_client.closed
+
+
 @pytest.mark.asyncio
 async def test_cancelled_resume_waits_for_rollout_replacement(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1112,10 +1193,10 @@ class _ConfiguredProviderResumeClient(_ScriptedResumeClient):
     [
         ("omnigent_databricks", None, "omnigent_databricks"),
         (None, "omnigent_databricks", "omnigent_databricks"),
-        (None, None, None),
+        (None, None, "openai"),
         (None, "Databricks", None),
     ],
-    ids=["pinned_launch", "config_selected", "no_provider", "same_missing_provider"],
+    ids=["pinned_launch", "config_selected", "computed_default", "same_missing_provider"],
 )
 def test_preload_codex_thread_moves_unconfigured_thread_provider(
     monkeypatch: pytest.MonkeyPatch,
@@ -1128,6 +1209,7 @@ def test_preload_codex_thread_moves_unconfigured_thread_provider(
     rollout = tmp_path / "rollout-thread_test.jsonl"
     original = b'{"type":"session_meta","payload":{"model_provider":"Databricks"}}\n'
     rollout.write_bytes(original)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "empty-source-home"))
     refusal = codex_native_app_server.CodexAppServerResponseError(_PROVIDER_NOT_CONFIGURED)
     fake_client = _ConfiguredProviderResumeClient([refusal], effective_provider)
     monkeypatch.setattr(
@@ -1155,6 +1237,228 @@ def test_preload_codex_thread_moves_unconfigured_thread_provider(
         assert len(resumes) == 2
         assert resumes[1]["modelProvider"] == restamped_to
         assert json.loads(rollout.read_text())["payload"]["model_provider"] == restamped_to
+    assert fake_client.closed
+
+
+def test_preload_codex_thread_moves_unconfigured_thread_to_computed_launch_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An unpinned launch still recomputes its provider when config/read is empty."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    rollout.write_bytes(
+        b'{"type":"session_meta","payload":{"model_provider":"removed-provider"}}\n'
+    )
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text(
+        'model_provider = "computed-provider"\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    refusal = codex_native_app_server.CodexAppServerResponseError(
+        {
+            **_PROVIDER_NOT_CONFIGURED,
+            "data": {
+                "type": "modelProviderNotConfigured",
+                "modelProvider": "removed-provider",
+            },
+        }
+    )
+    fake_client = _ConfiguredProviderResumeClient([refusal], None)
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    assert (
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+                model_provider=None,
+                rollout_path=rollout,
+            )
+        )
+        is None
+    )
+
+    resumes = [params for method, params in fake_client.requests if method == "thread/resume"]
+    assert len(resumes) == 2
+    assert resumes[1]["modelProvider"] == "computed-provider"
+    assert json.loads(rollout.read_text())["payload"]["model_provider"] == "computed-provider"
+    assert fake_client.closed
+
+
+def test_preload_codex_thread_recovers_managed_override_after_config_read_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A mismatch after the computed-provider retry uses Codex's managed provider once."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    rollout.write_bytes(
+        b'{"type":"session_meta","payload":{"model_provider":"removed-provider"}}\n'
+    )
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text(
+        'model_provider = "computed-provider"\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    unconfigured = codex_native_app_server.CodexAppServerResponseError(
+        {
+            **_PROVIDER_NOT_CONFIGURED,
+            "data": {
+                "type": "modelProviderNotConfigured",
+                "modelProvider": "removed-provider",
+            },
+        }
+    )
+    mismatch = codex_native_app_server.CodexAppServerResponseError(
+        {
+            **_PROVIDER_MISMATCH,
+            "data": {
+                "type": "modelProviderMismatch",
+                "modelProvider": "computed-provider",
+                "currentModelProvider": "managed-provider",
+            },
+        }
+    )
+
+    class _TimeoutConfigReadClient(_ConfiguredProviderResumeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "config/read":
+                self.requests.append((method, params))
+                raise TimeoutError("config/read timed out")
+            return await super().request(method, params)
+
+    fake_client = _TimeoutConfigReadClient([unconfigured, mismatch], None)
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    assert (
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+                model_provider=None,
+                rollout_path=rollout,
+            )
+        )
+        is None
+    )
+
+    resumes = [params for method, params in fake_client.requests if method == "thread/resume"]
+    assert len(resumes) == 3
+    assert resumes[1]["modelProvider"] == "computed-provider"
+    assert resumes[2]["modelProvider"] == "managed-provider"
+    assert json.loads(rollout.read_text())["payload"]["model_provider"] == "managed-provider"
+    assert fake_client.closed
+
+
+def test_preload_codex_thread_recovers_when_binary_snapshot_is_denied(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An advisory CLI snapshot failure still falls back and sends the second resume."""
+    import psutil
+
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    rollout.write_bytes(
+        b'{"type":"session_meta","payload":{"model_provider":"removed-provider"}}\n'
+    )
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    refusal = codex_native_app_server.CodexAppServerResponseError(
+        {
+            **_PROVIDER_NOT_CONFIGURED,
+            "data": {
+                "type": "modelProviderNotConfigured",
+                "modelProvider": "removed-provider",
+            },
+        }
+    )
+    fake_client = _ConfiguredProviderResumeClient([refusal], None)
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    def _denied_snapshot(_executable: str, **_kwargs: object) -> str:
+        raise psutil.AccessDenied(pid=4321)
+
+    monkeypatch.setattr(codex_native_app_server, "snapshot_codex_binary", _denied_snapshot)
+
+    assert (
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+                model_provider=None,
+                rollout_path=rollout,
+                codex_home=tmp_path / "private-codex-home",
+                codex_path="/opt/codex/bin/codex",
+                terminal_launch_args=["--profile", "work"],
+            )
+        )
+        is None
+    )
+
+    resumes = [params for method, params in fake_client.requests if method == "thread/resume"]
+    assert len(resumes) == 2
+    assert resumes[1]["modelProvider"] == "openai"
+    assert json.loads(rollout.read_text())["payload"]["model_provider"] == "openai"
+    warnings = [
+        record.message
+        for record in caplog.records
+        if "Could not resolve Codex rollout provider" in record.message
+    ]
+    assert len(warnings) == 1
+    assert "AccessDenied while probing the CLI version" in warnings[0]
+    assert "4321" not in warnings[0]
+    assert fake_client.closed
+
+
+def test_preload_codex_thread_moves_unconfigured_thread_to_effective_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A removed provider migrates to Codex's effective provider, not the launch pin."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    rollout.write_bytes(
+        b'{"type":"session_meta","payload":{"model_provider":"removed-provider"}}\n'
+    )
+    refusal = codex_native_app_server.CodexAppServerResponseError(
+        {
+            **_PROVIDER_NOT_CONFIGURED,
+            "data": {
+                "type": "modelProviderNotConfigured",
+                "modelProvider": "removed-provider",
+            },
+        }
+    )
+    fake_client = _ConfiguredProviderResumeClient([refusal], "managed-provider")
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    assert (
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+                model_provider="launch-provider",
+                rollout_path=rollout,
+            )
+        )
+        is None
+    )
+
+    resumes = [params for method, params in fake_client.requests if method == "thread/resume"]
+    assert len(resumes) == 2
+    assert resumes[0]["modelProvider"] == "launch-provider"
+    assert resumes[1]["modelProvider"] == "managed-provider"
+    assert json.loads(rollout.read_text())["payload"]["model_provider"] == "managed-provider"
     assert fake_client.closed
 
 

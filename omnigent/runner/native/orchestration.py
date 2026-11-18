@@ -6425,7 +6425,6 @@ async def _auto_create_codex_terminal(
             model_reset_notice = (
                 f"{pick_to_reset} isn't available on this host; using {launched_label}."
             )
-    _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
     # Cancel any surviving forwarder first so its teardown closes the OLD app-server,
     # not the one registered below — and so it can't mirror alongside the new one.
     await _cancel_auto_forwarder_task(session_id)
@@ -6582,7 +6581,7 @@ async def _auto_create_codex_terminal(
                 external_session_id=target_thread_id,
                 codex_home=codex_home,
                 workspace=clone_workspace,
-                model_provider=_session_meta_provider,
+                model_provider=_codex_launch,
                 codex_path=_codex_cli_path,
                 terminal_launch_args=launch_config.terminal_launch_args,
             )
@@ -6635,7 +6634,7 @@ async def _auto_create_codex_terminal(
             external_session_id=launch_config.external_session_id,
             codex_home=codex_home,
             workspace=Path(workspace).resolve(),
-            model_provider=_session_meta_provider,
+            model_provider=_codex_launch,
             codex_path=_codex_cli_path,
             terminal_launch_args=launch_config.terminal_launch_args,
         )
@@ -6847,7 +6846,7 @@ async def _auto_create_codex_terminal(
                         session_id=session_id,
                         cwd=Path(workspace),
                         model_provider=(
-                            _session_meta_provider
+                            codex_session_meta_model_provider(_codex_launch)
                             if native_codex_launch_pins_model_provider(_codex_launch)
                             else None
                         ),
@@ -6855,6 +6854,8 @@ async def _auto_create_codex_terminal(
                             app_server.codex_cli_version
                         ),
                         rollout_path=resume_rollout,
+                        codex_home=codex_home,
+                        codex_path=_codex_cli_path,
                     )
                     break
                 except Exception as exc:
