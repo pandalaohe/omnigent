@@ -17,14 +17,15 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { UsageCostCard, UsageByModel } from "./UsageAmounts";
-import { UsageAccountCost } from "./UsageAccountCost";
+import { LegacyUsageAccountCost } from "./UsageAccountCost";
 import { UsagePricingSummary } from "./UsagePricingPanel";
 import { UsageModelPoolsLink } from "./UsageModelPoolsLink";
 
 import { UsageBoardFrame } from "./UsageBoardFrame";
 import { UsageRing } from "./UsageRing";
 import { UsageTip } from "./UsageTip";
-import { useUsageOverview } from "./usageBoardData";
+import { useUsageOverview, type UsageAccountView } from "./usageBoardData";
+import { t } from "./usageText";
 import {
   formatAge,
   formatFullDate,
@@ -37,11 +38,10 @@ import {
   stateTone,
   windowName,
 } from "./usageBoardFormat";
-import { groupWindows, isStale, neverRead, pickWindow } from "./usageBoardSelect";
+import { groupWindows, isStale, neverRead, pickWindow, renewalOf } from "./usageBoardSelect";
 import { readingTip, windowTip } from "./usageBoardTips";
 import { useUsageAccountActivity } from "./usageActivityData";
 
-import { renewalOf } from "./UsageBoardPage";
 import { UsageBalances } from "./UsageBalances";
 import { UsageName } from "./UsageName";
 
@@ -75,10 +75,6 @@ export function UsageAccountPage() {
   }
 
   const stale = account ? isStale(account) : false;
-  const empty = account ? neverRead(account) : true;
-  const groups = account ? groupWindows(account.windows) : [];
-  groups.sort((a, b) => Number(b.key === focus) - Number(a.key === focus));
-  const pinnedId = board.windows[accountId];
   const renewal = account ? renewalOf(account, board.renewals[account.id]) : null;
 
   return (
@@ -139,125 +135,10 @@ export function UsageAccountPage() {
 
           <div className="usage-account-detail">
             <div className="usage-detail-grid">
-              <section className="usage-card">
-                <div className="usage-card-head">
-                  <h2 className="usage-card-title">Quota</h2>
-                  {stale && account.age_s !== null ? (
-                    <span className="usage-caption">Read {formatAge(account.age_s)} ago</span>
-                  ) : null}
-                </div>
-                {groups.length === 0 ? (
-                  <div className="flex flex-col items-center gap-2 py-6">
-                    <UsageRing window={null} stale size={100} />
-                    <p className="usage-caption">
-                      {empty ? "No reading yet." : "The last read returned no window."}
-                    </p>
-                  </div>
-                ) : (
-                  groups.map((group) => {
-                    const picked = pickWindow(group, account.deciding_window, pinnedId);
-                    return (
-                      <div
-                        key={group.key || "main"}
-                        data-pool={group.key}
-                        data-focused={group.key === focus || undefined}
-                      >
-                        {group.tag ? <p className="usage-group-tag">{group.tag}</p> : null}
-                        <div className="usage-window-grid">
-                          {group.windows.map((window) => {
-                            const isOn = picked.window === window && isPercentWindow(window);
-                            const tone = stale || empty ? "mute" : stateTone(window.state);
-                            return (
-                              <div key={window.id} data-usage-window className="usage-window">
-                                <UsageTip
-                                  className="usage-ring-trigger"
-                                  triggerLabel={`${windowName(window)} details`}
-                                  model={windowTip(account, window, group.tag, {
-                                    pinned: picked.pinned,
-                                    stale: stale || empty,
-                                    auto: !pinnedId || pinnedId === "auto",
-                                  })}
-                                  tapOpens
-                                >
-                                  <UsageRing
-                                    window={window}
-                                    stale={stale || empty}
-                                    size={100}
-                                    showName
-                                  />
-                                </UsageTip>
-                                {window.percent_used !== null ? (
-                                  <span
-                                    className={cn(
-                                      "usage-countdown",
-                                      stale && "text-muted-foreground",
-                                    )}
-                                  >
-                                    {formatTimeLeft(window.time_left_s) || "—"}
-                                  </span>
-                                ) : null}
-                                <span className="usage-caption max-w-full">
-                                  {window.resets_at !== null ? (
-                                    `Resets ${formatFullDate(window.resets_at)}`
-                                  ) : (
-                                    <UsageName>{windowName(window)}</UsageName>
-                                  )}
-                                </span>
-                                {window.used_value !== null ? (
-                                  <span className="usage-caption">
-                                    Used {formatUsageValue(window.used_value, window.unit)}
-                                    {window.limit_value !== null
-                                      ? ` / ${formatUsageValue(window.limit_value, window.unit)}`
-                                      : ""}
-                                  </span>
-                                ) : null}
-                                {window.remaining_pct !== null ? (
-                                  <span className="usage-caption">
-                                    Remaining {formatPercentReading(window.remaining_pct)}%
-                                  </span>
-                                ) : null}
-                                {window.ahead_pts !== null && window.ahead_pts > 0 && !stale ? (
-                                  <span className="usage-caption text-warning">
-                                    Ahead of time by {formatPercentReading(window.ahead_pts)} points
-                                  </span>
-                                ) : null}
-                                {isOn ? (
-                                  <span
-                                    className={cn(
-                                      "usage-caption inline-flex items-center gap-1",
-                                      TONE_TEXT[tone],
-                                    )}
-                                    title={
-                                      picked.pinned
-                                        ? "You pinned this window for the board."
-                                        : "Auto picked the most urgent window."
-                                    }
-                                  >
-                                    {picked.pinned ? (
-                                      <PinIcon className="size-3" aria-hidden="true" />
-                                    ) : (
-                                      <ZapIcon className="size-3" aria-hidden="true" />
-                                    )}
-                                    {paceChip(window, stale || empty).label}
-                                  </span>
-                                ) : null}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    );
-                  })
-                )}
-                {account.balances?.length ? (
-                  <div className="usage-card-section">
-                    <UsageBalances account={account} />
-                  </div>
-                ) : null}
-              </section>
+              <UsageAccountQuota account={account} focus={focus} />
 
               <div className="grid grid-cols-1 gap-2">
-                <UsageAccountCost account={account} />
+                <LegacyUsageAccountCost account={account} />
                 <UsagePricingSummary accountId={account.id} />
                 <section className="usage-card">
                   <h2 className="usage-card-title">Used in</h2>
@@ -342,5 +223,127 @@ export function UsageAccountPage() {
         </>
       ) : null}
     </UsageBoardFrame>
+  );
+}
+
+export function UsageAccountQuota({
+  account,
+  focus = null,
+}: {
+  account: UsageAccountView;
+  focus?: string | null;
+}) {
+  const pinnedId = useUsageContextPreferences().board.windows[account.id];
+  const stale = isStale(account);
+  const empty = neverRead(account);
+  const groups = groupWindows(account.windows);
+  groups.sort((a, b) => Number(b.key === focus) - Number(a.key === focus));
+  return (
+    <section className="usage-card">
+      <div className="usage-card-head">
+        <h2 className="usage-card-title">{t("overviewQuota")}</h2>
+        {stale && account.age_s !== null ? (
+          <span className="usage-caption">Read {formatAge(account.age_s)} ago</span>
+        ) : null}
+      </div>
+      {groups.length === 0 ? (
+        <div className="flex flex-col items-center gap-2 py-6">
+          <UsageRing window={null} stale size={100} />
+          <p className="usage-caption">
+            {empty ? "No reading yet." : "The last read returned no window."}
+          </p>
+        </div>
+      ) : (
+        groups.map((group) => {
+          const picked = pickWindow(group, account.deciding_window, pinnedId);
+          return (
+            <div
+              key={group.key || "main"}
+              data-pool={group.key}
+              data-focused={group.key === focus || undefined}
+            >
+              {group.tag ? <p className="usage-group-tag">{group.tag}</p> : null}
+              <div className="usage-window-grid">
+                {group.windows.map((window) => {
+                  const isOn = picked.window === window && isPercentWindow(window);
+                  const tone = stale || empty ? "mute" : stateTone(window.state);
+                  return (
+                    <div key={window.id} data-usage-window className="usage-window">
+                      <UsageTip
+                        className="usage-ring-trigger"
+                        triggerLabel={`${windowName(window)} details`}
+                        model={windowTip(account, window, group.tag, {
+                          pinned: picked.pinned,
+                          stale: stale || empty,
+                          auto: !pinnedId || pinnedId === "auto",
+                        })}
+                        tapOpens
+                      >
+                        <UsageRing window={window} stale={stale || empty} size={100} showName />
+                      </UsageTip>
+                      {window.percent_used !== null ? (
+                        <span className={cn("usage-countdown", stale && "text-muted-foreground")}>
+                          {formatTimeLeft(window.time_left_s) || "—"}
+                        </span>
+                      ) : null}
+                      <span className="usage-caption max-w-full">
+                        {window.resets_at !== null ? (
+                          `Resets ${formatFullDate(window.resets_at)}`
+                        ) : (
+                          <UsageName>{windowName(window)}</UsageName>
+                        )}
+                      </span>
+                      {window.used_value !== null ? (
+                        <span className="usage-caption">
+                          Used {formatUsageValue(window.used_value, window.unit)}
+                          {window.limit_value !== null
+                            ? ` / ${formatUsageValue(window.limit_value, window.unit)}`
+                            : ""}
+                        </span>
+                      ) : null}
+                      {window.remaining_pct !== null ? (
+                        <span className="usage-caption">
+                          Remaining {formatPercentReading(window.remaining_pct)}%
+                        </span>
+                      ) : null}
+                      {window.ahead_pts !== null && window.ahead_pts > 0 && !stale ? (
+                        <span className="usage-caption text-warning">
+                          Ahead of time by {formatPercentReading(window.ahead_pts)} points
+                        </span>
+                      ) : null}
+                      {isOn ? (
+                        <span
+                          className={cn(
+                            "usage-caption inline-flex items-center gap-1",
+                            TONE_TEXT[tone],
+                          )}
+                          title={
+                            picked.pinned
+                              ? "You pinned this window for the board."
+                              : "Auto picked the most urgent window."
+                          }
+                        >
+                          {picked.pinned ? (
+                            <PinIcon className="size-3" aria-hidden="true" />
+                          ) : (
+                            <ZapIcon className="size-3" aria-hidden="true" />
+                          )}
+                          {paceChip(window, stale || empty).label}
+                        </span>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })
+      )}
+      {account.balances?.length ? (
+        <div className="usage-card-section">
+          <UsageBalances account={account} />
+        </div>
+      ) : null}
+    </section>
   );
 }

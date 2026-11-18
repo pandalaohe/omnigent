@@ -1,9 +1,3 @@
-// The Usage board's rendering contract: one tile per account, the ring rule
-// (a window past its reset and an account never read show a dashed ring and no
-// `0`), an old reading dims with its read time, a tile goes straight to its
-// detail page, and no display route renders a settings control. The Settings
-// group owns every control and stays reachable with the module off.
-
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -131,66 +125,48 @@ describe("formatting", () => {
 });
 
 describe("board", () => {
-  it("draws one tile per account with its ring, countdown and window name", async () => {
-    mocks.overview.current = { ...LOADED, data: usageBoardData() };
+  it("opens on All with one quota row and switch per visible account", () => {
+    const data = usageBoardData();
+    mocks.overview.current = { ...LOADED, data };
     renderRoute();
-    const tiles = await screen.findAllByTestId("usage-tile");
-    expect(tiles.length).toBe(5);
-    // The longest reported window is main; the session remains as a satellite.
-    const codex = tiles.find((tile) => tile.dataset.account === "codex") as HTMLElement;
-    expect(within(codex).getByText("5h")).toBeTruthy();
-    expect(within(codex).getByText("4h 0m")).toBeTruthy();
-    expect(within(codex).getAllByTestId("usage-ring")[0].textContent).toContain("72");
-    // A weekly window writes its own name inside the ring.
-    expect(screen.getAllByText("7d").length).toBeGreaterThan(0);
+    const accounts = screen.getByRole("navigation", { name: "Usage accounts" });
+    expect(within(accounts).getAllByRole("link")).toHaveLength(data.accounts.length + 1);
+    expect(within(accounts).getByRole("link", { name: "All" })).toHaveAttribute(
+      "aria-current",
+      "true",
+    );
+    const quota = screen.getByRole("heading", { name: "Quota" }).closest("section")!;
+    expect(within(quota).getAllByRole("listitem")).toHaveLength(data.accounts.length);
+    const grok = within(quota).getByRole("link", { name: /Grok/ });
+    expect(within(grok).getByTestId("usage-ring")).toHaveAttribute("data-state", "none");
   });
 
-  it("shows a dashed ring and no figure for an account never read", async () => {
+  it("selects an account in the URL and displays every quota window", async () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
     renderRoute();
-    const tile = (await screen.findByText("Grok")).closest("[data-account]") as HTMLElement;
-    const ring = within(tile as HTMLElement).getByTestId("usage-ring");
-    expect(ring.getAttribute("data-state")).toBe("none");
-    expect(within(tile).queryByText("0")).toBeNull();
-    expect(within(tile).getAllByText("Not read").length).toBeGreaterThan(0);
+    const accounts = screen.getByRole("navigation", { name: "Usage accounts" });
+    const codex = within(accounts).getByRole("link", { name: "Codex" });
+    expect(codex).toHaveAttribute("href", "/usage/board?account=codex");
+    codex.click();
+    await waitFor(() => expect(codex).toHaveAttribute("aria-current", "true"));
+    expect(screen.getAllByText(/^Resets /)).toHaveLength(2);
   });
 
-  it("dims an old reading and writes how long ago it was read", async () => {
+  it("shows the stale reading and the value-only quota on their selected account", () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
-    renderRoute();
-    const tile = (await screen.findByText("Claude")).closest("[data-account]") as HTMLElement;
-    expect(within(tile).getByText("3 h")).toBeTruthy();
-    const ring = within(tile).getByTestId("usage-ring");
-    expect(ring.getAttribute("data-tone")).toBe("mute");
-    // The arcs are dimmed, not recoloured: the reading still shows its figure.
-    expect(ring.querySelector('circle[stroke="var(--muted-foreground)"]')).toBeTruthy();
-    expect(within(tile).getByTestId("usage-ring").textContent).toContain("13");
-  });
-
-  it("renders a value-only window as a plain figure, not a percent", async () => {
-    mocks.overview.current = { ...LOADED, data: usageBoardData() };
-    renderRoute();
-    const tile = (await screen.findByText("LiteLLM")).closest("[data-account]") as HTMLElement;
-    expect(within(tile).getByTestId("usage-figure").textContent).toContain("$41.00");
-    expect(within(tile).queryByText("%")).toBeNull();
-  });
-
-  it("takes a tap on a tile straight to the account's detail page", async () => {
-    mocks.overview.current = { ...LOADED, data: usageBoardData() };
-    renderRoute();
-    const tile = (await screen.findByText("Codex")).closest("[data-account]") as HTMLElement;
-    tile.click();
-    await waitFor(() => {
-      expect(screen.getByRole("heading", { name: "Codex" }).textContent).toBe("Codex");
-    });
-    // The detail page lists every window, with the reset written out.
-    expect(screen.getAllByText(/^Resets /).length).toBeGreaterThan(0);
+    renderRoute("/usage/board?account=claude");
+    const quota = screen.getByRole("heading", { name: "Quota" }).closest("section")!;
+    expect(within(quota).getByText("Read 3 h ago")).toBeTruthy();
+    expect(within(quota).getByTestId("usage-ring")).toHaveAttribute("data-tone", "mute");
+    cleanup();
+    renderRoute("/usage/board?account=litellm");
+    expect(screen.getByTestId("usage-figure").textContent).toContain("$41.00");
   });
 
   it("keeps settings controls off the board and the detail page", async () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
     renderRoute();
-    await screen.findAllByTestId("usage-tile");
+    await screen.findByTestId("usage-overview");
     expect(screen.queryAllByRole("switch").length).toBe(0);
     expect(screen.queryAllByRole("radio").length).toBe(0);
   });
@@ -199,7 +175,7 @@ describe("board", () => {
     mocks.overview.current = { ...LOADED, data: usageBoardData() };
     mocks.board.current = { ...mocks.board.current, hidden: ["codex"] };
     renderRoute();
-    await screen.findAllByTestId("usage-tile");
+    await screen.findByTestId("usage-overview");
     expect(screen.queryByText("Codex")).toBeNull();
     cleanup();
     // A bookmark to the account still resolves: the switch hides it from the
@@ -254,14 +230,6 @@ describe("board", () => {
     renderRoute();
     expect(screen.getByText("Usage could not be read")).toBeTruthy();
     expect(screen.getByText("Usage read failed (500)")).toBeTruthy();
-  });
-
-  it("renders a compact row with the same reading", async () => {
-    mocks.overview.current = { ...LOADED, data: usageBoardData() };
-    mocks.board.current = { ...mocks.board.current, density: "mini" };
-    renderRoute();
-    const tiles = await screen.findAllByTestId("usage-tile");
-    expect(tiles[0].className).toContain("min-h-[54px]");
   });
 
   it("opens the account's settings without a control on the display page", async () => {

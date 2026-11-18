@@ -41,6 +41,15 @@ export function sumUsage(values: UsageTotals[]): UsageTotals {
   };
 }
 
+/** The board-wide money total counts only metered rows. */
+export function boardTotals(totals: UsageTotals[], tokens: boolean): UsageTotals {
+  const result = sumUsage(totals.map((value) => (tokens ? value : (value.metered ?? value))));
+  if (!tokens && result.cost_usd === null && totals.some((value) => value.cost_usd !== null)) {
+    result.cost_usd = 0;
+  }
+  return result;
+}
+
 /** The summary counts only visible accounts and their metered rows. */
 export function boardAmount(
   accounts: UsageAccountActivity[],
@@ -59,15 +68,10 @@ export function boardAmount(
       group.push(tokens ? point : (point.metered ?? point));
       points.set(point.at, group);
     }
-  const totals = sumUsage(
-    amounts.map((amount) => (tokens ? amount.totals : (amount.totals.metered ?? amount.totals))),
+  const totals = boardTotals(
+    amounts.map((amount) => amount.totals),
+    tokens,
   );
-  if (
-    !tokens &&
-    amounts.some((amount) => amount.totals.cost_usd !== null) &&
-    totals.cost_usd === null
-  )
-    totals.cost_usd = 0;
   const approx = amounts.some((amount) => amount.span.approx);
   return {
     span: {

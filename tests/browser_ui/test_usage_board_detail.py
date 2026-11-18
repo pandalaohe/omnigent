@@ -274,6 +274,7 @@ def test_account_detail_keyboard_ranges_and_return(
         },
     )
     browser_contract.json("/v1/me/preferences", {"preferences": {"version": 1, "settings": {}}})
+    browser_contract.json("/v1/model-connections", {"connections": [], "can_manage": False})
     browser_contract.json("/v1/me/preferences/usage_context", {"ok": True}, method="PATCH")
     browser_contract.json(
         "/v1/extensions",
@@ -323,10 +324,7 @@ def test_account_detail_keyboard_ranges_and_return(
             expect(own.first).to_be_visible()
         name_views.append({"view": view, "width": width, "names": list(names)})
 
-    page.goto(appearance_url + "/frame/usage/board")
-    first = page.get_by_test_id("usage-tile").first
-    first.get_by_role("link", name="Example plan 0 Pool B", exact=True).focus()
-    page.keyboard.press("Enter")
+    page.goto(appearance_url + "/frame/usage/board/plan-0?focus=Pool%20B")
     expect(page.locator("[data-pool]").first).to_have_attribute("data-pool", "Pool B")
     assert_usage_geometry(
         page,
@@ -348,47 +346,6 @@ def test_account_detail_keyboard_ranges_and_return(
     expect(tools).not_to_contain_text("$12.34")
     # The relation read is real, but this fixture proves no activity channel.
     expect(page.get_by_role("group", name="Cost time range")).not_to_contain_text("$12.34")
-    page.get_by_role("link", name="Usage board", exact=True).click()
-    expect(page.get_by_test_id("usage-tile")).to_have_count(3)
-    assert_usage_geometry(
-        page,
-        {
-            '[data-testid="usage-tile"]': 3,
-            '[data-testid="usage-ring"]': 7,
-            '[data-testid="usage-figure"]': 4,
-            "[data-usage-amount]": 4,
-            "[data-usage-label]": 7,
-        },
-    )
-    page.get_by_text("Board tools", exact=True).click()
-    page.get_by_role("button", name="Compact view", exact=True).click()
-    # The density change persists the product-normalized group name.
-    shown_names = {
-        **LONG_NAMES,
-        "band": page.evaluate(
-            "JSON.parse(localStorage.getItem('omnigent:usage-context-preferences'))"
-            ".board.bands.find(band => band.id === 'long-band').name"
-        ),
-    }
-    assert_usage_geometry(
-        page,
-        {
-            '[data-testid="usage-tile"]': 3,
-            '[data-testid="usage-ring"]': 3,
-            '[data-testid="usage-figure"]': 0,
-            "[data-usage-amount]": 3,
-            # Three balance labels plus the window name inside each read compact ring.
-            "[data-usage-label]": 5,
-        },
-    )
-    names_in_view(
-        "compact", [shown_names[key] for key in ["account", "band", "plan", "model", "balance"]]
-    )
-    page.get_by_role("button", name="Rings view", exact=True).click()
-    names_in_view(
-        "rings",
-        [shown_names[key] for key in ["account", "band", "pool", "plan", "window", "balance"]],
-    )
     visited = []
     for item in accounts:
         page.goto(appearance_url + f"/frame/usage/board/{item['id']}")

@@ -141,6 +141,14 @@ export function formatCount(value: number, unit: string | null = null): string {
   return `${figure}${suffix}${unit ? ` ${unit}` : ""}`;
 }
 
+/** Fixed two decimal places for the scaled token amounts on the overview. */
+export function formatOverviewTokens(value: number): string {
+  const scale = COUNT_STEPS.find(([size]) => Math.abs(value) >= size);
+  if (!scale) return value.toLocaleString("en-US");
+  const [step, suffix] = scale;
+  return `${(value / step).toFixed(2)}${suffix}`;
+}
+
 /** Money with its symbol and two decimals; any other unit through `formatCount`. */
 export function formatUsageValue(value: number, unit: string | null): string {
   const symbol = unit ? CURRENCY_SYMBOLS[unit] : undefined;

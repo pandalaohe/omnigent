@@ -39,63 +39,65 @@ export function UsageBoardFrame({
   const location = useLocation();
   const analysis = location.pathname.endsWith("/cost");
   return (
-    <div className="usage-surface @container">
-      <header className="usage-top">
-        <h1>
-          {typeof title === "string" ? (
-            <UsageName>{title === "Cost" ? t("boardTitle") : title}</UsageName>
-          ) : (
-            title
-          )}
-        </h1>
-        <nav className="usage-tabs" aria-label="Usage pages">
-          <Link to={boardPath("/usage/board")} aria-current={!analysis ? "page" : undefined}>
-            {t("usageTab")}
-          </Link>
-          <Link to={boardPath("/usage/board/cost")} aria-current={analysis ? "page" : undefined}>
-            {t("analysisTab")}
-          </Link>
-        </nav>
-        {generatedAt != null ? (
-          <span className="usage-data-age text-xs text-muted-foreground">
-            {Date.now() / 1000 - generatedAt < 60
-              ? "Data just now"
-              : `Data ${formatAge(Math.max(0, Date.now() / 1000 - generatedAt))} ago`}
-          </span>
-        ) : null}
-        <span className="usage-top-actions">
-          {location.pathname.endsWith("/usage/board") || analysis ? <UsageModelPoolsLink /> : null}
-          {analysis ? (
-            <Link
-              {...boardExitProps()}
-              className="inline-flex min-h-11 items-center px-2 text-xs underline"
-              to="/settings/general#usage-settings"
-              aria-label="Pricing settings"
-            >
-              <SettingsIcon className="mr-1 size-3.5" aria-hidden="true" /> Pricing
+    <div className="min-h-0 min-w-0 flex-1 overflow-y-auto">
+      <div className="usage-surface @container">
+        <header className="usage-top">
+          <h1>
+            {typeof title === "string" ? (
+              <UsageName>{title === "Cost" ? t("boardTitle") : title}</UsageName>
+            ) : (
+              title
+            )}
+          </h1>
+          <nav className="usage-tabs" aria-label="Usage pages">
+            <Link to={boardPath("/usage/board")} aria-current={!analysis ? "page" : undefined}>
+              {t("usageTab")}
             </Link>
-          ) : null}
-          {actions}
-        </span>
-      </header>
-      {back ? (
-        <Button variant="ghost" size="sm" className="max-w-full" asChild>
-          <Link to={boardPath(back.to)} title={back.label}>
-            <span aria-hidden="true" className="shrink-0">
-              ‹{" "}
+            <Link to={boardPath("/usage/board/cost")} aria-current={analysis ? "page" : undefined}>
+              {t("analysisTab")}
+            </Link>
+          </nav>
+          {generatedAt != null ? (
+            <span className="usage-data-age text-xs text-muted-foreground">
+              {Date.now() / 1000 - generatedAt < 60
+                ? "Data just now"
+                : `Data ${formatAge(Math.max(0, Date.now() / 1000 - generatedAt))} ago`}
             </span>
-            <UsageName>{back.label}</UsageName>
-          </Link>
-        </Button>
-      ) : null}
-      {error ? <FailedReading error={error} /> : null}
-      {loading ? (
-        <div className="flex items-center gap-2 py-10 text-sm text-muted-foreground">
-          <Spinner className="size-4" />
-          Reading your usage…
-        </div>
-      ) : null}
-      {!loading ? children : null}
+          ) : null}
+          <span className="usage-top-actions">
+            {analysis ? <UsageModelPoolsLink /> : null}
+            {analysis ? (
+              <Link
+                {...boardExitProps()}
+                className="inline-flex min-h-11 items-center px-2 text-xs underline"
+                to="/settings/general#usage-settings"
+                aria-label="Pricing settings"
+              >
+                <SettingsIcon className="mr-1 size-3.5" aria-hidden="true" /> Pricing
+              </Link>
+            ) : null}
+            {actions}
+          </span>
+        </header>
+        {back ? (
+          <Button variant="ghost" size="sm" className="max-w-full" asChild>
+            <Link to={boardPath(back.to)} title={back.label}>
+              <span aria-hidden="true" className="shrink-0">
+                ‹{" "}
+              </span>
+              <UsageName>{back.label}</UsageName>
+            </Link>
+          </Button>
+        ) : null}
+        {error ? <FailedReading error={error} /> : null}
+        {loading ? (
+          <div className="flex items-center gap-2 py-10 text-sm text-muted-foreground">
+            <Spinner className="size-4" />
+            Reading your usage…
+          </div>
+        ) : null}
+        {!loading ? children : null}
+      </div>
     </div>
   );
 }

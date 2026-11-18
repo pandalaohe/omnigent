@@ -240,41 +240,6 @@ describe("Connect command", () => {
 });
 
 describe("arrangement", () => {
-  it("does not open the account when Enter activates a move button", async () => {
-    renderBoard();
-    await screen.findAllByTestId("usage-tile");
-    fireEvent.click(screen.getByRole("button", { name: "Arrange groups and order" }));
-    const forward = screen.getByRole("button", { name: "Move Codex forward" });
-    fireEvent.keyDown(forward, { key: "Enter" });
-    // The move happened and the board is still the board.
-    expect(screen.queryByRole("heading", { level: 1 })?.textContent).toBe("Usage board");
-    expect(screen.getAllByTestId("usage-tile").length).toBe(5);
-  });
-
-  it("switches to rings when entering Arrange from Compact", async () => {
-    mocks.board.current = { ...(mocks.board.current as object), density: "mini" };
-    renderBoard();
-    const compact = (await screen.findAllByTestId("usage-tile"))[0];
-    expect(compact.className).toContain("min-h-[54px]");
-    fireEvent.click(screen.getByRole("button", { name: "Arrange groups and order" }));
-    // A compact row has no room for handles, so entering Arrange writes the ring
-    // view; the mocked hook cannot re-render, so the write is what is asserted.
-    expect(mocks.patched.current).toContainEqual(expect.objectContaining({ density: "std" }));
-  });
-
-  it("gives arrangement controls and the reading tip 44 px targets on phones", async () => {
-    renderBoard();
-    await screen.findAllByTestId("usage-tile");
-    const tip = screen.getByRole("button", { name: /Last read 3 h ago/ });
-    expect(tip.className).toContain("min-h-11");
-    fireEvent.click(screen.getByRole("button", { name: "Arrange groups and order" }));
-    const forward = screen.getByRole("button", { name: "Move Codex forward" });
-    expect(forward.className).toContain("min-h-11");
-    expect(forward.className).toContain("min-w-11");
-    // A desktop pointer keeps the compact 28 px button.
-    expect(forward.className).toContain("md:min-h-7");
-  });
-
   it("materializes an account that arrived after the arrangement was made", () => {
     const board = {
       enabled: true,
@@ -304,16 +269,6 @@ describe("detail tips on a phone", () => {
     const ring = (await screen.findAllByTestId("usage-ring"))[0];
     fireEvent.click(ring);
     expect(await screen.findByTestId("usage-tip-card")).toBeTruthy();
-  });
-
-  it("keeps a board tile tap going to the detail page instead", async () => {
-    renderBoard();
-    const ring = (await screen.findAllByTestId("usage-ring"))[0];
-    fireEvent.click(ring);
-    await waitFor(() => {
-      expect(screen.getByRole("heading", { name: "Codex" }).textContent).toBe("Codex");
-    });
-    expect(screen.queryByTestId("usage-tip-card")).toBeNull();
   });
 });
 
@@ -383,19 +338,19 @@ function readCollab() {
   };
 }
 
-it("keeps imperative account navigation and back/settings links inside a frame", async () => {
+it("keeps account selection and its settings inside a frame", async () => {
   window.history.replaceState({}, "", "/frame/usage/board");
   try {
     renderBoard("/frame/usage/board");
-    fireEvent.click((await screen.findAllByTestId("usage-ring"))[0]);
-    await waitFor(() =>
-      expect(screen.getByRole("heading", { name: "Codex" }).textContent).toBe("Codex"),
-    );
-    expect(screen.getByRole("link", { name: "Account settings" }).getAttribute("href")).toBe(
+    const accounts = screen.getByRole("navigation", { name: "Usage accounts" });
+    const codex = within(accounts).getByRole("link", { name: "Codex" });
+    expect(codex).toHaveAttribute("href", "/frame/usage/board?account=codex");
+    fireEvent.click(codex);
+    await waitFor(() => expect(codex).toHaveAttribute("aria-current", "true"));
+    expect(screen.getByRole("link", { name: "Usage settings" })).toHaveAttribute(
+      "href",
       "/frame/usage/board/codex/settings",
     );
-    const back = screen.getByRole("link", { name: "Usage board" });
-    expect(back.getAttribute("href")).toBe("/frame/usage/board");
   } finally {
     window.history.replaceState({}, "", "/");
   }

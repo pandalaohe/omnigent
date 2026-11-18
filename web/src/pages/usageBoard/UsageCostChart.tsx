@@ -1,3 +1,4 @@
+import { t } from "./usageText";
 import { useMemo } from "react";
 import {
   analysisTotals,
@@ -20,7 +21,13 @@ import {
   YAxis,
 } from "recharts";
 import type { UsageAccountActivity } from "./usageActivityData";
-import { formatCount, formatMoney, formatTileAmount, formatUsageValue } from "./usageBoardFormat";
+import {
+  formatCount,
+  formatMoney,
+  formatOverviewTokens,
+  formatTileAmount,
+  formatUsageValue,
+} from "./usageBoardFormat";
 import { UsageTipCard } from "./UsageTip";
 
 export interface UsageChartPoint {
@@ -251,6 +258,7 @@ export function usageChartPoints(
   total: boolean,
   period: boolean,
   now: number,
+  bucketUnit?: "hour" | "day",
 ): UsageChartPoint[] {
   if (
     !accounts.length ||
@@ -263,8 +271,8 @@ export function usageChartPoints(
       : Math.min(...accounts.map((account) => account.span.counted_from));
   const until = Math.max(...accounts.map((account) => account.span.until));
   const length = until - from;
-  const hourly = length <= 48 * 3600;
-  const weekly = length > 45 * 86400;
+  const hourly = bucketUnit ? bucketUnit === "hour" : length <= 48 * 3600;
+  const weekly = bucketUnit === undefined && length > 45 * 86400;
   function bucketAt(at: number) {
     if (hourly) return Math.floor(at / 3600) * 3600;
     const date = new Date(at * 1000);
@@ -324,14 +332,17 @@ function ChartTip({
   active,
   payload,
   tokens,
+  bucketUnit,
 }: {
   active?: boolean;
   payload?: readonly { payload?: UsageChartPoint }[];
   tokens: boolean;
+  bucketUnit?: "hour" | "day";
 }) {
   const point = payload?.[0]?.payload;
   if (!active || !point) return null;
-  const figure = (value: number) => (tokens ? formatCount(value) : formatMoney(value));
+  const figure = (value: number) =>
+    tokens ? (bucketUnit ? formatOverviewTokens(value) : formatCount(value)) : formatMoney(value);
   return (
     <div className="rounded-lg border border-border bg-popover p-2.5 shadow-md">
       <UsageTipCard
@@ -379,6 +390,8 @@ export function UsageCostChart({
   period = false,
   now,
   fee,
+  bucketUnit,
+  showCurrent = true,
 }: {
   accounts: UsageAccountActivity[];
   tokens: boolean;
@@ -386,21 +399,27 @@ export function UsageCostChart({
   period?: boolean;
   now: number;
   fee?: number;
+  bucketUnit?: "hour" | "day";
+  showCurrent?: boolean;
 }) {
-  const points = usageChartPoints(accounts, tokens, total, period, now);
+  const points = usageChartPoints(accounts, tokens, total, period, now, bucketUnit);
   const last = points.at(-1);
-  const formatter = (value: number) => (tokens ? formatCount(value) : formatMoney(value));
+  const formatter = (value: number) =>
+    tokens ? (bucketUnit ? formatOverviewTokens(value) : formatCount(value)) : formatMoney(value);
   // Axis ticks are scale labels: two-decimal steps never repeat, large ones shorten.
   const tickText = (value: number) =>
     tokens ? formatCount(value) : formatTileAmount(value, "USD");
-  const hourly = points.length > 1 && points[1].at - points[0].at <= 3600;
+  const hourly = bucketUnit
+    ? bucketUnit === "hour"
+    : points.length > 1 && points[1].at - points[0].at <= 3600;
   const dateLabel = (at: number) =>
     new Date(at * 1000).toLocaleString(
       "en-US",
       hourly ? { hour: "numeric" } : { month: "short", day: "numeric" },
     );
   if (!points.length) return <p className="usage-chart-empty">No usage recorded in this range.</p>;
-  const showFee = !tokens && fee !== undefined && fee <= 4 * (last?.now ?? 0);
+  const showFee =
+    !tokens && fee !== undefined && (bucketUnit !== undefined || fee <= 4 * (last?.now ?? 0));
   const top = Math.max(
     ...points.map((point) => Math.max(point.now, point.previous ?? 0)),
     showFee ? (fee ?? 0) : 0,
@@ -411,30 +430,40 @@ export function UsageCostChart({
   return (
     <figure aria-label="Cumulative usage and usage per bucket" className="usage-chart">
       <figcaption className="usage-legend">
-        <span>
+        <span data-testid="usage-chart-now">
           <LegendSwatch kind="now" />
-          Now <b>{formatter(last?.now ?? 0)}</b>
+          {t("chartNow")} <b>{showCurrent ? formatter(last?.now ?? 0) : "—"}</b>
         </span>
         {last?.previous !== undefined ? (
           <span>
             <LegendSwatch kind="previous" />
-            Previous <b>{formatter(last.previous)}</b>
+            {t("chartPrevious")} <b>{formatter(last.previous)}</b>
           </span>
         ) : null}
         <span>
           <LegendSwatch kind="bucket" />
-          {hourly ? "Per hour" : "Per day"}
+          {t(hourly ? "chartHourly" : "chartDaily")}
         </span>
         {!tokens && fee !== undefined ? (
           <span>
             <LegendSwatch kind="fee" />
-            Monthly fee <b>{formatMoney(fee)}</b>
+            {t("chartFee")} <b>{formatMoney(fee)}</b>
           </span>
         ) : null}
       </figcaption>
       <div className="usage-chart-plot">
         <ResponsiveContainer width="100%" height="100%">
-          <ComposedChart data={points} margin={{ top: 6, right: 4, left: 0, bottom: 0 }}>
+          <ComposedChart
+            data={
+              bucketUnit && showFee && fee !== undefined
+                ? points.map((point, index) => ({
+                    ...point,
+                    fee: (fee * (index + 1)) / points.length,
+                  }))
+                : points
+            }
+            margin={{ top: 6, right: 4, left: 0, bottom: 0 }}
+          >
             <CartesianGrid
               yAxisId="total"
               vertical={false}
@@ -461,7 +490,10 @@ export function UsageCostChart({
               tickLine={false}
               axisLine={false}
             />
-            <Tooltip content={<ChartTip tokens={tokens} />} cursor={{ fill: "var(--accent)" }} />
+            <Tooltip
+              content={<ChartTip tokens={tokens} bucketUnit={bucketUnit} />}
+              cursor={{ fill: "var(--accent)" }}
+            />
             <Bar
               yAxisId="total"
               dataKey="bucket"
@@ -489,11 +521,20 @@ export function UsageCostChart({
               dot={false}
               isAnimationActive={false}
             />
-            {showFee ? (
+            {showFee && bucketUnit ? (
+              <Line
+                yAxisId="total"
+                dataKey="fee"
+                stroke="var(--success)"
+                strokeWidth={1.6}
+                dot={false}
+                isAnimationActive={false}
+              />
+            ) : showFee ? (
               <ReferenceLine
                 yAxisId="total"
                 y={fee}
-                stroke="var(--usage-ink-2)"
+                stroke="var(--success)"
                 strokeDasharray="6 4"
               />
             ) : null}
