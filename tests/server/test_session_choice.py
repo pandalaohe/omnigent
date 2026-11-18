@@ -987,6 +987,13 @@ def test_explicit_provider_quota_reset(message, seconds):
     assert quota_reset_at(message, NOW) == (NOW + seconds if seconds else None)
 
 
+CC_SWITCH_LIVE_REFUSAL = (
+    "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
+    "Provider: OpenAI Official; model: gpt-6.2-sol; cause: Codex 官方额度保护: "
+    "每周 98.00% ≥ 98%（重置 2026-11-22T03:19:03Z）"
+)
+
+
 @pytest.mark.parametrize(
     "message,reset",
     [
@@ -1010,6 +1017,17 @@ def test_explicit_provider_quota_reset(message, seconds):
             "2026-11-22T03:19:03+00:00",
         ),
         (
+            "Claude Code terminal did not become ready within 30.1s (...). "
+            "The message was not delivered. Last terminal output:\n" + CC_SWITCH_LIVE_REFUSAL,
+            None,
+        ),
+        (
+            "Claude Code terminal did not become ready within 30.1s (...). "
+            "The message was not delivered. Last captured terminal output:\n"
+            + CC_SWITCH_LIVE_REFUSAL,
+            None,
+        ),
+        (
             "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
             "cause: Codex quota protection: weekly 98.00% ≥ 98% "
             "(reset: 2027-11-19T03:19:03+00:00)",
@@ -1030,6 +1048,18 @@ def test_explicit_provider_quota_reset(message, seconds):
             "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
             "cause: Codex 官方额度保护: 每周 98.00% ≥ 98%（重置:\n"
             "2026-11-22T03:19:03Z）",
+            None,
+        ),
+        (
+            "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
+            "cause: Codex 官方额度保护: 每周 98.00% ≥ 98%（重置\n"
+            "2026-11-22T03:19:03Z）",
+            None,
+        ),
+        (
+            "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
+            "cause: Codex quota protection: weekly 98.00% ≥ 98% "
+            "(reset\n:2026-11-22T03:19:03Z)",
             None,
         ),
         (

@@ -54,7 +54,7 @@ _QUOTA_RESET = re.compile(
 _QUOTA_PROTECTION_RESET = re.compile(
     r"(?:\bquota\s+protection\b|额度保护)"
     r"(?:[^\r\n.;。!?！？;；|｜\"'“”‘’`]|(?<=\d)\.(?=\d)){0,120}?"
-    r"(?:\breset\s*[:：]|重置(?:\s*/\s*reset\s*[:：])?\s*[:：]?)"
+    r"(?:\breset[^\S\r\n]*[:：]|重置(?:[^\S\r\n]*/[^\S\r\n]*reset[^\S\r\n]*[:：])?[^\S\r\n]*[:：]?)"
     r"[^\S\r\n]*"
     r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))",
     re.IGNORECASE,
@@ -65,6 +65,7 @@ def quota_reset_at(message: str, now: float) -> float | None:
     """Recognize an explicit provider quota rejection with a bounded reset."""
     if message.startswith("[antigravity: ") and message.endswith("]"):
         message = message[len("[antigravity: ") : -1]
+    message = re.split(r"terminal output:", message, maxsplit=1, flags=re.IGNORECASE)[0]
     match = _QUOTA_RESET.match(message)
     if match is not None:
         seconds = sum(
