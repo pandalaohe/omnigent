@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.stores.scheduled_task_store import ArchivedTarget
 
 # Ordered exactly like the due-task and expired-startup indexes.
 DispatchCursor = tuple[int, int, str]
@@ -137,7 +138,7 @@ class ScheduledTaskDispatchStore(Protocol):
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
-        archived_target: ScheduledTask | None = None,
+        archived_target: ArchivedTarget | None = None,
     ) -> ScheduledTaskRun | None:
         """Finish startup conditionally on its lease still matching this snapshot.
 

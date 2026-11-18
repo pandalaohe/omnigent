@@ -486,7 +486,7 @@ async def test_archived_target_pauses_until_resumed_and_notifies_once_per_attemp
         [first] = _runs(store, task)
         assert (first.status, first.error_code, first.conversation_id) == (
             "failed",
-            "continued_session_archived",
+            "continued_session_archived_task_paused",
             None,
         )
         paused = store.get(task.id)
@@ -527,6 +527,92 @@ async def test_a_continue_tasks_first_claimed_run_keeps_its_session(store) -> No
 
     [session_id] = conversations.ids
     assert store.get(claimed.task.id).session_id == session_id
+
+
+async def test_claimed_run_follows_the_committed_handover_before_archiving(store, db_uri) -> None:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    old = conversations.create_conversation(agent_id=_AGENT_ID, title="Before handover")
+    successor = conversations.create_conversation(agent_id=_AGENT_ID, title="After handover")
+    claimed = _claim(
+        store, session_mode="continue", session_id=old.id, host_id=None, workspace=None
+    )
+    receipt_id = uuid.uuid4().hex
+    conversations.reassign_live_children(old.id, successor.id, receipt_id, allow_empty=True)
+    # Pause the phase engine after the move so its later retarget and archive cannot help.
+    assert conversations.get_succession_by_id(receipt_id).phase == "moved"
+    assert not conversations.get_conversation(old.id).archived
+    binding_at_move = store.get(claimed.task.id).session_id
+    dispatch = AsyncMock()
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations),
+        launch_dispatch=dispatch,
+        now=claimed.clock.now,
+    )
+    await executor.fire(claimed.task, claimed.lease)
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.conversation_id) == ("succeeded", successor.id)
+    dispatch.assert_awaited_once()
+    assert dispatch.await_args.args[0].id == successor.id
+    assert binding_at_move == successor.id
+    from omnigent.errors import SessionSupersededError
+
+    with pytest.raises(SessionSupersededError):
+        store.update(claimed.task.id, session_id=old.id)
+
+
+async def test_stale_archive_failure_cannot_pause_a_resumed_task(store, monkeypatch) -> None:
+    claimed = _claim(store, session_mode="continue", session_id=_CONV_ID)
+    second = _second_claim(store, claimed)
+    archived = _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, archived=True)
+    conversations = _ExistingConversationStore(archived)
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations),
+        launch_dispatch=AsyncMock(),
+        now=claimed.clock.now,
+    )
+    finish_second = second.finish
+
+    async def unarchive_and_resume(*args, **kwargs):
+        # The second executor saw the archived session. Finish the other run first.
+        await executor.fire(claimed.task, claimed.lease)
+        assert store.get(claimed.task.id).state == "paused"
+        conversations.existing[_CONV_ID] = replace(archived, archived=False)
+        assert store.update(claimed.task.id, state="active").state == "active"
+        await finish_second(*args, **kwargs)
+
+    monkeypatch.setattr(second, "finish", unarchive_and_resume)
+    await executor.fire(claimed.task, second)
+
+    assert store.get(claimed.task.id).state == "active"
+    assert (
+        next(run for run in _runs(store, claimed.task) if run.id == second.run.id).status
+        == "skipped"
+    )
+
+
+async def test_queued_manual_run_does_not_hide_the_archive_pause_notice(store) -> None:
+    claimed = _claim(store, session_mode="continue", session_id=_CONV_ID)
+    claimed.clock.advance(1)
+    queued = store.request_manual_run(
+        claimed.task,
+        now=int(claimed.clock.now()),
+        trigger_key=manual_trigger_key(),
+        host_id=_HOST_ID,
+    )
+    assert queued is not None and queued.status == "scheduled"
+    conversations = _ExistingConversationStore(
+        _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, archived=True)
+    )
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations),
+        launch_dispatch=AsyncMock(),
+        now=claimed.clock.now,
+    )
+    await executor.fire(claimed.task, claimed.lease)
+
+    assert store.get(claimed.task.id).state == "paused"
+    [notice], _ = store.list_inbox_failures(owner_user_id=None)
+    assert notice.run_id == claimed.lease.run.id
 
 
 def _second_claim(store: SqlAlchemyScheduledTaskStore, claimed: _Claimed) -> StartupLease:

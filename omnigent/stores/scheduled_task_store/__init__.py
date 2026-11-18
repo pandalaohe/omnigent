@@ -23,6 +23,15 @@ _UNSET: Any = object()
 # the session, another session got there first, or the task changed under the run.
 AdoptOutcome = Literal["adopted", "taken", "stale"]
 
+ARCHIVED_TARGET_CODE = "continued_session_archived"
+ARCHIVED_TARGET_PAUSED_CODE = "continued_session_archived_task_paused"
+
+
+@dataclass(frozen=True)
+class ArchivedTarget:
+    task: ScheduledTask
+    is_current: Callable[[], bool]
+
 
 @dataclass(frozen=True)
 class AutomationFailure:
@@ -386,7 +395,7 @@ class ScheduledTaskStore(ABC):
         finished_at: int | None = None,
         error: str | None = None,
         error_code: str | None = None,
-        archived_target: ScheduledTask | None = None,
+        archived_target: ArchivedTarget | None = None,
     ) -> ScheduledTaskRun:
         """
         Insert a new scheduled-task-run row.

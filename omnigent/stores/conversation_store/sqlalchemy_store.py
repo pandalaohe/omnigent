@@ -4302,6 +4302,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         self, conversation_id: str, *, owner_only: bool = False
     ) -> AccountAuthority | None:
         """Read the owner grant and registration together, including external identities."""
+        with self._session("select_session_owner") as session:
+            return self._session_owner_authority(session, conversation_id, owner_only=owner_only)
+
+    @staticmethod
+    def _session_owner_authority(
+        session: Session, conversation_id: str, *, owner_only: bool
+    ) -> AccountAuthority | None:
         from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
 
         query = (
@@ -4322,11 +4329,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         if owner_only:
             query = query.where(SqlSessionPermission.level >= LEVEL_OWNER)
-        with self._session("select_session_owner") as session:
-            row = session.execute(query).one_or_none()
-            if row is None:
-                return None
-            return AccountAuthority(row.user_id, row.account_generation, current_workspace_id())
+        row = session.execute(query).one_or_none()
+        if row is None:
+            return None
+        return AccountAuthority(row.user_id, row.account_generation, current_workspace_id())
 
     def search(
         self,
@@ -8261,6 +8267,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                     f"session already succeeded by {successor_id!r}",
                     successor_id=successor_id,
                 )
+            target_successor = _fetch_labels(ap_sess, new_id).get(SUCCEEDED_BY_LABEL_KEY)
+            if target_successor and not (reverse_of and target_successor == old_id):
+                raise SuccessionRefusedError(
+                    "already_succeeded",
+                    f"target session already succeeded by {target_successor!r}",
+                    successor_id=target_successor,
+                )
             if (
                 new_row.parent_conversation_id is not None
                 or old_row.parent_conversation_id is not None
@@ -8386,6 +8399,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             _upsert_labels(ap_sess, old_id, {SUCCEEDED_BY_LABEL_KEY: new_id}, now)
             _upsert_labels(ap_sess, new_id, {SUCCEEDS_LABEL_KEY: old_id}, now)
             _transfer_checkin_labels(ap_sess, old_id, new_id, now)
+            if self._conv_engine is self._engine:
+                self._retarget_succession_tasks(ap_sess, old_id, new_id)
             ap_sess.add(
                 SqlSessionSuccession(
                     id=receipt_id,
@@ -8404,6 +8419,23 @@ class SqlAlchemyConversationStore(ConversationStore):
             self._conv_session_immediate,
             "reassign_live_children",
             move,
+        )
+
+    def _retarget_succession_tasks(self, session: Session, old_id: str, new_id: str) -> None:
+        from omnigent.server.auth import RESERVED_USER_LOCAL
+        from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+            retarget_continued_tasks_in_session,
+        )
+
+        owner = self._session_owner_authority(session, old_id, owner_only=True)
+        if owner != self._session_owner_authority(session, new_id, owner_only=True):
+            return
+        retarget_continued_tasks_in_session(
+            session,
+            old_id,
+            new_id,
+            user_id=owner.user_id if owner and owner.user_id != RESERVED_USER_LOCAL else None,
+            generation=owner.generation if owner else None,
         )
 
     def get_succession(self, old_id: str, new_id: str) -> SessionSuccession | None:

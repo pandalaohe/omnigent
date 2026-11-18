@@ -4979,7 +4979,7 @@ def server(
     policy_store = SqlAlchemyPolicyStore(db_uri)
     global_instructions_store = SqlAlchemyGlobalInstructionsStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
-    scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
+    scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri, conv_db_uri)
     project_store = SqlAlchemyProjectStore(db_uri)
     project_repository_store = SqlAlchemyProjectRepositoryStore(db_uri)
     project_host_binding_store = SqlAlchemyProjectHostBindingStore(db_uri, conv_db_uri)

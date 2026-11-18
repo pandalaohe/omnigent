@@ -32,6 +32,7 @@ from omnigent.server.scheduled.telemetry import (
     scheduled_run_scope,
     startup_failure_stage,
 )
+from omnigent.stores.scheduled_task_store import ArchivedTarget
 from omnigent.stores.scheduled_task_store.dispatch import (
     DeletedTaskCursor,
     DispatchCursor,
@@ -213,7 +214,7 @@ class StartupLease:
         error: str | None = None,
         error_code: str | None = None,
         failure_stage: str | None = None,
-        archived_target: ScheduledTask | None = None,
+        archived_target: ArchivedTarget | None = None,
     ) -> None:
         """Record prompt delivery or a known startup failure, with a live lease.
 
@@ -277,7 +278,7 @@ class StartupLease:
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
-        archived_target: ScheduledTask | None = None,
+        archived_target: ArchivedTarget | None = None,
         committed: Callable[[ScheduledTaskRun], None] | None = None,
     ) -> None:
         await self._write(

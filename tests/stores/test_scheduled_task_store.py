@@ -19,6 +19,7 @@ from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.scheduled.schedule import next_scheduled_time
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from omnigent.stores.scheduled_task_store import ArchivedTarget
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 pytestmark = pytest.mark.usefixtures("frozen_recurrence_clock")
@@ -2589,7 +2590,7 @@ def test_archive_pause_requires_the_current_target_and_only_transitions_once(
             "failed",
             snapshot.created_at + offset,
             error_code="continued_session_archived",
-            archived_target=snapshot,
+            archived_target=ArchivedTarget(snapshot, lambda: True),
         )
 
     store.retarget_continued_sessions(
@@ -2604,7 +2605,10 @@ def test_archive_pause_requires_the_current_target_and_only_transitions_once(
     assert rebound is not None and rebound.state == "active"
 
     failed = record_failure(rebound, "archived-target", 1)
-    assert (failed.status, failed.error_code) == ("failed", "continued_session_archived")
+    assert (failed.status, failed.error_code) == (
+        "failed",
+        "continued_session_archived_task_paused",
+    )
     duplicate = record_failure(rebound, "duplicate-attempt", 2)
     assert duplicate.status == "skipped"
     [notice], _ = store.list_inbox_failures(owner_user_id=rebound.user_id)

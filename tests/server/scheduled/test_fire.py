@@ -64,6 +64,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
     SessionActivity,
 )
+from omnigent.stores.scheduled_task_store import ArchivedTarget
 from tests.server.helpers import build_agent_bundle
 
 # ── Fakes ──────────────────────────────────────────────────────────────────
@@ -79,6 +80,7 @@ class _FakeConversation:
     labels: dict[str, str] = field(default_factory=dict)
     runner_id: str | None = None
     archived: bool = False
+    archive_revision: int = 0
     session_usage: dict[str, Any] = field(default_factory=dict)
     live_status: str | None = None
     runner_last_seen: int | None = None
@@ -214,11 +216,11 @@ class FakeScheduledTaskStore:
         status: str,
         scheduled_at: int,
         *,
-        archived_target: ScheduledTask | None = None,
+        archived_target: ArchivedTarget | None = None,
         **kwargs: Any,
     ) -> Any:
         if archived_target is not None:
-            self._rows[scheduled_task_id] = replace(archived_target, state="paused")
+            self._rows[scheduled_task_id] = replace(archived_target.task, state="paused")
         self.run_workspace_ids.append(current_workspace_id())
         self.runs.append(
             {

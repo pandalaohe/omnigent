@@ -757,14 +757,20 @@ def _retarget_scheduled_tasks(
     conversation_store: ConversationStore,
     scheduled_task_store: ScheduledTaskStore,
 ) -> None:
+    from omnigent.server.routes.sessions.routes_peer import resolve_succeeded_by
+
+    # Split databases and receipts created before atomic rebinding can lag the AP move.
+    target_id = resolve_succeeded_by(conversation_store, receipt.old_id)
+    if target_id == receipt.old_id:
+        return
     old_owner = conversation_store.get_session_owner_authority(receipt.old_id, owner_only=True)
-    new_owner = conversation_store.get_session_owner_authority(receipt.new_id, owner_only=True)
+    new_owner = conversation_store.get_session_owner_authority(target_id, owner_only=True)
     if old_owner != new_owner:
         return
     user_id = old_owner.user_id if old_owner is not None else None
     scheduled_task_store.retarget_continued_sessions(
         receipt.old_id,
-        receipt.new_id,
+        target_id,
         user_id=None if user_id == RESERVED_USER_LOCAL else user_id,
         generation=old_owner.generation if old_owner is not None else None,
     )
@@ -781,7 +787,7 @@ async def _phase_archive(
     old_conversation = await asyncio.to_thread(conversation_store.get_conversation, receipt.old_id)
     if old_conversation is not None and not old_conversation.archived:
         if scheduled_task_store is not None:
-            # Catch new bindings and receipts that reached this phase before an upgrade.
+            # Catch receipts that reached this phase before an upgrade.
             await asyncio.to_thread(
                 _retarget_scheduled_tasks, receipt, conversation_store, scheduled_task_store
             )

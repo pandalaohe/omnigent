@@ -79,7 +79,7 @@ from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import workspace_scope
 from omnigent.debug_logging import set_current_session_id
 from omnigent.entities import Conversation, Project, ScheduledTask, ScheduledTaskRun
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, SessionSupersededError
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.native.permission_modes import (
     APPROVAL_SKIPPING_PERMISSION_MODES,
@@ -151,8 +151,10 @@ from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
+    SUCCEEDED_BY_LABEL_KEY,
     ConversationNotFoundError,
 )
+from omnigent.stores.scheduled_task_store import ARCHIVED_TARGET_CODE, ArchivedTarget
 
 if TYPE_CHECKING:
     from omnigent.server.managed_hosts import ManagedLaunch, ManagedLaunchTracker
@@ -324,7 +326,7 @@ class _FireRecorder(Protocol):
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
-        archived_target: ScheduledTask | None = None,
+        archived_target: ArchivedTarget | None = None,
     ) -> None:
         """Record the fire's startup outcome."""
         ...
@@ -357,7 +359,7 @@ class _NewRunRecorder:
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
-        archived_target: ScheduledTask | None = None,
+        archived_target: ArchivedTarget | None = None,
     ) -> None:
         await _record_run(
             self._deps,
@@ -985,7 +987,72 @@ async def _release_deleted_session(deps: FireDeps, task: ScheduledTask) -> Sched
     return replace(task, session_id=stored.session_id)
 
 
+def _continued_successor(deps: FireDeps, task: ScheduledTask, conv: Conversation) -> str | None:
+    from omnigent.server.routes.sessions.routes_peer import resolve_succeeded_by
+
+    if not conv.labels.get(SUCCEEDED_BY_LABEL_KEY):
+        return None
+    store = deps.conversation_store
+    successor_id = resolve_succeeded_by(store, conv.id)
+    if successor_id == conv.id:
+        return None
+    owner = store.get_session_owner_authority(conv.id, owner_only=True)
+    user_id = owner.user_id if owner and owner.user_id != RESERVED_USER_LOCAL else None
+    generation = owner.generation if owner else None
+    if (task.user_id, task.account_generation) != (user_id, generation):
+        return None
+    return (
+        successor_id
+        if store.get_session_owner_authority(successor_id, owner_only=True) == owner
+        else None
+    )
+
+
+def _check_continued_successor(deps: FireDeps, task: ScheduledTask, session_id: str) -> None:
+    conv = deps.conversation_store.get_conversation(session_id)
+    if conv is not None and (successor_id := _continued_successor(deps, task, conv)) is not None:
+        raise SessionSupersededError(successor_id)
+
+
 async def _continue_session(
+    deps: FireDeps,
+    task: ScheduledTask,
+    dispatch: LaunchDispatch,
+    recorder: _FireRecorder,
+) -> None:
+    """Use the durable handover link even when a run was claimed before the move."""
+    from omnigent.server.routes.sessions.routes_peer import _SUCCESSOR_MAX_HOPS
+
+    binding = task.session_id
+    assert binding is not None
+    for _ in range(_SUCCESSOR_MAX_HOPS):
+        if task.session_id != binding:
+            assert task.session_id is not None
+            # Repair an older receipt or a split-DB binding before recording a pause.
+            try:
+                await asyncio.to_thread(
+                    deps.scheduled_task_store.retarget_continued_sessions,
+                    binding,
+                    task.session_id,
+                    user_id=task.user_id,
+                    generation=task.account_generation,
+                )
+            except SessionSupersededError:
+                # The target moved again. Resolve and authorize the new chain from its source.
+                task = replace(task, session_id=binding)
+                continue
+            binding = task.session_id
+        try:
+            await _deliver_continued_session(deps, task, dispatch, recorder)
+            return
+        except SessionSupersededError as exc:
+            task = replace(task, session_id=exc.successor_id)
+    await recorder.finish(
+        "failed", error="the session kept changing during handover", error_code="launch_failed"
+    )
+
+
+async def _deliver_continued_session(
     deps: FireDeps,
     task: ScheduledTask,
     dispatch: LaunchDispatch,
@@ -1003,15 +1070,32 @@ async def _continue_session(
     assert session_id is not None  # guarded by the caller
     start_fire_stage("session_validation", session_id=session_id)
     conv = await asyncio.to_thread(deps.conversation_store.get_conversation, session_id)
+    if (
+        conv is not None
+        and (successor_id := await asyncio.to_thread(_continued_successor, deps, task, conv))
+        is not None
+    ):
+        raise SessionSupersededError(successor_id)
     problem = await continued_session_problem(
         task, conv, host_store=deps.host_store, permission_store=deps.permission_store
     )
     if problem is not None:
         reason, error_code = problem
         _logger.warning("scheduled fire: task %s cannot continue its session: %s", task.id, reason)
-        archived_target = task if error_code == "continued_session_archived" else None
-        if archived_target is not None:
-            reason = f"{reason}; the automation is paused"
+        archived_target = None
+        if error_code == ARCHIVED_TARGET_CODE:
+            assert conv is not None
+            archive_revision = conv.archive_revision
+
+            def still_archived() -> bool:
+                current = deps.conversation_store.get_conversation(session_id)
+                if current is None:
+                    return False
+                if (successor := _continued_successor(deps, task, current)) is not None:
+                    raise SessionSupersededError(successor)
+                return current.archived and current.archive_revision == archive_revision
+
+            archived_target = ArchivedTarget(task, still_archived)
         await recorder.finish(
             "failed",
             error=f"{reason}; {_NEW_SESSION_HINT}",
@@ -1064,7 +1148,10 @@ async def _continue_session(
         return
     try:
         start_fire_stage("runner_start", session_id=session_id)
+        await asyncio.to_thread(_check_continued_successor, deps, task, session_id)
         await dispatch(conv, task)
+    except SessionSupersededError:
+        raise
     except Exception:
         _logger.exception(
             "scheduled fire: dispatch into continued session %s failed for task %s",
@@ -1154,7 +1241,7 @@ async def continued_session_problem(
     ):
         return "the automation's owner does not own the session", "continued_session_forbidden"
     if conv.archived:
-        return "the session is archived", "continued_session_archived"
+        return "the session is archived", ARCHIVED_TARGET_CODE
     if conv.parent_conversation_id is not None:
         return "the session is a sub-agent's session", "continued_session_incompatible"
     from omnigent.member_snapshot import LIBRARY_AGENT_TEMPLATE_LABEL_KEY
@@ -2343,7 +2430,7 @@ async def _record_run(
     status: str,
     error: str | None = None,
     error_code: str | None = None,
-    archived_target: ScheduledTask | None = None,
+    archived_target: ArchivedTarget | None = None,
 ) -> None:
     """Stamp last_run_* on the task and write a scheduled_task_runs row."""
     await asyncio.to_thread(
@@ -2368,7 +2455,7 @@ def _record_run_sync(
     *,
     error: str | None = None,
     error_code: str | None = None,
-    archived_target: ScheduledTask | None = None,
+    archived_target: ArchivedTarget | None = None,
 ) -> None:
     """Synchronous run recording body for ``asyncio.to_thread`` callers."""
     now = _stamp_last_run_sync(deps, task, conversation_id)
@@ -2668,15 +2755,20 @@ def _make_reuse_dispatch(deps: FireDeps) -> LaunchDispatch:
                 # A sandbox automation's prompt never goes to a runner outside its
                 # sandbox, such as a local one a hostless session may have.
                 raise RuntimeError(f"session {conv.id} is not bound to the automation's sandbox")
-            runner_client, conv = await ensure_runner_connected(
-                session_id=conv.id,
-                conv=conv,
-                app_state=deps.app_state,
-                conversation_store=deps.conversation_store,
-                runner_router=deps.runner_router,
-            )
-            if runner_client is None:
-                raise RuntimeError(f"no runner can be reached or woken for session {conv.id}")
+            try:
+                runner_client, conv = await ensure_runner_connected(
+                    session_id=conv.id,
+                    conv=conv,
+                    app_state=deps.app_state,
+                    conversation_store=deps.conversation_store,
+                    runner_router=deps.runner_router,
+                )
+                if runner_client is None:
+                    raise RuntimeError(f"no runner can be reached or woken for session {conv.id}")
+            except Exception:
+                # Runner setup can race succession before there is any prompt to duplicate.
+                await asyncio.to_thread(_check_continued_successor, deps, task, conv.id)
+                raise
         await _send_prompt(deps, conv, runner_client, task)
 
     return _dispatch
@@ -2692,11 +2784,18 @@ async def _send_prompt(
     )
 
     with fire_stage("runner_start", session_id=conv.id):
-        await _ensure_runner_session_initialized(
-            conv.id, conv, runner_client, deps.conversation_store
-        )
+        try:
+            await _ensure_runner_session_initialized(
+                conv.id, conv, runner_client, deps.conversation_store
+            )
+        except Exception:
+            if task.continues_session:
+                await asyncio.to_thread(_check_continued_successor, deps, task, conv.id)
+            raise
     with fire_stage("prompt_prepare", session_id=conv.id):
         agent_revision = await _agent_revision(deps, conv)
+        if task.continues_session:
+            await asyncio.to_thread(_check_continued_successor, deps, task, conv.id)
     with fire_stage("prompt_send", session_id=conv.id):
         dispatch_id = uuid.uuid4().hex
         log_delivery(
@@ -2718,6 +2817,8 @@ async def _send_prompt(
         if result.accepted:
             log_prompt_sent(conv.id, dispatch_id=dispatch_id)
         else:
+            if task.continues_session:
+                await asyncio.to_thread(_check_continued_successor, deps, task, conv.id)
             log_delivery(
                 "scheduled_run_prompt_not_accepted",
                 session_id=conv.id,
@@ -2908,7 +3009,7 @@ class _ClaimedRunRecorder:
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
-        archived_target: ScheduledTask | None = None,
+        archived_target: ArchivedTarget | None = None,
     ) -> None:
         await self._lease.finish(
             status,
