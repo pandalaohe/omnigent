@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.harnesses.claude_native.bridge import (
+    _SCROLLED_DRAFT_SURFACE,
     BRIDGE_DIR_ENV_VAR,
     CLAUDE_FRAMEWORK_CONTEXT_FILE,
     MANAGED_SANDBOX_SIGN_IN_REMEDY,
@@ -32,6 +33,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeUserPromptPending,
     KeepWarmBtwResult,
     TmuxSessionNotAdvertised,
+    _tmux_input_identity,
     cancellable_injection,
     claude_pane_ready,
     has_pending_user_prompt,
@@ -60,6 +62,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    InjectionDeliveryAmbiguous,
     Message,
     TextChunk,
     ToolSpec,
@@ -105,8 +108,7 @@ _STALE_SESSION_MESSAGE = (
     "open the latest conversation and retry."
 )
 
-# Hold refusals raised before typing until the person answers or frees the box.
-_MESSAGE_HOLD_S = 8 * 60.0
+# Poll refusals raised before typing until the person answers or frees the box.
 _MESSAGE_HOLD_POLL_S = 1.0
 # How often a message held for the input box asks Claude Code to repaint it.
 _INPUT_BOX_REPAINT_INTERVAL_S = 10.0
@@ -210,6 +212,9 @@ class ClaudeNativeExecutor(Executor):
         try:
             async with self._inject_lock:
                 await self._inject_prompt(text, framework_notices(content))
+        except ClaudeDeliveryUnconfirmed as exc:
+            # Claude may already hold the paste; returning it to the runner would replay it.
+            raise InjectionDeliveryAmbiguous(str(exc)) from exc
         except RuntimeError:
             return False
         return True
@@ -492,6 +497,10 @@ class ClaudeNativeExecutor(Executor):
             surface,
             extra={"session_id": self._request_session_id},
         )
+        if surface == _SCROLLED_DRAFT_SURFACE:
+            return await self._poll_until(
+                deadline, lambda: claude_pane_ready(self._bridge_dir, require_empty=True)
+            )
         return await self._poll_until(deadline, lambda: claude_pane_ready(self._bridge_dir))
 
     async def _wait_for_answer(self, deadline: float) -> bool:
@@ -666,9 +675,7 @@ class ClaudeNativeExecutor(Executor):
                         if not _can_hold_refusal(exc):
                             raise
                         if hold_deadline is None:
-                            hold_deadline = asyncio.get_running_loop().time() + min(
-                                _MESSAGE_HOLD_S, message_readiness_remaining()
-                            )
+                            hold_deadline = loop.time() + message_readiness_remaining()
                         if not await self._hold_message(exc, hold_deadline):
                             raise
                         wanted_model_arg = self._model_command_arg(wanted_model)
@@ -754,9 +761,14 @@ class ClaudeNativeExecutor(Executor):
             return
         except ClaudeDeliveryUnconfirmed as exc:
             yield ExecutorError(
-                message=describe_exception(exc),
-                code="native_input_delivery_uncertain" if delivery_claimed else None,
-                undelivered=not delivery_claimed,
+                message=str(exc),
+                code=(
+                    "native_input_delivery_uncertain"
+                    if delivery_claimed
+                    else "claude_delivery_unconfirmed"
+                ),
+                title="Claude delivery is unconfirmed",
+                remediation="Inspect the terminal before sending this message again.",
                 preserve_session=True,
             )
             return
@@ -780,7 +792,10 @@ class ClaudeNativeExecutor(Executor):
     async def _inject(self, operation: Callable[[], None]) -> None:
         """Drain cancelled delivery workers before releasing the pane's injection lock."""
         cancelled = threading.Event()
-        with cancellable_injection(cancelled):
+        paste_started = threading.Event()
+        active_session_id = read_active_session_id(self._bridge_dir)
+        tmux_identity = _tmux_input_identity(self._bridge_dir)
+        with cancellable_injection(cancelled, paste_started=paste_started):
             worker = asyncio.create_task(asyncio.to_thread(operation))
         try:
             await asyncio.shield(worker)
@@ -791,7 +806,19 @@ class ClaudeNativeExecutor(Executor):
                     await asyncio.shield(worker)
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 worker.result()
-            if not await asyncio.to_thread(has_running_turn, self._bridge_dir):
+            if paste_started.is_set():
+                raise ClaudeDeliveryUnconfirmed(
+                    "Claude delivery was interrupted after the paste started. "
+                    "The message may already be queued or running."
+                ) from None
+            if (
+                not await asyncio.to_thread(has_running_turn, self._bridge_dir)
+                and read_active_session_id(self._bridge_dir) == active_session_id
+                and (
+                    tmux_identity.get("socket_path") is None
+                    or _tmux_input_identity(self._bridge_dir) == tmux_identity
+                )
+            ):
                 self._reap_failed_turn()
             raise
 
