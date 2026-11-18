@@ -94,7 +94,7 @@ async def test_runner_pending_input_reconciles_or_expires(db_uri, monkeypatch, e
     message, error = store.list_items(session_id).data
     assert message.type == "message"
     assert error.type == "error"
-    assert "not delivered" in error.data.message
+    assert "not delivered" in error.data.model_dump()["message"]
 
 
 @pytest.fixture

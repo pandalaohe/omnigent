@@ -6062,23 +6062,6 @@ async def _watch_runner_input_lease(
         await asyncio.sleep(remaining if remaining > 0 else 15)
 
 
-def _start_runner_input_lease_watch(
-    conversation_store: ConversationStore, session_id: str, pending_id: str
-) -> None:
-    remaining = pending_inputs.runner_lease_remaining(session_id, pending_id)
-    if remaining is None:
-        return
-
-    def start() -> None:
-        task = asyncio.create_task(
-            _watch_runner_input_lease(conversation_store, session_id, pending_id)
-        )
-        _runner_input_lease_tasks.add(task)
-        task.add_done_callback(_runner_input_lease_tasks.discard)
-
-    asyncio.get_running_loop().call_later(max(0, remaining), start)
-
-
 async def _reconcile_runner_input_leases(
     conversation_store: ConversationStore,
     session_id: str,
@@ -11386,7 +11369,11 @@ async def _dispatch_session_event_to_runner_impl(
             if pending_id is not None:
                 pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_accepted")
                 if claude_native:
-                    _start_runner_input_lease_watch(conversation_store, session_id, pending_id)
+                    watcher = asyncio.create_task(
+                        _watch_runner_input_lease(conversation_store, session_id, pending_id)
+                    )
+                    _runner_input_lease_tasks.add(watcher)
+                    watcher.add_done_callback(_runner_input_lease_tasks.discard)
             log_input_event(
                 _logger,
                 "native_input_forward_finished",

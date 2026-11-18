@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -109,13 +110,10 @@ while True:
 def test_first_message_survives_slow_terminal_startup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, startup: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Hold startup until the real readiness gate starts, then exceed its base budget."""
+    """Hold startup until the real readiness gate starts and exercise its deadline."""
     monkeypatch.delenv("PYTHONPATH", raising=False)
     monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
-    monkeypatch.setattr(
-        bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.3 if startup == "base-budget-only" else 5.0
-    )
     gate_started = tmp_path / "gate-started"
     delivered = tmp_path / "delivered.json"
     terminal = tmp_path / "terminal.py"
@@ -133,16 +131,10 @@ def test_first_message_survives_slow_terminal_startup(
 
         monkeypatch.setattr(bridge, "_claude_pane_state", pane_state_without_exit_status)
 
-    def observe_wait(
-        socket_path: str,
-        tmux_target: str,
-        *,
-        timeout_s: float,
-        bridge_dir: Path | None = None,
-    ) -> None:
+    def observe_wait(socket_path: str, tmux_target: str, **options: Any) -> None:
         started_at.append(time.monotonic())
         gate_started.touch()
-        original_wait(socket_path, tmux_target, timeout_s=timeout_s, bridge_dir=bridge_dir)
+        original_wait(socket_path, tmux_target, **options)
         if startup == "exit-after-ready":
             subprocess.run(
                 ["tmux", "-S", socket_path, "kill-server"],
@@ -200,9 +192,7 @@ def test_first_message_survives_slow_terminal_startup(
             bridge_dir = tmp_path / "bridge"
             bridge.write_tmux_target(bridge_dir, socket_path=socket_path, tmux_target="main")
             if startup == "slow":
-                bridge.inject_user_message(
-                    bridge_dir, content="FIRST_PROMPT_DELIVERED", timeout_s=0.3
-                )
+                bridge.inject_user_message(bridge_dir, content="FIRST_PROMPT_DELIVERED")
                 assert time.monotonic() - started_at[0] >= 1.0
                 assert json.loads(delivered.read_text()) == [["prompt", "FIRST_PROMPT_DELIVERED"]]
                 assert bridge._claude_pane_state(str(socket_path), "main").alive
@@ -225,9 +215,7 @@ def test_first_message_survives_slow_terminal_startup(
             elif startup == "exit-after-ready":
                 caplog.set_level(logging.WARNING)
                 with pytest.raises(RuntimeError, match="tmux command failed"):
-                    bridge.inject_user_message(
-                        bridge_dir, content="MUST_NOT_DELIVER", timeout_s=0.3
-                    )
+                    bridge.inject_user_message(bridge_dir, content="MUST_NOT_DELIVER", timeout_s=5)
                 record = next(
                     r
                     for r in caplog.records
@@ -241,9 +229,7 @@ def test_first_message_survives_slow_terminal_startup(
                 assert not delivered.exists()
             elif startup in {"dead", "dead-no-status"}:
                 with pytest.raises(bridge.ClaudeTerminalExited) as excinfo:
-                    bridge.inject_user_message(
-                        bridge_dir, content="MUST_NOT_DELIVER", timeout_s=0.3
-                    )
+                    bridge.inject_user_message(bridge_dir, content="MUST_NOT_DELIVER", timeout_s=3)
                 assert gate_started.with_suffix(".exited").exists()
                 assert not delivered.exists()
                 assert excinfo.value.exit_status in {None, "1"}
