@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import tempfile
@@ -46,32 +47,53 @@ def _configure(enabled: bool) -> None:
 
 def _service(action: str, launcher: WindowsSshLauncher, *, enrollment_id: str = "") -> None:
     script = Path(__file__).with_name("windows_admin_terminal.ps1")
-    result = subprocess.run(
-        [
-            launcher.powershell,
-            "-NoLogo",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(script),
-            "-Action",
-            action,
-            "-PublicKeyPath",
-            str(launcher.key.with_suffix(".pub")),
-            "-Username",
-            launcher.username,
-            "-EnrollmentId",
-            enrollment_id,
-        ],
-        check=False,
-    )
-    if result.returncode:
+    profile = Path(os.environ.get("USERPROFILE") or Path.home())
+    fd, name = tempfile.mkstemp(dir=profile, prefix=".omnigent-admin-terminal-", suffix=".result")
+    result_path = Path(name)
+    try:
+        # Give the elevated writer a way to recognize the original result file.
+        with os.fdopen(fd, "w", encoding="ascii") as stream:
+            stream.write(result_path.name)
+        result = subprocess.run(
+            [
+                launcher.powershell,
+                "-NoLogo",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script),
+                "-Action",
+                action,
+                "-PublicKeyPath",
+                str(launcher.key.with_suffix(".pub")),
+                "-Username",
+                launcher.username,
+                "-EnrollmentId",
+                enrollment_id,
+                "-ResultPath",
+                str(result_path),
+            ],
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+        try:
+            detail = result_path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            detail = ""
+        if detail and detail != result_path.name:
+            raise RuntimeError(f"Windows admin-terminal {action} failed at {detail}")
         raise RuntimeError(
-            f"Windows admin-terminal {action} failed; see the host output. "
+            f"Windows admin-terminal {action} failed (PowerShell exit {result.returncode}). "
+            "No diagnostic was returned. "
             "If Group Policy blocks scripts, contact your administrator; "
             "this command does not change persistent execution policy."
         )
+    finally:
+        # Keep the service outcome authoritative if the result file is locked.
+        with contextlib.suppress(OSError):
+            result_path.unlink(missing_ok=True)
 
 
 def _check_launcher(launcher: WindowsSshLauncher) -> None:
@@ -148,7 +170,7 @@ def install_windows_admin_terminal() -> None:
         _service("Install", launcher, enrollment_id=enrollment_id)
         _check_launcher(launcher)
         _configure(True)
-    except BaseException:
+    except BaseException as install_error:
         incomplete = []
         try:
             _configure(False)
@@ -157,11 +179,11 @@ def install_windows_admin_terminal() -> None:
         try:
             _service("Remove", launcher, enrollment_id=enrollment_id)
             _remove_key_files(launcher)
-        except (OSError, RuntimeError):
-            incomplete.append("SSH service or key files")
+        except (OSError, RuntimeError) as cleanup_error:
+            incomplete.append(f"SSH service or key files ({cleanup_error})")
         if incomplete:
             raise RuntimeError(
-                "Installation failed; automatic cleanup incomplete for "
+                f"{install_error}\nAutomatic cleanup incomplete for "
                 + ", ".join(incomplete)
                 + ". Resolve this state before retrying."
             ) from None
