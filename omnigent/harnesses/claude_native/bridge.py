@@ -204,7 +204,7 @@ def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunct
             except ClaudeComposerNotCleared:
                 # The refused paste sent nothing. Give a clipped composer room,
                 # then recheck readiness and pending prompts before retrying.
-                info = _wait_for_tmux_info(bridge_dir, timeout_s=_TMUX_READY_TIMEOUT_S)
+                info = _wait_for_tmux_info(bridge_dir, timeout_s=message_readiness_remaining())
                 with _usable_composer_height(info["socket_path"], info["tmux_target"]) as resized:
                     if not resized:
                         raise
@@ -406,6 +406,33 @@ _MAX_CONCURRENT_MCP_REQUESTS = 64
 # ``tmux.json`` after the Claude terminal launches; the harness
 # tails it and shells out to tmux.
 _TMUX_READY_TIMEOUT_S = 30.0
+MESSAGE_READINESS_TIMEOUT_S = 600.0
+_message_readiness_deadline: ContextVar[float | None] = ContextVar(
+    "claude_native_message_readiness_deadline", default=None
+)
+
+
+@contextlib.contextmanager
+def message_readiness_budget(timeout_s: float | None = None) -> Iterator[None]:
+    """Share one deadline across a message's readiness checks and retries."""
+    deadline = _message_readiness_deadline.get()
+    if deadline is not None:
+        yield
+        return
+    token = _message_readiness_deadline.set(
+        time.monotonic() + (MESSAGE_READINESS_TIMEOUT_S if timeout_s is None else timeout_s)
+    )
+    try:
+        yield
+    finally:
+        _message_readiness_deadline.reset(token)
+
+
+def message_readiness_remaining() -> float:
+    deadline = _message_readiness_deadline.get()
+    return _TMUX_READY_TIMEOUT_S if deadline is None else max(0.0, deadline - time.monotonic())
+
+
 # Hard cap on waiting for a slow-booting terminal whose process is still
 # alive.
 _TMUX_READY_SLOW_BOOT_TIMEOUT_S = 180.0
@@ -5416,15 +5443,20 @@ def write_tmux_target(
     _write_json_file(bridge_dir / _TMUX_FILE, payload)
 
 
+def inject_user_message(bridge_dir: Path, *, content: str, timeout_s: float | None = None) -> None:
+    """Deliver a Claude message within the active or newly allocated readiness budget."""
+    with message_readiness_budget(timeout_s):
+        _inject_user_message(bridge_dir, content=content)
+
+
 @delivery_diagnostics.trace_delivery(
     session_id_reader=read_active_session_id, cancelled_error=ClaudeInjectionCancelled
 )
 @_serialize_bridge_injection
-def inject_user_message(
+def _inject_user_message(
     bridge_dir: Path,
     *,
     content: str,
-    timeout_s: float = _TMUX_READY_TIMEOUT_S,
 ) -> None:
     r"""
     Deliver a user message into the Claude terminal via tmux send-keys.
@@ -5473,12 +5505,6 @@ def inject_user_message(
 
     :param bridge_dir: Bridge directory path.
     :param content: User text from the Omnigent web UI. Must be non-empty.
-    :param timeout_s: Seconds to wait for each readiness gate
-        (``tmux.json`` advertised, then prompt rendered), e.g. ``30.0``.
-        The prompt-rendered gate extends past this budget while the
-        terminal's process is verifiably alive but still booting (see
-        :func:`_wait_for_claude_prompt_ready`), so a slow host connect
-        delivers the message late instead of dropping it.
     :returns: None.
     :raises ClaudeTerminalDialog: If a dialog blocks delivery or a side chat
         cannot be confirmed closed. Dismissal Escapes may have been sent,
@@ -5491,13 +5517,16 @@ def inject_user_message(
         prompt-history search after the reclaim; nothing was typed.
     """
     delivery_diagnostics.set_stage("waiting_for_tmux")
-    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=message_readiness_remaining())
     delivery_diagnostics.set_stage("restoring_input")
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
     # reclaim the input box before waiting on it.
     surface = _restore_occupied_input(
-        info["socket_path"], info["tmux_target"], bridge_dir=bridge_dir
+        info["socket_path"],
+        info["tmux_target"],
+        bridge_dir=bridge_dir,
+        timeout_s=min(_OCCUPIED_INPUT_DISMISS_TIMEOUT_S, message_readiness_remaining()),
     )
     if surface is not None and surface != _OVERLAY_SURFACE:
         # An overlay may be launcher output the readiness gate waits through; a
@@ -5514,8 +5543,9 @@ def inject_user_message(
     _wait_for_claude_prompt_ready(
         info["socket_path"],
         info["tmux_target"],
-        timeout_s=timeout_s,
+        timeout_s=message_readiness_remaining(),
         bridge_dir=bridge_dir,
+        extend_for_slow_boot=False,
     )
     # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
     # Claude Code TUI treats them as user text instead of invoking a state
@@ -5652,7 +5682,7 @@ def _paste_and_submit(
             existing_draft = _wait_for_claude_prompt_ready(
                 socket_path,
                 tmux_target,
-                timeout_s=_TMUX_READY_TIMEOUT_S,
+                timeout_s=message_readiness_remaining(),
                 bridge_dir=bridge_dir,
                 extend_for_slow_boot=False,
                 draft_visible=lambda capture: (
@@ -5834,7 +5864,7 @@ def _paste_and_await_draft(
     polls = 0
     empty_captures = 0
     wait_started = time.monotonic()
-    deadline = wait_started + _PASTE_COMMIT_TIMEOUT_S
+    deadline = wait_started + min(_PASTE_COMMIT_TIMEOUT_S, message_readiness_remaining())
     while time.monotonic() < deadline:
         _check_injection_cancelled()
         pane = _capture_pane(socket_path, tmux_target)
@@ -9343,13 +9373,15 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
     """
     deadline = time.monotonic() + timeout_s
     path = bridge_dir / _TMUX_FILE
-    while time.monotonic() < deadline:
+    while True:
         _check_injection_cancelled()
         payload = _read_json_file(path)
         socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
         tmux_target = payload.get("tmux_target") if isinstance(payload, dict) else None
         if isinstance(socket_path, str) and isinstance(tmux_target, str):
             return {"socket_path": socket_path, "tmux_target": tmux_target}
+        if time.monotonic() >= deadline:
+            break
         time.sleep(0.05)
     raise TmuxSessionNotAdvertised(
         "Claude terminal tmux target is not advertised yet. Wait for the "

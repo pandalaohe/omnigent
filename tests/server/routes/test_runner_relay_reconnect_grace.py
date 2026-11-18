@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from omnigent.runtime import session_stream
+from omnigent.runtime import pending_inputs, session_stream
 from omnigent.server.routes._sessions import orchestration
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.server.helpers import start_session_stream_collector
@@ -53,6 +53,48 @@ class _NaturalEofStream(httpx.AsyncByteStream):
     async def __aiter__(self) -> AsyncIterator[bytes]:
         for frame in self.frames:
             yield frame
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expires", [False, True])
+async def test_runner_pending_input_reconciles_or_expires(db_uri, monkeypatch, expires):
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation().id
+    now = 0.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    pending_id = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "queued"}], runner_managed=True
+    )
+    pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_accepted")
+    for now in range(60, 661, 60):
+        await orchestration._reconcile_runner_input_leases(
+            store,
+            session_id,
+            {"active_pending_ids": [], "queued_pending_ids": [pending_id]},
+            set(),
+        )
+    assert pending_inputs.snapshot_for(session_id)[0]["pending_id"] == pending_id
+    assert "sending_since_ms" not in pending_inputs.snapshot_for(session_id)[0]
+    assert pending_inputs.runner_lease_remaining(session_id, pending_id) == 600
+    await orchestration._reconcile_runner_input_leases(
+        store, session_id, {"active_pending_ids": [pending_id], "queued_pending_ids": []}, set()
+    )
+    assert "sending_since_ms" in pending_inputs.snapshot_for(session_id)[0]
+    if expires:
+        now += 601
+        await orchestration._watch_runner_input_lease(store, session_id, pending_id)
+    else:
+        await orchestration._reconcile_runner_input_leases(
+            store,
+            session_id,
+            {"active_pending_ids": [], "queued_pending_ids": []},
+            pending_inputs.runner_accepted_ids(session_id),
+        )
+    assert pending_inputs.snapshot_for(session_id) == []
+    message, error = store.list_items(session_id).data
+    assert message.type == "message"
+    assert error.type == "error"
+    assert "not delivered" in error.data.message
 
 
 @pytest.fixture

@@ -7058,6 +7058,48 @@ def test_inject_user_message_submits_a_clipped_draft_once(
         assert mutations == ["paste", "submit"]
 
 
+@pytest.mark.parametrize("recovers", [True, False])
+def test_post_paste_readiness_uses_remaining_message_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recovers: bool
+) -> None:
+    bridge = claude_native_bridge
+    clock = _VirtualClock()
+    # The runner had the input queued for longer than the readiness budget.
+    queued_until = clock.now = 700.0
+    monkeypatch.setattr(bridge, "time", clock)
+    monkeypatch.setattr(bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(
+        bridge, "_claude_pane_state", lambda *_: bridge._ClaudePaneState(alive=True)
+    )
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    mutations: list[str] = []
+
+    def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        if "capture-pane" in cmd:
+            if not mutations and clock.now - queued_until < 10:
+                visible = ""
+            elif mutations == ["paste"]:
+                visible = _composer_pane("one message") if clock.now - queued_until >= 45 else ""
+            else:
+                visible = _composer_pane()
+            return SimpleNamespace(returncode=0, stdout=visible, stderr="")
+        if "paste-buffer" in cmd:
+            mutations.append("paste")
+        if cmd[-1] == "Enter":
+            mutations.append("submit")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", run)
+    if recovers:
+        inject_user_message(bridge_dir, content="one message", timeout_s=50)
+        assert mutations == ["paste", "submit"]
+    else:
+        with pytest.raises(bridge.ClaudeDeliveryUnconfirmed):
+            inject_user_message(bridge_dir, content="one message", timeout_s=25)
+        assert mutations == ["paste"]
+        assert clock.now - queued_until == pytest.approx(25, abs=0.3)
+
+
 @pytest.mark.parametrize(
     "replay_captures,recovered_draft",
     [(8, ""), (25, ""), (8, "unfinished terminal edit")],
@@ -15117,7 +15159,7 @@ def test_composer_recovery_rechecks_the_surface_before_typing(
                 bridge_dir, command="/effort high", ready_timeout_s=0.5
             )
         else:
-            inject_user_message(bridge_dir, content="hello from the web", timeout_s=0.5)
+            inject_user_message(bridge_dir, content="hello from the web", timeout_s=5)
 
     assert composer.submitted == []
     assert not resized

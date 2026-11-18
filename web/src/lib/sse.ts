@@ -956,6 +956,14 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       servers,
     } satisfies SessionMcpStartupEvent;
   }
+  if (eventType === "session.input.sending") {
+    const pendingId = data.pending_id;
+    const sinceMs = data.since_ms;
+    if (typeof pendingId !== "string" || (typeof sinceMs !== "number" && sinceMs !== null)) {
+      return null;
+    }
+    return { type: "session_input_sending", pendingId, sinceMs };
+  }
   if (eventType === "session.input.consumed") {
     // Nested envelope: `{type, data: {item_id, type, data}}`.
     const inner = data.data;

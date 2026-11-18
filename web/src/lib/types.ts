@@ -97,6 +97,7 @@ export interface AgyPermission {
  * message round-trips back through the transcript.
  */
 export interface PendingInput {
+  sendingSinceMs?: number;
   /** Server index id, e.g. ``"pending_a1b2c3"``; the bubble's stable key. */
   pendingId: string;
   /** Message content blocks as POSTed (file blocks carry real ids). */

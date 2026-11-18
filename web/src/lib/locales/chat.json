@@ -1,0 +1,4 @@
+{
+  "en": { "sending": "Sending {elapsed}", "stillSending": "Still sending…" },
+  "zh": { "sending": "发送中 {elapsed}", "stillSending": "发送中…" }
+}

@@ -669,6 +669,8 @@ export interface PendingUserMessage {
   posted?: boolean;
   /** The send's POST has gone unanswered for {@link SEND_STILL_SENDING_AFTER_MS}. */
   stillSending?: boolean;
+  /** Original server send time while the runner is delivering this input. */
+  sendingSinceMs?: number;
   /**
    * The server's pending-input id from the accepted POST. The bubble keeps
    * `tempId` as its React key, so this is its only link to the entry a
@@ -5786,11 +5788,18 @@ async function bindStream(
       const toPending = (p: PendingInput): PendingUserMessage => ({
         tempId: p.pendingId,
         content: p.content,
+        ...(p.sendingSinceMs === undefined ? {} : { sendingSinceMs: p.sendingSinceMs }),
         ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
       });
       let candidatePending: PendingUserMessage[];
       if (!hydratePending) {
-        candidatePending = state.pendingUserMessages;
+        const serverPending = new Map((session.pendingInputs ?? []).map((p) => [p.pendingId, p]));
+        candidatePending = state.pendingUserMessages.map((p) => {
+          const server = serverPending.get(p.pendingId ?? p.tempId);
+          return server && server.sendingSinceMs !== p.sendingSinceMs
+            ? { ...p, sendingSinceMs: server.sendingSinceMs }
+            : p;
+        });
       } else {
         const serverPending = (session.pendingInputs ?? []).map(toPending);
         // One-to-one consumption so two identical queued sends still match
@@ -10070,6 +10079,18 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // just after the idle edge, or an SSE reconnect that replays state
       // without a fresh transition, would strand the queue forever.
       return;
+    }
+    case "session_input_sending": {
+      if (sourceConversationId === null) break;
+      setterFor(sourceConversationId)((s) => ({
+        pendingUserMessages: s.pendingUserMessages.map((p) =>
+          (p.pendingId ?? p.tempId) === event.pendingId &&
+          p.sendingSinceMs !== (event.sinceMs ?? undefined)
+            ? { ...p, sendingSinceMs: event.sinceMs ?? undefined }
+            : p,
+        ),
+      }));
+      break;
     }
     case "session_input_consumed": {
       applyToConversation({ startupPending: false });

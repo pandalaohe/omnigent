@@ -39,6 +39,8 @@ from omnigent.harnesses.claude_native.bridge import (
     input_box_reads_clear,
     is_auth_slash_command,
     kill_session,
+    message_readiness_budget,
+    message_readiness_remaining,
     read_active_session_id,
     read_claude_context_state,
     read_claude_status_model,
@@ -102,7 +104,6 @@ _STALE_SESSION_MESSAGE = (
 )
 
 # Hold refusals raised before typing until the person answers or frees the box.
-# Report the result before the server's 600 s pending-input lifetime ends.
 _MESSAGE_HOLD_S = 8 * 60.0
 _MESSAGE_HOLD_POLL_S = 1.0
 # How often a message held for the input box asks Claude Code to repaint it.
@@ -626,7 +627,7 @@ class ClaudeNativeExecutor(Executor):
         # custom slot; anything else is ignored and the pane keeps its model.
         wanted_model_arg = self._model_command_arg(wanted_model)
         try:
-            with telemetry.span("claude_native.inject"):
+            with telemetry.span("claude_native.inject"), message_readiness_budget():
                 hold_deadline: float | None = None
                 while True:
                     try:
@@ -641,7 +642,9 @@ class ClaudeNativeExecutor(Executor):
                         if not _can_hold_refusal(exc):
                             raise
                         if hold_deadline is None:
-                            hold_deadline = asyncio.get_running_loop().time() + _MESSAGE_HOLD_S
+                            hold_deadline = asyncio.get_running_loop().time() + min(
+                                _MESSAGE_HOLD_S, message_readiness_remaining()
+                            )
                         if not await self._hold_message(exc, hold_deadline):
                             raise
                         wanted_model_arg = self._model_command_arg(wanted_model)

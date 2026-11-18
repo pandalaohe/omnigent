@@ -1161,6 +1161,7 @@ export type StreamEvent =
   | SessionStartupEvent
   | SessionMcpStartupEvent
   | SessionInputConsumedEvent
+  | { type: "session_input_sending"; pendingId: string; sinceMs: number | null }
   | SessionInterruptedEvent
   | SessionCreatedEvent
   | SessionSupersededEvent

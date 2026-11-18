@@ -29,6 +29,7 @@ import type { LucideIcon } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { askUserQuestionPayloadOf } from "@/lib/askUserQuestion";
+import chatText from "@/lib/locales/chat.json";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import {
   Message,
@@ -240,8 +241,9 @@ export function buildPendingBubbles(
       // No server item id yet; tempId keeps React keys stable until promotion.
       itemId: p.tempId,
       pending: true,
-      ...(p.sentMidTurn ? { awaitingAgent: true } : {}),
+      ...(p.sentMidTurn && p.sendingSinceMs === undefined ? { awaitingAgent: true } : {}),
       ...(p.stillSending && p.posted !== true ? { stillSending: true } : {}),
+      ...(p.sendingSinceMs === undefined ? {} : { sendingSinceMs: p.sendingSinceMs }),
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
       // Stamped once at send time; absent for snapshot-replayed entries,
@@ -1012,6 +1014,29 @@ function useMessageActionVisibility(persistentOnMobile = false, persistentOnDesk
   };
 }
 
+function PendingSendIndicator({ sinceMs }: { sinceMs?: number }) {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    if (sinceMs === undefined) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [sinceMs]);
+  const text = chatText[navigator.language.split("-")[0] === "zh" ? "zh" : "en"];
+  const seconds = Math.max(0, Math.floor((now - (sinceMs ?? now)) / 1000));
+  const elapsed = [Math.floor(seconds / 60), seconds % 60]
+    .map((value) => String(value).padStart(2, "0"))
+    .join(":");
+  return (
+    <div
+      className="flex items-center gap-1 pt-1 text-[11px] leading-4 text-muted-foreground"
+      data-testid="message-still-sending"
+    >
+      <Loader2Icon size={12} className="animate-spin" aria-hidden />
+      {sinceMs === undefined ? text.stillSending : text.sending.replace("{elapsed}", elapsed)}
+    </div>
+  );
+}
+
 function UserBubble({
   bubble,
   sessionId: sourceSessionId,
@@ -1243,14 +1268,8 @@ function UserBubble({
         {bubble.undelivered && (
           <UndeliveredMessageNotice sessionId={sessionId} text={text} content={bubble.content} />
         )}
-        {bubble.pending && bubble.stillSending && (
-          <div
-            className="flex items-center gap-1 pt-1 text-[11px] leading-4 text-muted-foreground"
-            data-testid="message-still-sending"
-          >
-            <Loader2Icon size={12} className="animate-spin" aria-hidden />
-            Still sending…
-          </div>
+        {bubble.pending && (bubble.stillSending || bubble.sendingSinceMs !== undefined) && (
+          <PendingSendIndicator sinceMs={bubble.sendingSinceMs} />
         )}
         {visibilityToggle}
         <div

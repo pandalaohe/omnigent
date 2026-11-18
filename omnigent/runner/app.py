@@ -5546,15 +5546,39 @@ def create_runner_app(
                 queue = asyncio.Queue()
                 _session_event_queues[session_id] = queue
             heartbeat_frame = b'data: {"type": "session.heartbeat"}\n\n'
+            loop = asyncio.get_running_loop()
+            # Replay queued terminal edges before reconciling ownership on a reconnect.
+            backlog = queue.qsize()
+            next_heartbeat = loop.time()
             yield heartbeat_frame
             while True:
+                if backlog == 0 and loop.time() >= next_heartbeat:
+                    active = sorted(_turn_pending_ids.get(session_id, ()))
+                    queued = [
+                        pending_id
+                        for body in _session_message_buffers.get(session_id, ())
+                        if isinstance(pending_id := body.get("pending_id"), str)
+                    ]
+                    frame = {
+                        "type": "session.heartbeat",
+                        "active_pending_ids": active,
+                        "queued_pending_ids": queued,
+                    }
+                    next_heartbeat = loop.time() + _SESSION_STREAM_HEARTBEAT_S
+                    yield f"data: {json.dumps(frame)}\n\n".encode()
                 try:
                     event = await asyncio.wait_for(
-                        queue.get(), timeout=_SESSION_STREAM_HEARTBEAT_S
+                        queue.get(),
+                        timeout=(
+                            _SESSION_STREAM_HEARTBEAT_S
+                            if backlog
+                            else max(0.001, next_heartbeat - loop.time())
+                        ),
                     )
                 except TimeoutError:
-                    yield heartbeat_frame
+                    backlog = 0
                     continue
+                backlog = max(0, backlog - 1)
                 if event is None:
                     break
                 # Drop inferred edges queued before a reconnect until the new server accepts them.

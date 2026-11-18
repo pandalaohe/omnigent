@@ -2111,6 +2111,23 @@ describe("chatStore — switchTo", () => {
     ]);
   });
 
+  it("replays the server send time for a native message waiting for delivery", async () => {
+    seedSession("conv_native", []);
+    const waiting = {
+      pending_id: "pending_waiting",
+      content: [{ type: "input_text", text: "waiting" }],
+      sending_since_ms: 1710000000000,
+    };
+    seedPendingInputs("conv_native", [waiting]);
+
+    await useChatStore.getState().switchTo("conv_native");
+
+    expect(useChatStore.getState().pendingUserMessages[0]).toMatchObject({
+      tempId: "pending_waiting",
+      sendingSinceMs: waiting.sending_since_ms,
+    });
+  });
+
   it.each([
     [[{ pending_id: "pending_first", content: [{ type: "input_text", text: "first" }] }], true],
     [[], false],

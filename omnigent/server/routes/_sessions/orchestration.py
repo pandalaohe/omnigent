@@ -5871,6 +5871,7 @@ async def _settle_undelivered_native_input(
     *,
     pending_id: str | None = None,
     delivery_attempt_id: str | None = None,
+    delivery_error: ErrorData | None = None,
 ) -> None:
     """
     Settle a failed native turn's own queued web message.
@@ -5963,7 +5964,9 @@ async def _settle_undelivered_native_input(
         )
         if isinstance(stable_id, str) and await defer_annotation(stable_id):
             return
-    drained = pending_inputs.resolve(session_id, matched_pending_id)
+    drained = pending_inputs.resolve(
+        session_id, matched_pending_id, hold=delivery_error is not None
+    )
     if drained is None:
         return
     item = NewConversationItem(
@@ -5980,8 +5983,13 @@ async def _settle_undelivered_native_input(
         ).hex,
         replaces_pending_id=drained.stable_id,
     )
+    items = [item]
+    if delivery_error is not None:
+        items.append(
+            NewConversationItem(type="error", response_id=item.response_id, data=delivery_error)
+        )
     try:
-        persisted = await asyncio.to_thread(conversation_store.append, session_id, [item])
+        persisted = await asyncio.to_thread(conversation_store.append, session_id, items)
     except Exception:  # noqa: BLE001 — the error item that follows still records the failure
         _logger.exception(
             "Relay: could not persist the undelivered native message for session=%s",
@@ -6006,6 +6014,96 @@ async def _settle_undelivered_native_input(
             ),
         )
     _publish_input_consumed(session_id, persisted[0], cleared_pending_id=drained.pending_id)
+    if delivery_error is not None:
+        pending_inputs.release(session_id, drained)
+        _publish_error_event(session_id, delivery_error)
+
+
+async def _settle_lost_runner_input(
+    conversation_store: ConversationStore,
+    session_id: str,
+    pending_id: str,
+    code: str,
+) -> None:
+    attempt_id = pending_inputs.delivery_attributes_for(session_id, pending_id).get(
+        "delivery_attempt_id"
+    )
+    if isinstance(attempt_id, str):
+        await _settle_undelivered_native_input(
+            conversation_store,
+            session_id,
+            None,
+            None,
+            reason_code=code,
+            pending_id=pending_id,
+            delivery_attempt_id=attempt_id,
+            delivery_error=ErrorData(
+                source="execution",
+                code=code,
+                message="The runner no longer holds this message. The message was not delivered.",
+            ),
+        )
+
+
+_runner_input_lease_tasks: WorkspaceScopedSet[asyncio.Task[None]] = WorkspaceScopedSet()
+
+
+async def _watch_runner_input_lease(
+    conversation_store: ConversationStore, session_id: str, pending_id: str
+) -> None:
+    """Settle a lapsed input even when the runner stream never reconnects."""
+    while (remaining := pending_inputs.runner_lease_remaining(session_id, pending_id)) is not None:
+        if remaining <= 0:
+            await _settle_lost_runner_input(
+                conversation_store, session_id, pending_id, "native_input_lease_expired"
+            )
+            if pending_inputs.runner_lease_remaining(session_id, pending_id) is None:
+                return
+        await asyncio.sleep(remaining if remaining > 0 else 15)
+
+
+def _start_runner_input_lease_watch(
+    conversation_store: ConversationStore, session_id: str, pending_id: str
+) -> None:
+    remaining = pending_inputs.runner_lease_remaining(session_id, pending_id)
+    if remaining is None:
+        return
+
+    def start() -> None:
+        task = asyncio.create_task(
+            _watch_runner_input_lease(conversation_store, session_id, pending_id)
+        )
+        _runner_input_lease_tasks.add(task)
+        task.add_done_callback(_runner_input_lease_tasks.discard)
+
+    asyncio.get_running_loop().call_later(max(0, remaining), start)
+
+
+async def _reconcile_runner_input_leases(
+    conversation_store: ConversationStore,
+    session_id: str,
+    event: Mapping[str, Any],
+    previous_ids: set[str],
+) -> None:
+    active, queued = event.get("active_pending_ids"), event.get("queued_pending_ids")
+    if not isinstance(active, list) or not isinstance(queued, list):
+        return  # Older runners send a plain heartbeat.
+    if not all(isinstance(value, str) for value in (*active, *queued)):
+        return
+    active_ids = set(active)
+    held_ids = active_ids.union(queued)
+    sending = pending_inputs.renew_runner_inputs(session_id, held_ids, active_ids)
+    for pending_id, since in sending.items():
+        session_stream.publish(
+            session_id,
+            {"type": "session.input.sending", "pending_id": pending_id, "since_ms": since},
+        )
+    for pending_id in previous_ids.difference(held_ids):
+        if pending_inputs.runner_lease_remaining(session_id, pending_id) is not None:
+            await _settle_lost_runner_input(
+                conversation_store, session_id, pending_id, "native_input_runner_lost"
+            )
+    previous_ids.clear()
 
 
 def _restore_drained_inputs(
@@ -11050,8 +11148,9 @@ async def _dispatch_session_event_to_runner_impl(
         # A Claude /btw answers in a TUI overlay that never enters the transcript, so nothing
         # mirrors it back to drain an entry (the web clears its own bubble). With an attachment
         # pasted ahead of the text it is an ordinary prompt, so only text-only content counts.
+        claude_native = await _native_pane_harness(conv) == "claude-native"
         is_btw = (
-            await _native_pane_harness(conv) == "claude-native"
+            claude_native
             and isinstance(content, list)
             and all(
                 isinstance(block, dict) and block.get("type") == "input_text" for block in content
@@ -11096,6 +11195,7 @@ async def _dispatch_session_event_to_runner_impl(
                 stable_id=web_stable_id,
                 background_titles_enabled=background_titles_enabled,
                 admission_id=usage_admission["admission_id"] if usage_admission else None,
+                runner_managed=claude_native,
                 auto_retry=(
                     guard.metadata if (guard := active_retry_dispatch()) is not None else None
                 ),
@@ -11285,6 +11385,8 @@ async def _dispatch_session_event_to_runner_impl(
             forwarded = True
             if pending_id is not None:
                 pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_accepted")
+                if claude_native:
+                    _start_runner_input_lease_watch(conversation_store, session_id, pending_id)
             log_input_event(
                 _logger,
                 "native_input_forward_finished",
@@ -12125,6 +12227,7 @@ async def _relay_runner_stream_once(
     # default (5s); ``write``/``pool`` are not rate-limiting here.
     _relay_timeout = httpx.Timeout(connect=5.0, read=45.0, write=None, pool=None)
     heartbeat_seen = False
+    previous_pending_ids = pending_inputs.runner_accepted_ids(session_id)
     try:
         # Every connection reopens this stream, so the runner relearns that inferred
         # status edges are handled below; an older runner ignores the parameter.
@@ -12240,6 +12343,10 @@ async def _relay_runner_stream_once(
                                 on_stream_ready()
                         if ready is not None:
                             ready.set()
+                        if conversation_store is not None:
+                            await _reconcile_runner_input_leases(
+                                conversation_store, session_id, event, previous_pending_ids
+                            )
                         continue
 
                     _record_native_input_lifecycle(session_id, event)
