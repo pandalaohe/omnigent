@@ -458,6 +458,64 @@ async def test_continued_session_fire_runs_on_the_claimed_run(store) -> None:
     assert store.get(claimed.task.id).session_id == _CONV_ID
 
 
+async def test_archived_target_pauses_until_resumed_and_notifies_once_per_attempt(
+    store: SqlAlchemyScheduledTaskStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = _saved_task(store, session_mode="continue", session_id=_CONV_ID)
+    assert task.next_run_at is not None
+    clock = FakeClock(task.next_run_at)
+    monkeypatch.setattr(
+        "omnigent.stores.scheduled_task_store.sqlalchemy_store.now_epoch",
+        lambda: int(clock.now()),
+    )
+    conversations = _ExistingConversationStore(
+        _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=_HOST_ID, archived=True)
+    )
+    dispatch = AsyncMock()
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations), launch_dispatch=dispatch, now=clock.now
+    )
+    scheduler = PersistentTaskScheduler(store, executor.fire, executor.recover, now=clock.now)
+
+    async def tick() -> None:
+        await scheduler.poll_once()
+        await asyncio.gather(*list(scheduler._startups.values()))
+
+    try:
+        await tick()
+        [first] = _runs(store, task)
+        assert (first.status, first.error_code, first.conversation_id) == (
+            "failed",
+            "continued_session_archived",
+            None,
+        )
+        paused = store.get(task.id)
+        assert paused is not None and paused.state == "paused"
+        assert first.error is not None and "the automation is paused" in first.error
+        [notice], _ = store.list_inbox_failures(owner_user_id=None)
+        assert (notice.run_id, notice.error_code) == (first.id, first.error_code)
+
+        clock.advance(3600)
+        await tick()
+        assert [run.id for run in _runs(store, task)] == [first.id]
+        assert store.list_inbox_failures(owner_user_id=None)[0] == [notice]
+
+        resumed = store.update(task.id, state="active")
+        assert resumed is not None and resumed.next_run_at is not None
+        clock.advance(resumed.next_run_at - clock.now())
+        await tick()
+        paused = store.get(task.id)
+        assert paused is not None and paused.state == "paused"
+        second, previous = _runs(store, task)
+        assert previous.id == first.id
+        assert (second.status, second.error_code) == ("failed", first.error_code)
+        [new_notice], _ = store.list_inbox_failures(owner_user_id=None)
+        assert (new_notice.run_id, new_notice.error_code) == (second.id, first.error_code)
+        dispatch.assert_not_awaited()
+    finally:
+        await scheduler.stop()
+
+
 async def test_a_continue_tasks_first_claimed_run_keeps_its_session(store) -> None:
     claimed = _claim(store, session_mode="continue")
     conversations = _ConversationStore()

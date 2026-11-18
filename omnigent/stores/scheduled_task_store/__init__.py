@@ -352,6 +352,13 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
+    def retarget_continued_sessions(
+        self, old_id: str, new_id: str, *, user_id: str | None, generation: str | None
+    ) -> None:
+        """Move an owner's continuing automations to their successor session."""
+        ...
+
+    @abstractmethod
     def delete(self, scheduled_task_id: str) -> bool:
         """
         Delete a scheduled task. Idempotent.
@@ -379,6 +386,7 @@ class ScheduledTaskStore(ABC):
         finished_at: int | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        archived_target: ScheduledTask | None = None,
     ) -> ScheduledTaskRun:
         """
         Insert a new scheduled-task-run row.
@@ -394,6 +402,8 @@ class ScheduledTaskStore(ABC):
         :param error: Optional failure detail.
         :param error_code: Optional short failure classification for future
             retry logic (e.g. ``"timeout"``, ``"rate_limited"``).
+        :param archived_target: Pause the still-matching task with this failure,
+            or record this firing as skipped if its target or state has changed.
         :returns: The newly created :class:`ScheduledTaskRun`.
         """
         ...

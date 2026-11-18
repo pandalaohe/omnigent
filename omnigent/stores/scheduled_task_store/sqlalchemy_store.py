@@ -249,6 +249,37 @@ def _run_to_entity(row: SqlScheduledTaskRun) -> ScheduledTaskRun:
     )
 
 
+def _pause_for_archived_target(row: SqlScheduledTask | None, snapshot: ScheduledTask) -> bool:
+    """Check the locked task before pausing it in the run's transaction."""
+    if (
+        row is None
+        or row.id != snapshot.id
+        or row.user_id != snapshot.user_id
+        or row.account_generation != snapshot.account_generation
+        or row.session_mode != encode_scheduled_task_session_mode("continue")
+        or row.session_id != snapshot.session_id
+    ):
+        return False
+    paused = encode_scheduled_task_state("paused")
+    if snapshot.state == "paused":
+        return row.state == paused  # A manual run can start while paused.
+    # Claiming the final occurrence can already have marked the task completed.
+    if row.state not in {
+        encode_scheduled_task_state("active"),
+        encode_scheduled_task_state("completed"),
+    }:
+        return False
+    row.state = paused
+    row.next_run_at = None
+    row.paused_by_archive_batch = None
+    row.updated_at = now_epoch()
+    return True
+
+
+_STALE_ARCHIVED_TARGET = "the automation target or state changed"
+_STALE_ARCHIVED_TARGET_CODE = "continued_session_archive_superseded"
+
+
 class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     """
     SQLAlchemy-backed implementation of :class:`ScheduledTaskStore`.
@@ -824,6 +855,27 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         return run_write_transaction(self._session_immediate, "release_task_session", write)
 
+    def retarget_continued_sessions(
+        self, old_id: str, new_id: str, *, user_id: str | None, generation: str | None
+    ) -> None:
+        def write(session: Session) -> None:
+            require_active_account(session, user_id, generation=generation)
+            session.execute(
+                update(SqlScheduledTask)
+                .where(
+                    SqlScheduledTask.workspace_id == current_workspace_id(),
+                    SqlScheduledTask.user_id == user_id,
+                    SqlScheduledTask.account_generation == generation,
+                    SqlScheduledTask.state != encode_scheduled_task_state("deleted"),
+                    SqlScheduledTask.session_mode
+                    == encode_scheduled_task_session_mode("continue"),
+                    SqlScheduledTask.session_id == old_id,
+                )
+                .values(session_id=new_id, updated_at=now_epoch())
+            )
+
+        run_write_transaction(self._session_immediate, "retarget_continued_sessions", write)
+
     def delete(self, scheduled_task_id: str) -> bool:
         """Hide the task, then remove history in bounded transactions, preserving live claims."""
 
@@ -989,20 +1041,34 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         finished_at: int | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        archived_target: ScheduledTask | None = None,
     ) -> ScheduledTaskRun:
         """Insert a new scheduled-task-run row."""
 
         def write(session: Session) -> ScheduledTaskRun:
+            outcome, detail, code = status, error, error_code
+            if archived_target is not None:
+                task = session.get(
+                    SqlScheduledTask,
+                    (current_workspace_id(), scheduled_task_id),
+                    with_for_update=True,
+                )
+                if not _pause_for_archived_target(task, archived_target):
+                    outcome, detail, code = (
+                        "skipped",
+                        _STALE_ARCHIVED_TARGET,
+                        _STALE_ARCHIVED_TARGET_CODE,
+                    )
             row = SqlScheduledTaskRun(
                 id=run_id,
                 scheduled_task_id=scheduled_task_id,
-                status=encode_scheduled_task_run_status(status),
+                status=encode_scheduled_task_run_status(outcome),
                 scheduled_at=scheduled_at,
                 conversation_id=conversation_id,
                 fired_at=fired_at,
                 finished_at=finished_at,
-                error=error,
-                error_code=error_code,
+                error=detail,
+                error_code=code,
             )
             session.add(row)
             session.flush()
@@ -1068,6 +1134,10 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     .where(
                         SqlScheduledTaskRun.workspace_id == current_workspace_id(),
                         SqlScheduledTaskRun.scheduled_task_id == task.id,
+                        # A superseded claim cannot hide the failure that paused the task.
+                        SqlScheduledTaskRun.error_code.is_distinct_from(
+                            _STALE_ARCHIVED_TARGET_CODE
+                        ),
                     )
                     .order_by(
                         SqlScheduledTaskRun.scheduled_at.desc(), SqlScheduledTaskRun.id.desc()
@@ -1780,6 +1850,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        archived_target: ScheduledTask | None = None,
     ) -> ScheduledTaskRun | None:
         """Transition only a matching startup lease."""
         if status not in {"starting", "running", "succeeded", "failed", "skipped"}:
@@ -1817,14 +1888,23 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 or (row.lease_expires_at <= timestamp) != expired
             ):
                 return None
-            row.status = encode_scheduled_task_run_status(status)
-            if status != "starting":
+            outcome, detail, code = status, error, error_code
+            if archived_target is not None and not _pause_for_archived_target(
+                task, archived_target
+            ):
+                outcome, detail, code = (
+                    "skipped",
+                    _STALE_ARCHIVED_TARGET,
+                    _STALE_ARCHIVED_TARGET_CODE,
+                )
+            row.status = encode_scheduled_task_run_status(outcome)
+            if outcome != "starting":
                 row.lease_expires_at = None
             if conversation_id is not None:
                 row.conversation_id = conversation_id
-            row.finished_at = timestamp if status in {"succeeded", "failed", "skipped"} else None
-            row.error = error
-            row.error_code = error_code
+            row.finished_at = timestamp if outcome in {"succeeded", "failed", "skipped"} else None
+            row.error = detail
+            row.error_code = code
             result = _run_to_entity(row)
             _purge_finished_deleted_task(session, task, row)
             return result

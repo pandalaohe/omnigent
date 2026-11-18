@@ -324,6 +324,7 @@ class _FireRecorder(Protocol):
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        archived_target: ScheduledTask | None = None,
     ) -> None:
         """Record the fire's startup outcome."""
         ...
@@ -356,6 +357,7 @@ class _NewRunRecorder:
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        archived_target: ScheduledTask | None = None,
     ) -> None:
         await _record_run(
             self._deps,
@@ -365,6 +367,7 @@ class _NewRunRecorder:
             status=status,
             error=error,
             error_code=error_code,
+            archived_target=archived_target,
         )
 
     async def hand_off_managed(
@@ -1006,8 +1009,14 @@ async def _continue_session(
     if problem is not None:
         reason, error_code = problem
         _logger.warning("scheduled fire: task %s cannot continue its session: %s", task.id, reason)
+        archived_target = task if error_code == "continued_session_archived" else None
+        if archived_target is not None:
+            reason = f"{reason}; the automation is paused"
         await recorder.finish(
-            "failed", error=f"{reason}; {_NEW_SESSION_HINT}", error_code=error_code
+            "failed",
+            error=f"{reason}; {_NEW_SESSION_HINT}",
+            error_code=error_code,
+            archived_target=archived_target,
         )
         return
     assert conv is not None
@@ -2334,6 +2343,7 @@ async def _record_run(
     status: str,
     error: str | None = None,
     error_code: str | None = None,
+    archived_target: ScheduledTask | None = None,
 ) -> None:
     """Stamp last_run_* on the task and write a scheduled_task_runs row."""
     await asyncio.to_thread(
@@ -2345,6 +2355,7 @@ async def _record_run(
         status,
         error=error,
         error_code=error_code,
+        archived_target=archived_target,
     )
 
 
@@ -2357,6 +2368,7 @@ def _record_run_sync(
     *,
     error: str | None = None,
     error_code: str | None = None,
+    archived_target: ScheduledTask | None = None,
 ) -> None:
     """Synchronous run recording body for ``asyncio.to_thread`` callers."""
     now = _stamp_last_run_sync(deps, task, conversation_id)
@@ -2369,6 +2381,7 @@ def _record_run_sync(
         fired_at=now,
         error=error,
         error_code=error_code,
+        archived_target=archived_target,
     )
 
 
@@ -2895,12 +2908,14 @@ class _ClaimedRunRecorder:
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        archived_target: ScheduledTask | None = None,
     ) -> None:
         await self._lease.finish(
             status,
             conversation_id=conversation_id,
             error=error,
             error_code=error_code,
+            archived_target=archived_target,
             failure_stage=(
                 (startup_failure_stage(error_code) if error_code != "launch_failed" else None)
                 or current_fire_stage()

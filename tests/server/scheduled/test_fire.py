@@ -213,8 +213,12 @@ class FakeScheduledTaskStore:
         scheduled_task_id: str,
         status: str,
         scheduled_at: int,
+        *,
+        archived_target: ScheduledTask | None = None,
         **kwargs: Any,
     ) -> Any:
+        if archived_target is not None:
+            self._rows[scheduled_task_id] = replace(archived_target, state="paused")
         self.run_workspace_ids.append(current_workspace_id())
         self.runs.append(
             {
@@ -4567,8 +4571,11 @@ def test_a_run_from_a_session_sends_its_instructions_or_the_opener_when_empty() 
 
 
 @pytest.mark.asyncio
-async def test_a_run_starts_from_a_copy_of_the_source_session() -> None:
-    conv_store = FakeConversationStore()
+@pytest.mark.parametrize("archived", [False, True])
+async def test_a_run_starts_from_a_copy_of_the_source_session(archived: bool) -> None:
+    conv_store = _ExistingConversationStore(
+        _FakeConversation(id="conv_source", agent_id="ag_1", archived=archived)
+    )
     store = FakeScheduledTaskStore(rows={"task_1": _task(source_session_id="conv_source")})
     launched: list[Any] = []
 
