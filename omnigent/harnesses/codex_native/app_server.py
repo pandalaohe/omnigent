@@ -88,6 +88,7 @@ from omnigent.harnesses.codex_native.launch_args import (
     codex_config_profile,
     codex_workspace_profile,
     codex_workspace_roots,
+    compute_codex_profile_config,
     expand_codex_approval_preset,
     materialize_codex_config_profile,
     normalize_codex_permission_launch_args,
@@ -1233,21 +1234,28 @@ def is_active_writer_error(exc: BaseException) -> bool:
 
 def codex_resume_current_model_provider(exc: BaseException) -> str | None:
     """
-    Return the provider Codex requires after a ``thread/resume`` provider mismatch.
+    Return the provider Codex requires after a ``thread/resume`` provider refusal.
 
     Codex 0.166+ resumes a thread only under its effective provider, and a
     managed config layer can outrank the launch's ``-c model_provider`` pin.
+    Both an ordinary mismatch and a managed-policy conflict name that provider.
 
     :param exc: The exception raised by the resume request.
-    :returns: Codex's current provider, e.g. ``"Databricks"``, or ``None`` for
+    :returns: Codex's required provider, e.g. ``"Databricks"``, or ``None`` for
         any other failure.
     """
     if not isinstance(exc, CodexAppServerResponseError) or exc.code != _CODEX_INVALID_REQUEST_CODE:
         return None
     data = exc.error.get("data") if isinstance(exc.error, dict) else None
-    if not isinstance(data, dict) or data.get("type") != "modelProviderMismatch":
+    if not isinstance(data, dict):
         return None
-    current = data.get("currentModelProvider")
+    error_type = data.get("type")
+    if error_type == "modelProviderMismatch":
+        current = data.get("currentModelProvider")
+    elif error_type == "modelProviderPolicyConflict":
+        current = data.get("requiredModelProvider")
+    else:
+        return None
     return current if isinstance(current, str) and current else None
 
 
@@ -3238,11 +3246,7 @@ class CodexNativeAppServer:
         # (``None``) is treated as supported so a flaky probe never
         # silently disables enforcement — a genuine trust failure is then
         # caught below.
-        codex_version = (
-            await _codex_cli_version(self.codex_path, env=self.env)
-            if CODEX_RUNTIME_BIN_ENV in self.env
-            else await _codex_cli_version(self.codex_path)
-        )
+        codex_version = await _native_codex_cli_version(self.codex_path, self.env)
         self.codex_cli_version = codex_version
         policy_hooks_supported = (
             codex_version is None or codex_version >= _MIN_POLICY_HOOK_CODEX_VERSION
@@ -5212,7 +5216,32 @@ def native_codex_launch_pins_model_provider(launch: NativeCodexLaunch) -> bool:
     )
 
 
-def codex_session_meta_model_provider(launch: NativeCodexLaunch) -> str:
+def _codex_session_meta_pinned_provider(
+    launch: NativeCodexLaunch, *, ignore_invalid_override: bool = False
+) -> str | None:
+    for override in launch.config_overrides:
+        if override.startswith(_MODEL_PROVIDER_OVERRIDE_PREFIX):
+            try:
+                decoded: object = json.loads(
+                    override.removeprefix(_MODEL_PROVIDER_OVERRIDE_PREFIX)
+                )
+                if not isinstance(decoded, str):
+                    raise ValueError("model_provider override must decode to a string")
+            except ValueError:
+                if not ignore_invalid_override:
+                    raise
+            else:
+                return decoded
+    return "omnigent_databricks" if launch.profile is not None else None
+
+
+def codex_session_meta_model_provider(
+    launch: NativeCodexLaunch,
+    *,
+    codex_home: Path | None = None,
+    terminal_launch_args: Sequence[str] = (),
+    codex_version: tuple[int, int, int] | None = None,
+) -> str:
     """Return the provider id a launch routes through, for rollout synthesis.
 
     Synthesized rollouts (fork carry-history, cross-machine cold resume) must
@@ -5237,15 +5266,89 @@ def codex_session_meta_model_provider(launch: NativeCodexLaunch) -> str:
     :returns: Provider id for ``session_meta.model_provider``, e.g.
         ``"omnigent_databricks"``.
     """
-    for override in launch.config_overrides:
-        if override.startswith(_MODEL_PROVIDER_OVERRIDE_PREFIX):
-            decoded: object = json.loads(override.removeprefix(_MODEL_PROVIDER_OVERRIDE_PREFIX))
-            if not isinstance(decoded, str):
-                raise ValueError("model_provider override must decode to a string")
-            return decoded
-    if launch.profile is not None:
-        return "omnigent_databricks"
+    pinned = _codex_session_meta_pinned_provider(launch)
+    if pinned is not None:
+        return pinned
+    from omnigent.onboarding.codex_auth_readiness import (
+        effective_codex_model_provider,
+        load_codex_config,
+    )
+
+    source_home = _codex_home_config_source_from_env()
+    private_config_path = (source_home if codex_home is None else codex_home) / "config.toml"
+    config_path = private_config_path
+    state_path = codex_home / ".omnigent-config-profile.toml" if codex_home is not None else None
+    if not config_path.exists():
+        # App-server start seeds an absent private config from the source after synthesis.
+        config_path = source_home / "config.toml"
+
+    try:
+        config_profile = codex_config_profile(terminal_launch_args)
+    except ValueError:
+        # Launch validation reports malformed selectors before Codex starts.
+        config_profile = None
+    if config_profile is not None or (state_path is not None and state_path.exists()):
+        config = compute_codex_profile_config(
+            config_path, state_path, source_home, config_profile, codex_version=codex_version
+        ).rendered
+    else:
+        config = load_codex_config(config_path)
+        if config is None and config_path.exists():
+            _logger.warning(
+                "Could not read Codex config for rollout provider; using the launch default"
+            )
+    if config is not None:
+        provider = effective_codex_model_provider(config)
+        if provider is not None:
+            return provider
     return "openai"
+
+
+async def _native_codex_cli_version(
+    codex_path: str, env: dict[str, str]
+) -> tuple[int, int, int] | None:
+    if CODEX_RUNTIME_BIN_ENV in env:
+        return await _codex_cli_version(codex_path, env=env)
+    return await _codex_cli_version(codex_path)
+
+
+async def codex_rollout_model_provider(
+    launch: NativeCodexLaunch,
+    *,
+    codex_home: Path,
+    terminal_launch_args: Sequence[str],
+    codex_path: str | None,
+) -> str:
+    """Best-effort provider stamp for a rollout without a usable local provider."""
+    step = "reading launch options"
+    try:
+        codex_version = None
+        if not native_codex_launch_pins_model_provider(launch) and codex_config_profile(
+            terminal_launch_args
+        ):
+            step = "probing the CLI version"
+            executable = codex_path or _find_codex_cli()
+            if executable:
+                env = _clean_codex_env()
+                executable = await asyncio.to_thread(snapshot_codex_binary, executable, env=env)
+                codex_version = await _native_codex_cli_version(executable, env)
+        step = "reading effective configuration"
+        return codex_session_meta_model_provider(
+            launch,
+            codex_home=codex_home,
+            terminal_launch_args=terminal_launch_args,
+            codex_version=codex_version,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Advisory synthesis must never block resume; launch validation stays strict.
+        # A resume mismatch can be retried with Codex's effective provider after startup.
+        _logger.warning(
+            "Could not resolve Codex rollout provider (%s while %s); using the launch default",
+            type(exc).__name__,
+            step,
+        )
+        pinned = _codex_session_meta_pinned_provider(launch, ignore_invalid_override=True)
+        return pinned if pinned is not None else "openai"
 
 
 def native_codex_launch_base_url(launch: NativeCodexLaunch) -> str | None:
@@ -6062,6 +6165,8 @@ async def preload_codex_thread_for_resume(
     session_id: str | None = None,
     model_provider: str | None = None,
     rollout_path: Path | None = None,
+    codex_home: Path | None = None,
+    codex_path: str | None = None,
 ) -> CodexAppServerClient | None:
     """
     Load an existing Codex thread into a freshly started app-server.
@@ -6090,6 +6195,8 @@ async def preload_codex_thread_for_resume(
         because its effective provider differs, e.g. under a managed config, or
         because the thread's recorded provider is no longer configured.
         None surfaces that refusal.
+    :param codex_home: Private Codex home used to recompute an unpinned launch provider.
+    :param codex_path: Codex CLI used by the provider recomputation's optional version probe.
     :returns: The subscribed client when retained, otherwise None.
     :raises RuntimeError: If the app-server rejects the resume.
     """
@@ -6156,8 +6263,18 @@ async def preload_codex_thread_for_resume(
             if rollout_path is not None and unconfigured_provider is not None:
                 # The refusal names only the thread's missing provider; move the
                 # thread to the one this launch runs so the session stays resumable.
-                current_provider = model_provider or await _codex_effective_model_provider(
-                    client, effective_cwd
+                # The app-server's managed config can take precedence over the TUI pin.
+                current_provider = (
+                    await _codex_effective_model_provider(client, effective_cwd)
+                    or model_provider
+                    # An empty pin means a profile-free launch. Recompute its
+                    # config-default provider exactly as rollout synthesis does.
+                    or await codex_rollout_model_provider(
+                        NativeCodexLaunch(config_overrides=[], model=None, profile=None),
+                        codex_home=codex_home or _codex_home_config_source_from_env(),
+                        terminal_launch_args=terminal_launch_args or (),
+                        codex_path=codex_path,
+                    )
                 )
                 if current_provider == unconfigured_provider:
                     current_provider = None
@@ -6170,29 +6287,41 @@ async def preload_codex_thread_for_resume(
                         code=ErrorCode.HARNESS_NOT_CONFIGURED,
                     ) from exc
                 raise
-            _logger.warning(
-                "Codex resumes thread %s only under its effective provider %r "
-                "(requested %r); restamping %s",
-                thread_id,
-                current_provider,
-                model_provider,
-                rollout_path,
-            )
-            restamp = asyncio.create_task(
-                asyncio.to_thread(
-                    _restamp_codex_rollout_model_provider, rollout_path, current_provider
+
+            async def _restamp_and_resume(provider: str) -> None:
+                _logger.warning(
+                    "Codex resumes thread %s only under its effective provider %r "
+                    "(requested %r); restamping %s",
+                    thread_id,
+                    provider,
+                    model_provider,
+                    rollout_path,
                 )
-            )
+                restamp = asyncio.create_task(
+                    asyncio.to_thread(
+                        _restamp_codex_rollout_model_provider, rollout_path, provider
+                    )
+                )
+                try:
+                    await asyncio.shield(restamp)
+                except asyncio.CancelledError:
+                    # Keep ownership until the worker can no longer replace the rollout.
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
+                        await await_cleanup_task(restamp)
+                    raise
+                await client.request("thread/resume", {**resume_params, "modelProvider": provider})
+
             try:
-                await asyncio.shield(restamp)
-            except asyncio.CancelledError:
-                # Keep ownership until the worker can no longer replace the rollout.
-                with contextlib.suppress(Exception, asyncio.CancelledError):
-                    await await_cleanup_task(restamp)
-                raise
-            await client.request(
-                "thread/resume", {**resume_params, "modelProvider": current_provider}
-            )
+                await _restamp_and_resume(current_provider)
+            except CodexAppServerResponseError as retry_exc:
+                if unconfigured_provider is None:
+                    raise
+                retry_provider = codex_resume_current_model_provider(retry_exc)
+                if retry_provider is None:
+                    raise
+                # Managed config can override the computed provider too. Follow
+                # Codex's named provider once more; a further refusal surfaces.
+                await _restamp_and_resume(retry_provider)
         if retain_client:
             retained = True
             return client

@@ -10,6 +10,7 @@ parser; config + ambient are isolated so resolution is deterministic.
 
 from __future__ import annotations
 
+import json
 import shlex
 import sys
 import tomllib
@@ -20,6 +21,7 @@ import yaml
 
 from omnigent.errors import OmnigentError
 from omnigent.harnesses.codex_native.app_server import (
+    NativeCodexLaunch,
     build_codex_native_server,
     codex_session_meta_model_provider,
     resolve_native_codex_launch,
@@ -1099,7 +1101,10 @@ def test_explicit_profile_selecting_openai_overrides_ambient_builtin(
 
     assert "Codex CLI login" in launch.summary
     assert "amazon-bedrock" not in launch.summary
-    assert codex_session_meta_model_provider(launch) == "openai"
+    assert (
+        codex_session_meta_model_provider(launch, terminal_launch_args=["--profile", "openai"])
+        == "openai"
+    )
     assert launch.login_required is (not logged_in)
 
 
@@ -1174,6 +1179,402 @@ def test_malformed_profile_selector_defers_to_launch_arg_validation(
             extra_config_overrides=launch.config_overrides,
             terminal_launch_args=args,
         )
+
+
+@pytest.mark.parametrize(
+    ("config_text", "expected"),
+    [
+        pytest.param(
+            'model_provider = "custom"\n'
+            "[model_providers.custom]\n"
+            'base_url = "https://provider.invalid/v1"\n',
+            "custom",
+            id="configured-custom-provider",
+        ),
+        pytest.param('model = "gpt-test"\n', "openai", id="provider-unset"),
+        pytest.param("model_provider = 42\n", "openai", id="provider-invalid"),
+    ],
+)
+def test_session_meta_provider_uses_session_codex_home(
+    tmp_path: Path, config_text: str, expected: str
+) -> None:
+    """An unpinned rollout names the provider its session Codex config uses."""
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(config_text, encoding="utf-8")
+    launch = NativeCodexLaunch(config_overrides=[], model=None, profile=None)
+
+    assert codex_session_meta_model_provider(launch, codex_home=codex_home) == expected
+
+
+def test_session_meta_provider_reads_source_config_before_private_home_is_populated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh private home inherits the provider its source config will copy."""
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text(
+        'model_provider = "custom"\n'
+        "[model_providers.custom]\n"
+        'base_url = "https://provider.invalid/v1"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    launch = NativeCodexLaunch(config_overrides=[], model=None, profile=None)
+
+    assert (
+        codex_session_meta_model_provider(launch, codex_home=tmp_path / "fresh-private-home")
+        == "custom"
+    )
+
+
+def test_session_meta_provider_warns_when_source_config_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A fresh private home logs a content-free warning for a broken source config."""
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text(
+        'model_provider = "broken-source-content\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    launch = NativeCodexLaunch(config_overrides=[], model=None, profile=None)
+
+    assert (
+        codex_session_meta_model_provider(launch, codex_home=tmp_path / "fresh-private-home")
+        == "openai"
+    )
+    warnings = [
+        record.message
+        for record in caplog.records
+        if "Could not read Codex config for rollout provider" in record.message
+    ]
+    assert len(warnings) == 1
+    assert "broken-source-content" not in caplog.text
+
+
+def _profile_rollout_codex_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Return the private home used by the cold-resume test terminal."""
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridge-root"
+    )
+    codex_home = codex_home_for_bridge_dir(bridge_dir_for_bridge_id("conv_profile"))
+    codex_home.mkdir(parents=True)
+    return codex_home
+
+
+_PROFILE_ROLLOUT_THREAD_ID = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+
+
+async def _rollout_provider_for_profile_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_launch_args: list[str],
+    *,
+    codex_version: tuple[int, int, int] | None = (0, 155, 0),
+    profile_probes: list[str] | None = None,
+    rollout_probes: list[str] | None = None,
+) -> str:
+    """Read the synthesized rollout before the app-server starts."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native import app_server
+    from omnigent.harnesses.codex_native import main as codex_native
+    from omnigent.inner import codex_executor
+
+    async def _profile_version(
+        executable: str, _env: dict[str, str]
+    ) -> tuple[int, int, int] | None:
+        if profile_probes is not None:
+            profile_probes.append(executable)
+        return codex_version
+
+    async def _rollout_version(executable: str) -> tuple[int, int, int] | None:
+        if rollout_probes is not None:
+            rollout_probes.append(executable)
+        return codex_version
+
+    monkeypatch.setattr(app_server, "_native_codex_cli_version", _profile_version)
+    monkeypatch.setattr(codex_executor, "_codex_cli_version", _rollout_version)
+    monkeypatch.setattr(app_server, "snapshot_codex_binary", lambda executable, **_: executable)
+
+    async def _fetch_session(_client: object, _session_id: str) -> dict[str, object]:
+        return {
+            "labels": {codex_native._WRAPPER_LABEL_KEY: codex_native._WRAPPER_LABEL_VALUE},
+            "external_session_id": _PROFILE_ROLLOUT_THREAD_ID,
+        }
+
+    async def _no_running_terminal(_client: object, _session_id: str) -> None:
+        return None
+
+    class _ProviderCaptured(Exception):
+        pass
+
+    ensure_rollout = codex_native._ensure_local_codex_resume_rollout
+    rollout: Path | None = None
+
+    async def _capture_rollout(*args, **kwargs) -> None:
+        nonlocal rollout
+        rollout = await ensure_rollout(*args, **kwargs)
+        raise _ProviderCaptured
+
+    # Isolate synthesis from provider routing: these cases exercise only the
+    # private/source config layers selected by the terminal's file-profile args.
+    monkeypatch.setattr(codex_native, "_fetch_codex_session", _fetch_session)
+    monkeypatch.setattr(codex_native, "_find_running_codex_terminal", _no_running_terminal)
+    monkeypatch.setattr(codex_native, "_ensure_local_codex_resume_rollout", _capture_rollout)
+    monkeypatch.setattr(codex_native, "_replay_dead_letters_before_resume", AsyncMock())
+    monkeypatch.setattr(
+        codex_native, "_fetch_all_session_items_for_codex_resume", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.native_attachments.resolve_session_item_file_references",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        codex_native,
+        "resolve_native_codex_launch",
+        lambda **_kwargs: NativeCodexLaunch(config_overrides=[], model=None, profile=None),
+    )
+
+    with pytest.raises(_ProviderCaptured):
+        await codex_native._prepare_codex_terminal(
+            base_url="http://test",
+            headers={},
+            session_id="conv_profile",
+            runner_id=None,
+            session_bundle=None,
+            codex_args=tuple(terminal_launch_args),
+            command="codex",
+            model=None,
+        )
+    assert rollout is not None
+    with rollout.open(encoding="utf-8") as handle:
+        provider = json.loads(handle.readline())["payload"]["model_provider"]
+    assert isinstance(provider, str)
+    return provider
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("private_provider", [None, "previous-profile"])
+async def test_session_meta_provider_uses_launch_profile_over_default_and_stale_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, private_provider: str | None
+) -> None:
+    """Rollout synthesis uses the selected file profile, never another config layer."""
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text(
+        'model_provider = "source-default"\n', encoding="utf-8"
+    )
+    (source_home / "work.config.toml").write_text(
+        'model_provider = "work-provider"\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    codex_home = _profile_rollout_codex_home(tmp_path, monkeypatch)
+    if private_provider is not None:
+        (codex_home / "config.toml").write_text(
+            f'model_provider = "{private_provider}"\n', encoding="utf-8"
+        )
+
+    provider = await _rollout_provider_for_profile_launch(monkeypatch, ["--profile", "work"])
+
+    assert provider == "work-provider"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_launch_args", [["--profile", "work"], []])
+async def test_session_meta_provider_restores_profile_base_before_synthesis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_launch_args: list[str],
+) -> None:
+    """Switching or removing a profile starts from its journal base, not its stale result."""
+    from omnigent.harnesses.codex_native.launch_args import materialize_codex_config_profile
+
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    base_config = 'model_provider = "base-provider"\n'
+    (source_home / "config.toml").write_text(base_config, encoding="utf-8")
+    (source_home / "previous.config.toml").write_text(
+        'model_provider = "previous-profile"\n', encoding="utf-8"
+    )
+    (source_home / "work.config.toml").write_text('approval_policy = "never"\n', encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    codex_home = _profile_rollout_codex_home(tmp_path, monkeypatch)
+    (codex_home / "config.toml").write_text(base_config, encoding="utf-8")
+    materialize_codex_config_profile(
+        codex_home,
+        source_home,
+        "previous",
+        codex_version=(0, 155, 0),
+    )
+
+    provider = await _rollout_provider_for_profile_launch(monkeypatch, terminal_launch_args)
+
+    assert provider == "base-provider"
+
+
+@pytest.mark.asyncio
+async def test_session_meta_provider_recovers_pending_profile_with_instructions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.codex_native.launch_args import materialize_codex_config_profile
+
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    profile_config = 'model_provider = "work-provider"\ndeveloper_instructions = "Use work."\n'
+    (source_home / "work.config.toml").write_text(profile_config, encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    codex_home = _profile_rollout_codex_home(tmp_path, monkeypatch)
+    config_path = codex_home / "config.toml"
+    written_config = (
+        'model_provider = "previous-provider"\ndeveloper_instructions = "Use previous."\n'
+    )
+    journal_path = codex_home / ".omnigent-config-profile.toml"
+    # The previous launch replaced config.toml and died before committing the journal.
+    pending_journal = (
+        '[base]\nmodel_provider = "base-provider"\n'
+        '[applied]\nmodel_provider = "base-provider"\n'
+        '[pending]\nmodel_provider = "previous-provider"\n'
+    )
+    config_path.write_text(written_config, encoding="utf-8")
+    journal_path.write_text(pending_journal, encoding="utf-8")
+
+    provider: str | ValueError
+    try:
+        provider = await _rollout_provider_for_profile_launch(monkeypatch, ["--profile", "work"])
+    except ValueError as error:
+        provider = error
+
+    assert config_path.read_text(encoding="utf-8") == written_config
+    assert journal_path.read_text(encoding="utf-8") == pending_journal
+    materialize_codex_config_profile(codex_home, source_home, "work", codex_version=(0, 155, 0))
+    launch_config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert launch_config["model_provider"] == "work-provider"
+    assert provider == launch_config["model_provider"]
+
+
+@pytest.mark.asyncio
+async def test_session_meta_provider_uses_inline_profile_for_legacy_codex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    (source_home / "work.config.toml").write_text(
+        'model_provider = "file-provider"\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    codex_home = _profile_rollout_codex_home(tmp_path, monkeypatch)
+    (codex_home / "config.toml").write_text(
+        '[profiles.work]\nmodel_provider = "inline-provider"\n', encoding="utf-8"
+    )
+
+    assert (
+        await _rollout_provider_for_profile_launch(
+            monkeypatch, ["--profile", "work"], codex_version=(0, 133, 0)
+        )
+        == "inline-provider"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing_provider", [None, "thread-provider"])
+async def test_session_meta_provider_with_unknown_legacy_codex_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    existing_provider: str | None,
+) -> None:
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    codex_home = _profile_rollout_codex_home(tmp_path, monkeypatch)
+    (codex_home / "config.toml").write_text(
+        '[profiles.work]\nmodel_provider = "inline-provider"\n', encoding="utf-8"
+    )
+    if existing_provider is not None:
+        target = codex_home / "sessions" / f"rollout-existing-{_PROFILE_ROLLOUT_THREAD_ID}.jsonl"
+        target.parent.mkdir()
+        target.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": _PROFILE_ROLLOUT_THREAD_ID,
+                        "model_provider": existing_provider,
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    profile_probes: list[str] = []
+    rollout_probes: list[str] = []
+    result: str | OSError
+    try:
+        result = await _rollout_provider_for_profile_launch(
+            monkeypatch,
+            ["--profile", "work"],
+            codex_version=None,
+            profile_probes=profile_probes,
+            rollout_probes=rollout_probes,
+        )
+    except OSError as error:
+        result = error
+
+    assert result == (existing_provider or "openai")
+    assert profile_probes == ([] if existing_provider else ["codex"])
+    assert rollout_probes == ([] if existing_provider else ["codex"])
+    warnings = [r for r in caplog.messages if "Could not resolve Codex rollout provider" in r]
+    assert len(warnings) == (0 if existing_provider else 1)
+
+
+@pytest.mark.asyncio
+async def test_session_meta_provider_falls_back_before_stance_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from omnigent.harnesses.codex_native.launch_args import materialize_codex_config_profile
+    from omnigent.inner.codex_config_sync import sync_codex_config
+
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    source_config = source_home / "config.toml"
+    source_config.write_text('approval_policy = "never"\n', encoding="utf-8")
+    (source_home / "work.config.toml").write_text(
+        'model_provider = "work-provider"\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    codex_home = _profile_rollout_codex_home(tmp_path, monkeypatch)
+    config_path = codex_home / "config.toml"
+    config_path.write_text(
+        'model_provider = "previous-provider"\napproval_policy = "on-request"\n', encoding="utf-8"
+    )
+    (codex_home / ".omnigent-config-profile.toml").write_text(
+        '[base]\nmodel_provider = "base-provider"\napproval_policy = "never"\n'
+        '[applied]\nmodel_provider = "base-provider"\napproval_policy = "never"\n'
+        '[pending]\nmodel_provider = "previous-provider"\napproval_policy = "never"\n',
+        encoding="utf-8",
+    )
+
+    result: str | ValueError
+    try:
+        result = await _rollout_provider_for_profile_launch(monkeypatch, ["--profile", "work"])
+    except ValueError as error:
+        result = error
+
+    assert result == "openai"
+    warnings = [r for r in caplog.messages if "Could not resolve Codex rollout provider" in r]
+    assert len(warnings) == 1
+    assert "ValueError while reading effective configuration" in warnings[0]
+    sync_codex_config(source_config, config_path, include_credentials=True, minimal_config=False)
+    materialize_codex_config_profile(codex_home, source_home, "work", codex_version=(0, 155, 0))
+    assert (
+        tomllib.loads(config_path.read_text(encoding="utf-8"))["model_provider"] == "work-provider"
+    )
 
 
 def test_global_api_key_routes_without_model_or_cli_login(
