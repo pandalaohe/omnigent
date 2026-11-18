@@ -476,6 +476,7 @@ _COMPOSER_KILL_TO_LINE_START = "\x1b[117;5u"
 _COMPOSER_CLEAR_MAX_ROUNDS = 3
 # Footer rows Claude Code draws under the input box (mode hints, status line).
 _SCROLLED_DRAFT_MAX_FOOTER_ROWS = 4
+_CLIPPED_DRAFT_RULE_RE = re.compile(r"─+ ↑ [1-9]\d* more ─+")
 # How long to wait for the pasted draft to visibly land in Claude's
 # input box before sending the submit Enter. Claude Code coalesces
 # rapid stdin bursts into a paste, so an Enter sent while the TUI is
@@ -869,6 +870,10 @@ class ClaudeUserPromptPending(RuntimeError):
 
 class ClaudeMessageNotAccepted(RuntimeError):
     """The submitted draft remained in Claude's input box until the deadline."""
+
+
+class ClaudeDeliveryUnconfirmed(ClaudeMessageNotAccepted):
+    """The pane may still hold the paste, so delivery recovery must preserve it."""
 
 
 class ClaudeComposerNotCleared(ClaudeMessageNotAccepted):
@@ -5635,25 +5640,46 @@ def _paste_and_submit(
     submitted_by_paste = bool(needle) and (
         pane.count(needle) > transcript_before_paste.count(needle)
     )
-    if (
-        not draft_seen
-        and not submitted_by_paste
-        and (box is None or (box.framed and "".join(box.rows).strip() == _CLAUDE_PROMPT_GLYPH))
-    ):
-        # A resuming TUI can drop the paste, then remount an empty composer
-        # before the draft wait ends. Recover once before sending any Enter.
+    empty_box = (
+        box is not None and box.framed and "".join(box.rows).strip() == _CLAUDE_PROMPT_GLYPH
+    )
+    if not draft_seen and empty_box and submitted_by_paste:
+        return
+    if not draft_seen and not submitted_by_paste and (box is None or empty_box):
+        # A resuming TUI can remount an empty composer or redraw the original paste.
         delivery_diagnostics.set_stage("waiting_for_composer")
-        _wait_for_claude_prompt_ready(
-            socket_path,
-            tmux_target,
-            timeout_s=_TMUX_READY_TIMEOUT_S,
-            bridge_dir=bridge_dir,
-            extend_for_slow_boot=False,
-        )
-        _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
-        draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
-            bridge_dir, socket_path, tmux_target, text=text, needle=needle, tail_needle=tail_needle
-        )
+        try:
+            existing_draft = _wait_for_claude_prompt_ready(
+                socket_path,
+                tmux_target,
+                timeout_s=_TMUX_READY_TIMEOUT_S,
+                bridge_dir=bridge_dir,
+                extend_for_slow_boot=False,
+                draft_visible=lambda capture: (
+                    _clipped_draft_matches(capture, tail_needle)
+                    or (
+                        bool(_composer_rows(capture))
+                        and _draft_in_input_box(capture, needle, tail_needle=tail_needle)
+                    )
+                ),
+            )
+        except ClaudeTerminalExited:
+            raise
+        except ClaudePromptTimeout as exc:
+            # The paste may still be in the live pane. Leave it available for inspection.
+            raise ClaudeDeliveryUnconfirmed(str(exc)) from exc
+        if existing_draft is not None:
+            draft_seen, pane = True, existing_draft
+        else:
+            _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+            draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
+                bridge_dir,
+                socket_path,
+                tmux_target,
+                text=text,
+                needle=needle,
+                tail_needle=tail_needle,
+            )
     delivery_diagnostics.record_draft(
         pane=pane,
         needle=needle,
@@ -5669,6 +5695,24 @@ def _paste_and_submit(
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; message not sent."
+        )
+    current = _capture_pane(socket_path, tmux_target)
+    _raise_if_user_prompt_pending(bridge_dir, current)
+    clipped_draft = draft_seen and (
+        _clipped_draft_matches(pane, tail_needle) or _clipped_draft_matches(current, tail_needle)
+    )
+    if (
+        _terminal_dialog_headline(current) is not None
+        or _history_search_footer_shown(current)
+        or (
+            not _composer_rows(current)
+            and not _clipped_draft_matches(current, tail_needle)
+            and not _unframed_prompt_row(current)
+        )
+        or (clipped_draft and not _draft_in_input_box(current, needle, tail_needle=tail_needle))
+    ):
+        raise ClaudeDeliveryUnconfirmed(
+            "Claude's pasted input could not be confirmed. Inspect the terminal before retrying."
         )
     delivery_diagnostics.set_stage("submitting")
     transcript_path = read_transcript_path(bridge_dir)
@@ -5700,9 +5744,10 @@ def _paste_and_submit(
             tail_needle=tail_needle,
             what="submitted message",
             bridge_dir=bridge_dir,
-            wait_for_startup=startup_submit,
+            wait_for_startup=startup_submit and not clipped_draft,
             submit_boundary=submit_boundary,
             submitted_text=text,
+            retry_enter=not clipped_draft,
         )
     except ClaudeUserPromptPending as exc:
         # The Enter already went out, so the prompt may belong to this message's own turn.
@@ -5716,7 +5761,8 @@ def _paste_and_submit(
             state["accepted_input_tmux"] = tmux_info
             _write_json_file(bridge_dir / _STATE_FILE, state)
         return
-    raise ClaudeMessageNotAccepted(
+    error_type = ClaudeDeliveryUnconfirmed if clipped_draft else ClaudeMessageNotAccepted
+    raise error_type(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(the draft is still in the input box). The message was not delivered."
     )
@@ -5790,6 +5836,7 @@ def _paste_and_await_draft(
     wait_started = time.monotonic()
     deadline = wait_started + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
+        _check_injection_cancelled()
         pane = _capture_pane(socket_path, tmux_target)
         polls += 1
         empty_captures += not pane.strip()
@@ -5812,6 +5859,7 @@ def _verify_submit_accepted(
     submit_boundary: SubmitBoundary | None = None,
     submitted_text: str | None = None,
     before_retry: Callable[[], None] | None = None,
+    retry_enter: bool = True,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -5838,6 +5886,7 @@ def _verify_submit_accepted(
     :param submit_boundary: Native transcript boundary captured before Enter.
     :param submitted_text: Full submitted text; a marker alone cannot identify a refusal.
     :param before_retry: Optional live idle guard before sending another Enter.
+    :param retry_enter: Whether the original draft was observed with its prompt glyph.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     :raises ClaudeSubmitBlockedUnconfirmed: A fresh matching refusal appeared;
@@ -5921,7 +5970,11 @@ def _verify_submit_accepted(
                 if wait_for_startup
                 else f"retrying for up to {_SUBMIT_VERIFY_TIMEOUT_S:.0f}s",
             )
-        if _draft_in_input_box(pane, needle) and now - last_enter >= retry_interval:
+        if (
+            retry_enter
+            and _draft_in_input_box(pane, needle)
+            and now - last_enter >= retry_interval
+        ):
             _raise_if_user_prompt_pending(bridge_dir, pane)
             if before_retry is not None:
                 before_retry()
@@ -8681,6 +8734,42 @@ def _submit_tail_needle(content: str) -> str:
     return ""
 
 
+def _clipped_draft_matches(pane: str, tail_needle: str) -> bool:
+    """Look for a clipped draft ending at the composer's actual closing rule."""
+    lines = pane.splitlines()
+    rules = _composer_frame_rule_indices(lines)
+    if not rules or _box_rule_start(lines[rules[-1]]) != 0:
+        return False
+    closing_rule = rules[-1]
+    footer = [line.strip() for line in lines[closing_rule + 1 :] if line.strip()]
+    if not footer or not footer[-1].startswith(("-- INSERT --", "⏵⏵", "? for shortcuts")):
+        return False
+    if any(_DIALOG_FOOTER_RE.search(line) for line in footer):
+        return False
+    opening_rule = rules[-2] if len(rules) >= 2 else -1
+    collapsed = opening_rule >= 0 and bool(_CLIPPED_DRAFT_RULE_RE.fullmatch(lines[opening_rule]))
+    if opening_rule >= 0 and not collapsed:
+        return False
+    rows = [line for line in lines[opening_rule + 1 : closing_rule] if line.strip()]
+    if not rows or any(not row.startswith("  ") for row in rows):
+        return False
+    target = _comparable_draft_text(tail_needle)
+    return _comparable_draft_text("".join(rows)).endswith(target) if target else collapsed
+
+
+def _unframed_prompt_row(pane: str) -> str:
+    """Allow a prompt clipped to the top row, excluding menu selections."""
+    first = pane.partition("\n")[0].strip()
+    if (
+        first.startswith(_CLAUDE_PROMPT_GLYPH)
+        and not re.match(r"❯\s+\d+[.)]\s", first)
+        and not any(_is_box_rule(line) for line in pane.splitlines())
+        and not _user_prompt_visible(pane)
+    ):
+        return first
+    return ""
+
+
 def _draft_in_input_box(pane: str, needle: str, *, tail_needle: str = "") -> bool:
     """
     Return whether the pasted draft is visible in Claude's input box.
@@ -8688,11 +8777,9 @@ def _draft_in_input_box(pane: str, needle: str, *, tail_needle: str = "") -> boo
     Reads the framed input box (:func:`_composer_rows`): the glyph row
     plus the rows under it down to the closing rule, since a collapsed
     paste can render as a blank ``❯`` with the placeholder one row
-    below. Rows above the frame, such as the submitted message's
-    transcript echo, are never read. Without a frame on screen it falls
-    back to the text after the **last** :data:`_CLAUDE_PROMPT_GLYPH` in
-    the pane, as before; that row can be an echo or a dialog row. The draft
-    counts as visible when that text contains *needle* (small pastes
+    below. A taller draft can scroll the glyph out of view. In that case
+    the remaining composer frame and draft tail identify it. The draft
+    counts as visible when the composer contains *needle* (small pastes
     render verbatim) or the :data:`_PASTED_PLACEHOLDER_PREFIX`
     placeholder (Claude Code collapses large pastes).
     Whitespace is ignored, so a needle wrapped across rows still matches,
@@ -8709,6 +8796,8 @@ def _draft_in_input_box(pane: str, needle: str, *, tail_needle: str = "") -> boo
         well: a draft taller than the box scrolls its first line out of view.
     :returns: ``True`` when the draft is still sitting in the input box.
     """
+    if _history_search_footer_shown(pane):
+        return False
     rows = _composer_rows(pane)
     first_row = rows[0].strip() if rows else ""
     if rows and _CLAUDE_PROMPT_GLYPH in rows[0]:
@@ -8717,10 +8806,9 @@ def _draft_in_input_box(pane: str, needle: str, *, tail_needle: str = "") -> boo
         tail = "\n".join([first_row[len(_SHELL_MODE_GLYPH) :], *rows[1:]])
         needle = needle.removeprefix(_SHELL_MODE_GLYPH)
     else:
-        glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
-        if not glyph_lines:
-            return False
-        tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
+        if _clipped_draft_matches(pane, tail_needle):
+            return True
+        tail = _unframed_prompt_row(pane).removeprefix(_CLAUDE_PROMPT_GLYPH)
     if _PASTED_PLACEHOLDER_PREFIX in tail:
         return True
     # The hint is not a draft, but a short needle such as "to" or "a" matches its words.
@@ -8832,7 +8920,8 @@ def _wait_for_claude_prompt_ready(
     timeout_s: float,
     bridge_dir: Path | None = None,
     extend_for_slow_boot: bool = True,
-) -> None:
+    draft_visible: Callable[[str], bool] | None = None,
+) -> str | None:
     """
     Block until Claude Code's TUI input box is ready for keystrokes.
 
@@ -8866,7 +8955,8 @@ def _wait_for_claude_prompt_ready(
         time). A slow boot then fails the wait instead of outliving the request,
         while a dead pane still ends it at the first liveness check, a
         :data:`_CLAUDE_LIVENESS_POLL_INTERVAL_S` in, rather than at the cap.
-    :returns: None.
+    :param draft_visible: Optional check for an existing paste when recovering after typing.
+    :returns: The matching draft capture, or ``None`` when the prompt rendered.
     :raises ClaudeTerminalExited: If the pane is gone: tmux affirms the
         process exited, carrying its wait-status so a clean quit is
         distinguishable from a crash, or tmux no longer reports the pane
@@ -8927,15 +9017,17 @@ def _wait_for_claude_prompt_ready(
             bridge_dir,
             pane,
             message="Claude is waiting for an explicit answer; message not sent.",
-            nothing_typed=True,
+            nothing_typed=draft_visible is None,
         )
         polls += 1
         if pane.strip():
             last_nonempty = pane
         else:
             empty_polls += 1
+        if draft_visible is not None and draft_visible(pane):
+            return pane
         if _claude_prompt_rendered(pane):
-            return
+            return None
         remaining = hard_deadline - time.monotonic()
         if (
             bridge_dir is not None

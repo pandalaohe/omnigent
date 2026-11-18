@@ -21,6 +21,7 @@ from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
     ClaudeComposerNotCleared,
+    ClaudeDeliveryUnconfirmed,
     ClaudeInputBoxOccupied,
     ClaudeMessageNotAccepted,
     ClaudePromptTimeout,
@@ -714,6 +715,11 @@ class ClaudeNativeExecutor(Executor):
                 extra={"session_id": self._request_session_id},
             )
             yield ExecutorError(message=describe_exception(exc), undelivered=True)
+            return
+        except ClaudeDeliveryUnconfirmed as exc:
+            yield ExecutorError(
+                message=describe_exception(exc), undelivered=True, preserve_session=True
+            )
             return
         except (TmuxSessionNotAdvertised, ClaudeMessageNotAccepted) as exc:
             # The terminal may still launch, or its unsent draft may be recoverable.

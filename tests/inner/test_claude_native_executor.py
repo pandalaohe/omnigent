@@ -21,6 +21,7 @@ import pytest
 from omnigent.harnesses.claude_native import bridge as claude_bridge
 from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
+    ClaudeDeliveryUnconfirmed,
     ClaudePromptTimeout,
     ClaudeSignInPending,
     ClaudeTerminalDialog,
@@ -2374,16 +2375,21 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("tmux send-keys failed"), ClaudeDeliveryUnconfirmed("paste unconfirmed")],
+)
 async def test_run_turn_does_not_reap_unrelated_runtime_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    error: RuntimeError,
 ) -> None:
     """Only the readiness failure that terminalizes the turn triggers cleanup."""
     killed: list[Path] = []
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
-        raise RuntimeError("tmux send-keys failed")
+        raise error
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
     monkeypatch.setattr(
@@ -2404,8 +2410,9 @@ async def test_run_turn_does_not_reap_unrelated_runtime_error(
 
     assert killed == []
     assert isinstance(events[0], ExecutorError)
-    assert events[0].message == "tmux send-keys failed"
-    assert events[0].undelivered is False
+    assert events[0].message == str(error)
+    assert events[0].undelivered is isinstance(error, ClaudeDeliveryUnconfirmed)
+    assert events[0].preserve_session is isinstance(error, ClaudeDeliveryUnconfirmed)
 
 
 @pytest.mark.asyncio

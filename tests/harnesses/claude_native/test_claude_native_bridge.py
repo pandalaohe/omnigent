@@ -6999,6 +6999,66 @@ def test_inject_user_message_retries_enter_for_a_draft_below_the_prompt_row(
 
 
 @pytest.mark.parametrize(
+    ("collapsed", "delayed", "dialog"),
+    [
+        pytest.param(False, False, False, id="scrolled-tail"),
+        pytest.param(True, False, False, id="collapsed"),
+        pytest.param(False, True, False, id="late-repaint-scrolled-tail"),
+        pytest.param(True, True, False, id="late-repaint-collapsed"),
+        pytest.param(True, False, True, id="dialog-before-enter"),
+    ],
+)
+def test_inject_user_message_submits_a_clipped_draft_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, collapsed: bool, delayed: bool, dialog: bool
+) -> None:
+    """A narrow pane can show the pasted draft without its prompt glyph."""
+    bridge = claude_native_bridge
+    clock = _VirtualClock()
+    monkeypatch.setattr(bridge, "time", clock)
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(bridge, "_TMUX_READY_TIMEOUT_S", 1.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=_TEST_TMUX_SOCKET, tmux_target="claude:0.0")
+    rule = "─" * 52
+    draft = "  in the next report, include the counts\n  and the final test result"
+    top = f"  ⎿  Processing… 1\n● Considering…\n─── ↑ 1 more {'─' * 39}\n" if collapsed else ""
+    pane = (
+        f"{top}{draft}\n{rule}\n"
+        "  [Model] │ workspace\n"
+        "  Context 158k/1.0M\n"
+        "  ✓ Bash ×13\n"
+        "  ✓ Read ×2\n"
+        "  -- INSERT -- ⏵⏵ auto mode on\n"
+    )
+    mutations: list[str] = []
+
+    def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        if "capture-pane" in cmd:
+            visible = _composer_pane()
+            if mutations == ["paste"]:
+                visible = "Repainting…\n" if delayed and clock.monotonic() < 1.0 else pane
+                if dialog and clock.monotonic() > 0:
+                    visible = "Choose a model\n❯ 1. Example\n  Enter to confirm\n"
+            return SimpleNamespace(returncode=0, stdout=visible, stderr="")
+        if "paste-buffer" in cmd:
+            mutations.append("paste")
+        if cmd[-1] == "Enter":
+            mutations.append("submit")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", run)
+    content = f"Please finish verifying the change.\n{draft.strip()}"
+    if dialog:
+        with pytest.raises(bridge.ClaudeDeliveryUnconfirmed):
+            inject_user_message(bridge_dir, content=content)
+        assert mutations == ["paste"]
+    else:
+        inject_user_message(bridge_dir, content=content)
+        assert mutations == ["paste", "submit"]
+
+
+@pytest.mark.parametrize(
     "replay_captures,recovered_draft",
     [(8, ""), (25, ""), (8, "unfinished terminal edit")],
     ids=["composer-returned", "still-replaying", "nonempty-composer"],
