@@ -7222,24 +7222,30 @@ def test_inject_user_message_never_submits_without_the_current_draft(
     assert mutations == ["paste"]
 
 
+@pytest.mark.parametrize(
+    "old_output", ["", "  Do you want to deploy?\n"], ids=["plain", "permission-wording"]
+)
 def test_frameless_echo_is_not_post_submit_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old_output: str
 ) -> None:
     bridge = claude_native_bridge
     monkeypatch.setattr(bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.3)
     monkeypatch.setattr(bridge, "_SUBMIT_STARTUP_TIMEOUT_S", 1.0, raising=False)
     content = "please review the attached change"
+    stale_frame = f"❯ another old message\n  ⎿  done\n{old_output}"
     bridge_dir, mutations, _clock = _scripted_paste_tui(
         monkeypatch,
         tmp_path,
         lambda _n, _now: _composer_pane(content),
-        after_submit="❯ another old message\n  ⎿  done\n",
+        after_submit=stale_frame,
     )
 
     with pytest.raises(bridge.ClaudeDeliveryUnconfirmed):
         inject_user_message(bridge_dir, content=content)
 
     assert mutations == ["paste", "submit"]
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: stale_frame)
+    assert not bridge.has_pending_user_prompt(bridge_dir)
 
 
 def test_inject_user_message_confirms_a_clipped_draft_ending_in_a_short_line(
@@ -7420,6 +7426,71 @@ def test_resized_protected_draft_is_rechecked_before_pasting(
         inject_user_message(bridge_dir, content=content)
 
     assert not sends and not mutations
+
+
+def test_torn_resize_capture_does_not_unprotect_a_clipped_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = claude_native_bridge
+    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setattr(bridge, "time", _VirtualClock())
+    write_tmux_target(bridge_dir, socket_path=_TEST_TMUX_SOCKET, tmux_target="claude:0.0")
+    expanded = _composer_pane("the old draft is visible again")
+    frames = iter(["", _LIVE_CLIPPED_PANE, "", expanded])
+    captured: list[str] = []
+
+    def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        if "capture-pane" in cmd:
+            captured.append(next(frames, expanded))
+            return SimpleNamespace(returncode=0, stdout=captured[-1], stderr="")
+        assert not {"send-keys", "load-buffer", "paste-buffer"}.intersection(cmd), cmd
+        return SimpleNamespace(returncode=0, stdout="0", stderr="")
+
+    monkeypatch.setattr("subprocess.run", run)
+    with pytest.raises(bridge.ClaudeInputBoxOccupied) as caught:
+        inject_user_message(bridge_dir, content="new web message")
+
+    assert caught.value.surface == bridge._SCROLLED_DRAFT_SURFACE
+    assert captured == ["", _LIVE_CLIPPED_PANE, "", expanded]
+
+
+def test_cancel_during_final_protected_draft_capture_prevents_paste(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = claude_native_bridge
+    bridge_dir = tmp_path / "bridge"
+    socket_path, target = str(_TEST_TMUX_SOCKET), "claude:0.0"
+    write_tmux_target(bridge_dir, socket_path=_TEST_TMUX_SOCKET, tmux_target=target)
+    bridge._set_protected_draft(bridge_dir, socket_path, target, protect=True)
+    cancelled, paste_started = threading.Event(), threading.Event()
+    buffer_loaded = False
+    protected_captures = 0
+    writes: list[list[str]] = []
+
+    def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        nonlocal buffer_loaded, protected_captures
+        if "capture-pane" in cmd:
+            if buffer_loaded:
+                protected_captures += 1
+                if protected_captures == 2:
+                    cancelled.set()
+            return SimpleNamespace(returncode=0, stdout=_composer_pane(), stderr="")
+        if "load-buffer" in cmd:
+            buffer_loaded = True
+        if "send-keys" in cmd or "paste-buffer" in cmd:
+            writes.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", run)
+    with (
+        bridge.cancellable_injection(cancelled, paste_started=paste_started),
+        pytest.raises(bridge.ClaudeInjectionCancelled),
+    ):
+        inject_user_message(bridge_dir, content="new web message")
+
+    assert protected_captures == 2
+    assert writes == []
+    assert not paste_started.is_set()
 
 
 def test_a_tall_draft_shape_with_a_dialog_footer_is_still_not_ready(
@@ -8102,8 +8173,11 @@ def test_submit_with_only_empty_frames_still_checks_receipts_liveness_and_deadli
     transcript = tmp_path / "session.jsonl"
     transcript.touch()
     probes = 0
+    submit_frames: list[float] = []
 
     def on_capture(now: float) -> None:
+        if "submit" in mutations:
+            submit_frames.append(now)
         if "submit" in mutations and outcome == "receipt":
             transcript.write_text(
                 json.dumps(
@@ -8140,15 +8214,20 @@ def test_submit_with_only_empty_frames_still_checks_receipts_liveness_and_deadli
         state["accepted_input_tmux"] = bridge._tmux_input_identity(bridge_dir)
         bridge._write_json_file(state_path, state)
 
-    def liveness(*_args: object) -> SimpleNamespace:
+    def liveness(*_args: object) -> claude_native_bridge._ClaudePaneState:
         nonlocal probes
         probes += 1
-        return SimpleNamespace(alive=outcome != "exit")
+        return bridge._ClaudePaneState(alive=outcome != "exit", exited=outcome == "exit")
 
     monkeypatch.setattr(bridge, "_claude_pane_state", liveness)
     started = clock.monotonic()
     if outcome == "receipt":
         inject_user_message(bridge_dir, content=content)
+    elif outcome == "exit":
+        with pytest.raises(bridge.ClaudeDeliveryUnconfirmed, match="terminal exited"):
+            inject_user_message(bridge_dir, content=content)
+        assert probes == 1
+        assert submit_frames == [clock.monotonic()]
     else:
         with pytest.raises(bridge.ClaudeDeliveryUnconfirmed):
             inject_user_message(bridge_dir, content=content)

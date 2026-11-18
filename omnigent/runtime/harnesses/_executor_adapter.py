@@ -77,6 +77,7 @@ from omnigent.server.schemas import (
     ElicitationResolvedEvent,
     ElicitationResult,
     InjectionConsumedEvent,
+    InjectionUnconfirmedEvent,
     OutputItemDoneEvent,
     OutputTextDeltaEvent,
     ReasoningStartedEvent,
@@ -1094,6 +1095,17 @@ class ExecutorAdapter(HarnessApp):
                 if injection.input_admission_required:
                     _emit_injection_consumed(ctx, injection)
                 continue
+            if not certain:
+                watcher = asyncio.current_task()
+                cancelling = watcher is not None and watcher.cancelling() > 0
+                if cancelling or ctx.cancelled.is_set():
+                    # Keep the reservation fenced. Drop the runner's replay copy
+                    # without claiming the draft reached the current turn.
+                    if injection.injection_id:
+                        ctx.emit(InjectionUnconfirmedEvent(injection_id=injection.injection_id))
+                    if cancelling:
+                        raise asyncio.CancelledError
+                    return
             try:
                 if injection.input_admission_required and certain:
                     await ctx.claim_input_execution(
@@ -1106,9 +1118,6 @@ class ExecutorAdapter(HarnessApp):
                 # Turn completion may cancel settlement after the executor accepted.
                 if accepted:
                     _emit_injection_consumed(ctx, injection)
-            watcher = asyncio.current_task()
-            if outcome == "executor_ambiguous" and watcher is not None and watcher.cancelling():
-                raise asyncio.CancelledError
             if not accepted:
                 _logger.warning(
                     "inner executor refused in-band injection "

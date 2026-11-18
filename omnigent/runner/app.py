@@ -11166,7 +11166,7 @@ def create_runner_app(
                                     # up-front spinner; drop the executor's own duplicate
                                     # so the web renders a single compaction spinner.
                                     continue
-                                if _evt_type == "injection.consumed":
+                                if _evt_type in {"injection.consumed", "injection.unconfirmed"}:
                                     _inj_id = event.get("injection_id")
                                     _buf = _session_message_buffers.get(conv_id)
                                     if _inj_id is not None and _buf:
@@ -11177,6 +11177,8 @@ def create_runner_app(
                                             _m for _m in _buf if _m.get("injection_id") != _inj_id
                                         ]
                                         _session_message_buffers[conv_id] = _remaining
+                                        if _evt_type == "injection.unconfirmed":
+                                            continue
                                         await _restore_pending_session_attachments(conv_id)
                                         for _m in _consumed:
                                             _pending_id = _m.get("pending_id")

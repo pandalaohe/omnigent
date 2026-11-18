@@ -5336,6 +5336,13 @@ class InjectionConsumedEvent(_SSEEventBase):
     injection_id: str
 
 
+class InjectionUnconfirmedEvent(_SSEEventBase):
+    """Runner-only marker to suppress replay without recording delivery."""
+
+    type: Literal["injection.unconfirmed"] = "injection.unconfirmed"
+    injection_id: str
+
+
 class SDKPeerReceiptEvent(_SSEEventBase):
     """Runner-internal SDK receipt, never a client conversation event."""
 
@@ -6469,6 +6476,7 @@ class InputExecutionClaimEvent(_SSEEventBase):
 HarnessStreamEvent = (
     ServerStreamEvent
     | InjectionConsumedEvent
+    | InjectionUnconfirmedEvent
     | SDKPeerReceiptEvent
     | PolicyEvaluationRequestEvent
     | SubagentStartedEvent

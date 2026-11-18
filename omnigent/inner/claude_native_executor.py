@@ -22,6 +22,7 @@ from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
     ClaudeComposerNotCleared,
+    ClaudeDeliveryOwner,
     ClaudeDeliveryUnconfirmed,
     ClaudeInputBoxOccupied,
     ClaudeMessageNotAccepted,
@@ -32,7 +33,6 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeUserPromptPending,
     KeepWarmBtwResult,
     TmuxSessionNotAdvertised,
-    _tmux_input_identity,
     cancellable_injection,
     claude_pane_ready,
     has_pending_user_prompt,
@@ -44,6 +44,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_active_session_id,
     read_claude_context_state,
     read_claude_status_model,
+    read_delivery_owner,
     read_launch_model,
     read_model_env,
     read_model_picker_values,
@@ -635,10 +636,12 @@ class ClaudeNativeExecutor(Executor):
         # ``/model`` only accepts this session's picker values, aliases, and
         # custom slot; anything else is ignored and the pane keeps its model.
         wanted_model_arg = self._model_command_arg(wanted_model)
+        owner = None
         try:
             with telemetry.span("claude_native.inject"):
                 hold_deadline: float | None = None
                 while True:
+                    owner = read_delivery_owner(self._bridge_dir)
                     try:
                         await self._inject_turn(text, notices, wanted_model, wanted_model_arg)
                         break
@@ -672,7 +675,7 @@ class ClaudeNativeExecutor(Executor):
                 exc_info=not clean_exit,
                 extra={"session_id": self._request_session_id},
             )
-            cleanup_error = self._reap_failed_turn()
+            cleanup_error = self._reap_failed_turn(owner)
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
@@ -685,7 +688,7 @@ class ClaudeNativeExecutor(Executor):
             )
             # The pane is still alive here: this turn's error reports the close,
             # so the runner must not also report the pane's exit as a failure.
-            cleanup_error = self._reap_failed_turn(expected_close=True)
+            cleanup_error = self._reap_failed_turn(owner, expected_close=True)
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
@@ -756,8 +759,7 @@ class ClaudeNativeExecutor(Executor):
         """Drain cancelled delivery workers before releasing the pane's injection lock."""
         cancelled = threading.Event()
         paste_started = threading.Event()
-        active_session_id = read_active_session_id(self._bridge_dir)
-        tmux_identity = _tmux_input_identity(self._bridge_dir)
+        owner = read_delivery_owner(self._bridge_dir)
         with cancellable_injection(cancelled, paste_started=paste_started):
             worker = asyncio.create_task(asyncio.to_thread(operation))
         try:
@@ -774,17 +776,22 @@ class ClaudeNativeExecutor(Executor):
                     "Claude delivery was interrupted after the paste started. "
                     "The message may already be queued or running."
                 ) from None
-            if read_active_session_id(self._bridge_dir) == active_session_id and (
-                tmux_identity.get("socket_path") is None
-                or _tmux_input_identity(self._bridge_dir) == tmux_identity
-            ):
-                self._reap_failed_turn()
+            self._reap_failed_turn(owner)
             raise
 
-    def _reap_failed_turn(self, *, expected_close: bool = False) -> str | None:
+    def _reap_failed_turn(
+        self, owner: ClaudeDeliveryOwner | None, *, expected_close: bool = False
+    ) -> str | None:
         """Kill the Claude pane before a delivery timeout becomes ``failed``."""
+        if owner is None:
+            return None
         try:
-            kill_session(self._bridge_dir, timeout_s=1.0, expected_close=expected_close)
+            kill_session(
+                self._bridge_dir,
+                timeout_s=1.0,
+                expected_close=expected_close,
+                expected_owner=owner,
+            )
         except TmuxSessionNotAdvertised:
             _logger.debug(
                 "claude-native: timed-out session already disappeared",

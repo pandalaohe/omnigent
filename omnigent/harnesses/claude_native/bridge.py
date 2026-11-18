@@ -5459,6 +5459,32 @@ class _MessagePane:
 _MESSAGE_PANE: ContextVar[_MessagePane | None] = ContextVar("claude_message_pane", default=None)
 
 
+@dataclass(frozen=True)
+class ClaudeDeliveryOwner:
+    """The advertised pane and conversations a delivery was allowed to clean up."""
+
+    socket_path: str
+    tmux_target: str
+    active_session_id: str | None
+    native_session_id: str | None
+
+
+def read_delivery_owner(bridge_dir: Path) -> ClaudeDeliveryOwner | None:
+    """A delivery without an advertised pane has no cleanup target."""
+    info = _tmux_input_identity(bridge_dir)
+    socket_path, tmux_target = info["socket_path"], info["tmux_target"]
+    if not isinstance(socket_path, str) or not socket_path:
+        return None
+    if not isinstance(tmux_target, str) or not tmux_target:
+        return None
+    return ClaudeDeliveryOwner(
+        socket_path,
+        tmux_target,
+        read_active_session_id(bridge_dir),
+        read_claude_session_id(bridge_dir),
+    )
+
+
 @delivery_diagnostics.trace_delivery(
     session_id_reader=read_active_session_id, cancelled_error=ClaudeInjectionCancelled
 )
@@ -6130,6 +6156,7 @@ def _verify_submit_accepted(
         _SUBMIT_STARTUP_TIMEOUT_S if wait_for_startup else _SUBMIT_VERIFY_TIMEOUT_S
     )
     draft_present = False
+    pane_exited = False
     while time.monotonic() < deadline:
         _check_injection_cancelled()
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
@@ -6189,12 +6216,14 @@ def _verify_submit_accepted(
             return True
         now = time.monotonic()
         if (wait_for_startup or require_evidence) and now >= next_liveness_probe:
-            if _claude_pane_state(socket_path, tmux_target).alive is False:
+            pane_state = _claude_pane_state(socket_path, tmux_target)
+            if pane_state.alive is False:
                 if draft_present:
                     raise ClaudeMessageNotAccepted(
                         "Claude Code exited with the submitted draft still in the input box. "
                         "The message was not delivered."
                     )
+                pane_exited = pane_state.exited
                 break
             next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
         if not draft_present:
@@ -6241,6 +6270,11 @@ def _verify_submit_accepted(
     if require_evidence and not draft_present:
         if pane.strip():
             delivery_diagnostics.record_details(verification="unconfirmed_submit")
+        if pane_exited:
+            raise ClaudeDeliveryUnconfirmed(
+                "The Claude terminal exited before delivery of the pasted message could be "
+                "confirmed. Check the conversation before retrying."
+            )
         raise ClaudeDeliveryUnconfirmed(
             "Delivery of the pasted message could not be confirmed. "
             "It may already be queued or running. Inspect the terminal before retrying."
@@ -6369,6 +6403,7 @@ def kill_session(
     *,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
     expected_close: bool = False,
+    expected_owner: ClaudeDeliveryOwner | None = None,
 ) -> None:
     """
     Forcefully terminate the Claude tmux session via ``kill-session``.
@@ -6399,12 +6434,25 @@ def kill_session(
         turn itself (a delivery timeout). The runner then reads the exit
         as expected instead of a terminal crash; see
         :func:`pane_closed_by_omnigent`.
+    :param expected_owner: When cleaning up delivery, act only on this pane
+        while its bridge ownership still matches.
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in
         time, or if ``tmux kill-session`` fails for an unexpected reason.
     """
+    if expected_owner is not None:
+        with _bridge_metadata_write_lock(bridge_dir):
+            if read_delivery_owner(bridge_dir) == expected_owner:
+                _kill_tmux_session(
+                    expected_owner.socket_path, expected_owner.tmux_target, expected_close
+                )
+        return
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    private_dir = Path(info["socket_path"]).parent
+    _kill_tmux_session(info["socket_path"], info["tmux_target"], expected_close)
+
+
+def _kill_tmux_session(socket_path: str, tmux_target: str, expected_close: bool) -> None:
+    private_dir = Path(socket_path).parent
     markers = [private_dir / _OMNIGENT_KILL_FILE]
     if expected_close:
         markers.append(private_dir / _EXPECTED_CLOSE_FILE)
@@ -6413,10 +6461,10 @@ def kill_session(
             marker.touch()
     try:
         _run_tmux(
-            info["socket_path"],
+            socket_path,
             "kill-session",
             "-t",
-            info["tmux_target"],
+            tmux_target,
             allow_missing_target=True,
         )
     except RuntimeError:
@@ -7549,6 +7597,7 @@ def _run_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) 
                     _require_protected_draft_clear(
                         owner.bridge_dir, socket_path, owner.tmux_target
                     )
+                    _check_injection_cancelled()
                 # Once tmux is invoked the outcome can be ambiguous, including on timeout.
                 paste_started = _INJECTION_PASTE_STARTED.get()
                 if paste_started is not None:
@@ -8044,7 +8093,15 @@ def _user_prompt_visible(pane: str) -> bool:
     else:
         region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
     # Narrow panes wrap the decision footer across captured lines.
-    footer = " ".join(region.split())
+    footer = " ".join(" ".join(region.splitlines()[-3:]).split())
+    selector = re.search(r"(?m)^[ \t│]*❯[ \t]+\d+[.)][ \t]+", region)
+    permission_choice = re.search(r"(?m)^[ \t│]*(?:❯[ \t]*)?\d+[.)][ \t]+(?:Yes|No)\b", region)
+    # Some consent cards use unnumbered choices and a confirmation footer.
+    permission_controls = (selector is not None and permission_choice is not None) or (
+        "Enter to confirm" in footer
+        and "Esc to cancel" in footer
+        and re.search(r"(?m)^[ \t│]*❯[ \t]+(?:Yes|No)\b", region) is not None
+    )
     # A short pane can clip the plan decision's footer entirely.
     plan_region = "\n".join(lines[rules[-1] + 1 :]) if rules else ""
     plan_exit = re.search(
@@ -8057,10 +8114,13 @@ def _user_prompt_visible(pane: str) -> bool:
     return (
         _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT)
         or (plan_exit is not None and "❯" in plan_exit.group())
-        or "Do you want to " in region
-        or "Yes, and don't ask again" in region
         or (
-            any(hint in footer for hint in ("Enter to select", "Enter to submit"))
+            permission_controls
+            and ("Do you want to " in region or "Yes, and don't ask again" in region)
+        )
+        or (
+            (bool(rules) or selector is not None)
+            and any(hint in footer for hint in ("Enter to select", "Enter to submit"))
             and "Esc to cancel" in footer
         )
     )
@@ -9388,16 +9448,15 @@ def _wait_for_claude_prompt_ready(
         else:
             empty_polls += 1
         tall_draft = _occupied_tall_draft(pane)
+        if tall_draft and not waited_on_tall_draft and bridge_dir is not None:
+            # A torn capture during resize must not erase evidence of an occupied composer.
+            _set_protected_draft(bridge_dir, socket_path, tmux_target, protect=True)
         if _claude_prompt_rendered(pane) and not tall_draft:
-            if waited_on_tall_draft and bridge_dir is not None:
-                _set_protected_draft(bridge_dir, socket_path, tmux_target, protect=True)
             if bridge_dir is not None:
                 _require_protected_draft_clear(bridge_dir, socket_path, tmux_target, pane=pane)
             return
         # Confirm a draft across two captures, before any overlay dismissal.
         if tall_draft and waited_on_tall_draft:
-            if bridge_dir is not None:
-                _set_protected_draft(bridge_dir, socket_path, tmux_target, protect=True)
             raise ClaudeInputBoxOccupied(
                 f"Claude Code's input box is occupied by {_SCROLLED_DRAFT_SURFACE}, so the "
                 "message was not delivered. Open the terminal, dismiss it, then resend your "
