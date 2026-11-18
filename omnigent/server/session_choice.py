@@ -8,6 +8,7 @@ import math
 import re
 from collections.abc import Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Self
 
 from pydantic import (
@@ -50,20 +51,38 @@ _QUOTA_RESET = re.compile(
     r"(?!\w)",
     re.IGNORECASE | re.DOTALL,
 )
+_QUOTA_PROTECTION_RESET = re.compile(
+    r"(?:\bquota\s+protection\b|额度保护)"
+    r"(?:[^\r\n.;。!?！？;；|｜\"'“”‘’`]|(?<=\d)\.(?=\d)){0,120}?"
+    r"(?:\breset[^\S\r\n]*[:：]|重置(?:[^\S\r\n]*/[^\S\r\n]*reset[^\S\r\n]*[:：])?[^\S\r\n]*[:：]?)"
+    r"[^\S\r\n]*"
+    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))",
+    re.IGNORECASE,
+)
 
 
 def quota_reset_at(message: str, now: float) -> float | None:
-    """Recognize an explicit provider quota rejection with a bounded relative reset."""
+    """Recognize an explicit provider quota rejection with a bounded reset."""
     if message.startswith("[antigravity: ") and message.endswith("]"):
         message = message[len("[antigravity: ") : -1]
+    message = re.split(r"terminal output:", message, maxsplit=1, flags=re.IGNORECASE)[0]
     match = _QUOTA_RESET.match(message)
-    if match is None:
+    if match is not None:
+        seconds = sum(
+            int(value or 0) * unit
+            for value, unit in zip(match.groups(), (86400, 3600, 60, 1), strict=True)
+        )
+        return now + seconds if 0 < seconds <= 366 * 86400 else None
+    if "cc switch" not in message.casefold():
         return None
-    seconds = sum(
-        int(value or 0) * unit
-        for value, unit in zip(match.groups(), (86400, 3600, 60, 1), strict=True)
-    )
-    return now + seconds if 0 < seconds <= 366 * 86400 else None
+    protection = _QUOTA_PROTECTION_RESET.search(message)
+    if protection is None:
+        return None
+    try:
+        reset_at = datetime.fromisoformat(protection.group(1).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+    return reset_at if 0 < reset_at - now <= 366 * 86400 else None
 
 
 PositiveInt = Annotated[int, Field(strict=True, ge=1)]
