@@ -430,6 +430,90 @@ async def test_absolute_reset_receipts_start_and_end_a_drain(
 
 
 @pytest.mark.asyncio
+async def test_quota_receipt_clears_drain_saved_while_waiting_for_owner_lock(
+    drain_choice_env, choice_settings_client, monkeypatch
+):
+    from omnigent.server import session_choice_runtime as runtime
+
+    env = drain_choice_env
+    owner = RESERVED_USER_LOCAL
+    now = time.time()
+    reset_at = now + 300
+    monkeypatch.setattr(runtime, "time", SimpleNamespace(time=lambda: now))
+    monkeypatch.setattr(runtime, "quota_reset_at", lambda message, now: reset_at)
+    runtime.state_for(env.app).exhausted[(owner, "pool-0")] = now + 60
+
+    fallback = await create(env)
+    assert fallback.status_code == 201, fallback.text
+    assert fallback.json()["session_choice"]["pool"] == "pool-1"
+    session = env.store.get_conversation(fallback.json()["id"])
+    env.prefs.close_choice_drain_locks(owner, lambda lock: lock.pool == "pool-1")
+
+    receipt_waiting = asyncio.Event()
+    resume_receipt = asyncio.Event()
+    owner_locks = env.app.state.child_cap_locks
+    hold = owner_locks.hold
+
+    @asynccontextmanager
+    async def pause_receipt(key):
+        if key == f"owner:{owner}" and asyncio.current_task() is receipt_task:
+            receipt_waiting.set()
+            await resume_receipt.wait()
+        async with hold(key):
+            yield
+
+    monkeypatch.setattr(owner_locks, "hold", pause_receipt)
+    receipt_task = asyncio.create_task(
+        runtime.record_quota_exhaustion(
+            env.app,
+            session,
+            "fallback quota reported",
+            actor=None,
+            from_runner=True,
+            response_id="fallback-reset",
+        )
+    )
+    try:
+        await asyncio.wait_for(receipt_waiting.wait(), timeout=5)
+        now += 1
+        fallback = await create(env)
+        assert fallback.status_code == 201, fallback.text
+        [lock] = (await choice_settings_client.get(CHOICE_URL)).json()["runtime"]["drainLocks"]
+        assert lock["savedLink"]["meter"] == "pool-1"
+        assert lock["since"] == now
+    finally:
+        resume_receipt.set()
+        await asyncio.wait_for(receipt_task, timeout=5)
+
+    locks_after_receipt = (await choice_settings_client.get(CHOICE_URL)).json()["runtime"][
+        "drainLocks"
+    ]
+    now = reset_at + 1
+    recovered = await create(env)
+    assert locks_after_receipt == [], "quota receipt left a drain lock"
+    assert recovered.status_code == 201, recovered.text
+    assert recovered.json()["session_choice"]["pool"] == "pool-0"
+
+
+@pytest.mark.asyncio
+async def test_exclude_with_no_matching_drain_survives_preference_write_failure(
+    choice_env, monkeypatch
+):
+    env = choice_env
+
+    def fail_preference_write(*args, **kwargs):
+        raise OSError("test preference write failed")
+
+    monkeypatch.setattr(env.prefs, "_upsert_row", fail_preference_write)
+    excluded = await create(env, exclude=["pool-0"])
+    following = await create(env)
+
+    assert excluded.status_code == 201, f"exclude create failed: {excluded.text}"
+    assert excluded.json()["session_choice"]["pool"] == "pool-1"
+    assert following.status_code == 201, following.text
+
+
+@pytest.mark.asyncio
 async def test_changing_head_mode_keeps_weighted_create_order(choice_env, choice_settings_client):
     env = choice_env
     client = choice_settings_client

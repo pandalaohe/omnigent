@@ -109,8 +109,11 @@ async def _flush_drain_closures(app, owner) -> bool:
 
 
 async def _close_drain_locks(
-    app, owner, *, observed_at, receipt=None, pools=(), route=None, host=None, agent=None, drops=()
+    app, owner, *, receipt=None, pools=(), route=None, host=None, agent=None, drops=()
 ) -> bool:
+    # Callers hold the owner lock. The first attempt includes locks saved while the receipt waited.
+    retry_cutoff = time.time()
+    first_attempt = True
     prefs = getattr(app.state, "user_preferences_store", None)
     groups = await asyncio.to_thread(read_provider_groups, prefs, owner) if pools else {}
     closed_pools = {canonical_pool(pool, groups) for pool in pools}
@@ -120,7 +123,7 @@ async def _close_drain_locks(
             # PUT may have carried the same lock into a newer settings revision.
             return lock.model_copy(update={"settings_revision": ""}) in observed_locks
         return (
-            lock.since <= observed_at
+            (first_attempt or lock.since <= retry_cutoff)
             and (not closed_pools or canonical_pool(lock.pool, groups) in closed_pools)
             and (route is None or lock.route == route)
             and (host is None or lock.host_id == host)
@@ -129,8 +132,11 @@ async def _close_drain_locks(
 
     observed_locks = tuple(drop.model_copy(update={"settings_revision": ""}) for drop in drops)
     state_for(app).pending_drain_closures.setdefault(owner, []).append((receipt, matches))
-    if await _flush_drain_closures(app, owner):
-        return True
+    try:
+        if await _flush_drain_closures(app, owner):
+            return True
+    finally:
+        first_attempt = False
     # Retry a transient write failure before relying on in-process redelivery.
     return await _flush_drain_closures(app, owner)
 
@@ -614,9 +620,7 @@ async def record_quota_exhaustion(
             key = (owner, pool)
             state.exhausted[key] = max(state.exhausted.get(key, 0), until)
             if until > now:
-                await _close_drain_locks(
-                    app, owner, observed_at=now, receipt=identity, pools=(pool,)
-                )
+                await _close_drain_locks(app, owner, receipt=identity, pools=(pool,))
             else:
                 state.quota_rejections.add(identity)
             return
@@ -645,9 +649,7 @@ async def record_quota_exhaustion(
         ):
             return
         state.refusals[key] = ProviderRefusal(reason, now, until, session.id, identity[1])
-        await _close_drain_locks(
-            app, owner, observed_at=now, receipt=identity, pools=(pool,), route=route
-        )
+        await _close_drain_locks(app, owner, receipt=identity, pools=(pool,), route=route)
 
 
 async def record_provider_recovery(
@@ -789,7 +791,7 @@ async def observe_external_admission(
         if pending is not None:
             state.exclusions[scope] = pending
             await _close_drain_locks(
-                app, owner, observed_at=now, receipt=identity, host=rule.host, agent=rule.agent
+                app, owner, receipt=identity, host=rule.host, agent=rule.agent
             )
 
 
@@ -1385,11 +1387,19 @@ async def admit_create(
         except Exception:
             _logger.exception("Session selection failed")
             raise HTTPException(409, {"code": "session_choice_unavailable"}) from None
-        if not named and pin is None and plan.drops:
-            if not await _close_drain_locks(app, owner, observed_at=now, drops=plan.drops):
-                raise HTTPException(503, {"code": "session_choice_unavailable"})
-        if not named and pin is None and request.exclude:
-            if not await _close_drain_locks(app, owner, observed_at=now, pools=request.exclude):
+        if not named and pin is None:
+            drops = plan.drops
+            if request.exclude and snapshot.locks:
+                # Pool exclusions apply across the owner's work types and hosts.
+                excluded_pools = {
+                    canonical_pool(pool, request.provider_groups) for pool in request.exclude
+                }
+                drops += tuple(
+                    lock
+                    for lock in snapshot.locks.values()
+                    if canonical_pool(lock.pool, request.provider_groups) in excluded_pools
+                )
+            if drops and not await _close_drain_locks(app, owner, drops=drops):
                 raise HTTPException(503, {"code": "session_choice_unavailable"})
         if named:
             from omnigent.server.routes._sessions.helpers import (
