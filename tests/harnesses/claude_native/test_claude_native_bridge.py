@@ -7234,6 +7234,63 @@ def test_inject_user_message_confirms_a_clipped_draft_ending_in_a_short_line(
     assert mutations == ["paste", "submit"]
 
 
+# A live 52-column pane: a wrapped CJK draft whose prompt row scrolled away, one
+# closing rule, a four-row status block and the vim INSERT footer.
+_LIVE_CLIPPED_ROWS = (
+    "  切换会撤掉一个已经上线的修复。abc1234 就是",
+    "  def5678 加上 081 修复，两者之间的产品代码差异只",
+    "  有这个已经在线上的修复，所以用 abc1234",
+    "  部署，生产上真正新增的只有当初批准的那部分。按",
+    "  规矩，换了部署版本要单独批准。用哪个版本部署？",
+    "  → 推荐 用 abc1234 部署",
+)
+_LIVE_CLIPPED_PANE = (
+    "\n".join(_LIVE_CLIPPED_ROWS)
+    + "\n"
+    + "─" * 52
+    + "\n"
+    + "  [Model] │ workspace +.claude +.codex +LaunchAge…\n"
+    + "  Context 0/1.0M │ 7d: 32% (3d 10h)\n"
+    + "  ✓ Bash ×13 | ✓ mcp__example__read_inbox ×3…\n"
+    + "  ✓ mcp__example__ask_user ×1 | +1 more\n"
+    + "  -- INSERT -- ⏵⏵ auto mode on\n"
+)
+_LIVE_CLIPPED_CONTENT = (
+    "Answer to the question card:\n"
+    + "".join(row.strip() for row in _LIVE_CLIPPED_ROWS[:-1])
+    + "\n"
+    + _LIVE_CLIPPED_ROWS[-1].strip()
+)
+
+
+def test_live_clipped_pane_reads_as_a_clipped_draft_not_a_ready_prompt() -> None:
+    """The live pane holds the draft's tail; it is no mounted prompt and no other draft."""
+    bridge = claude_native_bridge
+    content = _LIVE_CLIPPED_CONTENT
+    tail = bridge._submit_tail_needle(content) or bridge._submit_cross_line_tail(content)
+
+    assert bridge._clipped_draft_matches(_LIVE_CLIPPED_PANE, tail)
+    assert bridge._draft_in_input_box(
+        _LIVE_CLIPPED_PANE, bridge._submit_needle(content), tail_needle=tail
+    )
+    assert not bridge._clipped_draft_matches(_LIVE_CLIPPED_PANE, "an unrelated message tail")
+    assert not bridge._claude_prompt_rendered(_LIVE_CLIPPED_PANE)
+    assert not bridge._submit_left_composer(_LIVE_CLIPPED_PANE)
+
+
+def test_inject_user_message_submits_the_live_clipped_draft_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After the paste, the live clipped layout confirms the draft: one paste, one Enter."""
+    bridge_dir, mutations, _clock = _scripted_paste_tui(
+        monkeypatch, tmp_path, lambda _n, _now: _LIVE_CLIPPED_PANE
+    )
+
+    inject_user_message(bridge_dir, content=_LIVE_CLIPPED_CONTENT)
+
+    assert mutations == ["paste", "submit"]
+
+
 @pytest.mark.parametrize(
     "replay_captures,recovered_draft,late_draft",
     [(8, "", True), (25, "", True), (8, "", False), (8, "unfinished terminal edit", False)],
