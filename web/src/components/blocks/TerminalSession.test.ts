@@ -1366,7 +1366,7 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
-  it("clamps a fitted grid below the bridge's floor before sending it", () => {
+  it("clamps a fitted grid once the bridge identifies itself as tmux", () => {
     // WHY: the bridge drops resizes under 20x5, so a visible container that fits
     // smaller would otherwise render a grid narrower than the pane it shows.
     const { socket, session } = makeSession();
@@ -1375,10 +1375,35 @@ describe("TerminalSession", () => {
     vi.spyOn(fit, "fit").mockImplementation(() => term.resize(10, 3));
 
     socket.open();
+    socket.emit("message", { data: JSON.stringify({ type: "tmux-replies", queries: [] }) });
 
     expect([term.cols, term.rows]).toEqual([20, 5]);
-    const frame = socket.sent.find((m) => typeof m === "string" && m.includes('"type":"resize"'));
+    const frame = socket.sent
+      .filter((m) => typeof m === "string" && m.includes('"type":"resize"'))
+      .at(-1);
     expect(frame).toBe(JSON.stringify({ type: "resize", cols: 20, rows: 5 }));
+    session.dispose();
+  });
+
+  it("keeps a narrow ConPTY grid before and after receiving PTY info", () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    const fit = (session as unknown as { fit: { fit: () => void } }).fit;
+    let fittedCols = 18;
+    vi.spyOn(fit, "fit").mockImplementation(() => term.resize(fittedCols, 4));
+
+    socket.open();
+    expect([term.cols, term.rows]).toEqual([18, 4]);
+    socket.emit("message", {
+      data: JSON.stringify({ type: "pty_info", windows_pty: { backend: "conpty", build: 26300 } }),
+    });
+    fittedCols = 17;
+    FakeResizeObserver.instances[0].cb();
+
+    expect([term.cols, term.rows]).toEqual([17, 4]);
+    expect(
+      socket.sent.filter((m) => typeof m === "string" && m.includes('"type":"resize"')),
+    ).toEqual([18, 17].map((cols) => JSON.stringify({ type: "resize", cols, rows: 4 })));
     session.dispose();
   });
 

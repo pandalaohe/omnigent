@@ -1352,15 +1352,24 @@ class _SteppedWebSocket(_FakeWebSocket):
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
-async def test_control_bridge_keeps_pane_size_on_resize_below_floor() -> None:
+async def test_control_bridge_keeps_pane_size_on_resize_below_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Resizes from a browser terminal with no layout must not shrink the shared pane."""
+
+    async def unavailable_probe(_tmux: str, _env: object) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "omnigent.terminals.control_bridge.tmux_answered_queries", unavailable_probe
+    )
     sock, target = await _new_private_tmux("cat")
     await _wait_for_window_size(sock, target, (80, 24))
 
     ws = _SteppedWebSocket()
     task = asyncio.create_task(
         bridge_tmux_control_to_websocket(
-            ws, socket_path=str(sock), tmux_target=target, read_only=False
+            ws, socket_path=str(sock), tmux_target=target, read_only=False, browser_resize=True
         )
     )
     # Fit-addon sizes under a display:none ancestor (large and default code fonts),
@@ -1386,31 +1395,40 @@ async def test_control_bridge_keeps_pane_size_on_resize_below_floor() -> None:
             assert (width, height) == (80, 24), (
                 f"a {cols}x{rows} browser resize shrank the pane to {width}x{height}"
             )
+        assert json.loads(ws.sent_text[0]) == {"type": "tmux-replies", "queries": []}
     finally:
         await _kill_and_join(sock, task)
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
-async def test_control_bridge_forwards_resize_at_floor() -> None:
-    """The smallest usable size still reaches tmux, so a real narrow client is not dropped."""
+@pytest.mark.parametrize(
+    "browser_resize, cols, rows",
+    [(True, MIN_FORWARDED_COLS, MIN_FORWARDED_ROWS), (False, 18, 4)],
+    ids=["browser-at-floor", "native-below-floor"],
+)
+async def test_control_bridge_forwards_valid_resize(
+    browser_resize: bool, cols: int, rows: int
+) -> None:
     sock, target = await _new_private_tmux("cat")
     ws = _FakeWebSocket(
         inbound=[
             {
                 "type": "websocket.receive",
-                "text": json.dumps(
-                    {"type": "resize", "cols": MIN_FORWARDED_COLS, "rows": MIN_FORWARDED_ROWS}
-                ),
+                "text": json.dumps({"type": "resize", "cols": cols, "rows": rows}),
             }
         ]
     )
     task = asyncio.create_task(
         bridge_tmux_control_to_websocket(
-            ws, socket_path=str(sock), tmux_target=target, read_only=False
+            ws,
+            socket_path=str(sock),
+            tmux_target=target,
+            read_only=False,
+            browser_resize=browser_resize,
         )
     )
     try:
-        await _wait_for_window_size(sock, target, (MIN_FORWARDED_COLS, MIN_FORWARDED_ROWS))
+        await _wait_for_window_size(sock, target, (cols, rows))
     finally:
         await _kill_and_join(sock, task)

@@ -32,6 +32,7 @@ async def bridge_terminal_to_websocket(
     instance: TerminalInstance,
     *,
     read_only: bool = False,
+    browser_resize: bool = False,
     on_client_interaction: Callable[[], None] | None = None,
     on_input: Callable[[], None] | None = None,
 ) -> None:
@@ -41,6 +42,7 @@ async def bridge_terminal_to_websocket(
             socket_path=str(instance.socket_path),
             tmux_target=instance.tmux_target,
             read_only=read_only,
+            browser_resize=browser_resize,
             on_client_interaction=on_client_interaction,
             on_input=on_input,
         )

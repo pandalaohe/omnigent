@@ -705,6 +705,7 @@ export class TerminalSession {
   private readonly osc52Dispose: { dispose: () => void };
   /** Drops xterm's replies to the queries tmux answers, once the runner lists them. */
   private queryReplies: { dispose: () => void } | null = null;
+  private tmuxBacked = false;
   private readonly codexPalette: CodexTerminalPalette | null;
   private readonly onClipboardRequest?: TerminalClipboardListener;
   /** Whether this visible, interactive attach may write the local clipboard. */
@@ -893,7 +894,12 @@ export class TerminalSession {
           const tmuxAnswers = parseTmuxRepliesMessage(ev.data);
           if (tmuxAnswers !== null) {
             this.queryReplies?.dispose();
-            this.queryReplies = suppressRepliesTmuxSends(this.term, tmuxAnswers);
+            this.queryReplies =
+              tmuxAnswers.size > 0 ? suppressRepliesTmuxSends(this.term, tmuxAnswers) : null;
+            if (!this.tmuxBacked) {
+              this.tmuxBacked = true;
+              this.sendResize();
+            }
           }
           // Unknown text frames stay ignored for protocol forward compatibility.
         }
@@ -1292,9 +1298,12 @@ export class TerminalSession {
     } catch {
       return;
     }
-    const cols = Math.max(this.term.cols, MIN_FORWARDED_COLS);
-    const rows = Math.max(this.term.rows, MIN_FORWARDED_ROWS);
-    if (cols !== this.term.cols || rows !== this.term.rows) this.term.resize(cols, rows);
+    if (this.tmuxBacked) {
+      const cols = Math.max(this.term.cols, MIN_FORWARDED_COLS);
+      const rows = Math.max(this.term.rows, MIN_FORWARDED_ROWS);
+      if (cols !== this.term.cols || rows !== this.term.rows) this.term.resize(cols, rows);
+    }
+    const { cols, rows } = this.term;
     // Skip a no-op resize: the WS-open handler and the ResizeObserver both
     // call this on mount, and a transient re-fit can land the same size. On
     // the control transport an unchanged size is a wasted round-trip (tmux

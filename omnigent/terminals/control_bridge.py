@@ -639,6 +639,7 @@ async def bridge_tmux_control_to_websocket(
     socket_path: str,
     tmux_target: str,
     read_only: bool,
+    browser_resize: bool = False,
     on_client_interaction: Callable[[], None] | None = None,
     on_input: Callable[[], None] | None = None,
     reader_done: asyncio.Event | None = None,
@@ -655,6 +656,7 @@ async def bridge_tmux_control_to_websocket(
     :param tmux_target: The ``-t`` target string identifying the session.
     :param read_only: When ``True``, drop inbound binary input frames and
         attach with ``ignore-size`` so the viewer can't resize the pane.
+    :param browser_resize: Drop spurious sizes reported by hidden browser terminals.
     :param on_client_interaction: Optional callback fired on every client
         interaction (connect, disconnect, each input/resize frame) so the
         idle watcher can discount client-driven repaints.
@@ -682,8 +684,10 @@ async def bridge_tmux_control_to_websocket(
     # Sent before any pane output so no query reaches the browser first, and
     # probed before the capture so nothing slow sits between capture and attach.
     tmux_answers = await tmux_answered_queries(tmux, {"TERM": _WEB_TERMINAL_TERM})
-    if tmux_answers is not None:
-        message = json.dumps({"type": "tmux-replies", "queries": sorted(tmux_answers)})
+    # Browser clients also use this frame to identify tmux, even if the
+    # query probe failed and there are no replies to suppress.
+    if browser_resize or tmux_answers is not None:
+        message = json.dumps({"type": "tmux-replies", "queries": sorted(tmux_answers or ())})
         with contextlib.suppress(RuntimeError, WebSocketDisconnect):
             await websocket.send_text(message)
 
@@ -912,7 +916,9 @@ async def bridge_tmux_control_to_websocket(
                             rows = int(ctl["rows"])
                         except (KeyError, TypeError, ValueError):
                             continue
-                        if cols < MIN_FORWARDED_COLS or rows < MIN_FORWARDED_ROWS:
+                        if browser_resize and (
+                            cols < MIN_FORWARDED_COLS or rows < MIN_FORWARDED_ROWS
+                        ):
                             _logger.debug(
                                 "ignoring %dx%d resize below the usable floor target=%s",
                                 cols,

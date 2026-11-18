@@ -779,7 +779,14 @@ async def test_attach_terminal_await_launch_gives_up_on_a_runner_that_never_conn
     assert len(attempts) > 1
 
 
-async def test_attach_terminal_proxies_to_runner_ws_factory(app: FastAPI) -> None:
+@pytest.mark.parametrize(
+    "origin, browser_resize",
+    [(None, False), ("omnigent://internal", False), ("http://localhost", True)],
+    ids=["legacy-native", "native", "browser"],
+)
+async def test_attach_terminal_proxies_to_runner_ws_factory(
+    app: FastAPI, origin: str | None, browser_resize: bool
+) -> None:
     """
     When a runner WS factory is set, the server proxies frames
     instead of running tmux locally.
@@ -800,7 +807,8 @@ async def test_attach_terminal_proxies_to_runner_ws_factory(app: FastAPI) -> Non
     with (
         capture_debug_rows("server") as rows,
         TestClient(app).websocket_connect(
-            "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach?read_only=true"
+            "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach?read_only=true",
+            headers={"origin": origin} if origin is not None else {},
         ) as ws,
     ):
         # Control JSON leads, then two output frames, then a clean close.
@@ -812,6 +820,7 @@ async def test_attach_terminal_proxies_to_runner_ws_factory(app: FastAPI) -> Non
 
     assert factory.calls == [
         "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach?read_only=true"
+        + ("&browser_resize=true" if browser_resize else "")
     ]
     # One timing row per attach, for terminal output rather than the control frame.
     (first_output,) = [row for row in rows if row["event_name"] == "terminal_attach_first_output"]
@@ -961,6 +970,7 @@ async def test_attach_terminal_local_fallback_uses_control_mode(
         socket_path: str,
         tmux_target: str,
         read_only: bool,
+        browser_resize: bool = False,
         on_input: object = None,
         on_client_interaction: object = None,
     ) -> None:

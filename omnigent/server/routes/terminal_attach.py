@@ -87,6 +87,7 @@ from starlette import status
 
 from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import OmnigentError
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import (
     get_runner_ws_factory,
     get_terminal_registry,
@@ -233,6 +234,7 @@ def create_terminal_attach_router(
             ),
         )
 
+        browser_resize = websocket.headers.get("origin") not in (None, OMNIGENT_INTERNAL_WS_ORIGIN)
         ws_factory = get_runner_ws_factory()
         if ws_factory is not None:
             from urllib.parse import urlencode
@@ -273,6 +275,8 @@ def create_terminal_attach_router(
                 return
             if await_launch:
                 params["await_launch"] = "true"
+            if browser_resize:
+                params["browser_resize"] = "true"
             qs = urlencode(params)
             runner_path = (
                 f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach?{qs}"
@@ -395,6 +399,7 @@ def create_terminal_attach_router(
                 websocket,
                 entry.instance,
                 read_only=read_only,
+                browser_resize=browser_resize,
                 on_input=entry.instance.note_input,
             )
 
