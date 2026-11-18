@@ -52,9 +52,11 @@ _QUOTA_RESET = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _QUOTA_PROTECTION_RESET = re.compile(
-    r"\bquota\s+protection\b.{0,2048}?\breset:\s*"
+    r"(?:\bquota\s+protection\b|额度保护)"
+    r"[^\r\n;；|｜\"'“”‘’`]{0,2048}?"
+    r"(?:\breset\s*[:：]|重置(?:\s*/\s*reset\s*[:：])?\s*[:：]?)\s*"
     r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))",
-    re.IGNORECASE | re.DOTALL,
+    re.IGNORECASE,
 )
 
 

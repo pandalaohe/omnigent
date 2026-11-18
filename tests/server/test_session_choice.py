@@ -998,20 +998,48 @@ def test_explicit_provider_quota_reset(message, seconds):
             "2026-11-22T03:19:03+00:00",
         ),
         (
-            "unexpected status 403 Forbidden: quota protection: weekly; "
-            "reset: 2026-11-22T03:19:03Z",
+            "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
+            "Provider: OpenAI Official; model: gpt-6.2-sol; cause: Codex 官方额度保护: "
+            "每周 98.00% ≥ 98%（重置 2026-11-22T03:19:03Z）",
             "2026-11-22T03:19:03+00:00",
+        ),
+        (
+            "unexpected status 403 Forbidden: Codex quota protection: weekly "
+            "98.00% ≥ 98% (reset: 2026-11-22T03:19:03Z)",
+            "2026-11-22T03:19:03+00:00",
+        ),
+        (
+            "unexpected status 403 Forbidden: cause: Codex quota protection: weekly; "
+            "detail: retry later; reset: 2026-11-22T03:19:03Z",
+            None,
+        ),
+        (
+            "unexpected status 403 Forbidden: cause: Codex 官方额度保护: 每周\n"
+            "重置: 2026-11-22T03:19:03Z",
+            None,
+        ),
+        (
+            "unexpected status 403 Forbidden: "
+            '{"cause":"Codex quota protection: weekly","reset":"2026-11-22T03:19:03Z"}',
+            None,
+        ),
+        (
+            "unexpected status 403 Forbidden: Codex quota protection: weekly "
+            "(reset: 2026-11-22T03:19:03)",
+            None,
         ),
         (
             "unexpected status 403 Forbidden: quota exceeded; reset: 2026-11-22T03:19:03+00:00",
             None,
         ),
         (
-            "unexpected status 403 Forbidden: quota protection; reset: 2026-11-18T03:19:02+00:00",
+            "unexpected status 403 Forbidden: quota protection: weekly "
+            "(reset: 2026-11-18T03:19:02+00:00)",
             None,
         ),
         (
-            "unexpected status 403 Forbidden: quota protection; reset: 2027-11-20T03:19:03+00:00",
+            "unexpected status 403 Forbidden: quota protection: weekly "
+            "(reset: 2027-11-20T03:19:03+00:00)",
             None,
         ),
     ],

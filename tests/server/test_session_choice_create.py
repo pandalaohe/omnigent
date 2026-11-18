@@ -478,8 +478,19 @@ async def quota_runner(choice_env, monkeypatch):
             "2026-11-22T03:19:03+00:00）...",
             "2026-11-22T03:19:03+00:00",
         ),
+        (
+            "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
+            "Provider: OpenAI Official; model: gpt-6.2-sol; cause: Codex 官方额度保护: "
+            "每周 98.00% ≥ 98%（重置 2026-11-22T03:19:03Z）",
+            "2026-11-22T03:19:03+00:00",
+        ),
+        (
+            "unexpected status 403 Forbidden: Codex quota protection: weekly "
+            "98.00% ≥ 98% (reset: 2026-11-22T03:19:03Z)",
+            "2026-11-22T03:19:03+00:00",
+        ),
     ],
-    ids=["relative", "absolute-quota-protection"],
+    ids=["relative", "absolute-bilingual", "absolute-chinese", "absolute-english"],
 )
 async def test_provider_quota_failure_blocks_pool_until_reset(
     quota_runner, monkeypatch, event_type, message, absolute_reset
@@ -547,6 +558,16 @@ async def test_provider_quota_failure_blocks_pool_until_reset(
     assert named.json()["detail"]["reset"] == reset
 
     clock[0] += 30
+    if absolute_reset:
+        from omnigent.server.session_choice import state_for
+
+        class NoDeadlineRewrite(dict[tuple[str, str], float]):
+            def __setitem__(self, key: tuple[str, str], value: float) -> None:
+                raise AssertionError("replayed refusal rewrote the absolute deadline")
+
+        state = state_for(env.app)
+        assert state.exhausted[(RESERVED_USER_LOCAL, "pool-0")] == reset
+        state.exhausted = NoDeadlineRewrite(state.exhausted)
     replay = await env.client.post(f"/v1/sessions/{first['id']}/events", json=payload)
     assert replay.status_code == 202, replay.text
     env.settings["hosts"][HOST]["work"] = env.settings["hosts"][HOST]["work"][:1]
