@@ -75,9 +75,9 @@ def _bridge_dir_lock(bridge_dir: Path) -> FileLock:
 
 
 @contextmanager
-def bridge_dir_preparation_lock(bridge_dir: Path) -> Iterator[None]:
+def bridge_dir_preparation_lock(bridge_dir: Path, *, timeout_s: float = -1) -> Iterator[None]:
     """Exclude cleanup while preparing a bridge or updating its ownership."""
-    with _bridge_dir_lock(bridge_dir):
+    with _bridge_dir_lock(bridge_dir).acquire(timeout=timeout_s):
         yield
 
 

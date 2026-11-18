@@ -1047,7 +1047,6 @@ class ExecutorAdapter(HarnessApp):
                 except RuntimeError:
                     _logger.warning("in-band injection reservation unresolved", exc_info=True)
                     continue
-            certain = True
             try:
                 with (
                     input_delivery_scope(
@@ -1066,7 +1065,7 @@ class ExecutorAdapter(HarnessApp):
                         outcome = "executor_accepted" if accepted else "executor_refused"
                     except InjectionDeliveryAmbiguous:
                         # The harness may already hold the message; resending could duplicate it.
-                        accepted, outcome, certain = True, "executor_ambiguous", False
+                        accepted, outcome = None, "executor_ambiguous"
                     except BaseException as exc:
                         log_input_event(
                             _logger,
@@ -1086,28 +1085,27 @@ class ExecutorAdapter(HarnessApp):
                     )
             except asyncio.CancelledError:
                 if injection.input_admission_required:
-                    _emit_injection_consumed(ctx, injection)
+                    _emit_injection_unconfirmed(ctx, injection)
                 raise
             except Exception:
                 _logger.exception(
                     "inner executor.enqueue_session_message failed; in-band injection lost"
                 )
                 if injection.input_admission_required:
-                    _emit_injection_consumed(ctx, injection)
+                    _emit_injection_unconfirmed(ctx, injection)
                 continue
-            if not certain:
+            if accepted is None:
+                # Keep the reservation fenced and drop the replay copy without
+                # claiming the draft reached the current turn.
+                _emit_injection_unconfirmed(ctx, injection)
                 watcher = asyncio.current_task()
-                cancelling = watcher is not None and watcher.cancelling() > 0
-                if cancelling or ctx.cancelled.is_set():
-                    # Keep the reservation fenced. Drop the runner's replay copy
-                    # without claiming the draft reached the current turn.
-                    if injection.injection_id:
-                        ctx.emit(InjectionUnconfirmedEvent(injection_id=injection.injection_id))
-                    if cancelling:
-                        raise asyncio.CancelledError
+                if watcher is not None and watcher.cancelling():
+                    raise asyncio.CancelledError
+                if ctx.cancelled.is_set():
                     return
+                continue
             try:
-                if injection.input_admission_required and certain:
+                if injection.input_admission_required:
                     await ctx.claim_input_execution(
                         injection, boundary="injection_accept" if accepted else "injection_refuse"
                     )
@@ -1958,6 +1956,11 @@ def _emit_injection_consumed(ctx: TurnContext, injection: CreateResponseRequest)
         ctx.emit(
             InjectionConsumedEvent(type="injection.consumed", injection_id=injection.injection_id)
         )
+
+
+def _emit_injection_unconfirmed(ctx: TurnContext, injection: CreateResponseRequest) -> None:
+    if injection.injection_id:
+        ctx.emit(InjectionUnconfirmedEvent(injection_id=injection.injection_id))
 
 
 def _extract_user_text(

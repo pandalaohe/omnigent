@@ -10321,7 +10321,7 @@ async def _auto_create_claude_terminal(
         sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
     )
     if _pre_wipe_bridge_is_current and _pre_wipe_claude_sid is not None:
-        _write_csid(bridge_dir, _pre_wipe_claude_sid)
+        await asyncio.to_thread(_write_csid, bridge_dir, _pre_wipe_claude_sid)
     # Cancel any surviving forwarder BEFORE wiping its cursor/seen state, else it
     # re-posts with fresh dedup state alongside the forwarder spawned below.
     await _cancel_auto_forwarder_task(session_id)
@@ -10407,7 +10407,7 @@ async def _auto_create_claude_terminal(
 
     if session_external_id is not None and session_external_id_is_owned:
         if _read_csid_pre_wipe(bridge_dir) != session_external_id:
-            _write_csid(bridge_dir, session_external_id)
+            await asyncio.to_thread(_write_csid, bridge_dir, session_external_id)
         if server_client is not None and confirmed_claude_sid != session_external_id:
             from omnigent.harnesses.claude_native.forwarder import (
                 patch_confirmed_claude_session,

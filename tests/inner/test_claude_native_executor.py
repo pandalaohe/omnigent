@@ -2439,6 +2439,78 @@ async def test_prompt_timeout_rechecks_ownership_when_reaping(
 
 
 @pytest.mark.asyncio
+async def test_prompt_timeout_cleanup_skips_busy_lock_and_checks_owner_under_lock(
+    monkeypatch: pytest.MonkeyPatch, advertised_claude_bridge: Path
+) -> None:
+    from filelock import Timeout as FileLockTimeout
+
+    bridge_dir = advertised_claude_bridge
+    metadata = claude_bridge.native_bridge_common
+    executor = ClaudeNativeExecutor(bridge_dir)
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    locked = asyncio.Event()
+    release = threading.Event()
+    forced_release = threading.Event()
+    kills: list[str] = []
+
+    def hold_metadata_lock() -> None:
+        with metadata.bridge_dir_preparation_lock(bridge_dir):
+            loop.call_soon_threadsafe(locked.set)
+            # Bound the old synchronous implementation even when it stalls the loop.
+            if not release.wait(3):
+                forced_release.set()
+
+    def fail_inject(*_args: object, **_kwargs: object) -> None:
+        raise ClaudePromptTimeout("terminal did not become ready")
+
+    async def failed_turn() -> None:
+        events = [
+            event
+            async for event in executor.run_turn([{"role": "user", "content": "hello"}], [], "")
+        ]
+        assert len(events) == 1 and isinstance(events[0], ExecutorError)
+        assert events[0].undelivered
+
+    def assert_metadata_locked() -> None:
+        assert threading.get_ident() != loop_thread
+        assert executor._inject_lock.locked()
+        with pytest.raises(FileLockTimeout):
+            with metadata._bridge_dir_lock(bridge_dir).acquire(timeout=0):
+                pass
+
+    def kill(_socket: str, target: str, _expected_close: bool) -> None:
+        kills.append(target)
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(claude_bridge, "_kill_tmux_session", kill)
+    writer = asyncio.create_task(asyncio.to_thread(hold_metadata_lock))
+    try:
+        await asyncio.wait_for(locked.wait(), timeout=5)
+        await asyncio.wait_for(failed_turn(), timeout=2)
+        assert not forced_release.is_set()
+        assert kills == []
+    finally:
+        release.set()
+        await writer
+
+    read_owner = claude_bridge.read_delivery_owner
+
+    def read_locked_owner(directory: Path) -> claude_bridge.ClaudeDeliveryOwner | None:
+        assert_metadata_locked()
+        return read_owner(directory)
+
+    def kill_locked(socket_path: str, target: str, expected_close: bool) -> None:
+        assert_metadata_locked()
+        kill(socket_path, target, expected_close)
+
+    monkeypatch.setattr(claude_bridge, "read_delivery_owner", read_locked_owner)
+    monkeypatch.setattr(claude_bridge, "_kill_tmux_session", kill_locked)
+    await failed_turn()
+    assert len(kills) == 1
+
+
+@pytest.mark.asyncio
 async def test_inband_cancellation_after_paste_reports_unconfirmed_to_runner(
     monkeypatch: pytest.MonkeyPatch, advertised_claude_bridge: Path
 ) -> None:
@@ -2509,6 +2581,65 @@ async def test_inband_cancellation_after_paste_reports_unconfirmed_to_runner(
     payload = json.loads(frame)
     assert payload["type"] == "injection.unconfirmed"
     assert payload["injection_id"] == "inj_example"
+    assert events.empty()
+
+
+@pytest.mark.asyncio
+async def test_inband_cancellation_before_paste_does_not_report_consumed(
+    monkeypatch: pytest.MonkeyPatch, advertised_claude_bridge: Path
+) -> None:
+    from omnigent.entities.subagent_retry import InputExecutionReceipt
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import (
+        CreateResponseRequest,
+        HarnessStreamEvent,
+        InjectionUnconfirmedEvent,
+        InputExecutionClaimEvent,
+    )
+
+    events: asyncio.Queue[HarnessStreamEvent | None] = asyncio.Queue()
+    ctx = TurnContext("resp_example", events, asyncio.Event(), session_id="conv_example")
+    ctx._push_injection(
+        CreateResponseRequest(
+            model="example",
+            input="hello from the web",
+            injection_id="inj_example",
+            input_id="input_example",
+            input_admission_required=True,
+        )
+    )
+    executor = ClaudeNativeExecutor(advertised_claude_bridge)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="main")
+    enqueue_started = asyncio.Event()
+
+    async def wait_before_paste(*_args: object) -> bool:
+        enqueue_started.set()
+        await asyncio.Future()
+        raise AssertionError("a pre-paste cancellation was expected")
+
+    monkeypatch.setattr(executor, "enqueue_session_message", wait_before_paste)
+    watcher = asyncio.create_task(adapter._watch_injections(ctx, executor))
+    try:
+        async with asyncio.timeout(5):
+            claim = await events.get()
+            assert isinstance(claim, InputExecutionClaimEvent)
+            assert claim.claim.boundary == "injection_reserve"
+            assert ctx._complete_input_claim(
+                claim.claim_id, InputExecutionReceipt(state="reserved", reason="reserved")
+            )
+            await enqueue_started.wait()
+        watcher.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await watcher
+    finally:
+        if not watcher.done():
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+
+    event = events.get_nowait()
+    assert isinstance(event, InjectionUnconfirmedEvent)
+    assert event.injection_id == "inj_example"
     assert events.empty()
 
 

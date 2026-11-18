@@ -2625,13 +2625,13 @@ def record_model_vocabulary(
 
 
 @contextlib.contextmanager
-def _bridge_metadata_write_lock(bridge_dir: Path) -> Iterator[None]:
+def _bridge_metadata_write_lock(bridge_dir: Path, *, timeout_s: float = -1) -> Iterator[None]:
     """Cross-process mutual exclusion for bridge metadata read-modify-writes.
 
     Shares bridge-dir preparation's on-disk lock, so metadata updates and
     :func:`prepare_bridge_dir` exclude each other across processes.
     """
-    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
+    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir, timeout_s=timeout_s):
         yield
 
 
@@ -3768,15 +3768,16 @@ def write_claude_session_id(bridge_dir: Path, claude_session_id: str) -> None:
     """Retain a confirmed Claude id across bridge preparation and launch retries."""
     if not claude_session_id:
         raise ValueError("claude_session_id must not be empty")
-    state = _read_json_file(bridge_dir / _STATE_FILE)
-    if not isinstance(state, dict):
-        state = {}
-    seen = read_seen_claude_session_ids(bridge_dir)
-    seen.add(claude_session_id)
-    state["claude_session_id"] = claude_session_id
-    state["seen_claude_session_ids"] = sorted(seen)
-    state["updated_at"] = time.time()
-    _write_json_file(bridge_dir / _STATE_FILE, state)
+    with _bridge_metadata_write_lock(bridge_dir):
+        state = _read_json_file(bridge_dir / _STATE_FILE)
+        if not isinstance(state, dict):
+            state = {}
+        seen = read_seen_claude_session_ids(bridge_dir)
+        seen.add(claude_session_id)
+        state["claude_session_id"] = claude_session_id
+        state["seen_claude_session_ids"] = sorted(seen)
+        state["updated_at"] = time.time()
+        _write_json_file(bridge_dir / _STATE_FILE, state)
 
 
 def read_claude_session_id(bridge_dir: Path) -> str | None:
@@ -6157,9 +6158,9 @@ def _verify_submit_accepted(
     )
     draft_present = False
     pane_exited = False
-    while time.monotonic() < deadline:
+    while (remaining := deadline - time.monotonic()) > 0:
         _check_injection_cancelled()
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        time.sleep(min(_CLAUDE_READY_POLL_INTERVAL_S, remaining))
         pane = _capture_pane(socket_path, tmux_target)
         if check_owner is not None and not check_owner():
             raise ClaudeDeliveryUnconfirmed(
@@ -6253,6 +6254,8 @@ def _verify_submit_accepted(
             _raise_if_user_prompt_pending(bridge_dir, pane)
             if before_retry is not None:
                 before_retry()
+            if time.monotonic() >= deadline:
+                break
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             retries += 1
             delivery_diagnostics.record_details(retries=retries)
@@ -6435,17 +6438,21 @@ def kill_session(
         as expected instead of a terminal crash; see
         :func:`pane_closed_by_omnigent`.
     :param expected_owner: When cleaning up delivery, act only on this pane
-        while its bridge ownership still matches.
+        while its bridge ownership still matches. Skip cleanup if another
+        writer currently owns the bridge metadata lock.
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in
         time, or if ``tmux kill-session`` fails for an unexpected reason.
     """
     if expected_owner is not None:
-        with _bridge_metadata_write_lock(bridge_dir):
-            if read_delivery_owner(bridge_dir) == expected_owner:
-                _kill_tmux_session(
-                    expected_owner.socket_path, expected_owner.tmux_target, expected_close
-                )
+        try:
+            with _bridge_metadata_write_lock(bridge_dir, timeout_s=0):
+                if read_delivery_owner(bridge_dir) == expected_owner:
+                    _kill_tmux_session(
+                        expected_owner.socket_path, expected_owner.tmux_target, expected_close
+                    )
+        except FileLockTimeout:
+            _logger.debug("claude-native: skipping delivery cleanup while bridge metadata is busy")
         return
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     _kill_tmux_session(info["socket_path"], info["tmux_target"], expected_close)
@@ -8079,6 +8086,19 @@ def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
     return claude_pane_text_ready(instance.last_pane_text() or "")
 
 
+def _api_key_consent_visible(region: str) -> bool:
+    """Recognize the startup API-key decision even when its footer is clipped."""
+    controls = re.search(
+        r"(?m)^Do you want to use this API key\?\n"
+        r"(?:❯ +Yes\nNo|Yes\n❯ +No)(?: \(recommended\))?(?=\n|\Z)",
+        region,
+    )
+    if controls is None:
+        return False
+    trailing = " ".join(region[controls.end() :].split())
+    return "Enter to confirm · Esc to cancel".startswith(trailing)
+
+
 def _user_prompt_visible(pane: str) -> bool:
     """Recognize a native decision dialog, excluding text above a mounted composer."""
     clipped = _occupied_tall_draft(pane)
@@ -8095,12 +8115,18 @@ def _user_prompt_visible(pane: str) -> bool:
     # Narrow panes wrap the decision footer across captured lines.
     footer = " ".join(" ".join(region.splitlines()[-3:]).split())
     selector = re.search(r"(?m)^[ \t│]*❯[ \t]+\d+[.)][ \t]+", region)
-    permission_choice = re.search(r"(?m)^[ \t│]*(?:❯[ \t]*)?\d+[.)][ \t]+(?:Yes|No)\b", region)
-    # Some consent cards use unnumbered choices and a confirmation footer.
-    permission_controls = (selector is not None and permission_choice is not None) or (
-        "Enter to confirm" in footer
-        and "Esc to cancel" in footer
-        and re.search(r"(?m)^[ \t│]*❯[ \t]+(?:Yes|No)\b", region) is not None
+    decision_region = "\n".join(line.strip(" \t│") for line in region.splitlines())
+    # Bind the title, options and selection to one list, even without a frame.
+    permission_card = re.search(
+        r"(?m)^Do you want to .+\n"
+        r"(?:❯ +)?1[.)] +(?:Yes|No)\b[^\n]*\n"
+        r"(?:❯ +)?2[.)] +(?:Yes|No)\b[^\n]*"
+        r"(?:\n(?:❯ +)?\d+[.)] +(?:Yes|No)\b[^\n]*)*",
+        decision_region,
+    )
+    consent_card = re.search(
+        r"(?m)^Do you want to .+\n(?:❯ +Yes\b[^\n]*\nNo\b|Yes\b[^\n]*\n❯ +No\b)",
+        decision_region,
     )
     # A short pane can clip the plan decision's footer entirely.
     plan_region = "\n".join(lines[rules[-1] + 1 :]) if rules else ""
@@ -8114,9 +8140,10 @@ def _user_prompt_visible(pane: str) -> bool:
     return (
         _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT)
         or (plan_exit is not None and "❯" in plan_exit.group())
+        or (permission_card is not None and "\n❯" in permission_card.group())
+        or _api_key_consent_visible(decision_region)
         or (
-            permission_controls
-            and ("Do you want to " in region or "Yes, and don't ask again" in region)
+            consent_card is not None and "Enter to confirm" in footer and "Esc to cancel" in footer
         )
         or (
             (bool(rules) or selector is not None)
@@ -9310,8 +9337,8 @@ def _terminal_dialog_headline(pane: str) -> str | None:
     selector row and the footer inside the region below the last box rule
     (the pane tail when no rule is drawn). A pane echoing such text above a
     live composer never qualifies, because the composer row is found first.
-    Boxed prompts without that footer (tool permission prompts, the effort
-    dialog) are left to their own paths.
+    The API-key decision can also be recognized by its exact controls when
+    the footer is clipped. Other boxed prompts are left to their own paths.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: The dialog's first line, e.g.
@@ -9323,6 +9350,8 @@ def _terminal_dialog_headline(pane: str) -> str | None:
     lines = [line for line in pane.splitlines() if line.strip()]
     last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
     region = lines[last_rule + 1 :] if last_rule is not None else lines[-_DIALOG_SCAN_TAIL_LINES:]
+    if _api_key_consent_visible("\n".join(line.strip(" \t│") for line in region)):
+        return "Detected a custom API key in your environment"
     footer = next((line for line in reversed(region) if _DIALOG_FOOTER_RE.search(line)), None)
     if footer is None:
         return None
