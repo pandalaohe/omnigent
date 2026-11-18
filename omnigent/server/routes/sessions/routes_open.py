@@ -544,7 +544,7 @@ def register_open_routes(
             if body.speed is not None:
                 create_fields["labels"] = {"omnigent.speed_tier": body.speed}
             create_body = ProjectSessionCreateRequest(**create_fields)
-            _, conv = await _create_session_from_existing_agent(
+            created, conv = await _create_session_from_existing_agent(
                 conversation_store,
                 agent_store,
                 runner_router,
@@ -562,9 +562,7 @@ def register_open_routes(
                 calling_path_label="sys_session_open",
                 created_by_session_id=sender.id,
             )
-            from omnigent.server.session_choice_runtime import choice_record
-
-            selected = choice_record(conv)
+            selected = created.session_choice
             if conv.agent_id is not None:
                 actual = await asyncio.to_thread(agent_store.get, conv.agent_id)
                 if actual is not None:

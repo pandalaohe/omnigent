@@ -770,6 +770,9 @@ async def test_fallback_mode_round_trips_without_changing_return_copies(db_uri, 
             returned = await put(base["revision"])
             assert returned.status_code == 200, returned.text
             assert returned.json() == base
+            saved = (await client.get(url, headers=headers)).json()
+            assert saved["revision"] == base["revision"]
+            assert saved["settings"] == base["settings"]
         for links in (preset, row):
             links[1]["fallbackMode"] = "drain"
         drained = await put(base["revision"])
@@ -778,6 +781,12 @@ async def test_fallback_mode_round_trips_without_changing_return_copies(db_uri, 
         assert saved["revision"] != base["revision"]
         assert saved["settings"]["presets"][0]["links"][1]["fallbackMode"] == "drain"
         assert saved["settings"]["hosts"]["host-a"]["implementation"][0][0]["adjusted"] is False
+        assert (
+            saved["settings"]["hosts"]["host-a"]["implementation"][0][0]["links"][1][
+                "fallbackMode"
+            ]
+            == "drain"
+        )
         assert saved["runtime"] == {"settingsRevision": saved["revision"], "drainLocks": []}
         row[1]["fallbackMode"] = "sideways"
         assert (await put(saved["revision"])).status_code == 422
@@ -1054,7 +1063,7 @@ def test_drain_matches_route_reconciliation_sequence():
         if result.lock:
             locks[result.lock.key] = result.lock
         if locks and not sets:
-            assert "Using drain lock" in result.choice.reason
+            assert "Continuing to drain" in result.choice.reason
             assert next(iter(locks.values())).since < NOW + index
 
 
