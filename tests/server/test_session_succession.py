@@ -18,6 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -49,6 +50,8 @@ from omnigent.stores.conversation_store import (
     ARCHIVE_REMOVED_WORKTREE_LABEL_KEY,
     HANDOVER_ITEM_LABEL_KEY,
     ROTATE_REQUESTED_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
     SUCCEEDED_BY_LABEL_KEY,
     SUCCEEDS_LABEL_KEY,
 )
@@ -64,6 +67,7 @@ from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 pytestmark = pytest.mark.asyncio
 
@@ -296,6 +300,7 @@ def succession_app(
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         peer_message_store=SqlAlchemyPeerMessageStore(db_uri),
+        scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri),
     )
 
 
@@ -1304,6 +1309,83 @@ async def test_succession_retargets_queued_peer_mail(
     assert untouched.receiver_session_id == old
 
 
+async def test_succession_retargets_owned_continuing_automations(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runner: _FakeRunnerClient,
+    db_uri: str,
+) -> None:
+    task_id, agent_id = uuid4().hex, uuid4().hex
+    automation_labels = {
+        SCHEDULED_TASK_ORIGIN_LABEL_KEY: task_id,
+        SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY: "worktree-source-fingerprint",
+    }
+    old = store.create_conversation(
+        title="mother",
+        runner_id=RUNNER_ID,
+        agent_id=agent_id,
+        harness_override="codex-native",
+        labels=automation_labels,
+    ).id
+    _create(store, parent=old, title="child")
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+
+    continuing = tasks.create(
+        task_id,
+        "Continue",
+        "Prompt",
+        "FREQ=HOURLY",
+        None,
+        agent_id,
+        "UTC",
+        session_mode="continue",
+        session_id=old,
+        state="paused",
+    )
+    copying = tasks.create(
+        uuid4().hex,
+        "Copy",
+        "Prompt",
+        "FREQ=HOURLY",
+        None,
+        uuid4().hex,
+        "UTC",
+        session_id=old,
+        source_session_id=old,
+    )
+    foreign = tasks.create(
+        uuid4().hex,
+        "Foreign",
+        "Prompt",
+        "FREQ=HOURLY",
+        "other@example.test",
+        uuid4().hex,
+        "UTC",
+        session_mode="continue",
+        session_id=old,
+    )
+
+    prepared = await client.post(f"/v1/sessions/{old}/successor")
+    assert prepared.status_code == 200, prepared.text
+    new = prepared.json()["id"]
+    response = await client.post(f"/v1/sessions/{old}/succession", json={"target_session_id": new})
+
+    assert response.status_code == 200 and response.json()["status"] == "done"
+    old_row = store.get_conversation(old)
+    assert old_row is not None and old_row.archived
+    moved = tasks.get(continuing.id)
+    assert moved is not None
+    assert (moved.session_id, moved.state) == (new, "paused")
+    successor = store.get_conversation(new)
+    assert successor is not None
+    assert automation_labels.items() <= successor.labels.items()
+    copy = tasks.get(copying.id)
+    assert copy is not None
+    assert (copy.session_id, copy.source_session_id) == (old, old)
+    foreign_row = tasks.get(foreign.id)
+    assert foreign_row is not None and foreign_row.session_id == old
+
+
 async def test_succession_auth_requires_edit_on_target(
     runtime_init: None,
     db_uri: str,
@@ -1710,7 +1792,6 @@ async def test_deferred_recovery_scans_past_offline_backlog(
     trigger: str,
 ) -> None:
     import json
-    from uuid import uuid4
 
     import sqlalchemy as sa
 

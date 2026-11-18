@@ -21,19 +21,23 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from weakref import WeakValueDictionary
 
 import httpx
 
 from omnigent.db.utils import generate_task_id, now_epoch
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation, ErrorData, MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 from omnigent.native._native_session_labels import replacement_session_labels
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import pending_elicitations, session_stream
+from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.child_cap import CHILD_CAP_LABEL_KEY
 from omnigent.server.routes._sessions.helpers import (
     _get_runner_client,
@@ -55,6 +59,7 @@ from omnigent.stores.conversation_store import (
     SessionSuccession,
 )
 from omnigent.stores.peer_message_store import PeerMessageStore
+from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
 
@@ -68,6 +73,10 @@ _PEER_UNDELIVERED_STATES: tuple[str, ...] = ("pending", "queued", "held")
 # triggers remain after it gives up.
 _RETRY_BACKOFFS_S: tuple[float, ...] = (2.0, 4.0, 8.0, 16.0, 30.0)
 
+_scheduled_send_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScopedCache(
+    WeakValueDictionary
+)
+
 # One resumer lock per receipt; a phase is never run concurrently in-process.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by server-generated uuid4 receipt id
 _resumer_locks: dict[str, asyncio.Lock] = {}
@@ -75,6 +84,38 @@ _resumer_locks: dict[str, asyncio.Lock] = {}
 _retry_attempts: dict[str, int] = {}
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by server-generated uuid4 receipt id
 _retry_tasks: dict[str, asyncio.Task[None]] = {}
+
+
+def scheduled_send_lock(session_id: str) -> asyncio.Lock:
+    """Order continued sends and succession moves on this server process."""
+    return _scheduled_send_locks.setdefault(session_id, asyncio.Lock())
+
+
+async def commit_succession_move(
+    store: ConversationStore,
+    old_id: str,
+    new_id: str,
+    receipt_id: str,
+    *,
+    reverse_of: bool,
+    allow_empty: bool,
+) -> None:
+    async def move() -> None:
+        async with AsyncExitStack() as locks:
+            # An undo can also change the target's forward link.
+            for session_id in sorted({old_id, new_id}):
+                await locks.enter_async_context(scheduled_send_lock(session_id))
+            await asyncio.to_thread(
+                store.reassign_live_children,
+                old_id,
+                new_id,
+                receipt_id,
+                reverse_of=reverse_of,
+                allow_empty=allow_empty,
+            )
+
+    # Cancelling the HTTP waiter cannot stop a move already running in a thread.
+    await asyncio.shield(move())
 
 
 class _SuccessionParked(RuntimeError):
@@ -96,6 +137,7 @@ async def advance_succession(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     peer_message_store: PeerMessageStore | None,
+    scheduled_task_store: ScheduledTaskStore | None = None,
     archive_cleanup: Any = None,
 ) -> SessionSuccession:
     """
@@ -112,6 +154,7 @@ async def advance_succession(
     :param runner_router: Router resolving each session's runner client.
     :param peer_message_store: Durable peer-message store, or ``None`` when
         peer messaging is off.
+    :param scheduled_task_store: Store for continuing automations, when configured.
     :returns: The receipt at its resting phase.
     :raises OmnigentError: When the receipt no longer exists.
     """
@@ -151,6 +194,8 @@ async def advance_succession(
                         conversation_store=conversation_store,
                         runner_router=runner_router,
                         peer_message_store=peer_message_store,
+                        scheduled_task_store=scheduled_task_store,
+                        archive_cleanup=archive_cleanup,
                     )
                 elif phase == "rekeyed":
                     receipt = await _phase_open(
@@ -158,6 +203,7 @@ async def advance_succession(
                         conversation_store=conversation_store,
                         runner_router=runner_router,
                         peer_message_store=peer_message_store,
+                        scheduled_task_store=scheduled_task_store,
                     )
                 elif phase == "opened":
                     receipt = await _phase_release(
@@ -174,6 +220,7 @@ async def advance_succession(
                     receipt = await _phase_archive(
                         receipt,
                         conversation_store=conversation_store,
+                        scheduled_task_store=scheduled_task_store,
                         archive_cleanup=archive_cleanup,
                     )
                 elif phase == "archived":
@@ -217,6 +264,7 @@ async def advance_succession(
                     conversation_store=conversation_store,
                     runner_router=runner_router,
                     peer_message_store=peer_message_store,
+                    scheduled_task_store=scheduled_task_store,
                     archive_cleanup=archive_cleanup,
                 )
                 return await _record_phase_error(receipt, exc, conversation_store)
@@ -230,6 +278,7 @@ async def resume_unfinished_successions(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     peer_message_store: PeerMessageStore | None,
+    scheduled_task_store: ScheduledTaskStore | None = None,
     archive_cleanup: Any = None,
 ) -> None:
     """
@@ -257,6 +306,7 @@ async def resume_unfinished_successions(
             conversation_store=conversation_store,
             runner_router=runner_router,
             peer_message_store=peer_message_store,
+            scheduled_task_store=scheduled_task_store,
             archive_cleanup=archive_cleanup,
         )
 
@@ -267,6 +317,7 @@ async def resume_successions_for_runner(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     peer_message_store: PeerMessageStore | None,
+    scheduled_task_store: ScheduledTaskStore | None = None,
     archive_cleanup: Any = None,
 ) -> None:
     """
@@ -307,6 +358,7 @@ async def resume_successions_for_runner(
             conversation_store=conversation_store,
             runner_router=runner_router,
             peer_message_store=peer_message_store,
+            scheduled_task_store=scheduled_task_store,
             archive_cleanup=archive_cleanup,
         )
 
@@ -337,6 +389,7 @@ async def _resume_one(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     peer_message_store: PeerMessageStore | None,
+    scheduled_task_store: ScheduledTaskStore | None = None,
     archive_cleanup: Any = None,
 ) -> None:
     """Resume one receipt, logging instead of raising."""
@@ -346,6 +399,7 @@ async def _resume_one(
             conversation_store=conversation_store,
             runner_router=runner_router,
             peer_message_store=peer_message_store,
+            scheduled_task_store=scheduled_task_store,
             archive_cleanup=archive_cleanup,
         )
     except Exception:
@@ -412,6 +466,8 @@ async def _phase_rekey(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     peer_message_store: PeerMessageStore | None,
+    scheduled_task_store: ScheduledTaskStore | None,
+    archive_cleanup: Any,
 ) -> SessionSuccession:
     """``moved → rekeyed``: hand each holder of moved state to the successor."""
     groups = await _runner_groups(receipt, conversation_store, runner_router)
@@ -467,6 +523,8 @@ async def _phase_rekey(
                 conversation_store=conversation_store,
                 runner_router=runner_router,
                 peer_message_store=peer_message_store,
+                scheduled_task_store=scheduled_task_store,
+                archive_cleanup=archive_cleanup,
             )
             _logger.info(
                 "Succession %s: successor not ready; retrying later",
@@ -519,8 +577,9 @@ async def _phase_open(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     peer_message_store: PeerMessageStore | None,
+    scheduled_task_store: ScheduledTaskStore | None,
 ) -> SessionSuccession:
-    """``rekeyed → opened``: snapshot questions, re-target peers, post the opening."""
+    """``rekeyed → opened``: snapshot questions, retarget peers and tasks, post the opening."""
     successor = await asyncio.to_thread(conversation_store.get_conversation, receipt.new_id)
     if successor is not None and successor.runner_id is not None:
         client = await _get_runner_client(receipt.new_id, runner_router, conversation=successor)
@@ -577,6 +636,10 @@ async def _phase_open(
                 receipt.new_id,
                 extra={"session_id": receipt.old_id},
             )
+    if scheduled_task_store is not None:
+        await asyncio.to_thread(
+            _retarget_scheduled_tasks, receipt, conversation_store, scheduled_task_store
+        )
 
     handover = await _handover_text(conversation_store, old_conversation)
     children = await _direct_children(receipt, conversation_store)
@@ -728,15 +791,45 @@ async def _phase_close_questions(
     return await _advance(receipt, "cards_closed", conversation_store=conversation_store)
 
 
+def _retarget_scheduled_tasks(
+    receipt: SessionSuccession,
+    conversation_store: ConversationStore,
+    scheduled_task_store: ScheduledTaskStore,
+) -> None:
+    from omnigent.server.routes.sessions.routes_peer import resolve_succeeded_by
+
+    # Split databases and receipts created before atomic rebinding can lag the AP move.
+    target_id = resolve_succeeded_by(conversation_store, receipt.old_id)
+    if target_id == receipt.old_id:
+        return
+    old_owner = conversation_store.get_session_owner_authority(receipt.old_id, owner_only=True)
+    new_owner = conversation_store.get_session_owner_authority(target_id, owner_only=True)
+    if old_owner != new_owner:
+        return
+    user_id = old_owner.user_id if old_owner is not None else None
+    scheduled_task_store.retarget_continued_sessions(
+        receipt.old_id,
+        target_id,
+        user_id=None if user_id == RESERVED_USER_LOCAL else user_id,
+        generation=old_owner.generation if old_owner is not None else None,
+    )
+
+
 async def _phase_archive(
     receipt: SessionSuccession,
     *,
     conversation_store: ConversationStore,
+    scheduled_task_store: ScheduledTaskStore | None = None,
     archive_cleanup: Any = None,
 ) -> SessionSuccession:
     """``cards_closed → archived``: archive the old session without runner teardown."""
     old_conversation = await asyncio.to_thread(conversation_store.get_conversation, receipt.old_id)
     if old_conversation is not None and not old_conversation.archived:
+        if scheduled_task_store is not None:
+            # Catch receipts that reached this phase before an upgrade.
+            await asyncio.to_thread(
+                _retarget_scheduled_tasks, receipt, conversation_store, scheduled_task_store
+            )
         cleanup = archive_cleanup is not None and await archive_cleanup.should_cleanup_on_archive(
             old_conversation
         )
@@ -1096,6 +1189,7 @@ def _schedule_retry(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     peer_message_store: PeerMessageStore | None,
+    scheduled_task_store: ScheduledTaskStore | None = None,
     archive_cleanup: Any = None,
 ) -> None:
     """Retry a stalled receipt in-process, within a bounded schedule."""
@@ -1124,6 +1218,7 @@ def _schedule_retry(
             conversation_store=conversation_store,
             runner_router=runner_router,
             peer_message_store=peer_message_store,
+            scheduled_task_store=scheduled_task_store,
             archive_cleanup=archive_cleanup,
         )
 

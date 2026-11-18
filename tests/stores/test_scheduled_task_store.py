@@ -15,9 +15,11 @@ import sqlalchemy as sa
 
 from omnigent.db.db_models import current_workspace_id, uuid_to_bytes, workspace_scope
 from omnigent.db.utils import get_or_create_engine
+from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.scheduled.schedule import next_scheduled_time
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from omnigent.stores.scheduled_task_store import ArchivedTarget
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 pytestmark = pytest.mark.usefixtures("frozen_recurrence_clock")
@@ -2570,6 +2572,54 @@ def test_release_session_clears_only_the_session_it_was_given(
     # A deleted task releases nothing.
     store.delete(task.id)
     assert store.release_session(task.id, _uid("c2")) is False
+
+
+def test_archive_pause_requires_the_current_target_and_only_transitions_once(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _session_task(store, "archive-pause", session_mode="continue")
+    original_id, successor_id = _uid("original"), _uid("successor")
+    assert store.adopt_session(task.id, original_id, snapshot=task) == "adopted"
+    original = store.get(task.id)
+    assert original is not None
+
+    def record_failure(snapshot: ScheduledTask, seed: str, offset: int) -> ScheduledTaskRun:
+        return store.create_run(
+            _uid(seed),
+            snapshot.id,
+            "failed",
+            snapshot.created_at + offset,
+            error_code="continued_session_archived",
+            archived_target=ArchivedTarget(snapshot, lambda: True),
+        )
+
+    store.retarget_continued_sessions(
+        original_id,
+        successor_id,
+        user_id=original.user_id,
+        generation=original.account_generation,
+    )
+    stale = record_failure(original, "stale-target", 0)
+    assert stale.status == "skipped"
+    rebound = store.get(task.id)
+    assert rebound is not None and rebound.state == "active"
+
+    failed = record_failure(rebound, "archived-target", 1)
+    assert (failed.status, failed.error_code) == (
+        "failed",
+        "continued_session_archived_task_paused",
+    )
+    duplicate = record_failure(rebound, "duplicate-attempt", 2)
+    assert duplicate.status == "skipped"
+    [notice], _ = store.list_inbox_failures(owner_user_id=rebound.user_id)
+    assert (notice.run_id, notice.error_code) == (failed.id, failed.error_code)
+    current = store.get(task.id)
+    assert current is not None
+    assert (current.session_id, current.state, current.next_run_at) == (
+        successor_id,
+        "paused",
+        None,
+    )
 
 
 def test_adopt_session_records_only_an_unchanged_continue_task_without_one(

@@ -32,6 +32,7 @@ from omnigent.server.scheduled.telemetry import (
     scheduled_run_scope,
     startup_failure_stage,
 )
+from omnigent.stores.scheduled_task_store import ArchivedTarget
 from omnigent.stores.scheduled_task_store.dispatch import (
     DeletedTaskCursor,
     DispatchCursor,
@@ -213,6 +214,7 @@ class StartupLease:
         error: str | None = None,
         error_code: str | None = None,
         failure_stage: str | None = None,
+        archived_target: ArchivedTarget | None = None,
     ) -> None:
         """Record prompt delivery or a known startup failure, with a live lease.
 
@@ -230,20 +232,23 @@ class StartupLease:
         finished_at = self._now()
 
         def log_outcome(_previous: ScheduledTaskRun) -> None:
+            outcome = self.run.status
             _logger.info(
                 "Scheduled run %s startup ended with status %s",
                 self.run.id,
-                status,
+                outcome,
                 extra=_run_event(
                     "scheduled_run_startup_ended",
                     self.run,
                     target=self._target,
-                    outcome=status,
-                    error_code=error_code,
-                    failure_stage=failure_stage or startup_failure_stage(error_code),
+                    outcome=outcome,
+                    error_code=self.run.error_code,
+                    failure_stage=(failure_stage or startup_failure_stage(self.run.error_code))
+                    if outcome == status
+                    else None,
                     startup_delay_seconds=_seconds(finished_at - self.run.scheduled_at),
                     prompt_delay_seconds=_seconds(finished_at - self.run.scheduled_at)
-                    if status in ("running", "succeeded")
+                    if outcome in ("running", "succeeded")
                     else None,
                 ),
             )
@@ -253,6 +258,7 @@ class StartupLease:
             conversation_id=conversation_id,
             error=error,
             error_code=error_code,
+            archived_target=archived_target,
             committed=log_outcome,
         )
 
@@ -272,6 +278,7 @@ class StartupLease:
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        archived_target: ArchivedTarget | None = None,
         committed: Callable[[ScheduledTaskRun], None] | None = None,
     ) -> None:
         await self._write(
@@ -282,6 +289,7 @@ class StartupLease:
                 conversation_id=conversation_id,
                 error=error,
                 error_code=error_code,
+                archived_target=archived_target,
             ),
             committed=committed,
         )

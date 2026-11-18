@@ -24,6 +24,7 @@ from omnigent.db.utils import generate_task_id
 from omnigent.entities import Conversation, ErrorData, MessageData, NewConversationItem
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import MCP_SELECTION_PREFIX
+from omnigent.member_snapshot import LIBRARY_AGENT_TEMPLATE_LABEL_KEY
 from omnigent.permission_tiers import PermissionTier
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
@@ -41,6 +42,7 @@ from omnigent.server.auto_rotation import (
     rotation_injected,
 )
 from omnigent.server.child_cap import CHILD_CAP_LABEL_KEY
+from omnigent.server.managed_hosts import managed_repo_labels, read_managed_repo_workspaces
 from omnigent.server.permission_tiers import ConfirmedPermissionState, read_permission_state
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -56,12 +58,14 @@ from omnigent.server.routes._sessions.helpers import (
     _resolve_harness,
 )
 from omnigent.server.schemas import SessionHandoverRequest, SessionSuccessionRequest
-from omnigent.server.session_succession import advance_succession
+from omnigent.server.session_succession import advance_succession, commit_succession_move
 from omnigent.stores import AgentStore
 from omnigent.stores.conversation_store import (
     HANDOVER_ITEM_LABEL_KEY,
     PROJECT_LABEL_KEY,
     ROTATE_REQUESTED_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
     SUCCEEDED_BY_LABEL_KEY,
     SUCCEEDS_LABEL_KEY,
     ConversationStore,
@@ -130,6 +134,19 @@ def _successor_labels(
         retained = replacement_session_labels(source.labels)
         bridge_key = f"omnigent.{harness.replace('-', '_')}.bridge_id"
         retained[bridge_key] = source.labels.get(bridge_key, source.id)
+    if LIBRARY_AGENT_TEMPLATE_LABEL_KEY in source.labels:
+        retained[LIBRARY_AGENT_TEMPLATE_LABEL_KEY] = source.labels[
+            LIBRARY_AGENT_TEMPLATE_LABEL_KEY
+        ]
+    if SCHEDULED_TASK_ORIGIN_LABEL_KEY in source.labels:
+        # The prepared successor inherits the original host and worktree.
+        for key in (
+            SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+            SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
+        ):
+            if key in source.labels:
+                retained[key] = source.labels[key]
+        retained.update(managed_repo_labels(read_managed_repo_workspaces(source.labels)))
     if tier is not None:
         retained.update(ConfirmedPermissionState(tier, 1, "blocked").labels(harness))
     return retained
@@ -548,8 +565,8 @@ def register_succession_routes(
         if receipt is None:
             receipt_id = uuid4().hex
             try:
-                await asyncio.to_thread(
-                    conversation_store.reassign_live_children,
+                await commit_succession_move(
+                    conversation_store,
                     session_id,
                     target_id,
                     receipt_id,
@@ -587,6 +604,7 @@ def register_succession_routes(
             conversation_store=conversation_store,
             runner_router=runner_router,
             peer_message_store=peer_message_store,
+            scheduled_task_store=getattr(request.app.state, "scheduled_task_store", None),
             archive_cleanup=getattr(request.app.state, "archive_close_coordinator", None),
         )
         if receipt.phase == "void":

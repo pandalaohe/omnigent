@@ -555,6 +555,17 @@ describe("describeRunFailure", () => {
     expect(describeRunFailure("invalid_input", "failed").reason).toContain("Edit the automation");
   });
 
+  it("distinguishes historical archived-target failures from runs that paused the task", () => {
+    expect(describeRunFailure("continued_session_archived", "failed")).toEqual({
+      stage: "Session",
+      reason: "Target session was archived.",
+    });
+    expect(describeRunFailure("continued_session_archived_task_paused", "failed")).toEqual({
+      stage: "Session",
+      reason: "Target session was archived; task paused",
+    });
+  });
+
   it("falls back to a status-worded reason with no stage for unknown or missing codes", () => {
     expect(describeRunFailure("some_new_code", "skipped")).toEqual({
       stage: null,

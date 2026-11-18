@@ -20,7 +20,12 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from fastapi import APIRouter, FastAPI
+from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 
+from omnigent.db.db_models import SqlConversation, current_workspace_id
+from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.managed_hosts import ManagedLaunchTracker
@@ -458,6 +463,64 @@ async def test_continued_session_fire_runs_on_the_claimed_run(store) -> None:
     assert store.get(claimed.task.id).session_id == _CONV_ID
 
 
+async def test_archived_target_pauses_until_resumed_and_notifies_once_per_attempt(
+    store: SqlAlchemyScheduledTaskStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = _saved_task(store, session_mode="continue", session_id=_CONV_ID)
+    assert task.next_run_at is not None
+    clock = FakeClock(task.next_run_at)
+    monkeypatch.setattr(
+        "omnigent.stores.scheduled_task_store.sqlalchemy_store.now_epoch",
+        lambda: int(clock.now()),
+    )
+    conversations = _ExistingConversationStore(
+        _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=_HOST_ID, archived=True)
+    )
+    dispatch = AsyncMock()
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations), launch_dispatch=dispatch, now=clock.now
+    )
+    scheduler = PersistentTaskScheduler(store, executor.fire, executor.recover, now=clock.now)
+
+    async def tick() -> None:
+        await scheduler.poll_once()
+        await asyncio.gather(*list(scheduler._startups.values()))
+
+    try:
+        await tick()
+        [first] = _runs(store, task)
+        assert (first.status, first.error_code, first.conversation_id) == (
+            "failed",
+            "continued_session_archived_task_paused",
+            None,
+        )
+        paused = store.get(task.id)
+        assert paused is not None and paused.state == "paused"
+        assert first.error is not None and "the automation is paused" in first.error
+        [notice], _ = store.list_inbox_failures(owner_user_id=None)
+        assert (notice.run_id, notice.error_code) == (first.id, first.error_code)
+
+        clock.advance(3600)
+        await tick()
+        assert [run.id for run in _runs(store, task)] == [first.id]
+        assert store.list_inbox_failures(owner_user_id=None)[0] == [notice]
+
+        resumed = store.update(task.id, state="active")
+        assert resumed is not None and resumed.next_run_at is not None
+        clock.advance(resumed.next_run_at - clock.now())
+        await tick()
+        paused = store.get(task.id)
+        assert paused is not None and paused.state == "paused"
+        second, previous = _runs(store, task)
+        assert previous.id == first.id
+        assert (second.status, second.error_code) == ("failed", first.error_code)
+        [new_notice], _ = store.list_inbox_failures(owner_user_id=None)
+        assert (new_notice.run_id, new_notice.error_code) == (second.id, first.error_code)
+        dispatch.assert_not_awaited()
+    finally:
+        await scheduler.stop()
+
+
 async def test_a_continue_tasks_first_claimed_run_keeps_its_session(store) -> None:
     claimed = _claim(store, session_mode="continue")
     conversations = _ConversationStore()
@@ -469,6 +532,245 @@ async def test_a_continue_tasks_first_claimed_run_keeps_its_session(store) -> No
 
     [session_id] = conversations.ids
     assert store.get(claimed.task.id).session_id == session_id
+
+
+async def test_claimed_run_follows_the_committed_handover_before_archiving(store, db_uri) -> None:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    old = conversations.create_conversation(agent_id=_AGENT_ID, title="Before handover")
+    successor = conversations.create_conversation(agent_id=_AGENT_ID, title="After handover")
+    claimed = _claim(
+        store, session_mode="continue", session_id=old.id, host_id=None, workspace=None
+    )
+    receipt_id = uuid.uuid4().hex
+    conversations.reassign_live_children(old.id, successor.id, receipt_id, allow_empty=True)
+    # Pause the phase engine after the move so its later retarget and archive cannot help.
+    assert conversations.get_succession_by_id(receipt_id).phase == "moved"
+    assert not conversations.get_conversation(old.id).archived
+    binding_at_move = store.get(claimed.task.id).session_id
+    dispatch = AsyncMock()
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations),
+        launch_dispatch=dispatch,
+        now=claimed.clock.now,
+    )
+    await executor.fire(claimed.task, claimed.lease)
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.conversation_id) == ("succeeded", successor.id)
+    dispatch.assert_awaited_once()
+    assert dispatch.await_args.args[0].id == successor.id
+    assert binding_at_move == successor.id
+    from omnigent.errors import SessionSupersededError
+
+    with pytest.raises(SessionSupersededError):
+        store.update(claimed.task.id, session_id=old.id)
+
+
+@pytest.mark.parametrize("handover_first", [True, False], ids=["handover-first", "runner-first"])
+async def test_handover_and_runner_admission_are_ordered(
+    store, db_uri, monkeypatch, handover_first
+) -> None:
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes.sessions import routes_succession
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    old = conversations.create_conversation(agent_id=_AGENT_ID, title="Before handover")
+    successor = conversations.create_conversation(agent_id=_AGENT_ID, title="After handover")
+    claimed = _claim(
+        store, session_mode="continue", session_id=old.id, host_id=None, workspace=None
+    )
+    deps = _deps(store, conversation_store=conversations)
+    runner_at_admission = asyncio.Event()
+    allow_admission = asyncio.Event()
+    handover_at_move = asyncio.Event()
+    get_succession = conversations.get_succession
+    accepted = []
+
+    async def accept(request):
+        session_id = request.url.path.split("/")[-2]
+        assert request.url.path == f"/v1/sessions/{session_id}/events"
+        if session_id == old.id:
+            runner_at_admission.set()
+            await allow_admission.wait()
+        committed = await asyncio.to_thread(get_succession, old.id, successor.id)
+        accepted.append((session_id, committed is not None))
+        return httpx.Response(202, json={"queued": True})
+
+    async def prepare(_deps, conv):
+        if handover_first and conv.id == old.id:
+            runner_at_admission.set()
+            await allow_admission.wait()
+
+    async def park_after_move(receipt_id, **kwargs):
+        return await asyncio.to_thread(conversations.get_succession_by_id, receipt_id)
+
+    # Mark when the handover handler is about to enter the move, independently of any lock.
+    loop = asyncio.get_running_loop()
+
+    def observe_move(old_id, new_id):
+        receipt = get_succession(old_id, new_id)
+        loop.call_soon_threadsafe(handover_at_move.set)
+        return receipt
+
+    monkeypatch.setattr(conversations, "get_succession", observe_move)
+    monkeypatch.setattr(routes_succession, "advance_succession", park_after_move)
+    monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", AsyncMock())
+    monkeypatch.setattr(fire_mod, "_agent_revision", prepare)
+    router = APIRouter(prefix="/v1")
+    routes_succession.register_succession_routes(router, conversation_store=conversations)
+    app = FastAPI()
+    app.include_router(router)
+
+    async with (
+        httpx.AsyncClient(
+            base_url="http://runner", transport=httpx.MockTransport(accept)
+        ) as runner,
+        httpx.AsyncClient(base_url="http://server", transport=httpx.ASGITransport(app)) as client,
+        asyncio.timeout(15),
+        asyncio.TaskGroup() as group,
+    ):
+
+        async def connect(*, conv, **kwargs):
+            return runner, conv
+
+        monkeypatch.setattr(sessions, "ensure_runner_connected", connect)
+        executor = ClaimedRunExecutor(deps, now=claimed.clock.now)
+        group.create_task(executor.fire(claimed.task, claimed.lease))
+        await runner_at_admission.wait()
+        handover = group.create_task(
+            client.post(
+                f"/v1/sessions/{old.id}/succession",
+                json={"target_session_id": successor.id, "allow_empty": True},
+            )
+        )
+        await handover_at_move.wait()
+        if handover_first:
+            await handover
+        else:
+            # The old runner still holds admission. Let a move with no fence commit.
+            await asyncio.wait({handover}, timeout=3)
+        allow_admission.set()
+
+    assert handover.result().status_code == 200
+    assert get_succession(old.id, successor.id).phase == "moved"
+    assert store.get(claimed.task.id).session_id == successor.id
+    target = successor.id if handover_first else old.id
+    assert accepted == [(target, handover_first)], "runner admitted a prompt out of order"
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.conversation_id) == ("succeeded", target)
+
+
+async def test_unarchive_cannot_commit_between_archive_check_and_pause(
+    store, db_uri, monkeypatch
+) -> None:
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    engine = get_or_create_engine(db_uri)
+    if engine.dialect.name != "postgresql":
+        pytest.skip("requires PostgreSQL row-lock probing")
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    target = conversations.create_conversation(agent_id=_AGENT_ID, title="Target")
+    conversations.update_conversation_with_changes(target.id, archived=True)
+    claimed = _claim(
+        store, session_mode="continue", session_id=target.id, host_id=None, workspace=None
+    )
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations),
+        launch_dispatch=AsyncMock(),
+        now=claimed.clock.now,
+    )
+    archive_outcome = sqlalchemy_store._archived_target_outcome
+    unarchive_committed_early = False
+
+    def check_then_unarchive(*args):
+        nonlocal unarchive_committed_early
+        outcome = archive_outcome(*args)
+        assert outcome[2] == "continued_session_archived_task_paused"
+        # The archive route needs this row lock. Probe it on a separate connection
+        # and run the real transition immediately if it can acquire the lock.
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    select(SqlConversation.id)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id == target.id,
+                    )
+                    .with_for_update(nowait=True)
+                ).scalar_one()
+        except OperationalError as exc:
+            assert getattr(exc.orig, "sqlstate", None) == "55P03"
+        else:
+            conversations.update_conversation_with_changes(target.id, archived=False)
+            unarchive_committed_early = not conversations.get_conversation(target.id).archived
+        return outcome
+
+    monkeypatch.setattr(sqlalchemy_store, "_archived_target_outcome", check_then_unarchive)
+    await executor.fire(claimed.task, claimed.lease)
+
+    assert not unarchive_committed_early, "unarchive committed before the stale pause"
+    assert conversations.get_conversation(target.id).archived
+    assert store.get(claimed.task.id).state == "paused"
+    [run] = _runs(store, claimed.task)
+    [notice], _ = store.list_inbox_failures(owner_user_id=None)
+    assert (notice.run_id, notice.error_code) == (run.id, "continued_session_archived_task_paused")
+    conversations.update_conversation_with_changes(target.id, archived=False)
+    assert not conversations.get_conversation(target.id).archived
+
+
+async def test_stale_archive_failure_cannot_pause_a_resumed_task(store, monkeypatch) -> None:
+    claimed = _claim(store, session_mode="continue", session_id=_CONV_ID)
+    second = _second_claim(store, claimed)
+    archived = _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, archived=True)
+    conversations = _ExistingConversationStore(archived)
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations),
+        launch_dispatch=AsyncMock(),
+        now=claimed.clock.now,
+    )
+    finish_second = second.finish
+
+    async def unarchive_and_resume(*args, **kwargs):
+        # The second executor saw the archived session. Finish the other run first.
+        await executor.fire(claimed.task, claimed.lease)
+        assert store.get(claimed.task.id).state == "paused"
+        conversations.existing[_CONV_ID] = replace(archived, archived=False)
+        assert store.update(claimed.task.id, state="active").state == "active"
+        await finish_second(*args, **kwargs)
+
+    monkeypatch.setattr(second, "finish", unarchive_and_resume)
+    await executor.fire(claimed.task, second)
+
+    assert store.get(claimed.task.id).state == "active"
+    assert (
+        next(run for run in _runs(store, claimed.task) if run.id == second.run.id).status
+        == "skipped"
+    )
+
+
+async def test_queued_manual_run_does_not_hide_the_archive_pause_notice(store) -> None:
+    claimed = _claim(store, session_mode="continue", session_id=_CONV_ID)
+    claimed.clock.advance(1)
+    queued = store.request_manual_run(
+        claimed.task,
+        now=int(claimed.clock.now()),
+        trigger_key=manual_trigger_key(),
+        host_id=_HOST_ID,
+    )
+    assert queued is not None and queued.status == "scheduled"
+    conversations = _ExistingConversationStore(
+        _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, archived=True)
+    )
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations),
+        launch_dispatch=AsyncMock(),
+        now=claimed.clock.now,
+    )
+    await executor.fire(claimed.task, claimed.lease)
+
+    assert store.get(claimed.task.id).state == "paused"
+    [notice], _ = store.list_inbox_failures(owner_user_id=None)
+    assert notice.run_id == claimed.lease.run.id
 
 
 def _second_claim(store: SqlAlchemyScheduledTaskStore, claimed: _Claimed) -> StartupLease:

@@ -265,6 +265,14 @@ const RUN_FAILURES: Readonly<Record<string, RunFailure>> = {
     reason: "Couldn't find the host's home directory.",
   },
   managed_sandbox_unavailable: { stage: "Sandbox", reason: "This server has no sandboxes." },
+  continued_session_archived: {
+    stage: "Session",
+    reason: "Target session was archived.",
+  },
+  continued_session_archived_task_paused: {
+    stage: "Session",
+    reason: "Target session was archived; task paused",
+  },
   session_create_failed: { stage: "Session", reason: "Couldn't create the session." },
   owner_grant_failed: {
     stage: "Session",

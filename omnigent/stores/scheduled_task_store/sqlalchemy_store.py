@@ -9,7 +9,7 @@ import uuid
 from collections.abc import Callable
 from functools import partial
 from operator import ge, gt, le, lt
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 from sqlalchemy import and_, asc, desc, func, or_, select, tuple_, update
 from sqlalchemy.engine import CursorResult
@@ -19,6 +19,8 @@ from sqlalchemy.sql.elements import ColumnElement
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
     DEFAULT_WORKSPACE_ID,
+    SqlConversation,
+    SqlConversationLabel,
     SqlHost,
     SqlPreference,
     SqlScheduledTask,
@@ -38,13 +40,19 @@ from omnigent.db.enum_codecs import (
     encode_scheduled_task_state,
 )
 from omnigent.db.utils import (
+    get_or_create_conversation_engine,
     get_or_create_engine,
     make_named_managed_session_maker,
     now_epoch,
     run_write_transaction,
 )
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
-from omnigent.errors import ErrorCode, OmnigentError, ProjectArchiveBusyError
+from omnigent.errors import (
+    ErrorCode,
+    OmnigentError,
+    ProjectArchiveBusyError,
+    SessionSupersededError,
+)
 from omnigent.server.scheduled.run_reconciler import (
     STALE_RUN_ERROR_CODE,
     STALE_RUN_MAX_AGE_SECONDS,
@@ -56,6 +64,7 @@ from omnigent.server.scheduled.schedule import (
     occurrence_host_id,
     scheduled_trigger_key,
 )
+from omnigent.stores.conversation_store import SUCCEEDED_BY_LABEL_KEY
 from omnigent.stores.host_store import delete_unused_host_in_session
 from omnigent.stores.project_store.sqlalchemy_store import (
     assert_project_admits,
@@ -63,7 +72,10 @@ from omnigent.stores.project_store.sqlalchemy_store import (
     project_archive_op_is_current,
 )
 from omnigent.stores.scheduled_task_store import (
+    ARCHIVED_TARGET_CODE,
+    ARCHIVED_TARGET_PAUSED_CODE,
     AdoptOutcome,
+    ArchivedTarget,
     AutomationFailure,
     ScheduledTaskStore,
 )
@@ -249,6 +261,75 @@ def _run_to_entity(row: SqlScheduledTaskRun) -> ScheduledTaskRun:
     )
 
 
+def _archived_target_outcome(
+    row: SqlScheduledTask | None, target: ArchivedTarget, error: str | None
+) -> tuple[str, str | None, str]:
+    """Check the target under the task lock, then record any pause with its failure."""
+    snapshot = target.task
+    paused = encode_scheduled_task_state("paused")
+    if (
+        row is None
+        or row.id != snapshot.id
+        or row.user_id != snapshot.user_id
+        or row.account_generation != snapshot.account_generation
+        or row.session_mode != encode_scheduled_task_session_mode("continue")
+        or not target.is_current()
+        or row.session_id != snapshot.session_id
+        or (row.state == paused and snapshot.state != "paused")
+        or row.state == encode_scheduled_task_state("deleted")
+    ):
+        return "skipped", _STALE_ARCHIVED_TARGET, _STALE_ARCHIVED_TARGET_CODE
+    if snapshot.state == "paused":  # A manual run can start while paused.
+        if row.state != paused:
+            return "skipped", _STALE_ARCHIVED_TARGET, _STALE_ARCHIVED_TARGET_CODE
+        return "failed", error, ARCHIVED_TARGET_CODE
+    # Claiming the final occurrence can already have marked the task completed.
+    row.state = paused
+    row.next_run_at = None
+    row.paused_by_archive_batch = None
+    row.updated_at = now_epoch()
+    return "failed", f"{error}; the automation is paused", ARCHIVED_TARGET_PAUSED_CODE
+
+
+_STALE_ARCHIVED_TARGET = "the automation target or state changed"
+_STALE_ARCHIVED_TARGET_CODE = "continued_session_archive_superseded"
+
+
+def retarget_continued_tasks_in_session(
+    session: Session, old_id: str, new_id: str, *, user_id: str | None, generation: str | None
+) -> None:
+    session.execute(
+        update(SqlScheduledTask)
+        .where(
+            SqlScheduledTask.workspace_id == current_workspace_id(),
+            SqlScheduledTask.user_id == user_id,
+            SqlScheduledTask.account_generation == generation,
+            SqlScheduledTask.state != encode_scheduled_task_state("deleted"),
+            SqlScheduledTask.session_mode == encode_scheduled_task_session_mode("continue"),
+            SqlScheduledTask.session_id == old_id,
+        )
+        .values(session_id=new_id, updated_at=now_epoch())
+    )
+
+
+def _require_unsuperseded_target(session: Session, session_id: str) -> None:
+    workspace_id = current_workspace_id()
+    successor_id = session.scalar(
+        select(SqlConversationLabel.value)
+        .where(
+            SqlConversationLabel.workspace_id == workspace_id,
+            SqlConversationLabel.conversation_id == session_id,
+            SqlConversationLabel.key == SUCCEEDED_BY_LABEL_KEY,
+        )
+        .with_for_update()
+    )
+    if successor_id is not None:
+        raise SessionSupersededError(successor_id)
+
+
+_WriteResult = TypeVar("_WriteResult")
+
+
 class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     """
     SQLAlchemy-backed implementation of :class:`ScheduledTaskStore`.
@@ -262,7 +343,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     _active_boot_batch_size = 10_000
     _cleanup_batch_size = 100
 
-    def __init__(self, storage_location: str) -> None:
+    def __init__(
+        self, storage_location: str, conversation_storage_location: str | None = None
+    ) -> None:
         """
         Initialize the SQLAlchemy scheduled-task store.
 
@@ -276,6 +359,15 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         self._dispatch_enabled = False
         self._trigger_poll_seconds: int | None = None
         self._engine = get_or_create_engine(storage_location)
+        self._conversation_session_immediate = (
+            make_named_managed_session_maker(
+                get_or_create_conversation_engine(conversation_storage_location),
+                query_name_prefix="omnigent.scheduled_task_store",
+                immediate=True,
+            )
+            if conversation_storage_location and conversation_storage_location != storage_location
+            else None
+        )
         self._session = make_named_managed_session_maker(
             self._engine,
             query_name_prefix="omnigent.scheduled_task_store",
@@ -287,6 +379,42 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         )
 
     # ── Scheduled tasks ──────────────────────────────────────────
+
+    def _write_with_target_lock(
+        self,
+        name: str,
+        session_id: str | None,
+        write: Callable[[Session], _WriteResult],
+        *,
+        reject_superseded: bool = True,
+    ) -> _WriteResult:
+        if session_id is None:
+            return run_write_transaction(self._session_immediate, name, write)
+
+        def lock_target(session: Session) -> None:
+            # Handover also takes the conversation lock before writing the task.
+            session.execute(
+                select(SqlConversation.id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == session_id,
+                )
+                .with_for_update()
+            )
+            if reject_superseded:
+                _require_unsuperseded_target(session, session_id)
+
+        if self._conversation_session_immediate is not None:
+            # In split-DB mode hold the AP lock through the metadata commit.
+            with self._conversation_session_immediate(name) as conversation_session:
+                lock_target(conversation_session)
+                return run_write_transaction(self._session_immediate, name, write)
+
+        def locked_write(session: Session) -> _WriteResult:
+            lock_target(session)
+            return write(session)
+
+        return run_write_transaction(self._session_immediate, name, locked_write)
 
     def create(
         self,
@@ -358,7 +486,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             session.flush()
             return _to_entity(row)
 
-        return run_write_transaction(self._session_immediate, "insert_task", write)
+        return self._write_with_target_lock(
+            "insert_task", session_id if session_mode == "continue" else None, write
+        )
 
     def get(self, scheduled_task_id: str) -> ScheduledTask | None:
         """Return a scheduled task by id, or ``None`` if not found."""
@@ -718,7 +848,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             session.flush()
             return _to_entity(row)
 
-        return run_write_transaction(self._session_immediate, "update_task", write)
+        return self._write_with_target_lock(
+            "update_task", session_id if isinstance(session_id, str) else None, write
+        )
 
     def replace_model_if_matches(
         self,
@@ -823,6 +955,17 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return True
 
         return run_write_transaction(self._session_immediate, "release_task_session", write)
+
+    def retarget_continued_sessions(
+        self, old_id: str, new_id: str, *, user_id: str | None, generation: str | None
+    ) -> None:
+        def write(session: Session) -> None:
+            require_active_account(session, user_id, generation=generation)
+            retarget_continued_tasks_in_session(
+                session, old_id, new_id, user_id=user_id, generation=generation
+            )
+
+        self._write_with_target_lock("retarget_continued_sessions", new_id, write)
 
     def delete(self, scheduled_task_id: str) -> bool:
         """Hide the task, then remove history in bounded transactions, preserving live claims."""
@@ -989,26 +1132,40 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         finished_at: int | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        archived_target: ArchivedTarget | None = None,
     ) -> ScheduledTaskRun:
         """Insert a new scheduled-task-run row."""
 
         def write(session: Session) -> ScheduledTaskRun:
+            outcome, detail, code = status, error, error_code
+            if archived_target is not None:
+                task = session.get(
+                    SqlScheduledTask,
+                    (current_workspace_id(), scheduled_task_id),
+                    with_for_update=True,
+                )
+                outcome, detail, code = _archived_target_outcome(task, archived_target, error)
             row = SqlScheduledTaskRun(
                 id=run_id,
                 scheduled_task_id=scheduled_task_id,
-                status=encode_scheduled_task_run_status(status),
+                status=encode_scheduled_task_run_status(outcome),
                 scheduled_at=scheduled_at,
                 conversation_id=conversation_id,
                 fired_at=fired_at,
                 finished_at=finished_at,
-                error=error,
-                error_code=error_code,
+                error=detail,
+                error_code=code,
             )
             session.add(row)
             session.flush()
             return _run_to_entity(row)
 
-        return run_write_transaction(self._session_immediate, "insert_task_run", write)
+        return self._write_with_target_lock(
+            "insert_task_run",
+            archived_target.task.session_id if archived_target is not None else None,
+            write,
+            reject_superseded=False,
+        )
 
     def list_inbox_failures(
         self,
@@ -1056,7 +1213,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     or (check_generation and task.account_generation != generation)
                 ):
                     continue
-                run = session.execute(
+                runs = (
                     select(
                         SqlScheduledTaskRun.id,
                         SqlScheduledTaskRun.status,
@@ -1068,12 +1225,38 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     .where(
                         SqlScheduledTaskRun.workspace_id == current_workspace_id(),
                         SqlScheduledTaskRun.scheduled_task_id == task.id,
+                        # A superseded claim cannot hide the failure that paused the task.
+                        SqlScheduledTaskRun.error_code.is_distinct_from(
+                            _STALE_ARCHIVED_TARGET_CODE
+                        ),
                     )
                     .order_by(
                         SqlScheduledTaskRun.scheduled_at.desc(), SqlScheduledTaskRun.id.desc()
                     )
                     .limit(1)
-                ).first()
+                )
+                run = session.execute(runs).first()
+                if (
+                    run is not None
+                    and task.state == encode_scheduled_task_state("paused")
+                    and (
+                        run.status in _UNFINISHED_CLAIM_STATUSES
+                        or run.status == encode_scheduled_task_run_status("scheduled")
+                        or run.error_code == ARCHIVED_TARGET_CODE
+                    )
+                ):
+                    # Work queued before the pause must not hide its notice.
+                    pause = session.execute(
+                        runs.where(
+                            SqlScheduledTaskRun.status.not_in(
+                                _UNFINISHED_CLAIM_STATUSES
+                                | {encode_scheduled_task_run_status("scheduled")}
+                            ),
+                            SqlScheduledTaskRun.error_code.is_distinct_from(ARCHIVED_TARGET_CODE),
+                        )
+                    ).first()
+                    if pause is not None and pause.error_code == ARCHIVED_TARGET_PAUSED_CODE:
+                        run = pause
                 if run is not None and (
                     run.status == encode_scheduled_task_run_status("failed")
                     and run.conversation_id is None
@@ -1780,6 +1963,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        archived_target: ArchivedTarget | None = None,
     ) -> ScheduledTaskRun | None:
         """Transition only a matching startup lease."""
         if status not in {"starting", "running", "succeeded", "failed", "skipped"}:
@@ -1817,16 +2001,24 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 or (row.lease_expires_at <= timestamp) != expired
             ):
                 return None
-            row.status = encode_scheduled_task_run_status(status)
-            if status != "starting":
+            outcome, detail, code = status, error, error_code
+            if archived_target is not None:
+                outcome, detail, code = _archived_target_outcome(task, archived_target, error)
+            row.status = encode_scheduled_task_run_status(outcome)
+            if outcome != "starting":
                 row.lease_expires_at = None
             if conversation_id is not None:
                 row.conversation_id = conversation_id
-            row.finished_at = timestamp if status in {"succeeded", "failed", "skipped"} else None
-            row.error = error
-            row.error_code = error_code
+            row.finished_at = timestamp if outcome in {"succeeded", "failed", "skipped"} else None
+            row.error = detail
+            row.error_code = code
             result = _run_to_entity(row)
             _purge_finished_deleted_task(session, task, row)
             return result
 
-        return run_write_transaction(self._session_immediate, "finish_startup", write)
+        return self._write_with_target_lock(
+            "finish_startup",
+            archived_target.task.session_id if archived_target is not None else None,
+            write,
+            reject_superseded=False,
+        )

@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.stores.scheduled_task_store import ArchivedTarget
 
 # Ordered exactly like the due-task and expired-startup indexes.
 DispatchCursor = tuple[int, int, str]
@@ -137,6 +138,7 @@ class ScheduledTaskDispatchStore(Protocol):
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        archived_target: ArchivedTarget | None = None,
     ) -> ScheduledTaskRun | None:
         """Finish startup conditionally on its lease still matching this snapshot.
 
@@ -147,5 +149,8 @@ class ScheduledTaskDispatchStore(Protocol):
 
         Deleting a task prevents future claims; it does not cancel an existing
         claim. Startup and recovery may still record progress for that run.
+
+        An archived target pauses the still-matching task in the same write as
+        the failed outcome, or skips the run if its target or state changed.
         """
         ...

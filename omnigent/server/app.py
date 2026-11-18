@@ -2422,6 +2422,7 @@ def create_app(
                 conversation_store=conversation_store,
                 runner_router=runner_router,
                 peer_message_store=peer_message_store,
+                scheduled_task_store=scheduled_task_store,
                 archive_cleanup=archive_close_coordinator,
             ),
             name="succession-startup-resume",
@@ -6462,6 +6463,7 @@ def create_app(
                 conversation_store=conversation_store,
                 runner_router=runner_router,
                 peer_message_store=peer_message_store,
+                scheduled_task_store=scheduled_task_store,
                 archive_cleanup=archive_close_coordinator,
             )
 
