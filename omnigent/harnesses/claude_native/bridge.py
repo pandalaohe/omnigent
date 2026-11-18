@@ -465,6 +465,7 @@ _DIALOG_FOOTER_RE = re.compile(
 )
 # Lines scanned for a dialog when no box rule anchors the region.
 _DIALOG_SCAN_TAIL_LINES = 15
+_API_KEY_CONSENT_HEADLINE = "Detected a custom API key in your environment"
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
 # A pane whose prompt has not rendered for this long is asked to repaint
@@ -5996,11 +5997,13 @@ def _submit_left_composer(pane: str) -> bool:
     """Positive evidence after Enter: a mounted composer, or a dialog of the started turn."""
     if _occupied_tall_draft(pane):
         return False
-    return (
-        (_composer_row(pane) is not None and not _history_search_footer_shown(pane))
-        or _terminal_dialog_headline(pane) is not None
-        or _user_prompt_visible(pane)
-    )
+    if _composer_row(pane) is not None and not _history_search_footer_shown(pane):
+        return True
+    headline = _terminal_dialog_headline(pane)
+    # The startup card can cover a draft before Claude records the prompt.
+    if headline == _API_KEY_CONSENT_HEADLINE:
+        return False
+    return headline is not None or _user_prompt_visible(pane)
 
 
 def _paste_and_await_draft(
@@ -9351,7 +9354,7 @@ def _terminal_dialog_headline(pane: str) -> str | None:
     last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
     region = lines[last_rule + 1 :] if last_rule is not None else lines[-_DIALOG_SCAN_TAIL_LINES:]
     if _api_key_consent_visible("\n".join(line.strip(" \t│") for line in region)):
-        return "Detected a custom API key in your environment"
+        return _API_KEY_CONSENT_HEADLINE
     footer = next((line for line in reversed(region) if _DIALOG_FOOTER_RE.search(line)), None)
     if footer is None:
         return None

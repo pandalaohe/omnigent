@@ -16561,9 +16561,16 @@ _TRUST_DIALOG_PANE = """\
 _DIALOG_ECHO_ABOVE_COMPOSER_PANE = _MCP_APPROVAL_DIALOG_PANE + _READY_PANE
 
 
-@pytest.mark.parametrize("real_consent", [False, True], ids=["old-output", "clipped-api-key"])
-def test_permission_controls_belong_to_one_live_card(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_consent: bool
+@pytest.mark.parametrize(
+    ("real_consent", "matching_receipt"),
+    [
+        pytest.param(False, False, id="old-output"),
+        pytest.param(True, False, id="clipped-api-key"),
+        pytest.param(True, True, id="clipped-api-key-with-receipt"),
+    ],
+)
+def test_clipped_api_key_card_requires_a_matching_receipt_to_confirm_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_consent: bool, matching_receipt: bool
 ) -> None:
     bridge = claude_native_bridge
     monkeypatch.setattr(bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.3)
@@ -16577,11 +16584,35 @@ def test_permission_controls_belong_to_one_live_card(
     pane = (
         _API_KEY_DIALOG_PANE.rsplit("  Enter to confirm", 1)[0] if real_consent else echoed_output
     )
+    transcript = tmp_path / "session.jsonl"
+
+    def write_receipt(_now: float) -> None:
+        if matching_receipt and "submit" in mutations and not transcript.exists():
+            record = {
+                "type": "user",
+                "sessionId": "claude-session",
+                "uuid": "user-1",
+                "message": {"role": "user", "content": content},
+            }
+            transcript.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
     bridge_dir, mutations, _clock = _scripted_paste_tui(
-        monkeypatch, tmp_path, lambda *_: _composer_pane(content), after_submit=pane
+        monkeypatch,
+        tmp_path,
+        lambda *_: _composer_pane(content),
+        after_submit=pane,
+        on_capture=write_receipt,
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript),
+        },
     )
 
-    if real_consent:
+    if matching_receipt:
         inject_user_message(bridge_dir, content=content)
     else:
         with pytest.raises(bridge.ClaudeDeliveryUnconfirmed):
