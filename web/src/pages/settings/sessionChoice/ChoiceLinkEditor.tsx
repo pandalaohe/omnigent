@@ -1,11 +1,14 @@
 import { useId, useState } from "react";
 import { XIcon } from "lucide-react";
+import { RadioGroup } from "radix-ui";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
 import { useHostModelOptions, type Host } from "@/hooks/useHosts";
 import type { UsageAccountView } from "@/pages/usageBoard/usageBoardData";
-import type { ChoiceLink, ChoiceLimit } from "./sessionChoiceData";
+import type { ChoiceFallbackMode, ChoiceLink, ChoiceLimit } from "./sessionChoiceData";
+import type { ChoiceDrainTag } from "./choiceDrainLocks";
 import { guessMeter, type ChoiceAgent } from "./sessionChoiceEdits";
 import { canonicalNativeHarness } from "@/lib/nativeHarnessModes";
 import { splitModelId } from "@/lib/modelReference";
@@ -297,8 +300,64 @@ export function ChoiceLinkEditor({
   );
 }
 
+const FALLBACK_OPTIONS = [
+  { mode: "drain", label: "Drain", hint: "Use this node up before going back" },
+  { mode: "return", label: "Return", hint: "Go back as soon as an earlier node recovers" },
+] as const;
+const drainTime = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit" });
+
+function FallbackModeControl({
+  index,
+  mode,
+  since,
+  onChange,
+}: {
+  index: number;
+  mode: ChoiceFallbackMode;
+  since?: number;
+  onChange: (mode: ChoiceFallbackMode) => void;
+}) {
+  const id = useId();
+  return (
+    <div className="mb-1 space-y-1 text-xs">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span id={`${id}-label`} className="text-muted-foreground">
+          Fallback {index}
+        </span>
+        <RadioGroup.Root
+          aria-labelledby={`${id}-label`}
+          aria-describedby={`${id}-hint`}
+          orientation="horizontal"
+          className="inline-flex gap-0.5 rounded-md bg-muted p-0.5"
+          value={mode}
+          onValueChange={(value: ChoiceFallbackMode) => onChange(value)}
+        >
+          {FALLBACK_OPTIONS.map(({ mode: option, label }) => (
+            <RadioGroup.Item
+              key={option}
+              value={option}
+              className="rounded px-2 py-1 text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring data-[state=checked]:bg-background data-[state=checked]:font-medium data-[state=checked]:text-foreground data-[state=checked]:shadow-xs"
+            >
+              {label}
+            </RadioGroup.Item>
+          ))}
+        </RadioGroup.Root>
+        {since !== undefined && (
+          <Badge variant="secondary" className="text-xs tabular-nums">
+            Draining since {drainTime.format(since * 1000)}
+          </Badge>
+        )}
+      </div>
+      <p id={`${id}-hint`} className="text-muted-foreground">
+        {FALLBACK_OPTIONS.find((option) => option.mode === mode)?.hint}
+      </p>
+    </div>
+  );
+}
+
 export function ChoiceChainEditor({
   links,
+  drainTag,
   onChange,
   ...props
 }: Omit<
@@ -306,6 +365,7 @@ export function ChoiceChainEditor({
   "link" | "onChange" | "onRemove" | "removable" | "meterPicked" | "onPickMeter"
 > & {
   links: ChoiceLink[];
+  drainTag?: ChoiceDrainTag;
   onChange: (links: ChoiceLink[]) => void;
 }) {
   const [manualMeters, setManualMeters] = useState(() =>
@@ -316,7 +376,19 @@ export function ChoiceChainEditor({
       {links.map((link, index) => (
         // eslint-disable-next-line react/no-array-index-key -- Chain slots are fully controlled and ordered by position.
         <div key={`link:${index}`}>
-          {index > 0 && <p className="mb-1 text-xs text-muted-foreground">Fallback {index}</p>}
+          {index > 0 && (
+            <FallbackModeControl
+              index={index}
+              mode={link.fallbackMode ?? "return"}
+              since={drainTag?.linkIndex === index ? drainTag.since : undefined}
+              onChange={(mode) => {
+                const next = { ...link };
+                if (mode === "drain") next.fallbackMode = mode;
+                else delete next.fallbackMode;
+                onChange(links.map((item, i) => (i === index ? next : item)));
+              }}
+            />
+          )}
           <ChoiceLinkEditor
             {...props}
             link={link}

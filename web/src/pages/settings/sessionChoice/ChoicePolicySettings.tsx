@@ -5,16 +5,18 @@ import { listCallingDefaultCatalogs } from "@/lib/callingDefaultsApi";
 import { canonicalNativeHarness } from "@/lib/nativeHarnessModes";
 import type { UsageAccountView } from "@/pages/usageBoard/usageBoardData";
 import { ChoicePolicyEditor } from "./ChoicePolicyEditor";
-import type { SessionChoiceDocument } from "./sessionChoiceData";
+import type { ChoiceEnvelope, SessionChoiceDocument } from "./sessionChoiceData";
 
 export function ChoicePolicySettings({
   document,
+  savedChoice,
   host,
   meters,
   products,
   onChange,
 }: {
   document: SessionChoiceDocument;
+  savedChoice?: ChoiceEnvelope;
   host: string;
   meters: UsageAccountView[];
   products: Record<string, string | null>;
@@ -31,6 +33,7 @@ export function ChoicePolicySettings({
   return (
     <ChoicePolicyEditor
       document={document}
+      savedChoice={savedChoice}
       host={host}
       hosts={hosts.data ?? []}
       agents={(agents.data ?? []).map((agent) => ({
