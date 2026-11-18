@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -11,9 +12,14 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
+from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.runtime import pending_inputs, session_stream
 from omnigent.server.routes._sessions import orchestration
+from omnigent.server.routes.sessions import routes_hooks
 from omnigent.server.schemas import SessionEventInput
+from omnigent.stores.conversation_store import DetachedCard
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.server.helpers import start_session_stream_collector
 
@@ -275,6 +281,113 @@ async def test_system_delivery_waits_for_the_runner_outcome(db_uri, monkeypatch,
         finally:
             for body in posted:
                 pending_inputs.resolve(conv.id, body["pending_id"])
+
+
+@pytest.fixture
+async def replaced_runner_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[httpx.AsyncClient]:
+    registry = TunnelRegistry()
+    runner_id = "runner-test"
+    hello = HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[])
+    original = registry.register(runner_id, AsyncMock(), hello)
+    send = registry.send_text
+    replaced: list[RunnerSession] = []
+
+    async def replace_before_send(session: RunnerSession, data: str) -> None:
+        (request,) = session.in_flight.values()
+        replacement = registry.register(runner_id, AsyncMock(), hello)
+        replaced.append(replacement)
+        try:
+            await send(session, data)
+        finally:
+            # The registry also aborts the unused response waiter on replacement.
+            if request.head_future.done() and not request.head_future.cancelled():
+                request.head_future.exception()
+
+    monkeypatch.setattr(registry, "send_text", replace_before_send)
+    monkeypatch.setattr(orchestration, "_ensure_runner_relay", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        orchestration,
+        "_ensure_native_terminal_ready",
+        AsyncMock(return_value=orchestration._NativeTerminalEnsureOutcome(error=None)),
+    )
+    async with httpx.AsyncClient(
+        base_url="http://runner", transport=WSTunnelTransport(registry, runner_id)
+    ) as client:
+        monkeypatch.setattr(orchestration, "_get_runner_client", AsyncMock(return_value=client))
+        yield client
+
+    assert len(replaced) == 1
+    assert original.outbound_queue.get_nowait() is None  # Writer retirement marker.
+    assert original.outbound_queue.empty()
+    assert replaced[0].outbound_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_answered_card_keeps_retrying_after_tunnel_replacement_before_enqueue(
+    db_uri, monkeypatch: pytest.MonkeyPatch, replaced_runner_client: httpx.AsyncClient
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation(harness_override="claude-native").id
+    text = "[System: answers to your question card #q1]"
+    now = int(time.time())
+    card = DetachedCard(
+        elicitation_id="answered-card",
+        session_id=session_id,
+        kind="question",
+        state="answered",
+        mirror=False,
+        params={},
+        payload={"qid": "q1"},
+        grant_key=None,
+        verdict={"action": "accept", "content": {"Question": "Answer"}},
+        delivery_text=text,
+        created_at=now,
+        expires_at=now + 60,
+    )
+    store.add_detached_card(card)
+    backoff = AsyncMock(side_effect=asyncio.CancelledError)
+    monkeypatch.setattr(orchestration, "_delivery_retry_sleep", backoff)
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await routes_hooks._deliver_card_verdict(
+                card, text, granted=False, conversation_store=store, runner_router=None
+            )
+        backoff.assert_awaited_once_with(orchestration._DELIVER_RETRY_BACKOFFS_S[0])
+        (retained,) = store.list_detached_cards()
+        assert retained.elicitation_id == card.elicitation_id
+        assert retained.state == "answered"
+        assert retained.delivery_text == text
+        assert not pending_inputs.snapshot_for(session_id)
+    finally:
+        for entry in pending_inputs.snapshot_for(session_id):
+            pending_inputs.resolve(session_id, entry["pending_id"])
+
+
+@pytest.mark.asyncio
+async def test_confirmed_forward_treats_tunnel_replacement_before_enqueue_as_unsent(
+    db_uri, monkeypatch: pytest.MonkeyPatch, replaced_runner_client: httpx.AsyncClient
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation(harness_override="claude-native").id
+    monkeypatch.setattr(orchestration, "_DELIVER_RETRY_MAX_S", 0.0)
+
+    try:
+        delivered = await orchestration._deliver_with_retry(
+            session_id,
+            "Answer to the card",
+            conversation_store=store,
+            runner_router=None,
+            persist_failure=False,
+        )
+        assert delivered is False
+        assert not store.list_items(session_id).data
+        assert not pending_inputs.snapshot_for(session_id)
+    finally:
+        for entry in pending_inputs.snapshot_for(session_id):
+            pending_inputs.resolve(session_id, entry["pending_id"])
 
 
 @pytest.mark.asyncio

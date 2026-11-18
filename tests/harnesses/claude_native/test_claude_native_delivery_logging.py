@@ -215,7 +215,8 @@ def test_delivery_diagnostics(
         assert attrs["draft_wait_ms"] == 0
         assert attrs["draft_pane_rows"] == 3
         assert attrs["draft_pane_max_columns"] == len("❯ " + secret)
-        assert attrs["submit_polls"] == (6 if scenario == "empty_capture" else 1)
+        # Verification stops at 60 ms without taking a capture at the deadline.
+        assert attrs["submit_polls"] == (5 if scenario == "empty_capture" else 1)
         assert attrs["submit_wait_ms"] == (60 if scenario == "empty_capture" else 10)
         assert attrs["submit_pane_rows"] == (0 if scenario == "empty_capture" else 3)
         assert attrs["submit_pane_max_columns"] == (

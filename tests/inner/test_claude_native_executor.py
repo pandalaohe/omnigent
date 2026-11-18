@@ -2400,6 +2400,7 @@ async def test_readiness_deadline_bounds_executor_lock_wait(
     "outcome",
     [
         "transcript-and-prompt",
+        "transcript-only",
         "matching-hook",
         "no-receipt",
         "foreign-hook",
@@ -2431,12 +2432,30 @@ async def test_hidden_composer_after_paste_settles_without_reaping_or_replaying(
         nonlocal now
         now += delay
 
+    def write_transcript_receipt() -> None:
+        nonlocal receipt_written
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "user",
+                    "sessionId": native_id,
+                    "uuid": "receipt",
+                    "message": {"role": "user", "content": content},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        receipt_written = True
+
     def run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
         nonlocal receipt_written
         pane = ""
         if "capture-pane" in cmd:
             if not mutations:
                 pane = "────────────────\n❯ \n────────────────\n"
+            elif outcome == "transcript-only" and not receipt_written and now >= 2.0:
+                write_transcript_receipt()
             elif (
                 outcome in {"matching-hook", "foreign-hook"} and not receipt_written and now >= 2.0
             ):
@@ -2471,23 +2490,10 @@ async def test_hidden_composer_after_paste_settles_without_reaping_or_replaying(
         return SimpleNamespace(returncode=0, stdout=pane, stderr="")
 
     def pending_prompt(_bridge: Path) -> bool:
-        nonlocal receipt_written
         if not mutations or now < 2.0 or outcome != "transcript-and-prompt":
             return False
         if not receipt_written:
-            transcript.write_text(
-                json.dumps(
-                    {
-                        "type": "user",
-                        "sessionId": native_id,
-                        "uuid": "receipt",
-                        "message": {"role": "user", "content": content},
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            receipt_written = True
+            write_transcript_receipt()
         return True
 
     async def allow_paste(_deadline: float) -> bool:
@@ -2518,9 +2524,14 @@ async def test_hidden_composer_after_paste_settles_without_reaping_or_replaying(
     ]
 
     assert mutations == ["paste"]
-    if outcome in {"matching-hook", "transcript-and-prompt"}:
+    if outcome in {"matching-hook", "transcript-and-prompt", "transcript-only"}:
         assert receipt_written and now < 3.0
         assert events == [TurnComplete(response=None)]
+        monkeypatch.setattr(claude_bridge, "_claude_turn_running", lambda *_: None)
+        # Same gate the runner uses for FIFO when the working pane cannot report its turn.
+        assert claude_bridge.has_running_turn(
+            bridge_dir, unknown_is_busy=claude_bridge.claude_pane_has_accepted_input(bridge_dir)
+        )
     else:
         if outcome != "paste-timeout":
             assert now == pytest.approx(3.0, abs=0.3)

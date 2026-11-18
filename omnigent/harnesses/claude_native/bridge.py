@@ -5666,6 +5666,7 @@ def _inject_user_message(
                 owner.check_owner()
             raise
         if owner.read_receipt() is True:
+            _record_accepted_input(bridge_dir, owner.check_owner)
             delivery_diagnostics.record_details(verification="native_recorded")
             return
         if isinstance(exc, ClaudeDeliveryUnconfirmed):
@@ -5774,6 +5775,15 @@ def _tmux_input_identity(bridge_dir: Path) -> _JsonObject:
     return {key: info.get(key) for key in ("socket_path", "tmux_target")}
 
 
+def _record_accepted_input(bridge_dir: Path, check_owner: Callable[[], None]) -> None:
+    """Remember that the current pane has accepted input, even before its next hook."""
+    with _bridge_metadata_write_lock(bridge_dir):
+        check_owner()
+        state = _read_json_file(bridge_dir / _STATE_FILE)
+        state["accepted_input_tmux"] = _tmux_input_identity(bridge_dir)
+        _write_json_file(bridge_dir / _STATE_FILE, state)
+
+
 def _claim_message_delivery() -> None:
     claim = _message_delivery_claim.get()
     if claim is None:
@@ -5876,6 +5886,12 @@ def _paste_and_submit(
             paste_native_session_id is None or native_session_id == paste_native_session_id
         )
 
+    def check_paste_owner() -> None:
+        if not owns_paste():
+            raise ClaudeDeliveryUnconfirmed(
+                "Claude's session changed before delivery was confirmed."
+            )
+
     def read_receipt() -> bool | None:
         return owner.read_receipt() if owner is not None else None
 
@@ -5883,6 +5899,7 @@ def _paste_and_submit(
         bridge_dir, socket_path, tmux_target, text=text, needle=needle, tail_needle=tail_needle
     )
     if read_receipt() is True:
+        _record_accepted_input(bridge_dir, check_paste_owner)
         delivery_diagnostics.record_details(verification="native_recorded")
         return
     if needle and not draft_seen:
@@ -5910,6 +5927,7 @@ def _paste_and_submit(
             bridge_dir=bridge_dir,
         )
         if observed is None:
+            _record_accepted_input(bridge_dir, check_paste_owner)
             return
         draft_seen, pane = True, observed
     delivery_diagnostics.record_draft(
@@ -5947,6 +5965,7 @@ def _paste_and_submit(
             bridge_dir=bridge_dir,
         )
         if observed is None:
+            _record_accepted_input(bridge_dir, check_paste_owner)
             return
         current = observed
     clipped_draft = draft_seen and (
@@ -5959,6 +5978,7 @@ def _paste_and_submit(
         )
     delivery_diagnostics.set_stage("submitting")
     if read_receipt() is True:
+        _record_accepted_input(bridge_dir, check_paste_owner)
         delivery_diagnostics.record_details(verification="native_recorded")
         return
     if message_readiness_remaining() <= 0:
@@ -6003,14 +6023,7 @@ def _paste_and_submit(
             "it may already have been delivered."
         ) from exc
     if accepted:
-        with _bridge_metadata_write_lock(bridge_dir):
-            if not owns_paste():
-                raise ClaudeDeliveryUnconfirmed(
-                    "Claude's session changed before delivery was confirmed."
-                )
-            state = _read_json_file(bridge_dir / _STATE_FILE)
-            state["accepted_input_tmux"] = tmux_info
-            _write_json_file(bridge_dir / _STATE_FILE, state)
+        _record_accepted_input(bridge_dir, check_paste_owner)
         return
     # Keep automatic replay fenced after Enter, even when the full draft is visible.
     raise ClaudeDeliveryUnconfirmed(

@@ -117,7 +117,7 @@ from omnigent.runner.subagent_routing import (
     harness_family,
     subagent_routing_enabled,
 )
-from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry, TunnelRequestNotSent
 from omnigent.runtime import (
     disconnect_outcome,
     get_policy_store,
@@ -9405,7 +9405,7 @@ async def _forward_native_terminal_message(
         )
         error_type = (
             HTTPException
-            if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+            if isinstance(exc, (TunnelRequestNotSent, httpx.ConnectError, httpx.ConnectTimeout))
             else _NativeForwardReplyLost
         )
         raise error_type(
