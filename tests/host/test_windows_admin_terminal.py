@@ -197,7 +197,7 @@ def _process_boundary(
     encrypted=True,
     token_ok=True,
     wrong_key_rejected=True,
-    install_ok=True,
+    service_failures=None,
 ):
     calls = []
 
@@ -206,8 +206,13 @@ def _process_boundary(
         code, output = 0, b""
         if "-Action" in argv:
             action = argv[argv.index("-Action") + 1]
-            if action == "Install" and not install_ok:
+            failure = (service_failures or {}).get(action)
+            if failure is not None:
                 code = 1
+                if failure and "-ResultPath" in argv:
+                    receipt = Path(argv[argv.index("-ResultPath") + 1])
+                    assert receipt.read_text(encoding="ascii") == receipt.name
+                    receipt.write_text(failure, encoding="utf-8")
         elif Path(argv[0]).name == "ssh-keygen.exe" and "-a" in argv:
             key, public = _envelope(cipher=b"aes256-ctr" if encrypted else b"none")
             enrolled.key.write_bytes(key)
@@ -241,7 +246,7 @@ def test_install_enables_config_only_after_all_checks(enrolled, monkeypatch, fai
         encrypted=failure != "unencrypted",
         token_ok=failure != "token",
         wrong_key_rejected=failure != "wrong-key",
-        install_ok=failure != "service",
+        service_failures={"Install": ""} if failure == "service" else None,
     )
     result = CliRunner().invoke(cli, ["host", "admin-terminal", "install"], input="y\n")
     assert result.exit_code == (0 if failure is None else 1), result.output
@@ -260,11 +265,53 @@ def test_install_enables_config_only_after_all_checks(enrolled, monkeypatch, fai
     for argv, kwargs in calls:
         if "-Action" in argv:
             assert argv[argv.index("-ExecutionPolicy") + 1] == "Bypass"
+            receipt = Path(argv[argv.index("-ResultPath") + 1])
+            assert receipt.parent == enrolled.key.parents[2]
+            assert not receipt.exists()
         if Path(argv[0]).name == "ssh.exe":
             assert kwargs["env"].keys().isdisjoint(SSH_ENV_UNSET)
             assert argv[-1].startswith(
                 f'"{enrolled.powershell}" -NoLogo -NoProfile -EncodedCommand '
             )
+
+
+@pytest.mark.parametrize(
+    ("install_failure", "remove_failure", "expected"),
+    [
+        ("sshd -t: 設定錯誤", None, "Install failed at sshd -t: 設定錯誤"),
+        ("", None, "PowerShell exit 1). No diagnostic was returned."),
+        (
+            "listener check: listener absent",
+            "file cleanup: directory is in use",
+            "Install failed at listener check: listener absent",
+        ),
+    ],
+)
+def test_install_cli_reports_service_failure(
+    enrolled, monkeypatch, install_failure, remove_failure, expected
+):
+    from omnigent.cli import cli
+
+    monkeypatch.setattr("omnigent._platform.IS_WINDOWS", True)
+    enrolled.key.unlink()
+    enrolled.key.with_suffix(".pub").unlink()
+    failures = {"Install": install_failure}
+    if remove_failure is not None:
+        failures["Remove"] = remove_failure
+    calls = _process_boundary(monkeypatch, enrolled, service_failures=failures)
+
+    result = CliRunner().invoke(cli, ["host", "admin-terminal", "install"], input="y\n")
+
+    assert result.exit_code == 1, result.output
+    assert expected in result.output
+    if remove_failure is not None:
+        assert "Automatic cleanup incomplete" in result.output
+        assert remove_failure in result.output
+    receipts = [
+        Path(argv[argv.index("-ResultPath") + 1]) for argv, _ in calls if "-Action" in argv
+    ]
+    assert len(set(receipts)) == 3
+    assert all(not receipt.exists() for receipt in receipts)
 
 
 @pytest.mark.parametrize("operation", ["install", "remove"])
