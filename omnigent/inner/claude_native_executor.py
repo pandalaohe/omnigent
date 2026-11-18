@@ -21,6 +21,7 @@ from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
     ClaudeComposerNotCleared,
+    ClaudeDeliveryClaimRefused,
     ClaudeDeliveryUnconfirmed,
     ClaudeInputBoxOccupied,
     ClaudeMessageNotAccepted,
@@ -34,6 +35,7 @@ from omnigent.harnesses.claude_native.bridge import (
     cancellable_injection,
     claude_pane_ready,
     has_pending_user_prompt,
+    has_running_turn,
     inject_slash_command,
     inject_user_message,
     input_box_reads_clear,
@@ -626,8 +628,30 @@ class ClaudeNativeExecutor(Executor):
         # ``/model`` only accepts this session's picker values, aliases, and
         # custom slot; anything else is ignored and the pane keeps its model.
         wanted_model_arg = self._model_command_arg(wanted_model)
+        claim_native_delivery = config.claim_native_delivery if config is not None else None
+        loop = asyncio.get_running_loop()
+        delivery_claimed = False
+
+        async def claim_delivery(deadline: float) -> bool:
+            nonlocal delivery_claimed
+            assert claim_native_delivery is not None
+            if not delivery_claimed:
+                delivery_claimed = await claim_native_delivery(deadline)
+            return delivery_claimed
+
         try:
-            with telemetry.span("claude_native.inject"), message_readiness_budget():
+            with (
+                telemetry.span("claude_native.inject"),
+                message_readiness_budget(
+                    claim=(
+                        lambda deadline: asyncio.run_coroutine_threadsafe(
+                            claim_delivery(deadline), loop
+                        )
+                    )
+                    if claim_native_delivery is not None
+                    else None
+                ),
+            ):
                 hold_deadline: float | None = None
                 while True:
                     try:
@@ -648,6 +672,14 @@ class ClaudeNativeExecutor(Executor):
                         if not await self._hold_message(exc, hold_deadline):
                             raise
                         wanted_model_arg = self._model_command_arg(wanted_model)
+        except ClaudeDeliveryClaimRefused as exc:
+            yield ExecutorError(
+                message=str(exc),
+                code="native_input_claim_refused",
+                undelivered=True,
+                preserve_session=True,
+            )
+            return
         except NativeRetryRejected as exc:
             yield ExecutorError(
                 message=exc.reason, code=exc.reason, undelivered=True, preserve_session=True
@@ -678,11 +710,12 @@ class ClaudeNativeExecutor(Executor):
             )
             # The pane is still alive here: this turn's error reports the close,
             # so the runner must not also report the pane's exit as a failure.
-            cleanup_error = self._reap_failed_turn(expected_close=True)
+            running = await asyncio.to_thread(has_running_turn, self._bridge_dir)
+            cleanup_error = None if running else self._reap_failed_turn(expected_close=True)
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
-            yield ExecutorError(message=message, undelivered=True)
+            yield ExecutorError(message=message, undelivered=True, preserve_session=running)
             return
         except ClaudeSignInPending as exc:
             # The pane is parked on a launcher sign-in the person finishes from
@@ -721,7 +754,10 @@ class ClaudeNativeExecutor(Executor):
             return
         except ClaudeDeliveryUnconfirmed as exc:
             yield ExecutorError(
-                message=describe_exception(exc), undelivered=True, preserve_session=True
+                message=describe_exception(exc),
+                code="native_input_delivery_uncertain" if delivery_claimed else None,
+                undelivered=not delivery_claimed,
+                preserve_session=True,
             )
             return
         except (TmuxSessionNotAdvertised, ClaudeMessageNotAccepted) as exc:
@@ -755,7 +791,8 @@ class ClaudeNativeExecutor(Executor):
                     await asyncio.shield(worker)
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 worker.result()
-            self._reap_failed_turn()
+            if not await asyncio.to_thread(has_running_turn, self._bridge_dir):
+                self._reap_failed_turn()
             raise
 
     def _reap_failed_turn(self, *, expected_close: bool = False) -> str | None:

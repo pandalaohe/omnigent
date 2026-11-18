@@ -410,10 +410,15 @@ MESSAGE_READINESS_TIMEOUT_S = 600.0
 _message_readiness_deadline: ContextVar[float | None] = ContextVar(
     "claude_native_message_readiness_deadline", default=None
 )
+_message_delivery_claim: ContextVar[Callable[[float], Future[bool]] | None] = ContextVar(
+    "claude_native_message_delivery_claim", default=None
+)
 
 
 @contextlib.contextmanager
-def message_readiness_budget(timeout_s: float | None = None) -> Iterator[None]:
+def message_readiness_budget(
+    timeout_s: float | None = None, *, claim: Callable[[float], Future[bool]] | None = None
+) -> Iterator[None]:
     """Share one deadline across a message's readiness checks and retries."""
     deadline = _message_readiness_deadline.get()
     if deadline is not None:
@@ -422,9 +427,11 @@ def message_readiness_budget(timeout_s: float | None = None) -> Iterator[None]:
     token = _message_readiness_deadline.set(
         time.monotonic() + (MESSAGE_READINESS_TIMEOUT_S if timeout_s is None else timeout_s)
     )
+    claim_token = _message_delivery_claim.set(claim)
     try:
         yield
     finally:
+        _message_delivery_claim.reset(claim_token)
         _message_readiness_deadline.reset(token)
 
 
@@ -901,6 +908,10 @@ class ClaudeMessageNotAccepted(RuntimeError):
 
 class ClaudeDeliveryUnconfirmed(ClaudeMessageNotAccepted):
     """The pane may still hold the paste, so delivery recovery must preserve it."""
+
+
+class ClaudeDeliveryClaimRefused(RuntimeError):
+    """The server did not grant this attempt the right to paste."""
 
 
 class ClaudeComposerNotCleared(ClaudeMessageNotAccepted):
@@ -5606,6 +5617,28 @@ def _tmux_input_identity(bridge_dir: Path) -> _JsonObject:
     return {key: info.get(key) for key in ("socket_path", "tmux_target")}
 
 
+def _claim_message_delivery() -> None:
+    claim = _message_delivery_claim.get()
+    if claim is None:
+        return
+    result = claim(time.time() + message_readiness_remaining())
+    try:
+        while (remaining := message_readiness_remaining()) > 0:
+            _check_injection_cancelled()
+            try:
+                if (
+                    result.result(timeout=min(0.25, remaining))
+                    and message_readiness_remaining() > 0
+                ):
+                    return
+                break
+            except TimeoutError:
+                continue
+    finally:
+        result.cancel()
+    raise ClaudeDeliveryClaimRefused("The message could no longer be claimed for delivery.")
+
+
 def _paste_and_submit(
     bridge_dir: Path,
     socket_path: str,
@@ -5657,6 +5690,7 @@ def _paste_and_submit(
             nothing_typed=True,
         )
     tail_needle = _submit_tail_needle(text) if needle else ""
+    _claim_message_delivery()
     delivery_diagnostics.set_stage("pasting")
     # Clear stale text first, or the paste lands inside the person's draft and
     # Enter submits both together.
@@ -7864,6 +7898,17 @@ def has_pending_user_prompt(bridge_dir: Path) -> bool:
     if pending:
         delivery_diagnostics.record_pending_prompt("visible_prompt")
     return pending
+
+
+def has_running_turn(bridge_dir: Path) -> bool:
+    """Check whether Claude still owns the pane for a running turn."""
+    info = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(info, dict):
+        return False
+    socket_path, target = info.get("socket_path"), info.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(target, str):
+        return False
+    return _claude_turn_running(bridge_dir, socket_path, target) is True
 
 
 def input_box_reads_clear(bridge_dir: Path, *, repaint: bool = False) -> bool:

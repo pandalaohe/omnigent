@@ -808,6 +808,28 @@ async def test_held_message_is_sent_after_a_failed_bridge_lookup(
 
 
 @pytest.mark.asyncio
+async def test_followup_waits_for_claude_after_the_runner_slot_is_released(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, harness, _server = _build_app([_DELIVERED, _DELIVERED])
+    sid = uuid.uuid4().hex
+    running = False
+    monkeypatch.setattr(claude_native_bridge, "has_running_turn", lambda _: running)
+    async with _runner_client(app) as client:
+        await _create_session(client, sid)
+        await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
+        await _until(lambda: len(harness.posted_bodies) == 1 and sid not in app.state.active_turns)
+        running = True
+        reply = await client.post(f"/v1/sessions/{sid}/events", json=_message("follow-up"))
+        assert reply.json()["status"] == "buffered"
+        assert sid not in app.state.active_turns
+        assert len(harness.posted_bodies) == 1
+        running = False
+        await _until(lambda: len(harness.posted_bodies) == 2 and sid not in app.state.active_turns)
+    assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "follow-up"]
+
+
+@pytest.mark.asyncio
 async def test_held_message_is_sent_when_the_queue_drains_prompt_check_fails(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

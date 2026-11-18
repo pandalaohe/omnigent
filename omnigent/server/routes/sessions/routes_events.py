@@ -6600,6 +6600,21 @@ def register_events_routes(
             raise HTTPException(403, "Bound receiver authority required")
         return _retry_admission(request)
 
+    @event_router.post(
+        "/sessions/{session_id}/pending-inputs/{pending_id}/claim", include_in_schema=False
+    )
+    async def claim_pending_native_input(
+        request: Request, session_id: str, pending_id: str, claim_id: str, attempt_id: str
+    ) -> dict[str, bool]:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None or not _has_bound_runner_authority(request, conv):
+            raise HTTPException(403, "Bound receiver authority required")
+        return {
+            "claimed": pending_inputs.claim_runner_input(
+                session_id, pending_id, claim_id, expected_attempt_id=attempt_id
+            )
+        }
+
     @event_router.get("/sessions/{session_id}/input-controls", include_in_schema=False)
     async def pending_input_controls(request: Request, session_id: str):
         service = await _control_receiver(request, session_id)

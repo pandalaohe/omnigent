@@ -644,6 +644,7 @@ export function removeLocalConversation(tempConvId: string): boolean {
  * real id comes from the consumed event when we promote into `blocks`.
  */
 export interface PendingUserMessage {
+  stableId?: string;
   tempId: string;
   content: MessageContentBlock[];
   /** Unsent draft awaiting session/model readiness, including unuploaded files. */
@@ -2990,6 +2991,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
               {
                 tempId,
                 content,
+                stableId,
                 ...(initialDraft ? { initialDraft } : {}),
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
@@ -5781,67 +5783,36 @@ async function bindStream(
       // which the server can't replay because it hasn't been told about
       // them yet. A restored bubble the server turns out to know
       // after all (its record landed while the POST response was still in
-      // transit) is dropped in favor of its content-identical
+      // transit) is dropped in favor of its matching
       // ``pending_inputs`` twin: the server entry carries the durable
       // pending id, so the eventual consumed event clears it precisely —
       // keeping both would double-render and strand one of them.
       const toPending = (p: PendingInput): PendingUserMessage => ({
         tempId: p.pendingId,
         content: p.content,
+        ...(p.stableId === undefined ? {} : { stableId: p.stableId }),
         ...(p.sendingSinceMs === undefined ? {} : { sendingSinceMs: p.sendingSinceMs }),
         ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
       });
-      let candidatePending: PendingUserMessage[];
+      const serverPending = pendingInputsById(session.pendingInputs);
+      let snapshotPending: PendingUserMessage[];
       if (!hydratePending) {
-        const serverPending = new Map((session.pendingInputs ?? []).map((p) => [p.pendingId, p]));
-        candidatePending = state.pendingUserMessages.map((p) => {
-          const server = serverPending.get(p.pendingId ?? p.tempId);
-          return server && server.sendingSinceMs !== p.sendingSinceMs
-            ? { ...p, sendingSinceMs: server.sendingSinceMs }
-            : p;
-        });
+        snapshotPending = syncPendingSendTimes(state.pendingUserMessages, serverPending);
       } else {
-        const serverPending = (session.pendingInputs ?? []).map(toPending);
-        // One-to-one consumption so two identical queued sends still match
-        // pairwise. Content (not text) equality so image-only messages
-        // correlate too.
-        const unmatchedServer = serverPending.map((p) => contentKeyOf(p.content));
-        const unknownToServer = state.pendingUserMessages.filter((p) => {
-          const i = unmatchedServer.indexOf(contentKeyOf(p.content));
-          if (i === -1) return true;
-          unmatchedServer.splice(i, 1);
-          return false;
-        });
+        const stableIds = new Set(Array.from(serverPending.values(), (p) => p.stableId));
+        const committedIds = new Set(allBlocks.map((b) => b.ctx.itemId));
+        const unknownToServer = state.pendingUserMessages.filter(
+          (p) =>
+            !serverPending.has(p.pendingId ?? p.tempId) &&
+            (p.stableId === undefined || !stableIds.has(p.stableId)),
+        );
         // pending_inputs is FIFO-ordered and sends are serialized through
         // the send chain, so server-known entries precede in-flight ones.
-        candidatePending = [...serverPending, ...unknownToServer];
+        snapshotPending = [
+          ...Array.from(serverPending.values(), toPending),
+          ...unknownToServer,
+        ].filter((p) => p.stableId === undefined || !committedIds.has(p.stableId));
       }
-      // Dedupe on a COLD LOAD only: drop any candidate whose message already
-      // committed — a snapshot-replayed ghost the server never drained, or a
-      // restored stash bubble whose message persisted while the user was
-      // away. Without this the bubble double-renders beside the committed
-      // item. Native has no id to correlate the POST with the mirrored item,
-      // so dedupe by text; the transcript prepends markers/blockquotes,
-      // leaving the POSTed text at the end, so match with endsWith.
-      // Image-only entries (no text) are kept.
-      //
-      // A cold bind has no live optimistic bubbles of its own — the entry was
-      // just created — so every candidate here comes from the server's
-      // `pending_inputs`, and deduping against all committed copies is correct.
-      // (The old baseline arithmetic existed only because `switchTo` used to
-      // destroy state and restore bubbles from a stash, which could collide
-      // with an older identical message in history.)
-      const dedupePending = hydratePending && candidatePending.length > 0;
-      const committedUserTexts = dedupePending ? committedUserTextsOf(allBlocks) : [];
-      const countEndsWith = (texts: string[], suffix: string): number =>
-        texts.reduce((n, c) => (c.endsWith(suffix) ? n + 1 : n), 0);
-      const snapshotPending: PendingUserMessage[] = dedupePending
-        ? candidatePending.filter((p) => {
-            const text = messageContentText(p.content);
-            if (text === "") return true;
-            return countEndsWith(committedUserTexts, text) === 0;
-          })
-        : candidatePending;
       const syntheticError: ErrorBlock | null =
         session.status === "failed" && session.lastTaskError != null && !hasErrorBlock
           ? {
@@ -6881,6 +6852,7 @@ async function rehydrateWindowOnReconnect(
       s,
       settlementBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId)),
       pendingAtReconnectStart,
+      session.pendingInputs,
     );
     const statusPatch = statusPatchFor(s);
     const blocks =
@@ -7078,6 +7050,7 @@ async function reconcileOnReconnect(
         s,
         settlementBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId)),
         pendingAtReconnectStart,
+        session.pendingInputs,
       ),
     );
     let nextBlocks = reconciledBlocks;
@@ -9212,14 +9185,34 @@ function settledShellInputPatch(
   };
 }
 
+function pendingInputsById(inputs: PendingInput[] | undefined): Map<string, PendingInput> {
+  return new Map((inputs ?? []).map((input) => [input.pendingId, input]));
+}
+
+function syncPendingSendTimes(
+  messages: PendingUserMessage[],
+  inputs: Map<string, PendingInput>,
+): PendingUserMessage[] {
+  return messages.map((message) => {
+    const input = inputs.get(message.pendingId ?? message.tempId);
+    return input && input.sendingSinceMs !== message.sendingSinceMs
+      ? { ...message, sendingSinceMs: input.sendingSinceMs }
+      : message;
+  });
+}
+
 // Lost stream receipts have durable equivalents in the recovered input blocks.
 function recoveredPendingInputPatch(
   s: PendingInputState,
   recovered: AnyBlock[],
   pendingAtReconnectStart: Set<string>,
+  serverInputs: PendingInput[] | undefined,
 ): PendingInputState {
+  const pendingById = pendingInputsById(serverInputs);
+  const isStillPending = (p: PendingUserMessage | undefined) =>
+    p !== undefined && pendingById.has(p.pendingId ?? p.tempId);
   let state: PendingInputState = {
-    pendingUserMessages: s.pendingUserMessages,
+    pendingUserMessages: syncPendingSendTimes(s.pendingUserMessages, pendingById),
     settledShellInputs: s.settledShellInputs,
   };
   for (const block of recovered) {
@@ -9228,7 +9221,7 @@ function recoveredPendingInputPatch(
     } else if (block.type === "slash_command" && block.kind === "command") {
       const text = `/${block.name} ${block.arguments}`.replace(/\s+/g, " ").trim();
       const at = state.pendingUserMessages.findIndex(
-        (p) => !p.initialDraft && messageContentText(p.content) === text,
+        (p) => !p.initialDraft && !isStillPending(p) && messageContentText(p.content) === text,
       );
       if (at >= 0)
         state = {
@@ -9239,6 +9232,7 @@ function recoveredPendingInputPatch(
       block.type === "user_message" &&
       !isSystemUserContent(block.content) &&
       pendingAtReconnectStart.has(state.pendingUserMessages[0]?.tempId ?? "") &&
+      !isStillPending(state.pendingUserMessages[0]) &&
       !state.settledShellInputs.some((entry) => entry.contentKey === contentKeyOf(block.content)) &&
       !recovered.some(
         (input) => isTerminalCommandInput(input) && isShellCommandBubble(block, input.input),
@@ -9253,8 +9247,7 @@ function recoveredPendingInputPatch(
 
 /**
  * Normalized texts of the committed user-message blocks in `blocks`,
- * dropping empties (image-only messages). The dedup baseline for the
- * the snapshot replay in `bindStream`.
+ * dropping empties (image-only messages).
  */
 function committedUserTextsOf(blocks: AnyBlock[]): string[] {
   return blocks
@@ -9264,13 +9257,8 @@ function committedUserTextsOf(blocks: AnyBlock[]): string[] {
 }
 
 /**
- * Canonical JSON key for message content blocks, for correlating a
- * restored in-flight optimistic bubble with a server `pending_inputs`
- * entry by content equality. The server stores the POSTed blocks
- * verbatim, so an exact structural match means "same message" — keys
- * are sorted so serialization order can't break it. Unlike the
- * text-based dedupe this also correlates image-only messages, whose
- * empty text is otherwise unmatchable.
+ * Canonical JSON key for comparing terminal command receipts and native
+ * message content when no matching receipt ID is available.
  */
 function contentKeyOf(content: MessageContentBlock[]): string {
   const canonical = (v: unknown): unknown => {
@@ -10093,6 +10081,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       break;
     }
     case "session_input_consumed": {
+      if (event.itemType === "error" && event.clearedPendingId !== null) {
+        applyToConversation((s) => ({
+          pendingUserMessages: s.pendingUserMessages.filter(
+            (p) => (p.pendingId ?? p.tempId) !== event.clearedPendingId,
+          ),
+        }));
+        break;
+      }
       applyToConversation({ startupPending: false });
       // A retry from another client may have delivered an undelivered message: clear
       // it now when the receipt names it (native ones do), and re-read either way,

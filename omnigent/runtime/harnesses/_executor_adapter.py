@@ -349,6 +349,14 @@ class ExecutorAdapter(HarnessApp):
             service_tier=request.service_tier,
             extra=extra,
         )
+        if request.pending_input_claim_required:
+
+            async def claim_native_delivery(deadline: float) -> bool:
+                return await ctx.claim_input_execution(
+                    request, boundary="native_delivery", delivery_deadline=deadline
+                )
+
+            config.claim_native_delivery = claim_native_delivery
         tools = _normalize_tool_schemas(request.tools or [])
         system_prompt = request.instructions or ""
         # Install stable bridges once on first use — the SDK closure-captures them from the first

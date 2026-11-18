@@ -95,6 +95,68 @@ async def test_runner_pending_input_reconciles_or_expires(db_uri, monkeypatch, e
     assert message.type == "message"
     assert error.type == "error"
     assert "not delivered" in error.data.model_dump()["message"]
+    assert not pending_inputs.claim_runner_input(session_id, pending_id, "late_claim")
+
+
+@pytest.mark.asyncio
+async def test_claimed_input_survives_reconnect_and_expires_as_uncertain(db_uri, monkeypatch):
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation().id
+    now = 0.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    pending_id = pending_inputs.record(session_id, [{"type": "input_text", "text": "hello"}])
+    pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_accepted")
+    pending_inputs.enable_runner_lease(session_id, pending_id)
+    assert pending_inputs.claim_runner_input(session_id, pending_id, "first")
+    assert pending_inputs.claim_runner_input(session_id, pending_id, "first")
+    assert not pending_inputs.claim_runner_input(session_id, pending_id, "second")
+
+    now = 601.0
+    await orchestration._reconcile_runner_input_leases(
+        store, session_id, {"active_pending_ids": [], "queued_pending_ids": []}, {pending_id}
+    )
+    assert not store.list_items(session_id).data
+    assert pending_inputs.runner_lease_remaining(session_id, pending_id) == 119
+
+    now = 721.0
+    assert not pending_inputs.claim_runner_input(session_id, pending_id, "first")
+    await orchestration._watch_runner_input_lease(store, session_id, pending_id)
+
+    assert not pending_inputs.snapshot_for(session_id)
+    message, error = store.list_items(session_id).data
+    assert message.type == "message"
+    assert error.data.model_dump()["code"] == "native_input_delivery_uncertain"
+    assert "may have arrived" in error.data.model_dump()["message"]
+
+
+@pytest.mark.asyncio
+async def test_lapsed_annotation_keeps_explicit_retry_and_records_error(db_uri, monkeypatch):
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation().id
+    now = 0.0
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now)
+    stable_id = "a" * 32
+    deferred: list[tuple[str, str]] = []
+    monkeypatch.setattr(store, "annotation_receipt_for_item", lambda *args: object())
+    monkeypatch.setattr(
+        store,
+        "defer_unsubmitted_annotation",
+        lambda session, item, *, runner_reported: deferred.append((session, item)),
+    )
+    pending_id = pending_inputs.record(
+        session_id,
+        [{"type": "input_text", "text": "annotation"}],
+        stable_id=stable_id,
+        runner_managed=True,
+    )
+    now = 601.0
+    await orchestration._watch_runner_input_lease(store, session_id, pending_id)
+
+    assert deferred == [(session_id, stable_id)]
+    assert not pending_inputs.snapshot_for(session_id)
+    (error,) = store.list_items(session_id).data
+    assert error.type == "error"
+    assert "not delivered" in error.data.model_dump()["message"]
 
 
 @pytest.fixture

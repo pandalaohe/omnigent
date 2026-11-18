@@ -2687,6 +2687,37 @@ def create_runner_app(
                 _abandoned_input_executions[key] = claim
             raise
 
+    async def _claim_native_delivery(session_id: str, frame: InputExecutionClaimEvent) -> bool:
+        claim = frame.claim
+        deadline = claim.admission_deadline
+        while (
+            deadline is not None
+            and claim.delivery_attempt_id is not None
+            and time.time() < deadline
+            and claim.turn_id == _live_response_id.get(session_id)
+            and claim.input_id in _turn_pending_ids.get(session_id, ())
+        ):
+            try:
+                response = await server_client.post(
+                    f"/v1/sessions/{session_id}/pending-inputs/{claim.input_id}/claim",
+                    params={
+                        "claim_id": frame.claim_id,
+                        "attempt_id": claim.delivery_attempt_id,
+                    },
+                    timeout=min(5, max(0.001, deadline - time.time())),
+                )
+                if response.status_code < 500:
+                    return (
+                        response.is_success
+                        and response.json().get("claimed") is True
+                        and time.time() < deadline
+                        and claim.turn_id == _live_response_id.get(session_id)
+                    )
+            except (httpx.HTTPError, ValueError, RuntimeError, ConnectionError):
+                pass
+            await asyncio.sleep(min(1, max(0, deadline - time.time())))
+        return False
+
     async def _relay_input_execution_claim_impl(
         harness_client: httpx.AsyncClient, session_id: str, event: object
     ) -> None:
@@ -2695,6 +2726,22 @@ def create_runner_app(
         try:
             frame = InputExecutionClaimEvent.model_validate(event)
         except ValueError:
+            return
+        if frame.claim.boundary == "native_delivery":
+            claimed = await _claim_native_delivery(session_id, frame)
+            reply = await harness_client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "input_execution_result",
+                    "claim_id": frame.claim_id,
+                    "result": {
+                        "state": "accepted" if claimed else "refused",
+                        "reason": "native_delivery_claim",
+                    },
+                },
+                timeout=5,
+            )
+            reply.raise_for_status()
             return
         key = (session_id, frame.claim.input_id)
         expected = _input_execution_claims.get(key, ...)
@@ -7952,14 +7999,20 @@ def create_runner_app(
         )
         return bridge_dir_for_bridge_id(bridge_id)
 
+    def _claude_input_blocked(bridge_dir: Path) -> bool:
+        from omnigent.harnesses.claude_native.bridge import (
+            has_pending_user_prompt,
+            has_running_turn,
+        )
+
+        return has_running_turn(bridge_dir) or has_pending_user_prompt(bridge_dir)
+
     async def _pending_claude_prompt_bridge_dir(session_id: str) -> Path | None:
-        """Return the bridge whose question or approval currently owns input."""
+        """Return the bridge whose turn, question or approval currently owns input."""
         if _session_harness_name(session_id) != "claude-native":
             return None
-        from omnigent.harnesses.claude_native.bridge import has_pending_user_prompt
-
         bridge_dir = await _claude_prompt_bridge_dir(session_id)
-        if await asyncio.to_thread(has_pending_user_prompt, bridge_dir):
+        if await asyncio.to_thread(_claude_input_blocked, bridge_dir):
             return bridge_dir
         return None
 
@@ -7983,8 +8036,6 @@ def create_runner_app(
             return
 
         async def _wait_for_prompt() -> None:
-            from omnigent.harnesses.claude_native.bridge import has_pending_user_prompt
-
             resolved_dir = bridge_dir
             warned = False
             try:
@@ -8012,7 +8063,7 @@ def create_runner_app(
                     try:
                         if resolved_dir is None:
                             resolved_dir = await _claude_prompt_bridge_dir(session_id)
-                        pending = await asyncio.to_thread(has_pending_user_prompt, resolved_dir)
+                        pending = await asyncio.to_thread(_claude_input_blocked, resolved_dir)
                     except HTTPException:
                         await asyncio.sleep(_CLAUDE_PENDING_PROMPT_POLL_S)
                         continue
@@ -10007,6 +10058,7 @@ def create_runner_app(
             harness_body["input_generation"] = msg_body["input_generation"]
         for admission_field in (
             "input_admission_required",
+            "pending_input_claim_required",
             "retry_guard",
             "auto_retry",
             "input_admission_deadline",
@@ -11727,6 +11779,15 @@ def create_runner_app(
         request: Request,
         stream: bool = Query(default=False),
     ) -> Response:
+        response = await _post_session_events(conversation_id, request, stream)
+        response.headers["X-Omnigent-Pending-Input-Claim"] = "1"
+        return response
+
+    async def _post_session_events(
+        conversation_id: str,
+        request: Request,
+        stream: bool,
+    ) -> Response:
         if process_manager is None:
             return JSONResponse(
                 status_code=501,
@@ -12308,7 +12369,7 @@ def create_runner_app(
                                 "detail": (
                                     "Message buffered until the Databricks sign-in completes."
                                     if _message_held_for_sign_in(conversation_id)
-                                    else "Message buffered until the pending prompt is resolved."
+                                    else "Message buffered until the Claude terminal is available."
                                 ),
                             },
                         )

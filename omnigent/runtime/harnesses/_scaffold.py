@@ -858,6 +858,7 @@ class TurnContext:
             "native_reserve",
             "native_accept",
             "native_refuse",
+            "native_delivery",
             "injection_reserve",
             "injection_accept",
             "injection_refuse",
@@ -865,10 +866,12 @@ class TurnContext:
         native_turn_id: str | None = None,
         native_reason: str | None = None,
         native_detail: str | None = None,
+        delivery_deadline: float | None = None,
     ) -> bool:
         from omnigent.entities.subagent_retry import InputExecutionClaim
 
-        if not request.input_id or self.cancelled.is_set():
+        input_id = request.pending_id if boundary == "native_delivery" else request.input_id
+        if not input_id or self.cancelled.is_set():
             return False
         claim_id = uuid.uuid4().hex
         future: asyncio.Future[InputExecutionReceipt] = asyncio.get_running_loop().create_future()
@@ -877,25 +880,32 @@ class TurnContext:
             InputExecutionClaimEvent(
                 claim_id=claim_id,
                 claim=InputExecutionClaim(
-                    input_id=request.input_id,
+                    input_id=input_id,
                     turn_id=self.response_id,
                     retry=request.retry_guard,
-                    admission_deadline=request.input_admission_deadline,
+                    admission_deadline=delivery_deadline or request.input_admission_deadline,
                     boundary=boundary,
                     native_turn_id=native_turn_id,
                     native_reason=native_reason,
                     native_detail=native_detail,
+                    delivery_attempt_id=(
+                        request.delivery_attempt_id if boundary == "native_delivery" else None
+                    ),
                 ),
             )
         )
         try:
-            deadline = request.input_admission_deadline
+            deadline = delivery_deadline or request.input_admission_deadline
             remaining = max(0, deadline - time.time()) if deadline else _INPUT_CLAIM_TIMEOUT_S
-            result = await asyncio.wait_for(future, timeout=remaining + 5)
+            result = await asyncio.wait_for(
+                future, timeout=remaining if boundary == "native_delivery" else remaining + 5
+            )
             if result.state == "pending":
                 raise _InputExecutionAcceptanceUnknown("input_execution_acceptance_unknown")
             return result.state in {"accepted", "reserved"} and not self.cancelled.is_set()
         except TimeoutError:
+            if boundary == "native_delivery":
+                return False
             raise _InputExecutionAcceptanceUnknown("input_execution_acceptance_unknown") from None
         finally:
             self._pending_input_claims.pop(claim_id, None)

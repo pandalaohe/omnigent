@@ -726,7 +726,13 @@ function seedPendingElicitations(id: string, events: Record<string, unknown>[]):
 
 function seedPendingInputs(
   id: string,
-  inputs: { pending_id: string; content: unknown[]; created_by?: string }[],
+  inputs: {
+    pending_id: string;
+    content: unknown[];
+    created_by?: string;
+    stable_id?: string;
+    sending_since_ms?: number;
+  }[],
 ): void {
   sessionPendingInputs.set(id, inputs);
 }
@@ -2153,16 +2159,12 @@ describe("chatStore — switchTo", () => {
   );
 
   it("drops a snapshot pending_input whose message already committed (no resume re-inject)", async () => {
-    // Regression: a native pending_inputs entry whose message DID
-    // round-trip into history (or a ghost the TUI never accepted that
-    // lingers until its server-side TTL) must NOT replay as a second
-    // bubble on a cold-load resume — that is the "initial prompt got
-    // re-injected on resume" report. The committed item is the single
-    // source of truth; the stale pending copy is dropped.
-    seedSession("conv_native", [userMessage("resp1", "the initial prompt")]);
+    const committed = userMessage("resp1", "the initial prompt");
+    seedSession("conv_native", [committed]);
     seedPendingInputs("conv_native", [
       {
         pending_id: "pending_stale",
+        stable_id: committed.id,
         content: [{ type: "input_text", text: "the initial prompt" }],
       },
       {
@@ -2180,22 +2182,25 @@ describe("chatStore — switchTo", () => {
     ]);
   });
 
-  it("keeps a pending_input matching a committed message that the transcript reformatted", async () => {
-    // The native transcript can prepend markers/blockquotes, so the
-    // committed text is a superset of the POSTed text. Containment (not
-    // equality) still dedupes it, so the optimistic bubble doesn't
-    // double up with the reformatted committed copy.
-    seedSession("conv_native", [userMessage("resp1", "[Attached: a.png]\n\nthe initial prompt")]);
+  it("keeps a new pending input whose text is already in history", async () => {
+    seedSession("conv_native", [userMessage("resp1", "continue")]);
     seedPendingInputs("conv_native", [
       {
-        pending_id: "pending_stale",
-        content: [{ type: "input_text", text: "the initial prompt" }],
+        pending_id: "pending_new",
+        stable_id: "new_input",
+        content: [{ type: "input_text", text: "continue" }],
       },
     ]);
 
     await useChatStore.getState().switchTo("conv_native");
 
-    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([
+      {
+        tempId: "pending_new",
+        stableId: "new_input",
+        content: [{ type: "input_text", text: "continue" }],
+      },
+    ]);
   });
 
   it("keeps an image-only pending_input that has no text to dedupe on", async () => {
@@ -21264,6 +21269,47 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const last = sinks[1]!;
     last.push("data: [DONE]\n\n");
     last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it.each([
+    { path: "ordinary backfill", gapLength: 5 },
+    { path: "the fresh-window fallback", gapLength: 100 },
+  ])("recovers the sending timer by pending id through $path", async ({ gapLength }) => {
+    const id = `conv_timer_${gapLength}`;
+    const preGap = Array.from({ length: 30 }, (_, i) => gapUser("pre", i));
+    const pending = {
+      pending_id: "pending_followup",
+      content: [{ type: "input_text" as const, text: "gap 0" }],
+    };
+    seedSession(id, preGap);
+    seedPendingInputs(id, [pending]);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: id,
+      abortController: controller,
+      blocks: itemsToBlocks(preGap.slice(-SESSION_HISTORY_PAGE_SIZE)),
+      pendingUserMessages: [{ tempId: pending.pending_id, content: pending.content }],
+    });
+    const loop = startStreamPump(id, controller, setState, getState);
+    await drainAsync();
+
+    const since = 1710000000000;
+    seedPendingInputs(id, [{ ...pending, sending_since_ms: since }]);
+    seedSessionItems(id, [
+      ...preGap,
+      ...Array.from({ length: gapLength }, (_, i) => gapUser("gap", i)),
+    ]);
+    sinks[0]!.error();
+    await drainAsync();
+
+    expect(useChatStore.getState().pendingUserMessages).toMatchObject([
+      { tempId: pending.pending_id, sendingSinceMs: since },
+    ]);
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
     await drainAsync(2);
     await loop;
   });

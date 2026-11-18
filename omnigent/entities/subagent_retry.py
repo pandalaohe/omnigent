@@ -126,6 +126,7 @@ class InputExecutionClaim(BaseModel):
         "native_reserve",
         "native_accept",
         "native_refuse",
+        "native_delivery",
         "injection_reserve",
         "injection_accept",
         "injection_refuse",
@@ -133,6 +134,7 @@ class InputExecutionClaim(BaseModel):
     native_turn_id: str | None = Field(default=None, min_length=1, max_length=256)
     native_reason: str | None = Field(default=None, min_length=1, max_length=64)
     native_detail: str | None = Field(default=None, max_length=4096)
+    delivery_attempt_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class InputExecutionReceipt(BaseModel):

@@ -11,7 +11,7 @@ import contextlib
 import enum
 import json
 import threading
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeAlias, runtime_checkable
@@ -129,6 +129,7 @@ class ExecutorConfig:
     permission_mode: str | None = None
     approval_mode: str | None = None
     service_tier: str | None = None
+    claim_native_delivery: Callable[[float], Awaitable[bool]] | None = None
 
 
 # ---------------------------------------------------------------------------
