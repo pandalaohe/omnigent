@@ -2520,6 +2520,9 @@ class SqlAlchemyUserPreferencesStore:
         return self._merge_drain_locks(user_id, merge)
 
     def close_choice_drain_locks(self, user_id: str, matches: Callable[[DrainLock], bool]) -> None:
+        # A no-op needs no write transaction. Recheck under the version-row lock before deleting.
+        if not any(matches(lock) for lock in self.session_choice_snapshot(user_id).locks.values()):
+            return
         self._merge_drain_locks(
             user_id,
             lambda snapshot: {
