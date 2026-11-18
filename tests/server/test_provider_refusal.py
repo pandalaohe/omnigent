@@ -48,13 +48,21 @@ async def test_record_and_recover_requires_owner_route_account_and_new_turn(monk
     from types import SimpleNamespace
     from unittest.mock import Mock
 
+    from omnigent.server.child_cap import ChildCapLocks
     from omnigent.server.session_choice import CHOICE_LABEL, provider_route, state_for
     from omnigent.server.session_choice_runtime import (
         record_provider_recovery,
         record_quota_exhaustion,
     )
 
-    app = SimpleNamespace(state=SimpleNamespace(conversation_store=None, permission_store=None))
+    # Receipts take the owner's admission lock, so the app needs the store and the lock map.
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            conversation_store=Mock(),
+            permission_store=None,
+            child_cap_locks=ChildCapLocks(),
+        )
+    )
     session = SimpleNamespace(id="session", labels={CHOICE_LABEL: json.dumps({"pool": "account"})})
     identity = SimpleNamespace(host="host", agent="agent", model="route/model")
     monkeypatch.setattr(
