@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import replace
+from datetime import datetime
 
 import httpx
 import pytest
@@ -984,6 +985,41 @@ def test_exhausted_without_reset_is_skipped_without_an_invented_until():
 )
 def test_explicit_provider_quota_reset(message, seconds):
     assert quota_reset_at(message, NOW) == (NOW + seconds if seconds else None)
+
+
+@pytest.mark.parametrize(
+    "message,reset",
+    [
+        (
+            "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
+            "Provider: OpenAI Official; model: gpt-6.2-sol; cause: Codex 官方额度保护 "
+            "(quota protection): 每周 (weekly): 98.00% ≥ 98%（重置 / reset: "
+            "2026-11-22T03:19:03+00:00）...",
+            "2026-11-22T03:19:03+00:00",
+        ),
+        (
+            "unexpected status 403 Forbidden: quota protection: weekly; "
+            "reset: 2026-11-22T03:19:03Z",
+            "2026-11-22T03:19:03+00:00",
+        ),
+        (
+            "unexpected status 403 Forbidden: quota exceeded; reset: 2026-11-22T03:19:03+00:00",
+            None,
+        ),
+        (
+            "unexpected status 403 Forbidden: quota protection; reset: 2026-11-18T03:19:02+00:00",
+            None,
+        ),
+        (
+            "unexpected status 403 Forbidden: quota protection; reset: 2027-11-20T03:19:03+00:00",
+            None,
+        ),
+    ],
+)
+def test_quota_protection_absolute_reset(message, reset):
+    now = datetime.fromisoformat("2026-11-18T03:19:03+00:00").timestamp()
+    expected = datetime.fromisoformat(reset).timestamp() if reset else None
+    assert quota_reset_at(message, now) == expected
 
 
 def test_provider_rejection_overrides_balance_for_only_its_owner_until_reset():

@@ -8,6 +8,7 @@ import math
 import re
 from collections.abc import Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Self
 
 from pydantic import (
@@ -50,20 +51,32 @@ _QUOTA_RESET = re.compile(
     r"(?!\w)",
     re.IGNORECASE | re.DOTALL,
 )
+_QUOTA_PROTECTION_RESET = re.compile(
+    r"\bquota\s+protection\b.{0,2048}?\breset:\s*"
+    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def quota_reset_at(message: str, now: float) -> float | None:
-    """Recognize an explicit provider quota rejection with a bounded relative reset."""
+    """Recognize an explicit provider quota rejection with a bounded reset."""
     if message.startswith("[antigravity: ") and message.endswith("]"):
         message = message[len("[antigravity: ") : -1]
     match = _QUOTA_RESET.match(message)
-    if match is None:
+    if match is not None:
+        seconds = sum(
+            int(value or 0) * unit
+            for value, unit in zip(match.groups(), (86400, 3600, 60, 1), strict=True)
+        )
+        return now + seconds if 0 < seconds <= 366 * 86400 else None
+    protection = _QUOTA_PROTECTION_RESET.search(message)
+    if protection is None:
         return None
-    seconds = sum(
-        int(value or 0) * unit
-        for value, unit in zip(match.groups(), (86400, 3600, 60, 1), strict=True)
-    )
-    return now + seconds if 0 < seconds <= 366 * 86400 else None
+    try:
+        reset_at = datetime.fromisoformat(protection.group(1).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+    return reset_at if 0 < reset_at - now <= 366 * 86400 else None
 
 
 PositiveInt = Annotated[int, Field(strict=True, ge=1)]

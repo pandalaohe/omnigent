@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -466,14 +467,29 @@ async def quota_runner(choice_env, monkeypatch):
 @pytest.mark.parametrize(
     "event_type", ["status", "legacy-status", "error", "legacy-error", "batch-error"]
 )
+@pytest.mark.parametrize(
+    "message,absolute_reset",
+    [
+        ("Individual quota reached. Resets in 132h0m26s", None),
+        (
+            "unexpected status 403 Forbidden: CC Switch local proxy failed ... "
+            "Provider: OpenAI Official; model: gpt-6.2-sol; cause: Codex 官方额度保护 "
+            "(quota protection): 每周 (weekly): 98.00% ≥ 98%（重置 / reset: "
+            "2026-11-22T03:19:03+00:00）...",
+            "2026-11-22T03:19:03+00:00",
+        ),
+    ],
+    ids=["relative", "absolute-quota-protection"],
+)
 async def test_provider_quota_failure_blocks_pool_until_reset(
-    quota_runner, monkeypatch, event_type
+    quota_runner, monkeypatch, event_type, message, absolute_reset
 ):
     env = quota_runner
     clock = [time.time()]
+    if absolute_reset:
+        clock[0] = datetime.fromisoformat(absolute_reset).timestamp() - 3600
     monkeypatch.setattr("omnigent.server.session_choice_runtime.time.time", lambda: clock[0])
     first = (await create(env)).json()
-    message = "Individual quota reached. Resets in 132h0m26s"
     if event_type in {"status", "legacy-status"}:
         from omnigent.harnesses.antigravity_native.steps import error_message_text
 
@@ -507,7 +523,11 @@ async def test_provider_quota_failure_blocks_pool_until_reset(
     payload = [event] if event_type == "batch-error" else event
     response = await env.client.post(f"/v1/sessions/{first['id']}/events", json=payload)
     assert response.status_code == 202, response.text
-    reset = clock[0] + 132 * 3600 + 26
+    reset = (
+        datetime.fromisoformat(absolute_reset).timestamp()
+        if absolute_reset
+        else clock[0] + 132 * 3600 + 26
+    )
     env.store.set_session_live_status(first["id"], "idle")
     second = await create(env)
     assert second.status_code == 201, second.text
