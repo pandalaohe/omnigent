@@ -16761,6 +16761,9 @@ async def _create_session_from_existing_agent_impl(
     )
     response.warnings.extend(calling_warnings)
     response.notes = notes_from_labels(conv.labels)
+    if choice_admission is not None and choice_admission.committed_drain:
+        assert response.session_choice is not None
+        response.session_choice["reason"] = choice_admission.choice.reason
     return response, conv
 
 

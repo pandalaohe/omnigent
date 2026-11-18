@@ -10,7 +10,13 @@ import { Textarea } from "@/components/ui/textarea";
 import type { Host } from "@/hooks/useHosts";
 import type { CallingDefaultsCatalogRow } from "@/lib/callingDefaultsApi";
 import type { UsageAccountView } from "@/pages/usageBoard/usageBoardData";
-import { choiceRequest, type ChoiceRow, type SessionChoiceDocument } from "./sessionChoiceData";
+import {
+  choiceRequest,
+  type ChoiceEnvelope,
+  type ChoiceRow,
+  type SessionChoiceDocument,
+} from "./sessionChoiceData";
+import { projectChoiceDrainTags } from "./choiceDrainLocks";
 import {
   addToOtherTypes,
   applyPreset,
@@ -31,6 +37,7 @@ const EMPTY_CATALOGS: CallingDefaultsCatalogRow[] = [];
 
 export function ChoicePolicyEditor({
   document,
+  savedChoice,
   host,
   hosts,
   agents,
@@ -39,6 +46,7 @@ export function ChoicePolicyEditor({
   onChange,
 }: {
   document: SessionChoiceDocument;
+  savedChoice?: ChoiceEnvelope;
   host: string;
   hosts: Host[];
   agents: ChoiceAgent[];
@@ -79,6 +87,7 @@ export function ChoicePolicyEditor({
   const [previewing, setPreviewing] = useState(false);
   const targetHost = hosts.find((h) => h.host_id === host);
   const tiers = work ? (document.hosts[host]?.[work.id] ?? []) : [];
+  const drainTags = projectChoiceDrainTags(savedChoice, host, work?.id, tiers);
   const preset = document.presets.find((p) => p.id === presetId);
   function change(next: SessionChoiceDocument) {
     const nextTiers = work && next.hosts[host]?.[work.id];
@@ -577,6 +586,7 @@ export function ChoicePolicyEditor({
                                   <div className="mt-2 space-y-2 border-t border-border pt-2">
                                     <ChoiceChainEditor
                                       links={row.links}
+                                      drainTag={drainTags.get(row)}
                                       agents={agents}
                                       host={targetHost}
                                       meters={meters}

@@ -64,6 +64,32 @@ function mount(initial = document()) {
 const value = () =>
   JSON.parse(screen.getByTestId("document").textContent!) as SessionChoiceDocument;
 
+it("edits fallback modes in a preset, defaults to Return and omits Return from the draft", () => {
+  const initial = document();
+  initial.presets[0].links = [
+    { agent: "agent", model: "head", fallbackMode: "drain" },
+    { agent: "agent", model: "backup" },
+    { agent: "agent", model: "legacy-null", fallbackMode: null },
+    { agent: "agent", model: "explicit-return", fallbackMode: "return" },
+  ];
+  mount(initial);
+  fireEvent.click(screen.getByRole("button", { name: "Code" }));
+  const groups = screen.getAllByRole("radiogroup");
+  expect(groups).toHaveLength(3);
+  for (const group of groups) {
+    expect(within(group).getByRole("radio", { name: "Return" })).toBeChecked();
+    expect(group).toHaveAccessibleDescription("Go back as soon as an earlier node recovers");
+  }
+  const fallback = within(screen.getByRole("radiogroup", { name: "Fallback 1" }));
+  fireEvent.click(fallback.getByRole("radio", { name: "Drain" }));
+  expect(fallback.getByRole("radio", { name: "Drain" })).toBeChecked();
+  expect(groups[0]).toHaveAccessibleDescription("Use this node up before going back");
+  expect(value().presets[0].links[1].fallbackMode).toBe("drain");
+  fireEvent.click(fallback.getByRole("radio", { name: "Return" }));
+  expect(value().presets[0].links[1]).not.toHaveProperty("fallbackMode");
+  expect(value().presets[0].links[0].fallbackMode).toBe("drain");
+});
+
 it("edits links in place, protects adjusted rows from Apply, and restores a row", () => {
   mount();
   fireEvent.change(screen.getAllByRole("spinbutton")[0], { target: { value: "5" } });

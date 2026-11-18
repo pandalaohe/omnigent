@@ -2,12 +2,15 @@ import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import type { UsageAccountView } from "@/pages/usageBoard/usageBoardData";
 
+export type ChoiceFallbackMode = "drain" | "return";
+
 export interface ChoiceLink {
   agent: string;
   model?: string | null;
   effort?: string | null;
   meter?: string | null;
   maxRunning?: number | null;
+  fallbackMode?: ChoiceFallbackMode | null;
 }
 export interface ChoiceRow {
   preset?: string | null;
@@ -50,9 +53,21 @@ export interface SessionChoiceDocument {
 export interface ChoiceEnvelope {
   settings: SessionChoiceDocument | null;
   revision: string;
+  runtime?: { settingsRevision: string; drainLocks: ChoiceDrainLock[] };
   corrected?: string[];
   capabilities?: { documentVersions: number[]; limitRules: boolean; effectiveLimits: boolean };
   configurationError?: { code?: string; message?: string };
+}
+
+export interface ChoiceDrainLock {
+  hostId: string;
+  workType: string;
+  tierIndex: number;
+  rowPosition: number;
+  savedLink: ChoiceLink;
+  rowIdentity: string;
+  settingsRevision: string;
+  since: number;
 }
 
 export interface ChoiceConversionPlan {
@@ -144,12 +159,18 @@ export async function choiceRequest<T>(path = "", init?: RequestInit): Promise<T
     );
   return data as T;
 }
-export function useSessionChoiceDocument({ enabled = true }: { enabled?: boolean } = {}) {
+const METERS_REFRESH_MS = 60_000;
+
+export function useSessionChoiceDocument({
+  enabled = true,
+  refreshRuntime = false,
+}: { enabled?: boolean; refreshRuntime?: boolean } = {}) {
   return useQuery({
     queryKey: ["sessionChoice"],
     queryFn: () => choiceRequest<ChoiceEnvelope>(),
     enabled,
     retry: false,
+    refetchInterval: refreshRuntime ? METERS_REFRESH_MS : false,
   });
 }
 export function useChoiceMeters(hostId: string) {
@@ -158,7 +179,7 @@ export function useChoiceMeters(hostId: string) {
     queryFn: () => choiceRequest<ChoiceMeters>(`/meters?host_id=${encodeURIComponent(hostId)}`),
     enabled: Boolean(hostId),
     retry: false,
-    refetchInterval: 60_000,
+    refetchInterval: METERS_REFRESH_MS,
   });
 }
 

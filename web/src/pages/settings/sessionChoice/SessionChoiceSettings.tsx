@@ -82,7 +82,7 @@ export function SessionChoiceSettings() {
   const draftRevision = useRef("");
   const draftBaseline = useRef<SessionChoiceDocument | null>(null);
   const previewEpoch = useChoicePreviewEpoch();
-  const document = useSessionChoiceDocument();
+  const document = useSessionChoiceDocument({ refreshRuntime: true });
   const hosts = useHosts();
   const [draft, setDraft] = useState<SessionChoiceDocument | null>(null);
   const unsupportedDocument = Boolean(
@@ -109,13 +109,15 @@ export function SessionChoiceSettings() {
   } | null>(null);
   const meters = useChoiceMeters(host);
   const lines = useChoiceLines();
+  const savedSettings = document.data?.settings;
+  const savedRevision = document.data?.revision;
   useEffect(() => {
-    if (document.data && !dirty.current) {
-      draftBaseline.current = document.data.settings;
-      setDraft(document.data.settings ?? structuredClone(EMPTY_CHOICE));
-      draftRevision.current = document.data.revision;
+    if (savedSettings !== undefined && savedRevision !== undefined && !dirty.current) {
+      draftBaseline.current = savedSettings;
+      setDraft(savedSettings ?? structuredClone(EMPTY_CHOICE));
+      draftRevision.current = savedRevision;
     }
-  }, [document.data]);
+  }, [savedSettings, savedRevision]);
   const selectedHost = hosts.data?.find((item) => item.host_id === host);
   const hostIds = [
     ...new Set([
@@ -316,6 +318,7 @@ export function SessionChoiceSettings() {
         <ChoicePolicySettings
           key={host}
           document={draft}
+          savedChoice={document.data}
           host={host}
           meters={meters.data?.meters ?? []}
           products={meters.data?.products ?? {}}

@@ -28,6 +28,7 @@ from omnigent.server.session_choice import (
     choice_revision,
     floor_off_active,
     parse_session_choice,
+    revalidate_drain_locks,
     state_for,
     tile_line,
 )
@@ -216,7 +217,7 @@ def create_session_choice_router(
         except ValidationError as exc:
             raise HTTPException(422, str(exc)) from exc
         metadata = {
-            "savedRevision": saved["revision"],
+            "savedRevision": saved.revision,
             "draftFingerprint": choice_revision(body.settings)
             if body.settings is not None
             else None,
@@ -230,7 +231,7 @@ def create_session_choice_router(
                 owner,
                 settings,
             )
-            metadata["legacyConversion"]["sourceRevision"] = saved["revision"]
+            metadata["legacyConversion"]["sourceRevision"] = saved.revision
         caller = (
             await asyncio.to_thread(
                 request.app.state.conversation_store.get_conversation, body.caller_id
@@ -283,8 +284,23 @@ def create_session_choice_router(
         readings, running, floors = await asyncio.to_thread(
             inputs, request.app, settings, choice_request, now
         )
-        choice = state_for(request.app).select(
-            settings, body.work_type, choice_request, readings, running, floors, now=now
+        locks = revalidate_drain_locks(
+            settings, saved.locks.values(), saved.revision, project=True
+        )
+        choice = (
+            state_for(request.app)
+            .select(
+                settings,
+                body.work_type,
+                choice_request,
+                readings,
+                running,
+                floors,
+                now=now,
+                drain_locks=locks,
+                settings_revision=saved.revision,
+            )
+            .choice
         )
         result: dict[str, Any] = {**choice.payload(), "mode": "selection", **metadata}
         if choice.link is not None:
@@ -293,7 +309,7 @@ def create_session_choice_router(
                     limit_receipt,
                     request.app,
                     settings,
-                    saved["revision"],
+                    saved.revision,
                     choice.link,
                     choice_request,
                     running,
@@ -350,7 +366,7 @@ def create_session_choice_router(
                 "legacyChecks": result["legacyChecks"],
                 "lines": result["lines"],
                 "check": result["check"],
-                "savedRevision": saved["revision"],
+                "savedRevision": saved.revision,
             }
         if not active_on(settings, host_id):
             return {"notice": None}
@@ -432,7 +448,7 @@ def create_session_choice_router(
     @router.get("/me/session-choice")
     async def read(request: Request) -> dict[str, Any]:
         owner = require_user(request, auth_provider) or RESERVED_USER_LOCAL
-        result = await asyncio.to_thread(preferences().session_choice, owner)
+        result = await asyncio.to_thread(preferences().session_choice, owner, include_runtime=True)
         return {
             **result,
             "capabilities": {
@@ -457,22 +473,23 @@ def create_session_choice_router(
                 await validate_known_windows(
                     request.app, owner, parse_session_choice(body.settings)
                 )
-            result = await asyncio.to_thread(
-                preferences().replace_session_choice,
-                owner,
-                body.settings,
-                body.expected_revision,
-                create_if_missing=not accounts_mode,
-                conversion_proof=body.conversion_proof,
-                conversion_plan=conversion_plan
-                or (lambda user, stored: require_conversion_plan(request.app, user, stored)),
-            )
-            state_for(request.app).saved(
-                owner,
-                parse_session_choice(result["settings"])
-                if result["settings"]
-                else SessionChoice(),
-            )
+            async with request.app.state.child_cap_locks.hold(f"owner:{owner}"):
+                result = await asyncio.to_thread(
+                    preferences().replace_session_choice,
+                    owner,
+                    body.settings,
+                    body.expected_revision,
+                    create_if_missing=not accounts_mode,
+                    conversion_proof=body.conversion_proof,
+                    conversion_plan=conversion_plan
+                    or (lambda user, stored: require_conversion_plan(request.app, user, stored)),
+                )
+                state_for(request.app).saved(
+                    owner,
+                    parse_session_choice(result["settings"])
+                    if result["settings"]
+                    else SessionChoice(),
+                )
             return result
         except ChoiceRevisionConflict as exc:
             raise HTTPException(409, str(exc)) from exc

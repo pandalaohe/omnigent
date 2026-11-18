@@ -100,6 +100,7 @@ async def test_session_choice_tools_registered_on_native_and_dispatch_routes(tmp
         "replaced_paths": [["limits", "shared"]],
         "new_rule_ids": ["converted"],
     }
+    runtime = {"settingsRevision": "next", "drainLocks": []}
 
     def receive(request):
         seen.append(
@@ -109,7 +110,8 @@ async def test_session_choice_tools_registered_on_native_and_dispatch_routes(tmp
                 json.loads(request.content) if request.content else None,
             )
         )
-        return httpx.Response(200, json={"revision": "next"})
+        payload = {"revision": "next", **({"runtime": runtime} if request.method == "GET" else {})}
+        return httpx.Response(200, json=payload)
 
     async with httpx.AsyncClient(
         base_url="http://server", transport=httpx.MockTransport(receive)
@@ -130,7 +132,11 @@ async def test_session_choice_tools_registered_on_native_and_dispatch_routes(tmp
             result = await execute_tool(
                 tool_name=name, arguments=json.dumps(args), server_client=client
             )
-            assert json.loads(result) == {"revision": "next"}
+            expected = {
+                "revision": "next",
+                **({"runtime": runtime} if name == "sys_session_choice_read" else {}),
+            }
+            assert json.loads(result) == expected
     assert seen == [
         ("GET", "/v1/me/session-choice", None),
         (
