@@ -833,6 +833,54 @@ def test_rollout_session_meta_provider_ignores_invalid_utf8_after_first_line(
     assert codex_native._codex_rollout_provider_and_version(rollout) == ("custom", None)
 
 
+def test_rollout_session_meta_provider_rejects_lone_surrogate(tmp_path: Path) -> None:
+    """A line-0 provider no configured provider can equal falls back to the launch."""
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_bytes(b'{"type":"session_meta","payload":{"model_provider":"bad\\ud800id"}}\n')
+
+    assert codex_native._codex_rollout_provider_and_version(rollout) is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_replaces_lone_surrogate_provider(
+    tmp_path: Path,
+) -> None:
+    """A corrupt line-0 provider that no configured provider can equal is not carried."""
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        'model_provider = "custom"\n'
+        "[model_providers.custom]\n"
+        'base_url = "https://provider.invalid/v1"\n',
+        encoding="utf-8",
+    )
+    existing = _write_source_rollout(
+        codex_home=codex_home, thread_id=thread_id, source_cwd="/stale/cwd"
+    )
+    existing.write_bytes(b'{"type":"session_meta","payload":{"model_provider":"bad\\ud800id"}}\n')
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [], "has_more": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        rollout = await codex_native._ensure_local_codex_resume_rollout(
+            client,
+            session_id="conv_codex",
+            external_session_id=thread_id,
+            codex_home=codex_home,
+            workspace=(tmp_path / "workspace").resolve(),
+            model_provider="custom",
+            codex_path=None,
+        )
+
+    rebuilt = [json.loads(line) for line in rollout.read_text().splitlines()]
+    assert rebuilt[0]["payload"]["model_provider"] == "custom"
+    assert "ud800" not in rollout.read_text()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "existing_metadata",

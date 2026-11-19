@@ -1983,6 +1983,15 @@ def _clone_codex_rollout(
     return target
 
 
+def _codex_rollout_text_is_encodable(value: str) -> bool:
+    """Whether *value* can be written back into a UTF-8 rollout record."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _codex_rollout_provider_and_version(path: Path) -> tuple[str, str | None] | None:
     """
     Return the provider a rollout's first ``session_meta`` record already pins.
@@ -2017,7 +2026,19 @@ def _codex_rollout_provider_and_version(path: Path) -> tuple[str, str | None] | 
         return None
     if not isinstance(provider, str) or not provider.strip():
         return None
-    return provider, version if isinstance(version, str) else None
+    # A corrupt first line can decode to text no UTF-8 rollout can hold, e.g. a
+    # lone surrogate. Replaying it would leave Codex an unreadable record.
+    if not _codex_rollout_text_is_encodable(provider):
+        _logger.warning(
+            "Codex rollout %s records a provider that is not encodable text; using the launch "
+            "default",
+            path.name,
+        )
+        return None
+    replayable_version = (
+        version if isinstance(version, str) and _codex_rollout_text_is_encodable(version) else None
+    )
+    return provider, replayable_version
 
 
 async def _ensure_local_codex_resume_rollout(
