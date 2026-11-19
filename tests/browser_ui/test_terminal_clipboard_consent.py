@@ -276,6 +276,12 @@ def clipboard_browser(
 
     browser_contract.json(session_detail, _session)
     browser_contract.json(
+        re.compile(
+            rf"/v1/sessions/({'|'.join(map(re.escape, session_ids))})/host-terminals(?:\?.*)?$"
+        ),
+        {"terminals": [], "complete": True},
+    )
+    browser_contract.json(
         re.compile(rf"/v1/sessions/({'|'.join(map(re.escape, session_ids))})/items(?:\?.*)?$"),
         empty_list,
     )

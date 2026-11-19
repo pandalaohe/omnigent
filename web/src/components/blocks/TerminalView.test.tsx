@@ -668,14 +668,22 @@ describe("terminal clipboard", () => {
     expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
   });
 
-  it("copies an explicit selection under Ask, leaving program copies subject to consent", async () => {
+  it("asks before copying browser selections and Copy once does not grant future copies", async () => {
     await renderClipboardView();
-    const copied = await copySelection("browser selection");
-    expect(copied.setData).toHaveBeenCalledWith("text/plain", "browser selection");
-    expect(visibleClipboardConsent()).toBeNull();
+    const first = await copySelection("browser selection");
+
+    expect(first.setData).not.toHaveBeenCalled();
     expect(clipboardMock.copyText).not.toHaveBeenCalled();
+    expect(visibleClipboardConsent()).toBeInTheDocument();
+    clickConsentButton("Copy once");
+    await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
+    expect(clipboardMock.copyText).toHaveBeenCalledWith("browser selection");
+
+    const next = await copySelection("next browser selection");
+    expect(next.setData).not.toHaveBeenCalled();
+    expect(visibleClipboardConsent()).toBeInTheDocument();
     expect(readTerminalClipboardPreference()).toBe("ask");
-    await requestClipboardConsent("program copy");
+    expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
   });
 
   it("uses the native copy event for allowed selections without requiring the async clipboard API", async () => {
@@ -704,7 +712,7 @@ describe("terminal clipboard", () => {
   });
 
   it.each(["ask", "block"] as const)(
-    "applies a change to %s to explicit selections immediately",
+    "revokes selection copying in a mounted terminal when Settings changes to %s",
     async (decision) => {
       writeTerminalClipboardPreference("allow");
       await renderClipboardView();
@@ -714,36 +722,51 @@ describe("terminal clipboard", () => {
       act(() => writeTerminalClipboardPreference(decision));
       const after = await copySelection("after revocation");
 
-      if (decision === "ask")
-        expect(after.setData).toHaveBeenCalledWith("text/plain", "after revocation");
-      else expect(after.setData).not.toHaveBeenCalled();
+      expect(after.setData).not.toHaveBeenCalled();
       expect(clipboardMock.copyText).not.toHaveBeenCalled();
       expect(terminalSessionMock.instances).toHaveLength(1);
-      expect(visibleClipboardConsent()).toBeNull();
+      if (decision === "ask") expect(visibleClipboardConsent()).toBeInTheDocument();
+      else expect(visibleClipboardConsent()).toBeNull();
     },
   );
 
-  it("restores an explicit selection after an in-flight program copy completes", async () => {
-    writeTerminalClipboardPreference("allow");
-    await renderClipboardView();
-    let finishOldCopy: (() => void) | undefined;
-    clipboardMock.copyText.mockImplementationOnce(
-      () =>
-        new Promise<void>((resolve) => {
-          finishOldCopy = resolve;
-        }),
-    );
-    await requestClipboard("older program copy");
-    const newer = await copySelection("newer browser selection");
-    expect(newer.setData).toHaveBeenCalledWith("text/plain", "newer browser selection");
-    expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
-    await act(async () => finishOldCopy?.());
-    expect(clipboardMock.copyText.mock.calls).toEqual([
-      ["older program copy"],
-      ["newer browser selection"],
-    ]);
-    expect(visibleClipboardConsent()).toBeNull();
-  });
+  it.each(["succeeds", "needs a retry"] as const)(
+    "orders a newer selection after an in-flight program copy when copying %s",
+    async (outcome) => {
+      writeTerminalClipboardPreference("allow");
+      await renderClipboardView();
+      let finishOldCopy: (() => void) | undefined;
+      clipboardMock.copyText.mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finishOldCopy = resolve;
+          }),
+      );
+      await requestClipboard("older program copy");
+      if (outcome === "needs a retry") {
+        clipboardMock.copyText.mockRejectedValueOnce(new Error("browser needs a gesture"));
+      }
+      const newer = await copySelection("newer browser selection");
+
+      expect(newer.setData).not.toHaveBeenCalled();
+      expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
+      await act(async () => finishOldCopy?.());
+      expect(clipboardMock.copyText.mock.calls).toEqual([
+        ["older program copy"],
+        ["newer browser selection"],
+      ]);
+      if (outcome === "needs a retry") {
+        await waitFor(() =>
+          expect(visibleClipboardConsent()).toHaveTextContent("Copy needs a click"),
+        );
+        clickConsentButton("Copy now");
+        await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledTimes(3));
+        expect(clipboardMock.copyText).toHaveBeenLastCalledWith("newer browser selection");
+        await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
+        expect(readTerminalClipboardPreference()).toBe("allow");
+      }
+    },
+  );
 
   it("lets a native selection copy satisfy a pending browser retry", async () => {
     writeTerminalClipboardPreference("allow");
@@ -803,7 +826,7 @@ describe("terminal clipboard", () => {
           "newer selection",
           terminalSessionMock.instances.length - 1,
         );
-        expect(newer.setData).toHaveBeenCalledWith("text/plain", "newer selection");
+        expect(newer.setData).not.toHaveBeenCalled();
         expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
         expect(clipboard).toBe("before copying");
       } finally {
@@ -830,11 +853,20 @@ describe("terminal clipboard", () => {
 
       const copied = await copySelection("explicit read-only selection");
 
-      if (decision === "block") expect(copied.setData).not.toHaveBeenCalled();
-      else
+      if (decision === "allow") {
         expect(copied.setData).toHaveBeenCalledWith("text/plain", "explicit read-only selection");
-      expect(visibleClipboardConsent()).toBeNull();
-      expect(clipboardMock.copyText).not.toHaveBeenCalled();
+      } else {
+        expect(copied.setData).not.toHaveBeenCalled();
+      }
+      if (decision === "ask") {
+        expect(visibleClipboardConsent()).toBeInTheDocument();
+        clickConsentButton("Copy once");
+        await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
+        expect(clipboardMock.copyText).toHaveBeenCalledWith("explicit read-only selection");
+      } else {
+        expect(visibleClipboardConsent()).toBeNull();
+        expect(clipboardMock.copyText).not.toHaveBeenCalled();
+      }
     },
   );
 
@@ -2146,6 +2178,32 @@ describe("TerminalView phone key rows", () => {
       expect(clipboardMock.copyText).not.toHaveBeenCalledWith("late output");
     },
   );
+
+  it("does not restore a mobile copy over a program copy after leaving the phone layout", async () => {
+    stubPhoneViewport(390, 844);
+    act(() => writeTerminalClipboardPreference("allow"));
+    let completeProgramCopy: (() => void) | undefined;
+    clipboardMock.copyText.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          completeProgramCopy = resolve;
+        }),
+    );
+    render(<TerminalView keySurface="shell" sessionId="conv_abc" terminalId="terminal_a" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const terminal = terminalSessionMock.instances[0];
+    act(() => terminal.onState({ kind: "connected" }));
+    act(() => terminal.onClipboardRequest?.("program copy"));
+    const gesture = terminal.setTouchSelection.mock.lastCall?.[0];
+    await act(async () => gesture?.copy("mobile copy"));
+    expect(clipboardMock.copyText.mock.calls).toEqual([["program copy"], ["mobile copy"]]);
+
+    stubPhoneViewport(1280, 844, false);
+    act(() => window.dispatchEvent(new Event("resize")));
+    expect(terminal.setTouchSelection).toHaveBeenLastCalledWith(null);
+    await act(async () => completeProgramCopy?.());
+    expect(clipboardMock.copyText.mock.calls).toEqual([["program copy"], ["mobile copy"]]);
+  });
 
   it("lets the phone Copy key use the live selection, then the sheet once the selection is cleared", async () => {
     stubPhoneViewport(390, 844);

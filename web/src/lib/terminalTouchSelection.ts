@@ -151,20 +151,11 @@ export class TerminalTouchSelection {
     if (this.drag?.kind === "word") {
       this.endDrag(event);
     } else if (wasTap && this.ownsSelection) {
-      const range = this.currentRange();
-      const touch = event.changedTouches[0];
-      const cell = touch && this.cellAt(point(touch), false);
-      const offset = cell && cell.row * this.term.cols + cell.column;
-      if (range && offset !== undefined && offset >= range.start && offset < range.end) {
-        // A compatibility mousedown would clear the xterm selection.
-        event.preventDefault();
-      } else {
-        this.cancel();
-      }
+      this.cancel();
     }
   }
 
-  startHandle(handle: SelectionHandle, event: TouchEvent): void {
+  startHandle(handle: SelectionHandle, event: TouchEvent): (() => void) | undefined {
     const touch = event.touches[0];
     const position = this.positions?.[handle];
     const screen = this.screen();
@@ -203,6 +194,9 @@ export class TerminalTouchSelection {
     );
     window.addEventListener("touchend", (end) => this.endDrag(end), { passive: false, signal });
     window.addEventListener("touchcancel", () => this.cancel(), { signal });
+    return () => {
+      if (!signal.aborted) this.cancel();
+    };
   }
 
   shouldSuppressContextMenu(): boolean {
@@ -260,6 +254,10 @@ export class TerminalTouchSelection {
   private stopDrag(): void {
     if (this.drag && this.drag.kind !== "word") this.drag.listeners.abort();
     this.drag = undefined;
+    this.stopEdgeScroll();
+  }
+
+  private stopEdgeScroll(): void {
     clearInterval(this.edgeScroll);
     this.edgeScroll = undefined;
   }
@@ -335,12 +333,15 @@ export class TerminalTouchSelection {
     this.drag.point = point(touch);
     this.extendSelection();
     if (this.edgeDirection() === 0) {
-      clearInterval(this.edgeScroll);
-      this.edgeScroll = undefined;
+      this.stopEdgeScroll();
     } else {
       this.edgeScroll ??= setInterval(() => {
         const direction = this.edgeDirection();
-        if (!direction) return;
+        if (!direction) {
+          this.stopEdgeScroll();
+          this.placeHandles();
+          return;
+        }
         this.term.scrollLines(direction);
         this.extendSelection();
       }, EDGE_SCROLL_MS);
@@ -349,7 +350,7 @@ export class TerminalTouchSelection {
 
   private edgeDirection(): number {
     const screen = this.screen();
-    if (!screen || !this.drag) return 0;
+    if (!screen || !this.drag || !this.term.element?.isConnected) return 0;
     const row = (this.drag.point.y - screen.top) / screen.cellHeight;
     if (row < EDGE_ROWS) return -1;
     if (row >= this.term.rows - EDGE_ROWS) return 1;
@@ -388,7 +389,7 @@ export class TerminalTouchSelection {
   private placeHandles(): void {
     if (!this.ownsSelection || this.changingSelection) return;
     const range = this.currentRange();
-    if (!range) {
+    if (!range || !this.term.element?.isConnected) {
       this.cancel();
       return;
     }
@@ -416,6 +417,11 @@ export class TerminalTouchSelection {
   }
 
   private publishHandles(positions: SelectionHandles | null): void {
+    const handle = this.drag?.kind;
+    if (handle && handle !== "word" && !positions?.[handle]) {
+      this.cancel();
+      return;
+    }
     if (
       samePoint(positions?.start ?? null, this.positions?.start ?? null) &&
       samePoint(positions?.end ?? null, this.positions?.end ?? null)

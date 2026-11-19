@@ -692,11 +692,8 @@ export function wheelReportPayload(
  *     scrollback path); ``partial`` — the new carry.
  */
 /**
- * Finger travel (CSS px) before a one-finger touch is treated as a scroll
- * drag. Below this the gesture is left to the browser, so taps and the
- * start of a long-press (text selection) aren't swallowed by jitter; at or
- * beyond it the dominant axis decides — vertical locks into scrolling,
- * horizontal abandons the gesture to the browser.
+ * Finger travel (CSS px) that distinguishes a one-finger drag from a tap or hold.
+ * Past this threshold, the dominant axis decides whether the terminal scrolls.
  */
 export const TOUCH_SCROLL_SLOP_PX = 8;
 
@@ -792,7 +789,7 @@ export class TerminalSession {
   private sendingSoftKey = false;
   private imeAnchor: Detached | null = null;
   /** Start of the tracked one-finger touch, or ``null`` when none is active. */
-  private touchStart: { x: number; y: number } | null = null;
+  private touchStart: { x: number; y: number; canceledMove: boolean } | null = null;
   /** Whether the tracked touch passed the slop gate and owns scrolling. */
   private touchScrolling = false;
   /** Y of the last processed drag step (valid while {@link touchScrolling}). */
@@ -1085,7 +1082,7 @@ export class TerminalSession {
           this.resetTouchScroll();
           return;
         }
-        this.touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+        this.touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY, canceledMove: false };
         this.touchScrolling = false;
         this.touchPartialLines = 0;
         this.touchSelection?.start(e.touches[0]);
@@ -1099,12 +1096,16 @@ export class TerminalSession {
         if (this.touchStart === null || e.touches.length !== 1) return;
         const touch = e.touches[0];
         if (!this.touchScrolling) {
-          // Slop gate: taps and long-press jitter stay with the browser.
-          // Past the slop, the dominant axis decides — a mostly-horizontal
-          // drag is abandoned so browser gestures/selection still work.
+          // Below slop, the touch can still be a tap or a hold. Past it, the dominant axis wins.
           const dx = Math.abs(touch.clientX - this.touchStart.x);
           const dy = Math.abs(touch.clientY - this.touchStart.y);
-          if (Math.max(dx, dy) < TOUCH_SCROLL_SLOP_PX) return;
+          if (Math.max(dx, dy) < TOUCH_SCROLL_SLOP_PX) {
+            if (this.touchSelection && e.cancelable) {
+              e.preventDefault();
+              this.touchStart.canceledMove = true;
+            }
+            return;
+          }
           this.touchSelection?.cancelHold();
           if (dx > dy) {
             this.touchStart = null;
@@ -1141,7 +1142,11 @@ export class TerminalSession {
     container.addEventListener(
       "touchend",
       (e) => {
-        this.touchSelection?.end(e, this.touchStart !== null && !this.touchScrolling);
+        const start = this.touchStart;
+        const wasTap = start !== null && !this.touchScrolling && e.touches.length === 0;
+        this.touchSelection?.end(e, wasTap);
+        // Canceling a small move can suppress xterm's compatibility mousedown.
+        if (wasTap && start.canceledMove) this.term.focus();
         this.resetTouchScroll();
       },
       { passive: false, signal },
@@ -1338,8 +1343,8 @@ export class TerminalSession {
     element.style.userSelect = options ? "none" : "";
   }
 
-  startTouchSelectionHandle(handle: SelectionHandle, event: TouchEvent): void {
-    this.touchSelection?.startHandle(handle, event);
+  startTouchSelectionHandle(handle: SelectionHandle, event: TouchEvent): (() => void) | undefined {
+    return this.touchSelection?.startHandle(handle, event);
   }
 
   private resetTouchScroll(): void {

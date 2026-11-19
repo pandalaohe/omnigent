@@ -8,8 +8,11 @@
 
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
+import { render } from "@testing-library/react";
+import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TerminalClipboardAction } from "@/lib/terminalPaste";
+import { TerminalSelectionHandles } from "./TerminalSelectionHandles";
 import {
   terminalSoftKeyPayload,
   SHIFT_ENTER_CSI_U,
@@ -1588,6 +1591,105 @@ describe("TerminalSession", () => {
       dispatchTouch(container, "touchcancel", [], [origin]);
       expect(session.selectedText()).toBe("");
       expect(copy).not.toHaveBeenCalled();
+    } finally {
+      session.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([20, 160])("keeps xterm's tap-to-focus path after copying, at x=%d", async (x) => {
+    const { container, term, session, copy } = await touchSelectionSession("example");
+    try {
+      const hold = testTouch(1, 20, 8);
+      dispatchTouch(container, "touchstart", [hold]);
+      vi.advanceTimersByTime(500);
+      dispatchTouch(container, "touchend", [], [hold]);
+      expect(copy).toHaveBeenCalledExactlyOnceWith("example");
+      expect(session.selectedText()).toBe("example");
+      expect(term.textarea).not.toHaveFocus();
+
+      const tap = testTouch(2, x, 8);
+      dispatchTouch(container, "touchstart", [tap]);
+      expect(dispatchTouch(container, "touchend", [], [tap]).defaultPrevented).toBe(false);
+      // jsdom does not synthesize compatibility mouse events after a touch.
+      term.element!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+      expect(term.textarea).toHaveFocus();
+      expect(session.selectedText()).toBe("");
+      expect(copy).toHaveBeenCalledOnce();
+    } finally {
+      session.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels pre-hold jitter on phone layouts while preserving tap focus and pinch", async () => {
+    const { container, term, session, copy } = await touchSelectionSession("example");
+    try {
+      const first = testTouch(1, 20, 8);
+      const jitter = testTouch(1, 26, 8);
+      dispatchTouch(container, "touchstart", [first]);
+      expect(dispatchTouch(container, "touchmove", [jitter]).defaultPrevented).toBe(true);
+      expect(dispatchTouch(container, "touchend", [], [jitter]).defaultPrevented).toBe(false);
+      expect(term.textarea).toHaveFocus();
+      expect(session.selectedText()).toBe("");
+
+      term.blur();
+      dispatchTouch(container, "touchstart", [first]);
+      dispatchTouch(container, "touchmove", [jitter]);
+      const pinch = [jitter, testTouch(2, 80, 80)];
+      expect(dispatchTouch(container, "touchstart", pinch).defaultPrevented).toBe(false);
+      expect(dispatchTouch(container, "touchmove", pinch).defaultPrevented).toBe(false);
+      vi.advanceTimersByTime(500);
+      dispatchTouch(container, "touchend", [], pinch);
+      expect(term.textarea).not.toHaveFocus();
+      expect(copy).not.toHaveBeenCalled();
+
+      session.setTouchSelection(null);
+      dispatchTouch(container, "touchstart", [first]);
+      expect(dispatchTouch(container, "touchmove", [jitter]).defaultPrevented).toBe(false);
+    } finally {
+      session.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels edge scrolling and window listeners when just the dragged handle unmounts", async () => {
+    const { container, term, session, copy, handles } = await touchSelectionSession("example");
+    try {
+      const scroll = vi.spyOn(term, "scrollLines");
+      const hold = testTouch(1, 20, 8);
+      dispatchTouch(container, "touchstart", [hold]);
+      vi.advanceTimersByTime(500);
+      dispatchTouch(container, "touchend", [], [hold]);
+      copy.mockClear();
+
+      const positions = handles.mock.lastCall?.[0];
+      const onStart = session.startTouchSelectionHandle.bind(session);
+      const view = render(createElement(TerminalSelectionHandles, { positions, onStart }));
+      const end = view.getByTestId("terminal-selection-end");
+      const finger = testTouch(2, positions.end.x, positions.end.y);
+      dispatchTouch(end, "touchstart", [finger]);
+      const edge = testTouch(2, finger.clientX, term.rows * 16 - 2);
+      dispatchTouch(end, "touchmove", [edge]);
+      vi.advanceTimersByTime(60);
+      expect(scroll).toHaveBeenCalledExactlyOnceWith(1);
+
+      view.rerender(
+        createElement(TerminalSelectionHandles, {
+          positions: { ...positions, end: null },
+          onStart,
+        }),
+      );
+      expect(end.isConnected).toBe(false);
+      expect(container.isConnected).toBe(true);
+      expect(handles).toHaveBeenLastCalledWith(null);
+      expect(session.selectedText()).toBe("");
+      expect(dispatchTouch(document.body, "touchmove", [edge]).defaultPrevented).toBe(false);
+      dispatchTouch(document.body, "touchend", [], [edge]);
+      vi.advanceTimersByTime(180);
+      expect(scroll).toHaveBeenCalledTimes(1);
+      expect(copy).not.toHaveBeenCalled();
+      view.unmount();
     } finally {
       session.dispose();
       vi.useRealTimers();

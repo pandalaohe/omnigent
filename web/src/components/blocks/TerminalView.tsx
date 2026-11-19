@@ -19,6 +19,7 @@ import { useTerminalIsDark } from "@/components/theme/useTerminalIsDark";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import {
+  isTerminalClipboardWritePending,
   queueTerminalClipboardWrite,
   writeExplicitTerminalClipboardText,
 } from "@/lib/terminalClipboardWriter";
@@ -142,6 +143,7 @@ interface TerminalClipboardRequest {
   epoch: number;
   generation: number;
   text: string;
+  source: "terminal" | "selection";
 }
 
 // Host terminals always use the owner-checked relay, never direct attach.
@@ -503,14 +505,11 @@ export function TerminalView({
   );
 
   const copyExplicit = useCallback(
-    (text: string, copyEvent?: ClipboardEvent, isGestureCurrent?: () => boolean) => {
+    (text: string, isGestureCurrent?: () => boolean) => {
       clipboardRequestGenerationRef.current += 1;
       setClipboardPrompt(null);
-      const copiedNatively = Boolean(
-        copyEvent?.clipboardData && applyTerminalCopy(copyEvent, text),
-      );
       const isAllowed = () => isCopyAllowed() && (isGestureCurrent?.() ?? true);
-      void writeExplicitTerminalClipboardText(text, isAllowed, copiedNatively).then((copied) => {
+      void writeExplicitTerminalClipboardText(text, isAllowed).then((copied) => {
         if (!isAllowed()) return;
         if (copied && isGestureCurrent) toast.success("Copied", { duration: 1500 });
         if (!copied)
@@ -520,29 +519,31 @@ export function TerminalView({
     [isCopyAllowed],
   );
 
-  const copyTouchSelection = useRef<(text: string, session: TerminalSession) => void>(() => {});
-  copyTouchSelection.current = (text, session) => {
-    if (!canTouchSelect || sessionRef.current !== session || !mountedRef.current) return;
+  const copyTouchSelection = useRef<(text: string, isCurrent: () => boolean) => void>(() => {});
+  copyTouchSelection.current = (text, isCurrent) => {
+    if (!isCurrent()) return;
     if (!isCopyAllowed()) {
       toast.info("Copy blocked by the terminal clipboard setting", {
         id: "terminal-clipboard-blocked",
       });
       return;
     }
-    copyExplicit(text, undefined, () => sessionRef.current === session && mountedRef.current);
+    copyExplicit(text, isCurrent);
   };
 
   useLayoutEffect(() => {
     const session = sessionRef.current;
-    session?.setTouchSelection(
-      canTouchSelect && session
-        ? {
-            copy: (text) => copyTouchSelection.current(text, session),
-            handles: setSelectionHandles,
-          }
-        : null,
-    );
-    return () => session?.setTouchSelection(null);
+    if (!canTouchSelect || !session) return;
+    let enabled = true;
+    const isCurrent = () => enabled && sessionRef.current === session && mountedRef.current;
+    session.setTouchSelection({
+      copy: (text) => copyTouchSelection.current(text, isCurrent),
+      handles: setSelectionHandles,
+    });
+    return () => {
+      enabled = false;
+      session.setTouchSelection(null);
+    };
   }, [canTouchSelect]);
 
   const notifyClipboardRequest = useCallback(
@@ -570,17 +571,29 @@ export function TerminalView({
         });
         return;
       }
-      if (copyEvent) {
-        copyExplicit(text, copyEvent);
+      const source = copyEvent ? "selection" : "terminal";
+      if (
+        clipboardConsentRef.current.decision === "allow" &&
+        copyEvent?.clipboardData &&
+        !isTerminalClipboardWritePending()
+      ) {
+        // A pending write can overwrite a native copy, so queue the selection in that case.
+        setClipboardPrompt(null);
+        clipboardNeedsClickRef.current = false;
+        applyTerminalCopy(copyEvent, text);
         return;
       }
-      if (clipboardConsentRef.current.decision === "allow" && !clipboardNeedsClickRef.current) {
+      if (
+        clipboardConsentRef.current.decision === "allow" &&
+        (copyEvent || !clipboardNeedsClickRef.current)
+      ) {
         setClipboardPrompt(null);
         queueSessionClipboardCopy({
           scope: clipboardScope,
           epoch: clipboardScopeEpoch,
           generation,
           text,
+          source,
           kind: "automatic",
         });
         return;
@@ -591,10 +604,11 @@ export function TerminalView({
         epoch: clipboardScopeEpoch,
         generation,
         text,
+        source,
         reason: clipboardConsentRef.current.decision === "allow" ? "browser" : "consent",
       });
     },
-    [clipboardScope, clipboardScopeEpoch, copyExplicit, queueSessionClipboardCopy, readOnly],
+    [clipboardScope, clipboardScopeEpoch, queueSessionClipboardCopy, readOnly],
   );
 
   const onClipboardActionRef = useRef<TerminalClipboardAction>(() => {});
@@ -620,7 +634,7 @@ export function TerminalView({
       const prompt =
         clipboardMountedRef.current &&
         clipboardActiveRef.current &&
-        !readOnly &&
+        (!readOnly || clipboardPrompt?.source === "selection") &&
         clipboardPrompt?.scope === clipboardScope &&
         clipboardPrompt.epoch === clipboardScopeEpoch &&
         clipboardPrompt.generation === clipboardRequestGenerationRef.current
@@ -653,6 +667,7 @@ export function TerminalView({
           epoch: clipboardScopeEpoch,
           generation,
           text: prompt.text,
+          source: prompt.source,
           kind: "user",
         });
       }
@@ -672,7 +687,7 @@ export function TerminalView({
     clipboardPrompt.epoch === clipboardScopeEpoch &&
     clipboardPrompt.generation === clipboardRequestGenerationRef.current &&
     active &&
-    !readOnly
+    (!readOnly || clipboardPrompt.source === "selection")
       ? clipboardPrompt
       : null;
 
