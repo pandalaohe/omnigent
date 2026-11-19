@@ -34,7 +34,8 @@ export function recordTerminalKey(
   const input = shortcutEventFromLogicalKey(logical);
   const label = keyEventToLabel(input);
   if (logical.cmd) {
-    const chord = shortcutChordFromEvent(input);
+    // The terminal needs the character produced by the layout, even for C/V.
+    const chord = shortcutChordFromEvent({ ...input, code: logical.key });
     return !chord || "refused" in applyCmd({ chord }, CMD_KEY_MODE)
       ? { refused: "no-sequence" }
       : { action: { type: "combo", chord }, label };

@@ -226,6 +226,30 @@ describe("TerminalKeyRow", () => {
     ]);
   });
 
+  it("requires a whole tap for a repeatable legacy V key while Cmd is locked", () => {
+    vi.useFakeTimers();
+    const { session, sessionRef } = makeSessionMock();
+    const chord = { code: "KeyV", modifiers: [] };
+    const surface = fromBar322(
+      barWith([
+        { id: "v", label: "V", kind: "key", chord, width: 2, display: "text", repeat: true },
+      ]),
+    );
+    render(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} surface={surface} />);
+    act(() => session.setStickyModifiers({ ...EMPTY_STICKY_MODIFIERS, cmd: "locked" }));
+    const key = screen.getByRole("button", { name: "V" });
+    fireEvent.pointerDown(key, { button: 0, pointerId: 7, clientX: 20, clientY: 20 });
+    act(() => vi.advanceTimersByTime(2000));
+    expect(session.sendSoftKey).not.toHaveBeenCalled();
+    fireEvent.pointerUp(key, { pointerId: 7, clientX: 20, clientY: 20 });
+    expect(session.sendSoftKey).not.toHaveBeenCalled();
+    tapButton(key);
+    expect(session.sendSoftKey).toHaveBeenCalledExactlyOnceWith("enter", "v", {
+      focus: false,
+      chord,
+    });
+  });
+
   it("supports a Tap locks modifier and Shift in the sticky state", () => {
     const shift = {
       id: "shift",

@@ -263,7 +263,7 @@ function SurfaceEditor({
     index: number;
     error: string | null;
   } | null>(null);
-  const [rejection, setRejection] = useState<string | null>(null);
+  const [rejection, setRejection] = useState(false);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const dragStartedRef = useRef(false);
   const dragBarRef = useRef<SurfaceKeys | null>(null);
@@ -282,9 +282,9 @@ function SurfaceEditor({
 
   useEffect(() => {
     const onRejected = (event: Event) => {
-      const detail = (event as CustomEvent<{ namespace?: string; detail?: string }>).detail;
+      const detail = (event as CustomEvent<{ namespace?: string }>).detail;
       if (detail?.namespace !== "mobile_assistant") return;
-      setRejection(detail.detail || "The server rejected the key layout.");
+      setRejection(true);
     };
     window.addEventListener(USER_PREFERENCES_PATCH_REJECTED_EVENT, onRejected);
     return () => window.removeEventListener(USER_PREFERENCES_PATCH_REJECTED_EVENT, onRejected);
@@ -335,7 +335,7 @@ function SurfaceEditor({
     }
     setBar(candidate);
     setRowError(null);
-    setRejection(null);
+    setRejection(false);
     if (options.message) {
       const undo = options.before;
       toast(options.message, {
@@ -720,6 +720,11 @@ function SurfaceEditor({
     );
   };
 
+  const sheetRowKeys = bar.top.keys.some((key) => key.id === sheet?.key.id)
+    ? bar.top.keys
+    : bar.bottom.keys;
+  const sheetIndex = sheetRowKeys.findIndex((key) => key.id === sheet?.key.id);
+
   const restoreDefaults = () =>
     persist(withRows(bar, fromBar322(defaultTerminalBar())), {
       before: bar,
@@ -759,7 +764,7 @@ function SurfaceEditor({
           role="alert"
           className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm"
         >
-          Couldn't sync the key layout: {rejection}. Your previous layout is back.
+          Couldn't sync the key layout. Review the layout shown here and save your changes again.
         </p>
       ) : null}
 
@@ -841,6 +846,8 @@ function SurfaceEditor({
           key={sheet.key.id}
           keyDraft={sheet.key}
           isNew={sheet.isNew}
+          canMoveLeft={sheetIndex > 0}
+          canMoveRight={sheetIndex >= 0 && sheetIndex < sheetRowKeys.length - 1}
           error={sheet.error}
           onClose={() => setSheet(null)}
           onSave={saveSheet}

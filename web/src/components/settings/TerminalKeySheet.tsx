@@ -154,6 +154,8 @@ function ToggleRow({
 export interface TerminalKeySheetProps {
   keyDraft: StoredKey;
   isNew: boolean;
+  canMoveLeft: boolean;
+  canMoveRight: boolean;
   error?: string | null;
   onClose: () => void;
   onSave: (key: StoredKey) => void;
@@ -164,6 +166,8 @@ export interface TerminalKeySheetProps {
 export function TerminalKeySheet({
   keyDraft,
   isNew,
+  canMoveLeft,
+  canMoveRight,
   error,
   onClose,
   onSave,
@@ -213,11 +217,17 @@ export function TerminalKeySheet({
         return;
       }
       setDraft((current) => {
-        const next = { ...current, action: outcome.action };
+        const recorded = outcome.action;
+        const nextAction: KeyAction =
+          recorded.type === "send" &&
+          current.action.type === "send" &&
+          current.action.autoEnter === true
+            ? { ...recorded, autoEnter: true }
+            : recorded;
+        const next = { ...current, action: nextAction };
         if (!keySupportsRepeat(next)) delete next.repeat;
         if (!labelEdited || !current.label.trim()) {
-          const label =
-            outcome.action.type === "combo" ? comboLabel(outcome.action.chord) : outcome.label;
+          const label = recorded.type === "combo" ? comboLabel(recorded.chord) : outcome.label;
           next.label = label.slice(0, MAX_KEY_LABEL_LENGTH);
         }
         return next;
@@ -609,22 +619,26 @@ export function TerminalKeySheet({
 
           {!isNew ? (
             <div className="flex flex-wrap gap-2" role="group" aria-label="Move key">
-              <Button
-                type="button"
-                variant="outline"
-                className="min-h-11"
-                onClick={() => onMove(draft.id, "left")}
-              >
-                Move left
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                className="min-h-11"
-                onClick={() => onMove(draft.id, "right")}
-              >
-                Move right
-              </Button>
+              {canMoveLeft ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="min-h-11"
+                  onClick={() => onMove(draft.id, "left")}
+                >
+                  Move left
+                </Button>
+              ) : null}
+              {canMoveRight ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="min-h-11"
+                  onClick={() => onMove(draft.id, "right")}
+                >
+                  Move right
+                </Button>
+              ) : null}
               <Button
                 type="button"
                 variant="outline"

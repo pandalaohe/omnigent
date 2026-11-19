@@ -6,7 +6,7 @@ import {
   terminalHardwareKeyAction,
   type TerminalKeyboardPreferences,
 } from "./terminalKeyboardPreferences";
-import { encodeSend } from "./terminalKeys";
+import { encodeChord, encodeSend } from "./terminalKeys";
 import { EMPTY_STICKY_MODIFIERS } from "./terminalKeyBar";
 
 const altAsControl: TerminalKeyboardPreferences = {
@@ -63,6 +63,39 @@ describe("recordTerminalKey", () => {
         action: { type: "combo", chord: { code: "ArrowLeft", modifiers: ["meta"] } },
       });
     }
+  });
+
+  it.each([
+    ["v", "Period", { clipboard: "paste" }],
+    ["C", "KeyJ", { clipboard: "copy" }],
+    ["k", "KeyV", { bytes: "\x1bk" }],
+    ["é", "KeyC", { bytes: "\x1bé" }],
+  ])("replays logical Cmd+%s when the physical code is %s", (key, code, output) => {
+    const recording = recordTerminalKey(keyEvent(key, code, { metaKey: true }), { v: 1 }, "macos");
+    if (!recording || !("action" in recording) || recording.action.type !== "combo") {
+      throw new Error("Expected a recorded Command chord");
+    }
+    expect(recording.action.chord).toEqual({ code: key, modifiers: ["meta"] });
+    expect(encodeChord(recording.action.chord, EMPTY_STICKY_MODIFIERS, false)).toEqual(output);
+  });
+
+  it("uses the logical key and modifiers produced by a remap", () => {
+    const preferences = {
+      v: 1,
+      modifierMap: { macos: { ctrl: "cmd", alt: "alt", meta: "ctrl" } },
+    } satisfies TerminalKeyboardPreferences;
+    const recording = recordTerminalKey(
+      keyEvent("V", "Period", { ctrlKey: true, shiftKey: true }),
+      preferences,
+      "macos",
+    );
+    if (!recording || !("action" in recording) || recording.action.type !== "combo") {
+      throw new Error("Expected a recorded Command chord");
+    }
+    expect(recording.action.chord).toEqual({ code: "V", modifiers: ["meta", "shift"] });
+    expect(encodeChord(recording.action.chord, EMPTY_STICKY_MODIFIERS, false)).toEqual({
+      clipboard: "paste",
+    });
   });
 
   it("ignores repeats, modifiers and composition, and rejects AltGr and unsupported keys", () => {
