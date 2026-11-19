@@ -8261,18 +8261,6 @@ async def _launch_runner_on_host_locked(
             if caller == "card_answer":
                 fresh = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
                 if fresh is None or not _can_wake_for_card_answer(fresh):
-                    from omnigent.server.routes._sessions.orchestration import (
-                        _stop_host_runner_intentionally,
-                    )
-
-                    # The host orders the stop after the launch for this binding.
-                    await _stop_host_runner_intentionally(
-                        conv.id,
-                        host_conn.host_id,
-                        new_runner_id,
-                        host_registry,
-                        conversation_store,
-                    )
                     return _HostLaunchAttempt(runner_id=new_runner_id, lifecycle_blocked=True)
             result = await asyncio.wait_for(
                 launch_future,
@@ -8299,7 +8287,7 @@ async def _launch_runner_on_host_locked(
             if not launch_future.done():
                 launch_future.cancel()
             elif not launch_future.cancelled():
-                # A compensating stop can skip the launch acknowledgement.
+                # A lifecycle block can skip the launch acknowledgement.
                 launch_future.exception()
         if result.get("status") == "failed":
             refusal_code = result.get("error_code")

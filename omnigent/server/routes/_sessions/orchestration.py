@@ -7896,7 +7896,24 @@ async def ensure_runner_connected(
                     request_id=card_answer_wake.elicitation_id,
                     on_frame_enqueued=card_answer_wake.mark_frame_enqueued,
                 )
-                if launch_attempt.not_enqueued or launch_attempt.lifecycle_blocked:
+                if launch_attempt.lifecycle_blocked:
+                    conv = await _reread()
+                    # Keep the archive's existing teardown task and options.
+                    if (
+                        conv.archived
+                        and conv.archive_close_requested_revision == conv.archive_revision
+                        and conv.archive_close_completed_revision != conv.archive_revision
+                        and session_id not in _pending_archive_stops
+                    ):
+                        _spawn_archive_stop(
+                            session_id,
+                            conversation_store,
+                            runner_router,
+                            host_registry,
+                            getattr(app_state, "archive_close_coordinator", None),
+                        )
+                    return None, conv
+                if launch_attempt.not_enqueued:
                     return None, await _reread()
             # A harness-not-configured or workspace-missing refusal means the
             # runner will never appear — don't set relaunched_runner_id or the
@@ -10054,6 +10071,9 @@ async def _forward_event_to_runner(
         and annotation_lookup is not None
         and await asyncio.to_thread(annotation_lookup, session_id, startup_input_id) is not None
     )
+    # A card replay after persistence would create a second transcript item.
+    if before_forward is not None:
+        await before_forward()
     if annotation_pending:
         assert startup_input_id is not None
         canonical = await asyncio.to_thread(
@@ -10611,8 +10631,6 @@ async def _forward_event_to_runner(
             "input_admission_deadline"
         ) or _input_admission_deadline(body.data)
         await claim_retry_forward(session_id, runner_body, deadline=forward_deadline)
-        if before_forward is not None:
-            await before_forward()
         _forward_resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=runner_body,

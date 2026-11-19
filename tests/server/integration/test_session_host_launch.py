@@ -35,7 +35,7 @@ from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.entities import Conversation
+from omnigent.entities import Conversation, MessageData
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
@@ -5582,15 +5582,76 @@ async def test_async_card_restart_joins_startup_or_retires_sent_answer(
         assert any(item.get("code") == expected for item in items)
 
 
-@pytest.mark.parametrize(
-    "archive_during_enqueue", [False, True], ids=["before-read", "after-read"]
-)
+async def test_async_card_generic_restart_after_append_keeps_one_message(
+    client: httpx.AsyncClient, app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import routes_hooks
+
+    store = SqlAlchemyConversationStore(db_uri)
+    runners = _StagedRunners(store)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm, harness="claude-sdk")
+    session_id = session["id"]
+    runners.live.add(session["runner_id"])
+    elicitation_id, resolve_url = await _open_card_for_host_runner(client, session_id)
+    qid = "q" + elicitation_id.removeprefix("elicit_")[:6]
+    answer_content = [
+        {
+            "type": "input_text",
+            "text": f"[System: answers to your question card #{qid}]\nWhich database? → SQLite",
+        }
+    ]
+    appended = asyncio.Event()
+    seed_title = orchestration._seed_missing_title_from_user_message
+
+    def answer_message_ids() -> list[str]:
+        return [
+            item.id
+            for item in store.list_items(session_id, type="message").data
+            if isinstance(item.data, MessageData)
+            and item.data.role == "user"
+            and item.data.content == answer_content
+        ]
+
+    async def pause_after_append(*_args: Any, **_kwargs: Any) -> None:
+        appended.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", runners.get_runner_client)
+    monkeypatch.setattr(orchestration, "_seed_missing_title_from_user_message", pause_after_append)
+    async with runners.client:
+        try:
+            resolved = await client.post(
+                resolve_url, json={"action": "accept", "content": {"Which database?": "SQLite"}}
+            )
+            assert resolved.status_code == 202, resolved.text
+            await asyncio.wait_for(appended.wait(), budget(5.0))
+            [answer_id] = answer_message_ids()
+            assert not any(body.get("type") == "message" for _, body in runners.posts)
+            await orchestration.cancel_detached_elicitation_tasks()
+            monkeypatch.setattr(orchestration, "_seed_missing_title_from_user_message", seed_title)
+
+            await routes_hooks.restore_detached_cards(
+                store, runner_router=None, app_state=app.state
+            )
+            async with asyncio.timeout(budget(5.0)):
+                while await asyncio.to_thread(store.list_detached_cards):
+                    await asyncio.sleep(0.01)
+            assert answer_message_ids() == [answer_id]
+            assert not any(body.get("type") == "message" for _, body in runners.posts)
+        finally:
+            await orchestration.cancel_detached_elicitation_tasks()
+
+
+@pytest.mark.parametrize("archive_timing", ["before-read", "after-read", "undo"])
 async def test_async_card_does_not_launch_if_archived_during_launch_wait(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
-    archive_during_enqueue: bool,
+    archive_timing: str,
 ) -> None:
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import helpers, orchestration
@@ -5606,12 +5667,16 @@ async def test_async_card_does_not_launch_if_archived_during_launch_wait(
     preparing_frame = asyncio.Event()
     resume_launch = asyncio.Event()
     retried = asyncio.Event()
+    resume_retry = asyncio.Event()
+    archive_during_enqueue = archive_timing != "before-read"
     send_text = app.state.host_registry.send_text
 
     def archive_before_enqueue(conn: HostConnection, text: str) -> None:
         if isinstance(decode_host_frame(text), HostLaunchRunnerFrame):
             # The launch helper has read its final pre-enqueue snapshot.
-            result = store.update_conversation_with_changes(session_id, archived=True)
+            result = store.update_conversation_with_changes(
+                session_id, archived=True, close_cli_on_archive=True
+            )
             assert result is not None and result.conversation.archived
         send_text(conn, text)
 
@@ -5624,9 +5689,15 @@ async def test_async_card_does_not_launch_if_archived_during_launch_wait(
 
     async def pause_retry(_delay: float) -> None:
         retried.set()
-        await asyncio.Future()
+        await resume_retry.wait()
 
     if archive_during_enqueue:
+        monkeypatch.setattr(app.state, "archive_close_coordinator", None)
+        monkeypatch.setattr(
+            sessions_module,
+            "_ARCHIVE_STOP_UNDO_GRACE_S",
+            60.0 if archive_timing == "undo" else 0.0,
+        )
         monkeypatch.setattr(app.state.host_registry, "send_text", archive_before_enqueue)
     else:
         monkeypatch.setattr(helpers, "_resolve_harness_async", pause_frame_preparation)
@@ -5649,13 +5720,39 @@ async def test_async_card_does_not_launch_if_archived_during_launch_wait(
                 assert archived.status_code == 200, archived.text
                 resume_launch.set()
             await asyncio.wait_for(retried.wait(), budget(5.0))
+            assert not runners.posts
+            [record] = await asyncio.to_thread(store.list_detached_cards)
+            assert record.state == "answered"
             if archive_during_enqueue:
+                async with asyncio.timeout(budget(5.0)):
+                    while not host.launch_frames:
+                        await asyncio.sleep(0.01)
                 [frame] = host.launch_frames
-                assert token_bound_runner_id(frame.binding_token) in host.stopped_runner_ids
+                runner_id = token_bound_runner_id(frame.binding_token)
+                if archive_timing == "undo":
+                    archive_stop = orchestration._pending_archive_stops[session_id]
+                    runners.live.add(runner_id)
+                    undone = await asyncio.wait_for(
+                        client.patch(f"/v1/sessions/{session_id}", json={"archived": False}),
+                        budget(5.0),
+                    )
+                    assert undone.status_code == 200, undone.text
+                    resume_retry.set()
+                    async with asyncio.timeout(budget(5.0)):
+                        await asyncio.gather(archive_stop, return_exceptions=True)
+                        while await asyncio.to_thread(store.list_detached_cards):
+                            await asyncio.sleep(0.01)
+                    assert len(host.launch_frames) == 1
+                    assert runner_id not in host.stopped_runner_ids
+                    assert sum(body.get("type") == "message" for _, body in runners.posts) == 1
+                else:
+                    async with asyncio.timeout(budget(5.0)):
+                        while runner_id not in host.stopped_runner_ids:
+                            await asyncio.sleep(0.01)
             else:
                 assert not host.launch_frames
-            assert not runners.posts
         finally:
+            orchestration._cancel_pending_archive_stop(session_id)
             await orchestration.cancel_detached_elicitation_tasks()
 
 
