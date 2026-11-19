@@ -1,5 +1,6 @@
 import { queueUserPreferencePatch } from "./userPreferencesSync";
 import { isNativeShell } from "./nativeBridge";
+import { letterFromPhysicalCode } from "./keySequence";
 
 export type ShortcutPlatform = "macos" | "windows" | "linux";
 export type ShortcutModifier = "primary" | "control" | "meta" | "alt" | "shift";
@@ -7,6 +8,102 @@ export type ShortcutModifier = "primary" | "control" | "meta" | "alt" | "shift";
 export interface ShortcutChord {
   code: string;
   modifiers: ShortcutModifier[];
+}
+
+export type ModifierRole = "ctrl" | "alt" | "cmd";
+export type ModifierMap = Record<"ctrl" | "alt" | "meta", ModifierRole>;
+
+export const TERMINAL_MODIFIER_PRESETS = {
+  byName: { ctrl: "ctrl", alt: "alt", meta: "cmd" },
+  altAsCmd: { ctrl: "ctrl", alt: "cmd", meta: "cmd" },
+  swapAltCmd: { ctrl: "ctrl", alt: "cmd", meta: "alt" },
+} as const satisfies Record<string, ModifierMap>;
+
+export function terminalModifierPreset(map: ModifierMap) {
+  return Object.entries(TERMINAL_MODIFIER_PRESETS).find(
+    ([, preset]) => preset.ctrl === map.ctrl && preset.alt === map.alt && preset.meta === map.meta,
+  )?.[0] as keyof typeof TERMINAL_MODIFIER_PRESETS | undefined;
+}
+
+interface LogicalKeyEvent {
+  key: string;
+  code: string;
+  ctrl: boolean;
+  alt: boolean;
+  shift: boolean;
+  cmd: boolean;
+  remapped: boolean;
+}
+
+const US_PUNCTUATION: Record<string, string> = {
+  Minus: "-_",
+  Equal: "=+",
+  BracketLeft: "[{",
+  BracketRight: "]}",
+  Backslash: "\\|",
+  Semicolon: ";:",
+  Quote: "'\"",
+  Comma: ",<",
+  Period: ".>",
+  Slash: "/?",
+  Backquote: "`~",
+  Space: "  ",
+};
+
+function keyWithoutOption(event: KeyboardEvent): string {
+  const position = Number(event.shiftKey);
+  if (/^Digit[0-9]$/.test(event.code)) {
+    const digit = Number(event.code.slice(-1));
+    return event.shiftKey ? ")!@#$%^&*("[digit] : String(digit);
+  }
+  const letter = /^Key[A-Z]$/.test(event.code) && letterFromPhysicalCode(event.code);
+  if (letter) return event.shiftKey ? letter.toUpperCase() : letter;
+  return US_PUNCTUATION[event.code]?.[position] ?? event.key;
+}
+
+export function logicalKeyEvent(
+  event: KeyboardEvent,
+  map: ModifierMap,
+  platform: ShortcutPlatform,
+): LogicalKeyEvent | { passthrough: "ime" | "altgr" } {
+  if (event.isComposing || event.keyCode === 229 || event.key === "Process") {
+    return { passthrough: "ime" };
+  }
+  if (
+    (platform === "windows" && event.ctrlKey && event.altKey) ||
+    event.getModifierState("AltGraph")
+  ) {
+    return { passthrough: "altgr" };
+  }
+  const ctrl =
+    (event.ctrlKey && map.ctrl === "ctrl") ||
+    (event.altKey && map.alt === "ctrl") ||
+    (event.metaKey && map.meta === "ctrl");
+  const alt =
+    (event.ctrlKey && map.ctrl === "alt") ||
+    (event.altKey && map.alt === "alt") ||
+    (event.metaKey && map.meta === "alt");
+  const cmd =
+    (event.ctrlKey && map.ctrl === "cmd") ||
+    (event.altKey && map.alt === "cmd") ||
+    (event.metaKey && map.meta === "cmd");
+  const remappedOption = event.altKey && map.alt !== "alt";
+  return {
+    key: remappedOption ? keyWithoutOption(event) : event.key,
+    code: event.code,
+    ctrl,
+    alt,
+    shift: event.shiftKey,
+    cmd,
+    remapped:
+      remappedOption ||
+      (event.ctrlKey && map.ctrl !== "ctrl") ||
+      (event.metaKey && map.meta !== "cmd"),
+  };
+}
+
+export function shortcutEventFromLogicalKey({ key, code, ctrl, alt, cmd, shift }: LogicalKeyEvent) {
+  return { key, code, ctrlKey: ctrl, altKey: alt, metaKey: cmd, shiftKey: shift };
 }
 
 export type ShortcutGroupId =
@@ -532,7 +629,7 @@ function normalizeBindings(value: unknown): ShortcutChord[] | null {
   return bindings.every((binding): binding is ShortcutChord => binding !== null) ? bindings : null;
 }
 
-function normalizeActionPreference(value: unknown): ShortcutActionPreference | null {
+export function normalizeActionPreference(value: unknown): ShortcutActionPreference | null {
   if (!value || typeof value !== "object") return null;
   const raw = value as {
     common?: unknown;
@@ -839,10 +936,13 @@ function eventCode(event: Pick<KeyboardEvent, "code" | "key">): string {
   return byKey[event.key] ?? event.key;
 }
 
-export function shortcutChordFromEvent(event: KeyboardEvent): ShortcutChord | null {
+export function shortcutChordFromEvent(
+  event: Pick<KeyboardEvent, "key" | "code" | "ctrlKey" | "metaKey" | "altKey" | "shiftKey">,
+): ShortcutChord | null {
   const code = eventCode(event);
   if (
     !code ||
+    ["Control", "Meta", "Alt", "AltGraph", "Shift", "OS"].includes(event.key) ||
     [
       "ControlLeft",
       "ControlRight",

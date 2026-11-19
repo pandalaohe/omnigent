@@ -26,6 +26,7 @@ import { applyMacElectronShellAttribute } from "./lib/nativeBridge";
 import { applyMobileAppTargetAttribute } from "./lib/mobileAppTargets";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
+import { installTerminalHardwareInput } from "./lib/terminalHardwareInput";
 import {
   applyStoredUiFontSize,
   applyUiFontFamily,
@@ -43,6 +44,7 @@ import "./index.css";
 // and a trace begins in the browser. No-op unless a collector endpoint is
 // configured (VITE_OTEL_EXPORTER_OTLP_ENDPOINT).
 initBrowserTelemetry();
+installTerminalHardwareInput();
 
 // Single client at module scope — shared across the whole app.
 //
