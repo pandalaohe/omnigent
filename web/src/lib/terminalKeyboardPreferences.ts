@@ -151,7 +151,11 @@ export function terminalHardwareKeyAction(
     }
   }
   if (!logical.remapped) return null;
-  if (logical.cmd) return terminalModifierPreset(map) === "altAsCmd" ? null : { bytes: "" };
+  if (logical.cmd) {
+    return platform === "windows" && terminalModifierPreset(map) === "altAsCmd"
+      ? null
+      : { bytes: "" };
+  }
   // Reuse the chord encoder for the full set of Ctrl control bytes. For printable
   // keys, resolve the chord from the logical character rather than the US key position.
   const characterChord = shortcutChordFromEvent({ ...input, code: "" });

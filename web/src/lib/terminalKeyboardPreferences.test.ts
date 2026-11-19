@@ -55,6 +55,24 @@ describe("terminal hardware keyboard", () => {
     expect(action({ key: "Process", code: "KeyV" })).toBeNull();
   });
 
+  it.each([
+    { platform: "windows", key: "b", expected: null },
+    { platform: "macos", key: "∫", expected: { bytes: "" } },
+    { platform: "linux", key: "b", expected: { bytes: "" } },
+  ] as const)(
+    "uses the Alt as Cmd fallback for unmatched Alt+B on $platform",
+    ({ platform, key: altBKey, expected }) => {
+      const preferences = {
+        v: 1,
+        modifierMap: { [platform]: TERMINAL_MODIFIER_PRESETS.altAsCmd },
+      } satisfies TerminalKeyboardPreferences;
+      const action = (key: string, code: string) =>
+        terminalHardwareKeyAction(down({ key, code, altKey: true }), preferences, platform);
+      expect(action(altBKey, "KeyB")).toEqual(expected);
+      expect(action("ArrowLeft", "ArrowLeft")).toEqual({ bytes: "\x01" });
+    },
+  );
+
   it("ignores IME and AltGraph before normalizing an Option-generated character", () => {
     const map = TERMINAL_MODIFIER_PRESETS.swapAltCmd;
     expect(
