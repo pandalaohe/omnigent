@@ -2,7 +2,8 @@
    amber and red are quota state; text steps down through three cool greys;
    other categories use one five-colour series set. Type steps follow the app's
    UI size. Numbers use tabular figures. */
-:is(.usage-surface, .usage-palette) {
+:is(.usage-board-scroll, .usage-palette) {
+  --usage-background: #f5f6f8;
   --usage-ink: #0f141c;
   --usage-ink-2: #3a4454;
   --usage-ink-3: #566073;
@@ -33,7 +34,9 @@
   --usage-series-4: #e87ba4;
   --usage-series-5: #4a3aa7;
 }
-.dark :is(.usage-surface, .usage-palette) {
+.dark :is(.usage-board-scroll:not([data-usage-theme="light"]), .usage-palette),
+.usage-board-scroll[data-usage-theme="dark"] {
+  --usage-background: #10141b;
   --usage-ink: #eaeef4;
   --usage-ink-2: #b6becc;
   --usage-ink-3: #8e97a8;
@@ -61,9 +64,19 @@
   --usage-series-4: #d55181;
   --usage-series-5: #5243cc;
 }
+.usage-board-scroll {
+  background-color: var(--usage-background);
+}
+.usage-board-scroll[data-usage-theme="light"] {
+  color-scheme: light;
+}
+.usage-board-scroll[data-usage-theme="dark"] {
+  color-scheme: dark;
+}
 .usage-surface {
   /* Shared app roles follow the board palette inside the board. */
   --foreground: var(--usage-ink);
+  --background: var(--usage-background);
   --muted-foreground: var(--usage-ink-3);
   --card: var(--usage-tile);
   --border: var(--usage-line);

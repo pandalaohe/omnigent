@@ -216,7 +216,9 @@ def test_analysis_polls_visible_and_keeps_folded_reads_idle(
     page: Page, appearance_url: str, analysis_reads
 ):
     page.goto(appearance_url + "/frame/usage/board/cost?range=d30&group=account")
-    expect(page).to_have_url(appearance_url + "/frame/usage/board/analysis")
+    expect(page).to_have_url(
+        appearance_url + "/frame/usage/board/analysis?range=d30&group=account"
+    )
     expect(page.get_by_test_id("analysis-results")).to_be_visible()
     assert len(analysis_reads) == 1
     page.clock.fast_forward(298_000)

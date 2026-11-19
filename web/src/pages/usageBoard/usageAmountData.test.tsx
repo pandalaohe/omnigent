@@ -424,7 +424,7 @@ it("loads Issues, account activity and account models while the board switch is 
     "timeout",
   );
   cleanup();
-  mount("/usage/board/litellm");
+  mount("/usage/board?account=litellm&view=details");
   await screen.findByRole("heading", { name: "LiteLLM", level: 2 });
   await waitFor(() =>
     expect(fetchMock.mock.calls.some(([path]) => String(path).includes("/activity"))).toBe(true),

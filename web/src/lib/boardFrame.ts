@@ -11,3 +11,8 @@ export function boardPath(path: string): string {
 export function boardExitProps(): { target?: "_blank"; rel?: "noopener" } {
   return isFramePath() ? { target: "_blank", rel: "noopener" } : {};
 }
+
+export function usageBoardTheme(search: URLSearchParams): "dark" | "light" | undefined {
+  const theme = search.get("theme");
+  return theme === "dark" || theme === "light" ? theme : undefined;
+}

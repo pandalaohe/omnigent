@@ -2,7 +2,7 @@ import { boardPath } from "@/lib/boardFrame";
 // One account in detail: every window the last read returned, in its group,
 // with the countdown and the reset written out, and the hosts that reported.
 
-import { Link, useParams, useSearchParams } from "@/lib/routing";
+import { Link, useSearchParams } from "@/lib/routing";
 import {
   LaptopIcon,
   PinIcon,
@@ -46,8 +46,7 @@ import { UsageBalances } from "./UsageBalances";
 import { UsageName } from "./UsageName";
 import { analysisLink, filterFromQuery } from "./usageAnalysisFilters";
 
-export function UsageAccountPage() {
-  const { accountId = "" } = useParams();
+export function UsageAccountPage({ accountId }: { accountId: string }) {
   const info = useServerInfo();
   const board = useUsageContextPreferences().board;
   const overview = useUsageOverview(info !== "loading" && info.usage_board_enabled === true);

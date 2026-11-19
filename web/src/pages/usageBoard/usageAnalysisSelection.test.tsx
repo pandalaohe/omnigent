@@ -115,7 +115,7 @@ it("combines versioned model identities into the target families and keeps other
 
 it("round-trips repeated values and defaults over ranges, groupings, Unicode and blank tags", () => {
   const now = new Date(2026, 10, 19, 12);
-  const shell = new URLSearchParams("theme=dark&pool=https%3A%2F%2Fapp.example.test%2Fp%3Fa%3D1");
+  const shell = new URLSearchParams("theme=dark");
   const read = (query: URLSearchParams) => filterFromQuery(query, now);
   for (const range of ["today", "d7", "d30", "d90", "custom"] as const) {
     for (const group of ["account", "model", "host", "agent"] as const) {
@@ -154,7 +154,7 @@ it.each([
 ])(
   "keeps the %s group's other rows and removes a filter on the second click",
   async (group, selected, other) => {
-    mount(`?group=${group}&theme=dark&pool=example`);
+    mount(`?group=${group}&theme=dark`);
     const table = async () => within(await screen.findByRole("table", { name: "Each item" }));
     fireEvent.click((await table()).getByRole("button", { name: selected }));
     await waitFor(async () =>
@@ -177,9 +177,7 @@ it.each([
         "false",
       ),
     );
-    expect(screen.getByTestId("location")).toHaveTextContent(
-      `?group=${group}&theme=dark&pool=example`,
-    );
+    expect(screen.getByTestId("location")).toHaveTextContent(`?group=${group}&theme=dark`);
   },
 );
 

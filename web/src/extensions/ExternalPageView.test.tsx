@@ -71,6 +71,34 @@ afterEach(() => {
 });
 
 describe("ExternalPageView", () => {
+  it.each(["external", "proxied"] as const)(
+    "updates the %s frame and standalone links and restores the manifest fragment",
+    (kind) => {
+      window.__OMNIGENT_BASE_PATH__ = "/panel";
+      const path = kind === "proxied" ? proxiedUrl : page.url;
+      const expected = kind === "proxied" ? `/panel${path}` : path;
+      const target = { ...page, kind, url: `${path}?view=mini#default` };
+      const open = vi.spyOn(window, "open").mockReturnValue(null);
+      const { rerender } = render(<ExternalPageView page={target} hash="#/first" />);
+      const frame = screen.getByTitle("Dashboard");
+      expect(frame).toHaveAttribute("src", `${expected}?view=mini#/first`);
+
+      rerender(<ExternalPageView page={target} hash="#/second%20view" />);
+      expect(screen.getByTitle("Dashboard")).toBe(frame);
+      const changed = `${expected}?view=mini#/second%20view`;
+      expect(frame).toHaveAttribute("src", changed);
+      expect(screen.getByRole("link", { name: "Open in new tab" })).toHaveAttribute(
+        "href",
+        changed,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Open in window" }));
+      expect(open).toHaveBeenCalledWith(changed, "_blank", expect.any(String));
+
+      rerender(<ExternalPageView page={target} hash="" />);
+      expect(frame).toHaveAttribute("src", `${expected}?view=mini#default`);
+    },
+  );
+
   it("prefixes proxy frame, popup and tab URLs for a subpath deployment", () => {
     window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
     const open = vi.spyOn(window, "open").mockReturnValue(null);

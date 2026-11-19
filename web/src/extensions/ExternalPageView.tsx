@@ -7,14 +7,17 @@ type OpenSessionMethod = (params: unknown, signal: AbortSignal) => unknown;
 
 export function ExternalPageView({
   page,
+  hash,
   openSession,
 }: {
   page: ExtensionExternalPage;
+  hash?: string;
   openSession?: OpenSessionMethod;
 }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const proxied = page.kind === "proxied";
-  const navigationUrl = proxied ? withBasePath(page.url) : page.url;
+  const pageUrl = hash ? `${page.url.split("#", 1)[0]}${hash}` : page.url;
+  const navigationUrl = proxied ? withBasePath(pageUrl) : pageUrl;
   const validProxyPath =
     /^\/v1\/extensions\/[a-z0-9.-]+\/proxy\/[a-z0-9_-]+\/(?:\?[^#]*)?(?:#.*)?$/.test(page.url);
   let url: URL | null;

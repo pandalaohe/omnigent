@@ -1,19 +1,23 @@
 import { useExtensions } from "@/extensions/ExtensionProvider";
+import { resolveExtensionPage } from "@/extensions/catalog";
 import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
+import { boardExitProps } from "@/lib/boardFrame";
 import { Link } from "@/lib/routing";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
 
 export function UsageModelPoolsLink({ settings = false }: { settings?: boolean }) {
   const selected = useUsageContextPreferences().board.modelPoolsPage;
-  const pages = useExtensions().flatMap((extension) =>
+  const extensions = useExtensions();
+  const pandaWatch = resolveExtensionPage(extensions, "local.pandawatch", "pandawatch");
+  const pages = extensions.flatMap((extension) =>
     extension.pages.map((page) => ({
       path: `/extensions/${extension.id}/${page.route}`,
       title: `${extension.display_name} · ${page.title}`,
     })),
   );
   const page = pages.find((item) => item.path === selected);
-  if (settings)
+  if (settings && !pandaWatch)
     return (
       <label className="flex min-h-12 flex-wrap items-center justify-between gap-2 border-t border-border py-2 text-sm">
         Model pools page
@@ -53,12 +57,17 @@ export function UsageModelPoolsLink({ settings = false }: { settings?: boolean }
         )}
       </label>
     );
-  return page ? (
+  const path = pandaWatch
+    ? `/extensions/${pandaWatch.extension.id}/${pandaWatch.page.route}#/llm/pool`
+    : page?.path;
+  const exit = boardExitProps();
+  return path ? (
     <Link
       className="inline-flex min-h-11 items-center text-sm underline underline-offset-2"
-      to={page.path}
+      to={path}
+      {...exit}
     >
-      Model pools ↗
+      Model pools{!pandaWatch || exit.target ? " ↗" : ""}
     </Link>
   ) : (
     <p className="text-xs text-muted-foreground">

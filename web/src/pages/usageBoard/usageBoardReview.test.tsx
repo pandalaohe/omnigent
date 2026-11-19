@@ -265,7 +265,7 @@ describe("arrangement", () => {
 
 describe("detail tips on a phone", () => {
   it("opens the window card by tapping its ring", async () => {
-    renderBoard("/usage/board/codex");
+    renderBoard("/usage/board?account=codex&view=details");
     const ring = (await screen.findAllByTestId("usage-ring"))[0];
     fireEvent.click(ring);
     expect(await screen.findByTestId("usage-tip-card")).toBeTruthy();
@@ -363,7 +363,7 @@ describe("Account detail composition", () => {
     const name = "Monthly quota window with a meaningful full-name suffix";
     account.windows = [{ ...account.windows[0], label: name }];
     mocks.overview.current = { ...LOADED, data };
-    renderBoard(`/usage/board/${encodeURIComponent(account.id)}`);
+    renderBoard(`/usage/board?account=${encodeURIComponent(account.id)}&view=details`);
     const trigger = screen.getByRole("button", { name: `${name} details` });
     expect(trigger.tabIndex).toBe(0);
     expect(trigger.querySelector("button")).toBeNull();
@@ -385,7 +385,7 @@ describe("Account detail composition", () => {
     account.balances = [{ id: "balance", remaining: 298.24, unit: "CNY" }];
     account.balance_freshness = "fresh";
     mocks.overview.current = { ...LOADED, data };
-    renderBoard(`/usage/board/${encodeURIComponent(account.id)}`);
+    renderBoard(`/usage/board?account=${encodeURIComponent(account.id)}&view=details`);
     const balance = screen.getByTitle("¥298.24");
     const quota = screen.getByText("Quota", { exact: true }).closest("section")!;
     expect(quota.contains(balance)).toBe(true);
@@ -417,15 +417,43 @@ describe("Account detail composition", () => {
 
   it("keeps failed overview reads visible instead of claiming the account was removed", () => {
     mocks.overview.current = { ...LOADED, error: new Error("Source unavailable"), data: undefined };
-    renderBoard("/usage/board/example");
+    renderBoard("/usage/board?account=example&view=details");
     expect(screen.getByText("Usage could not be read")).toBeTruthy();
     expect(screen.queryByText("This account is not on the board any more.")).toBeNull();
   });
 });
 
 describe("Mounted model pools page", () => {
-  it("uses the selected installed page and withdraws its link when unavailable", () => {
+  it.each(["", "/frame"])("uses the registered PandaWatch route under prefix %j", (prefix) => {
+    const path = `${prefix}/usage/board`;
+    window.history.replaceState({}, "", path);
+    try {
+      mocks.extensions.current = [
+        {
+          id: "local.pandawatch",
+          pages: [{ id: "model-pools", title: "PandaWatch", route: "pandawatch" }],
+        },
+      ];
+      renderBoard(path);
+      const link = screen.getByRole("link", { name: /Model pools/ });
+      expect(link).toHaveAttribute("href", "/extensions/local.pandawatch/pandawatch#/llm/pool");
+      if (prefix) {
+        expect(link).toHaveAttribute("target", "_blank");
+        expect(link).toHaveAttribute("rel", "noopener");
+      } else {
+        expect(link).not.toHaveAttribute("target");
+      }
+    } finally {
+      window.history.replaceState({}, "", "/");
+    }
+  });
+
+  it("uses the selected page when the PandaWatch route is missing and withdraws dead links", () => {
     mocks.extensions.current = [
+      {
+        id: "local.pandawatch",
+        pages: [{ id: "example-board", title: "Example board", route: "board" }],
+      },
       {
         id: "example.pools",
         display_name: "Pool manager",

@@ -1,4 +1,4 @@
-import { boardPath } from "@/lib/boardFrame";
+import { boardPath, usageBoardTheme } from "@/lib/boardFrame";
 import { toDateInput } from "./usageBoardSelect";
 import type { AnalysisFilter } from "./usageAnalysisData";
 
@@ -97,9 +97,8 @@ export function toQuery(filter: PageFilter, shell?: URLSearchParams, api = false
   const dateKeys =
     api && filter.day ? (["day", "slot"] as const) : (["day", "slot", "from", "to"] as const);
   for (const key of dateKeys) if (filter[key] !== null) query.set(key, filter[key]);
-  for (const key of ["theme", "pool"]) {
-    for (const value of shell?.getAll(key) ?? []) query.append(key, value);
-  }
+  const theme = shell && usageBoardTheme(shell);
+  if (theme) query.set("theme", theme);
   return query;
 }
 

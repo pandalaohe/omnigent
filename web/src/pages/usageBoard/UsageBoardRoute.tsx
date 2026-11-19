@@ -3,7 +3,8 @@ import { boardExitProps } from "@/lib/boardFrame";
 // render here before a page fetches anything. Deployment off is a statement;
 // the user's own switch off redirects to the switch in Settings.
 
-import { Link } from "@/lib/routing";
+import { useEffect } from "react";
+import { Link, useLocation, useNavigate, useParams, useSearchParams } from "@/lib/routing";
 
 import { Spinner } from "@/components/ui/spinner";
 import { usageBoardAvailable } from "@/lib/capabilities";
@@ -19,6 +20,30 @@ import { UsageIssuesPage } from "./UsageIssuesPage";
 
 export const USAGE_BOARD_SETTINGS_PATH = "/settings/general#usage-settings";
 
+function UsageBoardLegacyRedirect({ accountId }: { accountId?: string }) {
+  const { pathname, search, hash } = useLocation();
+  const navigate = useNavigate();
+  useEffect(() => {
+    if (accountId !== undefined) {
+      const query = new URLSearchParams(search);
+      query.set("account", accountId);
+      navigate(
+        { pathname: pathname.replace(/\/[^/]+\/?$/, ""), search: query.toString(), hash },
+        { replace: true },
+      );
+    } else {
+      navigate(
+        { pathname: pathname.replace(/\/cost\/?$/, "/analysis"), search, hash },
+        {
+          replace: true,
+          state: { keepLegacyQuery: true },
+        },
+      );
+    }
+  }, [accountId, hash, navigate, pathname, search]);
+  return null;
+}
+
 export function UsageBoardRoute({
   view = "board",
 }: {
@@ -26,6 +51,9 @@ export function UsageBoardRoute({
 }) {
   const info = useServerInfo();
   const board = useUsageContextPreferences().board;
+  const { pathname } = useLocation();
+  const { accountId } = useParams();
+  const [search] = useSearchParams();
   if (info === "loading") {
     return (
       <div className="flex items-center justify-center py-16">
@@ -43,6 +71,21 @@ export function UsageBoardRoute({
         </p>
       </div>
     );
+  }
+  if (view === "account" && accountId !== undefined) {
+    return <UsageBoardLegacyRedirect accountId={accountId} />;
+  }
+  if (view === "cost" && /\/cost\/?$/.test(pathname)) return <UsageBoardLegacyRedirect />;
+  const selected = search.get("account");
+  if (
+    view === "board" &&
+    selected &&
+    (search.has("focus") ||
+      search.get("view") === "details" ||
+      !board.enabled ||
+      board.hidden.includes(selected))
+  ) {
+    return <UsageAccountPage accountId={selected} />;
   }
   if (!board.enabled && (view === "board" || view === "cost")) {
     // Not a silent redirect: the visitor is told where the switch is, and a
@@ -64,7 +107,6 @@ export function UsageBoardRoute({
       </div>
     );
   }
-  if (view === "account") return <UsageAccountPage />;
   if (view === "account_settings") return <UsageAccountSettingsPage />;
   if (view === "models") return <UsageModelsPage />;
   if (view === "cost") return <UsageCostPage />;

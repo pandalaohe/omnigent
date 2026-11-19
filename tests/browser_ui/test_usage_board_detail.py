@@ -227,6 +227,8 @@ def test_account_detail_keyboard_ranges_and_return(
         method="PUT",
     )
     browser_contract.json("/v1/me/usage/lines", {"schema": 1, "tiles": {}})
+    browser_contract.json("/v1/me/usage/events", {"events": [], "next_before": None})
+    browser_contract.json("/v1/me/usage/sources", {"sources": []})
     browser_contract.json("/v1/me/session-choice", {"settings": None, "revision": "sample"})
     browser_contract.json(
         "/v1/me/session-choice/meters", {"meters": [], "running": {}, "floors": {}}
@@ -325,6 +327,7 @@ def test_account_detail_keyboard_ranges_and_return(
         name_views.append({"view": view, "width": width, "names": list(names)})
 
     page.goto(appearance_url + "/frame/usage/board/plan-0?focus=Pool%20B")
+    expect(page).to_have_url(appearance_url + "/frame/usage/board?focus=Pool+B&account=plan-0")
     expect(page.locator("[data-pool]").first).to_have_attribute("data-pool", "Pool B")
     assert_usage_geometry(
         page,
@@ -349,6 +352,8 @@ def test_account_detail_keyboard_ranges_and_return(
     visited = []
     for item in accounts:
         page.goto(appearance_url + f"/frame/usage/board/{item['id']}")
+        expect(page).to_have_url(appearance_url + f"/frame/usage/board?account={item['id']}")
+        page.get_by_role("link", name="Account details", exact=True).click()
         expect(page.get_by_role("heading", name=item["display_name"], exact=True)).to_be_visible()
         cells = page.get_by_role("group", name="Cost time range")
         expect(cells.get_by_text("$12.34", exact=True)).to_have_count(3)

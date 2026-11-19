@@ -60,7 +60,7 @@ export function UsageIssuesPage() {
     <UsageBoardFrame
       title={title}
       back={{
-        to: accountId ? `/usage/board/${encodeURIComponent(accountId)}` : "/usage/board/cost",
+        to: accountId ? `/usage/board/${encodeURIComponent(accountId)}` : "/usage/board/analysis",
         label: accountId ? (names.get(accountId) ?? "Account") : "Cost",
       }}
       loading={query.isPending}
