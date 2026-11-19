@@ -1350,6 +1350,7 @@ async def test_serve_tunnel_once_sends_bearer_header(
     # an SSLContext isn't equality-comparable to a literal).
     kwargs = dict(captured["kwargs"])
     assert isinstance(kwargs.pop("ssl"), ssl.SSLContext)
+    assert kwargs.pop("logger").name == "websockets.omnigent.runner_tunnel"
     # The runner also sends the first-party Origin sentinel so the server's
     # CSWSH origin guard admits the tunnel (a non-browser client), in
     # addition to the bearer and tunnel-binding token.

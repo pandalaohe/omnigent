@@ -2318,6 +2318,17 @@ describe("terminal clipboard paste", () => {
     expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("make", enter);
   });
 
+  it("normalizes native paste data without attempting an async clipboard read", async () => {
+    const readText = vi.fn().mockRejectedValue(new Error("denied"));
+    vi.stubGlobal("navigator", { clipboard: { readText } });
+    const { terminal } = await openTerminal();
+    await act(async () =>
+      terminal.onClipboardAction?.("paste", { enter: false }, "a\x1bb\r\n\r\n"),
+    );
+    expect(readText).not.toHaveBeenCalled();
+    expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("ab", false);
+  });
+
   it.each([true, false])("confirms multiline input with bracketed mode=%s", async (bracketed) => {
     const readText = vi.fn(async () => "a\r\nb\r\n");
     vi.stubGlobal("navigator", { clipboard: { readText } });

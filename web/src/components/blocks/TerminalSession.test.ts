@@ -756,9 +756,9 @@ describe("TerminalSession", () => {
     return { session, states, container, socket: FakeWebSocket.instances.at(-1)! };
   }
 
-  it("requests paste without Enter for armed, recorded, and hardware Cmd+V", () => {
+  it("requests paste without Enter for armed and recorded Cmd+V", () => {
     const clipboard = vi.fn();
-    const { session, socket, container } = makeSession(
+    const { session, socket } = makeSession(
       undefined,
       undefined,
       true,
@@ -773,18 +773,45 @@ describe("TerminalSession", () => {
     session.setStickyModifiers({ ctrl: "off", alt: "off", shift: "off", cmd: "once" });
     term.input("v", true);
     session.sendBarChord({ code: "KeyV", modifiers: ["meta"] });
-    container.querySelector("textarea")!.dispatchEvent(
-      new KeyboardEvent("keydown", {
-        key: "v",
-        code: "KeyV",
-        metaKey: true,
-        bubbles: true,
-        cancelable: true,
-      }),
-    );
     expect(clipboard.mock.calls).toEqual(
-      Array.from({ length: 3 }, () => ["paste", { enter: false }]),
+      Array.from({ length: 2 }, () => ["paste", { enter: false }]),
     );
+    expect(socket.sent).toEqual([]);
+    session.dispose();
+  });
+
+  it("keeps physical Cmd+V native and forwards the paste event once without Enter", () => {
+    const clipboard = vi.fn();
+    const { session, socket, container } = makeSession(
+      undefined,
+      undefined,
+      true,
+      undefined,
+      true,
+      false,
+      clipboard,
+    );
+    socket.open();
+    socket.sent.length = 0;
+    const input = container.querySelector("textarea")!;
+    const key = new KeyboardEvent("keydown", {
+      key: "v",
+      code: "KeyV",
+      keyCode: 86,
+      metaKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    expect(input.dispatchEvent(key)).toBe(true);
+    expect(clipboard).not.toHaveBeenCalled();
+
+    const getData = vi.fn(() => "native\r\ntext");
+    const paste = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(paste, "clipboardData", { value: { getData } });
+    input.dispatchEvent(paste);
+
+    expect(getData).toHaveBeenCalledExactlyOnceWith("text/plain");
+    expect(clipboard).toHaveBeenCalledExactlyOnceWith("paste", { enter: false }, "native\r\ntext");
     expect(socket.sent).toEqual([]);
     session.dispose();
   });
@@ -1045,6 +1072,34 @@ describe("TerminalSession", () => {
       "x",
     ]);
     unsubscribe();
+    session.dispose();
+  });
+
+  it.each([false, true])(
+    "sends one CR frame for a Send key containing only Enter (autoEnter: %s)",
+    (autoEnter) => {
+      const { socket, session } = makeSession();
+      socket.open();
+      socket.sent = [];
+
+      session.sendBarSequence("\\r", autoEnter);
+
+      expect(socket.sent.map((frame) => Array.from(frame as Uint8Array))).toEqual([[0x0d]]);
+      session.dispose();
+    },
+  );
+
+  it("sends Escape and CR from the phone keyboard with Ctrl and Alt armed, then releases both", () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    socket.open();
+    socket.sent = [];
+    session.setStickyModifiers({ ctrl: "once", alt: "once", shift: "off" });
+
+    term.input("\r", true);
+
+    expect(socket.sent.map((frame) => Array.from(frame as Uint8Array))).toEqual([[0x1b, 0x0d]]);
+    expect(session.getStickyModifiers()).toEqual({ ctrl: "off", alt: "off", shift: "off" });
     session.dispose();
   });
 
