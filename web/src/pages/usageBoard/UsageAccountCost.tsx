@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { Link, useSearchParams } from "@/lib/routing";
 import { useQuery } from "@tanstack/react-query";
-import { boardPath } from "@/lib/boardFrame";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import {
   useUsageAccountActivity,
@@ -27,6 +26,8 @@ import { UsageName } from "./UsageName";
 import { FigureText } from "./UsageFigure";
 import { UsageAccountMoney } from "./UsageAccountMoney";
 import { usePricingBaseline, accountCostClass } from "./usagePricingData";
+import { analysisLink, filterFromQuery, type PageFilter } from "./usageAnalysisFilters";
+import { toDateInput } from "./usageBoardSelect";
 
 export function LegacyUsageAccountCost({ account }: { account: UsageAccountView }) {
   const [selected, setSelected] = useState(1);
@@ -155,6 +156,39 @@ export function overviewRange(range: string | null): OverviewRange {
   return range === "today" || range === "d30" || range === "period" ? range : "d7";
 }
 
+function overviewAnalysisRange(
+  range: OverviewRange,
+  amounts: UsageAccountActivity[],
+): Pick<PageFilter, "range" | "from" | "to"> {
+  if (range !== "period") return { range, from: null, to: null };
+  const span = amounts[0]?.span;
+  if (
+    span &&
+    amounts.every(
+      (amount) =>
+        amount.span.requested_from === span.requested_from && amount.span.until === span.until,
+    )
+  ) {
+    const start = new Date(span.requested_from * 1000);
+    const until = new Date(span.until * 1000);
+    const from = toDateInput(start.getTime());
+    const endDay = toDateInput(until.getTime());
+    const endAtMidnight = until.getTime() === new Date(`${endDay}T00:00:00`).getTime();
+    const to = endAtMidnight ? toDateInput(until.getTime() - 1) : endDay;
+    if (
+      (endAtMidnight || endDay === toDateInput(Date.now())) &&
+      start.getTime() === new Date(`${from}T00:00:00`).getTime() &&
+      span.requested_from === span.counted_from &&
+      span.requested_from % 3600 === 0
+    ) {
+      const candidate = filterFromQuery(new URLSearchParams({ range: "custom", from, to }));
+      if (candidate.range === "custom")
+        return { range: candidate.range, from: candidate.from, to: candidate.to };
+    }
+  }
+  return { range: "d30", from: null, to: null };
+}
+
 export function UsageAccountCost({
   account,
   accounts,
@@ -188,8 +222,7 @@ export function UsageAccountCost({
     monthlyFee !== undefined && own
       ? (monthlyFee * (own.span.until - own.span.requested_from)) / (30 * 86400)
       : undefined;
-  const analysisSearch = new URLSearchParams({ range: compositionRange });
-  if (account) analysisSearch.set("account", account.id);
+  const drill = overviewAnalysisRange(selected, amounts);
 
   function pick(key: string, value: string) {
     const next = new URLSearchParams(search);
@@ -277,9 +310,9 @@ export function UsageAccountCost({
         )}
         <Link
           className="justify-self-end text-xs underline underline-offset-2"
-          to={boardPath(`/usage/board/cost?${analysisSearch}`)}
+          to={analysisLink(search, { ...drill, account: account ? [account.id] : [] })}
         >
-          {selected === "period"
+          {selected === "period" && drill.range !== "custom"
             ? t("overviewAnalysisRange", { range: t(overviewRanges[compositionRange]) })
             : t("overviewAnalysis")}{" "}
           <span aria-hidden="true">›</span>
@@ -304,16 +337,22 @@ export function UsageAccountCost({
 
 export function UsageOverviewHosts({
   accounts,
+  account,
+  range,
   query,
 }: {
   accounts: UsageAccountView[];
+  account?: string;
+  range: OverviewRange;
   query: ReturnType<typeof useUsageActivity>;
 }) {
+  const [search] = useSearchParams();
   const hostNames = new Map(
     accounts.flatMap((item) => item.hosts.map((host) => [host.host_id, host.name])),
   );
   const visibleIds = new Set(accounts.map(({ id }) => id));
   const amounts = query.data?.accounts.filter((item) => visibleIds.has(item.account)) ?? [];
+  const drill = overviewAnalysisRange(range, amounts);
   const hosts = new Map<string, number>();
   for (const amount of amounts) {
     for (const host of amount.hosts ?? []) {
@@ -330,27 +369,43 @@ export function UsageOverviewHosts({
       ) : query.error ? (
         <p className="usage-caption">{t("overviewReadError")}</p>
       ) : hosts.size ? (
-        <ul>
-          {[...hosts]
-            .sort((a, b) => b[1] - a[1])
-            .map(([id, count]) => {
-              const percent = totalTokens ? (count / totalTokens) * 100 : 0;
-              return (
-                <li className="usage-row" key={id}>
-                  <UsageName className="flex-1">
-                    {hostNames.get(id) ?? (id || t("overviewUnknown"))}
-                  </UsageName>
-                  <span className="w-20 shrink-0" aria-hidden="true">
-                    <span
-                      className="usage-overview-share"
-                      style={{ width: `${Math.min(100, percent)}%` }}
-                    />
-                  </span>
-                  <span className="tabular-nums">{formatPercentReading(percent)}%</span>
-                </li>
-              );
-            })}
-        </ul>
+        <>
+          {range === "period" && drill.range !== "custom" ? (
+            <p className="usage-caption">
+              {t("overviewAnalysisRange", { range: t(overviewRanges.d30) })}
+            </p>
+          ) : null}
+          <ul>
+            {[...hosts]
+              .sort((a, b) => b[1] - a[1])
+              .map(([id, count]) => {
+                const percent = totalTokens ? (count / totalTokens) * 100 : 0;
+                return (
+                  <li key={id}>
+                    <Link
+                      className="usage-row"
+                      to={analysisLink(search, {
+                        ...drill,
+                        account: account === undefined ? [] : [account],
+                        host: [id],
+                      })}
+                    >
+                      <UsageName className="flex-1">
+                        {hostNames.get(id) ?? (id || t("overviewUnknown"))}
+                      </UsageName>
+                      <span className="w-20 shrink-0" aria-hidden="true">
+                        <span
+                          className="usage-overview-share"
+                          style={{ width: `${Math.min(100, percent)}%` }}
+                        />
+                      </span>
+                      <span className="tabular-nums">{formatPercentReading(percent)}%</span>
+                    </Link>
+                  </li>
+                );
+              })}
+          </ul>
+        </>
       ) : (
         <p className="usage-caption">{t("overviewNoHosts")}</p>
       )}
@@ -417,7 +472,7 @@ function UsageCostComposition({
       ) : query.isPending ? (
         <p className="usage-caption">{t("overviewReading")}</p>
       ) : query.data.classes ? (
-        <OverviewClasses classes={query.data.classes} complete={query.data.complete} />
+        <UsageClassComposition classes={query.data.classes} complete={query.data.complete} />
       ) : (
         <p className="usage-caption">{t("overviewUnknown")}</p>
       )}
@@ -425,7 +480,13 @@ function UsageCostComposition({
   );
 }
 
-function OverviewClasses({ classes, complete }: { classes: AnalysisClasses; complete: boolean }) {
+export function UsageClassComposition({
+  classes,
+  complete,
+}: {
+  classes: AnalysisClasses;
+  complete: boolean;
+}) {
   const rows = classes.items.map((item) => ({
     label: t(classLabels[item.kind]),
     color: classColors[item.kind],

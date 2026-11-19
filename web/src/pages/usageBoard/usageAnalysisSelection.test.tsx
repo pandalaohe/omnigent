@@ -1,78 +1,66 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { afterEach, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter, useLocation } from "react-router-dom";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { UsageCostPage } from "./UsageCostPage";
 import { UsageAnalysisShares } from "./UsageAnalysisAmounts";
-import {
-  analysisTotals,
-  analysisKey,
-  poolKey,
-  toggleAnalysisPick,
-  type AnalysisRow,
-} from "./usageAnalysisData";
+import { analysisTotals, analysisKey, poolKey, type AnalysisRow } from "./usageAnalysisData";
+import { usageAnalysisV2Fixture } from "./usageActivityFixtures";
+import { filterFromQuery, toQuery } from "./usageAnalysisFilters";
+import { toDateInput } from "./usageBoardSelect";
 
-const state = vi.hoisted(() => ({
-  range: "d7",
-  partial: false,
-  rows: [] as unknown[],
-  hidden: [] as string[],
-  readKeys: [] as string[],
-}));
-vi.mock("./usageActivityData", () => ({ useUsageActivity: () => ({ data: { accounts: [] } }) }));
-vi.mock("./usageBoardData", () => ({
-  USAGE_BOARD_POLL_MS: 60000,
-  useUsageOverview: () => ({
-    data: {
+const { fetchMock } = vi.hoisted(() => ({ fetchMock: vi.fn() }));
+vi.mock("@/lib/identity", () => ({ authenticatedFetch: fetchMock }));
+
+beforeEach(() => {
+  fetchMock.mockReset();
+  fetchMock.mockImplementation(async (path: string) => {
+    const url = new URL(path, "https://app.example.test");
+    if (url.pathname.endsWith("/analysis"))
+      return Response.json(usageAnalysisV2Fixture(url.searchParams));
+    return Response.json({
       accounts: [
-        { id: "a", display_name: "Alpha" },
-        { id: "b", display_name: "Beta" },
+        {
+          id: "claude",
+          display_name: "Alpha",
+          hosts: [{ host_id: "east", name: "East", read_at: null }],
+        },
+        {
+          id: "litellm",
+          display_name: "Beta",
+          hosts: [{ host_id: "west", name: "West", read_at: null }],
+        },
       ],
-    },
-  }),
-}));
-vi.mock("./usageAnalysisData", async (original) => ({
-  ...(await original<object>()),
-  useUsageAnalysis: (_range: unknown, selection?: { keys: string[] }) => {
-    if (selection) state.readKeys = selection.keys;
-    return {
-      data: {
-        generated_at: 10000,
-        span: { requested_from: 0, counted_from: 0, until: 10000 },
-        rows: state.rows,
-        partial: state.partial,
-        pool_catalog: [
-          { parent_account_id: "a", pool_id: "p", display_name: "Pool P", usage_available: true },
-          {
-            parent_account_id: "a",
-            pool_id: "q",
-            display_name: "Quota only",
-            usage_available: false,
-          },
-        ],
-      },
-    };
-  },
-}));
-vi.mock("@/hooks/useUsageContextPreferences", () => ({
-  useUsageContextPreferences: () => ({
-    board: { hidden: state.hidden, range: { key: state.range } },
-  }),
-}));
-vi.mock("@/lib/usageContextPreferences", () => ({ patchUsageBoardPreferences: vi.fn() }));
-vi.mock("./UsageCostChart", () => ({
-  UsageAnalysisChart: ({
-    rows,
-    previousUnavailable,
-  }: {
-    rows: AnalysisRow[];
-    previousUnavailable: boolean;
-  }) => (
-    <div data-testid="selected-chart">
-      {rows.map((entry) => entry.model).join(",")}
-      {previousUnavailable ? "previous unavailable" : ""}
-    </div>
-  ),
-}));
+    });
+  });
+});
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
+
+function CurrentUrl() {
+  const { pathname, search } = useLocation();
+  return (
+    <output data-testid="location">
+      {pathname}
+      {search}
+    </output>
+  );
+}
+
+function mount(query = "") {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={[`/usage/board/analysis${query}`]}>
+        <UsageCostPage />
+        <CurrentUrl />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
 function row(overrides: Partial<AnalysisRow> = {}): AnalysisRow {
   return {
     account_id: "a",
@@ -93,35 +81,6 @@ function row(overrides: Partial<AnalysisRow> = {}): AnalysisRow {
     ...overrides,
   };
 }
-function mount() {
-  state.rows = [
-    row(),
-    row({
-      account_id: "b",
-      parent_account_id: "b",
-      model: "GPT",
-      tokens: 300,
-      requests: 30,
-      failed: 3,
-    }),
-  ];
-  return render(
-    <MemoryRouter initialEntries={["/usage/board/cost"]}>
-      <UsageCostPage />
-    </MemoryRouter>,
-  );
-}
-afterEach(() => {
-  cleanup();
-  state.range = "d7";
-  state.partial = false;
-  state.hidden = [];
-});
-it("empty and full selections mean all; toggling an all view starts one item", () => {
-  expect(toggleAnalysisPick(null, "a", ["a", "b"])).toEqual(["a"]);
-  expect(toggleAnalysisPick(["a"], "a", ["a", "b"])).toBeNull();
-  expect(toggleAnalysisPick(["a"], "b", ["a", "b"])).toBeNull();
-});
 it("uses request-weighted failures and preserves valid zero tokens", () => {
   expect(analysisTotals([row({ tokens: 0 })]).tokens).toBe(0);
   expect(analysisTotals([row(), row({ requests: 30, failed: 3 })]).failure).toBe(7.5);
@@ -139,89 +98,6 @@ it("ignores money-channel tokens and never assigns historical parent rows to a p
   expect(analysisKey(row({ pool_id: "p", attributed: false }), "pool")).toBeNull();
   expect(analysisKey(row({ pool_id: "p", attributed: true }), "pool")).toBe(poolKey("a", "p"));
 });
-it("selects the same account for KPI table shares failures and chart", () => {
-  mount();
-  fireEvent.click(
-    within(screen.getByRole("group", { name: "Select items" })).getByRole("button", {
-      name: "Alpha",
-    }),
-  );
-  expect(screen.getByTestId("selected-chart").textContent).toBe("Claudeprevious unavailable");
-  expect(screen.getByRole("table")).toHaveTextContent("Alpha");
-  expect(screen.getByRole("table")).not.toHaveTextContent("Beta");
-  expect(screen.getByRole("button", { name: "Claude token share 100.00%" })).toBeVisible();
-  expect(screen.queryByRole("button", { name: /Beta failure rate/ })).toBeNull();
-});
-it("changes grouping without reusing a different dimension's picks", () => {
-  mount();
-  fireEvent.click(screen.getByRole("button", { name: "Alpha" }));
-  fireEvent.click(screen.getByRole("button", { name: "Model" }));
-  expect(screen.getByRole("button", { name: "All" })).toHaveAttribute("aria-pressed", "true");
-  fireEvent.click(screen.getByRole("button", { name: "GPT" }));
-  expect(screen.getByTestId("selected-chart")).toHaveTextContent("GPTprevious unavailable");
-  expect(screen.queryByRole("button", { name: /Claude token share/ })).toBeNull();
-});
-it("keeps an unavailable model selection empty until the user actively chooses All", () => {
-  const result = mount();
-  fireEvent.click(screen.getByRole("button", { name: "Model" }));
-  fireEvent.click(screen.getByRole("button", { name: "GPT" }));
-  expect(state.readKeys).toEqual(["GPT"]);
-  state.rows = [row()];
-  state.range = "d30";
-  result.rerender(
-    <MemoryRouter initialEntries={["/usage/board/cost"]}>
-      <UsageCostPage />
-    </MemoryRouter>,
-  );
-  expect(state.readKeys).toEqual([]);
-  expect(screen.getByRole("button", { name: "All" })).toHaveAttribute("aria-pressed", "false");
-  expect(screen.getByRole("status")).toHaveTextContent("Selected items are unavailable");
-  expect(screen.getByTestId("selected-chart")).not.toHaveTextContent("Claude");
-  fireEvent.click(screen.getByRole("button", { name: "All" }));
-  expect(state.readKeys).toEqual(["Claude"]);
-  expect(screen.getByTestId("selected-chart")).toHaveTextContent("Claude");
-});
-it("keeps a quota-only pool unknown instead of falling back to parent data", () => {
-  mount();
-  fireEvent.click(screen.getByRole("button", { name: "Pool" }));
-  fireEvent.click(screen.getByRole("button", { name: "Quota only" }));
-  expect(screen.getByTestId("selected-chart").textContent).toBe("previous unavailable");
-  expect(screen.getByRole("table")).toHaveTextContent("Unknown");
-  expect(screen.queryByRole("button", { name: /token share/ })).toBeNull();
-});
-it("sorts token rows both ways and puts unknowns last", () => {
-  mount();
-  fireEvent.click(screen.getByRole("button", { name: "Token" }));
-  let rows = within(screen.getByRole("table")).getAllByRole("row");
-  expect(rows[1]).toHaveTextContent("Beta");
-  fireEvent.click(screen.getByRole("button", { name: "Token ↓" }));
-  rows = within(screen.getByRole("table")).getAllByRole("row");
-  expect(rows[1]).toHaveTextContent("Alpha");
-});
-it("suppresses every prior-period comparison at 90 days", () => {
-  state.range = "d90";
-  mount();
-  expect(screen.getAllByText("90 days has no previous period")).toHaveLength(2);
-  expect(screen.getByTestId("selected-chart")).not.toHaveTextContent("previous");
-});
-it("does not include hidden accounts in any panel", () => {
-  state.hidden = ["b"];
-  mount();
-  expect(screen.queryByRole("button", { name: "Beta" })).toBeNull();
-  expect(screen.getByTestId("selected-chart")).not.toHaveTextContent("GPT");
-});
-it("labels incomplete data and never publishes a complete share population", () => {
-  state.partial = true;
-  mount();
-  expect(screen.getByText("Partial source coverage")).toBeVisible();
-  expect(screen.queryByRole("button", { name: /token share/ })).toBeNull();
-});
-it("keeps price evidence unavailable rather than presenting reported cost as API value", () => {
-  mount();
-  expect(screen.getAllByText("Not available yet · price evidence")[0]).toBeVisible();
-  expect(screen.getByRole("table")).not.toHaveTextContent("$2.00");
-});
-
 it("combines versioned model identities into the target families and keeps other models together", () => {
   render(
     <UsageAnalysisShares
@@ -235,4 +111,208 @@ it("combines versioned model identities into the target families and keeps other
   );
   expect(screen.getByRole("button", { name: "Claude token share 75.00%" })).toBeVisible();
   expect(screen.getByRole("button", { name: "Other token share 25.00%" })).toBeVisible();
+});
+
+it("round-trips repeated values and defaults over ranges, groupings, Unicode and blank tags", () => {
+  const now = new Date(2026, 10, 19, 12);
+  const shell = new URLSearchParams("theme=dark&pool=https%3A%2F%2Fapp.example.test%2Fp%3Fa%3D1");
+  const read = (query: URLSearchParams) => filterFromQuery(query, now);
+  for (const range of ["today", "d7", "d30", "d90", "custom"] as const) {
+    for (const group of ["account", "model", "host", "agent"] as const) {
+      for (const value of ["", "text with spaces", "comma,separated", "模型 + 🦊", "\uE000"]) {
+        const filter = {
+          range,
+          group,
+          account: ["a", "b"],
+          model: [value],
+          host: [value],
+          agent: ["", "codex"],
+          day: range === "custom" ? null : "2026-11-12",
+          slot: "2-14",
+          from: range === "custom" ? "2026-11-10" : null,
+          to: range === "custom" ? "2026-11-12" : null,
+        };
+        const canonical = toQuery(filter, shell);
+        expect(read(canonical)).toEqual(filter);
+        expect(toQuery(read(canonical), canonical).toString()).toBe(canonical.toString());
+      }
+    }
+  }
+  const raw = new URLSearchParams(
+    "host=z&host=a&host=z&range=d30&theme=dark&group=account&agent=&agent=BAD&slot=2-24&day=2026-02-30&tz=UTC&from=2026-01-01",
+  );
+  expect(toQuery(read(raw), raw).toString()).toBe("host=a&host=z&agent=&theme=dark");
+  expect(
+    toQuery(read(new URLSearchParams("model=%EE%80%80&model=%F0%9F%A6%8A"))).getAll("model"),
+  ).toEqual(["\uE000", "🦊"]);
+});
+
+it.each([
+  ["model", "Sonnet", "GPT"],
+  ["host", "East", "West"],
+  ["agent", "claude", "codex"],
+])(
+  "keeps the %s group's other rows and removes a filter on the second click",
+  async (group, selected, other) => {
+    mount(`?group=${group}&theme=dark&pool=example`);
+    const table = async () => within(await screen.findByRole("table", { name: "Each item" }));
+    fireEvent.click((await table()).getByRole("button", { name: selected }));
+    await waitFor(async () =>
+      expect((await table()).getByRole("button", { name: selected })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      ),
+    );
+    expect((await table()).getByRole("button", { name: other })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+    expect(
+      new URLSearchParams(screen.getByTestId("location").textContent!.split("?")[1]).has(group),
+    ).toBe(true);
+    fireEvent.click((await table()).getByRole("button", { name: selected }));
+    await waitFor(async () =>
+      expect((await table()).getByRole("button", { name: selected })).toHaveAttribute(
+        "aria-pressed",
+        "false",
+      ),
+    );
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      `?group=${group}&theme=dark&pool=example`,
+    );
+  },
+);
+
+it("keeps a focused source row mounted while its filter loads and lets it undo the read", async () => {
+  const respond = fetchMock.getMockImplementation()!;
+  let pending: AbortSignal | null | undefined;
+  fetchMock.mockImplementation((path: string, init?: RequestInit) => {
+    if (
+      path.includes("/analysis?") &&
+      new URL(path, "https://app.example.test").searchParams.has("model")
+    ) {
+      pending = init?.signal;
+      return new Promise(() => {});
+    }
+    return respond(path, init);
+  });
+  mount("?group=model");
+  const results = await screen.findByTestId("analysis-results");
+  const button = within(results).getByRole("button", { name: "Sonnet" });
+  button.focus();
+  fireEvent.click(button);
+
+  await waitFor(() => expect(pending?.aborted).toBe(false));
+  expect(screen.getByTestId("analysis-results")).toBe(results);
+  expect(results).toHaveAttribute("aria-busy", "true");
+  const totals = within(results).getByRole("region", { name: "Totals" });
+  expect(within(totals).getByText("$8.00", { exact: true })).toBeVisible();
+  expect(within(results).getByRole("button", { name: "Sonnet" })).toBe(button);
+  expect(button).toHaveFocus();
+  expect(button).toHaveAttribute("aria-pressed", "true");
+
+  fireEvent.click(button);
+  await waitFor(() => expect(pending?.aborted).toBe(true));
+  expect(results).toHaveAttribute("aria-busy", "false");
+  expect(button).toHaveFocus();
+  expect(button).toHaveAttribute("aria-pressed", "false");
+  expect(screen.getByTestId("location")).toHaveTextContent("/usage/board/analysis?group=model");
+});
+
+it("restores the originating custom range when a day chip is removed after reload", async () => {
+  const localDate = (daysAgo: number) => {
+    const date = new Date();
+    date.setDate(date.getDate() - daysAgo);
+    return toDateInput(date.getTime());
+  };
+  const from = localDate(12);
+  const to = localDate(2);
+  const day = localDate(5);
+  const base = "/usage/board/analysis";
+  const original = `?range=custom&from=${from}&to=${to}&theme=dark`;
+  const drilled = `?range=custom&day=${day}&from=${from}&to=${to}&theme=dark`;
+  const apiReads = () =>
+    fetchMock.mock.calls.flatMap(([path]) =>
+      path.includes("/analysis?") ? [new URL(path, "https://app.example.test").searchParams] : [],
+    );
+  const view = mount(original);
+  await screen.findByTestId("analysis-results");
+  fireEvent.change(screen.getByLabelText("Date"), { target: { value: day } });
+
+  await waitFor(() => expect(apiReads().at(-1)?.get("day")).toBe(day));
+  expect(apiReads().at(-1)?.get("range")).toBe("custom");
+  expect(apiReads().at(-1)?.has("from")).toBe(false);
+  expect(apiReads().at(-1)?.has("to")).toBe(false);
+  expect(screen.getByTestId("location")).toHaveTextContent(`${base}${drilled}`);
+
+  view.unmount();
+  mount(drilled);
+  await screen.findByTestId("analysis-results");
+  fireEvent.click(screen.getByRole("button", { name: `Remove Date: ${day}` }));
+  expect(screen.getByTestId("location")).toHaveTextContent(`${base}${original}`);
+  await waitFor(() => expect(apiReads().at(-1)?.get("from")).toBe(from));
+  expect(apiReads().at(-1)?.get("to")).toBe(to);
+  expect(apiReads().at(-1)?.has("day")).toBe(false);
+  expect(await screen.findByTestId("analysis-results")).toBeVisible();
+});
+
+it.each(["host=east", "agent=claude", "model=Sonnet", "slot=2-14"])(
+  "keeps allocated payment unknown for %s",
+  async (query) => {
+    mount(`?${query}`);
+    const totals = await screen.findByRole("region", { name: "Totals" });
+    expect(within(totals).getAllByText("未知")).toHaveLength(2);
+    expect(within(totals).getAllByText("实付不分 Host / Agent / 模型 / 时段")).toHaveLength(2);
+  },
+);
+
+it.each([false, true])(
+  "refuses numbers on a missing or changed filter echo (%s)",
+  async (changed) => {
+    fetchMock.mockImplementation(async (path: string) => {
+      if (!path.includes("/analysis?")) return Response.json({ accounts: [] });
+      const params = new URL(path, "https://app.example.test").searchParams;
+      const data = usageAnalysisV2Fixture(params);
+      return Response.json(
+        params.has("host")
+          ? {
+              ...data,
+              filter: changed ? { ...data.filter, host: ["west"] } : undefined,
+            }
+          : data,
+      );
+    });
+    mount(changed ? "?group=host" : "?host=east");
+    if (changed) {
+      const table = await screen.findByRole("table", { name: "Each item" });
+      fireEvent.click(within(table).getByRole("button", { name: "east" }));
+    }
+    expect(await screen.findByRole("alert")).toHaveTextContent("服务器版本不支持这个筛选");
+    expect(screen.queryByRole("region", { name: "Totals" })).toBeNull();
+    expect(screen.queryByRole("table", { name: "Each item" })).toBeNull();
+  },
+);
+
+it("keeps a well-formed unknown chip and clears selection without changing the shell", async () => {
+  mount("?host=retired&range=d30&group=none&theme=light");
+  await screen.findByTestId("analysis-results");
+  expect(screen.getByTestId("location")).toHaveTextContent("?host=retired&theme=light");
+  expect(screen.getByRole("button", { name: "Remove Host: retired" })).toHaveTextContent("· 0");
+  fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+  expect(screen.getByTestId("location")).toHaveTextContent("/usage/board/analysis?theme=light");
+});
+
+it("aborts the analysis read when the view leaves", async () => {
+  let signal: AbortSignal | undefined;
+  fetchMock.mockImplementation((path: string, init: RequestInit) => {
+    if (path.includes("/analysis?")) {
+      signal = init.signal ?? undefined;
+      return new Promise(() => {});
+    }
+    return Promise.resolve(Response.json({ accounts: [] }));
+  });
+  const view = mount();
+  await waitFor(() => expect(signal?.aborted).toBe(false));
+  view.unmount();
+  expect(signal?.aborted).toBe(true);
 });

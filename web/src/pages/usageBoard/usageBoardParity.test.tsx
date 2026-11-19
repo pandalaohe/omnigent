@@ -100,7 +100,7 @@ it("keeps navigation and the tools outside the matched tile composition", () => 
   expect(screen.getByRole("navigation", { name: "Usage pages" })).toBeTruthy();
   expect(screen.getByRole("link", { name: "Usage" }).getAttribute("aria-current")).toBe("page");
   expect(screen.getByRole("link", { name: "Analysis" }).getAttribute("href")).toBe(
-    "/usage/board/cost",
+    "/usage/board/analysis",
   );
   expect(screen.getByRole("link", { name }).getAttribute("title")).toBe(name);
 });

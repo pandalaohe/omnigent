@@ -5,12 +5,13 @@ import { boardPath, boardExitProps } from "@/lib/boardFrame";
 
 import { SettingsIcon } from "lucide-react";
 import type { ReactNode } from "react";
-import { useLocation, Link } from "@/lib/routing";
+import { useLocation, Link, useSearchParams } from "@/lib/routing";
 
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { t } from "./usageText";
 import { formatAge } from "./usageBoardFormat";
+import { analysisLink, analysisPath } from "./usageAnalysisFilters";
 import "./usageBoard.css";
 
 interface UsageBoardFrameProps {
@@ -37,7 +38,12 @@ export function UsageBoardFrame({
   children,
 }: UsageBoardFrameProps) {
   const location = useLocation();
-  const analysis = location.pathname.endsWith("/cost");
+  const [search] = useSearchParams();
+  const analysis = location.pathname.endsWith(analysisPath) || location.pathname.endsWith("/cost");
+  const shell = new URLSearchParams();
+  for (const key of ["theme", "pool"])
+    for (const value of search.getAll(key)) shell.append(key, value);
+  const overview = boardPath(`/usage/board${shell.size ? `?${shell}` : ""}`);
   return (
     <div className="min-h-0 min-w-0 flex-1 overflow-y-auto">
       <div className="usage-surface @container">
@@ -50,10 +56,13 @@ export function UsageBoardFrame({
             )}
           </h1>
           <nav className="usage-tabs" aria-label="Usage pages">
-            <Link to={boardPath("/usage/board")} aria-current={!analysis ? "page" : undefined}>
+            <Link to={overview} aria-current={!analysis ? "page" : undefined}>
               {t("usageTab")}
             </Link>
-            <Link to={boardPath("/usage/board/cost")} aria-current={analysis ? "page" : undefined}>
+            <Link
+              to={analysis ? { search: location.search } : analysisLink(search)}
+              aria-current={analysis ? "page" : undefined}
+            >
               {t("analysisTab")}
             </Link>
           </nav>

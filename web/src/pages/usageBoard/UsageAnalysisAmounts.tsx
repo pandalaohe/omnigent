@@ -1,16 +1,21 @@
 import {
+  type AnalysisAmounts,
+  type AnalysisCounts,
+  type UsageAnalysisV2,
   type AnalysisRow,
   type AnalysisProjection,
   analysisTotals,
   analysisValueText,
 } from "./usageAnalysisData";
-import { AnalysisPanel, AnalysisUnknown } from "./UsageAnalysisPanel";
+import { AnalysisPanel, AnalysisSection, AnalysisUnknown } from "./UsageAnalysisPanel";
 import { UsageTip } from "./UsageTip";
 import { AnalysisTrend, compareAnalysisDecimals } from "./UsageAnalysisDetails";
 import { UsageName } from "./UsageName";
 import { moneyText } from "./UsageAccountMoney";
-import { formatRingPercent } from "./usageBoardFormat";
-import type { CSSProperties } from "react";
+import { formatOverviewTokens, formatRingPercent } from "./usageBoardFormat";
+import { useState, type CSSProperties } from "react";
+import type { FilterDimension, PageFilter } from "./usageAnalysisFilters";
+import { analysisSections } from "./UsageAnalysisRail";
 
 interface Item {
   key: string;
@@ -284,5 +289,259 @@ export function UsageAnalysisFailures({
         <AnalysisUnknown reason="No complete request and failure counts" />
       )}
     </AnalysisPanel>
+  );
+}
+
+export const paymentRestriction = "实付不分 Host / Agent / 模型 / 时段";
+export const paymentRestricted = (filter: PageFilter) =>
+  !!(filter.host.length || filter.agent.length || filter.model.length || filter.slot);
+export const v2Tokens = (tokens: number | null | undefined) =>
+  tokens == null ? "Unknown" : formatOverviewTokens(tokens);
+export const v2Requests = (requests: number | null | undefined) =>
+  requests == null ? "Unknown" : requests.toLocaleString();
+export const v2Failure = (counts: Partial<AnalysisCounts>) =>
+  counts.requests && counts.failed != null ? (100 * counts.failed) / counts.requests : null;
+type V2Row = UsageAnalysisV2["groups"][number];
+
+function amountSort(value: AnalysisAmounts["paid"] | undefined) {
+  return value?.low ?? null;
+}
+
+export function AnalysisV2Items({
+  data,
+  filter,
+  label,
+  toggle,
+}: {
+  data: UsageAnalysisV2;
+  filter: PageFilter;
+  label: (dimension: FilterDimension, value: string) => string;
+  toggle: (dimension: FilterDimension, value: string) => void;
+}) {
+  const [sort, setSort] = useState<{ key: number; direction: 1 | -1 }>({ key: 0, direction: -1 });
+  const restricted = paymentRestricted(filter) || filter.group !== "account";
+  const metrics = [
+    {
+      title: "At API price",
+      display: (row: V2Row) => analysisValueText(row.api_value),
+      value: (row: V2Row) => amountSort(row.api_value),
+    },
+    {
+      title: "Paid",
+      display: (row: V2Row) => (restricted ? "未知" : analysisValueText(row.paid)),
+      value: (row: V2Row) => (restricted ? null : amountSort(row.paid)),
+    },
+    {
+      title: "Token",
+      display: (row: V2Row) => v2Tokens(row.tokens),
+      value: (row: V2Row) => row.tokens ?? null,
+    },
+    {
+      title: "Requests",
+      display: (row: V2Row) => v2Requests(row.requests),
+      value: (row: V2Row) => row.requests ?? null,
+    },
+    {
+      title: "Payback",
+      display: (row: V2Row) => (restricted ? "未知" : analysisValueText(row.payback, "ratio")),
+      value: (row: V2Row) => (restricted ? null : amountSort(row.payback)),
+    },
+    { title: "Failure rate", display: (row: V2Row) => percent(v2Failure(row)), value: v2Failure },
+  ];
+  const ordered = [...data.groups].sort((a, b) => {
+    if (a.remainder !== b.remainder && (a.remainder || b.remainder)) return a.remainder ? 1 : -1;
+    const left = metrics[sort.key].value(a);
+    const right = metrics[sort.key].value(b);
+    if (left === null) return right === null ? 0 : 1;
+    if (right === null) return -1;
+    return (
+      sort.direction *
+      (typeof left === "string" && typeof right === "string"
+        ? compareAnalysisDecimals(left, right)
+        : Number(left) - Number(right))
+    );
+  });
+  const active = filter[filter.group];
+  return (
+    <AnalysisSection id="items" title={analysisSections.items}>
+      {restricted ? <p className="usage-caption">{paymentRestriction}</p> : null}
+      {ordered.length ? (
+        <div className="ua-v2-table-scroll">
+          <table className="ua-v2-table" aria-label={analysisSections.items}>
+            <thead>
+              <tr>
+                <th scope="col">Item</th>
+                <th scope="col">Trend</th>
+                {metrics.map(({ title }, index) => (
+                  <th
+                    scope="col"
+                    key={title}
+                    aria-sort={
+                      sort.key === index
+                        ? sort.direction === 1
+                          ? "ascending"
+                          : "descending"
+                        : undefined
+                    }
+                  >
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSort({
+                          key: index,
+                          direction: sort.key === index && sort.direction === -1 ? 1 : -1,
+                        })
+                      }
+                    >
+                      {title}
+                    </button>
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {ordered.map((row) => {
+                const key = typeof row.key === "string" ? row.key : null;
+                const selected = key !== null && active.includes(key);
+                const name = key === null ? "Other items" : label(filter.group, key);
+                return (
+                  <tr
+                    key={key === null ? "remainder" : `item:${key}`}
+                    data-selected={selected || undefined}
+                    data-dimmed={(active.length > 0 && !selected) || undefined}
+                  >
+                    <th scope="row">
+                      {key === null ? (
+                        name
+                      ) : (
+                        <button
+                          type="button"
+                          aria-pressed={selected}
+                          disabled={active.length >= 64 && !selected}
+                          onClick={() => toggle(filter.group, key)}
+                        >
+                          <UsageName>{name}</UsageName>
+                        </button>
+                      )}
+                    </th>
+                    <td>
+                      <V2Trend trend={row.trend} />
+                    </td>
+                    {metrics.map(({ title, display }) => (
+                      <td key={title}>{display(row)}</td>
+                    ))}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p className="usage-caption">No items in this range.</p>
+      )}
+    </AnalysisSection>
+  );
+}
+
+function V2Trend({ trend }: { trend: V2Row["trend"] }) {
+  if (!trend?.length || trend.some((point) => point.tokens === null)) return <span>—</span>;
+  const values = trend.map((point) => point.tokens ?? 0);
+  const max = Math.max(1, ...values);
+  return (
+    <svg className="ua-spark" viewBox="0 0 75 20" role="img" aria-label="Token trend">
+      <path
+        d={values
+          .flatMap((value, index) => {
+            const y = 19 - (value / max) * 17;
+            return values.length === 1
+              ? [`M0,${y} L75,${y}`]
+              : [`${index ? "L" : "M"}${(index * 75) / (values.length - 1)},${y}`];
+          })
+          .join(" ")}
+      />
+    </svg>
+  );
+}
+
+export const exactCost = (value: AnalysisAmounts["api_value"] | undefined) =>
+  value?.state === "exact" && value.low !== null ? Number(value.low) : null;
+export const v2Share = (value: number | null, total: number | null) =>
+  value !== null && total !== null && total > 0 ? (value / total) * 100 : null;
+
+export function AnalysisV2Shares({ data, filter }: { data: UsageAnalysisV2; filter: PageFilter }) {
+  const families = new Map<string, { tokens: number | null; cost: number | null }>();
+  for (const row of data.facets.model) {
+    if (filter.model.length && (typeof row.key !== "string" || !filter.model.includes(row.key)))
+      continue;
+    const name = typeof row.key === "string" ? shareFamily(row.key) : "Unlisted models";
+    const previous = families.get(name) ?? { tokens: 0, cost: 0 };
+    const cost =
+      row.api_value?.currency === data.totals.api_value.currency ? exactCost(row.api_value) : null;
+    families.set(name, {
+      tokens: previous.tokens === null || row.tokens == null ? null : previous.tokens + row.tokens,
+      cost: previous.cost === null || cost === null ? null : previous.cost + cost,
+    });
+  }
+  const shares = [...families].map(([name, amounts], index) => ({
+    name,
+    color: colors[index % colors.length],
+    tokens: data.complete ? v2Share(amounts.tokens, data.totals.tokens) : null,
+    cost: data.complete ? v2Share(amounts.cost, exactCost(data.totals.api_value)) : null,
+  }));
+  return (
+    <AnalysisSection id="shares" title={analysisSections.shares} folded>
+      {shares.length ? (
+        <>
+          {(
+            [
+              { key: "tokens", title: "Token" },
+              { key: "cost", title: "Cost · at API price" },
+            ] as const
+          ).map(({ key, title }) => (
+            <div className="ua-share-row" key={key}>
+              <span>{title}</span>
+              {shares.every((item) => item[key] !== null) ? (
+                <div className="ua-stack">
+                  {shares.map((item) =>
+                    item[key] ? (
+                      <span key={item.name} style={{ width: `${item[key]}%` }}>
+                        <UsageTip
+                          model={{
+                            title: item.name,
+                            rows: [{ label: title, value: percent(item[key]) }],
+                          }}
+                          tapOpens
+                        >
+                          <button
+                            type="button"
+                            aria-label={`${item.name} ${title} share ${percent(item[key])}`}
+                            style={{ width: "100%", background: item.color }}
+                          />
+                        </UsageTip>
+                      </span>
+                    ) : null,
+                  )}
+                </div>
+              ) : (
+                <small>Unknown for part of this range</small>
+              )}
+            </div>
+          ))}
+          <div className="ua-share-legend">
+            {shares.map((item) => (
+              <span key={item.name}>
+                <i style={{ background: item.color }} />
+                <UsageName className="flex-1">{item.name}</UsageName>
+                <b>
+                  {percent(item.tokens)} / {percent(item.cost)}
+                </b>
+              </span>
+            ))}
+          </div>
+        </>
+      ) : (
+        <AnalysisUnknown reason="No matching models" />
+      )}
+    </AnalysisSection>
   );
 }

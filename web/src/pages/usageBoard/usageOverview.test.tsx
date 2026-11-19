@@ -110,12 +110,47 @@ it("counts only metered money but includes subscription tokens in All", async ()
 it("labels the 30-day Analysis link before leaving This period", async () => {
   mountOverview("?account=codex&range=period");
   const link = await screen.findByRole("link", { name: "View in Analysis · Last 30 days" });
-  expect(link).toHaveAttribute("href", "/usage/board/cost?range=d30&account=codex");
+  expect(link).toHaveAttribute("href", "/usage/board/analysis?account=codex");
   fireEvent.click(screen.getByRole("button", { name: /Last 7 days/ }));
   expect(screen.getByRole("link", { name: "View in Analysis" })).toHaveAttribute(
     "href",
-    "/usage/board/cost?range=d7&account=codex",
+    "/usage/board/analysis?range=d7&account=codex",
   );
+});
+
+it("carries a calendar-aligned period, host and shell parameters into Analysis", async () => {
+  const baseline = fetchMock.getMockImplementation()!;
+  vi.spyOn(Date, "now").mockReturnValue(now * 1000);
+  try {
+    fetchMock.mockImplementation(async (path: string) => {
+      const url = new URL(path, "https://example.test");
+      if (url.pathname.endsWith("/activity") && url.searchParams.get("range") === "period") {
+        const fixture = usageActivityFixture(
+          new URLSearchParams({
+            range: "custom",
+            account: "codex",
+            from: "2026-11-12",
+            to: "2026-11-17",
+          }),
+          now,
+        );
+        return Response.json({ ...fixture, range: "period" });
+      }
+      return baseline(path);
+    });
+    mountOverview("?account=codex&range=period&theme=light");
+    const host = within(await screen.findByRole("region", { name: "Hosts" }));
+    expect(await host.findByRole("link", { name: /^workstation/ })).toHaveAttribute(
+      "href",
+      "/usage/board/analysis?range=custom&account=codex&host=h1&from=2026-11-12&to=2026-11-17&theme=light",
+    );
+    expect(screen.getByRole("link", { name: "View in Analysis" })).toHaveAttribute(
+      "href",
+      "/usage/board/analysis?range=custom&account=codex&from=2026-11-12&to=2026-11-17&theme=light",
+    );
+  } finally {
+    vi.restoreAllMocks();
+  }
 });
 
 it.each(["today", "h24", "d7", "d30", "d90", "period", "custom"])(

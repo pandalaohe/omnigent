@@ -1,4 +1,6 @@
-import { useQuery } from "@tanstack/react-query";
+import { useSyncExternalStore } from "react";
+import { analysisDimensions, toQuery, type PageFilter } from "./usageAnalysisFilters";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { usageJson } from "./usagePriceSourceData";
 import { usageRangeQuery, type UsageRange } from "./UsageRangeControl";
 import { USAGE_BOARD_POLL_MS } from "./usageBoardData";
@@ -134,6 +136,7 @@ export function useUsageAnalysis(
     hidden: string[];
     enabled: boolean;
   },
+  live = true,
 ) {
   const params = usageRangeQuery(range);
   if (selection) {
@@ -143,12 +146,86 @@ export function useUsageAnalysis(
   }
   return useQuery({
     queryKey: ["usageBoard", "analysis", params.toString()],
-    queryFn: () => usageJson<UsageAnalysis>(`analysis?${params}`),
+    queryFn: ({ signal }) => usageJson<UsageAnalysis>(`analysis?${params}`, { signal }),
     enabled: selection?.enabled ?? true,
     retry: false,
-    refetchInterval: () => (document.visibilityState === "visible" ? USAGE_BOARD_POLL_MS : false),
+    refetchInterval: live
+      ? () => (document.visibilityState === "visible" ? USAGE_BOARD_POLL_MS : false)
+      : false,
+    refetchOnWindowFocus: live,
+    refetchOnReconnect: live,
+    staleTime: live ? 0 : 300_000,
   });
 }
+export const ANALYSIS_POLL_MS = 300_000;
+
+export class AnalysisFilterMismatch extends Error {
+  constructor() {
+    super("服务器版本不支持这个筛选");
+  }
+}
+
+function sameFilter(actual: unknown, expected: AnalysisFilter) {
+  if (typeof actual !== "object" || actual === null) return false;
+  const echo = actual as Partial<AnalysisFilter>;
+  return (
+    (["group", "range", "tz", "day", "slot", "from", "to"] as const).every(
+      (key) => echo[key] === expected[key],
+    ) &&
+    analysisDimensions.every(
+      (key) =>
+        Array.isArray(echo[key]) &&
+        echo[key].length === expected[key].length &&
+        echo[key].every((value, index) => value === expected[key][index]),
+    )
+  );
+}
+
+const visible = () => document.visibilityState === "visible";
+function subscribeVisibility(change: () => void) {
+  document.addEventListener("visibilitychange", change);
+  return () => document.removeEventListener("visibilitychange", change);
+}
+
+export function useAnalysisVisible() {
+  return useSyncExternalStore(subscribeVisibility, visible, () => true);
+}
+
+export function useUsageAnalysisV2(
+  filter: PageFilter,
+  { previous = true, poll = true, enabled = true, keepResults = false } = {},
+) {
+  const isVisible = useAnalysisVisible();
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const params = toQuery(filter, undefined, true);
+  params.set("tz", tz);
+  if (previous) params.append("include", "previous");
+  return useQuery({
+    queryKey: ["usageBoard", "analysisV2", params.toString()],
+    queryFn: async ({ signal }) => {
+      const data = await usageJson<UsageAnalysisV2>(`analysis?${params}`, { signal });
+      const expected = {
+        ...filter,
+        tz,
+        from: params.get("from"),
+        to: params.get("to"),
+        ...Object.fromEntries(analysisDimensions.map((key) => [key, params.getAll(key)])),
+      };
+      if (!sameFilter(data?.filter, expected)) throw new AnalysisFilterMismatch();
+      return data;
+    },
+    enabled: isVisible && enabled,
+    placeholderData: keepResults ? keepPreviousData : undefined,
+    staleTime: ANALYSIS_POLL_MS,
+    gcTime: 2 * ANALYSIS_POLL_MS,
+    retry: false,
+    refetchInterval: poll ? ANALYSIS_POLL_MS : false,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  });
+}
+
 export const poolKey = (parent: string, pool: string) => JSON.stringify([parent, pool]);
 export function analysisKey(row: AnalysisRow, dimension: AnalysisDimension) {
   return dimension === "account"

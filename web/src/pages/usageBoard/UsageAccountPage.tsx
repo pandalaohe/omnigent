@@ -44,6 +44,7 @@ import { useUsageAccountActivity } from "./usageActivityData";
 
 import { UsageBalances } from "./UsageBalances";
 import { UsageName } from "./UsageName";
+import { analysisLink, filterFromQuery } from "./usageAnalysisFilters";
 
 export function UsageAccountPage() {
   const { accountId = "" } = useParams();
@@ -76,6 +77,13 @@ export function UsageAccountPage() {
 
   const stale = account ? isStale(account) : false;
   const renewal = account ? renewalOf(account, board.renewals[account.id]) : null;
+  const drill = filterFromQuery(
+    new URLSearchParams({
+      range: board.range?.key ?? "d7",
+      ...(board.range?.from ? { from: board.range.from } : {}),
+      ...(board.range?.to ? { to: board.range.to } : {}),
+    }),
+  );
 
   return (
     <UsageBoardFrame
@@ -133,7 +141,7 @@ export function UsageAccountPage() {
             ) : null}
           </div>
 
-          <div className="usage-account-detail">
+          <div className="usage-account-detail min-w-0">
             <div className="usage-detail-grid">
               <UsageAccountQuota account={account} focus={focus} />
 
@@ -172,8 +180,8 @@ export function UsageAccountPage() {
               <summary>Records</summary>
               <p className="usage-caption">Not available yet</p>
             </details>
-            <div className="mt-2">
-              <details className="usage-card usage-fold">
+            <div className="mt-2 min-w-0">
+              <details className="usage-card usage-fold min-w-0">
                 <summary>Hosts</summary>
                 {account.hosts.length === 0 ? (
                   <p className="usage-caption">
@@ -181,13 +189,27 @@ export function UsageAccountPage() {
                     it.
                   </p>
                 ) : (
-                  <ul className="flex flex-col">
+                  <ul className="flex min-w-0 flex-col">
                     {account.hosts.map((host) => (
                       <li
                         key={host.host_id || host.name}
-                        className="flex min-h-9 items-center justify-between gap-2 border-t border-border/60 py-1.5 first:border-t-0 text-xs"
+                        className="flex min-h-9 min-w-0 items-center justify-between gap-2 border-t border-border/60 py-1.5 first:border-t-0 text-xs"
                       >
-                        <UsageName className="font-medium">{host.name}</UsageName>
+                        {!focus && drill.range === (board.range?.key ?? "d7") ? (
+                          <Link
+                            className="min-w-0 underline underline-offset-2"
+                            title={host.name}
+                            to={analysisLink(search, {
+                              ...drill,
+                              account: [account.id],
+                              host: [host.host_id],
+                            })}
+                          >
+                            <UsageName className="font-medium">{host.name}</UsageName>
+                          </Link>
+                        ) : (
+                          <UsageName className="font-medium">{host.name}</UsageName>
+                        )}
                         {(() => {
                           const own = activity.data?.accounts[0];
                           const part = own?.hosts?.find((item) => item.host_id === host.host_id);
