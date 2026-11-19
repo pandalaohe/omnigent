@@ -31,8 +31,7 @@ import {
 } from "@/lib/mobileAssistantPreferences";
 import type { ShortcutChord } from "@/lib/keyboardShortcutPreferences";
 import {
-  applyCmd,
-  CMD_KEY_MODE,
+  applyTerminalTextModifiers,
   isArmedModifier,
   chordForSequence,
   encodeChord,
@@ -1016,16 +1015,6 @@ export class TerminalSession {
     this.term.attachCustomKeyEventHandler((e) => {
       if (!this.imeInput.handleKeyEvent(e)) return false;
       if (this.imeInput.isComposing) return true;
-      if (e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "v") {
-        const command = applyCmd({ char: "v" }, CMD_KEY_MODE);
-        if ("clipboard" in command && this.onClipboardAction) {
-          if (e.type === "keydown") {
-            e.preventDefault();
-            if (!e.repeat) this.runClipboardAction(command.clipboard, { enter: false });
-          }
-          return false;
-        }
-      }
       const payload = terminalKeyEventPayload(e);
       if (payload === null) return true;
       // xterm invokes this handler for keydown, keypress, and keyup.
@@ -1294,10 +1283,13 @@ export class TerminalSession {
       isArmedModifier(this.stickyModifiers, "cmd") || isArmedModifier(this.stickyModifiers, "win");
     const isEscapeOrDelete = data.includes("\x1b") || data.includes("\x7f");
     if (isEscapeOrDelete && (!hasCommand || !chordForSequence(data))) return data;
+    const isAsciiCharacter = data.length === 1 && data.charCodeAt(0) < 128;
     const result =
-      isEscapeOrDelete || Array.from(data).length === 1
+      hasCommand && (isEscapeOrDelete || Array.from(data).length === 1)
         ? encodeTerminalData(data, this.stickyModifiers, this.term.modes.applicationCursorKeysMode)
-        : { bytes: data };
+        : {
+            bytes: isAsciiCharacter ? applyTerminalTextModifiers(data, this.stickyModifiers) : data,
+          };
     this.consumeStickyModifiers();
     if ("clipboard" in result) this.runClipboardAction(result.clipboard, { enter: false });
     return "bytes" in result ? result.bytes : "";
