@@ -5756,6 +5756,58 @@ async def test_async_card_does_not_launch_if_archived_during_launch_wait(
             await orchestration.cancel_detached_elicitation_tasks()
 
 
+async def test_async_card_stops_runner_if_session_closes_after_launch_enqueue(
+    client: httpx.AsyncClient, app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+
+    store = SqlAlchemyConversationStore(db_uri)
+    runners = _StagedRunners(store, confirm_answer=True)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm, harness="claude-native")
+    session_id = session["id"]
+    _, resolve_url = await _open_card_for_host_runner(client, session_id)
+    registry = app.state.host_registry
+    send_text = registry.send_text
+    retried = asyncio.Event()
+
+    def close_after_enqueue(conn: HostConnection, text: str) -> None:
+        send_text(conn, text)
+        frame = decode_host_frame(text)
+        if isinstance(frame, HostLaunchRunnerFrame):
+            store.set_labels(session_id, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+            # Make the new runner reachable so the test detects any attempted delivery.
+            runners.live.add(token_bound_runner_id(frame.binding_token))
+
+    async def pause_retry(_delay: float) -> None:
+        retried.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", runners.get_runner_client)
+    monkeypatch.setattr(registry, "send_text", close_after_enqueue)
+    monkeypatch.setattr(orchestration, "_delivery_retry_sleep", pause_retry)
+    async with (
+        runners.client,
+        _HostFrameResponder(comm, runner_status=lambda _: "unknown") as host,
+    ):
+        try:
+            resolved = await client.post(
+                resolve_url, json={"action": "accept", "content": {"Which database?": "SQLite"}}
+            )
+            assert resolved.status_code == 202, resolved.text
+            await asyncio.wait_for(retried.wait(), budget(5.0))
+            [launch] = host.launch_frames
+            assert token_bound_runner_id(launch.binding_token) in host.stopped_runner_ids
+            closed = store.get_conversation(session_id)
+            assert closed is not None and not closed.archived
+            assert closed.labels[CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
+            assert not any(body.get("type") == "message" for _, body in runners.posts)
+        finally:
+            await orchestration.cancel_detached_elicitation_tasks()
+
+
 async def _side_chat_with_exited_source_runner(
     client: httpx.AsyncClient,
     app: FastAPI,

@@ -541,6 +541,7 @@ from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_client_
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
+    is_session_closed,
     labels_with_closed_status,
     title_without_closed_marker,
 )
@@ -7911,6 +7912,14 @@ async def ensure_runner_connected(
                             runner_router,
                             host_registry,
                             getattr(app_state, "archive_close_coordinator", None),
+                        )
+                    elif not conv.archived and is_session_closed(conv.labels, conv.title):
+                        await _stop_host_runner_intentionally(
+                            session_id,
+                            host_conn.host_id,
+                            launch_attempt.runner_id,
+                            host_registry,
+                            conversation_store,
                         )
                     return None, conv
                 if launch_attempt.not_enqueued:
