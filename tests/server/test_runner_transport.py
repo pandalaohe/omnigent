@@ -59,3 +59,4 @@ def test_build_uds_runner_ws_factory_uses_unix_connect(
         "terminal_bash_s1/attach?read_only=false"
     )
     assert captured["kwargs"].get("open_timeout") == 10
+    assert captured["kwargs"]["logger"].name == "websockets.omnigent.runner_uds"

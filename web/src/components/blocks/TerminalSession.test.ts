@@ -767,10 +767,9 @@ describe("TerminalSession", () => {
     return { session, states, container, socket: FakeWebSocket.instances.at(-1)! };
   }
 
-  it("requests paste without Enter for armed, recorded, and remapped Cmd+V", () => {
-    vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
+  it("requests paste without Enter for armed and recorded Cmd+V", () => {
     const clipboard = vi.fn();
-    const { session, socket, container } = makeSession(
+    const { session, socket } = makeSession(
       undefined,
       undefined,
       true,
@@ -785,22 +784,8 @@ describe("TerminalSession", () => {
     session.setStickyModifiers({ ctrl: "off", alt: "off", shift: "off", cmd: "once" });
     term.input("v", true);
     session.sendBarChord({ code: "KeyV", modifiers: ["meta"] });
-    const dispatchPasteChord = (modifiers: KeyboardEventInit) => {
-      const event = new KeyboardEvent("keydown", {
-        key: "v",
-        code: "KeyV",
-        keyCode: 86,
-        bubbles: true,
-        cancelable: true,
-        ...modifiers,
-      });
-      container.querySelector("textarea")!.dispatchEvent(event);
-      return event;
-    };
-    expect(dispatchPasteChord({ altKey: true }).defaultPrevented).toBe(true);
-    expect(dispatchPasteChord({ metaKey: true }).defaultPrevented).toBe(false);
     expect(clipboard.mock.calls).toEqual(
-      Array.from({ length: 3 }, () => ["paste", { enter: false }]),
+      Array.from({ length: 2 }, () => ["paste", { enter: false }]),
     );
     expect(socket.sent).toEqual([]);
     session.dispose();
@@ -879,6 +864,85 @@ describe("TerminalSession", () => {
       outside.remove();
       localStorage.removeItem(MOBILE_ASSISTANT_STORAGE_KEY);
     }
+  });
+
+  it("uses the S5 clipboard callback for remapped Alt+C and Alt+V", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
+    const clipboard = vi.fn();
+    const { session, socket, container } = makeSession(
+      undefined,
+      undefined,
+      true,
+      undefined,
+      true,
+      false,
+      clipboard,
+    );
+    try {
+      socket.open();
+      socket.sent.length = 0;
+      vi.spyOn(session, "selectedText").mockReturnValue("selected text");
+      const textarea = container.querySelector("textarea")!;
+      for (const [key, code, keyCode] of [
+        ["c", "KeyC", 67],
+        ["v", "KeyV", 86],
+      ] as const) {
+        const event = new KeyboardEvent("keydown", {
+          key,
+          code,
+          keyCode,
+          altKey: true,
+          bubbles: true,
+          cancelable: true,
+        });
+        expect(textarea.dispatchEvent(event)).toBe(false);
+      }
+      expect(clipboard.mock.calls).toEqual([
+        ["copy", { enter: false }],
+        ["paste", { enter: false }],
+      ]);
+      expect(socket.sent).toEqual([]);
+    } finally {
+      session.dispose();
+      container.remove();
+    }
+  });
+
+  it("keeps physical Cmd+V native and forwards the paste event once without Enter", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    const clipboard = vi.fn();
+    const { session, socket, container } = makeSession(
+      undefined,
+      undefined,
+      true,
+      undefined,
+      true,
+      false,
+      clipboard,
+    );
+    socket.open();
+    socket.sent.length = 0;
+    const input = container.querySelector("textarea")!;
+    const key = new KeyboardEvent("keydown", {
+      key: "v",
+      code: "KeyV",
+      keyCode: 86,
+      metaKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    expect(input.dispatchEvent(key)).toBe(true);
+    expect(clipboard).not.toHaveBeenCalled();
+
+    const getData = vi.fn(() => "native\r\ntext");
+    const paste = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(paste, "clipboardData", { value: { getData } });
+    input.dispatchEvent(paste);
+
+    expect(getData).toHaveBeenCalledExactlyOnceWith("text/plain");
+    expect(clipboard).toHaveBeenCalledExactlyOnceWith("paste", { enter: false }, "native\r\ntext");
+    expect(socket.sent).toEqual([]);
+    session.dispose();
   });
 
   it("uses xterm bracketed paste without appending Enter to the lines", async () => {

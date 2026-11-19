@@ -850,6 +850,22 @@ export class TerminalSession {
       { capture: true, signal },
     );
 
+    container.addEventListener(
+      "paste",
+      (event) => {
+        if (!this.onClipboardAction || !event.clipboardData) return;
+        // The browser already supplied the text. Keep xterm from sending a second copy.
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        this.runClipboardAction(
+          "paste",
+          { enter: false },
+          event.clipboardData.getData("text/plain"),
+        );
+      },
+      { capture: true, signal },
+    );
+
     // Fork-only: xterm never sets touch-action, so a vertical finger drag can
     // start a browser pan before the touchmove listener below can claim it.
     // Declaring pan-x pinch-zoom leaves horizontal navigation and pinch zoom

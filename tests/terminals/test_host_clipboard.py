@@ -11,30 +11,28 @@ from omnigent.terminals import host_clipboard
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("manager", "payload", "expected"),
+    ("exit_code", "payload", "expected"),
     [
-        (b"Background\n", b"unused", ("unavailable", False)),
-        (b"Aqua\n", b"pwd", ("pwd", True)),
-        (b"Aqua\n", b"", ("empty", False)),
-        (b"Aqua\n", b"x" * (host_clipboard.HOST_CLIPBOARD_MAX_BYTES + 1), ("too-large", False)),
+        (1, b"unused", ("unavailable", False)),
+        (0, b"pwd", ("pwd", True)),
+        (0, b"", ("empty", False)),
+        (0, b"x" * (host_clipboard.HOST_CLIPBOARD_MAX_BYTES + 1), ("too-large", False)),
     ],
-    ids=["background", "desktop", "empty", "too-large"],
+    ids=["command-failed", "available", "empty", "too-large"],
 )
-async def test_mac_clipboard_requires_aqua_and_limits_response(
-    monkeypatch, manager, payload, expected
+async def test_mac_clipboard_uses_pbpaste_without_a_session_type_gate(
+    monkeypatch, exit_code, payload, expected
 ):
     monkeypatch.setattr(host_clipboard, "sys", SimpleNamespace(platform="darwin"))
     commands = []
 
     async def clipboard_command(*args, max_bytes):
-        commands.append(args)
-        return 0, manager if args[0] == "/bin/launchctl" else payload
+        commands.append((args, max_bytes))
+        return exit_code, payload
 
     monkeypatch.setattr(host_clipboard, "_clipboard_command", clipboard_command)
     assert await host_clipboard.read_host_clipboard() == expected
-    assert commands == [("/bin/launchctl", "managername")] + (
-        [("/usr/bin/pbpaste",)] if manager == b"Aqua\n" else []
-    )
+    assert commands == [(("/usr/bin/pbpaste",), host_clipboard.HOST_CLIPBOARD_MAX_BYTES)]
 
 
 @pytest.mark.asyncio

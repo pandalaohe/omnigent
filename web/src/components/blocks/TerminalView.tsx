@@ -567,9 +567,9 @@ export function TerminalView({
   );
 
   const onClipboardActionRef = useRef<TerminalClipboardAction>(() => {});
-  onClipboardActionRef.current = (op, options) => {
+  onClipboardActionRef.current = (op, options, nativeText) => {
     if (op !== "copy") {
-      void terminalPaste.paste(op, options);
+      void terminalPaste.paste(op, options, nativeText);
       return;
     }
     if (!active) return;
@@ -775,8 +775,8 @@ export function TerminalView({
           focusOnConnectRef.current && !isPhoneRef.current,
           terminalId === "terminal_codex_main",
           notifyFileLink,
-          (op, options) => {
-            if (!superseded()) onClipboardActionRef.current(op, options);
+          (...args) => {
+            if (!superseded()) onClipboardActionRef.current(...args);
           },
         );
         sessionRef.current = terminalSession;

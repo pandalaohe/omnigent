@@ -88,6 +88,7 @@ from omnigent.util.tunnel_limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
+from omnigent.util.websocket_logging import websocket_protocol_logger
 
 _logger = logging.getLogger(__name__)
 
@@ -1183,6 +1184,7 @@ async def _serve_tunnel_once(
             close_timeout=close_timeout,
             max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
             ssl=ssl_ctx,
+            logger=websocket_protocol_logger("websockets.omnigent.runner_tunnel"),
             # Protocol keepalive aligned to the server's 90 s app-level budget (not the
             # 20 s library default that drops a busy-but-healthy tunnel — issue #1116).
             # Application silence below also detects proxies answering PINGs.

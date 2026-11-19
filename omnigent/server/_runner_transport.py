@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from omnigent.scheduled_context import add_scheduled_run_header
+from omnigent.util.websocket_logging import websocket_protocol_logger
 
 # Type alias: callable returning an async context manager around a
 # connected websockets client. Kept ``Any`` because the actual return
@@ -42,6 +43,7 @@ def build_uds_runner(uds_path: str) -> tuple[httpx.AsyncClient, RunnerWSFactory]
             path=uds_path,
             uri=f"ws://runner{path}",
             open_timeout=10,
+            logger=websocket_protocol_logger("websockets.omnigent.runner_uds"),
         )
 
     return client, ws_factory

@@ -46,6 +46,7 @@ from fastapi import FastAPI, Query, WebSocket
 from starlette import status
 
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.util.websocket_logging import websocket_protocol_logger
 
 _logger = logging.getLogger(__name__)
 
@@ -255,6 +256,7 @@ async def start_direct_attach_listener(app: FastAPI) -> DirectAttachListener | N
         callers continue relay-only; the listener is an optimization
         and must never block or break the runner.
     """
+    websocket_protocol_logger("uvicorn.error")
     config = uvicorn.Config(
         app,
         host=DIRECT_ATTACH_BIND_HOST,
