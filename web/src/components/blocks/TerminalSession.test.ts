@@ -1437,6 +1437,163 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
+  async function touchSelectionSession(text: string) {
+    const fixture = makeSession();
+    const term = (fixture.session as unknown as { term: Terminal }).term;
+    vi.spyOn(
+      fixture.session as unknown as { screenMetrics: () => WheelScreenMetrics | null },
+      "screenMetrics",
+    ).mockImplementation(() => ({
+      left: 0,
+      top: 0,
+      cellWidth: 8,
+      cellHeight: 16,
+      cols: term.cols,
+      rows: term.rows,
+    }));
+    await new Promise<void>((resolve) => {
+      term.write(text, resolve);
+    });
+    vi.useFakeTimers();
+    const copy = vi.fn();
+    const handles = vi.fn();
+    fixture.session.setTouchSelection({ copy, handles });
+    return { ...fixture, term, copy, handles };
+  }
+
+  it("selects a whole path after a jittered hold, switches drag direction, and copies on release", async () => {
+    const { container, term, session, copy, handles } = await touchSelectionSession(
+      "above\r\n/opt/work/omnigent/fork/wt\r\n中文路径 below",
+    );
+    try {
+      expect(term.element?.style.touchAction).toBe("pinch-zoom");
+      dispatchTouch(container, "touchstart", [testTouch(1, 20, 24)]);
+      dispatchTouch(container, "touchmove", [testTouch(1, 26, 24)]);
+      vi.advanceTimersByTime(499);
+      expect(session.selectedText()).toBe("");
+      vi.advanceTimersByTime(1);
+      expect(session.selectedText()).toBe("/opt/work/omnigent/fork/wt");
+      dispatchTouch(container, "touchmove", [testTouch(1, 4, 8)]);
+      expect(session.selectedText()).toBe("above\n/opt/work/omnigent/fork/wt");
+      dispatchTouch(container, "touchmove", [testTouch(1, 13, 40)]);
+      expect(session.selectedText()).toBe("/opt/work/omnigent/fork/wt\n中");
+      expect(copy).not.toHaveBeenCalled();
+      expect(
+        dispatchTouch(container, "touchend", [], [testTouch(1, 13, 40)]).defaultPrevented,
+      ).toBe(true);
+      expect(copy).toHaveBeenCalledExactlyOnceWith("/opt/work/omnigent/fork/wt\n中");
+      expect(handles).toHaveBeenLastCalledWith({
+        start: expect.any(Object),
+        end: expect.any(Object),
+      });
+
+      dispatchTouch(container, "touchstart", [testTouch(2, 13, 40)]);
+      vi.advanceTimersByTime(500);
+      expect(session.selectedText()).toBe("中文路径");
+      dispatchTouch(container, "touchend", [], [testTouch(2, 13, 40)]);
+      session.setStickyModifiers({ ctrl: "once", alt: "off", shift: "off" });
+      expect(session.selectedText()).toBe("中文路径");
+      session.sendBarChord({ code: "KeyC", modifiers: [] });
+      expect(session.selectedText()).toBe("");
+      expect(handles).toHaveBeenLastCalledWith(null);
+    } finally {
+      session.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves vertical swipes with scroll, drops horizontal swipes, and cancels on pinch or touchcancel", async () => {
+    const { container, term, session, copy, handles } = await touchSelectionSession("example");
+    try {
+      const scroll = vi.spyOn(term, "scrollLines");
+      const origin = testTouch(1, 20, 8);
+      dispatchTouch(container, "touchstart", [origin]);
+      dispatchTouch(container, "touchmove", [testTouch(1, 29, 8)]);
+      vi.advanceTimersByTime(500);
+      expect(scroll).not.toHaveBeenCalled();
+      expect(session.selectedText()).toBe("");
+      dispatchTouch(container, "touchend", [], [origin]);
+
+      dispatchTouch(container, "touchstart", [origin]);
+      dispatchTouch(container, "touchmove", [testTouch(1, 20, 48)]);
+      vi.advanceTimersByTime(500);
+      expect(scroll).toHaveBeenCalledWith(-2);
+      expect(session.selectedText()).toBe("");
+      dispatchTouch(container, "touchend", [], [origin]);
+
+      dispatchTouch(container, "touchstart", [origin]);
+      vi.advanceTimersByTime(500);
+      dispatchTouch(document.body, "touchstart", [origin, testTouch(2, 80, 80)]);
+      dispatchTouch(container, "touchend", [], [origin]);
+      expect(session.selectedText()).toBe("");
+      expect(handles).toHaveBeenLastCalledWith(null);
+
+      dispatchTouch(container, "touchstart", [origin]);
+      vi.advanceTimersByTime(500);
+      dispatchTouch(container, "touchcancel", [], [origin]);
+      expect(session.selectedText()).toBe("");
+      expect(copy).not.toHaveBeenCalled();
+    } finally {
+      session.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("extends through the scrollback and removes handle drag listeners on cancel or dispose", async () => {
+    const { container, term, session, copy, handles } = await touchSelectionSession(
+      Array.from({ length: 44 }, (_, index) => `line-${index}`).join("\r\n"),
+    );
+    try {
+      const scroll = vi.spyOn(term, "scrollLines");
+      const hold = testTouch(1, 20, 56);
+      dispatchTouch(container, "touchstart", [hold]);
+      vi.advanceTimersByTime(500);
+      dispatchTouch(container, "touchmove", [testTouch(1, 20, 4)]);
+      vi.advanceTimersByTime(180);
+      expect(scroll.mock.calls).toEqual([[-1], [-1], [-1]]);
+      dispatchTouch(container, "touchend", [], [hold]);
+      expect(copy).toHaveBeenCalledOnce();
+
+      const end = handles.mock.lastCall?.[0].end;
+      const handle = testTouch(2, end.x, end.y);
+      session.startTouchSelectionHandle(
+        "end",
+        dispatchTouch(document.body, "touchstart", [handle]) as TouchEvent,
+      );
+      dispatchTouch(document.body, "touchmove", [testTouch(2, end.x, term.rows * 16 - 2)]);
+      vi.advanceTimersByTime(120);
+      expect(scroll.mock.calls.slice(-2)).toEqual([[1], [1]]);
+      dispatchTouch(document.body, "touchend", [], [handle]);
+      expect(copy).toHaveBeenCalledTimes(2);
+
+      const start = handles.mock.lastCall?.[0].start;
+      const startTouch = testTouch(3, start.x, start.y);
+      session.startTouchSelectionHandle(
+        "start",
+        dispatchTouch(document.body, "touchstart", [startTouch]) as TouchEvent,
+      );
+      dispatchTouch(document.body, "touchcancel", [], [startTouch]);
+      expect(handles).toHaveBeenLastCalledWith(null);
+      expect(copy).toHaveBeenCalledTimes(2);
+
+      dispatchTouch(container, "touchstart", [hold]);
+      vi.advanceTimersByTime(500);
+      const newEnd = handles.mock.lastCall?.[0].end;
+      const lastTouch = testTouch(4, newEnd.x, newEnd.y);
+      session.startTouchSelectionHandle(
+        "end",
+        dispatchTouch(document.body, "touchstart", [lastTouch]) as TouchEvent,
+      );
+      session.dispose();
+      dispatchTouch(document.body, "touchend", [], [lastTouch]);
+      expect(handles).toHaveBeenLastCalledWith(null);
+      expect(copy).toHaveBeenCalledTimes(2);
+    } finally {
+      session.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it("does not re-send a resize when the fitted size is unchanged", () => {
     // WHY: the WS-open handler and the ResizeObserver both drive sendResize on
     // mount, and jsdom's fit() yields a stable size, so without deduping the

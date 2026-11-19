@@ -406,6 +406,78 @@ def clipboard_browser(
     )
 
 
+@pytest.mark.only_browser("chromium")
+def test_phone_terminal_touch_selection_and_handle_drag(
+    clipboard_browser: _ClipboardBrowser,
+) -> None:
+    browser = clipboard_browser
+    page = browser.page
+    page.set_viewport_size({"width": 390, "height": 844})
+    browser.open()
+    terminal_id = _terminal_id(browser.session_ids[browser.active_session])
+    terminal = browser.terminal
+    screen = terminal.locator(".xterm-screen")
+    expect(terminal.locator(".xterm")).to_have_css("touch-action", "pinch-zoom")
+    bounds = screen.bounding_box()
+    assert bounds is not None
+    cols, rows = browser.resizes[terminal_id][-1]
+    path = "/opt/work/omnigent/fork/wt"
+    lines = [f"earlier line {index}" for index in range(18)] + [path, "中文路径", "last line"]
+    browser.sockets[terminal_id].send(
+        ("\x1b[2J\x1b[H" + "\r\n".join(lines[-min(rows, 8) :])).encode()
+    )
+    page.wait_for_timeout(100)  # xterm parses its canvas output asynchronously.
+    x = bounds["x"] + 2.5 * bounds["width"] / cols
+    y = bounds["y"] + (min(rows, 8) - 2.5) * bounds["height"] / rows
+    start = terminal.get_by_test_id("terminal-selection-start")
+    end = terminal.get_by_test_id("terminal-selection-end")
+    cdp = page.context.new_cdp_session(page)
+    cdp.send("Emulation.setTouchEmulationEnabled", {"enabled": True, "maxTouchPoints": 2})
+
+    def touch(kind: str, *points: tuple[float, float]) -> None:
+        cdp.send(
+            "Input.dispatchTouchEvent",
+            {"type": kind, "touchPoints": [{"x": px, "y": py} for px, py in points]},
+        )
+
+    def writes() -> list[str]:
+        return page.evaluate("window.__terminalClipboard.writes")
+
+    initial_scroll_x = page.evaluate("window.scrollX")
+    touch("touchStart", (x, y))
+    touch("touchMove", (x + 25, y))
+    page.wait_for_timeout(550)
+    touch("touchEnd")
+    expect(end).to_have_count(0)
+    assert page.evaluate("window.scrollX") == initial_scroll_x
+    assert writes() == []
+
+    touch("touchStart", (x, y))
+    touch("touchMove", (x + 6, y))
+    expect(end).to_be_visible()
+    assert writes() == []
+    touch("touchEnd")
+    _expect_clipboard(page, path)
+    assert writes() == [path]
+
+    handle = end.bounding_box()
+    assert handle is not None
+    handle_x = handle["x"] + handle["width"] / 2
+    handle_y = handle["y"] + handle["height"] / 2
+    touch("touchStart", (handle_x, handle_y))
+    touch("touchMove", (handle_x, handle_y + bounds["height"] / rows + 1))
+    touch("touchEnd")
+    _expect_clipboard(page, f"{path}\n中文路径")
+    assert writes() == [path, f"{path}\n中文路径"]
+
+    touch("touchStart", (x, y))
+    expect(end).to_be_visible()
+    touch("touchCancel")
+    expect(start).to_have_count(0)
+    expect(end).to_have_count(0)
+    assert writes() == [path, f"{path}\n中文路径"]
+
+
 @pytest.mark.parametrize(
     ("width", "height"),
     [(1280, 844), (390, 844), (390, 480), (320, 400)],

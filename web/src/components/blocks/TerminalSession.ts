@@ -42,6 +42,11 @@ import {
   splitTerminalWrites,
 } from "@/lib/terminalKeys";
 import { HostClipboardConnection, type TerminalClipboardAction } from "@/lib/terminalPaste";
+import {
+  TerminalTouchSelection,
+  type SelectionHandle,
+  type TerminalTouchSelectionOptions,
+} from "@/lib/terminalTouchSelection";
 import { TerminalImeInput } from "./TerminalImeInput";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { terminalSurfaceColors } from "@/lib/terminalPalette";
@@ -795,6 +800,7 @@ export class TerminalSession {
   private touchLastY = 0;
   /** Fractional touch lines carried across moves (see {@link touchScrollPayload}). */
   private touchPartialLines = 0;
+  private touchSelection: TerminalTouchSelection | null = null;
 
   /**
    * Construct, attach to the DOM, and open the WebSocket.
@@ -907,6 +913,15 @@ export class TerminalSession {
     // to the browser while reserving vertical panning for the terminal's own
     // touch listeners further down.
     if (this.term.element) this.term.element.style.touchAction = "pan-x pinch-zoom";
+    container.addEventListener(
+      "contextmenu",
+      (event) => {
+        if (!this.touchSelection?.shouldSuppressContextMenu()) return;
+        event.preventDefault();
+        event.stopPropagation();
+      },
+      { capture: true, signal },
+    );
 
     this.ws.addEventListener(
       "open",
@@ -965,6 +980,7 @@ export class TerminalSession {
     this.ws.addEventListener(
       "close",
       (ev) => {
+        this.touchSelection?.cancel();
         this.hostClipboard.close();
         onState({ kind: "closed", reason: ev.reason || `code ${ev.code}`, code: ev.code });
       },
@@ -974,6 +990,7 @@ export class TerminalSession {
     this.ws.addEventListener(
       "error",
       () => {
+        this.touchSelection?.cancel();
         this.hostClipboard.close();
         onState({ kind: "error" });
       },
@@ -1017,6 +1034,7 @@ export class TerminalSession {
       if (e.type === "keydown") {
         e.preventDefault();
         if (!this.imeInput.beforeSoftKey()) return false;
+        this.touchSelection?.cancel();
         onInput?.();
         this.lastUserInputAt = performance.now();
         if (this.ws.readyState === WebSocket.OPEN) {
@@ -1059,19 +1077,20 @@ export class TerminalSession {
       "touchstart",
       (e) => {
         if (e.touches.length !== 1) {
-          this.touchStart = null;
-          this.touchScrolling = false;
+          this.resetTouchScroll();
           return;
         }
         this.touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
         this.touchScrolling = false;
         this.touchPartialLines = 0;
+        this.touchSelection?.start(e.touches[0]);
       },
       { signal },
     );
     container.addEventListener(
       "touchmove",
       (e) => {
+        if (this.touchSelection?.move(e)) return;
         if (this.touchStart === null || e.touches.length !== 1) return;
         const touch = e.touches[0];
         if (!this.touchScrolling) {
@@ -1081,8 +1100,10 @@ export class TerminalSession {
           const dx = Math.abs(touch.clientX - this.touchStart.x);
           const dy = Math.abs(touch.clientY - this.touchStart.y);
           if (Math.max(dx, dy) < TOUCH_SCROLL_SLOP_PX) return;
+          this.touchSelection?.cancelHold();
           if (dx > dy) {
             this.touchStart = null;
+            if (this.touchSelection && e.cancelable) e.preventDefault();
             return;
           }
           // Lock in: the pre-slop travel feeds the first step so the view
@@ -1112,13 +1133,22 @@ export class TerminalSession {
       // Explicitly non-passive so preventDefault() above is honored.
       { passive: false, signal },
     );
-    const endTouch = () => {
-      this.touchStart = null;
-      this.touchScrolling = false;
-      this.touchPartialLines = 0;
-    };
-    container.addEventListener("touchend", endTouch, { signal });
-    container.addEventListener("touchcancel", endTouch, { signal });
+    container.addEventListener(
+      "touchend",
+      (e) => {
+        this.touchSelection?.end(e, this.touchStart !== null && !this.touchScrolling);
+        this.resetTouchScroll();
+      },
+      { passive: false, signal },
+    );
+    container.addEventListener(
+      "touchcancel",
+      () => {
+        this.touchSelection?.cancel();
+        this.resetTouchScroll();
+      },
+      { signal },
+    );
 
     // ResizeObserver fires on any layout-affecting change (window
     // resize, font load, CSS class change). tmux deduplicates same-
@@ -1281,6 +1311,35 @@ export class TerminalSession {
     return this.term.getSelection();
   }
 
+  setTouchSelection(options: TerminalTouchSelectionOptions | null): void {
+    const element = this.term.element;
+    if (this.disposed || !element || Boolean(options) === Boolean(this.touchSelection)) return;
+    this.touchSelection?.dispose();
+    this.resetTouchScroll();
+    this.touchSelection = options
+      ? new TerminalTouchSelection(
+          this.term,
+          this.container,
+          () => this.screenMetrics(),
+          () => this.resetTouchScroll(),
+          options,
+        )
+      : null;
+    element.style.touchAction = options ? "pinch-zoom" : "pan-x pinch-zoom";
+    element.style.setProperty("-webkit-touch-callout", options ? "none" : "");
+    element.style.userSelect = options ? "none" : "";
+  }
+
+  startTouchSelectionHandle(handle: SelectionHandle, event: TouchEvent): void {
+    this.touchSelection?.startHandle(handle, event);
+  }
+
+  private resetTouchScroll(): void {
+    this.touchStart = null;
+    this.touchScrolling = false;
+    this.touchPartialLines = 0;
+  }
+
   bufferText(): string {
     return terminalBufferText(this.term.buffer.active);
   }
@@ -1362,6 +1421,7 @@ export class TerminalSession {
     if (this.disposed) return;
     this.hostClipboard.close();
     this.disposed = true;
+    this.touchSelection?.dispose();
     this.cancelBarWrites();
     this.listenerCtl.abort();
     this.resizeObserver.disconnect();
@@ -1443,15 +1503,19 @@ export class TerminalSession {
     // Keep the last real size while hidden; the ResizeObserver re-fits once
     // the surface is laid out again.
     if (!this.hasLayoutBox()) return;
-    try {
+    const fitGrid = () => {
       this.fit.fit();
+      if (this.tmuxBacked) {
+        const cols = Math.max(this.term.cols, MIN_FORWARDED_COLS);
+        const rows = Math.max(this.term.rows, MIN_FORWARDED_ROWS);
+        if (cols !== this.term.cols || rows !== this.term.rows) this.term.resize(cols, rows);
+      }
+    };
+    try {
+      if (this.touchSelection) this.touchSelection.refit(fitGrid);
+      else fitGrid();
     } catch {
       return;
-    }
-    if (this.tmuxBacked) {
-      const cols = Math.max(this.term.cols, MIN_FORWARDED_COLS);
-      const rows = Math.max(this.term.rows, MIN_FORWARDED_ROWS);
-      if (cols !== this.term.cols || rows !== this.term.rows) this.term.resize(cols, rows);
     }
     const { cols, rows } = this.term;
     // Skip a no-op resize: the WS-open handler and the ResizeObserver both

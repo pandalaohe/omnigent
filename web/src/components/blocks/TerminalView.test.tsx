@@ -34,6 +34,7 @@ import {
 } from "@/lib/terminalClipboardPreferences";
 import type { ConnectionState } from "./TerminalSession";
 import type { TerminalClipboardAction } from "@/lib/terminalPaste";
+import type { TerminalTouchSelectionOptions } from "@/lib/terminalTouchSelection";
 import {
   TerminalView,
   RECONNECT_BACKOFF_MS,
@@ -98,6 +99,10 @@ const terminalSessionMock = vi.hoisted(() => ({
     dispose: ReturnType<typeof vi.fn>;
     setTheme: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
+    setTouchSelection: ReturnType<
+      typeof vi.fn<(options: TerminalTouchSelectionOptions | null) => void>
+    >;
+    selectedText: ReturnType<typeof vi.fn<() => string>>;
     sendSoftKey: ReturnType<typeof vi.fn>;
     getStickyModifiers: () => TerminalStickyModifiers;
     focus: ReturnType<typeof vi.fn>;
@@ -235,6 +240,9 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     dispose = vi.fn();
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
+    setTouchSelection = vi.fn<(options: TerminalTouchSelectionOptions | null) => void>();
+    selectedText = vi.fn(() => "");
+    bufferText = vi.fn(() => "terminal contents");
     sendSoftKey = vi.fn();
     cancelBarWrites = vi.fn();
     runBarKey = vi.fn((send: () => void) => send());
@@ -284,6 +292,8 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         dispose: this.dispose,
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
+        setTouchSelection: this.setTouchSelection,
+        selectedText: this.selectedText,
         sendSoftKey: this.sendSoftKey,
         getStickyModifiers: this.getStickyModifiers,
         focus: this.focus,
@@ -2097,6 +2107,58 @@ describe("TerminalView phone key rows", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it.each(["ask", "allow", "block"] as const)(
+    "uses clipboard preference %s for a gesture on a read-only phone attach with key rows off",
+    async (preference) => {
+      stubPhoneViewport(390, 844);
+      act(() => {
+        writeTerminalClipboardPreference(preference);
+        writeMobileAssistantPreferences({
+          ...readMobileAssistantPreferences(),
+          terminalKeysEnabled: false,
+        });
+      });
+      render(
+        <TerminalView keySurface="native" sessionId="conv_abc" terminalId="terminal_a" readOnly />,
+      );
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      const terminal = terminalSessionMock.instances[0];
+      act(() => terminal.onState({ kind: "connected" }));
+      const options = terminal.setTouchSelection.mock.lastCall?.[0];
+      expect(options).toBeTruthy();
+      expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+      await act(async () => options?.copy("selected output"));
+      if (preference === "block") {
+        expect(clipboardMock.copyText).not.toHaveBeenCalled();
+        expect(
+          await screen.findByText("Copy blocked by the terminal clipboard setting"),
+        ).toBeVisible();
+      } else {
+        expect(clipboardMock.copyText).toHaveBeenCalledExactlyOnceWith("selected output");
+        expect(await screen.findByText("Copied", { exact: true })).toBeVisible();
+      }
+      expect(screen.queryByTestId("terminal-clipboard-consent")).toBeNull();
+      act(() => terminal.onState({ kind: "closed", code: 1000, reason: "" }));
+      expect(terminal.setTouchSelection).toHaveBeenLastCalledWith(null);
+      await act(async () => options?.copy("late output"));
+      expect(clipboardMock.copyText).not.toHaveBeenCalledWith("late output");
+    },
+  );
+
+  it("lets the phone Copy key use the live selection, then the sheet once the selection is cleared", async () => {
+    stubPhoneViewport(390, 844);
+    render(<TerminalView keySurface="shell" sessionId="conv_abc" terminalId="terminal_a" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const terminal = terminalSessionMock.instances[0];
+    act(() => terminal.onState({ kind: "connected" }));
+    terminal.selectedText.mockReturnValueOnce("selected output");
+    await act(async () => terminal.onClipboardAction?.("copy", { enter: false }));
+    expect(clipboardMock.copyText).toHaveBeenCalledExactlyOnceWith("selected output");
+    expect(screen.queryByRole("button", { name: "Copy all" })).toBeNull();
+    act(() => terminal.onClipboardAction?.("copy", { enter: false }));
+    expect(await screen.findByRole("button", { name: "Copy all" })).toBeVisible();
   });
 
   it("renders key rows on a writable phone terminal, suppresses auto-focus on connect and reveal, and disables keys while reconnecting", async () => {

@@ -62,6 +62,8 @@ import {
   type TerminalClipboardPromptReason,
 } from "./TerminalClipboardPrompt";
 import { TerminalKeyRow } from "./TerminalKeyRow";
+import { TerminalSelectionHandles } from "./TerminalSelectionHandles";
+import type { SelectionHandles } from "@/lib/terminalTouchSelection";
 import {
   TERMINAL_COPY_BLOCKED_MESSAGE,
   TerminalCopySheet,
@@ -344,6 +346,7 @@ export function TerminalView({
   const terminalPaste = useTerminalPaste(sessionRef, clipboardScope, active, readOnly);
   const cancelPaste = terminalPaste.cancel;
   const [copySheet, setCopySheet] = useState<string | null>(null);
+  const [selectionHandles, setSelectionHandles] = useState<SelectionHandles | null>(null);
   useLayoutEffect(() => setCopySheet(null), [clipboardScope, active]);
   const terminalNodeRef = useRef<HTMLDivElement | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -368,6 +371,7 @@ export function TerminalView({
   const terminalEnded = state.kind === "closed" && !reconnectPending && !willAutoReconnect;
   const keyPreferences = useMobileAssistantPreferences();
   const gate = useTerminalKeyBarGate();
+  const canTouchSelect = gate && keySurface !== undefined && active && state.kind === "connected";
   const terminalKeys = keySurface
     ? resolveTerminalKeys({ ...keyPreferences }).keys[keySurface]
     : undefined;
@@ -499,20 +503,47 @@ export function TerminalView({
   );
 
   const copyExplicit = useCallback(
-    (text: string, copyEvent?: ClipboardEvent) => {
+    (text: string, copyEvent?: ClipboardEvent, isGestureCurrent?: () => boolean) => {
       clipboardRequestGenerationRef.current += 1;
       setClipboardPrompt(null);
       const copiedNatively = Boolean(
         copyEvent?.clipboardData && applyTerminalCopy(copyEvent, text),
       );
-      void writeExplicitTerminalClipboardText(text, isCopyAllowed, copiedNatively).then(
-        (copied) => {
-          if (!copied && isCopyAllowed()) toast.error("Couldn't copy terminal text");
-        },
-      );
+      const isAllowed = () => isCopyAllowed() && (isGestureCurrent?.() ?? true);
+      void writeExplicitTerminalClipboardText(text, isAllowed, copiedNatively).then((copied) => {
+        if (!isAllowed()) return;
+        if (copied && isGestureCurrent) toast.success("Copied", { duration: 1500 });
+        if (!copied)
+          toast.error(isGestureCurrent ? "Couldn't copy" : "Couldn't copy terminal text");
+      });
     },
     [isCopyAllowed],
   );
+
+  const copyTouchSelection = useRef<(text: string, session: TerminalSession) => void>(() => {});
+  copyTouchSelection.current = (text, session) => {
+    if (!canTouchSelect || sessionRef.current !== session || !mountedRef.current) return;
+    if (!isCopyAllowed()) {
+      toast.info("Copy blocked by the terminal clipboard setting", {
+        id: "terminal-clipboard-blocked",
+      });
+      return;
+    }
+    copyExplicit(text, undefined, () => sessionRef.current === session && mountedRef.current);
+  };
+
+  useLayoutEffect(() => {
+    const session = sessionRef.current;
+    session?.setTouchSelection(
+      canTouchSelect && session
+        ? {
+            copy: (text) => copyTouchSelection.current(text, session),
+            handles: setSelectionHandles,
+          }
+        : null,
+    );
+    return () => session?.setTouchSelection(null);
+  }, [canTouchSelect]);
 
   const notifyClipboardRequest = useCallback(
     (text: string, copyEvent?: ClipboardEvent) => {
@@ -996,6 +1027,14 @@ export function TerminalView({
         style={{ backgroundColor: terminalBackground }}
       >
         <div key={connectAttempt} ref={attachSession} className="h-full w-full overflow-hidden" />
+        {canTouchSelect && selectionHandles && (
+          <TerminalSelectionHandles
+            positions={selectionHandles}
+            onStart={(handle, event) =>
+              sessionRef.current?.startTouchSelectionHandle(handle, event)
+            }
+          />
+        )}
         {state.kind !== "connected" && (
           <StatusOverlay
             state={refusedDuringLaunch ? { kind: "connecting" } : state}
