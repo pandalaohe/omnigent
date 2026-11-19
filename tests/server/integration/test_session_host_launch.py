@@ -5493,7 +5493,7 @@ async def test_async_card_retries_launch_after_definite_enqueue_failure(
 
 
 @pytest.mark.parametrize(
-    "interrupt_at", ["starting", "accepted", "delivered", "delivery_uncertain"]
+    "interrupt_at", ["starting", "readiness", "accepted", "delivered", "delivery_uncertain"]
 )
 async def test_async_card_restart_joins_startup_or_retires_sent_answer(
     client: httpx.AsyncClient,
@@ -5515,6 +5515,8 @@ async def test_async_card_restart_joins_startup_or_retires_sent_answer(
     interrupted = asyncio.Event()
     allow_connect = asyncio.Event()
     persist_notice = routes_hooks._persist_answer_delivery_notice
+    ensure_terminal = orchestration._ensure_native_terminal_ready
+    accepted_before_restart = interrupt_at not in {"starting", "readiness"}
 
     async def wait_for_connection(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
         if interrupt_at == "starting":
@@ -5522,8 +5524,12 @@ async def test_async_card_restart_joins_startup_or_retires_sent_answer(
             await allow_connect.wait()
         return await runners.wait_for_runner_client(*args, **kwargs)
 
+    async def pause_readiness(*args: Any, **kwargs: Any) -> Any:
+        interrupted.set()
+        await asyncio.Future()
+
     async def pause_settlement(*args: Any, **kwargs: Any) -> None:
-        if interrupt_at != "starting" and kwargs.get("status") == "delivered":
+        if accepted_before_restart and kwargs.get("status") == "delivered":
             interrupted.set()
             await asyncio.Future()
         await persist_notice(*args, **kwargs)
@@ -5534,6 +5540,8 @@ async def test_async_card_restart_joins_startup_or_retires_sent_answer(
     monkeypatch.setattr(sessions_module, "_get_runner_client", runners.get_runner_client)
     monkeypatch.setattr(sessions_module, "_wait_for_runner_client", wait_for_connection)
     monkeypatch.setattr(routes_hooks, "_persist_answer_delivery_notice", pause_settlement)
+    if interrupt_at == "readiness":
+        monkeypatch.setattr(orchestration, "_ensure_native_terminal_ready", pause_readiness)
     async with runners.client, _HostFrameResponder(comm, runner_status=runner_status) as host:
         resolved = await client.post(
             resolve_url, json={"action": "accept", "content": {"Which database?": "SQLite"}}
@@ -5542,15 +5550,17 @@ async def test_async_card_restart_joins_startup_or_retires_sent_answer(
         await asyncio.wait_for(interrupted.wait(), budget(5.0))
         assert len(host.launch_frames) == 1
         assert sum(body.get("type") == "message" for _, body in runners.posts) == int(
-            interrupt_at != "starting"
+            accepted_before_restart
         )
         await orchestration.cancel_detached_elicitation_tasks()
+        [record] = await asyncio.to_thread(store.list_detached_cards)
+        assert record.state == ("settled" if accepted_before_restart else "answered")
+        monkeypatch.setattr(orchestration, "_ensure_native_terminal_ready", ensure_terminal)
         monkeypatch.setattr(routes_hooks, "_persist_answer_delivery_notice", persist_notice)
         helpers._relaunch_last_attempt.pop(session_id, None)
         runners.live.clear()
 
         if interrupt_at in {"delivered", "delivery_uncertain"}:
-            [record] = await asyncio.to_thread(store.list_detached_cards)
             assert record.delivery_text is not None
             await persist_notice(session_id, record.delivery_text, store, status=interrupt_at)
             # Older deliveries could leave an answered row and a terminal notice.
@@ -5572,8 +5582,15 @@ async def test_async_card_restart_joins_startup_or_retires_sent_answer(
         assert any(item.get("code") == expected for item in items)
 
 
+@pytest.mark.parametrize(
+    "archive_during_enqueue", [False, True], ids=["before-read", "after-read"]
+)
 async def test_async_card_does_not_launch_if_archived_during_launch_wait(
-    client: httpx.AsyncClient, app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    archive_during_enqueue: bool,
 ) -> None:
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import helpers, orchestration
@@ -5589,6 +5606,14 @@ async def test_async_card_does_not_launch_if_archived_during_launch_wait(
     preparing_frame = asyncio.Event()
     resume_launch = asyncio.Event()
     retried = asyncio.Event()
+    send_text = app.state.host_registry.send_text
+
+    def archive_before_enqueue(conn: HostConnection, text: str) -> None:
+        if isinstance(decode_host_frame(text), HostLaunchRunnerFrame):
+            # The launch helper has read its final pre-enqueue snapshot.
+            result = store.update_conversation_with_changes(session_id, archived=True)
+            assert result is not None and result.conversation.archived
+        send_text(conn, text)
 
     async def pause_frame_preparation(conv: Conversation, **kwargs: Any) -> str | None:
         # Archive cleanup resolves the updated row through this helper too.
@@ -5601,7 +5626,10 @@ async def test_async_card_does_not_launch_if_archived_during_launch_wait(
         retried.set()
         await asyncio.Future()
 
-    monkeypatch.setattr(helpers, "_resolve_harness_async", pause_frame_preparation)
+    if archive_during_enqueue:
+        monkeypatch.setattr(app.state.host_registry, "send_text", archive_before_enqueue)
+    else:
+        monkeypatch.setattr(helpers, "_resolve_harness_async", pause_frame_preparation)
     monkeypatch.setattr(orchestration, "_delivery_retry_sleep", pause_retry)
     async with (
         runners.client,
@@ -5612,15 +5640,20 @@ async def test_async_card_does_not_launch_if_archived_during_launch_wait(
                 resolve_url, json={"action": "accept", "content": {"Which database?": "SQLite"}}
             )
             assert resolved.status_code == 202, resolved.text
-            await asyncio.wait_for(preparing_frame.wait(), budget(5.0))
-            archived = await asyncio.wait_for(
-                client.patch(f"/v1/sessions/{session_id}", json={"archived": True}),
-                budget(5.0),
-            )
-            assert archived.status_code == 200, archived.text
-            resume_launch.set()
+            if not archive_during_enqueue:
+                await asyncio.wait_for(preparing_frame.wait(), budget(5.0))
+                archived = await asyncio.wait_for(
+                    client.patch(f"/v1/sessions/{session_id}", json={"archived": True}),
+                    budget(5.0),
+                )
+                assert archived.status_code == 200, archived.text
+                resume_launch.set()
             await asyncio.wait_for(retried.wait(), budget(5.0))
-            assert not host.launch_frames
+            if archive_during_enqueue:
+                [frame] = host.launch_frames
+                assert token_bound_runner_id(frame.binding_token) in host.stopped_runner_ids
+            else:
+                assert not host.launch_frames
             assert not runners.posts
         finally:
             await orchestration.cancel_detached_elicitation_tasks()

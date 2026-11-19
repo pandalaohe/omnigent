@@ -7896,7 +7896,7 @@ async def ensure_runner_connected(
                     request_id=card_answer_wake.elicitation_id,
                     on_frame_enqueued=card_answer_wake.mark_frame_enqueued,
                 )
-                if launch_attempt.not_enqueued:
+                if launch_attempt.not_enqueued or launch_attempt.lifecycle_blocked:
                     return None, await _reread()
             # A harness-not-configured or workspace-missing refusal means the
             # runner will never appear — don't set relaunched_runner_id or the
@@ -9301,6 +9301,7 @@ async def _forward_native_terminal_message(
     usage_admission: dict[str, Any] | None = None,
     startup_context: StartupInputContext | None = None,
     native_shell_authorized: bool = False,
+    before_forward: Callable[[], Awaitable[None]] | None = None,
 ) -> bool:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -9409,6 +9410,8 @@ async def _forward_native_terminal_message(
             forward_timeout = max(forward_timeout, MESSAGE_READINESS_TIMEOUT_S)
         await claim_retry_forward(session_id, event, deadline=forward_deadline)
         forward_timeout += 5.0
+        if before_forward is not None:
+            await before_forward()
         # The websocket transport does not apply HTTPX's per-request timeout.
         async with asyncio.timeout(forward_timeout if confirm else None):
             resp = await runner_client.post(
@@ -9997,6 +10000,7 @@ async def _forward_event_to_runner(
     startup_required: bool = False,
     usage_admission: dict[str, Any] | None = None,
     startup_context: StartupInputContext | None = None,
+    before_forward: Callable[[], Awaitable[None]] | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -10607,6 +10611,8 @@ async def _forward_event_to_runner(
             "input_admission_deadline"
         ) or _input_admission_deadline(body.data)
         await claim_retry_forward(session_id, runner_body, deadline=forward_deadline)
+        if before_forward is not None:
+            await before_forward()
         _forward_resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=runner_body,
@@ -10998,6 +11004,8 @@ async def _forward_codex_side_chat_turn(
     conv: Conversation,
     body: SessionEventInput,
     runner_client: httpx.AsyncClient,
+    *,
+    before_forward: Callable[[], Awaitable[None]] | None = None,
 ) -> _SessionEventDispatchResult | None:
     """
     Forward a Codex ``/side`` child's user turn to the PARENT runner.
@@ -11025,6 +11033,8 @@ async def _forward_codex_side_chat_turn(
     child_thread_id = (conv.labels or {}).get(_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY)
     if not parent_id or not child_thread_id:
         return None
+    if before_forward is not None:
+        await before_forward()
     resp = await runner_client.post(
         f"/v1/sessions/{url_component(parent_id)}/events",
         json={
@@ -11094,6 +11104,7 @@ async def _dispatch_session_event_to_runner_impl(
     background_titles_enabled: bool = True,
     agent_revision: str | None = None,
     startup_input: StartupInputContext | None = None,
+    before_forward: Callable[[], Awaitable[None]] | None = None,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -11216,7 +11227,9 @@ async def _dispatch_session_event_to_runner_impl(
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors
         # the child thread echo, staying the single writer).
-        side_result = await _forward_codex_side_chat_turn(conv, body, runner_client)
+        side_result = await _forward_codex_side_chat_turn(
+            conv, body, runner_client, before_forward=before_forward
+        )
         if side_result is not None:
             return side_result
     if body.type == "message" and await asyncio.to_thread(_is_native_terminal_session, conv):
@@ -11546,6 +11559,7 @@ async def _dispatch_session_event_to_runner_impl(
                 usage_admission=usage_admission,
                 startup_context=startup_input,
                 native_shell_authorized=native_shell_authorized,
+                before_forward=before_forward,
             )
             forwarded = True
             if pending_id is not None:
@@ -11653,6 +11667,7 @@ async def _dispatch_session_event_to_runner_impl(
         startup_required=host_registry is not None and host_registry.startup_admitter is not None,
         usage_admission=usage_admission,
         startup_context=startup_input,
+        before_forward=before_forward,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
@@ -14162,7 +14177,11 @@ async def _post_system_message(
         if agent_store is not None and conv.agent_id
         else None
     )
-    if card_answer_wake is not None:
+    marked_for_forward = False
+
+    async def mark_for_forward() -> None:
+        nonlocal marked_for_forward
+        assert card_answer_wake is not None
         # If the process dies during the forward, recovery treats the answer
         # as possibly accepted. A definitive failure reopens it below.
         await asyncio.to_thread(
@@ -14170,6 +14189,9 @@ async def _post_system_message(
             card_answer_wake.elicitation_id,
             state="settled",
         )
+        marked_for_forward = True
+
+    forward_options = {"before_forward": mark_for_forward} if card_answer_wake is not None else {}
     try:
         # None args: a system notice carries no agent/files/artifacts; the runner
         # recomputes has_mcp_servers from the session's cached spec.
@@ -14188,6 +14210,7 @@ async def _post_system_message(
                 if agent is not None
                 else None
             ),
+            **forward_options,
         )
     except _NativeDeliveryUncertain:
         raise
@@ -14196,7 +14219,7 @@ async def _post_system_message(
         ambiguous_transport = isinstance(
             exc, (_NativeForwardReplyLost, httpx.TransportError)
         ) and (not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)))
-        if card_answer_wake is not None and (not definite_failure or ambiguous_transport):
+        if marked_for_forward and (not definite_failure or ambiguous_transport):
             raise _NativeDeliveryUncertain("The card answer forward did not settle.") from exc
         if not definite_failure:
             raise
@@ -14204,7 +14227,7 @@ async def _post_system_message(
         forwarded = False
     else:
         forwarded = dispatch.forwarded
-    if not forwarded and card_answer_wake is not None:
+    if not forwarded and marked_for_forward and card_answer_wake is not None:
         try:
             await asyncio.to_thread(
                 conversation_store.update_detached_card,

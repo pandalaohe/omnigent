@@ -7711,6 +7711,7 @@ class _HostLaunchAttempt:
     :param acknowledged: Whether the host confirmed ``status="launched"``;
         timeout and lost-connection attempts remain unconfirmed.
     :param not_enqueued: Whether this attempt stopped before sending a frame.
+    :param lifecycle_blocked: Whether archive or close blocked use of an enqueued card launch.
     """
 
     runner_id: str
@@ -7718,6 +7719,7 @@ class _HostLaunchAttempt:
     error: str | None = None
     acknowledged: bool = False
     not_enqueued: bool = False
+    lifecycle_blocked: bool = False
 
 
 def _can_wake_for_card_answer(conv: Conversation) -> bool:
@@ -8256,6 +8258,22 @@ async def _launch_runner_on_host_locked(
                 )
             break
         try:
+            if caller == "card_answer":
+                fresh = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+                if fresh is None or not _can_wake_for_card_answer(fresh):
+                    from omnigent.server.routes._sessions.orchestration import (
+                        _stop_host_runner_intentionally,
+                    )
+
+                    # The host orders the stop after the launch for this binding.
+                    await _stop_host_runner_intentionally(
+                        conv.id,
+                        host_conn.host_id,
+                        new_runner_id,
+                        host_registry,
+                        conversation_store,
+                    )
+                    return _HostLaunchAttempt(runner_id=new_runner_id, lifecycle_blocked=True)
             result = await asyncio.wait_for(
                 launch_future,
                 timeout=_HOST_LAUNCH_RESULT_TIMEOUT_S,
@@ -8280,6 +8298,9 @@ async def _launch_runner_on_host_locked(
             host_conn.pending_launches.pop(host_request_id, None)
             if not launch_future.done():
                 launch_future.cancel()
+            elif not launch_future.cancelled():
+                # A compensating stop can skip the launch acknowledgement.
+                launch_future.exception()
         if result.get("status") == "failed":
             refusal_code = result.get("error_code")
             # Unmapped codes (spawn failures) are attributed on the host's own row.
