@@ -500,12 +500,14 @@ export function TerminalKeyRow({
         if (swipe.row === "top") {
           setTopPage((current) => {
             const base = Math.max(0, Math.min(current, topPageCount - 1));
-            return Math.max(0, Math.min(topPageCount - 1, base + (dx < 0 ? 1 : -1)));
+            return dx < 0 ? (base + 1) % topPageCount : (base - 1 + topPageCount) % topPageCount;
           });
         } else {
           setBottomPage((current) => {
             const base = Math.max(0, Math.min(current, bottomPageCount - 1));
-            return Math.max(0, Math.min(bottomPageCount - 1, base + (dx < 0 ? 1 : -1)));
+            return dx < 0
+              ? (base + 1) % bottomPageCount
+              : (base - 1 + bottomPageCount) % bottomPageCount;
           });
         }
         return;

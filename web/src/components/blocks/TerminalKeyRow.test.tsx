@@ -44,6 +44,24 @@ function tapButton(button: HTMLElement, pointerId = 1, x = 20, y = 20) {
   fireEvent.pointerUp(button, { button: 0, pointerId, clientX: x, clientY: y });
 }
 
+function swipePager(element: HTMLElement, pointerId: number, fromX: number, toX: number) {
+  fireEvent.pointerDown(element, { button: 0, pointerId, clientX: fromX, clientY: 70 });
+  fireEvent.pointerMove(element, { pointerId, clientX: toX, clientY: 72 });
+  fireEvent.pointerUp(element, { pointerId, clientX: toX, clientY: 72 });
+}
+
+/** Width-2 keys: six fill a 12-cell page, so 13 keys pack into three pages. */
+function wideRowKeys(prefix: string, count: number): TerminalBar["top"]["keys"] {
+  return Array.from({ length: count }, (_, index) => ({
+    id: `${prefix}${index + 1}`,
+    label: `${prefix} ${index + 1}`,
+    kind: "key" as const,
+    chord: { code: "KeyA", modifiers: [] },
+    display: "text" as const,
+    width: 2 as const,
+  }));
+}
+
 function barWith(keys: TerminalBar["top"]["keys"], bottomEnabled = false): TerminalBar {
   return {
     top: { keys, pinned: 0, enabled: true },
@@ -338,6 +356,69 @@ describe("TerminalKeyRow", () => {
     fireEvent.click(pageButton);
     expect(bar).toHaveAttribute("data-bottom-page", "0");
     expect(screen.getByRole("button", { name: "Bottom row: next page (1 of 2)" })).toHaveFocus();
+  });
+
+  it("wraps either end when swiping a multi-page row and keeps rows independent", () => {
+    const { session, sessionRef } = makeSessionMock();
+    const bar: TerminalBar = {
+      top: { keys: wideRowKeys("top", 13), pinned: 0, enabled: true },
+      bottom: { keys: wideRowKeys("bottom", 13), pinned: 0, enabled: true },
+    };
+    render(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} bar={bar} />);
+
+    const row = screen.getByTestId("terminal-key-row");
+    const topPager = screen
+      .getByTestId("terminal-key-row-primary")
+      .querySelector("[data-pager]") as HTMLElement;
+    const bottomPager = screen
+      .getByTestId("terminal-key-row-pager")
+      .querySelector("[data-pager]") as HTMLElement;
+    expect(row).toHaveAttribute("data-page", "0");
+    expect(row).toHaveAttribute("data-page-count", "3");
+    expect(row).toHaveAttribute("data-bottom-page", "0");
+    expect(row).toHaveAttribute("data-bottom-page-count", "3");
+
+    swipePager(topPager, 40, 200, 140);
+    swipePager(topPager, 41, 200, 140);
+    expect(row).toHaveAttribute("data-page", "2");
+
+    // Forward past the last page wraps to the first.
+    swipePager(topPager, 42, 200, 140);
+    expect(row).toHaveAttribute("data-page", "0");
+
+    // Back past the first page wraps to the last.
+    swipePager(topPager, 43, 140, 200);
+    expect(row).toHaveAttribute("data-page", "2");
+
+    // The bottom row keeps its own page while the top row moves.
+    expect(row).toHaveAttribute("data-bottom-page", "0");
+    swipePager(bottomPager, 44, 200, 140);
+    expect(row).toHaveAttribute("data-bottom-page", "1");
+    expect(row).toHaveAttribute("data-page", "2");
+    expect(session.sendSoftKey).not.toHaveBeenCalled();
+  });
+
+  it("keeps a single-page row on its only page when swiped either way", () => {
+    const { session, sessionRef } = makeSessionMock();
+    render(
+      <TerminalKeyRow
+        sessionRef={sessionRef}
+        keyboardUp={false}
+        bar={barWith(wideRowKeys("solo", 3))}
+      />,
+    );
+
+    const row = screen.getByTestId("terminal-key-row");
+    const topPager = screen
+      .getByTestId("terminal-key-row-primary")
+      .querySelector("[data-pager]") as HTMLElement;
+    expect(row).toHaveAttribute("data-page-count", "1");
+
+    swipePager(topPager, 50, 200, 140);
+    expect(row).toHaveAttribute("data-page", "0");
+    swipePager(topPager, 51, 140, 200);
+    expect(row).toHaveAttribute("data-page", "0");
+    expect(session.sendSoftKey).not.toHaveBeenCalled();
   });
 
   it("does not page when a swipe starts on a pinned key", () => {
