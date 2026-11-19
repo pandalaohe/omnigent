@@ -23,7 +23,7 @@ from PIL import Image
 
 from omnigent._runner_startup import RunnerStartupProgress
 from omnigent.entities import CompactionData
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native import main as codex_native
@@ -875,6 +875,52 @@ _PROVIDER_POLICY_CONFLICT = {
 
 
 @pytest.mark.parametrize(
+    ("message", "missing"),
+    [
+        ("failed to load configuration: Model provider `Databricks` not found", "Databricks"),
+        (
+            "failed to load configuration: Model provider `Databricks` not found (cwd=/opt/work)",
+            "Databricks",
+        ),
+        ("failed to load configuration: Model provider `Databricks` not found\n", "Databricks"),
+        (
+            "failed to load configuration: Model provider `custom` not found in the managed "
+            "allowlist",
+            None,
+        ),
+        ("failed to load configuration: Model provider Databricks not found", None),
+        ("failed to load configuration: Model provider `` not found", None),
+        (
+            "This chat uses model provider “Databricks”, which is no longer configured.",
+            None,
+        ),
+        ("failed to load configuration: project hooks config is not a directory", None),
+    ],
+    ids=[
+        "quoted",
+        "trailing_detail",
+        "trailing_newline",
+        "longer_sentence",
+        "unquoted",
+        "empty_name",
+        "structured_wording",
+        "other_config_load",
+    ],
+)
+def test_codex_resume_legacy_unconfigured_provider_reads_plain_message(
+    message: str, missing: str | None
+) -> None:
+    """Only the plain missing-provider message names a provider to report."""
+    error = codex_native_app_server.CodexAppServerResponseError(
+        {"code": -32600, "message": message}
+    )
+
+    assert (
+        codex_native_app_server.codex_resume_legacy_unconfigured_model_provider(error) == missing
+    )
+
+
+@pytest.mark.parametrize(
     ("error", "has_rollout"),
     [
         (_PROVIDER_MISMATCH, False),
@@ -1352,6 +1398,129 @@ def test_preload_codex_thread_recovers_managed_override_after_config_read_timeou
     assert resumes[1]["modelProvider"] == "computed-provider"
     assert resumes[2]["modelProvider"] == "managed-provider"
     assert json.loads(rollout.read_text())["payload"]["model_provider"] == "managed-provider"
+    assert fake_client.closed
+
+
+def test_preload_codex_thread_restamps_structured_mismatch_before_legacy_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A structured provider mismatch is not overridden by the legacy text shape."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    rollout.write_bytes(b'{"type":"session_meta","payload":{"model_provider":"saved-provider"}}\n')
+    refusal = codex_native_app_server.CodexAppServerResponseError(
+        {
+            "code": -32600,
+            "message": "failed to load configuration: Model provider `saved-provider` not found",
+            "data": {
+                "type": "modelProviderMismatch",
+                "modelProvider": "saved-provider",
+                "currentModelProvider": "live-provider",
+            },
+        }
+    )
+    fake_client = _ConfiguredProviderResumeClient([refusal], "live-provider")
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    assert (
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+                model_provider=None,
+                rollout_path=rollout,
+            )
+        )
+        is None
+    )
+
+    resumes = [params for method, params in fake_client.requests if method == "thread/resume"]
+    assert len(resumes) == 2
+    assert resumes[1]["modelProvider"] == "live-provider"
+
+
+def test_preload_codex_thread_reports_legacy_unconfigured_provider_without_restamp(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A pre-0.166 plain refusal is diagnosed without rewriting the rollout."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    original = b'{"type":"session_meta","payload":{"model_provider":"Databricks"}}\n'
+    rollout.write_bytes(original)
+    refusal = codex_native_app_server.CodexAppServerResponseError(
+        {
+            "code": -32600,
+            "message": "failed to load configuration: Model provider `Databricks` not found",
+        }
+    )
+    fake_client = _ConfiguredProviderResumeClient([refusal], "omnigent_databricks")
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    with pytest.raises(OmnigentError) as raised:
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+                model_provider=None,
+                rollout_path=rollout,
+            )
+        )
+
+    assert "'Databricks' is no longer configured" in str(raised.value)
+    assert raised.value.code == ErrorCode.HARNESS_NOT_CONFIGURED
+    assert rollout.read_bytes() == original
+    assert [method for method, _params in fake_client.requests] == ["thread/resume"]
+    assert fake_client.closed
+
+
+def test_preload_codex_thread_reports_removed_provider_after_config_read_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A removed provider stays diagnosed when the only candidate is the same provider."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    original = b'{"type":"session_meta","payload":{"model_provider":"Databricks"}}\n'
+    rollout.write_bytes(original)
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    # The saved config still selects the provider whose table was removed, so
+    # the local recomputation names the provider Codex just refused.
+    (source_home / "config.toml").write_text('model_provider = "Databricks"\n', encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    refusal = codex_native_app_server.CodexAppServerResponseError(_PROVIDER_NOT_CONFIGURED)
+
+    class _TimeoutConfigReadClient(_ConfiguredProviderResumeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "config/read":
+                self.requests.append((method, params))
+                raise TimeoutError("config/read timed out")
+            return await super().request(method, params)
+
+    fake_client = _TimeoutConfigReadClient([refusal], None)
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    with pytest.raises(OmnigentError) as raised:
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+                model_provider=None,
+                rollout_path=rollout,
+            )
+        )
+
+    assert "'Databricks' is no longer configured" in str(raised.value)
+    assert raised.value.code == ErrorCode.HARNESS_NOT_CONFIGURED
+    assert rollout.read_bytes() == original
+    assert [method for method, _params in fake_client.requests] == ["thread/resume", "config/read"]
+    assert "Could not read Codex's effective model provider" in caplog.text
     assert fake_client.closed
 
 

@@ -14,6 +14,7 @@ import shutil
 import socket
 import subprocess
 import time
+import unicodedata
 import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
@@ -1983,6 +1984,18 @@ def _clone_codex_rollout(
     return target
 
 
+def _codex_rollout_text_is_usable(value: str) -> bool:
+    """Whether *value* can name a provider in Codex's own configuration."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        # A lone surrogate has no UTF-8 form, so no rollout can carry it.
+        return False
+    # Cc is the C0 and C1 control block; every other code point is a legal TOML
+    # key, including the non-ASCII spaces a provider name may quote.
+    return not any(unicodedata.category(character) == "Cc" for character in value)
+
+
 def _codex_rollout_provider_and_version(path: Path) -> tuple[str, str | None] | None:
     """
     Return the provider a rollout's first ``session_meta`` record already pins.
@@ -2017,7 +2030,19 @@ def _codex_rollout_provider_and_version(path: Path) -> tuple[str, str | None] | 
         return None
     if not isinstance(provider, str) or not provider.strip():
         return None
-    return provider, version if isinstance(version, str) else None
+    # A corrupt first line can decode to text no configured provider can equal:
+    # a lone surrogate makes the record unreadable, and a control character can
+    # never be a provider id. Replaying either breaks the resume.
+    if not _codex_rollout_text_is_usable(provider):
+        _logger.warning(
+            "Codex rollout %s records an unusable provider; using the launch default",
+            path.name,
+        )
+        return None
+    replayable_version = (
+        version if isinstance(version, str) and _codex_rollout_text_is_usable(version) else None
+    )
+    return provider, replayable_version
 
 
 async def _ensure_local_codex_resume_rollout(

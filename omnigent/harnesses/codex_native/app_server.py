@@ -191,6 +191,13 @@ _EFFORT_CONNECT_TIMEOUT_SECONDS = 2.0
 _EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS = 2.0
 _EFFORT_CLOSE_TIMEOUT_SECONDS = 2.0
 _MODEL_PROVIDER_READ_TIMEOUT_SECONDS = 2.0
+# Codex before 0.166 reports a missing provider as plain configuration-load text,
+# e.g. "failed to load configuration: Model provider `Databricks` not found". Only
+# that message, optionally followed by one parenthesised detail, names a provider.
+_CODEX_LEGACY_MISSING_PROVIDER = re.compile(
+    r"^failed to load configuration: Model provider `([^`\n]+)` not found"
+    r"(?:\s+\([^\n)]*\))?\s*$"
+)
 # Model discovery is a best-effort side process whose callers fall back to a
 # cached or bundled catalog, so it keeps a short readiness budget.
 _CONNECT_TIMEOUT_SECONDS = 10.0
@@ -1279,6 +1286,38 @@ def codex_resume_unconfigured_model_provider(exc: BaseException) -> str | None:
         return None
     missing = data.get("modelProvider")
     return missing if isinstance(missing, str) and missing else None
+
+
+def codex_resume_legacy_unconfigured_model_provider(exc: BaseException) -> str | None:
+    """
+    Return the provider a pre-0.166 ``thread/resume`` refused as unconfigured.
+
+    Older Codex reports the same condition as a plain configuration-load
+    failure with no structured ``data``: ``failed to load configuration: Model
+    provider `Databricks` not found``. Those builds also keep a thread's
+    provider in their own state, so rewriting the rollout cannot move the
+    thread; the caller reports the diagnosis instead of retrying.
+
+    :param exc: The exception raised by the resume request.
+    :returns: The missing provider, e.g. ``"Databricks"``, or ``None`` for any
+        other failure.
+    """
+    if not isinstance(exc, CodexAppServerResponseError) or exc.code != _CODEX_INVALID_REQUEST_CODE:
+        return None
+    message = exc.message
+    if message is None:
+        return None
+    matched = _CODEX_LEGACY_MISSING_PROVIDER.match(message)
+    return matched.group(1) if matched is not None else None
+
+
+def _codex_unconfigured_provider_error(provider: str) -> OmnigentError:
+    """Build the diagnosed refusal for a thread whose provider is gone."""
+    return OmnigentError(
+        f"Cannot resume Codex thread: provider {provider!r} is no longer configured. "
+        "Restore its provider configuration and retry this session.",
+        code=ErrorCode.HARNESS_NOT_CONFIGURED,
+    )
 
 
 def is_project_hooks_config_refusal(exc: BaseException) -> bool:
@@ -6260,6 +6299,10 @@ async def preload_codex_thread_for_resume(
         except CodexAppServerResponseError as exc:
             current_provider = codex_resume_current_model_provider(exc)
             unconfigured_provider = codex_resume_unconfigured_model_provider(exc)
+            if unconfigured_provider is None and current_provider is None:
+                legacy_missing = codex_resume_legacy_unconfigured_model_provider(exc)
+                if legacy_missing is not None:
+                    raise _codex_unconfigured_provider_error(legacy_missing) from exc
             if rollout_path is not None and unconfigured_provider is not None:
                 # The refusal names only the thread's missing provider; move the
                 # thread to the one this launch runs so the session stays resumable.
@@ -6280,12 +6323,7 @@ async def preload_codex_thread_for_resume(
                     current_provider = None
             if current_provider is None or rollout_path is None:
                 if unconfigured_provider is not None:
-                    raise OmnigentError(
-                        f"Cannot resume Codex thread: provider {unconfigured_provider!r} is no "
-                        "longer configured. Restore its provider configuration and retry "
-                        "this session.",
-                        code=ErrorCode.HARNESS_NOT_CONFIGURED,
-                    ) from exc
+                    raise _codex_unconfigured_provider_error(unconfigured_provider) from exc
                 raise
 
             async def _restamp_and_resume(provider: str) -> None:
