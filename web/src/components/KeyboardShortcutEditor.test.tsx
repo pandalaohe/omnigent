@@ -71,6 +71,33 @@ describe("KeyboardShortcutEditor", () => {
     ).toBeNull();
   });
 
+  it("shows the physical line-start keys for the active terminal modifier map", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    render(<KeyboardShortcutEditor />);
+    const summary = screen.getByText("Terminal", { selector: "summary" });
+    fireEvent.click(summary);
+    const terminal = within(summary.parentElement!);
+    const preset = terminal.getByRole("combobox", { name: "Hardware modifier mapping" });
+    const lineStart = within(terminal.getByText("Move to start of line").closest("li")!);
+    expect(preset).toHaveValue("byName");
+    expect(lineStart.queryByText(/press option\+←/i)).toBeNull();
+
+    fireEvent.change(preset, { target: { value: "swapAltCmd" } });
+    expect(lineStart.getByText(/press option\+←/i)).toBeVisible();
+    expect(terminal.getByText("Option acts as Command. Cmd acts as Option.")).toBeVisible();
+
+    fireEvent.change(preset, { target: { value: "altAsCmd" } });
+    const fallbackHint = /unassigned alt shortcuts keep their original terminal input/i;
+    expect(terminal.queryByText(fallbackHint)).toBeNull();
+
+    fireEvent.change(terminal.getByRole("combobox", { name: "Client platform" }), {
+      target: { value: "windows" },
+    });
+    expect(preset).toHaveValue("altAsCmd");
+    expect(lineStart.getByText(/press alt\+←/i)).toBeVisible();
+    expect(terminal.getByText(fallbackHint)).toBeVisible();
+  });
+
   it("sets a custom modifier map and records and restores a Windows-only terminal binding", () => {
     vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
     render(<KeyboardShortcutEditor />);
@@ -96,6 +123,7 @@ describe("KeyboardShortcutEditor", () => {
         },
       },
     });
+    expect(screen.getByText("Press Alt+Shift+A")).toBeVisible();
     expect(readKeyboardShortcutPreferences().actions).toEqual({});
     fireEvent.change(screen.getByRole("combobox", { name: "Client platform" }), {
       target: { value: "linux" },

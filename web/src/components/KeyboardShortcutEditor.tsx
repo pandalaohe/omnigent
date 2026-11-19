@@ -50,6 +50,7 @@ import {
   writeMacWindowsKeyPositions,
   writeShortcutPreference,
   type ShortcutActionId,
+  type ModifierMap,
   type ModifierRole,
   type ShortcutChord,
   type ShortcutGroupId,
@@ -78,7 +79,54 @@ const TERMINAL_PHYSICAL_MODIFIERS = [
   ["alt", "Physical Alt / Option"],
   ["meta", "Physical Win / Cmd / Super"],
 ] as const;
+const TERMINAL_PHYSICAL_NAMES = {
+  macos: { ctrl: "Ctrl", alt: "Option", meta: "Cmd" },
+  windows: { ctrl: "Ctrl", alt: "Alt", meta: "Win" },
+  linux: { ctrl: "Ctrl", alt: "Alt", meta: "Super" },
+} satisfies Record<ShortcutPlatform, Record<keyof ModifierMap, string>>;
 const TERMINAL_SELECT_CLASS = "h-9 rounded-md border border-border bg-background px-2 text-ui";
+
+function remappedTerminalBindingLabels(
+  binding: ShortcutChord,
+  map: ModifierMap,
+  platform: ShortcutPlatform,
+): string[] {
+  const roleForModifier = {
+    control: "ctrl",
+    alt: "alt",
+    meta: "cmd",
+    primary: platform === "macos" ? "cmd" : "ctrl",
+  } as const;
+  const roles = new Set(
+    binding.modifiers.flatMap((modifier) =>
+      modifier === "shift" ? [] : [roleForModifier[modifier]],
+    ),
+  );
+  let choices: (keyof ModifierMap)[][] = [[]];
+  for (const role of roles) {
+    const sources = TERMINAL_PHYSICAL_MODIFIERS.filter(([physical]) => map[physical] === role);
+    choices = choices.flatMap((choice) => sources.map(([physical]) => [...choice, physical]));
+  }
+  const [key] = shortcutBindingLabels({ ...binding, modifiers: [] }, platform);
+  const shift = binding.modifiers.includes("shift") ? ["Shift"] : [];
+  return choices
+    .filter((choice) =>
+      choice.some((physical) => map[physical] !== TERMINAL_MODIFIER_PRESETS.byName[physical]),
+    )
+    .filter(
+      (choice) => platform !== "windows" || !(choice.includes("ctrl") && choice.includes("alt")),
+    )
+    .map((choice) => {
+      const modifiers = TERMINAL_PHYSICAL_MODIFIERS.filter(([physical]) =>
+        choice.includes(physical),
+      );
+      return [
+        ...modifiers.map(([physical]) => TERMINAL_PHYSICAL_NAMES[platform][physical]),
+        ...shift,
+        key,
+      ].join("+");
+    });
+}
 
 function terminalSaveError(result: ReturnType<typeof writeTerminalKeyboardPreferences>) {
   if (result === "saved") return null;
@@ -191,6 +239,16 @@ export function KeyboardShortcutEditor() {
     terminalPreferences.modifierMap?.[terminalPlatform] ??
     defaultTerminalModifierMap(terminalPlatform);
   const terminalPreset = terminalModifierPreset(terminalMap);
+  const physicalNames = TERMINAL_PHYSICAL_NAMES[terminalPlatform];
+  const roleNames = { ctrl: "Ctrl", alt: physicalNames.alt, cmd: "Command" };
+  const terminalMapHints = TERMINAL_PHYSICAL_MODIFIERS.flatMap(([physical]) =>
+    terminalMap[physical] === TERMINAL_MODIFIER_PRESETS.byName[physical]
+      ? []
+      : [`${physicalNames[physical]} acts as ${roleNames[terminalMap[physical]]}.`],
+  );
+  if (terminalPlatform === "windows" && terminalPreset === "altAsCmd") {
+    terminalMapHints.push("Unassigned Alt shortcuts keep their original terminal input.");
+  }
   const mapChanged =
     terminalPreset !== terminalModifierPreset(defaultTerminalModifierMap(terminalPlatform));
   const matchesTerminalMap =
@@ -721,11 +779,9 @@ export function KeyboardShortcutEditor() {
                   <option value="custom">Custom</option>
                 </select>
               </label>
-              <p className="mt-1 text-xs text-muted-foreground">
-                {terminalPreset === "altAsCmd"
-                  ? "Alt and Win/Cmd can invoke Command shortcuts. Other Alt chords keep their original terminal input."
-                  : "Win, Super and Cmd share a physical modifier role. Alt and Option share another."}
-              </p>
+              {terminalMapHints.length > 0 && (
+                <p className="mt-1 text-xs text-muted-foreground">{terminalMapHints.join(" ")}</p>
+              )}
               {(editingCustomMap || !terminalPreset) && (
                 <div className="mt-2 grid gap-2">
                   {TERMINAL_PHYSICAL_MODIFIERS.map(([physical, label]) => (
@@ -760,16 +816,27 @@ export function KeyboardShortcutEditor() {
                 const { label } = TERMINAL_BINDINGS[id];
                 const binding = terminalPreferences.bindings?.[id];
                 const hasOverride = binding?.platformOverrides?.[terminalPlatform] !== undefined;
+                const bindings = terminalBindingsFor(terminalPreferences, id, terminalPlatform);
+                const physicalBindings = bindings.flatMap((chord) =>
+                  remappedTerminalBindingLabels(chord, terminalMap, terminalPlatform),
+                );
                 return (
                   <li
                     key={id}
                     className="flex flex-wrap items-center gap-2 border-b border-border/60 py-1.5 last:border-b-0 phone:min-h-11"
                   >
-                    <span className="min-w-32 flex-1 text-ui">{label}</span>
+                    <div className="min-w-32 flex-1 text-ui">
+                      <span>{label}</span>
+                      {physicalBindings.length > 0 && (
+                        <p className="text-xs text-muted-foreground">
+                          Press {physicalBindings.join(" or ")}
+                        </p>
+                      )}
+                    </div>
                     <ShortcutBindingButton
                       label={label}
                       platform={terminalPlatform}
-                      bindings={terminalBindingsFor(terminalPreferences, id, terminalPlatform)}
+                      bindings={bindings}
                       recording={
                         recording !== null &&
                         "terminalId" in recording &&

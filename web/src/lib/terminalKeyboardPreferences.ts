@@ -173,6 +173,10 @@ export function terminalHardwareKeyAction(
     }
   }
   if (!logical.remapped) return null;
-  if (logical.cmd) return terminalModifierPreset(map) === "altAsCmd" ? null : { bytes: "" };
+  if (logical.cmd) {
+    return platform === "windows" && terminalModifierPreset(map) === "altAsCmd"
+      ? null
+      : { bytes: "" };
+  }
   return { bytes: encodeLogicalTerminalKey(input) };
 }
