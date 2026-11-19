@@ -19,6 +19,7 @@ function makeSessionMock(focused = false) {
     sendSoftKey: vi.fn(),
     sendBarSequence: vi.fn(),
     sendBarChord: vi.fn(),
+    runClipboardAction: vi.fn(),
     cancelBarWrites: vi.fn(),
     runBarKey: vi.fn((send: () => void) => send()),
     setStickyModifiers: vi.fn((next: TerminalStickyModifiers) => {
@@ -115,7 +116,7 @@ describe("TerminalKeyRow", () => {
     vi.useFakeTimers();
     const { session, sessionRef } = makeSessionMock(true);
     render(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={true} />);
-    const ctrl = screen.getByRole("button", { name: "Ctrl" });
+    const ctrl = screen.getByRole("button", { name: /^Ctrl,/ });
     expect(ctrl).toHaveAttribute("aria-pressed", "false");
     tapButton(ctrl);
     expect(ctrl).toHaveAttribute("data-sticky-state", "once");
@@ -165,8 +166,8 @@ describe("TerminalKeyRow", () => {
     ];
     render(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} surface={surface} />);
     fireEvent.click(screen.getByRole("button", { name: "Escape" }));
-    fireEvent.click(screen.getByRole("button", { name: "Command" }));
-    fireEvent.click(screen.getByRole("button", { name: "Line start" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Command,/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Line start,/ }));
     expect(session.sendBarSequence.mock.calls).toEqual([
       ["\\e", false],
       ["echo ok", true],
@@ -176,6 +177,53 @@ describe("TerminalKeyRow", () => {
       modifiers: ["meta"],
     });
     expect(screen.getByRole("button", { name: "Future, Needs a newer version" })).toBeDisabled();
+  });
+
+  it("renders an agent icon and runs clipboard keys only for whole taps", () => {
+    vi.useFakeTimers();
+    const { session, sessionRef } = makeSessionMock();
+    const surface = fromBar322(barWith([]));
+    surface.top.keys = [
+      {
+        id: "copy",
+        label: "Copy tool",
+        width: 2,
+        display: "icon",
+        icon: "agent-pi",
+        repeat: true,
+        action: { type: "clipboard", op: "copy" },
+      },
+      {
+        id: "paste",
+        label: "Paste tool",
+        width: 2,
+        display: "text",
+        action: { type: "clipboard", op: "paste", autoEnter: true },
+      },
+      {
+        id: "paste-host",
+        label: "Host tool",
+        width: 2,
+        display: "text",
+        action: { type: "clipboard", op: "pasteHost", autoEnter: false },
+      },
+    ];
+    render(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} surface={surface} />);
+    const copy = screen.getByRole("button", { name: "Copy tool" });
+    expect(copy.querySelector("svg")).not.toBeNull();
+    fireEvent.pointerDown(copy, { button: 0, pointerId: 7, clientX: 20, clientY: 20 });
+    act(() => vi.advanceTimersByTime(2000));
+    expect(session.runClipboardAction).not.toHaveBeenCalled();
+    fireEvent.pointerUp(copy, { pointerId: 7, clientX: 20, clientY: 20 });
+    expect(session.runClipboardAction).not.toHaveBeenCalled();
+    tapButton(copy);
+    tapButton(screen.getByRole("button", { name: "Paste tool" }));
+    tapButton(screen.getByRole("button", { name: "Host tool" }));
+    expect(session.runClipboardAction.mock.calls).toEqual([
+      ["copy", { keyId: "copy", enter: false }],
+      ["paste", { keyId: "paste", enter: true }],
+      ["pasteHost", { keyId: "paste-host", enter: false }],
+    ]);
   });
 
   it("supports a Tap locks modifier and Shift in the sticky state", () => {
@@ -205,7 +253,7 @@ describe("TerminalKeyRow", () => {
         ])}
       />,
     );
-    const key = screen.getByRole("button", { name: "Shift" });
+    const key = screen.getByRole("button", { name: /^Shift,/ });
     tapButton(key);
     expect(key).toHaveAttribute("data-sticky-state", "locked");
     tapButton(key, 2);
@@ -222,7 +270,7 @@ describe("TerminalKeyRow", () => {
     const { unmount, rerender } = render(
       <TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} identityKey="a" />,
     );
-    tapButton(screen.getByRole("button", { name: "Ctrl" }));
+    tapButton(screen.getByRole("button", { name: /^Ctrl,/ }));
     tapButton(screen.getByRole("button", { name: "←" }));
     expect(session.sendSoftKey).toHaveBeenLastCalledWith("arrowLeft", undefined, {
       focus: false,
@@ -230,9 +278,9 @@ describe("TerminalKeyRow", () => {
     });
     const listener = session.onStickyConsumed.mock.calls[0][0];
     act(() => listener({ ctrl: "off", alt: "locked", shift: "off" }));
-    expect(screen.getByRole("button", { name: "Ctrl" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: /^Ctrl,/ })).toHaveAttribute("aria-pressed", "false");
 
-    tapButton(screen.getByRole("button", { name: "Ctrl" }), 3);
+    tapButton(screen.getByRole("button", { name: /^Ctrl,/ }), 3);
     act(() => {
       Object.defineProperty(document, "visibilityState", {
         configurable: true,
@@ -245,14 +293,14 @@ describe("TerminalKeyRow", () => {
       alt: "off",
       shift: "off",
     });
-    expect(screen.getByRole("button", { name: "Ctrl" })).toHaveAttribute(
+    expect(screen.getByRole("button", { name: /^Ctrl,/ })).toHaveAttribute(
       "data-sticky-state",
       "off",
     );
     Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
-    tapButton(screen.getByRole("button", { name: "Ctrl" }), 4);
+    tapButton(screen.getByRole("button", { name: /^Ctrl,/ }), 4);
     rerender(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} identityKey="b" />);
-    expect(screen.getByRole("button", { name: "Ctrl" })).toHaveAttribute(
+    expect(screen.getByRole("button", { name: /^Ctrl,/ })).toHaveAttribute(
       "data-sticky-state",
       "off",
     );
@@ -567,7 +615,7 @@ describe("TerminalKeyRow", () => {
     render(
       <TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} bar={barWith([ctrl, text])} />,
     );
-    tapButton(screen.getByRole("button", { name: "Ctrl" }));
+    tapButton(screen.getByRole("button", { name: /^Ctrl,/ }));
     session.setStickyModifiers.mockClear();
     tapButton(screen.getByRole("button", { name: "OK" }));
     expect(session.sendSoftKey).toHaveBeenCalledWith("enter", "ok\r", { focus: false });

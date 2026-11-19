@@ -117,6 +117,32 @@ export function terminalBindingsFor(
 
 type TerminalHardwareKeyAction = { bytes: string } | { clipboard: "copy" | "paste" } | null;
 
+type LogicalShortcutEvent = ReturnType<typeof shortcutEventFromLogicalKey>;
+
+export function terminalBindingBytes(
+  input: LogicalShortcutEvent,
+  preferences: TerminalKeyboardPreferences,
+  platform: ShortcutPlatform,
+): string | undefined {
+  const binding = TERMINAL_BINDING_IDS.find((id) =>
+    terminalBindingsFor(preferences, id, platform).some((shortcut) =>
+      eventMatchesShortcut(input, shortcut, platform),
+    ),
+  );
+  return binding && TERMINAL_BINDINGS[binding].bytes;
+}
+
+export function encodeLogicalTerminalKey(input: LogicalShortcutEvent): string {
+  // Resolve control characters and named keys from the logical character. Keep
+  // the actual character for printable input on non-US layouts and Caps Lock.
+  const chord = shortcutChordFromEvent({ ...input, code: "" });
+  const bytes = chord && terminalDataForChord(chord);
+  const printable = !input.ctrlKey && Array.from(input.key).length === 1;
+  const expected = input.altKey ? `\x1b${input.key}` : input.key;
+  if (bytes !== null && (!printable || bytes === expected)) return bytes;
+  return keyEventToSequence(input);
+}
+
 /** A null action lets xterm interpret the physical input. Empty bytes claim it without sending. */
 export function terminalHardwareKeyAction(
   event: KeyboardEvent,
@@ -130,12 +156,8 @@ export function terminalHardwareKeyAction(
   const input = shortcutEventFromLogicalKey(logical);
   const chord = shortcutChordFromEvent(input);
   if (!chord) return null;
-  const binding = TERMINAL_BINDING_IDS.find((id) =>
-    terminalBindingsFor(preferences, id, platform).some((shortcut) =>
-      eventMatchesShortcut(input, shortcut, platform),
-    ),
-  );
-  if (binding) return { bytes: TERMINAL_BINDINGS[binding].bytes };
+  const bindingBytes = terminalBindingBytes(input, preferences, platform);
+  if (bindingBytes !== undefined) return { bytes: bindingBytes };
 
   if (
     logical.remapped &&
@@ -152,9 +174,5 @@ export function terminalHardwareKeyAction(
   }
   if (!logical.remapped) return null;
   if (logical.cmd) return terminalModifierPreset(map) === "altAsCmd" ? null : { bytes: "" };
-  // Reuse the chord encoder for the full set of Ctrl control bytes. For printable
-  // keys, resolve the chord from the logical character rather than the US key position.
-  const characterChord = shortcutChordFromEvent({ ...input, code: "" });
-  const controlBytes = logical.ctrl && characterChord && terminalDataForChord(characterChord);
-  return { bytes: controlBytes || keyEventToSequence(input) };
+  return { bytes: encodeLogicalTerminalKey(input) };
 }

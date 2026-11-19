@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { toast } from "sonner";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -17,100 +17,195 @@ import {
 import { buildTerminalKeyPreferences, fromBar322, resolveTerminalKeys } from "@/lib/terminalKeys";
 import * as preferencesSync from "@/lib/userPreferencesSync";
 
-vi.mock("sonner", () => ({ toast: vi.fn() }));
+vi.mock("sonner", () => ({ toast: Object.assign(vi.fn(), { error: vi.fn() }) }));
 
-function pickCombobox(label: string, query: string, option: string | RegExp) {
-  const input = screen.getByRole("combobox", { name: label });
-  fireEvent.change(input, { target: { value: query } });
-  fireEvent.click(screen.getByRole("option", { name: option }));
+function storedKeys() {
+  return resolveTerminalKeys({ ...readMobileAssistantPreferences() }).keys;
+}
+
+function openNative() {
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Native terminal" }), { button: 0 });
+}
+
+function addKey() {
+  fireEvent.click(screen.getAllByRole("button", { name: "Add key" }).at(-1)!);
+}
+
+function chooseFunction(value: string) {
+  fireEvent.change(screen.getByLabelText("Function"), { target: { value } });
 }
 
 describe("MobileAssistantSettings", () => {
   beforeEach(() => {
     localStorage.clear();
     vi.restoreAllMocks();
+    vi.clearAllMocks();
   });
 
-  it("edits the terminal bar, adds a chord by tap, moves it across rows, and persists both switches", () => {
-    localStorage.clear();
+  it("records Ctrl+B, pages through icons, and moves and deletes the saved key", () => {
     render(<MobileAssistantSettings />);
     const chat = readMobileAssistantPreferences().buttons;
     expect(screen.getByText(/Top row · 1 page/)).toBeTruthy();
     expect(screen.getByText(/Bottom row · 2 pages/)).toBeTruthy();
-    fireEvent.click(screen.getAllByRole("button", { name: "Add key" }).at(-1)!);
-    pickCombobox("More keys", "R", /^R\s*Letters/);
-    fireEvent.click(screen.getByRole("button", { name: "Ctrl" }));
-    fireEvent.click(screen.getByRole("button", { name: "Shift" }));
+    addKey();
+    fireEvent.click(screen.getByRole("button", { name: "Record" }));
+    fireEvent.keyDown(window, { key: "b", code: "KeyB", ctrlKey: true });
+    expect(screen.getByLabelText("Send sequence")).toHaveValue("^B");
+    expect(screen.getByLabelText("Label")).toHaveValue("ctrl+b");
+    fireEvent.click(screen.getByRole("radio", { name: "Icon" }));
+    const icons = within(screen.getByRole("group", { name: "Terminal key icons" }));
+    for (const page of [1, 2, 3]) {
+      expect(icons.getByText(`Page ${page} of 3`, { exact: false })).toBeVisible();
+      expect(
+        icons.getAllByRole("button", { pressed: false }).length +
+          icons.queryAllByRole("button", { pressed: true }).length,
+      ).toBe(24);
+      if (page < 3) fireEvent.click(icons.getByRole("button", { name: "Next icon page" }));
+    }
+    fireEvent.click(icons.getByRole("button", { name: "Previous icon page" }));
+    fireEvent.click(icons.getByRole("button", { name: "codex" }));
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    const added = readMobileAssistantPreferences().terminalBar!.bottom.keys.at(-1)!;
+    const added = storedKeys().shell.bottom.keys.at(-1)!;
     expect(added).toMatchObject({
-      kind: "key",
       width: 2,
-      chord: { code: "KeyR", modifiers: ["control", "shift"] },
-      label: "Ctrl+Shift+R",
+      label: "ctrl+b",
+      icon: "agent-codex",
+      display: "icon",
+      action: { type: "send", send: "^B" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /^Edit Ctrl\+Shift\+R, 2 cells/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Edit ctrl\+b, 2 cells/ }));
     fireEvent.click(screen.getByRole("button", { name: "Move to other row" }));
-    expect(
-      readMobileAssistantPreferences().terminalBar!.top.keys.some((key) => key.id === added.id),
-    ).toBe(true);
+    expect(storedKeys().shell.top.keys.some((key) => key.id === added.id)).toBe(true);
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    fireEvent.click(screen.getByRole("switch", { name: "Enable terminal key rows" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Show key bar on this page" }));
     fireEvent.click(screen.getByRole("switch", { name: "Show bottom terminal key row" }));
     expect(readMobileAssistantPreferences()).toMatchObject({
       buttons: chat,
       terminalKeysEnabled: false,
       terminalSecondRow: false,
     });
-    expect(readMobileAssistantPreferences().buttons).toEqual(chat);
-    fireEvent.click(screen.getByRole("button", { name: /^Edit Ctrl\+Shift\+R, 2 cells/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Edit ctrl\+b, 2 cells/ }));
     fireEvent.click(screen.getByRole("button", { name: "Delete key" }));
-    expect(
-      readMobileAssistantPreferences().terminalBar!.top.keys.some((key) => key.id === added.id),
-    ).toBe(false);
+    expect(storedKeys().shell.top.keys.some((key) => key.id === added.id)).toBe(false);
   });
 
-  it("pins leading keys with the stepper and refuses an unsupported terminal chord", () => {
-    localStorage.clear();
+  it("stops recording without changing the field and shows refusals while listening", () => {
     render(<MobileAssistantSettings />);
-    fireEvent.click(screen.getByRole("button", { name: "Pin one more bottom row key" }));
-    expect(readMobileAssistantPreferences().terminalBar!.bottom.pinned).toBe(1);
-    const tab = readMobileAssistantPreferences().terminalBar!.bottom.keys[0];
-    expect(tab.id).toBe("tab");
-    expect(screen.getByRole("button", { name: /^Edit Tab, 2 cells, pinned/ })).toBeInTheDocument();
-
-    fireEvent.click(screen.getAllByRole("button", { name: "Add key" }).at(-1)!);
-    fireEvent.click(screen.getByRole("button", { name: "Tab" }));
-    fireEvent.click(screen.getByRole("button", { name: "Ctrl" }));
-    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
-    expect(screen.getByText(/Not supported in terminals/)).toBeVisible();
-    pickCombobox("More keys", "R", /^R\s*Letters/);
-    fireEvent.click(screen.getByRole("button", { name: "Shift" }));
-    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
-    expect(screen.queryByText(/Not supported in terminals/)).toBeNull();
+    addKey();
+    fireEvent.change(screen.getByLabelText("Send sequence"), { target: { value: "text" } });
+    fireEvent.click(screen.getByRole("button", { name: "Record" }));
+    fireEvent.keyDown(window, { key: "b", code: "KeyB", repeat: true });
+    fireEvent.keyDown(window, { key: "Shift", code: "ShiftLeft" });
+    fireEvent.keyDown(window, { key: "MediaPlayPause", code: "MediaPlayPause" });
+    expect(screen.getByText("This key has no terminal sequence.")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    expect(screen.getByLabelText("Send sequence")).toHaveValue("text");
+    fireEvent.click(screen.getByRole("button", { name: "Record" }));
+    fireEvent.blur(window);
+    expect(screen.getByRole("button", { name: "Record" })).toBeVisible();
   });
 
-  it("saves modified arrows in the terminal bar", () => {
-    localStorage.clear();
+  it("captures a Cmd token and saves paste and special-key options", () => {
     render(<MobileAssistantSettings />);
-    fireEvent.click(screen.getAllByRole("button", { name: "Add key" }).at(-1)!);
-    fireEvent.click(screen.getByRole("button", { name: "↑" }));
-    fireEvent.click(screen.getByRole("button", { name: "Ctrl" }));
-    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    openNative();
+    addKey();
+    fireEvent.click(screen.getByRole("button", { name: "Record" }));
+    fireEvent.keyDown(window, { key: "ArrowLeft", code: "ArrowLeft", metaKey: true });
+    expect(screen.getByText("⌘← → Move to start of line")).toBeVisible();
+    expect(screen.queryByRole("switch", { name: "Send Enter after" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    expect(readMobileAssistantPreferences().terminalBar!.bottom.keys.at(-1)).toMatchObject({
-      kind: "key",
-      chord: { code: "ArrowUp", modifiers: ["control"] },
+    expect(storedKeys().native.bottom.keys.at(-1)?.action).toEqual({
+      type: "combo",
+      chord: { code: "ArrowLeft", modifiers: ["meta"] },
+    });
+    addKey();
+    chooseFunction("clipboard");
+    fireEvent.change(screen.getByLabelText("Clipboard action"), { target: { value: "pasteHost" } });
+    expect(screen.getByRole("switch", { name: "Press Enter after one line" })).toBeChecked();
+    expect(screen.queryByRole("switch", { name: "Repeat on hold" })).toBeNull();
+    fireEvent.click(screen.getByRole("switch", { name: "Press Enter after one line" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(storedKeys().native.bottom.keys.at(-1)?.action).toEqual({
+      type: "clipboard",
+      op: "pasteHost",
+      autoEnter: false,
+    });
+    addKey();
+    chooseFunction("special");
+    fireEvent.change(screen.getByLabelText("Special key"), { target: { value: "cmd" } });
+    fireEvent.click(screen.getByRole("switch", { name: "Keep held until tapped again" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(storedKeys().native.bottom.keys.at(-1)?.action).toEqual({
+      type: "special",
+      special: "cmd",
+      keepHeld: true,
     });
   });
 
-  it("uses the shared help control for terminal rows and closes it on a second tap", () => {
+  it("pins leading keys and keeps legacy text literal until the function is changed", () => {
+    const bar = defaultTerminalBar();
+    bar.top.keys[0] = {
+      id: "legacy",
+      label: "Legacy",
+      display: "text",
+      width: 2,
+      kind: "text",
+      text: "^C",
+    };
+    const terminalButtons = projectLegacy(bar);
+    writeMobileAssistantPreferences({
+      version: 2,
+      enabled: true,
+      buttons: [],
+      terminalBar: bar,
+      terminalButtons,
+      terminalLegacyBasis: legacyFingerprint(terminalButtons, true),
+    });
     render(<MobileAssistantSettings />);
-    const help = screen.getByRole("button", { name: "About Terminal key rows" });
-    fireEvent.click(help);
-    expect(screen.getByText(/Show keys above the phone keyboard/)).toBeVisible();
-    fireEvent.click(help);
-    expect(screen.queryByText(/Show keys above the phone keyboard/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Pin one more bottom row key" }));
+    expect(storedKeys().shell.bottom.pinned).toBe(1);
+    fireEvent.click(screen.getByRole("button", { name: /^Edit Legacy,/ }));
+    expect(screen.getByText("Kept from the previous editor: ^C")).toBeVisible();
+    fireEvent.change(screen.getByLabelText("Label"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByRole("radio", { name: "1 cell" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(storedKeys().shell.top.keys[0]).toMatchObject({
+      label: "Renamed",
+      width: 1,
+      action: { type: "legacy", key: { kind: "text", text: "^C" } },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^Edit Renamed,/ }));
+    chooseFunction("send");
+    expect(screen.getByLabelText("Send sequence")).toHaveValue("\\x5eC");
+    expect(screen.getByText("^C", { selector: "code" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(storedKeys().shell.top.keys[0].action).toEqual({ type: "send", send: "\\x5eC" });
+  });
+
+  it("copies only rows and undoes the copy without touching either page’s switches or presets", () => {
+    render(<MobileAssistantSettings />);
+    const original = storedKeys().native;
+    fireEvent.click(screen.getByRole("button", { name: "Pin one more bottom row key" }));
+    openNative();
+    fireEvent.click(screen.getByRole("switch", { name: "Show key bar on this page" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Only while the phone keyboard is up" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save as my preset" }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy from Shell" }));
+    const { shell, native } = storedKeys();
+    expect(native).toMatchObject({ enabled: false, showRows: "keyboard", bottom: shell.bottom });
+    const undo = vi.mocked(toast).mock.calls.at(-1)?.[1]?.action;
+    act(() => {
+      if (undo && typeof undo === "object" && "onClick" in undo) undo.onClick({} as never);
+    });
+    expect(storedKeys().native).toMatchObject({
+      enabled: false,
+      showRows: "keyboard",
+      bottom: original.bottom,
+    });
+    expect(storedKeys().shell).toEqual(shell);
+    expect(readMobileAssistantPreferences().terminalKeysPreset).toMatchObject({
+      native: { bottom: original.bottom },
+    });
   });
 
   it("round-trips a preset and undoes defaults without reverting an unrelated switch", () => {
@@ -127,7 +222,7 @@ describe("MobileAssistantSettings", () => {
     fireEvent.click(screen.getByRole("button", { name: "Restore defaults" }));
     const undo = vi.mocked(toast).mock.calls.at(-1)?.[1]?.action;
     expect(undo && typeof undo === "object" && "onClick" in undo).toBe(true);
-    fireEvent.click(screen.getByRole("switch", { name: "Enable terminal key rows" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Show key bar on this page" }));
     act(() => {
       if (undo && typeof undo === "object" && "onClick" in undo) undo.onClick({} as never);
     });
@@ -146,12 +241,13 @@ describe("MobileAssistantSettings", () => {
     localStorage.setItem("omnigent:mobile-assistant-preferences", JSON.stringify(raw));
     expect(readMobileAssistantPreferences().terminalButtons).toBeUndefined();
     render(<MobileAssistantSettings />);
-    expect(screen.getByText(/showing the default keys/)).toBeVisible();
+    expect(screen.getByText(/Saved terminal key layouts couldn’t be read/)).toBeVisible();
     expect(JSON.parse(localStorage.getItem("omnigent:mobile-assistant-preferences")!)).toEqual(raw);
-    fireEvent.click(screen.getByRole("switch", { name: "Enable native terminal key rows" }));
+    openNative();
+    fireEvent.click(screen.getByRole("switch", { name: "Show key bar on this page" }));
     expect(readMobileAssistantPreferences().terminalKeys?.shell.enabled).toBe(true);
     expect(readMobileAssistantPreferences().terminalKeys?.native.enabled).toBe(false);
-    expect(screen.queryByText(/showing the default keys/)).toBeNull();
+    expect(screen.queryByText(/Saved terminal key layouts couldn’t be read/)).toBeNull();
   });
 
   it.each([
@@ -196,10 +292,11 @@ describe("MobileAssistantSettings", () => {
     ).toBe(bytes);
     const writeLocal = vi.spyOn(Storage.prototype, "setItem");
     const queuePatch = vi.spyOn(preferencesSync, "queueUserPreferencePatch");
+    if (edit === "native switch") openNative();
     const control =
       edit === "preset"
         ? screen.getByRole("button", { name: "Save as my preset" })
-        : screen.getByRole("switch", { name: "Enable native terminal key rows" });
+        : screen.getByRole("switch", { name: "Show key bar on this page" });
     fireEvent.click(control);
     if (bytes === 65_536) {
       expect(readMobileAssistantPreferences().terminalBarPreset).toEqual(bar);

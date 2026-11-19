@@ -956,7 +956,7 @@ describe("SettingsPage", () => {
     const shortcuts = renderPage("/settings/shortcuts");
     expect(screen.getByRole("heading", { name: "Keyboard shortcuts" })).toBeInTheDocument();
     expect(screen.getByTestId("session-navigation-settings")).toBeInTheDocument();
-    expect(screen.getByLabelText("Enable terminal key rows")).toBeInTheDocument();
+    expect(screen.getByLabelText("Show key bar on this page")).toBeInTheDocument();
     shortcuts.unmount();
 
     const navigation = renderPage("/settings/navigation");
@@ -966,7 +966,7 @@ describe("SettingsPage", () => {
 
     renderPage("/settings/mobile-controls");
     expect(screen.getByRole("heading", { name: "Keyboard shortcuts" })).toBeInTheDocument();
-    expect(screen.getByLabelText("Enable terminal key rows")).toBeInTheDocument();
+    expect(screen.getByLabelText("Show key bar on this page")).toBeInTheDocument();
   });
 
   it("opens the embedded host's theme settings in a new tab", () => {

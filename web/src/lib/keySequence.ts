@@ -107,7 +107,7 @@ export function keyEventToSequence(
   else if (e.key === "Tab") ch = e.shiftKey ? "\x1b[Z" : "\t";
   else if (e.key === "Backspace") ch = "\x7f";
   else if (e.key === "Enter") ch = "\r";
-  else if (e.key.length === 1) {
+  else if (Array.from(e.key).length === 1) {
     ch = e.key;
     if (ctrl) {
       const code = ch.toUpperCase().charCodeAt(0) - 64;
@@ -132,7 +132,9 @@ export function keyEventToSequence(
   return ch;
 }
 
-export function keyEventToLabel(e: KeyboardEvent): string {
+export function keyEventToLabel(
+  e: Pick<KeyboardEvent, "key" | "ctrlKey" | "altKey" | "shiftKey" | "metaKey">,
+): string {
   const parts: string[] = [];
   if (e.ctrlKey) parts.push("ctrl");
   if (e.metaKey) parts.push("cmd");
