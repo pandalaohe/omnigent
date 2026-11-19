@@ -263,6 +263,7 @@ def clipboard_browser(
     )
     browser_contract.json("/v1/extensions", empty_list)
     browser_contract.json("/v1/harnesses", {"data": [], "setup_steps": {}})
+    browser_contract.json("/v1/model-connections", {"connections": [], "can_manage": False})
     browser_contract.json("/v1/sessions/projects", [])
     browser_contract.json("/v1/sessions", session_list)
 
