@@ -19,11 +19,20 @@ import { withBasePath } from "@/lib/basePath";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
 import {
   terminalDataForChord,
-  type TerminalSoftKeyEventDetail,
+  type MobileAssistantSoftKey,
   type TerminalStickyState,
   type TerminalStickyModifiers,
 } from "@/lib/mobileAssistantPreferences";
 import type { ShortcutChord } from "@/lib/keyboardShortcutPreferences";
+import {
+  isArmedModifier,
+  chordForSequence,
+  encodeChord,
+  encodeTerminalData,
+  resolveSend,
+  SPLIT_LONE_ESC_MS,
+  splitTerminalWrites,
+} from "@/lib/terminalKeys";
 import { TerminalImeInput } from "./TerminalImeInput";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { terminalSurfaceColors } from "@/lib/terminalPalette";
@@ -44,11 +53,11 @@ export type StickyState = TerminalStickyState;
 export type StickyModifiers = TerminalStickyModifiers;
 
 export function terminalSoftKeyPayload(
-  action: TerminalSoftKeyEventDetail["action"],
+  action: MobileAssistantSoftKey,
   applicationCursor: boolean,
 ): string {
   const prefix = applicationCursor ? "\u001bO" : "\u001b[";
-  const payloads: Record<TerminalSoftKeyEventDetail["action"], string> = {
+  const payloads: Record<MobileAssistantSoftKey, string> = {
     escape: "\u001b",
     tab: "\t",
     enter: "\r",
@@ -734,6 +743,8 @@ export class TerminalSession {
   private readonly imeInput: TerminalImeInput;
   private stickyModifiers: StickyModifiers = { ctrl: "off", alt: "off", shift: "off" };
   private readonly stickyListeners = new Set<(next: StickyModifiers) => void>();
+  private readonly queuedBarKeys: (() => void)[] = [];
+  private barWriteTimer: ReturnType<typeof setTimeout> | null = null;
   private sendingSoftKey = false;
   private imeAnchor: Detached | null = null;
   /** Start of the tracked one-finger touch, or ``null`` when none is active. */
@@ -934,7 +945,8 @@ export class TerminalSession {
     this.imeInput = new TerminalImeInput(this.term);
     this.dataDispose = this.term.onData((d) => {
       if (!this.imeInput.consumeData(d)) {
-        sendInput(this.sendingSoftKey ? d : this.applyStickyModifiers(d));
+        const input = this.sendingSoftKey ? d : this.applyStickyModifiers(d);
+        if (input) sendInput(input);
       }
     });
 
@@ -1074,16 +1086,24 @@ export class TerminalSession {
 
   /** Feed a mobile assistant key or text payload through xterm's normal onData path. */
   sendSoftKey(
-    action: TerminalSoftKeyEventDetail["action"],
+    action: MobileAssistantSoftKey,
     data?: string,
     options?: { focus?: boolean; chord?: ShortcutChord },
   ): void {
     if (!this.imeInput.beforeSoftKey()) return;
     let payload = data;
     if (options?.chord) {
+      if (
+        isArmedModifier(this.stickyModifiers, "cmd") ||
+        isArmedModifier(this.stickyModifiers, "win")
+      ) {
+        this.sendBarChord(options.chord);
+        return;
+      }
       const modifiers = [...options.chord.modifiers];
       if (this.stickyModifiers.ctrl !== "off") modifiers.push("control");
-      if (this.stickyModifiers.alt !== "off") modifiers.push("alt");
+      if (this.stickyModifiers.alt !== "off" || isArmedModifier(this.stickyModifiers, "opt"))
+        modifiers.push("alt");
       if (this.stickyModifiers.shift !== "off") modifiers.push("shift");
       const encoded = terminalDataForChord(
         { ...options.chord, modifiers },
@@ -1112,6 +1132,46 @@ export class TerminalSession {
     }
   }
 
+  runBarKey(send: () => void, repeat: boolean): void {
+    if (this.barWriteTimer === null) send();
+    else if (!repeat) this.queuedBarKeys.push(send);
+  }
+
+  cancelBarWrites(): void {
+    if (this.barWriteTimer !== null) clearTimeout(this.barWriteTimer);
+    this.barWriteTimer = null;
+    this.queuedBarKeys.length = 0;
+  }
+
+  sendBarSequence(send: string, autoEnter: boolean): void {
+    this.sendBarOutput(
+      resolveSend(send, autoEnter, this.stickyModifiers, this.term.modes.applicationCursorKeysMode),
+    );
+  }
+
+  sendBarChord(chord: ShortcutChord): void {
+    this.sendBarOutput(
+      encodeChord(chord, this.stickyModifiers, this.term.modes.applicationCursorKeysMode),
+    );
+  }
+
+  private sendBarOutput(output: ReturnType<typeof encodeChord>): void {
+    if (!this.imeInput.beforeSoftKey()) return;
+    this.consumeStickyModifiers();
+    if (!("bytes" in output)) return;
+    const writes = splitTerminalWrites(output.bytes);
+    const writeNext = (index: number) => {
+      this.barWriteTimer =
+        index + 1 < writes.length
+          ? setTimeout(() => writeNext(index + 1), SPLIT_LONE_ESC_MS)
+          : null;
+      this.sendSoftKey("enter", writes[index], { focus: false });
+      while (this.barWriteTimer === null && this.queuedBarKeys.length)
+        this.queuedBarKeys.shift()?.();
+    };
+    writeNext(0);
+  }
+
   setStickyModifiers(next: StickyModifiers): void {
     this.stickyModifiers = next;
     for (const listener of this.stickyListeners) listener(next);
@@ -1127,38 +1187,32 @@ export class TerminalSession {
   }
 
   private consumeStickyModifiers(): void {
-    const { ctrl, alt, shift } = this.stickyModifiers;
-    if (ctrl !== "once" && alt !== "once" && shift !== "once") return;
-    this.setStickyModifiers({
-      ctrl: ctrl === "once" ? "off" : ctrl,
-      alt: alt === "once" ? "off" : alt,
-      shift: shift === "once" ? "off" : shift,
-    });
+    const entries = Object.entries(this.stickyModifiers);
+    if (!entries.some(([, state]) => state === "once")) return;
+    this.setStickyModifiers(
+      Object.fromEntries(
+        entries.map(([modifier, state]) => [modifier, state === "once" ? "off" : state]),
+      ) as StickyModifiers,
+    );
   }
 
   private applyStickyModifiers(data: string): string {
-    const { ctrl, alt, shift } = this.stickyModifiers;
     if (
-      (ctrl === "off" && alt === "off" && shift === "off") ||
+      !Object.values(this.stickyModifiers).some((state) => state !== "off") ||
       this.imeInput.isComposing ||
-      data.includes("\x1b") ||
-      data.includes("\x7f")
+      !data
     )
       return data;
-    let result = data;
-    if (data.length === 1 && data.charCodeAt(0) < 128) {
-      const code = data.toUpperCase().charCodeAt(0);
-      if (ctrl !== "off") {
-        if (code >= 64 && code <= 95) result = String.fromCharCode(code & 31);
-        else if (data === " ") result = "\x00";
-        else if (data === "?") result = "\x7f";
-        else if (data === "/") result = "\x1f";
-      }
-      if (shift !== "off" && /^[a-z]$/.test(result)) result = result.toUpperCase();
-      if (alt !== "off") result = `\x1b${result}`;
-    }
+    const hasCommand =
+      isArmedModifier(this.stickyModifiers, "cmd") || isArmedModifier(this.stickyModifiers, "win");
+    const isEscapeOrDelete = data.includes("\x1b") || data.includes("\x7f");
+    if (isEscapeOrDelete && (!hasCommand || !chordForSequence(data))) return data;
+    const result =
+      isEscapeOrDelete || Array.from(data).length === 1
+        ? encodeTerminalData(data, this.stickyModifiers, this.term.modes.applicationCursorKeysMode)
+        : { bytes: data };
     this.consumeStickyModifiers();
-    return result;
+    return "bytes" in result ? result.bytes : "";
   }
 
   /** Enable clipboard bridging only for the visible, interactive surface. */
@@ -1213,6 +1267,7 @@ export class TerminalSession {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.cancelBarWrites();
     this.listenerCtl.abort();
     this.resizeObserver.disconnect();
     this.imeInput.dispose();

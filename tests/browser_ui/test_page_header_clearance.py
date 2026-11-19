@@ -748,7 +748,7 @@ def test_touch_landscape_chat_and_host_terminals_clear_header_and_controls(
         menu = page.get_by_role("button", name="Open sidebar", exact=True)
         expect(first_row).to_be_visible()
         expect(menu).to_be_visible()
-        expect(page.get_by_test_id("mobile-floating-assistant")).to_be_visible()
+        expect(page.get_by_test_id("mobile-floating-assistant")).to_have_count(0)
     row_box, menu_box = first_row.bounding_box(), menu.bounding_box()
     assert row_box is not None and menu_box is not None
     assert (

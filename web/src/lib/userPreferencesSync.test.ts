@@ -23,6 +23,7 @@ import {
 } from "./keepWarmPreferences";
 import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "./worktreeDefaultPreferences";
 import { defaultTerminalBar, legacyFingerprint, projectLegacy } from "./terminalKeyBar";
+import { resolveTerminalKeys, writeTerminalKeyPreferences } from "./terminalKeys";
 import {
   readMobileAssistantPreferences,
   writeMobileAssistantPreferences,
@@ -50,6 +51,60 @@ describe("terminal bar preference synchronization", () => {
       terminalLegacyBasis: legacyFingerprint(terminalButtons, true),
     };
   }
+
+  it("round-trips both surfaces and the unmodified circle envelope through a legacy client's edit", async () => {
+    vi.useFakeTimers();
+    const { chatActionsRevision: _unused, ...legacy } = mobileValue();
+    const value = {
+      ...legacy,
+      buttons: [{ label: "Old", binding: { kind: "text", text: "^C" }, id: "old" }],
+    };
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync(
+      { version: 1, settings: { mobile_assistant: value } },
+      fetcher,
+      "alice",
+    );
+    const { keys } = resolveTerminalKeys({ ...readMobileAssistantPreferences() });
+    expect(
+      writeTerminalKeyPreferences({
+        terminalKeys: { ...keys, shell: { ...keys.shell, enabled: false } },
+        terminalKeysPreset: { native: keys.native },
+        terminalKeyboard: { v: 1 },
+      }),
+    ).toBe("saved");
+    await vi.advanceTimersByTimeAsync(251);
+    expect(fetcher).toHaveBeenCalledOnce();
+    const sent = JSON.parse(fetcher.mock.calls[0][1].body).value;
+    expect(sent).not.toHaveProperty("chatActionsRevision");
+    expect(JSON.stringify(sent.buttons)).toBe(JSON.stringify(value.buttons));
+    expect(sent.terminalKeysEnabled).toBe(false);
+
+    const updatedCircle = [{ label: "Old client edit", id: "new-button" }];
+    fetcher.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          user_id: "alice",
+          preferences: {
+            version: 1,
+            settings: {
+              mobile_assistant: { ...sent, buttons: updatedCircle, terminalKeysEnabled: true },
+            },
+          },
+        }),
+      ),
+    );
+    await refreshUserPreferencesFromServer();
+    const reconciled = resolveTerminalKeys({ ...readMobileAssistantPreferences() });
+    expect(reconciled.keys.shell.enabled).toBe(true);
+    expect(reconciled.keys.native).toEqual(keys.native);
+    expect(reconciled.preset.native).toEqual(keys.native);
+    expect(writeTerminalKeyPreferences({ terminalKeyboard: { v: 1, bindings: {} } })).toBe("saved");
+    await vi.advanceTimersByTimeAsync(251);
+    const next = JSON.parse(fetcher.mock.calls[2][1].body).value;
+    expect(JSON.stringify(next.buttons)).toBe(JSON.stringify(updatedCircle));
+    expect(next).not.toHaveProperty("chatActionsRevision");
+  });
 
   it("hydrates the layout and preset without a write-back, then syncs a width-only edit", async () => {
     vi.useFakeTimers();

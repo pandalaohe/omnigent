@@ -317,7 +317,7 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
         expect(bar).to_have_attribute("data-bottom-page", "0")
         expect(bar).to_have_attribute("data-bottom-page-count", "2")
 
-        # Floating assistant wheel must hide while a writable terminal key bar is visible.
+        # Terminal key rows are the only mobile key controls.
         expect(page.get_by_test_id("mobile-floating-assistant")).to_have_count(0)
 
         textarea = view.locator("textarea.xterm-helper-textarea")
@@ -657,7 +657,8 @@ def test_mobile_terminal_keys_byte_delivery_app_cursor_and_gestures(
         back_to_chat = page.get_by_role("button", name="Back to chat", exact=True)
         expect(back_to_chat).to_be_visible()
         back_to_chat.click()
-        expect(page.get_by_test_id("mobile-floating-assistant")).to_be_visible(timeout=10_000)
+        expect(page.get_by_role("button", name="Conversation actions", exact=True)).to_be_visible()
+        expect(page.get_by_test_id("mobile-floating-assistant")).to_have_count(0)
         resources = httpx.get(
             f"{base_url}/v1/sessions/{session_id}/resources/terminals", timeout=10
         )

@@ -8,6 +8,7 @@ import {
   type TerminalStickyModifiers,
 } from "@/lib/terminalKeyBar";
 import { DEFAULT_TERMINAL_KEY_ITEMS as REEXPORTED, TerminalKeyRow } from "./TerminalKeyRow";
+import { fromBar322 } from "@/lib/terminalKeys";
 import type { StickyModifiers, TerminalSession } from "./TerminalSession";
 
 function makeSessionMock(focused = false) {
@@ -16,6 +17,10 @@ function makeSessionMock(focused = false) {
   const listeners = new Set<(next: TerminalStickyModifiers) => void>();
   const session = {
     sendSoftKey: vi.fn(),
+    sendBarSequence: vi.fn(),
+    sendBarChord: vi.fn(),
+    cancelBarWrites: vi.fn(),
+    runBarKey: vi.fn((send: () => void) => send()),
     setStickyModifiers: vi.fn((next: TerminalStickyModifiers) => {
       sticky = next;
       for (const listener of listeners) listener(next);
@@ -106,7 +111,7 @@ describe("TerminalKeyRow", () => {
     expect(screen.queryByRole("button", { name: /Top row: next page/ })).toBeNull();
   });
 
-  it("taps a modifier to once and back to off, and long-presses to lock", () => {
+  it("toggles a modifier once when a held pointer is released", () => {
     vi.useFakeTimers();
     const { session, sessionRef } = makeSessionMock(true);
     render(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={true} />);
@@ -122,15 +127,55 @@ describe("TerminalKeyRow", () => {
     act(() => vi.advanceTimersByTime(499));
     expect(ctrl).toHaveAttribute("data-sticky-state", "off");
     act(() => vi.advanceTimersByTime(1));
-    expect(ctrl).toHaveAttribute("data-sticky-state", "locked");
-    expect(ctrl).toHaveAttribute("aria-label", "Ctrl, locked");
+    expect(ctrl).toHaveAttribute("data-sticky-state", "off");
     fireEvent.pointerUp(ctrl, { pointerId: 3, clientX: 20, clientY: 20 });
-    // A long-press that fired consumes the pointer, so release sends no tap.
-    expect(ctrl).toHaveAttribute("data-sticky-state", "locked");
+    expect(ctrl).toHaveAttribute("data-sticky-state", "once");
     tapButton(ctrl, 4);
     expect(ctrl).toHaveAttribute("data-sticky-state", "off");
     expect(session.sendSoftKey).not.toHaveBeenCalled();
     expect(session.focus).not.toHaveBeenCalled();
+  });
+
+  it("dispatches the new action kinds and retains a label for future actions", () => {
+    const { session, sessionRef } = makeSessionMock();
+    const surface = fromBar322(migrateLegacy([], false));
+    const base = { width: 1 as const, display: "text" as const };
+    surface.top.keys = [
+      { ...base, id: "special", label: "Escape", action: { type: "special", special: "esc" } },
+      {
+        ...base,
+        id: "send",
+        label: "Command",
+        action: { type: "send", send: "echo ok", autoEnter: true },
+      },
+      {
+        ...base,
+        id: "combo",
+        label: "Line start",
+        action: { type: "combo", chord: { code: "ArrowLeft", modifiers: ["meta"] } },
+      },
+      {
+        ...base,
+        id: "future",
+        label: "Future",
+        display: "icon",
+        icon: "future-icon",
+        action: { type: "future" },
+      },
+    ];
+    render(<TerminalKeyRow sessionRef={sessionRef} keyboardUp={false} surface={surface} />);
+    fireEvent.click(screen.getByRole("button", { name: "Escape" }));
+    fireEvent.click(screen.getByRole("button", { name: "Command" }));
+    fireEvent.click(screen.getByRole("button", { name: "Line start" }));
+    expect(session.sendBarSequence.mock.calls).toEqual([
+      ["\\e", false],
+      ["echo ok", true],
+    ]);
+    expect(session.sendBarChord).toHaveBeenCalledExactlyOnceWith({
+      code: "ArrowLeft",
+      modifiers: ["meta"],
+    });
+    expect(screen.getByRole("button", { name: "Future, Needs a newer version" })).toBeDisabled();
   });
 
   it("supports a Tap locks modifier and Shift in the sticky state", () => {

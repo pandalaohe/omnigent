@@ -1,25 +1,15 @@
-import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { POLL_SESSIONS_ACTION_EVENT } from "@/hooks/useSessionPollingHotkeys";
-import { SELECT_WORKSPACE_TAB_ACTION_EVENT } from "@/hooks/useWorkspaceTabHotkeys";
 import {
   MOBILE_ASSISTANT_ACTIONS,
   MOBILE_ASSISTANT_STORAGE_KEY,
-  TERMINAL_SOFT_KEY_EVENT,
-  dispatchMobileAssistantAction,
-  dispatchMobileAssistantButton,
   defaultTerminalButtons,
   defaultMobileAssistantButtons,
   visibleChatButtons,
   readMobileAssistantPreferences,
-  registerTypableTerminal,
   softKeyForChord,
   terminalDataForChord,
-  useTypableTerminals,
-  writeMobileAssistantDeviceState,
   writeMobileAssistantPreferences,
-  type TerminalSoftKeyEventDetail,
 } from "./mobileAssistantPreferences";
 import { queueUserPreferencePatch } from "./userPreferencesSync";
 
@@ -105,33 +95,6 @@ describe("mobileAssistantPreferences", () => {
     expect(
       JSON.parse(localStorage.getItem(MOBILE_ASSISTANT_STORAGE_KEY) ?? "null"),
     ).not.toHaveProperty("direction");
-  });
-
-  it("keeps placement device-local and never resends stale button configuration", () => {
-    writeMobileAssistantPreferences({
-      version: 2,
-      enabled: true,
-      buttons: [
-        {
-          id: "fresh",
-          label: "Fresh",
-          binding: { kind: "text", text: "/fresh" },
-        },
-      ],
-    });
-    vi.mocked(queueUserPreferencePatch).mockClear();
-
-    writeMobileAssistantDeviceState({
-      position: { x: 0.1, y: 0.4 },
-      dock: { edge: "left", offset: 0.4 },
-    });
-
-    expect(queueUserPreferencePatch).not.toHaveBeenCalled();
-    expect(readMobileAssistantPreferences()).toMatchObject({
-      buttons: [expect.objectContaining({ id: "fresh" })],
-      position: { x: 0.1, y: 0.4 },
-      dock: { edge: "left", offset: 0.4 },
-    });
   });
 
   it("migrates the fixed version-1 action list without losing order or position", () => {
@@ -344,252 +307,6 @@ describe("mobileAssistantPreferences", () => {
     ]);
   });
 
-  it("routes app actions through the shared session action event", () => {
-    const listener = vi.fn();
-    window.addEventListener(POLL_SESSIONS_ACTION_EVENT, listener);
-
-    dispatchMobileAssistantAction("pollSessions");
-
-    expect(listener).toHaveBeenCalledOnce();
-    window.removeEventListener(POLL_SESSIONS_ACTION_EVENT, listener);
-  });
-
-  it("lets a terminal consume a soft key before DOM fallback", () => {
-    const input = document.createElement("textarea");
-    document.body.appendChild(input);
-    input.focus();
-    const keyListener = vi.fn();
-    input.addEventListener("keydown", keyListener);
-    const terminalListener = (event: Event) => {
-      (event as CustomEvent<TerminalSoftKeyEventDetail>).detail.handled = true;
-    };
-    window.addEventListener(TERMINAL_SOFT_KEY_EVENT, terminalListener);
-
-    dispatchMobileAssistantAction("escape");
-
-    expect(keyListener).not.toHaveBeenCalled();
-    window.removeEventListener(TERMINAL_SOFT_KEY_EVENT, terminalListener);
-    input.remove();
-  });
-
-  it("prefers the focused terminal when multiple writable terminals are mounted", () => {
-    const first = vi.fn();
-    const focused = vi.fn();
-    const collect = (event: Event) => {
-      const detail = (event as CustomEvent<TerminalSoftKeyEventDetail>).detail;
-      (detail.candidates ??= []).push(
-        { focused: false, ownsPreferredTarget: false, send: first },
-        { focused: true, ownsPreferredTarget: false, send: focused },
-      );
-    };
-    window.addEventListener(TERMINAL_SOFT_KEY_EVENT, collect);
-
-    dispatchMobileAssistantAction("tab");
-
-    expect(focused).toHaveBeenCalledOnce();
-    expect(first).not.toHaveBeenCalled();
-    window.removeEventListener(TERMINAL_SOFT_KEY_EVENT, collect);
-  });
-
-  it("prefers the saved DOM control over an unfocused terminal", () => {
-    const terminal = vi.fn();
-    const collect = (event: Event) => {
-      const detail = (event as CustomEvent<TerminalSoftKeyEventDetail>).detail;
-      (detail.candidates ??= []).push({
-        focused: false,
-        ownsPreferredTarget: false,
-        send: terminal,
-      });
-    };
-    const textarea = document.createElement("textarea");
-    document.body.appendChild(textarea);
-    const domListener = vi.fn();
-    textarea.addEventListener("keydown", domListener);
-    window.addEventListener(TERMINAL_SOFT_KEY_EVENT, collect);
-
-    dispatchMobileAssistantAction("enter", textarea);
-
-    expect(domListener).toHaveBeenCalledOnce();
-    expect(terminal).not.toHaveBeenCalled();
-    window.removeEventListener(TERMINAL_SOFT_KEY_EVENT, collect);
-    textarea.remove();
-  });
-
-  it("uses the only writable TUI after app chrome steals DOM focus", () => {
-    const terminal = vi.fn();
-    const collect = (event: Event) => {
-      const detail = (event as CustomEvent<TerminalSoftKeyEventDetail>).detail;
-      (detail.candidates ??= []).push({
-        focused: false,
-        ownsPreferredTarget: false,
-        send: terminal,
-      });
-    };
-    const chromeButton = document.createElement("button");
-    document.body.appendChild(chromeButton);
-    const domListener = vi.fn();
-    chromeButton.addEventListener("keydown", domListener);
-    window.addEventListener(TERMINAL_SOFT_KEY_EVENT, collect);
-
-    dispatchMobileAssistantAction("escape", chromeButton);
-
-    expect(terminal).toHaveBeenCalledOnce();
-    expect(domListener).not.toHaveBeenCalled();
-    window.removeEventListener(TERMINAL_SOFT_KEY_EVENT, collect);
-    chromeButton.remove();
-  });
-
-  it("inserts a custom phrase at the saved input selection", () => {
-    const textarea = document.createElement("textarea");
-    textarea.value = "hello ";
-    document.body.appendChild(textarea);
-    textarea.setSelectionRange(6, 6);
-    const input = vi.fn();
-    textarea.addEventListener("input", input);
-
-    dispatchMobileAssistantButton(
-      { id: "compact", label: "Compact", binding: { kind: "text", text: "/compact" } },
-      textarea,
-    );
-
-    expect(textarea.value).toBe("hello /compact");
-    expect(input).toHaveBeenCalledOnce();
-    textarea.remove();
-  });
-
-  it("ignores a connected saved input after its surface becomes hidden", () => {
-    const hidden = document.createElement("textarea");
-    hidden.style.visibility = "hidden";
-    const current = document.createElement("textarea");
-    document.body.append(hidden, current);
-    current.focus();
-
-    dispatchMobileAssistantButton(
-      { id: "phrase", label: "Phrase", binding: { kind: "text", text: "hello" } },
-      hidden,
-    );
-
-    expect(hidden.value).toBe("");
-    expect(current.value).toBe("hello");
-    expect(document.activeElement).toBe(current);
-    hidden.remove();
-    current.remove();
-  });
-
-  it("dispatches a workspace-tab action event for select-tab buttons", () => {
-    const listener = vi.fn();
-    window.addEventListener(SELECT_WORKSPACE_TAB_ACTION_EVENT, listener);
-
-    dispatchMobileAssistantButton({
-      id: "tab-2",
-      label: "Tab 2",
-      binding: { kind: "shortcut", actionId: "selectWorkspaceTab2" },
-    });
-
-    expect(listener).toHaveBeenCalledOnce();
-    const dispatched = listener.mock.calls[0]?.[0] as
-      CustomEvent<{ tabNumber: number }> | undefined;
-    expect(dispatched?.detail).toEqual({ tabNumber: 2 });
-    window.removeEventListener(SELECT_WORKSPACE_TAB_ACTION_EVENT, listener);
-  });
-
-  it("does nothing for the recent-sessions switcher (needs a held key)", () => {
-    const listener = vi.fn();
-    window.addEventListener("keydown", listener);
-
-    dispatchMobileAssistantButton({
-      id: "recents",
-      label: "Recents",
-      binding: { kind: "shortcut", actionId: "recentSessions" },
-    });
-
-    expect(listener).not.toHaveBeenCalled();
-    window.removeEventListener("keydown", listener);
-  });
-
-  it("dispatches a recorded in-app chord with resolved primary modifier", () => {
-    const textarea = document.createElement("textarea");
-    document.body.appendChild(textarea);
-    const listener = vi.fn();
-    textarea.addEventListener("keydown", listener);
-
-    dispatchMobileAssistantButton(
-      {
-        id: "custom-key",
-        label: "Ctrl T",
-        binding: { kind: "key", chord: { code: "KeyT", modifiers: ["primary"] } },
-      },
-      textarea,
-    );
-
-    expect(listener).toHaveBeenCalledOnce();
-    expect(listener.mock.calls[0]?.[0]).toMatchObject({ code: "KeyT", ctrlKey: true });
-    textarea.remove();
-  });
-
-  it("carries the Poll sessions hint on the mobile assistant action definition", () => {
-    expect(
-      MOBILE_ASSISTANT_ACTIONS.find((action) => action.id === "pollSessions")?.description,
-    ).toBe("Jumps to the next session waiting for your answer.");
-  });
-
-  it("routes phrases and modified key chords to the active terminal when no DOM input is targeted", () => {
-    const received: { action: string; data?: string }[] = [];
-    const collect = (event: Event) => {
-      const detail = (event as CustomEvent<TerminalSoftKeyEventDetail>).detail;
-      (detail.candidates ??= []).push({
-        focused: false,
-        ownsPreferredTarget: false,
-        send: () => received.push({ action: detail.action, data: detail.data }),
-      });
-    };
-    const staleWarmContainer = document.createElement("div");
-    staleWarmContainer.className = "invisible";
-    staleWarmContainer.setAttribute("aria-hidden", "true");
-    const staleXtermTextarea = document.createElement("textarea");
-    staleXtermTextarea.className = "xterm-helper-textarea";
-    staleWarmContainer.appendChild(staleXtermTextarea);
-    document.body.appendChild(staleWarmContainer);
-    staleXtermTextarea.focus();
-
-    window.addEventListener(TERMINAL_SOFT_KEY_EVENT, collect);
-
-    dispatchMobileAssistantButton(
-      {
-        id: "cp",
-        label: "Cp",
-        binding: { kind: "text", text: "/compact", submit: true },
-      },
-      staleXtermTextarea,
-    );
-    dispatchMobileAssistantButton(
-      {
-        id: "stop",
-        label: "Stop",
-        binding: { kind: "key", chord: { code: "KeyC", modifiers: ["primary"] } },
-      },
-      staleXtermTextarea,
-    );
-    dispatchMobileAssistantButton(
-      {
-        id: "newline",
-        label: "Newline",
-        binding: { kind: "shortcut", actionId: "newLine" },
-      },
-      staleXtermTextarea,
-    );
-
-    expect(received).toEqual([
-      { action: "enter", data: "/compact" },
-      { action: "enter", data: undefined },
-      { action: "enter", data: "\x03" },
-      { action: "enter", data: "\x1b[13;2u" },
-    ]);
-
-    window.removeEventListener(TERMINAL_SOFT_KEY_EVENT, collect);
-    staleWarmContainer.remove();
-  });
-
   it.each([
     [{ code: "BracketLeft", modifiers: ["control"] as const }, "\x1b"],
     [{ code: "Slash", modifiers: ["shift"] as const }, "?"],
@@ -675,32 +392,5 @@ describe("mobileAssistantPreferences", () => {
     expect(softKeyForChord({ code: "Home", modifiers: [] })).toBe("home");
     expect(softKeyForChord({ code: "End", modifiers: [] })).toBe("end");
     expect(softKeyForChord({ code: "Home", modifiers: ["shift"] })).toBeNull();
-  });
-
-  it("tracks active typable terminals and those showing a key row via registerTypableTerminal", () => {
-    const { result } = renderHook(() => useTypableTerminals());
-    expect(result.current).toEqual({ count: 0, withBar: 0 });
-
-    let releaseBar = () => {};
-    let releaseNoBar = () => {};
-    act(() => {
-      releaseBar = registerTypableTerminal(true);
-    });
-    expect(result.current).toEqual({ count: 1, withBar: 1 });
-
-    act(() => {
-      releaseNoBar = registerTypableTerminal(false);
-    });
-    expect(result.current).toEqual({ count: 2, withBar: 1 });
-
-    act(() => {
-      releaseBar();
-    });
-    expect(result.current).toEqual({ count: 1, withBar: 0 });
-
-    act(() => {
-      releaseNoBar();
-    });
-    expect(result.current).toEqual({ count: 0, withBar: 0 });
   });
 });

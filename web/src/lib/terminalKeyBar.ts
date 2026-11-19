@@ -150,6 +150,9 @@ export interface TerminalStickyModifiers {
   ctrl: TerminalStickyState;
   alt: TerminalStickyState;
   shift: TerminalStickyState;
+  opt?: TerminalStickyState;
+  cmd?: TerminalStickyState;
+  win?: TerminalStickyState;
 }
 
 export const EMPTY_STICKY_MODIFIERS: TerminalStickyModifiers = {
@@ -338,6 +341,10 @@ export function legacyFingerprint(items: unknown, secondRow: unknown): string {
   )}`;
 }
 
+export function barFingerprint(bar: TerminalBar): string {
+  return `fnv1a:${fnv1a(stableJson(canonicalizeBar(bar)))}`;
+}
+
 function cloneChord(chord: ShortcutChord): ShortcutChord {
   return { code: chord.code, modifiers: [...chord.modifiers] };
 }
@@ -406,6 +413,9 @@ const MOBILE_SYNC_FIELD_ORDER = [
   "terminalBar",
   "terminalBarPreset",
   "terminalLegacyBasis",
+  "terminalKeys",
+  "terminalKeysPreset",
+  "terminalKeyboard",
   "chatActionsRevision",
 ] as const;
 
@@ -738,17 +748,21 @@ export function reconcileLegacy(bar: TerminalBar, items: unknown, secondRow: unk
   });
 }
 
-export function packRow(row: TerminalBarRow): {
-  pinned: TerminalBarKey[];
-  pages: TerminalBarKey[][];
+export function packRow<Key extends { width: TerminalKeyWidth }>(row: {
+  keys: Key[];
+  pinned: number;
+  enabled?: boolean;
+}): {
+  pinned: Key[];
+  pages: Key[][];
   pagerCells: number;
 } {
   const keys = Array.isArray(row.keys) ? row.keys : [];
   const pinnedCount = Math.max(0, Math.min(row.pinned, keys.length));
   const pinned = keys.slice(0, pinnedCount);
   const pagerCells = ROW_CELLS - pinned.reduce((total, key) => total + key.width, 0);
-  const pages: TerminalBarKey[][] = [];
-  let page: TerminalBarKey[] = [];
+  const pages: Key[][] = [];
+  let page: Key[] = [];
   let used = 0;
   for (const key of keys.slice(pinnedCount)) {
     const width = key.width === 1 ? 1 : 2;
@@ -791,10 +805,16 @@ export function flattenBar(bar: TerminalBar): TerminalBarKey[] {
   return [...bar.top.keys, ...bar.bottom.keys];
 }
 
-export function barHeightPx(bar: TerminalBar, oneLine: boolean): number {
+export function barHeightPx(
+  bar: Record<
+    "top" | "bottom",
+    { keys: { width: TerminalKeyWidth }[]; pinned: number; enabled: boolean }
+  >,
+  oneLine: boolean,
+): number {
   const lines = oneLine ? 1 : bar.bottom.enabled ? 2 : 1;
-  const topPages = packRow(rowFromUnknown(bar.top)).pages.length;
-  const bottomPages = packRow(rowFromUnknown(bar.bottom)).pages.length;
+  const topPages = packRow(bar.top).pages.length;
+  const bottomPages = packRow(bar.bottom).pages.length;
   const pages = topPages > 1 || (bar.bottom.enabled && bottomPages > 1);
   return lines * 44 + (lines - 1) * 2 + 3 + (pages ? PAGE_STRIP_PX : 0);
 }

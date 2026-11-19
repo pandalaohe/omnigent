@@ -31,7 +31,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setSessionHost } from "@/lib/sessionHost";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { toast } from "sonner";
-import { dispatchMobileAssistantButton } from "@/lib/mobileAssistantPreferences";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { handleSessionEvent, useChatStore, type ChatState } from "@/store/chatStore";
 import {
@@ -4027,26 +4026,6 @@ describe("Composer permission-mode shortcut", () => {
     expect(input).toHaveValue("half-written prompt");
   });
 
-  it("cycles permission mode from a mobile action while keeping the composer draft", async () => {
-    const setMode = spyClaudeSetter();
-    const input = renderClaudeSession("mobile-cycle");
-    input.focus();
-    fireEvent.change(input, { target: { value: "half-written prompt" } });
-    act(() =>
-      dispatchMobileAssistantButton(
-        {
-          id: "permission",
-          label: "Permission",
-          binding: { kind: "shortcut", actionId: "cyclePermissionMode" },
-        },
-        input,
-      ),
-    );
-    await waitFor(() => expect(chip()).toHaveTextContent("Auto"));
-    expect(setMode).toHaveBeenCalledWith("auto");
-    expect(input).toHaveValue("half-written prompt");
-  });
-
   it("holds Shift+Tab without a second request while a change is in flight", async () => {
     let finish: () => void = () => {};
     const setMode = vi.spyOn(useChatStore.getState(), "setClaudePermissionMode").mockImplementation(
@@ -6262,7 +6241,7 @@ describe("Composer reply quotes", () => {
     expect(document.activeElement).not.toBe(ta);
   });
 
-  it("focuses the real phone composer from a tap while its keyboard hotkey stays inert", () => {
+  it("keeps the focus composer hotkey inert on phones", () => {
     const matchMedia = window.matchMedia;
     vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...matchMedia(query),
@@ -6274,15 +6253,6 @@ describe("Composer reply quotes", () => {
     input.blur();
     fireEvent.keyDown(window, { key: "L", code: "KeyL", ctrlKey: true, shiftKey: true });
     expect(input).not.toHaveFocus();
-    act(() =>
-      dispatchMobileAssistantButton({
-        id: "focus",
-        label: "Focus composer",
-        binding: { kind: "shortcut", actionId: "focusComposer" },
-      }),
-    );
-    expect(input).toHaveFocus();
-    expect(input).toHaveValue("Keep this draft");
   });
 
   it.each([

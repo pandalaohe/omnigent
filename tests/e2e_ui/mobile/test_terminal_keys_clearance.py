@@ -660,7 +660,7 @@ def _measure_and_assert(
     # --- Assertion 8: Read-only has no bar ---
     if surface == "read-only":
         assert snap["barRect"] is None, f"read-only must not render a bar ({ctx_desc})"
-        assert snap["wheelCount"] > 0, f"read-only must keep chat wheel ({ctx_desc})"
+        assert snap["wheelCount"] == 0, f"read-only has no floating assistant ({ctx_desc})"
         return snap
 
     # --- Assertion 1: Navigation bottom <= terminal viewport top, and top >= safe-area top ---

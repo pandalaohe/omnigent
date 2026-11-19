@@ -52,7 +52,7 @@ import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
-import { derivePermissionLevel, isOwnerLevel, isEditorLevel } from "@/lib/permissionsApi";
+import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   closeDesktopWindow,
   confirmDesktopQuit,
@@ -166,13 +166,6 @@ import {
 import { AppShellWorkspacePanels } from "./AppShellWorkspacePanels";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { PeerHeldPanel } from "@/components/PeerHeldPanel";
-import { MobileFloatingAssistant } from "@/components/MobileFloatingAssistant";
-import {
-  MOBILE_ASSISTANT_ACTION_EVENT,
-  type MobileAssistantDirectAction,
-} from "@/lib/mobileAssistantPreferences";
-import { computeIsTurnActive } from "@/components/chat/chatBubbleParts";
-import { TerminalsSheet } from "./TerminalsSheet";
 import { AppShellOverlays } from "./AppShellOverlays";
 import { CloseShellDialog } from "./CloseShellDialog";
 import { CloseWindowDialog } from "./CloseWindowDialog";
@@ -611,7 +604,6 @@ function AppShellImpl() {
   // on a phone they open as full-screen overlays from the session-menu FAB.
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
   const [shellsPanelOpen, setShellsPanelOpen] = useState(false);
-  const [terminalsSheetOpen, setTerminalsSheetOpen] = useState(false);
   const [githubPanelOpen, setGithubPanelOpen] = useState(false);
   const [contentSearchPanelOpen, setContentSearchPanelOpen] = useState(false);
   const [sideChatsPanelOpen, setSideChatsPanelOpen] = useState(false);
@@ -2555,41 +2547,6 @@ function AppShellImpl() {
     revealRightPanel();
   }
 
-  const mobileActionRef = useRef<(action: MobileAssistantDirectAction) => void>(() => {});
-  mobileActionRef.current = (action) => {
-    if (action === "openTerminals") {
-      setTerminalsSheetOpen(true);
-      return;
-    }
-    if (!conversationId) return;
-    if (action === "openFiles" && showFilesPanel) handleWorkspaceTabShortcut("files");
-    else if (action === "openChanges" && showFilesPanel) handleWorkspaceTabShortcut("changes");
-    else if (action === "openAgents") handleWorkspaceTabShortcut("subagents");
-    else if (action === "openSideChats" && showSideChats) openSideChatsPanel();
-    else if (action === "stopResponse" && isEditorLevel(permissionLevel)) {
-      const chat = useChatStore.getState();
-      if (
-        chat.conversationId === conversationId &&
-        (computeIsTurnActive(chat.sessionStatus, chat.status === "streaming") ||
-          chat.pendingUserMessages.some((message) => message.initialDraft))
-      ) {
-        void chat
-          .stop()
-          .catch((error: unknown) =>
-            toast.error(error instanceof Error ? error.message : "Couldn't stop the response."),
-          );
-      }
-    }
-  };
-  useEffect(() => {
-    const onAction = (event: Event) =>
-      mobileActionRef.current(
-        (event as CustomEvent<{ actionId: MobileAssistantDirectAction }>).detail.actionId,
-      );
-    window.addEventListener(MOBILE_ASSISTANT_ACTION_EVENT, onAction);
-    return () => window.removeEventListener(MOBILE_ASSISTANT_ACTION_EVENT, onAction);
-  }, []);
-
   function openArchivePanel() {
     setSelectedFilePath(null);
     clearFileViewerUrl();
@@ -3333,13 +3290,7 @@ function AppShellImpl() {
               </DialogContent>
             </Dialog>
           )}
-          <MobileFloatingAssistant />
-          <TerminalsSheet
-            open={terminalsSheetOpen}
-            onOpenChange={setTerminalsSheetOpen}
-            conversationId={conversationId}
-            onSelectTerminal={openTerminalsPanel}
-          />
+
           <AppShellOverlays
             isEmbedded={isEmbedded}
             serverInfo={serverInfo}

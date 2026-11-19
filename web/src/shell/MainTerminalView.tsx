@@ -1,3 +1,4 @@
+import { TERMINAL_KEY_SURFACE } from "@/lib/terminalKeys";
 // Inline terminal renderer for terminal-first sessions. Replaces the
 // chat conversation + composer when the user picks "Terminal" in the
 // connection pill, or opens a shell as a rail soft tab. Shares
@@ -541,6 +542,7 @@ export function MainTerminalView({
                         <TerminalAgentAccess conversationId={conversationId} terminal={terminal} />
                         <Suspense fallback={null}>
                           <TerminalView
+                            keySurface={TERMINAL_KEY_SURFACE.mainTerminal}
                             {...(terminal.hostId
                               ? { hostId: terminal.hostId }
                               : {

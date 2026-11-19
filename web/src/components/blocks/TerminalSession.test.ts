@@ -942,6 +942,36 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
+  it("keeps legacy text literal and gives a Cmd chord the same bytes as an armed Cmd", () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    socket.open();
+    socket.sent = [];
+    session.setStickyModifiers({ ctrl: "once", alt: "off", shift: "off" });
+    for (const text of ["^C", String.raw`echo a\nb`, "\x03\r", "ls"]) {
+      session.sendSoftKey("enter", text, { focus: false });
+    }
+    expect(session.getStickyModifiers().ctrl).toBe("once");
+    term.input("c", true);
+    session.setStickyModifiers({ ctrl: "off", alt: "off", shift: "off", cmd: "once" });
+    session.sendSoftKey("arrowLeft", undefined, {
+      focus: false,
+      chord: { code: "ArrowLeft", modifiers: [] },
+    });
+    session.sendBarChord({ code: "ArrowLeft", modifiers: ["meta"] });
+    session.sendBarChord({ code: "KeyV", modifiers: ["meta"] });
+    expect(socket.sent.map((frame) => new TextDecoder().decode(frame as Uint8Array))).toEqual([
+      "^C",
+      String.raw`echo a\nb`,
+      "\x03\r",
+      "ls",
+      "\x03",
+      "\x01",
+      "\x01",
+    ]);
+    session.dispose();
+  });
+
   it("preserves escape sequences and DEL, but clears a one-shot on committed Chinese or pasted text", () => {
     const { socket, session } = makeSession();
     const term = (session as unknown as { term: Terminal }).term;

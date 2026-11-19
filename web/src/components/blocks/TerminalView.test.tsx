@@ -17,13 +17,10 @@ import { Toaster } from "@/components/ui/sonner";
 import { FileViewerContext, type OpenFileOptions } from "@/shell/FileViewerContext";
 import { toast } from "sonner";
 import { signInForTerminal } from "@/lib/identity";
+import { resolveTerminalKeys, writeTerminalKeyPreferences } from "@/lib/terminalKeys";
 import * as capabilities from "@/lib/capabilities";
 import * as nativeBridge from "@/lib/nativeBridge";
 import {
-  dispatchMobileAssistantAction,
-  dispatchMobileAssistantButton,
-  dispatchTerminalBarKey,
-  bindTerminalBarTarget,
   readMobileAssistantPreferences,
   writeMobileAssistantPreferences,
   type TerminalStickyModifiers,
@@ -233,6 +230,8 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
     sendSoftKey = vi.fn();
+    cancelBarWrites = vi.fn();
+    runBarKey = vi.fn((send: () => void) => send());
     stickyModifiers: TerminalStickyModifiers = { ctrl: "off", alt: "off", shift: "off" };
     setStickyModifiers = vi.fn((next: TerminalStickyModifiers) => {
       this.stickyModifiers = next;
@@ -392,62 +391,6 @@ describe("control-mode terminal", () => {
     routing.mockRestore();
     databricks.mockRestore();
   });
-  it("routes a mobile assistant soft key to the active writable terminal", async () => {
-    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
-    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
-    act(() => dispatchMobileAssistantAction("arrowUp"));
-
-    expect(terminalSessionMock.instances[0]?.sendSoftKey).toHaveBeenCalledWith("arrowUp");
-  });
-
-  it("keeps routing to the terminal that owned focus before the assistant button took it", async () => {
-    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
-    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
-    const terminalInput = document.createElement("textarea");
-    terminalSessionMock.instances[0].container.appendChild(terminalInput);
-    terminalInput.focus();
-    const assistantButton = document.createElement("button");
-    document.body.appendChild(assistantButton);
-    assistantButton.focus();
-
-    act(() => dispatchMobileAssistantAction("tab", terminalInput));
-
-    expect(terminalSessionMock.instances[0]?.sendSoftKey).toHaveBeenCalledWith("tab");
-    assistantButton.remove();
-  });
-
-  it("ignores a terminal inside a hidden container and forwards phrase and chord payloads to the visible terminal", async () => {
-    render(
-      <>
-        <div className="invisible opacity-0" aria-hidden="true">
-          <TerminalView sessionId="conv_warm" terminalId="terminal_claude_main" />
-        </div>
-        <TerminalView sessionId="conv_active" terminalId="terminal_claude_main" />
-      </>,
-    );
-    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
-
-    act(() => {
-      dispatchMobileAssistantButton({
-        id: "cp",
-        label: "Cp",
-        binding: { kind: "text", text: "/compact", submit: true },
-      });
-      dispatchMobileAssistantButton({
-        id: "stop",
-        label: "Stop",
-        binding: { kind: "key", chord: { code: "KeyC", modifiers: ["primary"] } },
-      });
-    });
-
-    expect(terminalSessionMock.instances[0]?.sendSoftKey).not.toHaveBeenCalled();
-    expect(terminalSessionMock.instances[1]?.sendSoftKey.mock.calls).toEqual([
-      ["enter", "/compact"],
-      ["enter"],
-      ["enter", "\x03"],
-    ]);
-  });
-
   it.each([
     ["terminal_codex_main", true],
     ["terminal_claude_main", false],
@@ -2177,7 +2120,12 @@ describe("TerminalView phone key rows", () => {
     stubRootRect(390, 788);
 
     const { rerender } = render(
-      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
+      <TerminalView
+        keySurface="shell"
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        active={false}
+      />,
     );
     await act(async () => {});
     expect(terminalSessionMock.instances).toHaveLength(1);
@@ -2185,7 +2133,9 @@ describe("TerminalView phone key rows", () => {
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
 
     // Reveal on phone: key row mounts, session.focus() is not called automatically
-    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
+    rerender(
+      <TerminalView keySurface="shell" sessionId="conv_abc" terminalId="terminal_bash_s1" active />,
+    );
     await act(async () => {});
     expect(terminalSessionMock.instances[0].focus).not.toHaveBeenCalled();
     const keyRow = screen.getByTestId("terminal-key-row");
@@ -2232,13 +2182,23 @@ describe("TerminalView phone key rows", () => {
     const rectSpy = stubRootRect(390, 788);
 
     const { rerender } = render(
-      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly />,
+      <TerminalView
+        keySurface="shell"
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        readOnly
+      />,
     );
     await act(async () => {});
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
 
     rerender(
-      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" showKeyRows={false} />,
+      <TerminalView
+        keySurface="shell"
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        showKeyRows={false}
+      />,
     );
     await act(async () => {});
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
@@ -2246,7 +2206,9 @@ describe("TerminalView phone key rows", () => {
     // Portrait room floor: height 180 < 119 + 108 (227) -> hidden
     rectSpy.mockRestore();
     const tightSpy = stubRootRect(390, 180);
-    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    rerender(
+      <TerminalView keySurface="shell" sessionId="conv_abc" terminalId="terminal_bash_s1" />,
+    );
     await act(async () => {});
     act(() => {
       window.dispatchEvent(new Event("resize"));
@@ -2267,7 +2229,7 @@ describe("TerminalView phone key rows", () => {
     stubPhoneViewport(844, 390);
     stubRootRect(590.8, 180);
 
-    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    render(<TerminalView keySurface="shell" sessionId="conv_abc" terminalId="terminal_bash_s1" />);
     await act(async () => {});
 
     const view = screen.getByTestId("terminal-view");
@@ -2281,7 +2243,31 @@ describe("TerminalView phone key rows", () => {
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
   });
 
-  it("consumes custom order and live switches, and sends fallback wheel keys to the registered session", async () => {
+  it("uses the Native layout and toggle independently of Shell", async () => {
+    stubPhoneViewport(390, 844);
+    stubRootRect(390, 788);
+    const { keys } = resolveTerminalKeys({ ...readMobileAssistantPreferences() });
+    keys.shell.enabled = false;
+    keys.native.top.keys[0].label = "Native key";
+    expect(writeTerminalKeyPreferences({ terminalKeys: keys })).toBe("saved");
+    const { rerender } = render(
+      <TerminalView keySurface="shell" sessionId="conv_abc" terminalId="terminal_bash_s1" />,
+    );
+    await act(async () => {});
+    expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+    rerender(
+      <TerminalView keySurface="native" sessionId="conv_abc" terminalId="terminal_bash_s1" />,
+    );
+    expect(screen.getByRole("button", { name: "Native key" })).toBeInTheDocument();
+    act(() =>
+      writeTerminalKeyPreferences({
+        terminalKeys: { ...keys, native: { ...keys.native, enabled: false } },
+      }),
+    );
+    expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+  });
+
+  it("uses custom order and reacts to live switches", async () => {
     stubPhoneViewport(390, 844);
     stubRootRect(390, 788);
     const initial = readMobileAssistantPreferences();
@@ -2295,7 +2281,7 @@ describe("TerminalView phone key rows", () => {
       ...initial,
       terminalButtons: [customKey, ...initial.terminalButtons!],
     });
-    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    render(<TerminalView keySurface="shell" sessionId="conv_abc" terminalId="terminal_bash_s1" />);
     await act(async () => {});
     act(() => terminalSessionMock.instances[0].onState({ kind: "connected" }));
     expect(
@@ -2315,47 +2301,6 @@ describe("TerminalView phone key rows", () => {
       }),
     );
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
-    const session = terminalSessionMock.instances[0];
-    act(() => {
-      dispatchTerminalBarKey({
-        id: "ctrl",
-        label: "Ctrl",
-        kind: "modifier",
-        modifier: "ctrl",
-        display: "text",
-        width: 2,
-      });
-      dispatchTerminalBarKey({ ...customKey, display: "text", width: 2 });
-    });
-    expect(session.getStickyModifiers()).toEqual({ ctrl: "once", alt: "off", shift: "off" });
-    expect(session.sendSoftKey).toHaveBeenLastCalledWith("enter", "r", {
-      focus: false,
-      chord: customKey.chord,
-    });
-    session.isFocused.mockReturnValue(true);
-    const keyboard = {
-      id: "keyboard",
-      label: "Keyboard",
-      kind: "action" as const,
-      action: "keyboard" as const,
-      display: "text" as const,
-      width: 2 as const,
-    };
-    // A stale focused textarea must be blurred and refocused within the tap gesture.
-    act(() => dispatchTerminalBarKey(keyboard));
-    expect(session.blur).toHaveBeenCalledOnce();
-    expect(session.focus).toHaveBeenCalledOnce();
-    session.blur.mockClear();
-    session.focus.mockClear();
-    vi.stubGlobal("visualViewport", {
-      height: 500,
-      offsetTop: 0,
-      addEventListener: vi.fn(),
-      removeEventListener: vi.fn(),
-    });
-    act(() => dispatchTerminalBarKey(keyboard));
-    expect(session.blur).toHaveBeenCalledOnce();
-    expect(session.focus).not.toHaveBeenCalled();
     act(() =>
       writeMobileAssistantPreferences({
         ...readMobileAssistantPreferences(),
@@ -2364,33 +2309,5 @@ describe("TerminalView phone key rows", () => {
     );
     expect(screen.getByTestId("terminal-key-row")).toBeInTheDocument();
     expect(screen.queryByTestId("terminal-key-row-pager")).toBeNull();
-  });
-  it("invalidates a bound held-gesture target across a disconnect and reconnect", async () => {
-    stubPhoneViewport(390, 844);
-    stubRootRect(390, 788);
-    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
-    await act(async () => {});
-    const session = terminalSessionMock.instances[0];
-    act(() => session.onState({ kind: "connected" }));
-    const target = bindTerminalBarTarget();
-    expect(target?.isCurrent()).toBe(true);
-    const key = {
-      id: "up",
-      label: "Up",
-      kind: "key" as const,
-      chord: { code: "ArrowUp", modifiers: [] },
-      width: 2 as const,
-      display: "text" as const,
-    };
-    act(() => session.onState({ kind: "connecting" }));
-    expect(target?.isCurrent()).toBe(false);
-    act(() => session.onState({ kind: "connected" }));
-    expect(target?.isCurrent()).toBe(false);
-    target?.press(key, "repeat");
-    expect(session.sendSoftKey).not.toHaveBeenCalled();
-    const fresh = bindTerminalBarTarget();
-    expect(fresh?.isCurrent()).toBe(true);
-    fresh?.press(key, "tap");
-    expect(session.sendSoftKey).toHaveBeenCalledOnce();
   });
 });
