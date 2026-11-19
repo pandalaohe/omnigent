@@ -20,7 +20,11 @@ export interface TerminalPasteOptions {
   keyId?: string;
 }
 
-export type TerminalClipboardAction = (op: ClipboardOp, options: TerminalPasteOptions) => void;
+export type TerminalClipboardAction = (
+  op: ClipboardOp,
+  options: TerminalPasteOptions,
+  nativeText?: string,
+) => void;
 
 // C0/C1 controls can end bracketed paste or send a key sequence.
 // oxlint-disable-next-line no-control-regex
@@ -201,7 +205,11 @@ export function useTerminalPaste(
     }
   };
 
-  const paste = async (source: PasteRequest["source"], options: TerminalPasteOptions) => {
+  const paste = async (
+    source: PasteRequest["source"],
+    options: TerminalPasteOptions,
+    nativeText?: string,
+  ) => {
     const session = sessionRef.current;
     if (!active) return;
     if (readOnly) {
@@ -230,6 +238,10 @@ export function useTerminalPaste(
     cancel();
     const request = { ...options, source, session, controller: new AbortController() };
     requestRef.current = request;
+    if (nativeText !== undefined) {
+      offerText(request, nativeText);
+      return;
+    }
     if (source === "pasteHost") {
       const result = await session.readHostClipboard(request.controller.signal);
       if (!isCurrent(request)) return;

@@ -46,11 +46,7 @@ async def read_host_clipboard() -> tuple[str, bool]:
         async with asyncio.timeout(_READ_TIMEOUT_S):
             commands: list[tuple[str, ...]] = []
             if sys.platform == "darwin":
-                code, manager = await _clipboard_command(
-                    "/bin/launchctl", "managername", max_bytes=32
-                )
-                if code == 0 and manager.strip() == b"Aqua":
-                    commands.append(("/usr/bin/pbpaste",))
+                commands.append(("/usr/bin/pbpaste",))
             elif sys.platform == "win32":
                 # Isolate delayed rendering in a process that can be stopped by the timeout.
                 commands.append((sys.executable, "-m", __name__))
