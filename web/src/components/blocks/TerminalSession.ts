@@ -25,6 +25,7 @@ import {
 } from "@/lib/mobileAssistantPreferences";
 import type { ShortcutChord } from "@/lib/keyboardShortcutPreferences";
 import {
+  applyTerminalTextModifiers,
   isArmedModifier,
   chordForSequence,
   encodeChord,
@@ -1207,10 +1208,13 @@ export class TerminalSession {
       isArmedModifier(this.stickyModifiers, "cmd") || isArmedModifier(this.stickyModifiers, "win");
     const isEscapeOrDelete = data.includes("\x1b") || data.includes("\x7f");
     if (isEscapeOrDelete && (!hasCommand || !chordForSequence(data))) return data;
+    const isAsciiCharacter = data.length === 1 && data.charCodeAt(0) < 128;
     const result =
-      isEscapeOrDelete || Array.from(data).length === 1
+      hasCommand && (isEscapeOrDelete || Array.from(data).length === 1)
         ? encodeTerminalData(data, this.stickyModifiers, this.term.modes.applicationCursorKeysMode)
-        : { bytes: data };
+        : {
+            bytes: isAsciiCharacter ? applyTerminalTextModifiers(data, this.stickyModifiers) : data,
+          };
     this.consumeStickyModifiers();
     return "bytes" in result ? result.bytes : "";
   }

@@ -5,6 +5,7 @@ import {
   MOBILE_ASSISTANT_CHANGED_EVENT,
   MOBILE_ASSISTANT_STORAGE_KEY,
   readMobileAssistantPreferences,
+  softKeyForChord,
   terminalDataForChord,
   type MobileAssistantPreferences,
 } from "@/lib/mobileAssistantPreferences";
@@ -14,6 +15,7 @@ import {
   canonicalTerminalFields,
   canonicalizeBar,
   canonicalizeBarKey,
+  EMPTY_STICKY_MODIFIERS,
   isTerminalKeyIcon,
   legacyFingerprint,
   normalizeChord,
@@ -233,13 +235,23 @@ function projectKey(key: StoredKey): TerminalBarKey {
         };
       }
       break;
-    case "combo":
-      return { ...base, kind: "key", chord: action.chord, ...repeat };
+    case "combo": {
+      const output = encodeChord(action.chord, EMPTY_STICKY_MODIFIERS, false);
+      if ("bytes" in output && output.bytes === terminalDataForChord(action.chord)) {
+        return { ...base, kind: "key", chord: action.chord, ...repeat };
+      }
+      break;
+    }
     case "send": {
       const data = unescapeFromDisplay(action.send);
       const chord = chordForSequence(data);
-      if (chord && (!action.autoEnter || isSingleControl(data)))
+      if (
+        chord &&
+        (!action.autoEnter || isSingleControl(data)) &&
+        (softKeyForChord(chord) !== null || terminalDataForChord(chord) !== null)
+      ) {
         return { ...base, kind: "key", chord, ...repeat };
+      }
       if (data && !Array.from(data).some((char) => isSingleControl(char))) {
         return { ...base, kind: "text", text: data, ...(action.autoEnter ? { submit: true } : {}) };
       }
@@ -561,6 +573,7 @@ type KeyOutput = { bytes: string } | { clipboard: "copy" | "paste" } | { refused
 function chordBytes(chord: BarChord, appCursor: boolean): string | null {
   const bytes = terminalDataForChord(chord, appCursor);
   if (bytes !== null) return bytes;
+  if (chord.code === "Enter" && chord.modifiers.length === 0) return "\r";
   if (chord.code === "Digit6" && chord.modifiers.includes("control")) {
     return `${chord.modifiers.includes("alt") ? "\x1b" : ""}\x1e`;
   }
@@ -633,24 +646,10 @@ function withChord(chord: BarChord): { chord: BarChord } {
   };
 }
 
-export function encodeTerminalData(
-  data: string,
-  armed: ArmedModifiers,
-  appCursor: boolean,
-): KeyOutput {
-  const chord = chordForSequence(data);
-  if (chord) return encodeChord(chord, armed, appCursor);
-  const characters = Array.from(data);
-  const command = isArmedModifier(armed, "cmd") || isArmedModifier(armed, "win");
+export function applyTerminalTextModifiers(data: string, armed: ArmedModifiers): string {
   let bytes = data;
-  if (characters.length === 1) {
+  if (Array.from(data).length === 1) {
     if (isArmedModifier(armed, "shift") && /^[a-z]$/.test(bytes)) bytes = bytes.toUpperCase();
-    if (command) {
-      if (/^[a-z]$/i.test(bytes)) {
-        return encodeChord({ code: `Key${bytes.toUpperCase()}`, modifiers: [] }, armed, appCursor);
-      }
-      return applyCmd({ char: bytes }, CMD_KEY_MODE, appCursor);
-    }
     if (isArmedModifier(armed, "ctrl")) {
       const code = bytes.toUpperCase().charCodeAt(0);
       if (code >= 64 && code <= 95) bytes = String.fromCharCode(code & 31);
@@ -659,9 +658,24 @@ export function encodeTerminalData(
       else if (bytes === "/") bytes = "\x1f";
     }
   }
-  if (command) return applyCmd({ char: bytes }, CMD_KEY_MODE, appCursor);
   if (isArmedModifier(armed, "alt") || isArmedModifier(armed, "opt")) bytes = `\x1b${bytes}`;
-  return { bytes };
+  return bytes;
+}
+
+export function encodeTerminalData(
+  data: string,
+  armed: ArmedModifiers,
+  appCursor: boolean,
+): KeyOutput {
+  const chord = chordForSequence(data);
+  if (chord) return encodeChord(chord, armed, appCursor);
+  if (isArmedModifier(armed, "cmd") || isArmedModifier(armed, "win")) {
+    if (/^[a-z]$/i.test(data)) {
+      return encodeChord({ code: `Key${data.toUpperCase()}`, modifiers: [] }, armed, appCursor);
+    }
+    return applyCmd({ char: data }, CMD_KEY_MODE, appCursor);
+  }
+  return { bytes: applyTerminalTextModifiers(data, armed) };
 }
 
 export function resolveSend(
