@@ -24,6 +24,8 @@ import {
   splitTerminalWrites,
   toBar322,
   writeTerminalKeyPreferences,
+  type BarChord,
+  type KeyAction,
   type SurfaceKeys,
 } from "./terminalKeys";
 
@@ -82,6 +84,37 @@ it("migrates every legacy key and its preset without changing its projection or 
   expect(validateBar(toBar322(keys.shell)).structural).toEqual([]);
   expect(preset.shell).toEqual(keys.shell);
   expect(readRaw()).toBeNull();
+});
+
+it.each<[KeyAction, BarChord]>([
+  [
+    { type: "send", send: "\\x1e" },
+    { code: "Unidentified", modifiers: ["meta"] },
+  ],
+  [
+    { type: "send", send: "\\r", autoEnter: true },
+    { code: "Enter", modifiers: [] },
+  ],
+  [
+    { type: "send", send: "\\e[1;5D" },
+    { code: "ArrowLeft", modifiers: ["control"] },
+  ],
+  [
+    { type: "combo", chord: { code: "KeyK", modifiers: ["meta"] } },
+    { code: "Unidentified", modifiers: ["meta"] },
+  ],
+  [
+    { type: "combo", chord: { code: "ArrowLeft", modifiers: ["meta"] } },
+    { code: "ArrowLeft", modifiers: ["meta"] },
+  ],
+])("projects %j to an encodable 322 chord or an inert key", (action, chord) => {
+  const {
+    keys: { shell },
+  } = resolveTerminalKeys({});
+  shell.top.keys[0].action = action;
+  const projected = toBar322(shell);
+  expect(projected.top.keys[0]).toMatchObject({ kind: "key", chord });
+  expect(reconcileShell(shell, projected).top.keys[0].action).toEqual(action);
 });
 
 it("preserves a legacy key during appearance edits and can explicitly convert literal text to Send", () => {

@@ -1140,6 +1140,34 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
+  it.each([false, true])(
+    "sends one CR frame for a Send key containing only Enter (autoEnter: %s)",
+    (autoEnter) => {
+      const { socket, session } = makeSession();
+      socket.open();
+      socket.sent = [];
+
+      session.sendBarSequence("\\r", autoEnter);
+
+      expect(socket.sent.map((frame) => Array.from(frame as Uint8Array))).toEqual([[0x0d]]);
+      session.dispose();
+    },
+  );
+
+  it("sends Escape and CR from the phone keyboard with Ctrl and Alt armed, then releases both", () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    socket.open();
+    socket.sent = [];
+    session.setStickyModifiers({ ctrl: "once", alt: "once", shift: "off" });
+
+    term.input("\r", true);
+
+    expect(socket.sent.map((frame) => Array.from(frame as Uint8Array))).toEqual([[0x1b, 0x0d]]);
+    expect(session.getStickyModifiers()).toEqual({ ctrl: "off", alt: "off", shift: "off" });
+    session.dispose();
+  });
+
   it("keeps legacy text literal and gives a Cmd chord the same bytes as an armed Cmd", () => {
     const { socket, session } = makeSession();
     const term = (session as unknown as { term: Terminal }).term;
