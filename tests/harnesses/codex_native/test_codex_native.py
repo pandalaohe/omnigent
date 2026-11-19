@@ -883,7 +883,12 @@ _PROVIDER_POLICY_CONFLICT = {
             "Databricks",
         ),
         ("failed to load configuration: Model provider `Databricks` not found\n", "Databricks"),
-        ("failed to load configuration: Model provider Databricks not found", "Databricks"),
+        (
+            "failed to load configuration: Model provider `custom` not found in the managed "
+            "allowlist",
+            None,
+        ),
+        ("failed to load configuration: Model provider Databricks not found", None),
         ("failed to load configuration: Model provider `` not found", None),
         (
             "This chat uses model provider “Databricks”, which is no longer configured.",
@@ -895,6 +900,7 @@ _PROVIDER_POLICY_CONFLICT = {
         "quoted",
         "trailing_detail",
         "trailing_newline",
+        "longer_sentence",
         "unquoted",
         "empty_name",
         "structured_wording",
@@ -1393,6 +1399,46 @@ def test_preload_codex_thread_recovers_managed_override_after_config_read_timeou
     assert resumes[2]["modelProvider"] == "managed-provider"
     assert json.loads(rollout.read_text())["payload"]["model_provider"] == "managed-provider"
     assert fake_client.closed
+
+
+def test_preload_codex_thread_restamps_structured_mismatch_before_legacy_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A structured provider mismatch is not overridden by the legacy text shape."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    rollout.write_bytes(b'{"type":"session_meta","payload":{"model_provider":"saved-provider"}}\n')
+    refusal = codex_native_app_server.CodexAppServerResponseError(
+        {
+            "code": -32600,
+            "message": "failed to load configuration: Model provider `saved-provider` not found",
+            "data": {
+                "type": "modelProviderMismatch",
+                "modelProvider": "saved-provider",
+                "currentModelProvider": "live-provider",
+            },
+        }
+    )
+    fake_client = _ConfiguredProviderResumeClient([refusal], "live-provider")
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    assert (
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+                model_provider=None,
+                rollout_path=rollout,
+            )
+        )
+        is None
+    )
+
+    resumes = [params for method, params in fake_client.requests if method == "thread/resume"]
+    assert len(resumes) == 2
+    assert resumes[1]["modelProvider"] == "live-provider"
 
 
 def test_preload_codex_thread_reports_legacy_unconfigured_provider_without_restamp(

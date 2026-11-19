@@ -14,6 +14,7 @@ import shutil
 import socket
 import subprocess
 import time
+import unicodedata
 import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
@@ -1984,12 +1985,15 @@ def _clone_codex_rollout(
 
 
 def _codex_rollout_text_is_usable(value: str) -> bool:
-    """Whether *value* can be replayed as a provider id Codex can match."""
+    """Whether *value* can name a provider in Codex's own configuration."""
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
+        # A lone surrogate has no UTF-8 form, so no rollout can carry it.
         return False
-    return value.isprintable()
+    # Cc is the C0 and C1 control block; every other code point is a legal TOML
+    # key, including the non-ASCII spaces a provider name may quote.
+    return not any(unicodedata.category(character) == "Cc" for character in value)
 
 
 def _codex_rollout_provider_and_version(path: Path) -> tuple[str, str | None] | None:

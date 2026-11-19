@@ -191,12 +191,13 @@ _EFFORT_CONNECT_TIMEOUT_SECONDS = 2.0
 _EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS = 2.0
 _EFFORT_CLOSE_TIMEOUT_SECONDS = 2.0
 _MODEL_PROVIDER_READ_TIMEOUT_SECONDS = 2.0
-# Codex before 0.166 reports a missing provider as plain configuration-load text.
-_CODEX_LEGACY_MISSING_PROVIDER_PREFIX = "failed to load configuration: Model provider "
-_CODEX_LEGACY_MISSING_PROVIDER_QUOTED = re.compile(
+# Codex before 0.166 reports a missing provider as plain configuration-load text,
+# e.g. "failed to load configuration: Model provider `Databricks` not found". Only
+# that message, optionally followed by one parenthesised detail, names a provider.
+_CODEX_LEGACY_MISSING_PROVIDER = re.compile(
     r"^failed to load configuration: Model provider `([^`\n]+)` not found"
+    r"(?:\s+\([^\n)]*\))?\s*$"
 )
-_CODEX_LEGACY_MISSING_PROVIDER_SUFFIX = " not found"
 # Model discovery is a best-effort side process whose callers fall back to a
 # cached or bundled catalog, so it keeps a short readiness budget.
 _CONNECT_TIMEOUT_SECONDS = 10.0
@@ -1306,16 +1307,8 @@ def codex_resume_legacy_unconfigured_model_provider(exc: BaseException) -> str |
     message = exc.message
     if message is None:
         return None
-    quoted = _CODEX_LEGACY_MISSING_PROVIDER_QUOTED.match(message)
-    if quoted is not None:
-        return quoted.group(1)
-    prefix, suffix = _CODEX_LEGACY_MISSING_PROVIDER_PREFIX, _CODEX_LEGACY_MISSING_PROVIDER_SUFFIX
-    if not message.startswith(prefix) or not message.endswith(suffix):
-        return None
-    # An unquoted message names the provider directly; a leftover backtick means
-    # the quoted form was malformed, not that a provider is named.
-    remainder = message[len(prefix) : -len(suffix)].strip()
-    return None if not remainder or "`" in remainder else remainder
+    matched = _CODEX_LEGACY_MISSING_PROVIDER.match(message)
+    return matched.group(1) if matched is not None else None
 
 
 def _codex_unconfigured_provider_error(provider: str) -> OmnigentError:
@@ -6306,7 +6299,7 @@ async def preload_codex_thread_for_resume(
         except CodexAppServerResponseError as exc:
             current_provider = codex_resume_current_model_provider(exc)
             unconfigured_provider = codex_resume_unconfigured_model_provider(exc)
-            if unconfigured_provider is None:
+            if unconfigured_provider is None and current_provider is None:
                 legacy_missing = codex_resume_legacy_unconfigured_model_provider(exc)
                 if legacy_missing is not None:
                     raise _codex_unconfigured_provider_error(legacy_missing) from exc
