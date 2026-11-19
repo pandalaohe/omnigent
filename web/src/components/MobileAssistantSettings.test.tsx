@@ -3,6 +3,7 @@ import { toast } from "sonner";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  MOBILE_ASSISTANT_STORAGE_KEY,
   readMobileAssistantPreferences,
   writeMobileAssistantPreferences,
 } from "@/lib/mobileAssistantPreferences";
@@ -13,8 +14,8 @@ import {
   legacyFingerprint,
   projectLegacy,
 } from "@/lib/terminalKeyBar";
-import { buildTerminalKeyPreferences, fromBar322 } from "@/lib/terminalKeys";
-import { collectLocalUserPreferences } from "@/lib/userPreferencesSync";
+import { buildTerminalKeyPreferences, fromBar322, resolveTerminalKeys } from "@/lib/terminalKeys";
+import * as preferencesSync from "@/lib/userPreferencesSync";
 
 vi.mock("sonner", () => ({ toast: vi.fn() }));
 
@@ -134,39 +135,6 @@ describe("MobileAssistantSettings", () => {
     expect(readMobileAssistantPreferences().terminalKeysEnabled).toBe(false);
   });
 
-  it("refuses an oversized saved preset before touching local storage", () => {
-    const bar = defaultTerminalBar();
-    for (const row of ["top", "bottom"] as const) {
-      bar[row] = {
-        enabled: true,
-        pinned: 0,
-        keys: Array.from({ length: 60 }, (_, index) => ({
-          id: `${row}-${index}`,
-          label: "快捷".repeat(6),
-          kind: "text",
-          display: "text",
-          width: 1,
-          text: "输入".repeat(32),
-        })),
-      };
-    }
-    const legacy = projectLegacy(bar);
-    writeMobileAssistantPreferences({
-      version: 2,
-      enabled: true,
-      buttons: [],
-      terminalBar: bar,
-      terminalButtons: legacy,
-      terminalLegacyBasis: legacyFingerprint(legacy, true),
-      chatActionsRevision: 1,
-    });
-    render(<MobileAssistantSettings />);
-    const before = localStorage.getItem("omnigent:mobile-assistant-preferences");
-    fireEvent.click(screen.getByRole("button", { name: "Save as my preset" }));
-    expect(screen.getByText("Too large to sync: remove keys or shorten texts")).toBeVisible();
-    expect(localStorage.getItem("omnigent:mobile-assistant-preferences")).toBe(before);
-  });
-
   it("names the default fallback when an invalid stored bar had no older key list", () => {
     const raw = {
       version: 2,
@@ -186,8 +154,11 @@ describe("MobileAssistantSettings", () => {
     expect(screen.queryByText(/showing the default keys/)).toBeNull();
   });
 
-  it.each([65_536, 65_537])("enforces the exact normalized editor budget at %i bytes", (bytes) => {
-    localStorage.clear();
+  it.each([
+    ["preset", 65_536],
+    ["preset", 65_537],
+    ["native switch", 65_537],
+  ])("enforces the account limit when the editor saves a %s at %i bytes", (edit, bytes) => {
     const bar = defaultTerminalBar();
     const terminalButtons = projectLegacy(bar);
     writeMobileAssistantPreferences({
@@ -200,25 +171,50 @@ describe("MobileAssistantSettings", () => {
       terminalLegacyBasis: legacyFingerprint(terminalButtons, true),
     });
     render(<MobileAssistantSettings />);
-    const envelope = collectLocalUserPreferences();
+    const envelope = preferencesSync.collectLocalUserPreferences();
+    const current = { ...readMobileAssistantPreferences() };
+    const { keys } = resolveTerminalKeys(current);
     const mobile = buildTerminalKeyPreferences(
-      { terminalKeysPreset: { shell: fromBar322(bar) } },
-      { ...readMobileAssistantPreferences() },
+      edit === "preset"
+        ? { terminalKeysPreset: { shell: fromBar322(bar) } }
+        : { terminalKeys: { ...keys, native: { ...keys.native, enabled: false } } },
+      current,
       envelope.settings.mobile_assistant as Record<string, unknown>,
     );
     envelope.settings.mobile_assistant = mobile;
     envelope.settings.usage_context = "";
     const padding = "x".repeat(bytes - preferencesEnvelopeBytes(envelope));
     localStorage.setItem("omnigent:usage-context-preferences", JSON.stringify(padding));
-    const actual = collectLocalUserPreferences();
-    actual.settings.mobile_assistant = mobile;
-    expect(preferencesEnvelopeBytes(actual)).toBe(bytes);
-    fireEvent.click(screen.getByRole("button", { name: "Save as my preset" }));
+    const before = preferencesSync.collectLocalUserPreferences();
+    const rawBefore = localStorage.getItem(MOBILE_ASSISTANT_STORAGE_KEY);
+    expect(preferencesEnvelopeBytes(before)).toBeLessThanOrEqual(65_536);
+    expect(
+      preferencesEnvelopeBytes({
+        ...before,
+        settings: { ...before.settings, mobile_assistant: mobile },
+      }),
+    ).toBe(bytes);
+    const writeLocal = vi.spyOn(Storage.prototype, "setItem");
+    const queuePatch = vi.spyOn(preferencesSync, "queueUserPreferencePatch");
+    const control =
+      edit === "preset"
+        ? screen.getByRole("button", { name: "Save as my preset" })
+        : screen.getByRole("switch", { name: "Enable native terminal key rows" });
+    fireEvent.click(control);
     if (bytes === 65_536) {
       expect(readMobileAssistantPreferences().terminalBarPreset).toEqual(bar);
+      expect(queuePatch).toHaveBeenCalledWith("mobile_assistant", mobile);
     } else {
-      expect(readMobileAssistantPreferences().terminalBarPreset).toBeUndefined();
-      expect(screen.getByText("Too large to sync: remove keys or shorten texts")).toBeVisible();
+      const message = screen.getByText(
+        "Too large to save: preferences are limited to 64 KiB. Shorten or remove some keys.",
+      );
+      expect(message).toBeVisible();
+      expect(message).toHaveAttribute("role", "status");
+      expect(writeLocal).not.toHaveBeenCalled();
+      expect(queuePatch).not.toHaveBeenCalled();
+      expect(localStorage.getItem(MOBILE_ASSISTANT_STORAGE_KEY)).toBe(rawBefore);
+      expect(preferencesSync.collectLocalUserPreferences()).toEqual(before);
+      if (edit === "native switch") expect(control).toBeChecked();
     }
   });
 });

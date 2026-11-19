@@ -36,6 +36,7 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { USER_PREFERENCES_PATCH_REJECTED_EVENT } from "@/lib/userPreferencesSync";
 import {
+  MAX_PREFERENCE_ENVELOPE_BYTES,
   MAX_ROW_PAGES,
   ROW_CELLS,
   canonicalizeBar,
@@ -64,6 +65,8 @@ import {
 import { TerminalKeySheet } from "./TerminalKeySheet";
 
 type RowName = "top" | "bottom";
+
+const PREFERENCE_SIZE_ERROR = `Too large to save: preferences are limited to ${MAX_PREFERENCE_ENVELOPE_BYTES / 1024} KiB. Shorten or remove some keys.`;
 
 function createKeyId(): string {
   return `key-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -307,9 +310,7 @@ export function TerminalBarEditor({ preferences }: TerminalBarEditorProps) {
     });
     if (result !== "saved") {
       lastErrorRef.current =
-        result === "too-large"
-          ? "Too large to sync: remove keys or shorten texts"
-          : "Couldn't save terminal keys";
+        result === "too-large" ? PREFERENCE_SIZE_ERROR : "Couldn't save terminal keys";
       setRowError({ row: "top", message: lastErrorRef.current });
       return false;
     }
@@ -695,10 +696,7 @@ export function TerminalBarEditor({ preferences }: TerminalBarEditorProps) {
     if (result !== "saved")
       setRowError({
         row: "top",
-        message:
-          result === "too-large"
-            ? "Too large to sync: remove keys or shorten texts"
-            : "Couldn't save terminal keys",
+        message: result === "too-large" ? PREFERENCE_SIZE_ERROR : "Couldn't save terminal keys",
       });
   };
 
