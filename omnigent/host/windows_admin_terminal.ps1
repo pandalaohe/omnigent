@@ -17,25 +17,55 @@ $systemSsh = Join-Path $env:SystemRoot 'System32\OpenSSH'
 $hostKeyNames = @('ssh_host_ed25519_key', 'ssh_host_ecdsa_key', 'ssh_host_rsa_key')
 
 function Assert-Fresh {
-    if ((Get-Service sshd -ErrorAction SilentlyContinue) -or
-        (Test-Path -LiteralPath $marker) -or
-        @(Get-ChildItem -LiteralPath $sshDirectory -Force -ErrorAction SilentlyContinue).Count) {
-        throw 'Existing sshd service, enrollment marker or ProgramData\ssh files; refusing to take ownership.'
+    $service = Get-Service sshd -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $marker) {
+        $refusal = "Existing Omnigent enrollment marker at $marker; refusing to take ownership."
+        try { Assert-Owned } catch { throw "$refusal $($_.Exception.Message)" }
+        throw "$refusal Run `"omni host admin-terminal remove`" to remove this enrollment before retrying."
+    }
+    $sshEntries = @(if (Test-Path -LiteralPath $sshDirectory) {
+        Get-ChildItem -LiteralPath $sshDirectory -Force
+    })
+    if ($service -and $sshEntries.Count -eq 0) {
+        throw ('An existing sshd service is not Omnigent-owned: the enrollment marker is absent ' +
+            'and ProgramData\ssh has no entries. Refusing to take ownership. ' +
+            'If this is your Windows OpenSSH Server capability and you intend to remove it, ' +
+            "run Remove-WindowsCapability -Online -Name $capability in elevated PowerShell " +
+            'and restart Windows if asked.')
+    }
+    if ($sshEntries.Count) {
+        $leftovers = "Existing ProgramData\ssh entries: $($sshEntries.Name -join ', ')."
+        if ($service) { $leftovers = "Existing sshd service. $leftovers" }
+        throw "$leftovers The Omnigent enrollment marker is absent; refusing to take ownership."
     }
     $shell = (Get-ItemProperty 'HKLM:\SOFTWARE\OpenSSH' -ErrorAction SilentlyContinue).DefaultShell
     if ($shell -and $shell -ine (Join-Path $env:SystemRoot 'System32\cmd.exe')) {
-        throw 'Existing OpenSSH DefaultShell is not cmd.exe; refusing to change it.'
+        throw "Existing OpenSSH DefaultShell '$shell' is not cmd.exe; refusing to change it."
     }
 }
 
 function Assert-Owned {
     if (-not (Test-Path -LiteralPath $marker)) {
-        throw 'Omnigent enrollment marker missing or invalid; refusing removal.'
+        throw 'Omnigent enrollment marker is missing; refusing removal.'
     }
-    $record = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
-    if ($record.kind -cne 'omnigent-admin-terminal-v1' -or
-        ($EnrollmentId -and $record.id -cne $EnrollmentId)) {
-        throw 'Enrollment marker does not belong to this installation; refusing removal.'
+    try {
+        $markerText = Get-Content -LiteralPath $marker -Raw
+    } catch {
+        throw "Omnigent enrollment marker at $marker is not readable; refusing removal. $($_.Exception.Message)"
+    }
+    try {
+        $record = ConvertFrom-Json -InputObject $markerText
+    } catch {
+        throw 'Omnigent enrollment marker is not valid JSON; refusing removal.'
+    }
+    if ($record.kind -cne 'omnigent-admin-terminal-v1') {
+        throw 'Enrollment marker kind is not omnigent-admin-terminal-v1; refusing removal.'
+    }
+    if ($record.id -isnot [string] -or $record.id -notmatch '^[a-f0-9]{32}$') {
+        throw 'Enrollment marker id is missing or invalid; refusing removal.'
+    }
+    if ($EnrollmentId -and $record.id -cne $EnrollmentId) {
+        throw 'Enrollment marker id does not match this installation; refusing removal.'
     }
 }
 
