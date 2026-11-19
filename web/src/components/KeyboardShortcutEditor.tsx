@@ -14,14 +14,27 @@ import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
 import { SettingRow } from "@/components/SettingsFields";
 import { SessionNavigationSettings } from "@/components/SessionNavigationSettings";
+import { useMobileAssistantPreferences } from "@/lib/mobileAssistantPreferences";
+import {
+  defaultTerminalModifierMap,
+  readTerminalKeyboardPreferences,
+  terminalBindingsFor,
+  TERMINAL_BINDING_IDS,
+  TERMINAL_BINDINGS,
+  writeTerminalKeyboardPreferences,
+  type TerminalBindingId,
+  type TerminalKeyboardPreferences,
+} from "@/lib/terminalKeyboardPreferences";
 import {
   DEFAULT_SHORTCUT_DEFINITIONS,
   SHORTCUT_ACTION_IDS,
   currentShortcutPlatform,
   defaultShortcutBindings,
   deleteShortcutPlatformOverride,
+  eventMatchesShortcut,
   findShortcutConflicts,
   isShortcutActionEnabled,
+  logicalKeyEvent,
   macWindowsKeyPositionNotes,
   readKeyboardShortcutPreferences,
   readMacWindowsKeyPositions,
@@ -30,10 +43,15 @@ import {
   shortcutAriaKeys,
   shortcutBindingLabels,
   shortcutChordFromEvent,
+  shortcutEventFromLogicalKey,
   setShortcutRecordingActive,
+  terminalModifierPreset,
+  TERMINAL_MODIFIER_PRESETS,
   writeMacWindowsKeyPositions,
   writeShortcutPreference,
   type ShortcutActionId,
+  type ModifierMap,
+  type ModifierRole,
   type ShortcutChord,
   type ShortcutGroupId,
   type ShortcutPlatform,
@@ -56,10 +74,70 @@ const PLATFORMS: { id: ShortcutPlatform; label: string }[] = [
   { id: "linux", label: "Linux" },
 ];
 
-interface RecordingTarget {
-  actionId: ShortcutActionId;
-  platform: ShortcutPlatform | null;
+const TERMINAL_PHYSICAL_MODIFIERS = [
+  ["ctrl", "Physical Ctrl"],
+  ["alt", "Physical Alt / Option"],
+  ["meta", "Physical Win / Cmd / Super"],
+] as const;
+const TERMINAL_PHYSICAL_NAMES = {
+  macos: { ctrl: "Ctrl", alt: "Option", meta: "Cmd" },
+  windows: { ctrl: "Ctrl", alt: "Alt", meta: "Win" },
+  linux: { ctrl: "Ctrl", alt: "Alt", meta: "Super" },
+} satisfies Record<ShortcutPlatform, Record<keyof ModifierMap, string>>;
+const TERMINAL_SELECT_CLASS = "h-9 rounded-md border border-border bg-background px-2 text-ui";
+
+function remappedTerminalBindingLabels(
+  binding: ShortcutChord,
+  map: ModifierMap,
+  platform: ShortcutPlatform,
+): string[] {
+  const roleForModifier = {
+    control: "ctrl",
+    alt: "alt",
+    meta: "cmd",
+    primary: platform === "macos" ? "cmd" : "ctrl",
+  } as const;
+  const roles = new Set(
+    binding.modifiers.flatMap((modifier) =>
+      modifier === "shift" ? [] : [roleForModifier[modifier]],
+    ),
+  );
+  let choices: (keyof ModifierMap)[][] = [[]];
+  for (const role of roles) {
+    const sources = TERMINAL_PHYSICAL_MODIFIERS.filter(([physical]) => map[physical] === role);
+    choices = choices.flatMap((choice) => sources.map(([physical]) => [...choice, physical]));
+  }
+  const [key] = shortcutBindingLabels({ ...binding, modifiers: [] }, platform);
+  const shift = binding.modifiers.includes("shift") ? ["Shift"] : [];
+  return choices
+    .filter((choice) =>
+      choice.some((physical) => map[physical] !== TERMINAL_MODIFIER_PRESETS.byName[physical]),
+    )
+    .filter(
+      (choice) => platform !== "windows" || !(choice.includes("ctrl") && choice.includes("alt")),
+    )
+    .map((choice) => {
+      const modifiers = TERMINAL_PHYSICAL_MODIFIERS.filter(([physical]) =>
+        choice.includes(physical),
+      );
+      return [
+        ...modifiers.map(([physical]) => TERMINAL_PHYSICAL_NAMES[platform][physical]),
+        ...shift,
+        key,
+      ].join("+");
+    });
 }
+
+function terminalSaveError(result: ReturnType<typeof writeTerminalKeyboardPreferences>) {
+  if (result === "saved") return null;
+  if (result === "too-large")
+    return "Too large to sync. Your preferences would exceed the 64 KiB limit.";
+  return "Could not save terminal shortcuts.";
+}
+
+type RecordingTarget =
+  | { actionId: ShortcutActionId; platform: ShortcutPlatform | null }
+  | { terminalId: TerminalBindingId; platform: ShortcutPlatform };
 
 function normalizeRecordedPrimary(chord: ShortcutChord): ShortcutChord {
   const platform = currentShortcutPlatform();
@@ -74,19 +152,20 @@ function normalizeRecordedPrimary(chord: ShortcutChord): ShortcutChord {
 }
 
 function ShortcutBindingButton({
-  actionId,
+  label,
   platform,
   bindings,
   recording,
   onRecord,
+  terminal = false,
 }: {
-  actionId: ShortcutActionId;
+  label: string;
   platform: ShortcutPlatform | null;
   bindings: ShortcutChord[];
   recording: boolean;
   onRecord: () => void;
+  terminal?: boolean;
 }) {
-  const definition = DEFAULT_SHORTCUT_DEFINITIONS[actionId];
   const displayPlatform = platform ?? currentShortcutPlatform();
   const targetLabel = platform
     ? `${PLATFORMS.find((entry) => entry.id === platform)?.label} shortcut`
@@ -95,7 +174,7 @@ function ShortcutBindingButton({
     <button
       type="button"
       onClick={onRecord}
-      aria-label={`Record ${targetLabel} for ${definition.label}`}
+      aria-label={`Record ${targetLabel} for ${label}`}
       aria-pressed={recording}
       className="phone-hit-area relative flex min-h-7 items-center justify-end gap-1 rounded-md px-1.5 outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring phone:min-h-11 phone:min-w-11"
     >
@@ -105,8 +184,10 @@ function ShortcutBindingButton({
         <span className="text-sm text-muted-foreground">Not set</span>
       ) : (
         bindings.flatMap((binding, bindingIndex) =>
-          shortcutBindingLabels(binding, displayPlatform).map((label) => (
-            <Kbd key={`${bindingIndex}-${label}`}>{label}</Kbd>
+          shortcutBindingLabels(binding, displayPlatform).map((keyLabel) => (
+            <Kbd key={`${bindingIndex}-${keyLabel}`}>
+              {terminal && keyLabel === "Meta" ? "Cmd" : keyLabel}
+            </Kbd>
           )),
         )
       )}
@@ -120,6 +201,10 @@ function platformLabel(platform: ShortcutPlatform): string {
 
 export function KeyboardShortcutEditor() {
   useKeyboardShortcutsVersion();
+  useMobileAssistantPreferences();
+  const terminalPreferences = readTerminalKeyboardPreferences();
+  const [terminalPlatform, setTerminalPlatform] = useState(currentShortcutPlatform);
+  const [editingCustomMap, setEditingCustomMap] = useState(false);
   const [recording, setRecording] = useState<RecordingTarget | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
@@ -150,6 +235,57 @@ export function KeyboardShortcutEditor() {
       .replace(/⌥|option/g, "alt")
       .replace(/[\s+]+/g, "");
   const query = normalizeSearch(search.trim());
+  const terminalMap =
+    terminalPreferences.modifierMap?.[terminalPlatform] ??
+    defaultTerminalModifierMap(terminalPlatform);
+  const terminalPreset = terminalModifierPreset(terminalMap);
+  const physicalNames = TERMINAL_PHYSICAL_NAMES[terminalPlatform];
+  const roleNames = { ctrl: "Ctrl", alt: physicalNames.alt, cmd: "Command" };
+  const terminalMapHints = TERMINAL_PHYSICAL_MODIFIERS.flatMap(([physical]) =>
+    terminalMap[physical] === TERMINAL_MODIFIER_PRESETS.byName[physical]
+      ? []
+      : [`${physicalNames[physical]} acts as ${roleNames[terminalMap[physical]]}.`],
+  );
+  if (terminalPlatform === "windows" && terminalPreset === "altAsCmd") {
+    terminalMapHints.push("Unassigned Alt shortcuts keep their original terminal input.");
+  }
+  const mapChanged =
+    terminalPreset !== terminalModifierPreset(defaultTerminalModifierMap(terminalPlatform));
+  const matchesTerminalMap =
+    (!changedOnly || mapChanged) &&
+    (!query ||
+      [
+        "Terminal hardware modifier mapping",
+        "By name",
+        "Alt as Cmd",
+        "Swap Alt and Cmd",
+        "Custom",
+      ].some((value) => normalizeSearch(value).includes(query)));
+  const terminalRows = TERMINAL_BINDING_IDS.filter((id) => {
+    const binding = terminalPreferences.bindings?.[id];
+    if (changedOnly && !binding?.common && !binding?.platformOverrides?.[terminalPlatform])
+      return false;
+    return (
+      !query ||
+      [
+        "Terminal",
+        TERMINAL_BINDINGS[id].label,
+        ...terminalBindingsFor(terminalPreferences, id, terminalPlatform).map((chord) =>
+          shortcutAriaKeys(chord, terminalPlatform),
+        ),
+      ].some((value) => normalizeSearch(value).includes(query))
+    );
+  });
+  const saveTerminalPreferences = (next: TerminalKeyboardPreferences) => {
+    setError(terminalSaveError(writeTerminalKeyboardPreferences(next)));
+  };
+  const saveTerminalMap = (map: typeof terminalMap) => {
+    stopRecording();
+    saveTerminalPreferences({
+      ...terminalPreferences,
+      modifierMap: { ...terminalPreferences.modifierMap, [terminalPlatform]: map },
+    });
+  };
   const isChanged = (actionId: ShortcutActionId) => {
     const preference = preferences.actions[actionId];
     return (
@@ -186,6 +322,54 @@ export function KeyboardShortcutEditor() {
     if (!recording) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.repeat || event.isComposing) return;
+      if ("terminalId" in recording) {
+        const platform = currentShortcutPlatform();
+        const current = readTerminalKeyboardPreferences();
+        const logical = logicalKeyEvent(
+          event,
+          current.modifierMap?.[platform] ?? defaultTerminalModifierMap(platform),
+          platform,
+        );
+        if ("passthrough" in logical) {
+          if (logical.passthrough === "altgr")
+            setError("AltGr types a character and cannot be recorded as a terminal shortcut.");
+          return;
+        }
+        const input = shortcutEventFromLogicalKey(logical);
+        const chord = shortcutChordFromEvent(input);
+        if (!chord || event.key === "Unidentified") return;
+        event.preventDefault();
+        event.stopPropagation();
+        const { terminalId, platform: target } = recording;
+        const conflict = TERMINAL_BINDING_IDS.find(
+          (id) =>
+            id !== terminalId &&
+            terminalBindingsFor(current, id, target).some((binding) =>
+              eventMatchesShortcut(input, binding, target),
+            ),
+        );
+        if (conflict) {
+          setError(`That shortcut is already used by ${TERMINAL_BINDINGS[conflict].label}.`);
+          return;
+        }
+        const binding = current.bindings?.[terminalId];
+        const result = writeTerminalKeyboardPreferences({
+          ...current,
+          bindings: {
+            ...current.bindings,
+            [terminalId]: {
+              ...binding,
+              platformOverrides: { ...binding?.platformOverrides, [target]: [chord] },
+            },
+          },
+        });
+        setError(terminalSaveError(result));
+        if (result === "saved") {
+          setShortcutRecordingActive(false);
+          setRecording(null);
+        }
+        return;
+      }
       const recordedChord = shortcutChordFromEvent(event);
       if (!recordedChord) return;
       const normalizedChord = normalizeRecordedPrimary(recordedChord);
@@ -372,6 +556,7 @@ export function KeyboardShortcutEditor() {
             if (
               !event.currentTarget.open &&
               recording &&
+              "actionId" in recording &&
               DEFAULT_SHORTCUT_DEFINITIONS[recording.actionId].group === group.id
             )
               stopRecording();
@@ -424,11 +609,14 @@ export function KeyboardShortcutEditor() {
                         className="scale-90 phone:after:min-h-[calc(44px/0.9)] phone:after:min-w-[calc(44px/0.9)]"
                       />
                       <ShortcutBindingButton
-                        actionId={definition.id}
+                        label={definition.label}
                         platform={null}
                         bindings={actionPreference?.common ?? defaultsFor(definition.id)}
                         recording={
-                          recording?.actionId === definition.id && recording.platform === null
+                          recording !== null &&
+                          "actionId" in recording &&
+                          recording.actionId === definition.id &&
+                          recording.platform === null
                         }
                         onRecord={() => startRecording({ actionId: definition.id, platform: null })}
                       />
@@ -494,14 +682,16 @@ export function KeyboardShortcutEditor() {
                           {platform.label}
                         </span>
                         <ShortcutBindingButton
-                          actionId={definition.id}
+                          label={definition.label}
                           platform={platform.id}
                           bindings={
                             platformOverrides[platform.id] ??
                             defaultsFor(definition.id, platform.id)
                           }
                           recording={
-                            recording?.actionId === definition.id &&
+                            recording !== null &&
+                            "actionId" in recording &&
+                            recording.actionId === definition.id &&
                             recording.platform === platform.id
                           }
                           onRecord={() =>
@@ -535,7 +725,158 @@ export function KeyboardShortcutEditor() {
           </ul>
         </details>
       ))}
-      {!SHORTCUT_ACTION_IDS.some(matches) && (
+      {(matchesTerminalMap || terminalRows.length > 0) && (
+        <details
+          open={query || changedOnly ? true : undefined}
+          className="mb-2 rounded-xl border border-border bg-card px-3 py-2 last:mb-0"
+          onToggle={(event) => {
+            if (!event.currentTarget.open && recording && "terminalId" in recording)
+              stopRecording();
+          }}
+        >
+          <summary className="cursor-pointer select-none text-ui font-medium">Terminal</summary>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Applies to hardware keys while the terminal has focus. Physical Cmd+C, Cmd+V, Cmd+K and
+            Cmd+R keep their usual behavior with By name. The browser or system can reserve
+            shortcuts such as Cmd+N and Win combinations.
+          </p>
+          <label className="mt-2 flex flex-wrap items-center justify-between gap-2 text-ui">
+            Client platform
+            <select
+              className={TERMINAL_SELECT_CLASS}
+              value={terminalPlatform}
+              onChange={(event) => {
+                stopRecording();
+                setEditingCustomMap(false);
+                setError(null);
+                setTerminalPlatform(event.target.value as ShortcutPlatform);
+              }}
+            >
+              {PLATFORMS.map(({ id, label }) => (
+                <option key={id} value={id}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </label>
+          {matchesTerminalMap && (
+            <div className="border-b border-border/60 py-2">
+              <label className="flex flex-wrap items-center justify-between gap-2 text-ui">
+                Hardware modifier mapping
+                <select
+                  className={TERMINAL_SELECT_CLASS}
+                  value={editingCustomMap ? "custom" : (terminalPreset ?? "custom")}
+                  onChange={(event) => {
+                    const preset = event.target.value as
+                      keyof typeof TERMINAL_MODIFIER_PRESETS | "custom";
+                    setEditingCustomMap(preset === "custom");
+                    if (preset !== "custom") saveTerminalMap(TERMINAL_MODIFIER_PRESETS[preset]);
+                  }}
+                >
+                  <option value="byName">By name</option>
+                  <option value="altAsCmd">Alt as Cmd</option>
+                  <option value="swapAltCmd">Swap Alt and Cmd</option>
+                  <option value="custom">Custom</option>
+                </select>
+              </label>
+              {terminalMapHints.length > 0 && (
+                <p className="mt-1 text-xs text-muted-foreground">{terminalMapHints.join(" ")}</p>
+              )}
+              {(editingCustomMap || !terminalPreset) && (
+                <div className="mt-2 grid gap-2">
+                  {TERMINAL_PHYSICAL_MODIFIERS.map(([physical, label]) => (
+                    <label
+                      className="flex flex-wrap items-center justify-between gap-2 text-ui"
+                      key={physical}
+                    >
+                      {label}
+                      <select
+                        className={TERMINAL_SELECT_CLASS}
+                        value={terminalMap[physical]}
+                        onChange={(event) =>
+                          saveTerminalMap({
+                            ...terminalMap,
+                            [physical]: event.target.value as ModifierRole,
+                          })
+                        }
+                      >
+                        <option value="ctrl">Ctrl</option>
+                        <option value="alt">Alt / Option</option>
+                        <option value="cmd">Command</option>
+                      </select>
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          {terminalRows.length > 0 && (
+            <ul className="mt-1">
+              {terminalRows.map((id) => {
+                const { label } = TERMINAL_BINDINGS[id];
+                const binding = terminalPreferences.bindings?.[id];
+                const hasOverride = binding?.platformOverrides?.[terminalPlatform] !== undefined;
+                const bindings = terminalBindingsFor(terminalPreferences, id, terminalPlatform);
+                const physicalBindings = bindings.flatMap((chord) =>
+                  remappedTerminalBindingLabels(chord, terminalMap, terminalPlatform),
+                );
+                return (
+                  <li
+                    key={id}
+                    className="flex flex-wrap items-center gap-2 border-b border-border/60 py-1.5 last:border-b-0 phone:min-h-11"
+                  >
+                    <div className="min-w-32 flex-1 text-ui">
+                      <span>{label}</span>
+                      {physicalBindings.length > 0 && (
+                        <p className="text-xs text-muted-foreground">
+                          Press {physicalBindings.join(" or ")}
+                        </p>
+                      )}
+                    </div>
+                    <ShortcutBindingButton
+                      label={label}
+                      platform={terminalPlatform}
+                      bindings={bindings}
+                      recording={
+                        recording !== null &&
+                        "terminalId" in recording &&
+                        recording.terminalId === id &&
+                        recording.platform === terminalPlatform
+                      }
+                      onRecord={() =>
+                        startRecording({ terminalId: id, platform: terminalPlatform })
+                      }
+                      terminal
+                    />
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      disabled={!hasOverride}
+                      aria-label={`Restore ${platformLabel(terminalPlatform)} shortcut for ${label}`}
+                      onClick={() => {
+                        stopRecording();
+                        const { [terminalPlatform]: _removed, ...overrides } =
+                          binding?.platformOverrides ?? {};
+                        saveTerminalPreferences({
+                          ...terminalPreferences,
+                          bindings: {
+                            ...terminalPreferences.bindings,
+                            [id]: { ...binding, platformOverrides: overrides },
+                          },
+                        });
+                      }}
+                    >
+                      <RotateCcwIcon />
+                    </Button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </details>
+      )}
+      {!SHORTCUT_ACTION_IDS.some(matches) && !matchesTerminalMap && terminalRows.length === 0 && (
         <p role="status" className="py-3 text-sm text-muted-foreground">
           No matching shortcuts.
         </p>

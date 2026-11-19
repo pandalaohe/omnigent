@@ -23,8 +23,10 @@ import {
 import {
   isArmedModifier,
   availableAction,
+  encodeChord,
   fromBar322,
   keySupportsRepeat,
+  resolveSend,
   specialModifier,
   type SurfaceKeys,
   type TerminalKeyRowV2,
@@ -62,6 +64,7 @@ type RenderKey = TerminalKeyRowV2["keys"][number];
 interface ActiveKeyPress {
   key: RenderKey;
   pointerId: number;
+  clipboardTarget?: HTMLButtonElement;
   startX: number;
   startY: number;
   moved: boolean;
@@ -153,11 +156,23 @@ function pressBarKey(session: TerminalSession, key: RenderKey, keyboardUp: boole
     case "send":
       session.sendBarSequence(action.send, action.autoEnter === true);
       break;
+    case "clipboard":
+      session.runClipboardAction(action.op, { enter: action.autoEnter === true, keyId: key.id });
+      break;
   }
 }
 
 function stickyLabel(state: TerminalStickyState): string {
   return state === "off" ? "" : `, ${state === "once" ? "next key" : "locked"}`;
+}
+
+function isClipboardPress(key: RenderKey, sticky: TerminalStickyModifiers): boolean {
+  const action = availableAction(key);
+  if (action?.type === "send") {
+    return "clipboard" in resolveSend(action.send, action.autoEnter === true, sticky, false);
+  }
+  if (action?.type === "combo") return "clipboard" in encodeChord(action.chord, sticky, false);
+  return action?.type === "clipboard";
 }
 
 function PageButton({
@@ -329,6 +344,7 @@ export function TerminalKeyRow({
       if (disabled) return;
       const targetSession = sessionRef.current;
       if (!targetSession) return;
+      if (gesture === "repeat" && isClipboardPress(key, targetSession.getStickyModifiers())) return;
       targetSession.runBarKey(() => {
         pressBarKey(targetSession, key, keyboardUp);
         updateSticky(targetSession.getStickyModifiers());
@@ -393,9 +409,12 @@ export function TerminalKeyRow({
     }
 
     stopPress();
+    const clipboardTarget =
+      session && isClipboardPress(key, session.getStickyModifiers()) ? buttonEl : undefined;
     const press: ActiveKeyPress = {
       key,
       pointerId: event.pointerId,
+      clipboardTarget,
       startX: event.clientX,
       startY: event.clientY,
       moved: false,
@@ -403,7 +422,11 @@ export function TerminalKeyRow({
       timeoutId: null,
       intervalId: null,
     };
-    if (key.repeat && keySupportsRepeat(key)) {
+    if (clipboardTarget) {
+      press.timeoutId = window.setTimeout(() => {
+        press.consumed = true;
+      }, TERMINAL_REPEAT_DELAY_MS);
+    } else if (key.repeat && keySupportsRepeat(key)) {
       press.timeoutId = window.setTimeout(() => {
         if (pressRef.current !== press || press.moved) return;
         press.consumed = true;
@@ -480,8 +503,14 @@ export function TerminalKeyRow({
 
     const press = pressRef.current;
     if (!press || press.pointerId !== event.pointerId) return;
-    const { key, moved, consumed } = press;
+    const { key, moved, consumed, clipboardTarget } = press;
     stopPress();
+    if (
+      clipboardTarget &&
+      document.elementFromPoint &&
+      !clipboardTarget.contains(document.elementFromPoint(event.clientX, event.clientY))
+    )
+      return;
     if (!moved && !consumed) fireKey(key, "tap");
   };
 
@@ -509,11 +538,21 @@ export function TerminalKeyRow({
     const modifierState = (modifier && sticky[modifier]) || "off";
     const available = availableAction(key);
     const unavailableReason = !available
-      ? "Needs a newer version"
-      : available.type === "clipboard"
+      ? key.action.type === "clipboard"
         ? "Not available"
-        : undefined;
+        : "Needs a newer version"
+      : undefined;
     const isActive = (isKeyboardAction && keyboardUp) || modifierState !== "off";
+    let functionLabel = "";
+    if (available?.type === "special" && modifier) {
+      functionLabel =
+        modifierState === "off"
+          ? available.keepHeld
+            ? ", holds until tapped again"
+            : ", holds for next key"
+          : stickyLabel(modifierState);
+    } else if (available?.type === "send") functionLabel = ", sends a terminal sequence";
+    else if (available?.type === "combo") functionLabel = ", sends a terminal shortcut";
     return (
       <button
         key={`${pinnedCopy ? "copy-" : ""}${key.id}`}
@@ -522,9 +561,7 @@ export function TerminalKeyRow({
         data-pinned={pinnedCopy ? "true" : undefined}
         disabled={disabled || !!unavailableReason}
         aria-label={
-          unavailableReason
-            ? `${key.label}, ${unavailableReason}`
-            : `${key.label}${stickyLabel(modifierState)}`
+          unavailableReason ? `${key.label}, ${unavailableReason}` : `${key.label}${functionLabel}`
         }
         aria-pressed={isKeyboardAction || modifier ? isActive : undefined}
         data-sticky-state={modifier ? modifierState : undefined}
@@ -541,7 +578,7 @@ export function TerminalKeyRow({
           pinnedCopy && "border-dashed opacity-60",
         )}
       >
-        <TerminalKeyContent button={key} />
+        <TerminalKeyContent button={unavailableReason ? { ...key, display: "text" } : key} />
         {modifierState === "locked" && (
           <LockKeyhole className="ml-0.5 size-3 shrink-0" aria-hidden="true" />
         )}

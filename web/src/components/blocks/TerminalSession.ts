@@ -25,11 +25,17 @@ import { withBasePath } from "@/lib/basePath";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
 import {
   terminalDataForChord,
+  MOBILE_ASSISTANT_CHANGED_EVENT,
   type MobileAssistantSoftKey,
   type TerminalStickyState,
   type TerminalStickyModifiers,
 } from "@/lib/mobileAssistantPreferences";
-import type { ShortcutChord } from "@/lib/keyboardShortcutPreferences";
+import { currentShortcutPlatform, type ShortcutChord } from "@/lib/keyboardShortcutPreferences";
+import { registerTerminalKeydown } from "@/lib/terminalHardwareInput";
+import {
+  readTerminalKeyboardPreferences,
+  terminalHardwareKeyAction,
+} from "@/lib/terminalKeyboardPreferences";
 import {
   applyTerminalTextModifiers,
   isArmedModifier,
@@ -298,62 +304,6 @@ export type ConnectionStateListener = (state: ConnectionState) => void;
 export type TerminalActivityListener = () => void;
 /** Listener for user keyboard input sent to the terminal. */
 export type TerminalInputListener = () => void;
-
-/** Kitty Keyboard Protocol / CSI-u encoding for Shift+Enter. */
-export const SHIFT_ENTER_CSI_U = "\x1b[13;2u";
-
-/** Readline line-editing bytes for the macOS Cmd key mappings below. */
-export const CMD_BACKSPACE_LINE_KILL = "\x15"; // Ctrl-U: kill to line start
-export const CMD_LEFT_LINE_START = "\x01"; // Ctrl-A: cursor to line start
-export const CMD_RIGHT_LINE_END = "\x05"; // Ctrl-E: cursor to line end
-
-/**
- * Return the terminal bytes to send for a browser key event.
- *
- * Two key families need synthesized bytes because neither xterm.js nor the
- * browser produces them:
- *
- * - **Shift+Enter** — xterm does not emit Kitty Keyboard Protocol sequences
- *   for it, so the browser attach path synthesizes the CSI-u sequence,
- *   mirroring native terminals that support CSI-u while keeping plain Enter
- *   and modified Enter variants on xterm's default path.
- * - **macOS Cmd+Backspace / Cmd+Left / Cmd+Right** — the standard
- *   readline-style line shortcuts. The Option (Alt) equivalents work because
- *   xterm encodes Alt-modified keys as ESC-prefixed sequences that
- *   readline/zsh read as word operations; Cmd (metaKey) combos get no
- *   encoding at all — the browser eats them and nothing reaches the PTY.
- *   Each maps to the Ctrl control character a native terminal sends. Only
- *   bare Cmd combos are mapped: Cmd+C/V/K/R and friends keep their
- *   browser/xterm meaning (copy/paste/clear/reload).
- *
- * :param event: Browser keyboard event from xterm's custom key handler.
- * :returns: Bytes to send instead of xterm's default handling, or ``null``
- *     to let xterm handle the event normally.
- */
-export function terminalKeyEventPayload(event: KeyboardEvent): string | null {
-  // An in-flight IME composition owns the keyboard: xterm consults this
-  // handler BEFORE its CompositionHelper, so claiming a key mid-conversion
-  // would drop the composed text. Return null so xterm runs composition
-  // handling (keyCode 229 is the legacy composition signal).
-  if (event.isComposing || event.keyCode === 229 || event.key === "Process") {
-    return null;
-  }
-  if (
-    event.key === "Enter" &&
-    event.shiftKey &&
-    !event.altKey &&
-    !event.ctrlKey &&
-    !event.metaKey
-  ) {
-    return SHIFT_ENTER_CSI_U;
-  }
-  if (event.metaKey && !event.altKey && !event.ctrlKey && !event.shiftKey) {
-    if (event.key === "Backspace") return CMD_BACKSPACE_LINE_KILL;
-    if (event.key === "ArrowLeft") return CMD_LEFT_LINE_START;
-    if (event.key === "ArrowRight") return CMD_RIGHT_LINE_END;
-  }
-  return null;
-}
 
 // Reused across keystrokes — allocating a fresh TextEncoder per keypress
 // is needless churn on the input hot path.
@@ -1025,25 +975,60 @@ export class TerminalSession {
       }
     });
 
-    this.term.attachCustomKeyEventHandler((e) => {
-      if (!this.imeInput.handleKeyEvent(e)) return false;
-      if (this.imeInput.isComposing) return true;
-      const payload = terminalKeyEventPayload(e);
-      if (payload === null) return true;
-      // xterm invokes this handler for keydown, keypress, and keyup.
-      // Suppress all three so xterm cannot also send a bare Enter; emit
-      // the CSI-u sequence once, on keydown.
-      if (e.type === "keydown") {
-        e.preventDefault();
-        if (!this.imeInput.beforeSoftKey()) return false;
+    const platform = currentShortcutPlatform();
+    let keyboardPreferences = readTerminalKeyboardPreferences();
+    const refreshKeyboardPreferences = () => {
+      keyboardPreferences = readTerminalKeyboardPreferences();
+    };
+    window.addEventListener(MOBILE_ASSISTANT_CHANGED_EVENT, refreshKeyboardPreferences, { signal });
+    window.addEventListener("storage", refreshKeyboardPreferences, { signal });
+
+    const claimedKeys = new Set<string>();
+    let claimedKeypress: string | null = null;
+    const claimHardwareKeydown = (e: KeyboardEvent, fromWindowCapture = false): boolean => {
+      claimedKeypress = null;
+      if (this.imeInput.isComposing) return false;
+      const action = terminalHardwareKeyAction(
+        e,
+        keyboardPreferences,
+        platform,
+        this.onClipboardAction ? { hasSelection: () => Boolean(this.selectedText()) } : undefined,
+      );
+      if (!action || (fromWindowCapture && !this.imeInput.handleKeyEvent(e))) return false;
+      const key = e.code || e.key;
+      claimedKeys.add(key);
+      claimedKeypress = key;
+      e.preventDefault();
+      if ("clipboard" in action) {
+        if (!e.repeat) this.runClipboardAction(action.clipboard, { enter: false });
+      } else if (action.bytes && this.imeInput.beforeSoftKey()) {
         this.touchSelection?.cancel();
-        onInput?.();
-        this.lastUserInputAt = performance.now();
-        if (this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(INPUT_ENCODER.encode(payload));
-        }
+        sendInput(action.bytes);
       }
-      return false;
+      return true;
+    };
+    const textarea = this.term.textarea;
+    if (textarea) {
+      registerTerminalKeydown(textarea, (e) => claimHardwareKeydown(e, true), signal);
+      textarea.addEventListener(
+        "blur",
+        () => {
+          claimedKeys.clear();
+          claimedKeypress = null;
+        },
+        { signal },
+      );
+    }
+    this.term.attachCustomKeyEventHandler((e) => {
+      const key = e.code || e.key;
+      if (e.type === "keyup" && claimedKeys.delete(key)) {
+        if (claimedKeypress === key) claimedKeypress = null;
+        return false;
+      }
+      if (e.type === "keypress" && claimedKeypress && (!e.code || e.code === claimedKeypress))
+        return false;
+      if (!this.imeInput.handleKeyEvent(e)) return false;
+      return e.type !== "keydown" || !claimHardwareKeydown(e);
     });
 
     // Replace xterm's lossy wheel→mouse-report conversion (trackpad deltas

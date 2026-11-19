@@ -1,25 +1,8 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import {
-  ArchiveIcon,
-  ArrowDownIcon,
-  ArrowLeftIcon,
-  ArrowRightIcon,
-  ArrowUpIcon,
-  ChevronsDownIcon,
-  ChevronsUpIcon,
-  CommandIcon,
-  CornerDownLeftIcon,
-  DeleteIcon,
-  KeyboardIcon,
-  RefreshCwIcon,
-  SquareTerminalIcon,
-  XIcon,
-  type LucideIcon,
-} from "lucide-react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { CircleIcon, SquareIcon, XIcon } from "lucide-react";
 
+import { TerminalKeyContent } from "@/components/blocks/TerminalKeyContent";
 import { Button } from "@/components/ui/button";
-import { Combobox } from "@/components/ui/combobox";
-import { useIsPhone } from "@/hooks/useIsPhone";
 import {
   Dialog,
   DialogContent,
@@ -31,202 +14,154 @@ import {
 import { Input } from "@/components/ui/input";
 import { Segmented } from "@/components/ui/segmented";
 import { Switch } from "@/components/ui/switch";
-import type { ShortcutChord } from "@/lib/keyboardShortcutPreferences";
+import { Textarea } from "@/components/ui/textarea";
+import { useIsPhone } from "@/hooks/useIsPhone";
 import {
-  MAX_KEY_LABEL_LENGTH,
-  MAX_KEY_TEXT_LENGTH,
-  TERMINAL_KEY_ICONS,
-  type TerminalBarKey,
-  type TerminalKeyIcon,
-  type TerminalKeyModifier,
-} from "@/lib/terminalKeyBar";
+  currentShortcutPlatform,
+  setShortcutRecordingActive,
+} from "@/lib/keyboardShortcutPreferences";
+import { escapeForDisplay, escapeLiteral, unescapeFromDisplay } from "@/lib/keySequence";
+import { mobileAssistantBindingLabel } from "@/lib/mobileAssistantPreferences";
+import { MAX_KEY_LABEL_LENGTH } from "@/lib/terminalKeyBar";
+import { recordTerminalKey } from "@/lib/terminalKeyRecording";
+import { readTerminalKeyboardPreferences } from "@/lib/terminalKeyboardPreferences";
 import {
-  mobileAssistantBindingLabel,
-  softKeyForChord,
-  terminalDataForChord,
-} from "@/lib/mobileAssistantPreferences";
+  applyCmd,
+  availableAction,
+  CMD_KEY_MODE,
+  keySupportsRepeat,
+  MAX_SEND_BYTES,
+  specialModifier,
+  TERMINAL_CLIPBOARD_KEYS,
+  type BarChord,
+  type ClipboardOp,
+  type KeyAction,
+  type SpecialId,
+  type TerminalKeyRowV2,
+} from "@/lib/terminalKeys";
+import { cn } from "@/lib/utils";
+import { TerminalKeyIconPicker } from "./TerminalKeyIconPicker";
 
-type FunctionKind = "key" | "text" | "modifier" | "keyboard";
+type StoredKey = TerminalKeyRowV2["keys"][number];
+type FunctionKind = "send" | "special" | "keyboard" | "clipboard";
 
-const FUNCTION_KIND: Record<TerminalBarKey["kind"], FunctionKind> = {
-  key: "key",
-  text: "text",
-  modifier: "modifier",
-  action: "keyboard",
+const SPECIAL_LABELS: Record<SpecialId, string> = {
+  ctrl: "Ctrl",
+  shift: "Shift",
+  alt: "Alt",
+  opt: "Opt",
+  cmd: "Cmd",
+  win: "Win",
+  tab: "Tab",
+  esc: "Esc",
 };
-
-const KEY_GROUPS: readonly { label: string; choices: readonly [string, string][] }[] = [
-  {
-    label: "Common",
-    choices: [
-      ["Escape", "Esc"],
-      ["Tab", "Tab"],
-      ["Enter", "Enter"],
-      ["Space", "Space"],
-      ["Backspace", "Backspace"],
-      ["Delete", "Delete"],
-    ],
-  },
-  {
-    label: "Arrows and navigation",
-    choices: [
-      ["ArrowUp", "↑"],
-      ["ArrowDown", "↓"],
-      ["ArrowLeft", "←"],
-      ["ArrowRight", "→"],
-      ["Home", "Home"],
-      ["End", "End"],
-      ["PageUp", "PgUp"],
-      ["PageDown", "PgDn"],
-      ["Insert", "Insert"],
-    ],
-  },
-  {
-    label: "Letters",
-    choices: Array.from("ABCDEFGHIJKLMNOPQRSTUVWXYZ", (letter) => [`Key${letter}`, letter]),
-  },
-  {
-    label: "Digits",
-    choices: Array.from("0123456789", (digit) => [`Digit${digit}`, digit]),
-  },
-  {
-    label: "Symbols",
-    choices: [
-      ["Slash", "/"],
-      ["Backslash", "\\"],
-      ["BracketLeft", "["],
-      ["BracketRight", "]"],
-      ["Minus", "-"],
-      ["Equal", "="],
-      ["Semicolon", ";"],
-      ["Quote", "'"],
-      ["Comma", ","],
-      ["Period", "."],
-      ["Backquote", "`"],
-    ],
-  },
-  {
-    label: "Function keys",
-    choices: Array.from({ length: 12 }, (_, index) => [`F${index + 1}`, `F${index + 1}`]) as [
-      string,
-      string,
-    ][],
-  },
-];
-
-const ICON_COMPONENTS: Record<TerminalKeyIcon, LucideIcon> = {
-  escape: XIcon,
-  tab: ArrowRightIcon,
-  "arrow-up": ArrowUpIcon,
-  "arrow-down": ArrowDownIcon,
-  "arrow-left": ArrowLeftIcon,
-  "arrow-right": ArrowRightIcon,
-  enter: CornerDownLeftIcon,
-  backspace: DeleteIcon,
-  delete: DeleteIcon,
-  "page-up": ChevronsUpIcon,
-  "page-down": ChevronsDownIcon,
-  keyboard: KeyboardIcon,
-  refresh: RefreshCwIcon,
-  archive: ArchiveIcon,
-  terminal: SquareTerminalIcon,
-  command: CommandIcon,
+const CLIPBOARD_LABELS: Record<ClipboardOp, string> = {
+  copy: "Copy",
+  paste: "Paste",
+  pasteHost: "Paste from host",
 };
+const selectClass = "min-h-11 w-full rounded-md border border-input bg-background px-2 text-ui";
 
-function chordLabel(chord: ShortcutChord): string {
-  let label = mobileAssistantBindingLabel({ kind: "key", chord }).replace("Control", "Ctrl");
-  if (/^Key[A-Z]$/.test(chord.code)) label = `${label.slice(0, -1)}${chord.code.slice(3)}`;
-  return label.length <= MAX_KEY_LABEL_LENGTH
-    ? label
-    : label.replace("Ctrl+", "⌃").replace("Alt+", "⌥").replace("Shift+", "⇧");
-}
-
-function automaticLabel(key: TerminalBarKey): string {
-  if (key.kind === "key") return chordLabel(key.chord);
-  if (key.kind === "text") return key.text;
-  if (key.kind === "modifier")
-    return key.modifier === "ctrl" ? "Ctrl" : key.modifier === "alt" ? "Alt" : "Shift";
-  return "Keyboard";
-}
-
-function withFunction(key: TerminalBarKey, kind: FunctionKind): TerminalBarKey {
-  const base = {
-    id: key.id,
-    width: key.width,
-    display: key.display,
-    ...(key.icon ? { icon: key.icon } : {}),
+function comboLabel(chord: BarChord): string {
+  const arrowKeys: Record<string, string> = {
+    ArrowLeft: "←",
+    ArrowRight: "→",
+    ArrowUp: "↑",
+    ArrowDown: "↓",
+    Backspace: "⌫",
+    Enter: "↵",
   };
-  if (kind === "text")
-    return {
-      ...base,
-      kind: "text",
-      text: key.kind === "text" ? key.text : "ok",
-      submit: key.kind === "text" ? key.submit : true,
-      label: key.kind === "text" ? key.label : "ok",
-    };
-  if (kind === "modifier")
-    return {
-      ...base,
-      kind: "modifier",
-      modifier: key.kind === "modifier" ? key.modifier : "ctrl",
-      tapLocks: key.kind === "modifier" ? key.tapLocks : false,
-      label: key.kind === "modifier" ? key.label : "Ctrl",
-    };
-  if (kind === "keyboard")
-    return { ...base, kind: "action", action: "keyboard", label: "Keyboard" };
-  return {
-    ...base,
-    kind: "key",
-    chord: key.kind === "key" ? key.chord : { code: "Escape", modifiers: [] },
-    repeat: key.kind === "key" ? key.repeat : false,
-    label: key.kind === "key" ? key.label : "Esc",
-  };
+  const key =
+    arrowKeys[chord.code] ??
+    mobileAssistantBindingLabel({ kind: "key", chord: { ...chord, modifiers: [] } });
+  return `${chord.modifiers.includes("control") ? "⌃" : ""}${chord.modifiers.includes("alt") ? "⌥" : ""}${chord.modifiers.includes("shift") ? "⇧" : ""}⌘${key.length === 1 ? key.toUpperCase() : key}`;
 }
 
-function KeyPreview({ barKey, onCut }: { barKey: TerminalBarKey; onCut: (cut: boolean) => void }) {
-  const labelRef = useRef<HTMLSpanElement>(null);
-  const Icon = barKey.display === "icon" && barKey.icon ? ICON_COMPONENTS[barKey.icon] : null;
+function comboDescription(chord: BarChord): string {
+  const result = applyCmd({ chord }, CMD_KEY_MODE);
+  if ("clipboard" in result) return CLIPBOARD_LABELS[result.clipboard];
+  if ("refused" in result) return result.refused;
+  if (chord.modifiers.length === 1 && (CMD_KEY_MODE === "mac-meta" || CMD_KEY_MODE === "mac")) {
+    if (chord.code === "ArrowLeft") return "Move to start of line";
+    if (chord.code === "ArrowRight") return "Move to end of line";
+    if (chord.code === "Backspace") return "Delete to start of line";
+    if (chord.code === "Enter") return "Send Enter";
+  }
+  return `Sends ${escapeForDisplay(result.bytes)}`;
+}
+
+function legacySend(action: Extract<KeyAction, { type: "legacy" }>): KeyAction {
+  const key = action.key;
+  return key.kind === "text"
+    ? { type: "send", send: escapeLiteral(key.text), ...(key.submit ? { autoEnter: true } : {}) }
+    : { type: "send", send: "" };
+}
+
+function newClipboardAction(op: ClipboardOp): KeyAction {
+  return op === "copy" ? { type: "clipboard", op } : { type: "clipboard", op, autoEnter: true };
+}
+
+function KeyPreview({ draft }: { draft: StoredKey }) {
+  const previewRef = useRef<HTMLDivElement>(null);
+  const [clipped, setClipped] = useState(false);
+
   useLayoutEffect(() => {
-    const label = labelRef.current;
-    const measure = () => onCut(Boolean(label && label.scrollWidth > label.clientWidth));
+    const label = previewRef.current?.querySelector("span");
+    const measure = () => setClipped(!!label && label.scrollWidth > label.clientWidth);
     measure();
-    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
-    if (label) observer?.observe(label);
-    return () => observer?.disconnect();
-  }, [barKey.label, barKey.width, barKey.display, onCut]);
+    if (!label || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(label);
+    return () => observer.disconnect();
+  }, [draft.display, draft.icon, draft.label, draft.width]);
+
   return (
-    <div
-      data-testid="terminal-key-preview"
-      className="flex h-11 items-center justify-center rounded-[7px] border border-border bg-background px-1 font-mono text-[12px] font-semibold text-foreground"
-      style={{ width: barKey.width === 1 ? 28 : 59 }}
-    >
-      {Icon ? (
-        <Icon className="size-3.5" aria-hidden />
-      ) : (
-        <span
-          ref={labelRef}
-          className={Array.from(barKey.label).length === 1 ? "shrink-0" : "truncate"}
-        >
-          {barKey.label}
-        </span>
-      )}
+    <div className="flex min-w-0 items-center gap-2">
+      <div
+        ref={previewRef}
+        data-testid="terminal-key-preview"
+        aria-label="Key preview"
+        className={cn(
+          "flex h-11 shrink-0 items-center justify-center overflow-hidden rounded-[7px] border border-border bg-background px-1 font-mono text-xs font-semibold",
+          draft.style === "danger" && "text-destructive",
+        )}
+        style={{ width: draft.width === 1 ? 28 : 59 }}
+      >
+        <TerminalKeyContent button={draft} />
+      </div>
+      {clipped ? <span className="text-xs text-muted-foreground">Label is clipped</span> : null}
     </div>
   );
 }
 
+function ToggleRow({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <label className="flex min-h-11 items-center justify-between gap-3 text-ui">
+      {label}
+      <Switch checked={checked} onCheckedChange={onChange} aria-label={label} />
+    </label>
+  );
+}
+
 export interface TerminalKeySheetProps {
-  open: boolean;
-  keyDraft: TerminalBarKey | null;
+  keyDraft: StoredKey;
   isNew: boolean;
   error?: string | null;
   onClose: () => void;
-  onSave: (key: TerminalBarKey) => void;
+  onSave: (key: StoredKey) => void;
   onDelete: (id: string) => void;
   onMove: (id: string, direction: "left" | "right" | "other-row") => void;
 }
 
 export function TerminalKeySheet({
-  open,
   keyDraft,
   isNew,
   error,
@@ -236,60 +171,111 @@ export function TerminalKeySheet({
   onMove,
 }: TerminalKeySheetProps) {
   const isPhone = useIsPhone();
-  const [draft, setDraft] = useState<TerminalBarKey | null>(keyDraft);
-  const [labelEdited, setLabelEdited] = useState(false);
-  const [wouldCut, setWouldCut] = useState(false);
+  const [draft, setDraft] = useState(keyDraft);
+  const [labelEdited, setLabelEdited] = useState(!isNew && !!keyDraft.label);
+  const [recording, setRecording] = useState(false);
+  const [recordMessage, setRecordMessage] = useState("");
+  const sink = useRef<HTMLSpanElement>(null);
+  const recordButton = useRef<HTMLButtonElement>(null);
+  const sendHintId = useId();
+  const action = availableAction(draft);
+  const currentKind = action?.type === "combo" ? "send" : action?.type;
+  const clipboardOps = [...TERMINAL_CLIPBOARD_KEYS];
+  const showSend = currentKind === "send" || action?.type === "legacy";
+  const supportsRepeat = keySupportsRepeat(draft);
+  const initialAction = availableAction(keyDraft);
+  const send = action?.type === "send" ? action.send : "";
+  const decoded = unescapeFromDisplay(send);
+  const sendBytes = new TextEncoder().encode(decoded).length;
+  const originalBytes =
+    initialAction?.type === "send"
+      ? new TextEncoder().encode(unescapeFromDisplay(initialAction.send)).length
+      : 0;
+  const sendTooLong = sendBytes > MAX_SEND_BYTES && sendBytes > originalBytes;
+  const labelTooLong =
+    draft.label.length > MAX_KEY_LABEL_LENGTH && draft.label.length > keyDraft.label.length;
 
   useEffect(() => {
-    setDraft(keyDraft);
-    setLabelEdited(Boolean(!isNew && keyDraft && keyDraft.label !== automaticLabel(keyDraft)));
-  }, [keyDraft, isNew]);
+    if (!recording) return;
+    const platform = currentShortcutPlatform();
+    const preferences = readTerminalKeyboardPreferences();
+    const onKeyDown = (event: KeyboardEvent) => {
+      const outcome = recordTerminalKey(event, preferences, platform);
+      event.stopImmediatePropagation();
+      if (!outcome) return;
+      event.preventDefault();
+      if ("refused" in outcome) {
+        setRecordMessage(
+          outcome.refused === "altgr"
+            ? "AltGr types characters. Type the character into the field."
+            : "This key has no terminal sequence.",
+        );
+        return;
+      }
+      setDraft((current) => {
+        const next = { ...current, action: outcome.action };
+        if (!keySupportsRepeat(next)) delete next.repeat;
+        if (!labelEdited || !current.label.trim()) {
+          const label =
+            outcome.action.type === "combo" ? comboLabel(outcome.action.chord) : outcome.label;
+          next.label = label.slice(0, MAX_KEY_LABEL_LENGTH);
+        }
+        return next;
+      });
+      setRecordMessage("");
+      setRecording(false);
+      recordButton.current?.focus({ preventScroll: true });
+    };
+    const stopOnBlur = () => {
+      setRecording(false);
+      setRecordMessage("");
+      sink.current?.blur();
+    };
+    setShortcutRecordingActive(true);
+    window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("blur", stopOnBlur);
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+    sink.current?.focus({ preventScroll: true });
+    return () => {
+      setShortcutRecordingActive(false);
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("blur", stopOnBlur);
+    };
+  }, [recording, labelEdited]);
 
-  if (!draft) return null;
-  const kind = FUNCTION_KIND[draft.kind];
-  const unsupportedChord =
-    draft.kind === "key" &&
-    softKeyForChord(draft.chord) === null &&
-    terminalDataForChord(draft.chord) === null;
-
-  const setKey = (next: TerminalBarKey) => setDraft(next);
-  const chooseCode = (code: string) => {
-    if (draft.kind !== "key") return;
-    const chord = { ...draft.chord, code };
-    setKey({
-      ...draft,
-      chord,
-      ...(isNew
-        ? {
-            repeat: [
-              "ArrowUp",
-              "ArrowDown",
-              "ArrowLeft",
-              "ArrowRight",
-              "Backspace",
-              "Delete",
-              "PageUp",
-              "PageDown",
-            ].includes(code),
-          }
-        : {}),
-      ...(labelEdited ? {} : { label: chordLabel(chord) }),
+  const changeAction = (nextAction: KeyAction, label?: string) => {
+    setDraft((current) => {
+      const next = { ...current, action: nextAction };
+      if (!keySupportsRepeat(next)) delete next.repeat;
+      if (label !== undefined && !labelEdited) next.label = label.slice(0, MAX_KEY_LABEL_LENGTH);
+      return next;
     });
   };
-  const updateLabel = (label: string) => {
-    setLabelEdited(true);
-    setKey({ ...draft, label });
+
+  const chooseKind = (kind: FunctionKind) => {
+    setRecording(false);
+    setRecordMessage("");
+    if (kind === currentKind) return;
+    if (kind === "send") {
+      changeAction(action?.type === "legacy" ? legacySend(action) : { type: "send", send: "" });
+    } else if (kind === "special") {
+      changeAction({ type: "special", special: "ctrl" }, "Ctrl");
+    } else if (kind === "keyboard") {
+      changeAction({ type: "keyboard" }, "Keyboard");
+    } else if (clipboardOps.length) {
+      changeAction(newClipboardAction(clipboardOps[0]), CLIPBOARD_LABELS[clipboardOps[0]]);
+    }
   };
 
   return (
     <Dialog
-      open={open}
-      onOpenChange={(next) => {
-        if (!next) onClose();
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
       }}
     >
       <DialogContent
-        className="flex max-h-[88vh] flex-col overflow-hidden sm:max-w-md"
+        className="flex max-h-[88vh] flex-col overflow-hidden sm:max-w-md phone:p-3"
         style={
           isPhone
             ? {
@@ -310,280 +296,17 @@ export function TerminalKeySheet({
       >
         <DialogHeader className="shrink-0">
           <DialogTitle>{isNew ? "Add terminal key" : "Edit terminal key"}</DialogTitle>
-          <DialogDescription>
-            Choose what the key sends, how it looks, and how wide it is.
+          <DialogDescription className="sr-only">
+            Set the key’s function and appearance.
           </DialogDescription>
         </DialogHeader>
-        <div className="grid min-h-0 gap-4 overflow-y-auto">
+        <div className="grid min-h-0 gap-4 overflow-y-auto p-1">
           <div className="flex items-center justify-between gap-3">
-            <KeyPreview barKey={draft} onCut={setWouldCut} />
-            <span className="text-sm text-muted-foreground">
-              {draft.width === 1 ? "1 cell" : "2 cells"}
-              {wouldCut
-                ? ` · Cut off at ${draft.width} ${draft.width === 1 ? "cell" : "cells"}`
-                : ""}
-            </span>
-          </div>
-          <div className="grid gap-1.5 text-ui">
-            <span>Function</span>
-            <Segmented<FunctionKind>
-              label="Function"
-              value={kind}
-              onChange={(next) => {
-                const updated = withFunction(draft, next);
-                setKey(labelEdited ? { ...updated, label: draft.label } : updated);
-              }}
-              options={[
-                { value: "key", label: "Key" },
-                { value: "text", label: "Text" },
-                { value: "modifier", label: "Modifier" },
-                { value: "keyboard", label: "Keyboard" },
-              ]}
-            />
-          </div>
-          <div className="grid gap-1.5 text-ui">
-            <span>Show</span>
-            <Segmented<"text" | "icon">
-              label="Show"
-              value={draft.display}
-              onChange={(display) =>
-                setKey({
-                  ...draft,
-                  display,
-                  ...(display === "icon" && !draft.icon ? { icon: "command" as const } : {}),
-                })
-              }
-              options={[
-                { value: "text", label: "Text" },
-                { value: "icon", label: "Icon" },
-              ]}
-            />
-          </div>
-          {draft.display === "icon" ? (
-            <div className="grid gap-1.5 text-ui">
-              <span>Icon</span>
-              <div role="radiogroup" aria-label="Icon" className="grid grid-cols-5 gap-2">
-                {TERMINAL_KEY_ICONS.map((icon) => {
-                  const Icon = ICON_COMPONENTS[icon.id];
-                  return (
-                    <button
-                      key={icon.id}
-                      type="button"
-                      role="radio"
-                      aria-label={icon.label}
-                      aria-checked={draft.icon === icon.id}
-                      onClick={() => setKey({ ...draft, icon: icon.id })}
-                      className={
-                        draft.icon === icon.id
-                          ? "flex h-11 items-center justify-center rounded-md border border-primary bg-primary/15"
-                          : "flex h-11 items-center justify-center rounded-md border border-border"
-                      }
-                    >
-                      <Icon className="size-4" aria-hidden />
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          ) : null}
-          <label className="grid gap-1.5 text-ui">
-            Label
-            <Input
-              value={draft.label}
-              maxLength={MAX_KEY_LABEL_LENGTH}
-              onChange={(event) => updateLabel(event.target.value)}
-            />
-          </label>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="justify-self-start"
-            onClick={() => {
-              setLabelEdited(false);
-              setKey({ ...draft, label: automaticLabel(draft) });
-            }}
-          >
-            Reset to automatic
-          </Button>
-
-          {draft.kind === "key" ? (
-            <>
-              <div className="grid gap-1.5 text-ui">
-                <div className="grid grid-cols-5 gap-1" role="group" aria-label="Common keys">
-                  {KEY_GROUPS.slice(0, 2)
-                    .flatMap((group) => group.choices)
-                    .map(([code, label]) => (
-                      <button
-                        key={code}
-                        type="button"
-                        aria-label={label}
-                        aria-pressed={draft.chord.code === code}
-                        onClick={() => chooseCode(code)}
-                        className="min-h-11 min-w-0 rounded-md border border-border px-1 text-xs aria-pressed:border-primary-cta aria-pressed:bg-primary-cta aria-pressed:text-primary-cta-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
-                      >
-                        {code === "Backspace" ? (
-                          <DeleteIcon className="mx-auto size-4" aria-hidden />
-                        ) : (
-                          label
-                        )}
-                      </button>
-                    ))}
-                </div>
-                <label className="grid gap-1.5">
-                  More keys
-                  <Combobox
-                    mode="select"
-                    options={[
-                      ...KEY_GROUPS.flatMap((group) =>
-                        group.choices.map(([code, label]) => ({
-                          key: code,
-                          label,
-                          description: group.label,
-                        })),
-                      ),
-                      ...(!KEY_GROUPS.some((group) =>
-                        group.choices.some(([code]) => code === draft.chord.code),
-                      )
-                        ? [{ key: draft.chord.code, label: draft.chord.code }]
-                        : []),
-                    ]}
-                    value={draft.chord.code}
-                    onValueChange={chooseCode}
-                    aria-label="More keys"
-                    className="h-auto w-full rounded-none! bg-transparent p-0"
-                  />
-                </label>
-                <div className="flex flex-wrap gap-2" role="group" aria-label="Key modifiers">
-                  {(
-                    [
-                      ["control", "Ctrl"],
-                      ["alt", "Alt"],
-                      ["shift", "Shift"],
-                    ] as const
-                  ).map(([modifier, label]) => (
-                    <Button
-                      key={modifier}
-                      type="button"
-                      variant="outline"
-                      aria-pressed={draft.chord.modifiers.includes(modifier)}
-                      className={
-                        draft.chord.modifiers.includes(modifier)
-                          ? "bg-primary-cta text-primary-cta-foreground"
-                          : undefined
-                      }
-                      onClick={() => {
-                        const chord: ShortcutChord = {
-                          ...draft.chord,
-                          modifiers: draft.chord.modifiers.includes(modifier)
-                            ? draft.chord.modifiers.filter((item) => item !== modifier)
-                            : [...draft.chord.modifiers, modifier],
-                        };
-                        setKey({
-                          ...draft,
-                          chord,
-                          ...(labelEdited ? {} : { label: chordLabel(chord) }),
-                        });
-                      }}
-                    >
-                      {label}
-                    </Button>
-                  ))}
-                </div>
-              </div>
-              {unsupportedChord ? (
-                <p role="status" className="text-sm text-muted-foreground">
-                  Not supported in terminals. Choose a different key or modifier.
-                </p>
-              ) : null}
-              <label className="flex min-h-11 items-center justify-between gap-3 text-ui">
-                Repeat while held
-                <Switch
-                  checked={draft.repeat === true}
-                  onCheckedChange={(repeat) => setKey({ ...draft, repeat })}
-                  aria-label="Repeat while held"
-                />
-              </label>
-            </>
-          ) : null}
-
-          {draft.kind === "text" ? (
-            <>
-              <label className="grid gap-1.5 text-ui">
-                Text
-                <Input
-                  value={draft.text}
-                  maxLength={MAX_KEY_TEXT_LENGTH}
-                  onChange={(event) => {
-                    const text = event.target.value;
-                    setKey({
-                      ...draft,
-                      text,
-                      ...(labelEdited ? {} : { label: text }),
-                    });
-                  }}
-                />
-              </label>
-              <label className="flex min-h-11 items-center justify-between gap-3 text-ui">
-                Send Enter after
-                <Switch
-                  checked={draft.submit === true}
-                  onCheckedChange={(submit) => setKey({ ...draft, submit })}
-                  aria-label="Send Enter after"
-                />
-              </label>
-            </>
-          ) : null}
-
-          {draft.kind === "modifier" ? (
-            <>
-              <label className="grid gap-1.5 text-ui">
-                Modifier
-                <select
-                  aria-label="Modifier"
-                  className="min-h-11 rounded-md border border-input bg-background px-2"
-                  value={draft.modifier}
-                  onChange={(event) => {
-                    const modifier = event.target.value as TerminalKeyModifier;
-                    setKey({
-                      ...draft,
-                      modifier,
-                      ...(labelEdited
-                        ? {}
-                        : {
-                            label:
-                              modifier === "ctrl" ? "Ctrl" : modifier === "alt" ? "Alt" : "Shift",
-                          }),
-                    });
-                  }}
-                >
-                  <option value="ctrl">Ctrl</option>
-                  <option value="alt">Alt</option>
-                  <option value="shift">Shift</option>
-                </select>
-              </label>
-              <label className="flex min-h-11 items-center justify-between gap-3 text-ui">
-                Tap locks
-                <Switch
-                  checked={draft.tapLocks === true}
-                  onCheckedChange={(tapLocks) => setKey({ ...draft, tapLocks })}
-                  aria-label="Tap locks"
-                />
-              </label>
-              <p className="text-sm text-muted-foreground">
-                {draft.tapLocks
-                  ? "Tap locks · tap again releases"
-                  : "Tap = next key only · hold = lock"}
-              </p>
-            </>
-          ) : null}
-
-          <div className="grid gap-1.5 text-ui">
-            <span>Width</span>
-            <Segmented<"1" | "2">
+            <KeyPreview draft={draft} />
+            <Segmented
               label="Width"
-              value={String(draft.width) as "1" | "2"}
-              onChange={(width) => setKey({ ...draft, width: width === "1" ? 1 : 2 })}
+              value={draft.width === 1 ? "1" : "2"}
+              onChange={(width) => setDraft({ ...draft, width: width === "1" ? 1 : 2 })}
               options={[
                 { value: "1", label: "1 cell" },
                 { value: "2", label: "2 cells" },
@@ -591,38 +314,327 @@ export function TerminalKeySheet({
             />
           </div>
 
-          {!isNew ? (
-            <div className="grid gap-1.5 text-ui">
-              <span>Move</span>
-              <div className="flex flex-wrap gap-2">
+          <div className="grid gap-2">
+            {action?.type === "legacy" ? (
+              <p className="text-sm text-muted-foreground">
+                Kept from the previous editor: {mobileAssistantBindingLabel(action.key)}
+              </p>
+            ) : !action ? (
+              <p className="text-sm text-muted-foreground">
+                {draft.action.type === "clipboard" ? "Not available" : "Needs a newer version"}
+              </p>
+            ) : null}
+            <label className="grid gap-1.5 text-ui">
+              Function
+              <select
+                className={selectClass}
+                value={action && action.type !== "legacy" ? currentKind : ""}
+                onChange={(event) => chooseKind(event.target.value as FunctionKind)}
+              >
+                {!action || action.type === "legacy" ? (
+                  <option value="" disabled>
+                    Change function…
+                  </option>
+                ) : null}
+                <option value="send">Send to terminal</option>
+                <option value="special">Special key</option>
+                <option value="keyboard">Keyboard toggle</option>
+                {clipboardOps.length ? <option value="clipboard">Clipboard</option> : null}
+              </select>
+            </label>
+          </div>
+
+          {showSend ? (
+            <div className="grid gap-2">
+              <p className="text-ui">Send sequence</p>
+              <div className="flex items-center gap-2">
+                {action?.type === "combo" ? (
+                  <div
+                    className="flex min-h-11 min-w-0 flex-1 items-center gap-1 rounded-md border border-input px-2"
+                    aria-label="Recorded shortcut"
+                  >
+                    <span className="rounded bg-muted px-2 py-1 font-mono text-sm">
+                      {comboLabel(action.chord)}
+                    </span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="size-11"
+                      aria-label="Clear recorded shortcut"
+                      onClick={() => changeAction({ type: "send", send: "" })}
+                    >
+                      <XIcon aria-hidden />
+                    </Button>
+                  </div>
+                ) : (
+                  <Textarea
+                    aria-label="Send sequence"
+                    aria-describedby={sendHintId}
+                    aria-invalid={sendTooLong || undefined}
+                    placeholder="Commands or text; use Record for key chords"
+                    className="min-w-0 flex-1 font-mono"
+                    rows={2}
+                    value={
+                      action?.type === "legacy" && action.key.kind === "text"
+                        ? escapeLiteral(action.key.text)
+                        : send
+                    }
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      const autoEnter =
+                        action?.type === "send"
+                          ? action.autoEnter
+                          : action?.type === "legacy" &&
+                            action.key.kind === "text" &&
+                            action.key.submit;
+                      changeAction({
+                        type: "send",
+                        send: value,
+                        ...(autoEnter ? { autoEnter: true } : {}),
+                      });
+                    }}
+                  />
+                )}
                 <Button
+                  ref={recordButton}
                   type="button"
                   variant="outline"
-                  size="sm"
-                  onClick={() => onMove(draft.id, "left")}
+                  className="min-h-11 shrink-0"
+                  aria-pressed={recording}
+                  onClick={() => {
+                    setRecordMessage("");
+                    setRecording(!recording);
+                  }}
                 >
-                  Move left
+                  {recording ? <SquareIcon aria-hidden /> : <CircleIcon aria-hidden />}
+                  {recording ? "Stop" : "Record"}
                 </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => onMove(draft.id, "right")}
-                >
-                  Move right
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => onMove(draft.id, "other-row")}
-                >
-                  Move to other row
-                </Button>
+                <span ref={sink} className="sr-only" tabIndex={-1}>
+                  Terminal key recording
+                </span>
               </div>
+              <div
+                id={sendHintId}
+                className="grid gap-1 text-sm text-muted-foreground"
+                role="status"
+              >
+                {action?.type === "combo" ? (
+                  <span>
+                    {comboLabel(action.chord)} → {comboDescription(action.chord)}
+                  </span>
+                ) : null}
+                {send ? (
+                  <span className="wrap-anywhere">
+                    Sends <code className="whitespace-pre-wrap">{escapeForDisplay(decoded)}</code>
+                    {` · ${sendBytes} ${sendBytes === 1 ? "byte" : "bytes"}`}
+                  </span>
+                ) : null}
+                {sendTooLong ? (
+                  <span className="text-destructive">
+                    Decoded sequence is {sendBytes} bytes. The limit is {MAX_SEND_BYTES} bytes.
+                  </span>
+                ) : null}
+                {recording ? (
+                  <span>
+                    {recordMessage ||
+                      "Recording. Press a key or combination. macOS can reserve ⌘N, ⌘W, ⌘Q and ⌘T. Windows can reserve Win shortcuts."}
+                  </span>
+                ) : null}
+              </div>
+              {action?.type === "send" ? (
+                <ToggleRow
+                  label="Send Enter after"
+                  checked={action.autoEnter === true}
+                  onChange={(checked) =>
+                    changeAction({ type: "send", send, ...(checked ? { autoEnter: true } : {}) })
+                  }
+                />
+              ) : null}
             </div>
           ) : null}
 
+          {action?.type === "special" ? (
+            <div className="grid gap-1.5">
+              <label className="grid gap-1.5 text-ui">
+                Special key
+                <select
+                  className={selectClass}
+                  value={action.special}
+                  onChange={(event) => {
+                    const special = event.target.value as SpecialId;
+                    changeAction(
+                      {
+                        type: "special",
+                        special,
+                        ...(special !== "tab" && special !== "esc" && action.keepHeld
+                          ? { keepHeld: true }
+                          : {}),
+                      },
+                      SPECIAL_LABELS[special],
+                    );
+                  }}
+                >
+                  {Object.entries(SPECIAL_LABELS)
+                    .filter(([id]) => CMD_KEY_MODE !== "none" || (id !== "cmd" && id !== "win"))
+                    .map(([id, label]) => (
+                      <option key={id} value={id}>
+                        {label}
+                      </option>
+                    ))}
+                </select>
+              </label>
+              {specialModifier(draft) ? (
+                <ToggleRow
+                  label="Keep held until tapped again"
+                  checked={action.keepHeld === true}
+                  onChange={(checked) =>
+                    changeAction({
+                      type: "special",
+                      special: action.special,
+                      ...(checked ? { keepHeld: true } : {}),
+                    })
+                  }
+                />
+              ) : null}
+              {action.special === "cmd" || action.special === "win" ? (
+                <p className="text-sm text-muted-foreground">
+                  {CMD_KEY_MODE === "meta"
+                    ? "Acts as terminal Meta (Escape prefix)."
+                    : "Uses Mac terminal shortcuts for ←, →, ⌫, Enter, C and V."}
+                  {CMD_KEY_MODE === "mac-meta"
+                    ? " Other combinations act as terminal Meta (Escape prefix)."
+                    : null}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+
+          {action?.type === "clipboard" ? (
+            <div className="grid gap-1.5">
+              <label className="grid gap-1.5 text-ui">
+                Clipboard action
+                <select
+                  className={selectClass}
+                  value={action.op}
+                  onChange={(event) => {
+                    const op = event.target.value as ClipboardOp;
+                    changeAction(newClipboardAction(op), CLIPBOARD_LABELS[op]);
+                  }}
+                >
+                  {clipboardOps.map((op) => (
+                    <option key={op} value={op}>
+                      {CLIPBOARD_LABELS[op]}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {action.op !== "copy" ? (
+                <ToggleRow
+                  label="Press Enter after one line"
+                  checked={action.autoEnter === true}
+                  onChange={(checked) => changeAction({ ...action, autoEnter: checked })}
+                />
+              ) : null}
+            </div>
+          ) : null}
+          {supportsRepeat ? (
+            <ToggleRow
+              label="Repeat on hold"
+              checked={draft.repeat === true}
+              onChange={(checked) => {
+                const { repeat: _repeat, ...base } = draft;
+                setDraft(checked ? { ...base, repeat: true } : base);
+              }}
+            />
+          ) : null}
+
+          <label className="grid gap-1.5 text-ui">
+            Label
+            <Input
+              className="min-h-11"
+              value={draft.label}
+              maxLength={Math.max(keyDraft.label.length, MAX_KEY_LABEL_LENGTH)}
+              aria-invalid={labelTooLong || undefined}
+              onChange={(event) => {
+                setLabelEdited(true);
+                setDraft({ ...draft, label: event.target.value });
+              }}
+            />
+            {labelTooLong ? (
+              <span className="text-sm text-destructive">
+                Use at most {MAX_KEY_LABEL_LENGTH} characters.
+              </span>
+            ) : null}
+          </label>
+          <div className="grid justify-items-start gap-2">
+            <Segmented
+              label="Display"
+              value={draft.display}
+              onChange={(display) =>
+                setDraft({
+                  ...draft,
+                  display,
+                  ...(display === "icon" && !draft.icon ? { icon: "square-terminal" } : {}),
+                })
+              }
+              options={[
+                { value: "text", label: "Text" },
+                { value: "icon", label: "Icon" },
+              ]}
+            />
+            {draft.display === "icon" ? (
+              <div className="w-full">
+                <TerminalKeyIconPicker
+                  value={draft.icon ?? ""}
+                  onChange={(icon) => setDraft({ ...draft, icon })}
+                />
+              </div>
+            ) : null}
+          </div>
+          <div>
+            <Segmented
+              label="Style"
+              value={draft.style ?? "normal"}
+              onChange={(style) => {
+                const { style: _style, ...base } = draft;
+                setDraft(style === "danger" ? { ...base, style } : base);
+              }}
+              options={[
+                { value: "normal", label: "Normal" },
+                { value: "danger", label: "Danger" },
+              ]}
+            />
+          </div>
+
+          {!isNew ? (
+            <div className="flex flex-wrap gap-2" role="group" aria-label="Move key">
+              <Button
+                type="button"
+                variant="outline"
+                className="min-h-11"
+                onClick={() => onMove(draft.id, "left")}
+              >
+                Move left
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                className="min-h-11"
+                onClick={() => onMove(draft.id, "right")}
+              >
+                Move right
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                className="min-h-11"
+                onClick={() => onMove(draft.id, "other-row")}
+              >
+                Move to other row
+              </Button>
+            </div>
+          ) : null}
           {error ? (
             <p role="alert" className="text-sm text-destructive">
               {error}
@@ -635,7 +647,7 @@ export function TerminalKeySheet({
               <Button
                 type="button"
                 variant="ghost"
-                className="text-destructive"
+                className="min-h-11 text-destructive"
                 onClick={() => onDelete(draft.id)}
               >
                 Delete key
@@ -643,13 +655,18 @@ export function TerminalKeySheet({
             ) : null}
           </div>
           <div className="flex gap-2">
-            <Button type="button" variant="outline" onClick={onClose}>
+            <Button type="button" variant="outline" className="min-h-11" onClick={onClose}>
               Cancel
             </Button>
             <Button
               type="button"
+              className="min-h-11"
               disabled={
-                !draft.label.trim() || unsupportedChord || (draft.kind === "text" && !draft.text)
+                recording ||
+                !draft.label.trim() ||
+                labelTooLong ||
+                sendTooLong ||
+                (action?.type === "send" && !decoded)
               }
               onClick={() => onSave(draft)}
             >

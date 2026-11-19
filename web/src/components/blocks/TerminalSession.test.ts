@@ -13,9 +13,14 @@ import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TerminalClipboardAction } from "@/lib/terminalPaste";
 import { TerminalSelectionHandles } from "./TerminalSelectionHandles";
+import { MOBILE_ASSISTANT_STORAGE_KEY } from "@/lib/mobileAssistantPreferences";
+import { installTerminalHardwareInput } from "@/lib/terminalHardwareInput";
+import {
+  terminalHardwareKeyAction,
+  writeTerminalKeyboardPreferences,
+} from "@/lib/terminalKeyboardPreferences";
 import {
   terminalSoftKeyPayload,
-  SHIFT_ENTER_CSI_U,
   TerminalSession,
   WHEEL_REPORTS_MAX_PER_EVENT,
   applyTerminalCopy,
@@ -28,7 +33,6 @@ import {
   resolveTerminalWorkspaceFileLink,
   sgrWheelReports,
   terminalTheme,
-  terminalKeyEventPayload,
   touchScrollPayload,
   type ConnectionState,
   wheelReportPayload,
@@ -311,9 +315,14 @@ describe("terminalTheme", () => {
   });
 });
 
-describe("terminalKeyEventPayload", () => {
+describe("default terminal keyboard shortcuts", () => {
   function keyEvent(init: KeyboardEventInit): KeyboardEvent {
     return new KeyboardEvent("keydown", init);
+  }
+
+  function terminalKeyEventPayload(event: KeyboardEvent): string | null {
+    const action = terminalHardwareKeyAction(event, { v: 1 }, "macos");
+    return action && "bytes" in action ? action.bytes : null;
   }
 
   it("encodes Shift+Enter as Kitty CSI-u", () => {
@@ -322,8 +331,10 @@ describe("terminalKeyEventPayload", () => {
     // This is the byte sequence prompt-toolkit maps to F20, which the
     // REPL binds to "insert newline". Returning "\x1b\r" here would be
     // the old Alt+Enter fallback, not Kitty/CSI-u support.
-    expect(payload).toBe(SHIFT_ENTER_CSI_U);
     expect(payload).toBe("\x1b[13;2u");
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "Enter", code: "NumpadEnter", shiftKey: true })),
+    ).toBe(payload);
   });
 
   it("maps macOS Cmd line shortcuts to their readline control bytes", () => {
@@ -783,7 +794,125 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
+  it("updates attached terminals on save and sends a remapped chord only on keydown", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux x86_64");
+    const { session, socket, container } = makeSession();
+    try {
+      socket.open();
+      socket.sent.length = 0;
+      const textarea = container.querySelector("textarea")!;
+      expect(
+        writeTerminalKeyboardPreferences({
+          v: 1,
+          modifierMap: { linux: { ctrl: "ctrl", alt: "ctrl", meta: "cmd" } },
+        }),
+      ).toBe("saved");
+      const dispatch = (type: string, init: KeyboardEventInit) => {
+        const event = new KeyboardEvent(type, { bubbles: true, cancelable: true, ...init });
+        textarea.dispatchEvent(event);
+        return event;
+      };
+      expect(dispatch("keydown", { key: "b", code: "KeyB", altKey: true }).defaultPrevented).toBe(
+        true,
+      );
+      dispatch("keypress", { key: "b", code: "KeyB", charCode: 98 });
+      dispatch("keyup", { key: "b", code: "KeyB" });
+      expect(socket.sent).toEqual([new TextEncoder().encode("\x02")]);
+    } finally {
+      session.dispose();
+      container.remove();
+      localStorage.removeItem(MOBILE_ASSISTANT_STORAGE_KEY);
+    }
+  });
+
+  it("routes swapped terminal Cmd+B before app hotkeys and leaves the same chord alone elsewhere", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    const controller = new AbortController();
+    const { session, socket, container } = makeSession();
+    const outside = document.createElement("textarea");
+    document.body.appendChild(outside);
+    try {
+      socket.open();
+      socket.sent.length = 0;
+      expect(
+        writeTerminalKeyboardPreferences({
+          v: 1,
+          modifierMap: { macos: { ctrl: "ctrl", alt: "cmd", meta: "alt" } },
+        }),
+      ).toBe("saved");
+      installTerminalHardwareInput(controller.signal);
+      const appShortcut = vi.fn((event: KeyboardEvent) => event.stopPropagation());
+      window.addEventListener("keydown", appShortcut, { capture: true, signal: controller.signal });
+      const cmdB = () =>
+        new KeyboardEvent("keydown", {
+          key: "b",
+          code: "KeyB",
+          metaKey: true,
+          bubbles: true,
+          cancelable: true,
+        });
+      const terminalEvent = cmdB();
+      container.querySelector("textarea")!.dispatchEvent(terminalEvent);
+      expect(terminalEvent.defaultPrevented).toBe(true);
+      expect(socket.sent).toEqual([new TextEncoder().encode("\x1bb")]);
+      expect(appShortcut).not.toHaveBeenCalled();
+
+      outside.dispatchEvent(cmdB());
+      expect(appShortcut).toHaveBeenCalledOnce();
+      expect(socket.sent).toHaveLength(1);
+    } finally {
+      controller.abort();
+      session.dispose();
+      container.remove();
+      outside.remove();
+      localStorage.removeItem(MOBILE_ASSISTANT_STORAGE_KEY);
+    }
+  });
+
+  it("uses the S5 clipboard callback for remapped Alt+C and Alt+V", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
+    const clipboard = vi.fn();
+    const { session, socket, container } = makeSession(
+      undefined,
+      undefined,
+      true,
+      undefined,
+      true,
+      false,
+      clipboard,
+    );
+    try {
+      socket.open();
+      socket.sent.length = 0;
+      vi.spyOn(session, "selectedText").mockReturnValue("selected text");
+      const textarea = container.querySelector("textarea")!;
+      for (const [key, code, keyCode] of [
+        ["c", "KeyC", 67],
+        ["v", "KeyV", 86],
+      ] as const) {
+        const event = new KeyboardEvent("keydown", {
+          key,
+          code,
+          keyCode,
+          altKey: true,
+          bubbles: true,
+          cancelable: true,
+        });
+        expect(textarea.dispatchEvent(event)).toBe(false);
+      }
+      expect(clipboard.mock.calls).toEqual([
+        ["copy", { enter: false }],
+        ["paste", { enter: false }],
+      ]);
+      expect(socket.sent).toEqual([]);
+    } finally {
+      session.dispose();
+      container.remove();
+    }
+  });
+
   it("keeps physical Cmd+V native and forwards the paste event once without Enter", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
     const clipboard = vi.fn();
     const { session, socket, container } = makeSession(
       undefined,

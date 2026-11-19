@@ -33,38 +33,37 @@ import { MinusIcon, PinIcon, MenuIcon, PlusIcon, RotateCcwIcon, SaveIcon } from 
 import { SettingRow } from "@/components/SettingsFields";
 import { TerminalKeyContent } from "@/components/blocks/TerminalKeyContent";
 import { Button } from "@/components/ui/button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Switch } from "@/components/ui/switch";
 import { USER_PREFERENCES_PATCH_REJECTED_EVENT } from "@/lib/userPreferencesSync";
 import {
   MAX_PREFERENCE_ENVELOPE_BYTES,
   MAX_ROW_PAGES,
   ROW_CELLS,
-  canonicalizeBar,
   defaultTerminalBar,
   packRow,
   moveBarKey,
-  resolveTerminalBar,
-  validateBar,
   type BarLimitIssue,
-  type TerminalBar,
-  type TerminalBarKey,
-  type TerminalBarRow,
 } from "@/lib/terminalKeyBar";
 import {
-  MOBILE_ASSISTANT_CHANGED_EVENT,
   readMobileAssistantPreferences,
   type ResolvedMobileAssistantPreferences,
 } from "@/lib/mobileAssistantPreferences";
 import {
   fromBar322,
-  reconcileShell,
   resolveTerminalKeys,
+  validateTerminalKeySurface,
   writeTerminalKeyPreferences,
+  MAX_SEND_BYTES,
+  type SurfaceKeys,
+  type TerminalKeyRowV2,
   type KeySurface,
 } from "@/lib/terminalKeys";
 import { TerminalKeySheet } from "./TerminalKeySheet";
 
 type RowName = "top" | "bottom";
+type StoredKey = TerminalKeyRowV2["keys"][number];
+const SURFACE_LABELS = { shell: "Shell", native: "Native terminal" } as const;
 
 const PREFERENCE_SIZE_ERROR = `Too large to save: preferences are limited to ${MAX_PREFERENCE_ENVELOPE_BYTES / 1024} KiB. Shorten or remove some keys.`;
 
@@ -72,23 +71,26 @@ function createKeyId(): string {
   return `key-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function newKey(): TerminalBarKey {
+function newKey(): StoredKey {
   return {
     id: createKeyId(),
-    label: "Esc",
-    kind: "key",
-    chord: { code: "Escape", modifiers: [] },
+    label: "",
+    action: { type: "send", send: "" },
     display: "text",
     width: 2,
   };
 }
 
-function rowClone(row: TerminalBarRow): TerminalBarRow {
-  return { keys: structuredClone(row.keys), pinned: row.pinned, enabled: row.enabled };
+function rowClone(row: TerminalKeyRowV2): TerminalKeyRowV2 {
+  return { ...row, keys: [...row.keys] };
 }
 
-function withRow(bar: TerminalBar, row: RowName, next: TerminalBarRow): TerminalBar {
+function withRow(bar: SurfaceKeys, row: RowName, next: TerminalKeyRowV2): SurfaceKeys {
   return row === "top" ? { ...bar, top: next } : { ...bar, bottom: next };
+}
+
+function withRows(layout: SurfaceKeys, rows: SurfaceKeys): SurfaceKeys {
+  return { ...layout, top: rows.top, bottom: rows.bottom };
 }
 
 function PageEndDropZone({
@@ -121,12 +123,16 @@ function PageEndDropZone({
   );
 }
 
-function limitMessage(issue: BarLimitIssue, row: TerminalBarRow): string {
+function limitMessage(issue: BarLimitIssue, row: TerminalKeyRowV2): string {
   if (issue.kind === "pages") return "This row is full: 5 pages";
   if (issue.kind === "label") return "Labels can be at most 12 characters";
-  if (issue.kind === "text") return "Text can be at most 64 characters";
+  if (issue.kind === "text") {
+    const action = row.keys.find((key) => key.id === issue.keyId)?.action;
+    return action?.type === "send"
+      ? `The decoded sequence can be at most ${MAX_SEND_BYTES} bytes`
+      : "Legacy text can be at most 64 characters";
+  }
   if (issue.kind === "id") return "Key id is too long";
-  void row;
   return "This key is too large";
 }
 
@@ -144,7 +150,7 @@ function SortableKeyTile({
   pinned,
   onOpen,
 }: {
-  barKey: TerminalBarKey;
+  barKey: StoredKey;
   row: RowName;
   index: number;
   pinned: boolean;
@@ -194,7 +200,7 @@ function SortableKeyTile({
   );
 }
 
-function PinnedCopy({ barKey }: { barKey: TerminalBarKey }) {
+function PinnedCopy({ barKey }: { barKey: StoredKey }) {
   return (
     <div
       style={{ gridColumn: `span ${barKey.width}` }}
@@ -211,15 +217,47 @@ export interface TerminalBarEditorProps {
 }
 
 export function TerminalBarEditor({ preferences }: TerminalBarEditorProps) {
-  const resolved = useMemo(
-    () => resolveTerminalBar(preferences as unknown as Record<string, unknown>),
-    [preferences],
+  const resolved = useMemo(() => resolveTerminalKeys({ ...preferences }), [preferences]);
+  return (
+    <Tabs defaultValue="shell" className="mt-4">
+      <TabsList aria-label="Terminal key bar page" className="h-11!">
+        <TabsTrigger value="shell" className="px-3">
+          Shell
+        </TabsTrigger>
+        <TabsTrigger value="native" className="px-3">
+          Native terminal
+        </TabsTrigger>
+      </TabsList>
+      {(["shell", "native"] as const).map((surface) => (
+        <TabsContent value={surface} key={surface}>
+          <SurfaceEditor
+            surface={surface}
+            layout={resolved.keys[surface]}
+            preset={resolved.preset[surface]}
+            fallback={resolved.source === "fallback"}
+          />
+        </TabsContent>
+      ))}
+    </Tabs>
   );
-  const [bar, setBar] = useState<TerminalBar>(resolved.bar);
-  const [source, setSource] = useState(resolved.source);
+}
+
+function SurfaceEditor({
+  surface,
+  layout,
+  preset,
+  fallback,
+}: {
+  surface: KeySurface;
+  layout: SurfaceKeys;
+  preset?: SurfaceKeys | "invalid";
+  fallback: boolean;
+}) {
+  const [bar, setBar] = useState(layout);
+  const otherSurface = surface === "shell" ? "native" : "shell";
   const [rowError, setRowError] = useState<{ row: RowName; message: string } | null>(null);
   const [sheet, setSheet] = useState<{
-    key: TerminalBarKey;
+    key: StoredKey;
     isNew: boolean;
     row: RowName;
     index: number;
@@ -228,7 +266,7 @@ export function TerminalBarEditor({ preferences }: TerminalBarEditorProps) {
   const [rejection, setRejection] = useState<string | null>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const dragStartedRef = useRef(false);
-  const dragBarRef = useRef<TerminalBar | null>(null);
+  const dragBarRef = useRef<SurfaceKeys | null>(null);
   const lastErrorRef = useRef("");
   const pinDragRef = useRef<{
     row: RowName;
@@ -239,30 +277,17 @@ export function TerminalBarEditor({ preferences }: TerminalBarEditorProps) {
   } | null>(null);
 
   useEffect(() => {
-    setBar(resolved.bar);
-    setSource(resolved.source);
-  }, [resolved]);
+    setBar(layout);
+  }, [layout]);
 
   useEffect(() => {
-    const onChanged = () => {
-      const next = resolveTerminalBar(
-        readMobileAssistantPreferences() as unknown as Record<string, unknown>,
-      );
-      setBar(next.bar);
-      setSource(next.source);
-    };
     const onRejected = (event: Event) => {
       const detail = (event as CustomEvent<{ namespace?: string; detail?: string }>).detail;
       if (detail?.namespace !== "mobile_assistant") return;
       setRejection(detail.detail || "The server rejected the key layout.");
-      onChanged();
     };
-    window.addEventListener(MOBILE_ASSISTANT_CHANGED_EVENT, onChanged);
     window.addEventListener(USER_PREFERENCES_PATCH_REJECTED_EVENT, onRejected);
-    return () => {
-      window.removeEventListener(MOBILE_ASSISTANT_CHANGED_EVENT, onChanged);
-      window.removeEventListener(USER_PREFERENCES_PATCH_REJECTED_EVENT, onRejected);
-    };
+    return () => window.removeEventListener(USER_PREFERENCES_PATCH_REJECTED_EVENT, onRejected);
   }, []);
 
   const sensors = useSensors(
@@ -272,38 +297,32 @@ export function TerminalBarEditor({ preferences }: TerminalBarEditorProps) {
   );
 
   const persist = (
-    candidate: TerminalBar,
-    options: { before?: TerminalBar; message?: string; preset?: TerminalBar } = {},
+    candidate: SurfaceKeys,
+    options: { before?: SurfaceKeys; message?: string; savePreset?: boolean } = {},
   ): boolean => {
-    const validation = validateBar(candidate, { before: bar });
-    if (validation.structural.length > 0) {
-      lastErrorRef.current = structuralMessage(validation.structural[0]);
+    const current = readMobileAssistantPreferences();
+    const { keys, preset: presets } = resolveTerminalKeys({ ...current });
+    const validation = validateTerminalKeySurface(candidate, keys[surface]);
+    const structural = validation.structural[0];
+    const worse = validation.limits.find((issue) => issue.worse);
+    if (structural || worse) {
+      lastErrorRef.current = worse
+        ? limitMessage(worse, candidate[worse.row])
+        : structuralMessage(structural);
       setRowError({
-        row: validation.structural[0].startsWith("bottom") ? "bottom" : "top",
+        row: worse?.row ?? (structural.startsWith("bottom") ? "bottom" : "top"),
         message: lastErrorRef.current,
       });
       return false;
     }
-    const worse = validation.limits.find((issue) => issue.worse);
-    if (worse) {
-      lastErrorRef.current = limitMessage(worse, candidate[worse.row]);
-      setRowError({ row: worse.row, message: lastErrorRef.current });
-      return false;
-    }
-    const canonical = canonicalizeBar(candidate);
-    const current = readMobileAssistantPreferences();
-    const { keys, preset } = resolveTerminalKeys({ ...current });
-    const shell = reconcileShell(keys.shell, canonical);
     const result = writeTerminalKeyPreferences({
-      terminalKeys: { ...keys, shell },
-      ...(options.preset
+      terminalKeys: { ...keys, [surface]: candidate },
+      ...(options.savePreset
         ? {
             terminalKeysPreset: {
               ...current.terminalKeysPreset,
-              shell:
-                preset.shell && preset.shell !== "invalid"
-                  ? reconcileShell(preset.shell, options.preset)
-                  : fromBar322(options.preset, shell.enabled),
+              ...(presets.shell && presets.shell !== "invalid" ? { shell: presets.shell } : {}),
+              [surface]: candidate,
             },
           }
         : {}),
@@ -314,39 +333,60 @@ export function TerminalBarEditor({ preferences }: TerminalBarEditorProps) {
       setRowError({ row: "top", message: lastErrorRef.current });
       return false;
     }
-    setBar(canonical);
-    setSource("stored");
+    setBar(candidate);
     setRowError(null);
     setRejection(null);
     if (options.message) {
       const undo = options.before;
       toast(options.message, {
         duration: 6000,
-        ...(undo ? { action: { label: "Undo", onClick: () => persist(undo) } } : {}),
+        ...(undo
+          ? {
+              action: {
+                label: "Undo",
+                onClick: () => {
+                  const latest = resolveTerminalKeys({ ...readMobileAssistantPreferences() }).keys[
+                    surface
+                  ];
+                  if (
+                    JSON.stringify(latest.top) !== JSON.stringify(candidate.top) ||
+                    JSON.stringify(latest.bottom) !== JSON.stringify(candidate.bottom)
+                  ) {
+                    toast.error("This layout has changed since that action");
+                    return;
+                  }
+                  if (persist(withRows(latest, undo))) toast("Layout restored");
+                },
+              },
+            }
+          : {}),
       });
     }
     return true;
   };
 
-  const openSheet = (key: TerminalBarKey, isNew: boolean, row: RowName, index: number) =>
+  const openSheet = (key: StoredKey, isNew: boolean, row: RowName, index: number) =>
     setSheet({ key: structuredClone(key), isNew, row, index, error: null });
 
-  const saveSheet = (key: TerminalBarKey) => {
+  const saveSheet = (key: StoredKey) => {
     if (!sheet) return;
-    const candidate: TerminalBar = { ...bar, top: rowClone(bar.top), bottom: rowClone(bar.bottom) };
+    const rowName = sheet.isNew
+      ? sheet.row
+      : bar.top.keys.some((item) => item.id === key.id)
+        ? "top"
+        : "bottom";
+    const target = rowClone(bar[rowName]);
     if (sheet.isNew) {
-      const target = rowClone(candidate[sheet.row]);
       target.keys.splice(Math.min(sheet.index, target.keys.length), 0, key);
-      candidate[sheet.row] = target;
     } else {
-      const rowName = candidate.top.keys.some((item) => item.id === key.id) ? "top" : "bottom";
-      const target = rowClone(candidate[rowName]);
       const at = target.keys.findIndex((item) => item.id === key.id);
-      if (at >= 0) target.keys[at] = key;
-      else target.keys.push(key);
-      candidate[rowName] = target;
+      if (at < 0) {
+        setSheet({ ...sheet, error: "This key was removed from the layout." });
+        return;
+      }
+      target.keys[at] = key;
     }
-    if (persist(candidate)) setSheet(null);
+    if (persist(withRow(bar, rowName, target))) setSheet(null);
     else setSheet((current) => (current ? { ...current, error: lastErrorRef.current } : current));
   };
 
@@ -355,12 +395,14 @@ export function TerminalBarEditor({ preferences }: TerminalBarEditorProps) {
     const previous = bar;
     const target = rowClone(bar[rowName]);
     const removed = target.keys.find((key) => key.id === id);
+    if (!removed) return;
     if (target.keys.findIndex((key) => key.id === id) < target.pinned) target.pinned -= 1;
     target.keys = target.keys.filter((key) => key.id !== id);
     target.pinned = Math.min(target.pinned, target.keys.length);
     const candidate = withRow(bar, rowName, target);
-    if (persist(candidate, { before: previous, message: `Deleted ${removed?.label ?? "key"}` }))
+    if (persist(candidate, { before: previous, message: `Deleted ${removed.label}` }))
       setSheet(null);
+    else setSheet((current) => (current ? { ...current, error: lastErrorRef.current } : current));
   };
 
   const moveKey = (id: string, direction: "left" | "right" | "other-row") => {
@@ -473,7 +515,7 @@ export function TerminalBarEditor({ preferences }: TerminalBarEditorProps) {
     const to = dropPosition(event);
     if (!to || to.row === fromRow) return;
     const candidate = moveBarKey(bar, id, to.row, to.boundary, to.pinned);
-    const validation = validateBar(candidate, { before: dragBarRef.current });
+    const validation = validateTerminalKeySurface(candidate, dragBarRef.current);
     if (!validation.structural.length && !validation.limits.some((issue) => issue.worse))
       setBar(candidate);
   };
@@ -511,7 +553,7 @@ export function TerminalBarEditor({ preferences }: TerminalBarEditorProps) {
 
   const allIds = [...bar.top.keys, ...bar.bottom.keys].map((key) => key.id);
 
-  const renderRow = (rowName: RowName, row: TerminalBarRow) => {
+  const renderRow = (rowName: RowName, row: TerminalKeyRowV2) => {
     const pack = packRow(row);
     const pages = pack.pages;
     const pageNumbers = pages.map((_, index) => index + 1);
@@ -678,80 +720,47 @@ export function TerminalBarEditor({ preferences }: TerminalBarEditorProps) {
     );
   };
 
-  const preset = resolved.preset === "invalid" || resolved.preset === null ? null : resolved.preset;
-  const presetInvalid = resolved.preset === "invalid";
-  const fallbackNotice =
-    source === "fallback-legacy"
-      ? "Saved key layout couldn't be read; showing your earlier key list. Your next edit replaces it."
-      : source === "fallback-defaults"
-        ? "Saved key layout couldn't be read; showing the default keys. Your next edit replaces it."
-        : null;
-
-  const surfaces = resolveTerminalKeys({ ...preferences });
-  const setSurfaceEnabled = (surface: KeySurface, enabled: boolean) => {
-    const { keys } = resolveTerminalKeys({ ...readMobileAssistantPreferences() });
-    const result = writeTerminalKeyPreferences({
-      terminalKeys: { ...keys, [surface]: { ...keys[surface], enabled } },
+  const restoreDefaults = () =>
+    persist(withRows(bar, fromBar322(defaultTerminalBar())), {
+      before: bar,
+      message: "Restored default keys",
     });
-    if (result !== "saved")
-      setRowError({
-        row: "top",
-        message: result === "too-large" ? PREFERENCE_SIZE_ERROR : "Couldn't save terminal keys",
-      });
-  };
 
   return (
-    <div className="mt-4 space-y-5 phone:[&_[data-slot=setting-row]]:min-h-11">
-      <SettingRow
-        label="Terminal key rows"
-        hint="Show keys above the phone keyboard on the host and session terminal pages."
-      >
+    <div className="space-y-3 phone:[&_[data-slot=setting-row]]:min-h-11">
+      <SettingRow label="Show key bar on this page">
         <Switch
-          checked={surfaces.keys.shell.enabled}
-          onCheckedChange={(enabled) => setSurfaceEnabled("shell", enabled)}
-          aria-label="Enable terminal key rows"
+          checked={bar.enabled}
+          onCheckedChange={(enabled) => persist({ ...bar, enabled })}
+          aria-label="Show key bar on this page"
         />
       </SettingRow>
-
-      <SettingRow
-        label="Native terminal key rows"
-        hint="Show keys in a chat's terminal view on a phone."
-      >
+      <SettingRow label="Only while the phone keyboard is up">
         <Switch
-          checked={surfaces.keys.native.enabled}
-          onCheckedChange={(enabled) => setSurfaceEnabled("native", enabled)}
-          aria-label="Enable native terminal key rows"
+          checked={bar.showRows === "keyboard"}
+          onCheckedChange={(onlyWithKeyboard) => {
+            const { showRows: _showRows, ...withoutKeyboardGate } = bar;
+            persist(
+              onlyWithKeyboard
+                ? { ...withoutKeyboardGate, showRows: "keyboard" }
+                : withoutKeyboardGate,
+            );
+          }}
+          aria-label="Only while the phone keyboard is up"
         />
       </SettingRow>
-
-      {fallbackNotice || surfaces.source === "fallback" ? (
-        <div className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-sm">
-          <span>
-            {fallbackNotice ??
-              "Saved terminal key layouts couldn’t be read. Your next edit replaces them."}
-          </span>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => persist(defaultTerminalBar())}
-          >
-            Restore defaults
-          </Button>
-        </div>
+      {fallback ? (
+        <p role="status" className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm">
+          Saved terminal key layouts couldn’t be read. Your next edit saves the layout shown here.
+        </p>
       ) : null}
       {rejection ? (
-        <div className="flex flex-wrap items-center gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm">
-          <span>Couldn't sync the key layout: {rejection}. Your previous layout is back.</span>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => persist(defaultTerminalBar())}
-          >
-            Restore defaults
-          </Button>
-        </div>
+        <p
+          role="alert"
+          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm"
+        >
+          Couldn't sync the key layout: {rejection}. Your previous layout is back.
+        </p>
       ) : null}
 
       <DndContext
@@ -784,59 +793,61 @@ export function TerminalBarEditor({ preferences }: TerminalBarEditorProps) {
       </DndContext>
 
       <div className="flex flex-wrap items-center gap-2 phone:gap-y-4">
-        <Button
-          type="button"
-          variant="outline"
-          onClick={() => {
-            const previous = bar;
-            if (
-              persist(defaultTerminalBar(), { before: previous, message: "Restored default keys" })
-            )
-              setSource("stored");
-          }}
-        >
+        <Button type="button" variant="outline" onClick={restoreDefaults}>
           <RotateCcwIcon /> Restore defaults
         </Button>
         <Button
           type="button"
           variant="outline"
           onClick={() => {
-            if (persist(bar, { preset: bar })) toast("Preset saved");
+            if (persist(bar, { savePreset: true })) toast("Preset saved");
           }}
         >
           <SaveIcon /> Save as my preset
         </Button>
-        <Button
-          type="button"
-          variant="outline"
-          disabled={!preset}
-          onClick={() => {
-            if (!preset) return;
-            const previous = bar;
-            persist(preset, { before: previous, message: "Loaded my preset" });
-          }}
-        >
-          Load my preset
-        </Button>
-        {presetInvalid ? (
+        {preset && preset !== "invalid" ? (
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() =>
+              persist(withRows(bar, preset), { before: bar, message: "Loaded my preset" })
+            }
+          >
+            Load my preset
+          </Button>
+        ) : null}
+        {preset === "invalid" ? (
           <span className="self-center text-sm text-muted-foreground">
             Saved preset couldn't be read
           </span>
-        ) : resolved.preset === null ? (
-          <span className="self-center text-sm text-muted-foreground">No preset saved yet</span>
         ) : null}
+        <Button
+          type="button"
+          variant="outline"
+          onClick={() => {
+            const { keys } = resolveTerminalKeys({ ...readMobileAssistantPreferences() });
+            persist(withRows(keys[surface], keys[otherSurface]), {
+              before: bar,
+              message: `Copied layout from ${SURFACE_LABELS[otherSurface]}`,
+            });
+          }}
+        >
+          Copy from {SURFACE_LABELS[otherSurface]}
+        </Button>
       </div>
 
-      <TerminalKeySheet
-        open={sheet !== null}
-        keyDraft={sheet?.key ?? null}
-        isNew={sheet?.isNew ?? false}
-        error={sheet?.error ?? null}
-        onClose={() => setSheet(null)}
-        onSave={saveSheet}
-        onDelete={deleteKey}
-        onMove={moveKey}
-      />
+      {sheet ? (
+        <TerminalKeySheet
+          key={sheet.key.id}
+          keyDraft={sheet.key}
+          isNew={sheet.isNew}
+          error={sheet.error}
+          onClose={() => setSheet(null)}
+          onSave={saveSheet}
+          onDelete={deleteKey}
+          onMove={moveKey}
+        />
+      ) : null}
       <span className="sr-only" aria-live="polite">
         {draggingId ? "Moving key" : ""}
       </span>

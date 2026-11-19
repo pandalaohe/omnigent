@@ -785,7 +785,13 @@ export function moveBarKey(
   toRow: "top" | "bottom",
   boundary: number,
   pinned: boolean,
-): TerminalBar {
+): TerminalBar;
+export function moveBarKey<
+  Bar extends Record<"top" | "bottom", { keys: { id: string }[]; pinned: number }>,
+>(bar: Bar, id: string, toRow: "top" | "bottom", boundary: number, pinned: boolean): Bar;
+export function moveBarKey<
+  Bar extends Record<"top" | "bottom", { keys: { id: string }[]; pinned: number }>,
+>(bar: Bar, id: string, toRow: "top" | "bottom", boundary: number, pinned: boolean): Bar {
   const fromRow = bar.top.keys.some((key) => key.id === id) ? "top" : "bottom";
   const candidate = structuredClone(bar);
   const source = candidate[fromRow];

@@ -7,6 +7,7 @@ import time
 import pytest
 from playwright.sync_api import Locator, Page, WebSocketRoute, expect
 
+from tests._helpers.polling import poll_until
 from tests.browser_ui.chat.session_contract import ChatSessionContract, list_payload
 
 
@@ -21,7 +22,8 @@ def browser_context_args(browser_context_args):
 
 
 def _configure_buttons(page: Page) -> None:
-    page.add_init_script("""
+    page.add_init_script("""(() => {
+        if (localStorage.getItem('omnigent:mobile-assistant-preferences') !== null) return;
         localStorage.setItem('omnigent:mobile-assistant-preferences', JSON.stringify({
             version: 2, enabled: true,
             terminalButtons: [['Esc', 'Escape'], ['Tab', 'Tab'], ['Up', 'ArrowUp'],
@@ -31,7 +33,17 @@ def _configure_buttons(page: Page) -> None:
                 })).concat([{id: 'ctrl', label: 'Ctrl', kind: 'modifier', modifier: 'ctrl'}]),
             buttons: []
         }));
-    """)
+    })()""")
+
+
+def _open_cli_terminal(page: Page, chat: ChatSessionContract) -> Locator:
+    page.goto(chat.url)
+    page.get_by_role("button", name="Conversation actions", exact=True).tap()
+    page.get_by_role("menuitem", name="Terminal", exact=True).tap()
+    expect(page.get_by_role("menu")).to_have_count(0)
+    terminal = page.locator('[data-testid="terminal-view"]:visible').first
+    expect(terminal).to_have_attribute("data-state", "connected", timeout=20_000)
+    return terminal
 
 
 @pytest.fixture
@@ -43,6 +55,9 @@ def cli_bridge(
     chat.harness = "codex-native"
     chat.update_session(labels={"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"})
     chat.contract.json(f"/v1/sessions/{chat.session_id}/codex_goal", {"goal": None})
+    chat.contract.json(
+        f"/v1/sessions/{chat.session_id}/host-terminals", {"terminals": [], "complete": True}
+    )
     terminal_id = "terminal_codex_main"
     chat.contract.json(
         f"/v1/sessions/{chat.session_id}/resources/terminals",
@@ -66,12 +81,7 @@ def cli_bridge(
         socket.send(b"\x1b[2J\x1b[HCLI ready\r\n")
 
     chat.contract.websocket(re.compile(rf"/resources/terminals/{terminal_id}/attach"), attach)
-    page.goto(chat.url)
-    page.get_by_role("button", name="Conversation actions", exact=True).tap()
-    page.get_by_role("menuitem", name="Terminal", exact=True).tap()
-    expect(page.get_by_role("menu")).to_have_count(0)
-    terminal = page.locator('[data-testid="terminal-view"]:visible').first
-    expect(terminal).to_have_attribute("data-state", "connected", timeout=20_000)
+    terminal = _open_cli_terminal(page, chat)
     expect(terminal.get_by_role("toolbar", name="Terminal keys")).to_be_visible()
     expect(page.get_by_role("button", name="Open floating assistant", exact=True)).to_have_count(0)
     # A short viewport cannot fit the key rows.
@@ -119,7 +129,7 @@ def test_sticky_ctrl_arrow_reaches_cli_bridge(
     page.set_viewport_size({"width": 390, "height": 844})
     toolbar = page.get_by_role("toolbar", name="Terminal keys")
     expect(toolbar).to_be_visible()
-    toolbar.get_by_role("button", name="Ctrl", exact=True).tap()
+    toolbar.get_by_role("button", name=re.compile(r"^Ctrl,")).tap()
     toolbar.get_by_role("button", name="Up", exact=True).tap()
     toolbar.get_by_role("button", name="Down", exact=True).tap()
     deadline = time.monotonic() + 3
@@ -272,3 +282,66 @@ def test_shift_bar_key_modifies_the_real_terminal_input(
     while len(inputs) < 2 and time.monotonic() < deadline:
         page.wait_for_timeout(10)
     assert inputs == [b"\x1b[1;2A", b"a"]
+
+
+def test_record_native_terminal_key_and_replay_its_chord(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    cli_bridge: tuple[Locator, list[bytes]],
+) -> None:
+    _, inputs = cli_bridge
+    chat = chat_session_contract
+    chat.contract.json("/v1/model-connections", {"connections": [], "can_manage": False})
+    page.goto(f"{chat.base_url}/settings/shortcuts")
+    page.get_by_role("tab", name="Native terminal").tap()
+    panel = page.get_by_role("tabpanel", name="Native terminal")
+    panel.get_by_role("button", name="Add key", exact=True).last.tap()
+    sheet = page.get_by_role("dialog", name="Add terminal key")
+    sheet.get_by_role("button", name="Record", exact=True).tap()
+    page.keyboard.press("Control+b")
+    expect(sheet.get_by_label("Send sequence")).to_have_value("^B")
+    expect(sheet.get_by_label("Label", exact=True)).to_have_value("ctrl+b")
+    sheet.get_by_role("radio", name="Icon", exact=True).tap()
+    expect(sheet.get_by_text("Keys · Page 1 of 3")).to_be_visible()
+    sheet.get_by_role("button", name="Next icon page").tap()
+    expect(sheet.get_by_text("Tools and agents · Page 2 of 3")).to_be_visible()
+    sheet.get_by_role("button", name="Next icon page").tap()
+    expect(sheet.get_by_text("Symbols · Page 3 of 3")).to_be_visible()
+    sheet.get_by_role("button", name="Previous icon page").tap()
+    sheet.get_by_role("button", name="codex", exact=True).tap()
+    sheet.get_by_role("button", name="Save", exact=True).tap()
+    expect(sheet).to_have_count(0)
+
+    panel.get_by_role("button", name=re.compile(r"^Edit ctrl\+b,")).tap()
+    edit = page.get_by_role("dialog", name="Edit terminal key")
+    edit.get_by_label("Label", exact=True).fill("Build")
+    edit.get_by_role("button", name="Save", exact=True).tap()
+    expect(edit).to_have_count(0)
+    page.get_by_role("tab", name="Shell", exact=True).tap()
+    expect(
+        page.get_by_role("tabpanel", name="Shell").get_by_role(
+            "button", name=re.compile(r"^Edit Build,")
+        )
+    ).to_have_count(0)
+
+    terminal = _open_cli_terminal(page, chat)
+    toolbar = terminal.get_by_role("toolbar", name="Terminal keys")
+    key = toolbar.get_by_role("button", name="Build, sends a terminal sequence", exact=True)
+    expect(key.locator("svg")).to_be_visible()
+    key.tap()
+
+    def chord_arrived() -> bool:
+        page.wait_for_timeout(20)
+        return b"".join(inputs) == b"\x02"
+
+    poll_until(chord_arrived, timeout_s=5, interval_s=0.02)
+
+    page.goto(f"{chat.base_url}/settings/shortcuts")
+    page.get_by_role("tab", name="Native terminal").tap()
+    page.get_by_role("button", name=re.compile(r"^Edit Build,")).tap()
+    edit.get_by_role("button", name="Delete key", exact=True).tap()
+    expect(edit).to_have_count(0)
+    terminal = _open_cli_terminal(page, chat)
+    expect(
+        terminal.get_by_role("button", name="Build, sends a terminal sequence", exact=True)
+    ).to_have_count(0)

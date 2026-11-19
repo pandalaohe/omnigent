@@ -128,11 +128,12 @@ export function specialModifier(key: StoredKey): SpecialModifier | undefined {
 }
 
 export function keySupportsRepeat(key: StoredKey): boolean {
-  const action = key.action;
+  const action = availableAction(key);
+  if (!action) return false;
   return (
     action.type === "send" ||
-    action.type === "combo" ||
-    (action.type === "legacy" && record(action.key)?.kind === "key") ||
+    (action.type === "combo" && "bytes" in applyCmd({ chord: action.chord }, CMD_KEY_MODE)) ||
+    (action.type === "legacy" && action.key.kind === "key") ||
     (action.type === "special" && (action.special === "tab" || action.special === "esc"))
   );
 }
@@ -142,6 +143,8 @@ export function availableAction(key: StoredKey): KeyAction | undefined {
   const action = key.action;
   switch (action.type) {
     case "special":
+      if (CMD_KEY_MODE === "none" && (action.special === "cmd" || action.special === "win"))
+        return undefined;
       return isSpecialId(action.special) ? (action as KeyAction) : undefined;
     case "clipboard":
       return TERMINAL_CLIPBOARD_KEYS.has(action.op as ClipboardOp)
@@ -355,7 +358,7 @@ function validAction(value: unknown): boolean {
   );
 }
 
-function validateSurface(value: unknown, before?: SurfaceKeys): BarValidation {
+export function validateTerminalKeySurface(value: unknown, before?: SurfaceKeys): BarValidation {
   const surface = record(value);
   if (
     !surface ||
@@ -439,8 +442,8 @@ export function validateKeys(
   ) {
     return { structural: ["invalid terminal key layout basis"], limits: [] };
   }
-  const shell = validateSurface(keys.shell, options.before?.shell);
-  const native = validateSurface(keys.native, options.before?.native);
+  const shell = validateTerminalKeySurface(keys.shell, options.before?.shell);
+  const native = validateTerminalKeySurface(keys.native, options.before?.native);
   return {
     structural: [
       ...shell.structural.map((error) => `shell: ${error}`),
@@ -485,7 +488,9 @@ export function resolveTerminalKeys(stored: Record<string, unknown>): {
     const rawPreset = rawPresets?.[surface];
     if (rawPreset !== undefined) {
       preset[surface] =
-        validateSurface(rawPreset).structural.length === 0 ? (rawPreset as SurfaceKeys) : "invalid";
+        validateTerminalKeySurface(rawPreset).structural.length === 0
+          ? (rawPreset as SurfaceKeys)
+          : "invalid";
     }
   }
   if (effective.preset && effective.preset !== "invalid") {
@@ -721,7 +726,7 @@ export function buildTerminalKeyPreferences(
   const shellPreset = record(presets)?.shell;
   const terminalBarPreset =
     fields.terminalKeysPreset !== undefined
-      ? shellPreset !== undefined
+      ? shellPreset !== undefined && !validateTerminalKeySurface(shellPreset).structural.length
         ? toBar322(shellPreset as SurfaceKeys)
         : undefined
       : current.terminalBarPreset;

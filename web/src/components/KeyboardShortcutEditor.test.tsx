@@ -11,6 +11,7 @@ import {
   writeShortcutPreference,
 } from "@/lib/keyboardShortcutPreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
+import { readTerminalKeyboardPreferences } from "@/lib/terminalKeyboardPreferences";
 
 function actionRow(label: string): HTMLElement {
   const row = screen.getByText(label).closest('[data-testid^="shortcut-editor-row-"]');
@@ -35,10 +36,10 @@ describe("KeyboardShortcutEditor", () => {
     vi.restoreAllMocks();
   });
 
-  it("starts with six folded groups and opens search matches", () => {
+  it("starts with seven folded groups and opens search matches", () => {
     const { container } = render(<KeyboardShortcutEditor />);
     const groups = container.querySelectorAll("details");
-    expect(groups).toHaveLength(6);
+    expect(groups).toHaveLength(7);
     expect(container.querySelectorAll("details[open]")).toHaveLength(0);
     groups.forEach((group) => {
       expect(group.className).toContain("px-3");
@@ -68,6 +69,77 @@ describe("KeyboardShortcutEditor", () => {
     expect(
       screen.queryByRole("switch", { name: "Scroll to the bottom when opening a session" }),
     ).toBeNull();
+  });
+
+  it("shows the physical line-start keys for the active terminal modifier map", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    render(<KeyboardShortcutEditor />);
+    const summary = screen.getByText("Terminal", { selector: "summary" });
+    fireEvent.click(summary);
+    const terminal = within(summary.parentElement!);
+    const preset = terminal.getByRole("combobox", { name: "Hardware modifier mapping" });
+    const lineStart = within(terminal.getByText("Move to start of line").closest("li")!);
+    expect(preset).toHaveValue("byName");
+    expect(lineStart.queryByText(/press option\+←/i)).toBeNull();
+
+    fireEvent.change(preset, { target: { value: "swapAltCmd" } });
+    expect(lineStart.getByText(/press option\+←/i)).toBeVisible();
+    expect(terminal.getByText("Option acts as Command. Cmd acts as Option.")).toBeVisible();
+
+    fireEvent.change(preset, { target: { value: "altAsCmd" } });
+    const fallbackHint = /unassigned alt shortcuts keep their original terminal input/i;
+    expect(terminal.queryByText(fallbackHint)).toBeNull();
+
+    fireEvent.change(terminal.getByRole("combobox", { name: "Client platform" }), {
+      target: { value: "windows" },
+    });
+    expect(preset).toHaveValue("altAsCmd");
+    expect(lineStart.getByText(/press alt\+←/i)).toBeVisible();
+    expect(terminal.getByText(fallbackHint)).toBeVisible();
+  });
+
+  it("sets a custom modifier map and records and restores a Windows-only terminal binding", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
+    render(<KeyboardShortcutEditor />);
+    fireEvent.click(screen.getByText("Terminal", { selector: "summary" }));
+    const preset = screen.getByRole("combobox", { name: "Hardware modifier mapping" });
+    expect(preset).toHaveValue("altAsCmd");
+    fireEvent.change(preset, { target: { value: "custom" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Physical Alt / Option" }), {
+      target: { value: "ctrl" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Record Windows shortcut for Move to start of line" }),
+    );
+    fireEvent.keyDown(window, { key: "@", code: "KeyQ", ctrlKey: true, altKey: true });
+    expect(screen.getByRole("alert")).toHaveTextContent("AltGr");
+    expect(isShortcutRecordingActive()).toBe(true);
+    fireEvent.keyDown(window, { key: "A", code: "KeyA", altKey: true, shiftKey: true });
+    expect(readTerminalKeyboardPreferences()).toMatchObject({
+      modifierMap: { windows: { ctrl: "ctrl", alt: "ctrl", meta: "cmd" } },
+      bindings: {
+        lineStart: {
+          platformOverrides: { windows: [{ code: "KeyA", modifiers: ["control", "shift"] }] },
+        },
+      },
+    });
+    expect(screen.getByText("Press Alt+Shift+A")).toBeVisible();
+    expect(readKeyboardShortcutPreferences().actions).toEqual({});
+    fireEvent.change(screen.getByRole("combobox", { name: "Client platform" }), {
+      target: { value: "linux" },
+    });
+    expect(preset).toHaveValue("byName");
+    const restoreLinux = screen.getByRole("button", {
+      name: "Restore Linux shortcut for Move to start of line",
+    });
+    expect(restoreLinux).toBeDisabled();
+    fireEvent.change(screen.getByRole("combobox", { name: "Client platform" }), {
+      target: { value: "windows" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Restore Windows shortcut for Move to start of line" }),
+    );
+    expect(readTerminalKeyboardPreferences().bindings?.lineStart?.platformOverrides).toEqual({});
   });
 
   it("explains restore defaults when the shortcut is already unchanged", async () => {

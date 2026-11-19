@@ -3098,7 +3098,9 @@ function ShortcutsSection() {
         <KeyboardShortcutEditor />
         <div className="border-t border-border pt-6">
           <h2 className="text-ui font-medium">Mobile controls</h2>
-          <p className="mt-1 text-sm text-muted-foreground">Customize the mobile assistant.</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Customize the terminal key bar in the phone layout.
+          </p>
           <div className="mt-5">
             <MobileAssistantSettings />
           </div>

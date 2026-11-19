@@ -25,6 +25,15 @@ import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "./worktreeDefault
 import { defaultTerminalBar, legacyFingerprint, projectLegacy } from "./terminalKeyBar";
 import { resolveTerminalKeys, writeTerminalKeyPreferences } from "./terminalKeys";
 import {
+  readTerminalKeyboardPreferences,
+  writeTerminalKeyboardPreferences,
+  type TerminalKeyboardPreferences,
+} from "./terminalKeyboardPreferences";
+import {
+  readKeyboardShortcutPreferences,
+  resetShortcutPreference,
+} from "./keyboardShortcutPreferences";
+import {
   readMobileAssistantPreferences,
   writeMobileAssistantPreferences,
 } from "./mobileAssistantPreferences";
@@ -51,6 +60,53 @@ describe("terminal bar preference synchronization", () => {
       terminalLegacyBasis: legacyFingerprint(terminalButtons, true),
     };
   }
+
+  it("preserves terminal maps and bindings when an older editor deletes the app shortcut namespace", async () => {
+    vi.useFakeTimers();
+    const terminalKeyboard: TerminalKeyboardPreferences = {
+      v: 1,
+      modifierMap: { macos: { ctrl: "ctrl", alt: "cmd", meta: "alt" } },
+      bindings: {
+        lineStart: {
+          platformOverrides: { windows: [{ code: "KeyA", modifiers: ["control", "shift"] }] },
+        },
+      },
+    };
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync(
+      {
+        version: 1,
+        settings: {
+          mobile_assistant: mobileValue(),
+          keyboard_shortcuts: {
+            version: 1,
+            actions: { newSession: { common: [{ code: "F9", modifiers: [] }] } },
+          },
+        },
+      },
+      fetcher,
+      "alice",
+    );
+    expect(writeTerminalKeyboardPreferences(terminalKeyboard)).toBe("saved");
+    await vi.advanceTimersByTimeAsync(251);
+    const mobile = JSON.parse(fetcher.mock.calls[0][1].body).value;
+    expect(mobile.terminalKeyboard).toEqual(terminalKeyboard);
+    resetShortcutPreference("newSession");
+    await vi.advanceTimersByTimeAsync(251);
+    expect(fetcher.mock.calls[1][0]).toBe("/v1/me/preferences/keyboard_shortcuts");
+    expect(JSON.parse(fetcher.mock.calls[1][1].body)).toEqual({ value: null });
+    fetcher.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          user_id: "alice",
+          preferences: { version: 1, settings: { mobile_assistant: mobile } },
+        }),
+      ),
+    );
+    await refreshUserPreferencesFromServer();
+    expect(readKeyboardShortcutPreferences().actions).toEqual({});
+    expect(readTerminalKeyboardPreferences()).toEqual(terminalKeyboard);
+  });
 
   it("round-trips both surfaces and the unmodified circle envelope through a legacy client's edit", async () => {
     vi.useFakeTimers();
