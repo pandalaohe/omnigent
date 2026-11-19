@@ -841,6 +841,34 @@ def test_rollout_session_meta_provider_rejects_lone_surrogate(tmp_path: Path) ->
     assert codex_native._codex_rollout_provider_and_version(rollout) is None
 
 
+def test_rollout_session_meta_provider_rejects_control_character(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A control character in a provider id can never match one, so it falls back."""
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(
+        json.dumps({"type": "session_meta", "payload": {"model_provider": "bad\u0000id"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert codex_native._codex_rollout_provider_and_version(rollout) is None
+    assert "records an unusable provider" in caplog.text
+    assert "bad" not in caplog.text
+
+
+def test_rollout_session_meta_keeps_provider_but_drops_unusable_version(
+    tmp_path: Path,
+) -> None:
+    """Only the unreadable half of the metadata is dropped."""
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_bytes(
+        b'{"type":"session_meta","payload":{"model_provider":"custom",'
+        b'"cli_version":"1.0\\ud800"}}\n'
+    )
+
+    assert codex_native._codex_rollout_provider_and_version(rollout) == ("custom", None)
+
+
 @pytest.mark.asyncio
 async def test_ensure_local_codex_resume_rollout_replaces_lone_surrogate_provider(
     tmp_path: Path,

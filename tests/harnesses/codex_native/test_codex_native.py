@@ -878,18 +878,28 @@ _PROVIDER_POLICY_CONFLICT = {
     ("message", "missing"),
     [
         ("failed to load configuration: Model provider `Databricks` not found", "Databricks"),
-        ("failed to load configuration: Model provider Databricks not found", "Databricks"),
         (
             "failed to load configuration: Model provider `Databricks` not found (cwd=/opt/work)",
-            None,
+            "Databricks",
         ),
+        ("failed to load configuration: Model provider `Databricks` not found\n", "Databricks"),
+        ("failed to load configuration: Model provider Databricks not found", "Databricks"),
+        ("failed to load configuration: Model provider `` not found", None),
         (
             "This chat uses model provider “Databricks”, which is no longer configured.",
             None,
         ),
         ("failed to load configuration: project hooks config is not a directory", None),
     ],
-    ids=["quoted", "unquoted", "trailing_detail", "structured_wording", "other_config_load"],
+    ids=[
+        "quoted",
+        "trailing_detail",
+        "trailing_newline",
+        "unquoted",
+        "empty_name",
+        "structured_wording",
+        "other_config_load",
+    ],
 )
 def test_codex_resume_legacy_unconfigured_provider_reads_plain_message(
     message: str, missing: str | None

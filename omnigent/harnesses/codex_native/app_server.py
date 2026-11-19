@@ -193,6 +193,9 @@ _EFFORT_CLOSE_TIMEOUT_SECONDS = 2.0
 _MODEL_PROVIDER_READ_TIMEOUT_SECONDS = 2.0
 # Codex before 0.166 reports a missing provider as plain configuration-load text.
 _CODEX_LEGACY_MISSING_PROVIDER_PREFIX = "failed to load configuration: Model provider "
+_CODEX_LEGACY_MISSING_PROVIDER_QUOTED = re.compile(
+    r"^failed to load configuration: Model provider `([^`\n]+)` not found"
+)
 _CODEX_LEGACY_MISSING_PROVIDER_SUFFIX = " not found"
 # Model discovery is a best-effort side process whose callers fall back to a
 # cached or bundled catalog, so it keeps a short readiness budget.
@@ -1301,16 +1304,18 @@ def codex_resume_legacy_unconfigured_model_provider(exc: BaseException) -> str |
     if not isinstance(exc, CodexAppServerResponseError) or exc.code != _CODEX_INVALID_REQUEST_CODE:
         return None
     message = exc.message
-    if message is None or not message.startswith(_CODEX_LEGACY_MISSING_PROVIDER_PREFIX):
+    if message is None:
         return None
-    if not message.endswith(_CODEX_LEGACY_MISSING_PROVIDER_SUFFIX):
+    quoted = _CODEX_LEGACY_MISSING_PROVIDER_QUOTED.match(message)
+    if quoted is not None:
+        return quoted.group(1)
+    prefix, suffix = _CODEX_LEGACY_MISSING_PROVIDER_PREFIX, _CODEX_LEGACY_MISSING_PROVIDER_SUFFIX
+    if not message.startswith(prefix) or not message.endswith(suffix):
         return None
-    name = message[
-        len(_CODEX_LEGACY_MISSING_PROVIDER_PREFIX) : -len(_CODEX_LEGACY_MISSING_PROVIDER_SUFFIX)
-    ].strip()
-    if len(name) > 1 and name.startswith("`") and name.endswith("`"):
-        name = name[1:-1]
-    return name or None
+    # An unquoted message names the provider directly; a leftover backtick means
+    # the quoted form was malformed, not that a provider is named.
+    remainder = message[len(prefix) : -len(suffix)].strip()
+    return None if not remainder or "`" in remainder else remainder
 
 
 def _codex_unconfigured_provider_error(provider: str) -> OmnigentError:
