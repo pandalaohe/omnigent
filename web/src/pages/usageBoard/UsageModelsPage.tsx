@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
-import { useParams } from "@/lib/routing";
+import { usageAccountSubpagePath } from "@/lib/boardFrame";
+import { useParams, useSearchParams } from "@/lib/routing";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { UsageUnitControl } from "./UsageAmounts";
 import { UsageBoardFrame } from "./UsageBoardFrame";
@@ -31,6 +32,7 @@ export interface UsageModelsResponse {
 
 export function UsageModelsPage() {
   const { accountId = "" } = useParams();
+  const [search] = useSearchParams();
   const board = useUsageContextPreferences().board;
   const params = usageRangeQuery(board.range ?? { key: "d7" });
   params.set("account", accountId);
@@ -44,7 +46,7 @@ export function UsageModelsPage() {
     <UsageBoardFrame
       title={`${query.data?.display_name ?? "Account"} · Models`}
       back={{
-        to: `/usage/board/${encodeURIComponent(accountId)}/settings`,
+        to: usageAccountSubpagePath(accountId, "settings", search.get("focus")),
         label: "Account settings",
       }}
       loading={query.isPending}

@@ -1,6 +1,6 @@
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ServerInfo } from "@/lib/capabilities";
@@ -59,13 +59,27 @@ const SERVER_INFO = {
 
 const LOADED = { isPending: false, error: null, refetch: vi.fn(), data: { accounts: [] } };
 
+function LocationProbe() {
+  const { pathname, search, hash } = useLocation();
+  return (
+    <span data-testid="board-location">
+      {pathname}
+      {search}
+      {hash}
+    </span>
+  );
+}
+
 function renderRoute(path = "/usage/board") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[path]}>
+        <LocationProbe />
         <Routes>
           <Route path="/usage/board" element={<UsageBoardRoute view="board" />} />
+          <Route path="/frame/usage/board/cost" element={<UsageBoardRoute view="cost" />} />
+          <Route path="/frame/usage/board/analysis" element={<UsageBoardRoute view="cost" />} />
           <Route path="/usage/board/:accountId" element={<UsageBoardRoute view="account" />} />
           <Route
             path="/usage/board/:accountId/settings"
@@ -150,6 +164,31 @@ describe("board", () => {
     codex.click();
     await waitFor(() => expect(codex).toHaveAttribute("aria-current", "true"));
     expect(screen.getAllByText(/^Resets /)).toHaveLength(2);
+  });
+
+  it("replaces an old account URL with a selected overview and retains its theme and fragment", () => {
+    mocks.overview.current = { ...LOADED, data: usageBoardData() };
+    renderRoute("/usage/board/codex?theme=dark#quota");
+    expect(screen.getByTestId("board-location")).toHaveTextContent(
+      "/usage/board?theme=dark&account=codex#quota",
+    );
+    expect(screen.getByTestId("usage-overview").closest("[data-usage-theme]")).toHaveAttribute(
+      "data-usage-theme",
+      "dark",
+    );
+    expect(screen.getByRole("link", { name: "Account details" })).toHaveAttribute(
+      "href",
+      "/usage/board?theme=dark&account=codex&view=details",
+    );
+  });
+
+  it("keeps default values and unknown parameters on a legacy analysis bookmark", () => {
+    const suffix = "?range=d30&extra=keep&group=account&theme=invalid#summary";
+    renderRoute(`/frame/usage/board/cost${suffix}`);
+    expect(screen.getByTestId("board-location")).toHaveTextContent(
+      `/frame/usage/board/analysis${suffix}`,
+    );
+    expect(screen.getByRole("heading", { level: 1 }).closest("[data-usage-theme]")).toBeNull();
   });
 
   it("shows the stale reading and the value-only quota on their selected account", () => {

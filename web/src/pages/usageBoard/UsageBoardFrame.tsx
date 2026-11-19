@@ -1,4 +1,4 @@
-import { boardPath, boardExitProps } from "@/lib/boardFrame";
+import { useBoardPath, boardExitProps, usageBoardTheme } from "@/lib/boardFrame";
 // Page chrome shared by every Usage board route: the title row, the actions on
 // its right, and the loading / failed / off states, so no route renders a
 // half-filled page while the reading is still arriving.
@@ -37,15 +37,18 @@ export function UsageBoardFrame({
   generatedAt,
   children,
 }: UsageBoardFrameProps) {
+  const boardPath = useBoardPath();
+
   const location = useLocation();
   const [search] = useSearchParams();
-  const analysis = location.pathname.endsWith(analysisPath) || location.pathname.endsWith("/cost");
-  const shell = new URLSearchParams();
-  for (const key of ["theme", "pool"])
-    for (const value of search.getAll(key)) shell.append(key, value);
-  const overview = boardPath(`/usage/board${shell.size ? `?${shell}` : ""}`);
+  const analysis = location.pathname.endsWith(analysisPath);
+  const theme = usageBoardTheme(search);
+  const overview = boardPath("/usage/board");
   return (
-    <div className="min-h-0 min-w-0 flex-1 overflow-y-auto">
+    <div
+      className="usage-board-scroll min-h-0 min-w-0 flex-1 overflow-y-auto"
+      data-usage-theme={theme}
+    >
       <div className="usage-surface @container">
         <header className="usage-top">
           <h1>
@@ -60,7 +63,7 @@ export function UsageBoardFrame({
               {t("usageTab")}
             </Link>
             <Link
-              to={analysis ? { search: location.search } : analysisLink(search)}
+              to={analysis ? { search: location.search } : boardPath(analysisLink(search))}
               aria-current={analysis ? "page" : undefined}
             >
               {t("analysisTab")}

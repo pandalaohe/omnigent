@@ -1,5 +1,5 @@
 import { Segmented } from "@/components/ui/segmented";
-import { boardPath } from "@/lib/boardFrame";
+import { usageAccountSubpagePath, useBoardPath } from "@/lib/boardFrame";
 import { Link } from "@/lib/routing";
 import {
   ArrowDownRightIcon,
@@ -105,6 +105,8 @@ export function UsageAmountFigure({
 }
 
 export function UsageSummary({ accountIds }: { accountIds: string[] }) {
+  const boardPath = useBoardPath();
+
   const d30 = useUsageActivity(undefined, true, { key: "d30" });
   const today = useUsageActivity(undefined, true, { key: "today" });
   const h24 = useUsageActivity(undefined, true, { key: "h24" });
@@ -179,19 +181,22 @@ export function UsageCostCard({
   account,
   now,
   fee,
+  focus,
 }: {
   accounts: UsageAccountActivity[];
   account?: UsageAccountView;
   now: number;
   fee?: number;
+  focus?: string | null;
 }) {
+  const boardPath = useBoardPath();
   const board = useUsageContextPreferences().board;
   const tokens = board.unit === "tokens";
   const amount = account ? (accounts[0] ?? null) : boardAmount(accounts, false, tokens);
   const previous = account ? accounts[0]?.previous : boardAmount(accounts, true, tokens);
   const failures = sumUsage(accounts.map((item) => item.totals));
   const issuesPath = account
-    ? `/usage/board/${encodeURIComponent(account.id)}/issues`
+    ? usageAccountSubpagePath(account.id, "issues", focus)
     : "/usage/board/issues";
   const efficiency = sumUsage(accounts.map((item) => item.totals.metered ?? item.totals));
   const previousEfficiency = sumUsage(

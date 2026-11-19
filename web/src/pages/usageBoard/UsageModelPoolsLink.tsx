@@ -1,5 +1,6 @@
 import { useExtensions } from "@/extensions/ExtensionProvider";
 import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
+import { boardExitProps } from "@/lib/boardFrame";
 import { Link } from "@/lib/routing";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
@@ -12,7 +13,7 @@ export function UsageModelPoolsLink({ settings = false }: { settings?: boolean }
       title: `${extension.display_name} · ${page.title}`,
     })),
   );
-  const page = pages.find((item) => item.path === selected);
+  const page = pages.find((item) => item.path === selected?.split("#", 1)[0]);
   if (settings)
     return (
       <label className="flex min-h-12 flex-wrap items-center justify-between gap-2 border-t border-border py-2 text-sm">
@@ -29,9 +30,11 @@ export function UsageModelPoolsLink({ settings = false }: { settings?: boolean }
               })),
             ]}
             value={page?.path ?? "__none__"}
-            onValueChange={(value) =>
-              patchUsageBoardPreferences({ modelPoolsPage: value === "__none__" ? "" : value })
-            }
+            onValueChange={(value) => {
+              if (value !== page?.path) {
+                patchUsageBoardPreferences({ modelPoolsPage: value === "__none__" ? "" : value });
+              }
+            }}
             aria-label="Model pools page"
             className="h-auto w-72 max-w-full rounded-none! bg-transparent p-0"
           />
@@ -53,12 +56,14 @@ export function UsageModelPoolsLink({ settings = false }: { settings?: boolean }
         )}
       </label>
     );
-  return page ? (
+  const exit = boardExitProps();
+  return page && selected ? (
     <Link
       className="inline-flex min-h-11 items-center text-sm underline underline-offset-2"
-      to={page.path}
+      to={selected}
+      {...exit}
     >
-      Model pools ↗
+      Model pools{!selected.includes("#") || exit.target ? " ↗" : ""}
     </Link>
   ) : (
     <p className="text-xs text-muted-foreground">

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Link, useSearchParams } from "@/lib/routing";
+import { useBoardPath } from "@/lib/boardFrame";
 import { useQuery } from "@tanstack/react-query";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import {
@@ -199,6 +200,7 @@ export function UsageAccountCost({
   reads: ReturnType<typeof useOverviewCostReads>;
 }) {
   const [search, setSearch] = useSearchParams();
+  const boardPath = useBoardPath();
   const board = useUsageContextPreferences().board;
   const unit = search.get("unit");
   const tokens = unit === "tokens" || (unit !== "money" && board.unit === "tokens");
@@ -310,7 +312,7 @@ export function UsageAccountCost({
         )}
         <Link
           className="justify-self-end text-xs underline underline-offset-2"
-          to={analysisLink(search, { ...drill, account: account ? [account.id] : [] })}
+          to={boardPath(analysisLink(search, { ...drill, account: account ? [account.id] : [] }))}
         >
           {selected === "period" && drill.range !== "custom"
             ? t("overviewAnalysisRange", { range: t(overviewRanges[compositionRange]) })
@@ -346,6 +348,7 @@ export function UsageOverviewHosts({
   range: OverviewRange;
   query: ReturnType<typeof useUsageActivity>;
 }) {
+  const boardPath = useBoardPath();
   const [search] = useSearchParams();
   const hostNames = new Map(
     accounts.flatMap((item) => item.hosts.map((host) => [host.host_id, host.name])),
@@ -384,11 +387,13 @@ export function UsageOverviewHosts({
                   <li key={id}>
                     <Link
                       className="usage-row"
-                      to={analysisLink(search, {
-                        ...drill,
-                        account: account === undefined ? [] : [account],
-                        host: [id],
-                      })}
+                      to={boardPath(
+                        analysisLink(search, {
+                          ...drill,
+                          account: account === undefined ? [] : [account],
+                          host: [id],
+                        }),
+                      )}
                     >
                       <UsageName className="flex-1">
                         {hostNames.get(id) ?? (id || t("overviewUnknown"))}

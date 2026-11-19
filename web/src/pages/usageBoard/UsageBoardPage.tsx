@@ -1,5 +1,5 @@
 import { Link, useSearchParams } from "@/lib/routing";
-import { boardExitProps, boardPath } from "@/lib/boardFrame";
+import { boardExitProps, usageAccountSubpagePath, useBoardPath } from "@/lib/boardFrame";
 import { SettingsIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -37,15 +37,18 @@ function tightest(account: UsageAccountView) {
 }
 
 export function UsageBoardPage() {
+  const boardPath = useBoardPath();
+
   const board = useUsageContextPreferences().board;
   const overview = useUsageOverview(true);
   const [search] = useSearchParams();
   const accounts = boardBands(board, overview.data?.accounts ?? []).flatMap(
     (band) => band.accounts,
   );
-  const account = accounts.find((item) => item.id === search.get("account"));
+  const selected = search.get("account");
+  const account = accounts.find((item) => item.id === selected);
   const settings = account
-    ? boardPath(`/usage/board/${encodeURIComponent(account.id)}/settings`)
+    ? boardPath(usageAccountSubpagePath(account.id, "settings"))
     : "/settings/general#usage-settings";
   const reads = useOverviewCostReads(account?.id, accounts.length > 0);
   const shown = account ? [account] : accounts;
@@ -57,6 +60,9 @@ export function UsageBoardPage() {
     else next.delete("account");
     return { search: next.toString() };
   }
+
+  const details = new URLSearchParams(search);
+  details.set("view", "details");
 
   return (
     <UsageBoardFrame
@@ -87,13 +93,23 @@ export function UsageBoardPage() {
           </Link>
         ))}
       </nav>
-      {accounts.length ? (
+      {selected && !account && !overview.error ? (
+        <p className="usage-card usage-caption">This account is not on the board any more.</p>
+      ) : accounts.length ? (
         <div data-testid="usage-overview">
           <div className="usage-account-heading">
             <h2 className="usage-account-name">
               {account?.display_name ?? t("overviewAllAccounts")}
             </h2>
             {account?.plan ? <p className="usage-caption usage-wrap">{account.plan}</p> : null}
+            {account ? (
+              <Link
+                className="inline-flex min-h-11 items-center text-sm underline"
+                to={{ search: details.toString() }}
+              >
+                Account details
+              </Link>
+            ) : null}
           </div>
           <div className="usage-overview">
             <div className="usage-overview-column">

@@ -5,13 +5,20 @@ import { ExternalPageView } from "./ExternalPageView";
 import { ExtensionViewHost } from "./ExtensionViewHost";
 import { useExtensionHostServices } from "./services/useExtensionHostServices";
 
-export function ExtensionPageHost({ resolved }: { resolved: ResolvedExtensionPage }) {
+export function ExtensionPageHost({
+  resolved,
+  hash,
+}: {
+  resolved: ResolvedExtensionPage;
+  hash?: string;
+}) {
   const refresh = useRefreshExtensions();
   const { methods, events } = useExtensionHostServices(resolved.extension);
   if (resolved.page.kind === "external" || resolved.page.kind === "proxied")
     return (
       <ExternalPageView
         page={resolved.page}
+        hash={hash}
         openSession={
           resolved.page.kind === "proxied" ? methods["navigation.openSession"] : undefined
         }

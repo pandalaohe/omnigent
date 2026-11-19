@@ -599,6 +599,17 @@ describe("usage/context preferences", () => {
     ).toBe(false);
   });
 
+  it.each([
+    ["/extensions/example.pools/main", true],
+    ["/extensions/example.pools/main#/models/pool%20A", true],
+    ["//example.test/extensions/example.pools/main#/models", false],
+    ["https://example.test/extensions/example.pools/main#/models", false],
+    ["/extensions/example.pools/main?redirect=example#/models", false],
+  ])("round-trips the configured model pools route %s only when valid", (path, valid) => {
+    patchUsageBoardPreferences({ modelPoolsPage: path });
+    expect(readUsageContextPreferences().board.modelPoolsPage).toBe(valid ? path : undefined);
+  });
+
   it("patches one board field without disturbing the others", () => {
     writeUsageContextPreferences({
       ...DEFAULT_USAGE_CONTEXT_PREFERENCES,

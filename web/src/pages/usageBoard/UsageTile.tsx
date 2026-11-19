@@ -12,7 +12,7 @@ import {
   ReceiptIcon,
   TriangleAlertIcon,
 } from "lucide-react";
-import { boardPath } from "@/lib/boardFrame";
+import { usageAccountDetailPath, useBoardPath } from "@/lib/boardFrame";
 import { Link } from "@/lib/routing";
 import type { ReactNode } from "react";
 
@@ -83,6 +83,8 @@ export function UsageTile({
   amount,
   tokens = false,
 }: UsageTileProps) {
+  const boardPath = useBoardPath();
+
   const pricing = usePricingBaseline();
   const free = pricing.data ? accountCostClass(pricing.data, account.id) === "free" : false;
   const stale = isStale(account);
@@ -228,9 +230,7 @@ export function UsageTile({
               className={cn("usage-unit", wideBoxes && "usage-box")}
               data-tone={wideBoxes ? displayTone(main) : undefined}
               aria-label={`${name}${group.tag ? ` ${group.tag}` : ""}`}
-              to={boardPath(
-                `/usage/board/${encodeURIComponent(account.id)}${group.key ? `?focus=${encodeURIComponent(group.key)}` : ""}`,
-              )}
+              to={boardPath(usageAccountDetailPath(account.id, group.key))}
               onClick={(event) => {
                 if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
                 event.preventDefault();
@@ -309,9 +309,7 @@ export function UsageTile({
               if (onOpenGroup) onOpenGroup(balance.group ?? balance.id);
               else activate();
             }}
-            to={boardPath(
-              `/usage/board/${encodeURIComponent(account.id)}?focus=${encodeURIComponent(balance.group ?? balance.id)}`,
-            )}
+            to={boardPath(usageAccountDetailPath(account.id, balance.group ?? balance.id))}
           >
             {wideBoxes ? (
               <UsageName className="usage-unit-tag">{balance.group || "\u00a0"}</UsageName>

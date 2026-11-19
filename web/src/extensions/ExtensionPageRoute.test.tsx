@@ -1,25 +1,27 @@
-import { render, screen } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { Link, MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const catalog = vi.hoisted(() => ({ loading: true }));
+const catalog = vi.hoisted(() => ({ loading: true, extensions: [] as unknown[] }));
 
 vi.mock("./ExtensionProvider", () => ({
-  useExtensions: () => [],
+  useExtensions: () => catalog.extensions,
   useExtensionsLoading: () => catalog.loading,
 }));
 vi.mock("@/pages/NotFoundPage", () => ({
   NotFoundPage: () => <div>page not found</div>,
 }));
 vi.mock("./ExtensionPageHost", () => ({
-  ExtensionPageHost: () => <div>extension page</div>,
+  ExtensionPageHost: ({ hash }: { hash: string }) => <div data-testid="extension-hash">{hash}</div>,
 }));
 
 import { ExtensionPageRoute } from "./ExtensionPageRoute";
 
 function renderRoute() {
   return render(
-    <MemoryRouter initialEntries={["/extensions/acme.review/dashboard"]}>
+    <MemoryRouter initialEntries={["/extensions/acme.review/dashboard#/first"]}>
+      <Link to="#/second">Second view</Link>
+      <Link to="/extensions/acme.review/dashboard">Default view</Link>
       <Routes>
         <Route path="/extensions/:extensionId/*" element={<ExtensionPageRoute />} />
       </Routes>
@@ -29,6 +31,7 @@ function renderRoute() {
 
 beforeEach(() => {
   catalog.loading = true;
+  catalog.extensions = [];
 });
 
 describe("ExtensionPageRoute", () => {
@@ -45,5 +48,17 @@ describe("ExtensionPageRoute", () => {
 
     expect(screen.getByText("page not found")).toBeInTheDocument();
     expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("passes initial, changed and cleared route fragments to the same page host", () => {
+    catalog.loading = false;
+    catalog.extensions = [{ id: "acme.review", pages: [{ route: "dashboard" }] }];
+    renderRoute();
+    const target = screen.getByTestId("extension-hash");
+    expect(target).toHaveTextContent("#/first");
+    fireEvent.click(screen.getByRole("link", { name: "Second view" }));
+    expect(target).toHaveTextContent("#/second");
+    fireEvent.click(screen.getByRole("link", { name: "Default view" }));
+    expect(target).toBeEmptyDOMElement();
   });
 });

@@ -1,6 +1,6 @@
 import { useEffect } from "react";
-import { Link, useLocation, useNavigate, useSearchParams } from "@/lib/routing";
-import { boardExitProps, boardPath } from "@/lib/boardFrame";
+import { Link, useLocation, useSearchParams } from "@/lib/routing";
+import { boardExitProps, useBoardPath } from "@/lib/boardFrame";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { UsageBoardFrame } from "./UsageBoardFrame";
 import { useUsageOverview } from "./usageBoardData";
@@ -44,28 +44,21 @@ import { formatRingPercent, formatUsageValue } from "./usageBoardFormat";
 import "./usageAnalysis.css";
 
 export function UsageCostPage() {
+  const boardPath = useBoardPath();
+
   const [search, setSearch] = useSearchParams();
   const location = useLocation();
-  const navigate = useNavigate();
-  const legacyPath = location.pathname.endsWith("/cost");
   const raw = location.search.slice(1);
   const filter = filterFromQuery(search);
   const canonical = toQuery(filter, search).toString();
+  // A legacy bookmark retains its complete query until the user changes a filter.
+  const keepLegacyQuery = location.state?.keepLegacyQuery === true;
   useEffect(() => {
-    if (legacyPath) {
-      navigate(
-        {
-          pathname: location.pathname.replace(/\/cost$/, "/analysis"),
-          search: canonical,
-          hash: location.hash,
-        },
-        { replace: true },
-      );
-    } else if (raw !== canonical) {
+    if (!keepLegacyQuery && raw !== canonical) {
       setSearch(canonical, { replace: true });
     }
-  }, [canonical, legacyPath, location.hash, location.pathname, navigate, raw, setSearch]);
-  const overview = useUsageOverview(!legacyPath, false);
+  }, [canonical, keepLegacyQuery, raw, setSearch]);
+  const overview = useUsageOverview(true, false);
   const hidden = useUsageContextPreferences().board.hidden;
   const visibleAccounts = overview.data?.accounts.filter(({ id }) => !hidden.includes(id)) ?? [];
   const accountKeys = visibleAccounts.map(({ id }) => id);
@@ -78,7 +71,7 @@ export function UsageCostPage() {
     !!hidden.length && !awaitScope && (scopedAccounts.length === 0 || scopedAccounts.length > 64);
   const effectiveFilter = hidden.length ? { ...filter, account: scopedAccounts } : filter;
   const reading = useUsageAnalysisV2(effectiveFilter, {
-    enabled: !legacyPath && !awaitScope && !invalidScope,
+    enabled: !awaitScope && !invalidScope,
     keepResults: true,
   });
   const outdated = reading.error instanceof AnalysisFilterMismatch;

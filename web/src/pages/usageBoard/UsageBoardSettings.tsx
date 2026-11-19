@@ -1,4 +1,4 @@
-import { boardExitProps, boardPath } from "@/lib/boardFrame";
+import { boardExitProps, useBoardPath } from "@/lib/boardFrame";
 // The Usage board's own group in Settings. One place for the module's switch,
 // the ring colour line, which accounts are on the board, and how to connect an
 // outside source. Display routes never render any of it.
@@ -63,6 +63,8 @@ function sampleState(percentUsed: number, tight: number, low: number, floor: num
 }
 
 export function UsageBoardSettings() {
+  const boardPath = useBoardPath();
+
   const info = useServerInfo();
   const available = usageBoardAvailable(info);
   const board = useUsageContextPreferences().board;

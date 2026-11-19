@@ -1,7 +1,13 @@
 import * as identity from "@/lib/identity";
 import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { Link, Outlet, MemoryRouter, useNavigate } from "react-router-dom";
+import {
+  Link,
+  Outlet,
+  MemoryRouter,
+  useLocation as useRouterLocation,
+  useNavigate,
+} from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -493,15 +499,26 @@ describe("Usage frame capability transitions", () => {
     vi.restoreAllMocks();
   });
 
+  function UsageLocation() {
+    const { pathname, search } = useRouterLocation();
+    return <output data-testid="usage-location">{pathname + search}</output>;
+  }
+
   it.each([
-    ["/frame/usage/board", "Usage board"],
-    ["/frame/usage/board/account", "Account reading"],
-  ])("keeps %s shell-free as capabilities resolve", async (path, heading) => {
+    ["/frame/usage/board", "Usage board", "/frame/usage/board"],
+    ["/frame/usage/board/account", "Usage board", "/frame/usage/board?account=account"],
+    [
+      "/frame/usage/board/account?focus=group",
+      "Account reading",
+      "/frame/usage/board?focus=group&account=account",
+    ],
+  ])("keeps %s shell-free as capabilities resolve", async (path, heading, resolvedPath) => {
     function route(info: typeof FALLBACK_SERVER_INFO | "loading") {
       return (
         <CapabilitiesProvider info={info}>
           <MemoryRouter initialEntries={[path]}>
             <App />
+            <UsageLocation />
           </MemoryRouter>
         </CapabilitiesProvider>
       );
@@ -512,6 +529,7 @@ describe("Usage frame capability transitions", () => {
     expect(screen.queryByText("not found")).toBeNull();
     view.rerender(route({ ...FALLBACK_SERVER_INFO, usage_board_enabled: true }));
     expect(await screen.findByRole("heading", { name: heading })).toBeInTheDocument();
+    expect(screen.getByTestId("usage-location")).toHaveTextContent(resolvedPath);
     expect(screen.queryByText("app shell")).toBeNull();
     expect(screen.queryByText("not found")).toBeNull();
     view.rerender(route("loading"));

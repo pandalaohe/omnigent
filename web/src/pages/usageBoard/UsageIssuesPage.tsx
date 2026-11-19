@@ -1,7 +1,7 @@
-import { boardPath } from "@/lib/boardFrame";
+import { usageAccountDetailPath, useBoardPath } from "@/lib/boardFrame";
 import { useState } from "react";
 import { Input } from "@/components/ui/input";
-import { Link, useParams } from "@/lib/routing";
+import { Link, useParams, useSearchParams } from "@/lib/routing";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { UsageBoardFrame } from "./UsageBoardFrame";
 import { UsageRangeControl } from "./UsageRangeControl";
@@ -17,7 +17,11 @@ const SOURCE_LABELS: Record<string, string> = {
 };
 
 export function UsageIssuesPage() {
+  const boardPath = useBoardPath();
+
   const { accountId } = useParams();
+  const [params] = useSearchParams();
+  const focus = params.get("focus");
   const board = useUsageContextPreferences().board;
   const overview = useUsageOverview(true);
   const query = useUsageIssues(accountId);
@@ -50,7 +54,7 @@ export function UsageIssuesPage() {
     return (
       <Link
         className="block min-w-0 max-w-full font-medium underline underline-offset-2"
-        to={boardPath(`/usage/board/${encodeURIComponent(id)}`)}
+        to={boardPath(usageAccountDetailPath(id, id === accountId ? focus : null))}
       >
         <UsageName>{names.get(id) ?? id}</UsageName>
       </Link>
@@ -60,7 +64,7 @@ export function UsageIssuesPage() {
     <UsageBoardFrame
       title={title}
       back={{
-        to: accountId ? `/usage/board/${encodeURIComponent(accountId)}` : "/usage/board/cost",
+        to: accountId ? usageAccountDetailPath(accountId, focus) : "/usage/board/analysis",
         label: accountId ? (names.get(accountId) ?? "Account") : "Cost",
       }}
       loading={query.isPending}

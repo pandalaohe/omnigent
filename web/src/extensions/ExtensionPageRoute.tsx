@@ -1,5 +1,5 @@
 import { Spinner } from "@/components/ui/spinner";
-import { useParams } from "@/lib/routing";
+import { useLocation, useParams } from "@/lib/routing";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { resolveExtensionPage } from "./catalog";
 import { useExtensions, useExtensionsLoading } from "./ExtensionProvider";
@@ -7,6 +7,7 @@ import { ExtensionPageHost } from "./ExtensionPageHost";
 
 export function ExtensionPageRoute() {
   const params = useParams<{ extensionId: string; "*": string }>();
+  const { hash } = useLocation();
   const route = params["*"]?.split("/")[0];
   const extensions = useExtensions();
   const extensionsLoading = useExtensionsLoading();
@@ -24,5 +25,5 @@ export function ExtensionPageRoute() {
 
   if (!resolved) return <NotFoundPage />;
 
-  return <ExtensionPageHost resolved={resolved} />;
+  return <ExtensionPageHost resolved={resolved} hash={hash} />;
 }

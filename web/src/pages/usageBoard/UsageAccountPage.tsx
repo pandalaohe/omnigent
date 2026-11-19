@@ -1,8 +1,8 @@
-import { boardPath } from "@/lib/boardFrame";
+import { usageAccountSubpagePath, useBoardPath } from "@/lib/boardFrame";
 // One account in detail: every window the last read returned, in its group,
 // with the countdown and the reset written out, and the hosts that reported.
 
-import { Link, useParams, useSearchParams } from "@/lib/routing";
+import { Link, useSearchParams } from "@/lib/routing";
 import {
   LaptopIcon,
   PinIcon,
@@ -46,8 +46,9 @@ import { UsageBalances } from "./UsageBalances";
 import { UsageName } from "./UsageName";
 import { analysisLink, filterFromQuery } from "./usageAnalysisFilters";
 
-export function UsageAccountPage() {
-  const { accountId = "" } = useParams();
+export function UsageAccountPage({ accountId }: { accountId: string }) {
+  const boardPath = useBoardPath();
+
   const info = useServerInfo();
   const board = useUsageContextPreferences().board;
   const overview = useUsageOverview(info !== "loading" && info.usage_board_enabled === true);
@@ -93,11 +94,7 @@ export function UsageAccountPage() {
       error={overview.error ?? activity.error}
       actions={
         <Button variant="ghost" size="icon" asChild aria-label="Account settings">
-          <Link
-            to={boardPath(
-              `/usage/board/${encodeURIComponent(accountId)}/settings${focus ? `?focus=${encodeURIComponent(focus)}` : ""}`,
-            )}
-          >
+          <Link to={boardPath(usageAccountSubpagePath(accountId, "settings", focus))}>
             <SettingsIcon className="size-4" aria-hidden="true" />
           </Link>
         </Button>
@@ -169,6 +166,7 @@ export function UsageAccountPage() {
                   <UsageCostCard
                     accounts={activity.data?.accounts ?? []}
                     account={account}
+                    focus={focus}
                     now={activity.data?.generated_at ?? Date.now() / 1000}
                     fee={focus ? undefined : board.fees?.[account.id]}
                   />
@@ -199,11 +197,13 @@ export function UsageAccountPage() {
                           <Link
                             className="min-w-0 underline underline-offset-2"
                             title={host.name}
-                            to={analysisLink(search, {
-                              ...drill,
-                              account: [account.id],
-                              host: [host.host_id],
-                            })}
+                            to={boardPath(
+                              analysisLink(search, {
+                                ...drill,
+                                account: [account.id],
+                                host: [host.host_id],
+                              }),
+                            )}
                           >
                             <UsageName className="font-medium">{host.name}</UsageName>
                           </Link>
