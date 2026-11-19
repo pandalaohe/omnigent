@@ -272,6 +272,30 @@ def test_replace_activity_drops_rows_outside_the_report_bound(db_uri):
     assert store.read("a@example.test", 0, HOUR + 2 * 86_400) == []
 
 
+def test_report_correction_and_prune_share_the_cutoff_hour(db_uri, monkeypatch):
+    from omnigent.stores.usage_hours_store import _ACTIVITY_MAX_AGE_S
+
+    store = UsageHoursStore(db_uri)
+    owner = "owner@example.test"
+    cutoff = int(datetime(2025, 1, 1, tzinfo=UTC).timestamp())
+    expired = cutoff - 3600
+    now = cutoff
+    monkeypatch.setattr("omnigent.stores.usage_hours_store.now_epoch", lambda: now)
+    entries = [ActivityEntryV2(hour=hour, tokens=100) for hour in (expired, cutoff)]
+    assert store.replace_rows(owner, "plan", entries).applied == 2
+
+    now = cutoff + _ACTIVITY_MAX_AGE_S + 3599
+    assert store.prune_hours(now) == 1
+    corrections = [
+        entry.model_copy(update={"tokens": 80, "correction": True}) for entry in entries
+    ]
+    outcome = store.replace_rows(owner, "plan", corrections)
+    assert outcome.applied == 1, "cutoff-hour correction must be accepted"
+    assert [(entry.hour, entry.reason) for entry in outcome.skipped] == [(expired, "out_of_range")]
+    [row] = store.read(owner, expired, cutoff + 3600)
+    assert (row.hour_utc, row.total_tokens) == (cutoff, 80)
+
+
 def test_replace_activity_estimate_basis_is_kept(db_uri):
     store = UsageHoursStore(db_uri)
     store.replace_activity(
@@ -660,6 +684,60 @@ def test_agent_prune_preserves_cutoff_and_rejects_stale_over_total_split(db_uri)
     assert store.prune_hours(OTHER_HOUR + _ACTIVITY_MAX_AGE_S) == 0
     row = next(iter(store.read_chunks(owner, HOUR, OTHER_HOUR + 3600)))[0]
     assert row.hour_utc == OTHER_HOUR and len(row.agent_parts) == 1
+
+
+def test_hour_retention_drains_bounded_batches_across_workspaces(db_uri, monkeypatch):
+    from sqlalchemy import insert, select
+
+    from omnigent.db.db_models import SqlUsageHour, SqlUsageHourAgent
+    from omnigent.db.utils import run_write_transaction
+    from omnigent.server.usage_evidence import UsageEvidenceService
+    from omnigent.stores.usage_evidence_store import UsageEvidenceStore
+    from omnigent.stores.usage_hours_store import _ACTIVITY_MAX_AGE_S
+
+    store = UsageHoursStore(db_uri)
+    evidence = UsageEvidenceService(
+        UsageEvidenceStore(db_uri), retention_days=30, hours_store=store
+    )
+    expired = [
+        {
+            "workspace_id": index % 2,
+            "owner_id": "owner@example.test",
+            "account_id": f"plan-{index}",
+            "hour_utc": HOUR,
+            "updated_at": HOUR,
+        }
+        for index in range(2501)
+    ]
+    kept = [{**expired[0], "workspace_id": space, "hour_utc": OTHER_HOUR} for space in (0, 1)]
+
+    def seed(session):
+        session.execute(insert(SqlUsageHour), expired + kept)
+        session.execute(
+            insert(SqlUsageHourAgent), [{**row, "agent": "codex"} for row in expired + kept]
+        )
+
+    run_write_transaction(store._write_session(), "test_seed_hour_retention", seed)
+    now = OTHER_HOUR + _ACTIVITY_MAX_AGE_S + 3599
+    monkeypatch.setattr("omnigent.server.usage_evidence.now_epoch", lambda: now)
+    prune_batch = store.prune_hours
+    batches = []
+
+    def record_batch(at):
+        removed = prune_batch(at)
+        batches.append(removed)
+        return removed
+
+    monkeypatch.setattr(store, "prune_hours", record_batch)
+    evidence.prune()
+    evidence.prune()
+    assert batches == [5000, 2, 0, 0]
+    with store._read_session()("test_retained_hours") as session:
+        for table in (SqlUsageHourAgent, SqlUsageHour):
+            assert set(session.execute(select(table.workspace_id, table.hour_utc))) == {
+                (0, OTHER_HOUR),
+                (1, OTHER_HOUR),
+            }
 
 
 def test_dense_hour_limit_never_returns_a_complete_partial_hour(db_uri):

@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from omnigent.stores.usage_hours_store import UsageReadLimit
 from omnigent.usage.analysis_filters import local_day, local_slot
+from omnigent.usage.analysis_presentation import CacheSavingsFold
 from omnigent.usage.contract import AnalysisSpan
 from omnigent.usage.pricing_projection import ValueUsageFold, _PricingFold, payment_periods
 from omnigent.usage.value import Value, endpoint
@@ -232,6 +233,7 @@ class AnalysisFold:
             f"{day}-{hour:02d}": CountsFold() for day in range(1, 8) for hour in range(24)
         }
         self.classes = ClassesFold()
+        self.cache_savings = CacheSavingsFold()
         self.days = {}
         self.details = []
         self.rows_seen = 0
@@ -335,9 +337,11 @@ class AnalysisFold:
                 else main_rows
             )
 
-        selected = [row for row in source() if self.filters.matches(row)]
+        candidates = source()
+        selected = [row for row in candidates if self.filters.matches(row)]
         self.total.add(selected, partial=partial)
         self.classes.add(selected)
+        self.cache_savings.add(main_rows, candidates, selected)
         buckets = defaultdict(list)
         for row in selected:
             day, _, _ = local_slot(row.hour, self.zone)
@@ -561,7 +565,7 @@ class AnalysisFold:
             "heat": [{"slot": key, **value.result()} for key, value in self.heat.items()],
             "days": days,
             "classes": self.classes.result(),
-            "cache_savings": {"state": "unknown", "reason": "requires_savings_projection"},
+            "cache_savings": self.cache_savings.result(as_of=int(self.view.generated_at)),
             "rows": self.details if "rows" in self.filters.include else [],
             "rows_truncated": "rows" in self.filters.include and self.rows_seen > 5000,
         }

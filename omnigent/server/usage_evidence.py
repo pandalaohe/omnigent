@@ -19,6 +19,7 @@ from omnigent.db.utils import now_epoch
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.host_registry import HostConnection
 from omnigent.stores.usage_evidence_store import EVIDENCE_TABLES, UsageEvidenceStore
+from omnigent.stores.usage_hours_store import UsageHoursStore
 from omnigent.usage.contract import UsageAnalysisView
 from omnigent.usage.evidence import EvidenceBody, Rejected, SourceEvent, SourceStatus
 from omnigent.usage.prices import PriceAliases, PriceEstimate, PriceEvidence, aggregate_prices
@@ -30,9 +31,16 @@ logger = logging.getLogger(__name__)
 
 
 class UsageEvidenceService:
-    def __init__(self, store: UsageEvidenceStore, retention_days: int = 400) -> None:
+    def __init__(
+        self,
+        store: UsageEvidenceStore,
+        retention_days: int = 400,
+        *,
+        hours_store: UsageHoursStore | None = None,
+    ) -> None:
         self.store = store
         self.retention_days = retention_days
+        self.hours_store = hours_store
 
     def host_connection(self, conn: HostConnection, connected: bool) -> None:
         with workspace_scope(conn.workspace_id):
@@ -310,8 +318,12 @@ class UsageEvidenceService:
         }
 
     def prune(self) -> None:
-        cutoff = now_epoch() - self.retention_days * 86400
+        now = now_epoch()
+        cutoff = now - self.retention_days * 86400
         self.store.prune({table.__tablename__: cutoff for table in EVIDENCE_TABLES})
+        if self.hours_store is not None:
+            while self.hours_store.prune_hours(now):
+                pass
 
     async def run_retention(self) -> None:
         while True:

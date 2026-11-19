@@ -22,6 +22,7 @@ import {
   v2Tokens,
 } from "./UsageAnalysisAmounts";
 import {
+  V2CacheSavings,
   V2Composition,
   V2Cumulative,
   V2Heatmap,
@@ -238,9 +239,7 @@ export function UsageCostPage() {
                 <V2QuotaClosings filter={effectiveFilter} names={accounts} />
               )}
             </AnalysisSection>
-            <AnalysisSection id="savings" title={analysisSections.savings} folded>
-              <AnalysisUnknown reason="No cache savings projection is available." />
-            </AnalysisSection>
+            <V2CacheSavings data={data} />
           </div>
         ) : null}
       </AnalysisSectionState>

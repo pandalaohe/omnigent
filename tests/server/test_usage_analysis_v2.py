@@ -388,6 +388,121 @@ def test_agent_values_coexist_without_changing_unfiltered_money(service):
     assert used[0]["top_agent"] == "codex"
 
 
+@pytest.mark.asyncio
+async def test_cache_savings_use_whole_evidence_keys(service, db_uri, monkeypatch):
+    from types import SimpleNamespace
+
+    from omnigent.server.usage_evidence import UsageEvidenceService
+    from omnigent.stores.usage_evidence_store import UsageEvidenceStore
+    from omnigent.usage.contract import AgentPart
+    from omnigent.usage.prices import PriceEstimate, PriceEvidence
+
+    older_hour, closed_hour = HOUR - 7200, HOUR - 3600
+    hours = [
+        ActivityEntryV2(
+            hour=hour,
+            model=model,
+            host=host,
+            cache_read_input_tokens=tokens,
+            tokens=tokens,
+            agents=[
+                AgentPart(agent=agent, cache_read_input_tokens=count, tokens=count)
+                for agent, count in agents
+            ],
+        )
+        for hour, model, host, tokens, agents in (
+            (older_hour, "shared", "east", 70, [("codex", 30), ("claude", 40)]),
+            (older_hour, "shared", "west", 50, [("claude", 50)]),
+            (closed_hour, "whole", "east", 20, [("codex", 20)]),
+            (closed_hour, "unbounded", "east", 10, [("codex", 10)]),
+        )
+    ]
+    service.report_account(
+        OWNER,
+        "plan",
+        UsageReportV2(schema_version=2, observed_at=NOW, activity=hours),
+        now=NOW,
+    )
+    evidence = UsageEvidenceService(UsageEvidenceStore(db_uri))
+    evidence.store.upsert_prices(
+        OWNER,
+        [
+            PriceEvidence(
+                account="plan",
+                hour=hour,
+                model=model,
+                estimate=PriceEstimate(
+                    state="partial",
+                    cache_savings_low_usd=low,
+                    cache_savings_high_usd=high,
+                ),
+            )
+            for hour, model, low, high in (
+                (older_hour, "shared", "1.001", "1.002"),
+                (closed_hour, "whole", "2", "2"),
+                (closed_hour, "unbounded", "99", None),
+            )
+        ],
+        [],
+    )
+    filters = AnalysisFilter(group="host", range="d7")
+    for chunk_size in (1, 2000):
+        result = read_analysis_v2(
+            service, OWNER, filters, evidence=evidence, now=NOW, chunk_size=chunk_size
+        )["cache_savings"]
+        assert (result["amount"].low, result["amount"].high) == ("3.001", "3.002")
+        assert (result["unknown_tokens"], result["split_keys"], result["unbounded_keys"]) == (
+            10,
+            0,
+            1,
+        )
+
+    monkeypatch.setattr("omnigent.server.routes.agent_quota.require_user", lambda *_: OWNER)
+    clock = SimpleNamespace(time=lambda: NOW)
+    monkeypatch.setattr("omnigent.server.routes.agent_quota.time", clock)
+    monkeypatch.setattr("omnigent.usage.analysis_v2.time", clock)
+    app = FastAPI()
+    app.include_router(
+        create_agent_quota_router(
+            service, auth_provider=None, host_store=None, evidence_service=evidence
+        ),
+        prefix="/v1",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+
+        async def savings(query):
+            response = await client.get("/v1/me/usage/analysis?group=host&range=d7" + query)
+            assert response.status_code == 200, response.text
+            return response.json()["cache_savings"]
+
+        for query, split_tokens in (("&host=east", 70), ("&agent=codex", 30)):
+            filtered = await savings(query)
+            assert filtered["amount"]["state"] == "exact"
+            assert filtered["amount"]["low"] == filtered["amount"]["high"] == "2"
+            assert filtered["split_tokens"] == split_tokens
+            assert filtered["unknown_tokens"] == split_tokens + 10
+
+        slot = local_slot(older_hour, ZoneInfo("UTC"))[1]
+        for query in (
+            "&account=plan&model=shared",
+            "&model=shared&agent=claude&agent=codex",
+            f"&slot={slot}",
+        ):
+            whole = await savings(query)
+            assert whole["amount"]["state"] == "range"
+            assert whole["amount"]["formatted"] == {"low": "1.00", "high": "1.01"}
+            assert whole["unknown_tokens"] == 0
+
+        unbounded = await savings("&model=unbounded")
+        assert unbounded["amount"]["state"] == "unknown"
+        assert unbounded["unknown_tokens"] == 10
+        split_only = await savings("&model=shared&host=west")
+        assert split_only["amount"]["state"] == "unknown"
+        assert split_only["split_tokens"] == 50
+
+
 def test_native_agent_survives_account_retargeting(service, monkeypatch):
     service.report_account(
         OWNER, "plan", UsageReportV2(schema_version=2, observed_at=NOW, product="codex"), now=NOW

@@ -55,6 +55,13 @@ export interface AnalysisHour extends AnalysisCounts {
   top_agent: string | null;
   top_model: string | null;
 }
+export interface CacheSavings {
+  amount: AnalysisValue | null;
+  unknown_tokens: number;
+  split_keys: number;
+  split_tokens: number | null;
+  unbounded_keys: number;
+}
 export interface UsageAnalysisV2 {
   generated_at: number;
   filter: AnalysisFilter;
@@ -80,7 +87,7 @@ export interface UsageAnalysisV2 {
   heat: (AnalysisCounts & { slot: string })[];
   days: (AnalysisAmounts & { day: string; classes: AnalysisClasses; hours: AnalysisHour[] })[];
   classes: AnalysisClasses;
-  cache_savings: { state: string; reason?: string };
+  cache_savings: CacheSavings;
   previous?: Pick<UsageAnalysisV2, "span" | "totals" | "series">;
   rows: (AnalysisRow & { host_id: string; agent: string })[];
   rows_truncated: boolean;
