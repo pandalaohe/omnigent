@@ -5283,8 +5283,11 @@ class _StagedRunners:
     the host relaunched registers its tunnel.
     """
 
-    def __init__(self, store: SqlAlchemyConversationStore) -> None:
+    def __init__(
+        self, store: SqlAlchemyConversationStore, *, confirm_answer: bool | None = None
+    ) -> None:
         self._store = store
+        self._confirm_answer = confirm_answer
         self.live: set[str] = set()
         self.posts: list[tuple[str, dict[str, Any]]] = []
         self.client = httpx.AsyncClient(
@@ -5295,6 +5298,14 @@ class _StagedRunners:
         if request.method == "POST":
             self.posts.append((request.url.path, json.loads(request.content or b"{}")))
         if request.url.path.endswith("/events"):
+            if self._confirm_answer is not None and request.url.params.get("stream") == "true":
+                if self._confirm_answer:
+                    return httpx.Response(
+                        200,
+                        text='data: {"type": "response.completed"}\n\n',
+                        headers={"content-type": "text/event-stream"},
+                    )
+                return httpx.Response(202, json={"status": "buffered"})
             return httpx.Response(202, json={"queued": True})
         return httpx.Response(200, json={})
 
@@ -5323,6 +5334,85 @@ class _StagedRunners:
         if runner_id is not None:
             self.live.add(runner_id)
         return await self.get_runner_client(session_id, runner_router)
+
+
+@pytest.mark.parametrize(
+    ("runner_online", "confirm_answer"),
+    [(False, True), (True, True), (False, False)],
+    ids=["offline-confirmed", "online-confirmed", "offline-buffered"],
+)
+async def test_async_card_answer_reaches_host_runner_once(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_online: bool,
+    confirm_answer: bool,
+) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    store = SqlAlchemyConversationStore(db_uri)
+    runners = _StagedRunners(store, confirm_answer=confirm_answer)
+    monkeypatch.setattr(sessions_module, "_get_runner_client", runners.get_runner_client)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", runners.wait_for_runner_client)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm, harness="claude-native")
+    session_id = session["id"]
+    if runner_online:
+        runners.live.add(session["runner_id"])
+
+    opened = await client.post(
+        f"/v1/sessions/{session_id}/async-questions",
+        json={"questions": [{"question": "Which database?"}]},
+    )
+    assert opened.status_code == 200, opened.text
+    card = opened.json()
+    resolve_url = f"/v1/sessions/{session_id}/elicitations/{card['elicitation_id']}/resolve"
+    verdict = {"action": "accept", "content": {"Which database?": "SQLite"}}
+    events_path = f"/v1/sessions/{session_id}/events"
+    expected_notice = "answer_delivered" if confirm_answer else "answer_delivery_uncertain"
+    async with runners.client, _HostFrameResponder(comm) as host:
+        for response in await asyncio.gather(
+            client.post(resolve_url, json=verdict), client.post(resolve_url, json=verdict)
+        ):
+            assert response.status_code == 202, response.text
+
+        if not runner_online:
+            deadline = Deadline(5.0)
+            while not host.launch_frames and deadline.remaining() > 0:
+                await asyncio.sleep(0.01)
+            assert host.launch_frames, "answering an async card did not request a host launch"
+
+        async with asyncio.timeout(budget(5.0)):
+            while True:
+                items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+                if any(item.get("code") == expected_notice for item in items):
+                    if not await asyncio.to_thread(store.list_detached_cards):
+                        break
+                await asyncio.sleep(0.01)
+
+        replay = await client.post(resolve_url, json=verdict)
+        assert replay.status_code == 202, replay.text
+        assert len(host.launch_frames) == (0 if runner_online else 1)
+        messages = [
+            body
+            for path, body in runners.posts
+            if path == events_path and body.get("type") == "message"
+        ]
+        assert len(messages) == 1
+        assert messages[0]["content"] == [
+            {
+                "type": "input_text",
+                "text": f"[System: answers to your question card #{card['qid']}]\n"
+                "Which database? → SQLite",
+            }
+        ]
+        if not runner_online:
+            assert session["runner_id"] not in runners.live
+            assert len(runners.live) == 1
+            posted_paths = [path for path, _ in runners.posts]
+            assert posted_paths.index("/v1/sessions") < posted_paths.index(events_path)
 
 
 async def _side_chat_with_exited_source_runner(

@@ -19,7 +19,7 @@ import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypedDict, cast
 
 import httpx
 from fastapi import (
@@ -28,6 +28,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 from pydantic import ValidationError
+from starlette.datastructures import State
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import generate_agent_id, generate_task_id, now_epoch
@@ -862,6 +863,17 @@ class _NativeDeliveryUncertain(RuntimeError):
     """The runner may still deliver this input, so it must not be replayed."""
 
 
+@dataclass
+class _CardAnswerWake:
+    app_state: State
+    attempted: bool = False
+
+
+class _CardDeliveryOptions(TypedDict, total=False):
+    image_ids: list[str]
+    card_answer_wake: _CardAnswerWake
+
+
 async def _delivery_retry_sleep(seconds: float) -> None:
     """
     Indirection over :func:`asyncio.sleep` for the delivery retry backoff.
@@ -880,6 +892,7 @@ async def _deliver_with_retry(
     runner_router: RunnerRouter | None,
     persist_failure: bool = True,
     image_ids: list[str] | None = None,
+    card_answer_wake: _CardAnswerWake | None = None,
 ) -> bool | None:
     """
     Post one system message, retrying until it lands or the window elapses.
@@ -898,30 +911,27 @@ async def _deliver_with_retry(
     :param runner_router: Router used to resolve the session's bound runner.
     :param persist_failure: Whether an exhausted window records a visible
         undelivered-answer notice. Detached cards keep retrying themselves.
+    :param card_answer_wake: Shared wake state across retries of one saved answer.
     :returns: ``True`` for confirmed delivery, ``False`` for failure, or ``None``
         for an uncertain handoff that must not be replayed.
     """
+    options: _CardDeliveryOptions = {}
+    if image_ids:
+        options["image_ids"] = image_ids
+    if card_answer_wake is not None:
+        options["card_answer_wake"] = card_answer_wake
     started = time.monotonic()
     attempt = 0
     while True:
         try:
-            if image_ids:
-                delivered = await _post_system_message(
-                    session_id,
-                    text,
-                    conversation_store=conversation_store,
-                    runner_router=runner_router,
-                    confirm_delivery=True,
-                    image_ids=image_ids,
-                )
-            else:
-                delivered = await _post_system_message(
-                    session_id,
-                    text,
-                    conversation_store=conversation_store,
-                    runner_router=runner_router,
-                    confirm_delivery=True,
-                )
+            delivered = await _post_system_message(
+                session_id,
+                text,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                confirm_delivery=True,
+                **options,
+            )
         except _NativeDeliveryUncertain:
             await _persist_answer_delivery_notice(
                 session_id, text, conversation_store, status="delivery_uncertain"
@@ -14010,6 +14020,7 @@ async def _post_system_message(
     agent_store: AgentStore | None = None,
     confirm_delivery: bool = False,
     image_ids: list[str] | None = None,
+    card_answer_wake: _CardAnswerWake | None = None,
 ) -> bool:
     """
     Deliver a synthetic ``[System: …]`` user message to a session's runner.
@@ -14034,6 +14045,7 @@ async def _post_system_message(
         reinstall since its last turn reaches this wake turn too.
     :param confirm_delivery: Wait for Claude's injection result before settling
         an async card verdict, rather than accepting a queued turn as delivered.
+    :param card_answer_wake: Allow one host recovery for a saved question answer.
     :returns: ``True`` when the message was dispatched to the runner;
         ``False`` when delivery could not happen (session gone, no runner
         bound, or the forward raised a transport error).
@@ -14047,6 +14059,35 @@ async def _post_system_message(
         )
         return False
     runner_client = await _get_runner_client(session_id, runner_router)
+    if runner_client is None and card_answer_wake is not None and not card_answer_wake.attempted:
+        app_state = card_answer_wake.app_state
+        host_registry = getattr(app_state, "host_registry", None)
+        if (
+            conv.host_id is not None
+            and not conv.archived
+            and session_id not in _intentional_stop_sessions
+            and host_registry is not None
+            and host_registry.get(conv.host_id) is not None
+        ):
+            card_answer_wake.attempted = True
+            runner_client, conv = await ensure_runner_connected(
+                session_id=session_id,
+                conv=conv,
+                app_state=app_state,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                raise_host_refusal=True,
+            )
+            if runner_client is not None:
+                await _ensure_runner_session_initialized(
+                    session_id,
+                    conv,
+                    runner_client,
+                    conversation_store,
+                    initializer=getattr(app_state, "runner_session_initializer", None),
+                    suppress_recovery_turn=True,
+                    trigger="card_answer",
+                )
     if runner_client is None:
         # WARNING (not DEBUG): an unbound session is the transient-miss case
         # retried by callers — surface it rather than burying it as routine.
