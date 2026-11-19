@@ -2,7 +2,7 @@ import { nanoid } from "nanoid";
 import { cloneElement, useId, useState, type ReactElement } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation } from "@/lib/routing";
-import { boardExitProps, boardPath } from "@/lib/boardFrame";
+import { boardExitProps, useBoardPath } from "@/lib/boardFrame";
 import { Button } from "@/components/ui/button";
 import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
@@ -1045,6 +1045,7 @@ export function UsagePricingSummary({
   const ids = new Set(accountId ? [accountId] : accounts?.map(({ id }) => id));
   const single = accountId ?? (accounts?.length === 1 ? accounts[0].id : undefined);
   const amountsById = new Map(amounts?.map((amount) => [amount.account, amount]));
+  const boardPath = useBoardPath();
   const query = usePricingBaseline();
   const cards =
     query.data?.cards.filter((card) => ids.has(card.parent_account_id ?? card.target_id)) ?? [];

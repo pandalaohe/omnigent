@@ -1,5 +1,4 @@
 import { useExtensions } from "@/extensions/ExtensionProvider";
-import { resolveExtensionPage } from "@/extensions/catalog";
 import { Combobox, COMBOBOX_OPTION_THRESHOLD } from "@/components/ui/combobox";
 import { boardExitProps } from "@/lib/boardFrame";
 import { Link } from "@/lib/routing";
@@ -8,16 +7,14 @@ import { patchUsageBoardPreferences } from "@/lib/usageContextPreferences";
 
 export function UsageModelPoolsLink({ settings = false }: { settings?: boolean }) {
   const selected = useUsageContextPreferences().board.modelPoolsPage;
-  const extensions = useExtensions();
-  const pandaWatch = resolveExtensionPage(extensions, "local.pandawatch", "pandawatch");
-  const pages = extensions.flatMap((extension) =>
+  const pages = useExtensions().flatMap((extension) =>
     extension.pages.map((page) => ({
       path: `/extensions/${extension.id}/${page.route}`,
       title: `${extension.display_name} · ${page.title}`,
     })),
   );
-  const page = pages.find((item) => item.path === selected);
-  if (settings && !pandaWatch)
+  const page = pages.find((item) => item.path === selected?.split("#", 1)[0]);
+  if (settings)
     return (
       <label className="flex min-h-12 flex-wrap items-center justify-between gap-2 border-t border-border py-2 text-sm">
         Model pools page
@@ -33,9 +30,11 @@ export function UsageModelPoolsLink({ settings = false }: { settings?: boolean }
               })),
             ]}
             value={page?.path ?? "__none__"}
-            onValueChange={(value) =>
-              patchUsageBoardPreferences({ modelPoolsPage: value === "__none__" ? "" : value })
-            }
+            onValueChange={(value) => {
+              if (value !== page?.path) {
+                patchUsageBoardPreferences({ modelPoolsPage: value === "__none__" ? "" : value });
+              }
+            }}
             aria-label="Model pools page"
             className="h-auto w-72 max-w-full rounded-none! bg-transparent p-0"
           />
@@ -57,17 +56,14 @@ export function UsageModelPoolsLink({ settings = false }: { settings?: boolean }
         )}
       </label>
     );
-  const path = pandaWatch
-    ? `/extensions/${pandaWatch.extension.id}/${pandaWatch.page.route}#/llm/pool`
-    : page?.path;
   const exit = boardExitProps();
-  return path ? (
+  return page && selected ? (
     <Link
       className="inline-flex min-h-11 items-center text-sm underline underline-offset-2"
-      to={path}
+      to={selected}
       {...exit}
     >
-      Model pools{!pandaWatch || exit.target ? " ↗" : ""}
+      Model pools{!selected.includes("#") || exit.target ? " ↗" : ""}
     </Link>
   ) : (
     <p className="text-xs text-muted-foreground">

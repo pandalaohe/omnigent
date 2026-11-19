@@ -1,4 +1,4 @@
-import { boardPath, usageBoardTheme } from "@/lib/boardFrame";
+import { usageBoardTheme } from "@/lib/boardFrame";
 import { toDateInput } from "./usageBoardSelect";
 import type { AnalysisFilter } from "./usageAnalysisData";
 
@@ -105,7 +105,7 @@ export function toQuery(filter: PageFilter, shell?: URLSearchParams, api = false
 export function analysisLink(search: URLSearchParams, values: Partial<PageFilter> = {}) {
   const filter = { ...filterFromQuery(new URLSearchParams()), ...values };
   const query = toQuery(filter, search).toString();
-  return boardPath(`${analysisPath}${query ? `?${query}` : ""}`);
+  return `${analysisPath}${query ? `?${query}` : ""}`;
 }
 
 export function toggleAnalysisValue(filter: PageFilter, dimension: FilterDimension, value: string) {

@@ -1,5 +1,5 @@
 import { Link, useSearchParams } from "@/lib/routing";
-import { boardExitProps, boardPath } from "@/lib/boardFrame";
+import { boardExitProps, usageAccountSubpagePath, useBoardPath } from "@/lib/boardFrame";
 import { SettingsIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -37,6 +37,8 @@ function tightest(account: UsageAccountView) {
 }
 
 export function UsageBoardPage() {
+  const boardPath = useBoardPath();
+
   const board = useUsageContextPreferences().board;
   const overview = useUsageOverview(true);
   const [search] = useSearchParams();
@@ -46,7 +48,7 @@ export function UsageBoardPage() {
   const selected = search.get("account");
   const account = accounts.find((item) => item.id === selected);
   const settings = account
-    ? boardPath(`/usage/board/${encodeURIComponent(account.id)}/settings`)
+    ? boardPath(usageAccountSubpagePath(account.id, "settings"))
     : "/settings/general#usage-settings";
   const reads = useOverviewCostReads(account?.id, accounts.length > 0);
   const shown = account ? [account] : accounts;

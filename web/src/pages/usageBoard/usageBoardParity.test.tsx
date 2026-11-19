@@ -74,7 +74,7 @@ it("keeps independent pool links inside a single account tile, with a main ring 
   );
   expect(screen.getAllByTestId("usage-tile")).toHaveLength(1);
   const pool = screen.getByRole("link", { name: "Codex Pool B" });
-  expect(pool.getAttribute("href")).toContain("focus=Pool%20B");
+  expect(pool).toHaveAttribute("href", "/usage/board?account=codex&view=details&focus=Pool+B");
   expect(within(pool).getAllByTestId("usage-ring")).toHaveLength(2);
   expect(pool.textContent).toContain("90.61%");
   fireEvent.click(pool);

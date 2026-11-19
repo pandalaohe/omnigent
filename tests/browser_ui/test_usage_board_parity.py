@@ -171,8 +171,28 @@ def test_usage_overview_geometry_and_navigation(
     )
     browser_contract.json("/v1/me/usage/events", {"events": [], "next_before": None})
     browser_contract.json("/v1/me/usage/sources", {"sources": []})
-    extension_path = "/extensions/local.pandawatch/pandawatch"
-    proxy_path = "/v1/extensions/local.pandawatch/proxy/pandawatch/"
+    browser_contract.json(
+        "/v1/me/usage/issues", {"failures": [], "unpriced_models": [], "source_reports": []}
+    )
+    extension_path = "/extensions/example.pools/main"
+    proxy_path = "/v1/extensions/example.pools/proxy/main/"
+    pool_fragment = "#/models/pools"
+    browser_contract.json(
+        "/v1/me",
+        {
+            "user_id": "local",
+            "is_admin": True,
+            "preferences": {
+                "version": 1,
+                "settings": {
+                    "usage_context": {
+                        "version": 6,
+                        "board": {"modelPoolsPage": extension_path + pool_fragment},
+                    }
+                },
+            },
+        },
+    )
     browser_contract.json(
         "/v1/extensions",
         {
@@ -180,9 +200,9 @@ def test_usage_overview_geometry_and_navigation(
             "data": [
                 {
                     "object": "extension",
-                    "id": "local.pandawatch",
-                    "display_name": "PandaWatch",
-                    "distribution": "example-pandawatch",
+                    "id": "example.pools",
+                    "display_name": "Example pool explorer",
+                    "distribution": "example-pools",
                     "version": "1.0.0",
                     "extension_api": 1,
                     "status": "enabled",
@@ -190,8 +210,8 @@ def test_usage_overview_geometry_and_navigation(
                     "pages": [
                         {
                             "id": "model-pools",
-                            "title": "PandaWatch",
-                            "route": "pandawatch",
+                            "title": "Pool explorer",
+                            "route": "main",
                             "kind": "proxied",
                             "view": None,
                             "url": proxy_path,
@@ -301,8 +321,26 @@ def test_usage_overview_geometry_and_navigation(
         expect(page.locator(".usage-board-scroll")).to_have_css("background-color", background)
         expect(surface).to_have_css("color", ink)
 
+    scroll = page.locator(".usage-board-scroll")
+    if prefix:
+        expect(page.locator("header.chat-header")).to_have_count(0)
+        assert scroll.evaluate("element => element.getBoundingClientRect().top") == 0
+    else:
+        clearance = scroll.evaluate(
+            """element => element.getBoundingClientRect().top -
+                document.querySelector('header.chat-header').getBoundingClientRect().bottom"""
+        )
+        assert clearance >= 0
+    page.get_by_role("link", name="Analysis", exact=True).click()
+    page.get_by_text("Analysis tools", exact=True).click()
+    page.get_by_role("link", name="Issues", exact=True).click()
+    expect(page).to_have_url(overview_url + "/issues?theme=dark")
+    expect(surface).to_have_css("color", "rgb(234, 238, 244)")
+    page.get_by_role("link", name="Cost").click()
+    expect(page).to_have_url(overview_url + "/analysis?theme=dark")
+
     pools = page.get_by_role("link", name=re.compile(r"^Model pools"))
-    expect(pools).to_have_attribute("href", extension_path + "#/llm/pool")
+    expect(pools).to_have_attribute("href", extension_path + pool_fragment)
     if prefix:
         expect(pools).to_have_attribute("target", "_blank")
         expect(pools).to_have_attribute("rel", "noopener")
@@ -313,9 +351,9 @@ def test_usage_overview_geometry_and_navigation(
         assert pools.get_attribute("target") is None
         pools.click()
         extension_page = page
-    expect(extension_page).to_have_url(appearance_url + extension_path + "#/llm/pool")
-    frame = extension_page.frame_locator('iframe[title="PandaWatch"]')
-    expect(frame.locator("output")).to_have_text("#/llm/pool")
+    expect(extension_page).to_have_url(appearance_url + extension_path + pool_fragment)
+    frame = extension_page.frame_locator('iframe[title="Pool explorer"]')
+    expect(frame.locator("output")).to_have_text(pool_fragment)
     extension_page.evaluate("location.hash = '#/another-view'")
     expect(frame.locator("output")).to_have_text("#/another-view")
     if prefix:

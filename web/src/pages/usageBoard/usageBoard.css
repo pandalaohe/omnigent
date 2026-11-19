@@ -67,6 +67,10 @@
 .usage-board-scroll {
   background-color: var(--usage-background);
 }
+/* Keep the scroll viewport below the shell overlay so its controls can receive clicks. */
+main[data-shell-header="visible"] .usage-board-scroll {
+  margin-top: calc(var(--omnigent-header-height) + var(--omnigent-inset-top));
+}
 .usage-board-scroll[data-usage-theme="light"] {
   color-scheme: light;
 }

@@ -5,7 +5,7 @@
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ServerInfo } from "@/lib/capabilities";
@@ -78,23 +78,36 @@ const LOADED = { isPending: false, error: null, refetch: vi.fn(), data: { accoun
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
 
+function BoardLocation() {
+  const { pathname, search } = useLocation();
+  return <output data-testid="board-location">{pathname + search}</output>;
+}
+
 function renderBoard(path = "/usage/board") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[path]}>
+        <BoardLocation />
         <Routes>
-          <Route path="/frame/usage/board" element={<UsageBoardRoute view="board" />} />
-          <Route
-            path="/frame/usage/board/:accountId"
-            element={<UsageBoardRoute view="account" />}
-          />
-          <Route path="/usage/board" element={<UsageBoardRoute view="board" />} />
-          <Route path="/usage/board/:accountId" element={<UsageBoardRoute view="account" />} />
-          <Route
-            path="/usage/board/:accountId/settings"
-            element={<UsageBoardRoute view="account_settings" />}
-          />
+          {["", "/frame"].flatMap((prefix) =>
+            (
+              [
+                ["", "board"],
+                ["/analysis", "cost"],
+                ["/issues", "issues"],
+                ["/:accountId", "account"],
+                ["/:accountId/settings", "account_settings"],
+                ["/:accountId/issues", "issues"],
+              ] as const
+            ).map(([suffix, view]) => (
+              <Route
+                key={prefix + suffix}
+                path={`${prefix}/usage/board${suffix}`}
+                element={<UsageBoardRoute view={view} />}
+              />
+            )),
+          )}
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -338,22 +351,55 @@ function readCollab() {
   };
 }
 
-it("keeps account selection and its settings inside a frame", async () => {
-  window.history.replaceState({}, "", "/frame/usage/board");
-  try {
-    renderBoard("/frame/usage/board");
+it.each([
+  ["/frame", "dark"],
+  ["", "light"],
+])(
+  "keeps the selected account, its settings and the %s theme navigation together",
+  (prefix, theme) => {
+    const path = `${prefix}/usage/board`;
+    renderBoard(`${path}?theme=${theme}`);
     const accounts = screen.getByRole("navigation", { name: "Usage accounts" });
     const codex = within(accounts).getByRole("link", { name: "Codex" });
-    expect(codex).toHaveAttribute("href", "/frame/usage/board?account=codex");
+    expect(codex).toHaveAttribute("href", `${path}?theme=${theme}&account=codex`);
     fireEvent.click(codex);
-    await waitFor(() => expect(codex).toHaveAttribute("aria-current", "true"));
-    expect(screen.getByRole("link", { name: "Usage settings" })).toHaveAttribute(
-      "href",
-      "/frame/usage/board/codex/settings",
+    fireEvent.click(screen.getByRole("link", { name: "Usage settings" }));
+    expect(screen.getByTestId("board-location")).toHaveTextContent(
+      `${path}/codex/settings?theme=${theme}`,
     );
-  } finally {
-    window.history.replaceState({}, "", "/");
-  }
+    expect(
+      screen.getByRole("heading", { name: "Account settings" }).closest("[data-usage-theme]"),
+    ).toHaveAttribute("data-usage-theme", theme);
+    const back = screen
+      .getAllByRole("link", { name: "Codex" })
+      .find((link) => link.getAttribute("title") === "Codex");
+    expect(back).toBeDefined();
+    fireEvent.click(back!);
+    expect(screen.getByTestId("board-location")).toHaveTextContent(
+      `${path}?account=codex&view=details&theme=${theme}`,
+    );
+    expect(screen.getByText("Usage tools")).toBeInTheDocument();
+  },
+);
+
+it("returns from account issues to the original focused detail and keeps the frame theme", () => {
+  const path = "/frame/usage/board";
+  renderBoard(`${path}/codex/issues?focus=Pool+B&theme=dark`);
+  fireEvent.click(screen.getByRole("link", { name: "Codex" }));
+  expect(screen.getByTestId("board-location")).toHaveTextContent(
+    `${path}?account=codex&view=details&focus=Pool+B&theme=dark`,
+  );
+  expect(screen.getByText("Usage tools")).toBeInTheDocument();
+});
+
+it.each(["", "/frame"])("keeps the analysis theme on the issues round trip under %j", (prefix) => {
+  const path = `${prefix}/usage/board`;
+  renderBoard(`${path}/analysis?theme=light`);
+  fireEvent.click(screen.getByText("Analysis tools"));
+  fireEvent.click(screen.getByRole("link", { name: "Issues" }));
+  expect(screen.getByTestId("board-location")).toHaveTextContent(`${path}/issues?theme=light`);
+  fireEvent.click(screen.getByRole("link", { name: "Cost" }));
+  expect(screen.getByTestId("board-location")).toHaveTextContent(`${path}/analysis?theme=light`);
 });
 
 describe("Account detail composition", () => {
@@ -424,19 +470,21 @@ describe("Account detail composition", () => {
 });
 
 describe("Mounted model pools page", () => {
-  it.each(["", "/frame"])("uses the registered PandaWatch route under prefix %j", (prefix) => {
+  it.each(["", "/frame"])("uses the configured extension deep link under %j", (prefix) => {
     const path = `${prefix}/usage/board`;
     window.history.replaceState({}, "", path);
     try {
       mocks.extensions.current = [
         {
-          id: "local.pandawatch",
-          pages: [{ id: "model-pools", title: "PandaWatch", route: "pandawatch" }],
+          id: "example.pools",
+          pages: [{ id: "model-pools", title: "Example pool explorer", route: "main" }],
         },
       ];
+      const target = "/extensions/example.pools/main#/models/pools";
+      mocks.board.current = { ...(mocks.board.current as object), modelPoolsPage: target };
       renderBoard(path);
       const link = screen.getByRole("link", { name: /Model pools/ });
-      expect(link).toHaveAttribute("href", "/extensions/local.pandawatch/pandawatch#/llm/pool");
+      expect(link).toHaveAttribute("href", target);
       if (prefix) {
         expect(link).toHaveAttribute("target", "_blank");
         expect(link).toHaveAttribute("rel", "noopener");
@@ -448,10 +496,10 @@ describe("Mounted model pools page", () => {
     }
   });
 
-  it("uses the selected page when the PandaWatch route is missing and withdraws dead links", () => {
+  it("uses the saved plain route and withdraws its link when that page is removed", () => {
     mocks.extensions.current = [
       {
-        id: "local.pandawatch",
+        id: "example.dashboard",
         pages: [{ id: "example-board", title: "Example board", route: "board" }],
       },
       {

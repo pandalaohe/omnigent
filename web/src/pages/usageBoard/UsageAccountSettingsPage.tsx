@@ -1,5 +1,5 @@
 import { Segmented } from "@/components/ui/segmented";
-import { boardPath } from "@/lib/boardFrame";
+import { usageAccountDetailPath, usageAccountSubpagePath, useBoardPath } from "@/lib/boardFrame";
 // One account's settings. Reached only from its tile: the windows it shows, the
 // renewal countdown, and removing a reported source. Every change applies at
 // once — no save button — and the tile beside the rows is the preview.
@@ -31,8 +31,12 @@ import { t } from "./usageText";
 import { UsageName } from "./UsageName";
 
 export function UsageAccountSettingsPage() {
+  const boardPath = useBoardPath();
+
   const { accountId = "" } = useParams();
   const [search] = useSearchParams();
+  const focus = search.get("focus");
+  const detailPath = usageAccountDetailPath(accountId, focus);
   const info = useServerInfo();
   const preferences = useUsageContextPreferences();
   const board = preferences.board;
@@ -59,7 +63,7 @@ export function UsageAccountSettingsPage() {
     <UsageBoardFrame
       title="Account settings"
       back={{
-        to: `/usage/board/${encodeURIComponent(accountId)}`,
+        to: detailPath,
         label: account?.display_name ?? "Account",
       }}
       loading={overview.isPending}
@@ -74,7 +78,7 @@ export function UsageAccountSettingsPage() {
               renewal={renewalOf(account, board.renewals[account.id])}
               density={board.density}
               shownModel={preferences.shownModels?.[account.id]}
-              onOpen={() => navigate(boardPath(`/usage/board/${encodeURIComponent(account.id)}`))}
+              onOpen={() => navigate(boardPath(detailPath))}
             />
           </div>
           <div className="min-w-0 rounded-[11px] border border-border bg-card px-3.5 py-1">
@@ -109,7 +113,7 @@ export function UsageAccountSettingsPage() {
               </details>
             </div>
             <Link
-              to={boardPath(`/usage/board/${encodeURIComponent(account.id)}/models`)}
+              to={boardPath(usageAccountSubpagePath(account.id, "models", focus))}
               className="flex min-h-12 items-center justify-between border-b border-border py-2 text-sm"
             >
               Models <span aria-hidden="true">›</span>
@@ -141,13 +145,13 @@ export function UsageAccountSettingsPage() {
             <UsagePricingPanel
               accounts={overview.data?.accounts ?? []}
               accountId={account.id}
-              focus={search.get("focus")}
+              focus={focus}
               monthlyFee={board.fees?.[account.id]}
             />
             <QuotaFloorControl tile={account.id} label={account.display_name} account={account} />
             <Link
               className="flex min-h-11 items-center text-sm underline"
-              to={boardPath(`/usage/board/${encodeURIComponent(account.id)}/issues`)}
+              to={boardPath(usageAccountSubpagePath(account.id, "issues", focus))}
             >
               Issues
             </Link>

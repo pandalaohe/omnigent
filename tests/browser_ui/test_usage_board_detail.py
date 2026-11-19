@@ -480,6 +480,11 @@ def test_account_detail_keyboard_ranges_and_return(
             page.locator('[data-slot="button"]')
         )
         expect(back).to_have_attribute("title", item["display_name"])
+        back.click()
+        expect(page).to_have_url(
+            appearance_url + f"/frame/usage/board?account={item['id']}&view=details"
+        )
+        expect(page.get_by_text("Usage tools", exact=True)).to_be_visible()
     page.goto(appearance_url + "/frame/usage/board/plan-0/settings")
     expect(page.get_by_role("link", name="Models", exact=True)).to_be_visible()
     expect(page.get_by_role("link", name="Issues", exact=True)).to_be_visible()
@@ -551,10 +556,17 @@ def test_account_detail_keyboard_ranges_and_return(
         "models", [LONG_NAMES[key] for key in ["account", "model", "host", "pool", "source"]]
     )
     assert_usage_geometry(page, {"table": 1})
-    page.goto(appearance_url + "/frame/usage/board/plan-1/issues")
+    page.goto(appearance_url + "/frame/usage/board/plan-1/issues?theme=dark")
     expect(page.get_by_role("region", name="Failures", exact=True)).to_be_visible()
     names_in_view("issues", [LONG_NAMES[key] for key in ["account", "model"]])
     assert_usage_geometry(page, {".usage-surface section": 3})
+    page.get_by_role("link", name=LONG_NAMES["account"], exact=True).and_(
+        page.locator('[data-slot="button"]')
+    ).click()
+    expect(page).to_have_url(
+        appearance_url + "/frame/usage/board?account=plan-1&view=details&theme=dark"
+    )
+    expect(page.locator(".usage-board-scroll")).to_have_attribute("data-usage-theme", "dark")
     page.goto(appearance_url + "/settings/general#usage-settings")
     usage_settings = page.get_by_test_id("settings-group-usage-settings")
     expect(usage_settings).to_be_visible()

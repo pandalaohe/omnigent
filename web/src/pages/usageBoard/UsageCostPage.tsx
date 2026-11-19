@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { Link, useLocation, useSearchParams } from "@/lib/routing";
-import { boardExitProps, boardPath } from "@/lib/boardFrame";
+import { boardExitProps, useBoardPath } from "@/lib/boardFrame";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { UsageBoardFrame } from "./UsageBoardFrame";
 import { useUsageOverview } from "./usageBoardData";
@@ -43,6 +43,8 @@ import { formatRingPercent, formatUsageValue } from "./usageBoardFormat";
 import "./usageAnalysis.css";
 
 export function UsageCostPage() {
+  const boardPath = useBoardPath();
+
   const [search, setSearch] = useSearchParams();
   const location = useLocation();
   const raw = location.search.slice(1);

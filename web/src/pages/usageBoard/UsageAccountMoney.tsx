@@ -1,5 +1,5 @@
 import { Link } from "@/lib/routing";
-import { boardPath } from "@/lib/boardFrame";
+import { useBoardPath } from "@/lib/boardFrame";
 import { useUsageContextPreferences } from "@/hooks/useUsageContextPreferences";
 import { analysisValueText, useUsageAnalysis, type AnalysisValue } from "./usageAnalysisData";
 import { decimalDisplay } from "./usagePricingData";
@@ -24,6 +24,7 @@ export function UsageAccountMoney({
   range?: UsageRange;
   compact?: boolean;
 }) {
+  const boardPath = useBoardPath();
   const board = useUsageContextPreferences().board;
   const query = useUsageAnalysis(range ?? board.range ?? { key: "d7" });
   const money = query.data?.pricing?.account_money?.[accountId];

@@ -368,7 +368,7 @@ export function normalizeUsageBoardPreferences(value: unknown): UsageBoardPrefer
     density: raw.density === "mini" ? "mini" : "std",
     bands,
     ...(typeof raw.modelPoolsPage === "string" &&
-    /^\/extensions\/[a-z0-9.-]+\/[a-z0-9_-]+$/.test(raw.modelPoolsPage)
+    /^\/extensions\/[a-z0-9.-]+\/[a-z0-9_-]+(?:#[^\s]+)?$/.test(raw.modelPoolsPage)
       ? { modelPoolsPage: raw.modelPoolsPage }
       : {}),
     windows: idMap(raw.windows),
