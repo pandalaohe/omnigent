@@ -49,17 +49,71 @@ function CurrentUrl() {
   );
 }
 
-function mount(query = "") {
+function mount(query = "", prefix = "") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={[`/usage/board/analysis${query}`]}>
+      <MemoryRouter initialEntries={[`${prefix}/usage/board/analysis${query}`]}>
         <UsageCostPage />
         <CurrentUrl />
       </MemoryRouter>
     </QueryClientProvider>,
   );
 }
+
+it.each(["", "/frame"])(
+  "shows evidence bounds and the split share in the %s shell",
+  async (prefix) => {
+    const respond = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((path: string, init?: RequestInit) => {
+      const url = new URL(path, "https://app.example.test");
+      if (!url.pathname.endsWith("/analysis")) return respond(path, init);
+      const data = usageAnalysisV2Fixture(url.searchParams);
+      const host = url.searchParams.get("host");
+      data.cache_savings = {
+        amount:
+          host === "west"
+            ? null
+            : {
+                state: "range",
+                low: "1.001",
+                high: "1.002",
+                currency: "USD",
+                reason: null,
+                formatted: { low: "1.00", high: "1.01" },
+              },
+        unknown_tokens: host === "east" ? 70 : host === "west" ? 50 : 0,
+        split_keys: host ? 1 : 0,
+        split_tokens: host === "east" ? 70 : host === "west" ? 50 : 0,
+        unbounded_keys: 0,
+      };
+      return Response.json(data);
+    });
+    mount("?group=host", prefix);
+    const fold = (await screen.findByText("Cache savings", { selector: "summary" })).closest(
+      "details",
+    )!;
+    fold.open = true;
+    fireEvent(fold, new Event("toggle"));
+    expect(await within(fold).findByText("$1.00–$1.01")).toBeVisible();
+    expect(within(fold).queryByText(/cannot be split/)).toBeNull();
+
+    const table = within(await screen.findByRole("table", { name: "Each item" }));
+    const east = table.getByRole("button", { name: "East" });
+    fireEvent.click(east);
+    expect(
+      await within(fold).findByText("70 cache-read tokens cannot be split by Host / Agent."),
+    ).toBeVisible();
+    expect(within(fold).getByText("$1.00–$1.01")).toBeVisible();
+
+    fireEvent.click(east);
+    fireEvent.click(table.getByRole("button", { name: "West" }));
+    expect(await within(fold).findByText("Unknown")).toBeVisible();
+    expect(
+      within(fold).getByText("50 cache-read tokens cannot be split by Host / Agent."),
+    ).toBeVisible();
+  },
+);
 
 function row(overrides: Partial<AnalysisRow> = {}): AnalysisRow {
   return {

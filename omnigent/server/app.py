@@ -2200,6 +2200,7 @@ def create_app(
     usage_evidence_service = UsageEvidenceService(
         UsageEvidenceStore(conversation_store.storage_location),
         usage_evidence_retention_days(resolved_server_config),
+        hours_store=usage_hours_store,
     )
     host_registry.connection_observer = usage_evidence_service.host_connection
     usage_price_source = UsagePriceSource(

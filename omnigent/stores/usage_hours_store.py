@@ -350,6 +350,7 @@ class UsageHoursStore:
     ) -> WriteOutcome:
         """Apply replacements within the caller's transaction."""
         now = now_epoch()
+        cutoff = _activity_cutoff_hour(now)
         require_active_account(session, owner)
         outcome = WriteOutcome()
         for row in rows:
@@ -359,7 +360,7 @@ class UsageHoursStore:
                 "model": row.model,
                 "cost_basis": row.cost_basis,
             }
-            if row.hour > now or row.hour < now - _ACTIVITY_MAX_AGE_S:
+            if row.hour > now or row.hour < cutoff:
                 outcome.skipped.append(EntryOutcome(**entry_key, reason="out_of_range"))
                 continue
             predicates = (
@@ -489,10 +490,10 @@ class UsageHoursStore:
         run_write_transaction(self._write_session(), "delete_usage_account_hours", write)
 
     def prune_hours(self, now: int, *, limit: int = 5000) -> int:
-        """Remove at most one transaction's expired child/main rows, child first."""
+        """Remove one batch of expired child/main rows across all workspaces, child first."""
         if not 1 <= limit <= 5000:
             raise ValueError("prune limit must be between 1 and 5000")
-        cutoff = hours_of(now - _ACTIVITY_MAX_AGE_S)
+        cutoff = _activity_cutoff_hour(now)
 
         def write(session: Session) -> int:
             removed = 0
@@ -503,10 +504,7 @@ class UsageHoursStore:
                 keys = list(
                     session.execute(
                         select(*columns)
-                        .where(
-                            table.workspace_id == current_workspace_id(),
-                            table.hour_utc < cutoff,
-                        )
+                        .where(table.hour_utc < cutoff)
                         .order_by(table.hour_utc)
                         .limit(limit - removed)
                     )
@@ -1194,6 +1192,10 @@ def record_turn_usage(
 def hours_of(epoch_seconds: int) -> int:
     """Floor an epoch second to its UTC hour start."""
     return epoch_seconds // 3600 * 3600
+
+
+def _activity_cutoff_hour(now: int) -> int:
+    return hours_of(now - _ACTIVITY_MAX_AGE_S)
 
 
 __all__ = [

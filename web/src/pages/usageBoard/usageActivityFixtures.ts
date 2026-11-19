@@ -124,7 +124,13 @@ export function usageAnalysisV2Fixture(
       unsplit_tokens: 0,
       unsplit_cost: { low: "0", high: "0" },
     },
-    cache_savings: { state: "unknown" },
+    cache_savings: {
+      amount: null,
+      unknown_tokens: 0,
+      split_keys: 0,
+      split_tokens: 0,
+      unbounded_keys: 0,
+    },
     previous: {
       span: { requested_from: now - 7200, counted_from: now - 7200, until: now - 3600 },
       totals,

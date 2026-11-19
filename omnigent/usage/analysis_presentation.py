@@ -3,15 +3,100 @@
 from __future__ import annotations
 
 import json
+from collections import Counter, defaultdict
+from collections.abc import Sequence
 from fractions import Fraction
 from typing import Any, Literal, cast
 
-from omnigent.usage.contract import UsageAnalysisView
+from omnigent.usage.contract import AnalysisRowView, UsageAnalysisView
 from omnigent.usage.pricing import PricingBaseline
 from omnigent.usage.pricing_projection import compare_periods, value_usage
-from omnigent.usage.value import Value, combine, divide, exact, scale, subtract
+from omnigent.usage.value import Value, combine, divide, endpoint, exact, scale, subtract
 
 Dimension = Literal["account", "pool", "model", "card"]
+
+
+def _evidence_key(row: AnalysisRowView) -> tuple[str, int, str]:
+    return row.account_id, row.hour, row.model
+
+
+class CacheSavingsFold:
+    """Sum each hour-wide evidence estimate once, keeping excluded shares unvalued."""
+
+    def __init__(self) -> None:
+        self.low = Fraction(0)
+        self.high = Fraction(0)
+        self.bounded_keys = 0
+        self.unbounded_keys = 0
+        self.unknown_tokens = 0
+        self.split_keys = 0
+        self.split_tokens = 0
+        self.split_tokens_complete = True
+
+    def add(
+        self,
+        main_rows: Sequence[AnalysisRowView],
+        candidates: Sequence[AnalysisRowView],
+        selected: Sequence[AnalysisRowView],
+    ) -> None:
+        selected_counts: Counter[tuple[str, int, str]] = Counter()
+        cache_reads: defaultdict[tuple[str, int, str], int] = defaultdict(int)
+        missing_cache_reads = set()
+        for row in selected:
+            if row.contributes_usage:
+                key = _evidence_key(row)
+                selected_counts[key] += 1
+                if row.cache_read_input_tokens is None:
+                    missing_cache_reads.add(key)
+                else:
+                    cache_reads[key] += row.cache_read_input_tokens
+        if not selected_counts:
+            return
+        candidate_counts = Counter(
+            _evidence_key(row) for row in candidates if row.contributes_usage
+        )
+        estimates = {
+            _evidence_key(row): row.price_estimate
+            for row in main_rows
+            if row.contributes_usage and row.price_estimate is not None
+        }
+        for key, count in selected_counts.items():
+            if count < candidate_counts[key]:
+                self.unknown_tokens += cache_reads[key]
+                self.split_keys += 1
+                self.split_tokens += cache_reads[key]
+                self.split_tokens_complete &= key not in missing_cache_reads
+                continue
+            estimate = estimates.get(key)
+            low = estimate.cache_savings_low_usd if estimate is not None else None
+            high = estimate.cache_savings_high_usd if estimate is not None else None
+            if low is None or high is None:
+                self.unbounded_keys += 1
+                self.unknown_tokens += cache_reads[key]
+                continue
+            self.bounded_keys += 1
+            self.low += Fraction(low)
+            self.high += Fraction(high)
+
+    def result(self, *, as_of: int) -> dict[str, Any]:
+        amount = Value(unit="money", currency="USD", cohort_id="cache_savings", as_of=as_of)
+        if self.bounded_keys:
+            amount = Value(
+                unit="money",
+                currency="USD",
+                cohort_id="cache_savings",
+                as_of=as_of,
+                state="exact" if self.low == self.high else "range",
+                low=endpoint(self.low),
+                high=endpoint(self.high),
+            )
+        return {
+            "amount": amount,
+            "unknown_tokens": self.unknown_tokens,
+            "split_keys": self.split_keys,
+            "split_tokens": self.split_tokens if self.split_tokens_complete else None,
+            "unbounded_keys": self.unbounded_keys,
+        }
 
 
 def display_values(value: Any) -> Any:

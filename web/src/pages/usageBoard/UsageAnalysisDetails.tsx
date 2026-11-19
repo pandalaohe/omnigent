@@ -810,3 +810,48 @@ export function V2Composition({ data }: { data: UsageAnalysisV2 }) {
     </AnalysisSection>
   );
 }
+
+export function V2CacheSavings({ data }: { data: UsageAnalysisV2 }) {
+  const savings = data.cache_savings;
+  const amount = data.complete ? savings?.amount : null;
+  const unknown = !amount || amount.state === "unknown";
+  const cacheReads = data.classes.items.find((item) => item.kind === "cache_read")?.tokens;
+  const total = data.totals.tokens;
+  const caption = !data.complete
+    ? "Analysis is incomplete."
+    : unknown
+      ? "Savings bounds are unavailable for this selection."
+      : savings.split_keys || savings.unbounded_keys
+        ? "Price evidence for covered usage"
+        : "From price evidence";
+
+  return (
+    <AnalysisSection id="savings" title={analysisSections.savings} folded>
+      <div className="ua-unknown">
+        <strong data-unknown={unknown ? "" : undefined}>{analysisValueText(amount)}</strong>
+        <small>{caption}</small>
+        {data.complete &&
+          cacheReads !== undefined &&
+          total !== null &&
+          total > 0 &&
+          data.classes.unsplit_tokens === 0 && (
+            <small>
+              {formatOverviewTokens(cacheReads)} cache-read tokens ·{" "}
+              {formatRingPercent((cacheReads / total) * 100)}% of tokens
+            </small>
+          )}
+        {data.complete && !!savings?.split_keys && (
+          <small>
+            {savings.split_tokens === null
+              ? "Some cache-read tokens"
+              : `${formatOverviewTokens(savings.split_tokens)} cache-read tokens`}{" "}
+            cannot be split by Host / Agent.
+          </small>
+        )}
+        {data.complete && !unknown && !!savings.unbounded_keys && (
+          <small>Savings bounds are missing for some usage.</small>
+        )}
+      </div>
+    </AnalysisSection>
+  );
+}
