@@ -19,7 +19,7 @@ import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypedDict, cast
 
 import httpx
 from fastapi import (
@@ -28,6 +28,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 from pydantic import ValidationError
+from starlette.datastructures import State
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import generate_agent_id, generate_task_id, now_epoch
@@ -311,6 +312,7 @@ from omnigent.server.routes._sessions.helpers import (
     _blocked_on_for,
     _build_new_item,
     _build_policy_engine_from_spec,
+    _can_wake_for_card_answer,
     _canonical_worktree_path,
     _child_session_summary_from_conversation,
     _child_summary_identity,
@@ -539,6 +541,7 @@ from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_client_
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
+    is_session_closed,
     labels_with_closed_status,
     title_without_closed_marker,
 )
@@ -815,8 +818,6 @@ async def _persist_answer_delivery_notice(
         "undelivered": f"{subject} could not be delivered; re-ask.",
         "delivery_uncertain": f"{subject} may have arrived. Check the terminal before resending.",
     }[status]
-    notice_key = f"{code}:{reference or text}"
-    stable_id = hashlib.sha256(notice_key.encode()).hexdigest()[:32]
     item = NewConversationItem(
         type="error",
         response_id=generate_task_id(),
@@ -826,7 +827,7 @@ async def _persist_answer_delivery_notice(
             message=message,
             level="info",
         ),
-        stable_id=stable_id,
+        stable_id=_answer_delivery_notice_id(text, status),
     )
     try:
         persisted = await asyncio.to_thread(
@@ -846,6 +847,11 @@ async def _persist_answer_delivery_notice(
         _publish_external_conversation_item(session_id, persisted[0])
 
 
+def _answer_delivery_notice_id(text: str, status: str) -> str:
+    notice_key = f"answer_{status}:{_delivery_reference(text) or text}"
+    return hashlib.sha256(notice_key.encode()).hexdigest()[:32]
+
+
 #: Backoff schedule for a verdict that could not be delivered.
 _DELIVER_RETRY_BACKOFFS_S: tuple[float, ...] = (2.0, 5.0, 15.0, 30.0, 60.0)
 #: Steady interval once the schedule above is exhausted.
@@ -860,6 +866,21 @@ class _NativeForwardReplyLost(HTTPException):
 
 class _NativeDeliveryUncertain(RuntimeError):
     """The runner may still deliver this input, so it must not be replayed."""
+
+
+@dataclass
+class _CardAnswerWake:
+    app_state: State
+    elicitation_id: str
+    attempted: bool = False
+
+    def mark_frame_enqueued(self) -> None:
+        self.attempted = True
+
+
+class _CardDeliveryOptions(TypedDict, total=False):
+    image_ids: list[str]
+    card_answer_wake: _CardAnswerWake
 
 
 async def _delivery_retry_sleep(seconds: float) -> None:
@@ -880,6 +901,7 @@ async def _deliver_with_retry(
     runner_router: RunnerRouter | None,
     persist_failure: bool = True,
     image_ids: list[str] | None = None,
+    card_answer_wake: _CardAnswerWake | None = None,
 ) -> bool | None:
     """
     Post one system message, retrying until it lands or the window elapses.
@@ -898,30 +920,27 @@ async def _deliver_with_retry(
     :param runner_router: Router used to resolve the session's bound runner.
     :param persist_failure: Whether an exhausted window records a visible
         undelivered-answer notice. Detached cards keep retrying themselves.
+    :param card_answer_wake: Shared wake state across retries of one saved answer.
     :returns: ``True`` for confirmed delivery, ``False`` for failure, or ``None``
         for an uncertain handoff that must not be replayed.
     """
+    options: _CardDeliveryOptions = {}
+    if image_ids:
+        options["image_ids"] = image_ids
+    if card_answer_wake is not None:
+        options["card_answer_wake"] = card_answer_wake
     started = time.monotonic()
     attempt = 0
     while True:
         try:
-            if image_ids:
-                delivered = await _post_system_message(
-                    session_id,
-                    text,
-                    conversation_store=conversation_store,
-                    runner_router=runner_router,
-                    confirm_delivery=True,
-                    image_ids=image_ids,
-                )
-            else:
-                delivered = await _post_system_message(
-                    session_id,
-                    text,
-                    conversation_store=conversation_store,
-                    runner_router=runner_router,
-                    confirm_delivery=True,
-                )
+            delivered = await _post_system_message(
+                session_id,
+                text,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                confirm_delivery=True,
+                **options,
+            )
         except _NativeDeliveryUncertain:
             await _persist_answer_delivery_notice(
                 session_id, text, conversation_store, status="delivery_uncertain"
@@ -7742,6 +7761,7 @@ async def ensure_runner_connected(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     raise_host_refusal: bool = False,
+    card_answer_wake: _CardAnswerWake | None = None,
 ) -> tuple[httpx.AsyncClient | None, Conversation]:
     """
     Bring a wakeable session's runner online for out-of-band resource access.
@@ -7811,11 +7831,15 @@ async def ensure_runner_connected(
     # A resumable managed host whose persisted liveness has gone stale wakes
     # in place; re-read the row and re-resolve, since the wake may have
     # relaunched the runner and rebound the session.
-    if conv.host_id is not None and await _maybe_wake_stale_resumable_managed_sandbox(
-        session_id=session_id,
-        conv=conv,
-        app_state=app_state,
-        conversation_store=conversation_store,
+    if (
+        card_answer_wake is None
+        and conv.host_id is not None
+        and await _maybe_wake_stale_resumable_managed_sandbox(
+            session_id=session_id,
+            conv=conv,
+            app_state=app_state,
+            conversation_store=conversation_store,
+        )
     ):
         conv = await _reread()
         runner_client = await _get_runner_client(
@@ -7840,7 +7864,8 @@ async def ensure_runner_connected(
             # gone) before relaunching — otherwise we'd spawn a second runner
             # and orphan the one still coming up.
             if (
-                conv.runner_id is not None
+                card_answer_wake is None
+                and conv.runner_id is not None
                 and host_registry is not None
                 and _facade._HOST_BOUND_RUNNER_CONNECT_GRACE_S > 0
             ):
@@ -7857,12 +7882,48 @@ async def ensure_runner_connected(
                 )
                 if runner_client is not None:
                     return runner_client, await _reread()
-            launch_attempt = await _launch_runner_on_host(
-                conv,
-                conversation_store,
-                host_registry,
-                host_conn,
-            )
+            if card_answer_wake is None:
+                launch_attempt = await _launch_runner_on_host(
+                    conv, conversation_store, host_registry, host_conn
+                )
+            else:
+                launch_attempt = await _launch_runner_on_host(
+                    conv,
+                    conversation_store,
+                    host_registry,
+                    host_conn,
+                    runner_router=runner_router,
+                    caller="card_answer",
+                    request_id=card_answer_wake.elicitation_id,
+                    on_frame_enqueued=card_answer_wake.mark_frame_enqueued,
+                )
+                if launch_attempt.lifecycle_blocked:
+                    conv = await _reread()
+                    # Keep the archive's existing teardown task and options.
+                    if (
+                        conv.archived
+                        and conv.archive_close_requested_revision == conv.archive_revision
+                        and conv.archive_close_completed_revision != conv.archive_revision
+                        and session_id not in _pending_archive_stops
+                    ):
+                        _spawn_archive_stop(
+                            session_id,
+                            conversation_store,
+                            runner_router,
+                            host_registry,
+                            getattr(app_state, "archive_close_coordinator", None),
+                        )
+                    elif not conv.archived and is_session_closed(conv.labels, conv.title):
+                        await _stop_host_runner_intentionally(
+                            session_id,
+                            host_conn.host_id,
+                            launch_attempt.runner_id,
+                            host_registry,
+                            conversation_store,
+                        )
+                    return None, conv
+                if launch_attempt.not_enqueued:
+                    return None, await _reread()
             # A harness-not-configured or workspace-missing refusal means the
             # runner will never appear — don't set relaunched_runner_id or the
             # caller will wait out the full connect timeout for nothing.
@@ -7906,7 +7967,7 @@ async def ensure_runner_connected(
                     )
             if _refusal_code is None:
                 relaunched_runner_id = launch_attempt.runner_id
-        elif await _maybe_relaunch_managed_sandbox(
+        elif card_answer_wake is None and await _maybe_relaunch_managed_sandbox(
             session_id=session_id,
             conv=conv,
             app_state=app_state,
@@ -9266,6 +9327,7 @@ async def _forward_native_terminal_message(
     usage_admission: dict[str, Any] | None = None,
     startup_context: StartupInputContext | None = None,
     native_shell_authorized: bool = False,
+    before_forward: Callable[[], Awaitable[None]] | None = None,
 ) -> bool:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -9374,6 +9436,8 @@ async def _forward_native_terminal_message(
             forward_timeout = max(forward_timeout, MESSAGE_READINESS_TIMEOUT_S)
         await claim_retry_forward(session_id, event, deadline=forward_deadline)
         forward_timeout += 5.0
+        if before_forward is not None:
+            await before_forward()
         # The websocket transport does not apply HTTPX's per-request timeout.
         async with asyncio.timeout(forward_timeout if confirm else None):
             resp = await runner_client.post(
@@ -9962,6 +10026,7 @@ async def _forward_event_to_runner(
     startup_required: bool = False,
     usage_admission: dict[str, Any] | None = None,
     startup_context: StartupInputContext | None = None,
+    before_forward: Callable[[], Awaitable[None]] | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -10015,6 +10080,9 @@ async def _forward_event_to_runner(
         and annotation_lookup is not None
         and await asyncio.to_thread(annotation_lookup, session_id, startup_input_id) is not None
     )
+    # A card replay after persistence would create a second transcript item.
+    if before_forward is not None:
+        await before_forward()
     if annotation_pending:
         assert startup_input_id is not None
         canonical = await asyncio.to_thread(
@@ -10963,6 +11031,8 @@ async def _forward_codex_side_chat_turn(
     conv: Conversation,
     body: SessionEventInput,
     runner_client: httpx.AsyncClient,
+    *,
+    before_forward: Callable[[], Awaitable[None]] | None = None,
 ) -> _SessionEventDispatchResult | None:
     """
     Forward a Codex ``/side`` child's user turn to the PARENT runner.
@@ -10990,6 +11060,8 @@ async def _forward_codex_side_chat_turn(
     child_thread_id = (conv.labels or {}).get(_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY)
     if not parent_id or not child_thread_id:
         return None
+    if before_forward is not None:
+        await before_forward()
     resp = await runner_client.post(
         f"/v1/sessions/{url_component(parent_id)}/events",
         json={
@@ -11059,6 +11131,7 @@ async def _dispatch_session_event_to_runner_impl(
     background_titles_enabled: bool = True,
     agent_revision: str | None = None,
     startup_input: StartupInputContext | None = None,
+    before_forward: Callable[[], Awaitable[None]] | None = None,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -11181,7 +11254,9 @@ async def _dispatch_session_event_to_runner_impl(
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors
         # the child thread echo, staying the single writer).
-        side_result = await _forward_codex_side_chat_turn(conv, body, runner_client)
+        side_result = await _forward_codex_side_chat_turn(
+            conv, body, runner_client, before_forward=before_forward
+        )
         if side_result is not None:
             return side_result
     if body.type == "message" and await asyncio.to_thread(_is_native_terminal_session, conv):
@@ -11511,6 +11586,7 @@ async def _dispatch_session_event_to_runner_impl(
                 usage_admission=usage_admission,
                 startup_context=startup_input,
                 native_shell_authorized=native_shell_authorized,
+                before_forward=before_forward,
             )
             forwarded = True
             if pending_id is not None:
@@ -11618,6 +11694,7 @@ async def _dispatch_session_event_to_runner_impl(
         startup_required=host_registry is not None and host_registry.startup_admitter is not None,
         usage_admission=usage_admission,
         startup_context=startup_input,
+        before_forward=before_forward,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
@@ -14010,6 +14087,7 @@ async def _post_system_message(
     agent_store: AgentStore | None = None,
     confirm_delivery: bool = False,
     image_ids: list[str] | None = None,
+    card_answer_wake: _CardAnswerWake | None = None,
 ) -> bool:
     """
     Deliver a synthetic ``[System: …]`` user message to a session's runner.
@@ -14034,6 +14112,7 @@ async def _post_system_message(
         reinstall since its last turn reaches this wake turn too.
     :param confirm_delivery: Wait for Claude's injection result before settling
         an async card verdict, rather than accepting a queued turn as delivered.
+    :param card_answer_wake: Allow one host recovery for a saved question answer.
     :returns: ``True`` when the message was dispatched to the runner;
         ``False`` when delivery could not happen (session gone, no runner
         bound, or the forward raised a transport error).
@@ -14046,7 +14125,29 @@ async def _post_system_message(
             session_id,
         )
         return False
+    if card_answer_wake is not None and not _can_wake_for_card_answer(conv):
+        return False
     runner_client = await _get_runner_client(session_id, runner_router)
+    initialize_woken_runner = card_answer_wake is not None and card_answer_wake.attempted
+    if runner_client is None and card_answer_wake is not None and not card_answer_wake.attempted:
+        app_state = card_answer_wake.app_state
+        host_registry = getattr(app_state, "host_registry", None)
+        if (
+            conv.host_id is not None
+            and session_id not in _intentional_stop_sessions
+            and host_registry is not None
+            and host_registry.get(conv.host_id) is not None
+        ):
+            runner_client, conv = await ensure_runner_connected(
+                session_id=session_id,
+                conv=conv,
+                app_state=app_state,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                raise_host_refusal=True,
+                card_answer_wake=card_answer_wake,
+            )
+            initialize_woken_runner = True
     if runner_client is None:
         # WARNING (not DEBUG): an unbound session is the transient-miss case
         # retried by callers — surface it rather than burying it as routine.
@@ -14055,6 +14156,18 @@ async def _post_system_message(
             session_id,
         )
         return False
+    if card_answer_wake is not None and initialize_woken_runner:
+        if not _can_wake_for_card_answer(conv):
+            return False
+        await _ensure_runner_session_initialized(
+            session_id,
+            conv,
+            runner_client,
+            conversation_store,
+            initializer=getattr(card_answer_wake.app_state, "runner_session_initializer", None),
+            suppress_recovery_turn=True,
+            trigger="card_answer",
+        )
     # Ensure the session's SSE relay is live so the wake turn's output is
     # persisted (parity with post_event).
     _ensure_runner_relay(
@@ -14091,6 +14204,21 @@ async def _post_system_message(
         if agent_store is not None and conv.agent_id
         else None
     )
+    marked_for_forward = False
+
+    async def mark_for_forward() -> None:
+        nonlocal marked_for_forward
+        assert card_answer_wake is not None
+        # If the process dies during the forward, recovery treats the answer
+        # as possibly accepted. A definitive failure reopens it below.
+        await asyncio.to_thread(
+            conversation_store.update_detached_card,
+            card_answer_wake.elicitation_id,
+            state="settled",
+        )
+        marked_for_forward = True
+
+    forward_options = {"before_forward": mark_for_forward} if card_answer_wake is not None else {}
     try:
         # None args: a system notice carries no agent/files/artifacts; the runner
         # recomputes has_mcp_servers from the session's cached spec.
@@ -14109,15 +14237,35 @@ async def _post_system_message(
                 if agent is not None
                 else None
             ),
+            **forward_options,
         )
-    except (httpx.HTTPError, HTTPException, OmnigentError):
-        _logger.warning(
-            "system message POST failed for session=%s",
-            session_id,
-            exc_info=True,
-        )
-        return False
-    return dispatch.forwarded
+    except _NativeDeliveryUncertain:
+        raise
+    except Exception as exc:
+        definite_failure = isinstance(exc, (httpx.HTTPError, HTTPException, OmnigentError))
+        ambiguous_transport = isinstance(
+            exc, (_NativeForwardReplyLost, httpx.TransportError)
+        ) and (not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)))
+        if marked_for_forward and (not definite_failure or ambiguous_transport):
+            raise _NativeDeliveryUncertain("The card answer forward did not settle.") from exc
+        if not definite_failure:
+            raise
+        _logger.warning("system message POST failed for session=%s", session_id, exc_info=True)
+        forwarded = False
+    else:
+        forwarded = dispatch.forwarded
+    if not forwarded and marked_for_forward and card_answer_wake is not None:
+        try:
+            await asyncio.to_thread(
+                conversation_store.update_detached_card,
+                card_answer_wake.elicitation_id,
+                state="answered",
+            )
+        except Exception as exc:
+            raise _NativeDeliveryUncertain(
+                "Could not reopen the card after a failed forward."
+            ) from exc
+    return forwarded
 
 
 async def _wake_parent_for_blocked_child(

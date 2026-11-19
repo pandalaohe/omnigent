@@ -19,6 +19,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import Response
+from starlette.datastructures import State
 
 from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import Agent, Conversation
@@ -122,6 +123,9 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.orchestration import (
     HarnessTimeoutPolicy,
+    _answer_delivery_notice_id,
+    _CardAnswerWake,
+    _CardDeliveryOptions,
     _deliver_with_retry,
     _hold_native_ask_gate,
     _persist_answer_delivery_notice,
@@ -596,6 +600,8 @@ _pending_delivery_tasks: dict[str, asyncio.Task[bool | None]] = {}
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by server-minted globally unique elicitation IDs
 _grant_delivery_tasks: dict[str, asyncio.Task[None]] = {}
 # custom-lint: disable-next=workspace-scoped-cache -- server-minted globally unique elicitation IDs
+_question_answer_deliveries: set[tuple[str, str]] = set()
+# custom-lint: disable-next=workspace-scoped-cache -- server-minted globally unique elicitation IDs
 _resolving_answers: dict[str, tuple[DetachedCard, int, int]] = {}
 _last_answer_stamp = 0
 
@@ -667,6 +673,16 @@ async def _write_card_record(write: Callable[..., Any], *args: Any, **kwargs: An
     return True
 
 
+def _has_terminal_answer_notice(
+    card: DetachedCard, text: str, conversation_store: ConversationStore
+) -> bool:
+    return any(
+        conversation_store.get_item(card.session_id, _answer_delivery_notice_id(text, status))
+        is not None
+        for status in ("delivered", "delivery_uncertain")
+    )
+
+
 async def _deliver_card_verdict(
     card: DetachedCard,
     text: str,
@@ -675,6 +691,7 @@ async def _deliver_card_verdict(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     result: ElicitationResult | None = None,
+    wake_app_state: State | None = None,
 ) -> None:
     """
     Deliver an answered card's message, then drop what is no longer owed.
@@ -687,11 +704,27 @@ async def _deliver_card_verdict(
     :param granted: Whether the verdict armed a grant.
     :param conversation_store: Store for the delivery and the record.
     :param runner_router: Router used to reach the runner.
+    :param wake_app_state: Host recovery context for a saved question answer.
     :returns: None.
     """
     if result is None and card.verdict is not None:
         result = ElicitationResult.model_validate(card.verdict)
     image_ids = _question_card_image_ids(result) if result is not None else []
+    delivery_options: _CardDeliveryOptions = {}
+    if image_ids:
+        delivery_options["image_ids"] = image_ids
+    delivery_key = (card.session_id, card.elicitation_id)
+    accepted_question = (
+        card.kind == "question" and result is not None and result.action == "accept"
+    )
+    if accepted_question:
+        if delivery_key in _question_answer_deliveries:
+            return
+        _question_answer_deliveries.add(delivery_key)
+        if wake_app_state is not None:
+            delivery_options["card_answer_wake"] = _CardAnswerWake(
+                wake_app_state, card.elicitation_id
+            )
     task = asyncio.current_task()
     lapsed = card.kind == "approval" and card.grant_key is None and card.verdict is not None
     if granted and task is not None:
@@ -700,14 +733,29 @@ async def _deliver_card_verdict(
         while True:
             try:
                 records = await asyncio.to_thread(conversation_store.list_detached_cards)
+                current = next(
+                    (row for row in records if row.elicitation_id == card.elicitation_id), None
+                )
+                if current is None or current.state not in {"answered", "settled"}:
+                    return
+                recorded = accepted_question and await asyncio.to_thread(
+                    _has_terminal_answer_notice, current, text, conversation_store
+                )
             except Exception:
                 _logger.warning("Could not read an owed detached card", exc_info=True)
                 await asyncio.sleep(_CARD_RETRY_INTERVAL_S)
                 continue
-            current = next(
-                (row for row in records if row.elicitation_id == card.elicitation_id), None
-            )
-            if current is None or current.state != "answered":
+            if recorded or (accepted_question and current.state == "settled"):
+                if not recorded:
+                    await _persist_answer_delivery_notice(
+                        card.session_id, text, conversation_store, status="delivery_uncertain"
+                    )
+                while not await _write_card_record(
+                    conversation_store.delete_detached_card, card.elicitation_id
+                ):
+                    await asyncio.sleep(_CARD_RETRY_INTERVAL_S)
+                return
+            if current.state != "answered":
                 return
             remaining = current.expires_at - time.time()
             if remaining <= 0:
@@ -751,7 +799,7 @@ async def _deliver_card_verdict(
                         conversation_store=conversation_store,
                         runner_router=runner_router,
                         persist_failure=False,
-                        **({"image_ids": image_ids} if image_ids else {}),
+                        **delivery_options,
                     ),
                     timeout=remaining,
                 )
@@ -769,6 +817,10 @@ async def _deliver_card_verdict(
                 )
                 await asyncio.sleep(min(_CARD_RETRY_INTERVAL_S, max(remaining, 0)))
                 continue
+            if accepted_question:
+                await _persist_answer_delivery_notice(
+                    card.session_id, text, conversation_store, status="delivered"
+                )
             if result is not None:
                 comment_ids = (result.meta or {}).get("omnigent_comment_ids")
                 if isinstance(comment_ids, list):
@@ -803,12 +855,14 @@ async def _deliver_card_verdict(
                 fields = {}
             while not await _write_card_record(write, *args, **fields):
                 await asyncio.sleep(_CARD_RETRY_INTERVAL_S)
-            if not lapsed:
+            if not lapsed and not accepted_question:
                 await _persist_answer_delivery_notice(
                     card.session_id, text, conversation_store, status="delivered"
                 )
             return
     finally:
+        if accepted_question:
+            _question_answer_deliveries.discard(delivery_key)
         if task is not None and _grant_delivery_tasks.get(card.elicitation_id) is task:
             _grant_delivery_tasks.pop(card.elicitation_id, None)
 
@@ -818,6 +872,7 @@ def _detached_card_callback(
     *,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    wake_app_state: State | None,
 ) -> Callable[[ElicitationResult | None], Awaitable[None]]:
     """
     Build the verdict handler for one detached card.
@@ -915,6 +970,7 @@ def _detached_card_callback(
             conversation_store=conversation_store,
             runner_router=runner_router,
             result=result,
+            wake_app_state=wake_app_state,
         )
 
     return _on_result
@@ -927,6 +983,7 @@ def _park_detached_card(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     published: asyncio.Event | None = None,
+    wake_app_state: State | None = None,
 ) -> None:
     """
     Park one recorded card under its own id.
@@ -946,7 +1003,10 @@ def _park_detached_card(
         ElicitationRequestParams.model_validate(params),
         conversation_store=conversation_store if card.mirror else None,
         on_result=_detached_card_callback(
-            card, conversation_store=conversation_store, runner_router=runner_router
+            card,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
+            wake_app_state=wake_app_state,
         ),
         on_resolved=lambda result: _observe_card_answer(card, result),
         timeout_s=timeout_s,
@@ -966,6 +1026,7 @@ async def _open_detached_card(
     mirror: bool,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    wake_app_state: State | None = None,
 ) -> None:
     """
     Record a new detached card durably, then park it.
@@ -1006,6 +1067,7 @@ async def _open_detached_card(
         timeout_s=_DETACHED_CARD_TTL_S,
         conversation_store=conversation_store,
         runner_router=runner_router,
+        wake_app_state=wake_app_state,
     )
 
 
@@ -1076,6 +1138,8 @@ async def _consume_grant(
 async def restore_detached_cards(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    *,
+    app_state: State | None = None,
 ) -> None:
     """
     Reopen what the previous server process owed for its detached cards.
@@ -1090,6 +1154,7 @@ async def restore_detached_cards(
 
     :param conversation_store: Store holding the records.
     :param runner_router: Router used to deliver verdicts.
+    :param app_state: Host recovery context for restored question cards.
     :returns: None.
     """
     global _last_answer_stamp
@@ -1139,26 +1204,37 @@ async def restore_detached_cards(
             await _write_card_record(conversation_store.delete_detached_card, card.elicitation_id)
             continue
         remaining = card.expires_at - time.time()
-        alive = (
-            await asyncio.to_thread(conversation_store.get_conversation, card.session_id)
-            is not None
-        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, card.session_id)
         verdict = (
             ElicitationResult.model_validate(card.verdict) if card.verdict is not None else None
         )
         granted = card.grant_key is not None and verdict is not None and verdict.action == "accept"
+        recover_question = (
+            card.kind == "question"
+            and verdict is not None
+            and verdict.action == "accept"
+            and card.state in {"answered", "settled"}
+            and card.delivery_text is not None
+        )
         expired_owed_grant = remaining <= 0 and card.state == "answered" and granted
-        if remaining <= 0 and card.state == "answered" and not granted and card.delivery_text:
+        if (
+            remaining <= 0
+            and card.state == "answered"
+            and not granted
+            and not recover_question
+            and card.delivery_text
+        ):
             await _persist_answer_delivery_notice(
                 card.session_id, card.delivery_text, conversation_store, status="undelivered"
             )
         if (
-            not alive
-            or (remaining <= 0 and not expired_owed_grant)
-            or (card.state == "settled" and not granted)
+            conv is None
+            or (remaining <= 0 and not expired_owed_grant and not recover_question)
+            or (card.state == "settled" and not granted and not recover_question)
         ):
             await _write_card_record(conversation_store.delete_detached_card, card.elicitation_id)
             continue
+        wake_app_state = app_state if conv.host_id is not None else None
         if card.state == "pending":
             published.append(asyncio.Event())
             _park_detached_card(
@@ -1167,6 +1243,7 @@ async def restore_detached_cards(
                 conversation_store=conversation_store,
                 runner_router=runner_router,
                 published=published[-1],
+                wake_app_state=wake_app_state,
             )
             continue
         if granted and remaining > 0:
@@ -1179,7 +1256,7 @@ async def restore_detached_cards(
                 source_id=card.elicitation_id,
                 answered_at=(card.verdict or {}).get("answer_stamp", 0),
             )
-        if card.state == "answered" and card.delivery_text is not None:
+        if (card.state == "answered" or recover_question) and card.delivery_text is not None:
             task = asyncio.create_task(
                 _deliver_card_verdict(
                     card,
@@ -1187,6 +1264,7 @@ async def restore_detached_cards(
                     granted=granted,
                     conversation_store=conversation_store,
                     runner_router=runner_router,
+                    wake_app_state=wake_app_state,
                 )
             )
             _detached_elicitation_tasks.add(task)
@@ -1686,6 +1764,7 @@ def register_hooks_routes(
             mirror=False,
             conversation_store=conversation_store,
             runner_router=runner_router,
+            wake_app_state=request.app.state if conv.host_id is not None else None,
         )
         return Response(
             content=json.dumps({"elicitation_id": elicitation_id, "qid": qid}),

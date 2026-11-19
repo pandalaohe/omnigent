@@ -24,7 +24,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -35,7 +35,7 @@ from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.entities import Conversation
+from omnigent.entities import Conversation, MessageData
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
@@ -4975,8 +4975,14 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
 class _HostFrameResponder:
     """Answer host round-trips in the background and record every stop request."""
 
-    def __init__(self, comm: ApplicationCommunicator) -> None:
+    def __init__(
+        self,
+        comm: ApplicationCommunicator,
+        *,
+        runner_status: Callable[[str], str] | None = None,
+    ) -> None:
         self._comm = comm
+        self._runner_status = runner_status
         self.stopped_runner_ids: list[str] = []
         self.launch_frames: list[HostLaunchRunnerFrame] = []
         self._task: asyncio.Task[None] | None = None
@@ -5002,7 +5008,7 @@ class _HostFrameResponder:
                 # Keepalive pings interleave with the frames under test.
                 continue
             if isinstance(frame, HostStatFrame):
-                reply: object = HostStatResultFrame(
+                reply = HostStatResultFrame(
                     request_id=frame.request_id,
                     status="ok",
                     exists=True,
@@ -5016,6 +5022,10 @@ class _HostFrameResponder:
                 self.launch_frames.append(frame)
                 reply = HostLaunchRunnerResultFrame(
                     request_id=frame.request_id, status="launched", runner_id="runner_from_host"
+                )
+            elif isinstance(frame, HostRunnerStatusFrame) and self._runner_status is not None:
+                reply = HostRunnerStatusResultFrame(
+                    request_id=frame.request_id, status=self._runner_status(frame.runner_id)
                 )
             else:
                 continue
@@ -5283,8 +5293,11 @@ class _StagedRunners:
     the host relaunched registers its tunnel.
     """
 
-    def __init__(self, store: SqlAlchemyConversationStore) -> None:
+    def __init__(
+        self, store: SqlAlchemyConversationStore, *, confirm_answer: bool | None = None
+    ) -> None:
         self._store = store
+        self._confirm_answer = confirm_answer
         self.live: set[str] = set()
         self.posts: list[tuple[str, dict[str, Any]]] = []
         self.client = httpx.AsyncClient(
@@ -5295,6 +5308,14 @@ class _StagedRunners:
         if request.method == "POST":
             self.posts.append((request.url.path, json.loads(request.content or b"{}")))
         if request.url.path.endswith("/events"):
+            if self._confirm_answer is not None and request.url.params.get("stream") == "true":
+                if self._confirm_answer:
+                    return httpx.Response(
+                        200,
+                        text='data: {"type": "response.completed"}\n\n',
+                        headers={"content-type": "text/event-stream"},
+                    )
+                return httpx.Response(202, json={"status": "buffered"})
             return httpx.Response(202, json={"queued": True})
         return httpx.Response(200, json={})
 
@@ -5323,6 +5344,468 @@ class _StagedRunners:
         if runner_id is not None:
             self.live.add(runner_id)
         return await self.get_runner_client(session_id, runner_router)
+
+
+@pytest.mark.parametrize(
+    ("runner_online", "confirm_answer"),
+    [(False, True), (True, True), (False, False)],
+    ids=["offline-confirmed", "online-confirmed", "offline-buffered"],
+)
+async def test_async_card_answer_reaches_host_runner_once(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_online: bool,
+    confirm_answer: bool,
+) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    store = SqlAlchemyConversationStore(db_uri)
+    runners = _StagedRunners(store, confirm_answer=confirm_answer)
+    monkeypatch.setattr(sessions_module, "_get_runner_client", runners.get_runner_client)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", runners.wait_for_runner_client)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm, harness="claude-native")
+    session_id = session["id"]
+    if runner_online:
+        runners.live.add(session["runner_id"])
+
+    opened = await client.post(
+        f"/v1/sessions/{session_id}/async-questions",
+        json={"questions": [{"question": "Which database?"}]},
+    )
+    assert opened.status_code == 200, opened.text
+    card = opened.json()
+    resolve_url = f"/v1/sessions/{session_id}/elicitations/{card['elicitation_id']}/resolve"
+    verdict = {"action": "accept", "content": {"Which database?": "SQLite"}}
+    events_path = f"/v1/sessions/{session_id}/events"
+    expected_notice = "answer_delivered" if confirm_answer else "answer_delivery_uncertain"
+    async with (
+        runners.client,
+        _HostFrameResponder(comm, runner_status=lambda _: "unknown") as host,
+    ):
+        for response in await asyncio.gather(
+            client.post(resolve_url, json=verdict), client.post(resolve_url, json=verdict)
+        ):
+            assert response.status_code == 202, response.text
+
+        if not runner_online:
+            deadline = Deadline(5.0)
+            while not host.launch_frames and deadline.remaining() > 0:
+                await asyncio.sleep(0.01)
+            assert host.launch_frames, "answering an async card did not request a host launch"
+
+        async with asyncio.timeout(budget(5.0)):
+            while True:
+                items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+                if any(item.get("code") == expected_notice for item in items):
+                    if not await asyncio.to_thread(store.list_detached_cards):
+                        break
+                await asyncio.sleep(0.01)
+
+        replay = await client.post(resolve_url, json=verdict)
+        assert replay.status_code == 202, replay.text
+        assert len(host.launch_frames) == (0 if runner_online else 1)
+        messages = [
+            body
+            for path, body in runners.posts
+            if path == events_path and body.get("type") == "message"
+        ]
+        assert len(messages) == 1
+        assert messages[0]["content"] == [
+            {
+                "type": "input_text",
+                "text": f"[System: answers to your question card #{card['qid']}]\n"
+                "Which database? → SQLite",
+            }
+        ]
+        if not runner_online:
+            assert session["runner_id"] not in runners.live
+            assert len(runners.live) == 1
+            posted_paths = [path for path, _ in runners.posts]
+            assert posted_paths.index("/v1/sessions") < posted_paths.index(events_path)
+
+
+async def _open_card_for_host_runner(
+    client: httpx.AsyncClient, session_id: str
+) -> tuple[str, str]:
+    opened = await client.post(
+        f"/v1/sessions/{session_id}/async-questions",
+        json={"questions": [{"question": "Which database?"}]},
+    )
+    assert opened.status_code == 200, opened.text
+    elicitation_id = opened.json()["elicitation_id"]
+    return elicitation_id, f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve"
+
+
+async def test_async_card_retries_launch_after_definite_enqueue_failure(
+    client: httpx.AsyncClient, app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    store = SqlAlchemyConversationStore(db_uri)
+    runners = _StagedRunners(store, confirm_answer=True)
+    monkeypatch.setattr(sessions_module, "_get_runner_client", runners.get_runner_client)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", runners.wait_for_runner_client)
+    old_comm = await _connect_host(app)
+    session = await _inline_launch_session(client, old_comm, harness="claude-native")
+    _, resolve_url = await _open_card_for_host_runner(client, session["id"])
+    registry = app.state.host_registry
+    old_host = registry.get(_HOST_ID)
+    send_text = registry.send_text
+    rejected = asyncio.Event()
+    reconnected = asyncio.Event()
+
+    def reject_old_launch(conn: HostConnection, text: str) -> None:
+        if conn is old_host and isinstance(decode_host_frame(text), HostLaunchRunnerFrame):
+            rejected.set()
+            raise ConnectionError("host disconnected before enqueue")
+        send_text(conn, text)
+
+    async def wait_for_reconnect(_delay: float) -> None:
+        await reconnected.wait()
+
+    monkeypatch.setattr(registry, "send_text", reject_old_launch)
+    monkeypatch.setattr(orchestration, "_delivery_retry_sleep", wait_for_reconnect)
+    async with (
+        runners.client,
+        _HostFrameResponder(old_comm, runner_status=lambda _: "unknown") as old_responder,
+    ):
+        resolved = await client.post(
+            resolve_url, json={"action": "accept", "content": {"Which database?": "SQLite"}}
+        )
+        assert resolved.status_code == 202, resolved.text
+        await asyncio.wait_for(rejected.wait(), budget(5.0))
+        await old_comm.send_input({"type": "websocket.disconnect", "code": 1001})
+        await old_comm.wait(timeout=budget(5.0))
+        new_comm = await _connect_host(app)
+        async with _HostFrameResponder(new_comm, runner_status=lambda _: "unknown") as host:
+            reconnected.set()
+            async with asyncio.timeout(budget(5.0)):
+                while await asyncio.to_thread(store.list_detached_cards):
+                    await asyncio.sleep(0.01)
+            assert not old_responder.launch_frames
+            assert len(host.launch_frames) == 1
+            assert sum(body.get("type") == "message" for _, body in runners.posts) == 1
+
+
+@pytest.mark.parametrize(
+    "interrupt_at", ["starting", "readiness", "accepted", "delivered", "delivery_uncertain"]
+)
+async def test_async_card_restart_joins_startup_or_retires_sent_answer(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt_at: str,
+) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers, orchestration
+    from omnigent.server.routes.sessions import routes_hooks
+
+    store = SqlAlchemyConversationStore(db_uri)
+    runners = _StagedRunners(store, confirm_answer=True)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm, harness="claude-native")
+    session_id = session["id"]
+    elicitation_id, resolve_url = await _open_card_for_host_runner(client, session_id)
+    interrupted = asyncio.Event()
+    allow_connect = asyncio.Event()
+    persist_notice = routes_hooks._persist_answer_delivery_notice
+    ensure_terminal = orchestration._ensure_native_terminal_ready
+    accepted_before_restart = interrupt_at not in {"starting", "readiness"}
+
+    async def wait_for_connection(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
+        if interrupt_at == "starting":
+            interrupted.set()
+            await allow_connect.wait()
+        return await runners.wait_for_runner_client(*args, **kwargs)
+
+    async def pause_readiness(*args: Any, **kwargs: Any) -> Any:
+        interrupted.set()
+        await asyncio.Future()
+
+    async def pause_settlement(*args: Any, **kwargs: Any) -> None:
+        if accepted_before_restart and kwargs.get("status") == "delivered":
+            interrupted.set()
+            await asyncio.Future()
+        await persist_notice(*args, **kwargs)
+
+    def runner_status(runner_id: str) -> str:
+        return "unknown" if runner_id == session["runner_id"] else "alive"
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", runners.get_runner_client)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", wait_for_connection)
+    monkeypatch.setattr(routes_hooks, "_persist_answer_delivery_notice", pause_settlement)
+    if interrupt_at == "readiness":
+        monkeypatch.setattr(orchestration, "_ensure_native_terminal_ready", pause_readiness)
+    async with runners.client, _HostFrameResponder(comm, runner_status=runner_status) as host:
+        resolved = await client.post(
+            resolve_url, json={"action": "accept", "content": {"Which database?": "SQLite"}}
+        )
+        assert resolved.status_code == 202, resolved.text
+        await asyncio.wait_for(interrupted.wait(), budget(5.0))
+        assert len(host.launch_frames) == 1
+        assert sum(body.get("type") == "message" for _, body in runners.posts) == int(
+            accepted_before_restart
+        )
+        await orchestration.cancel_detached_elicitation_tasks()
+        [record] = await asyncio.to_thread(store.list_detached_cards)
+        assert record.state == ("settled" if accepted_before_restart else "answered")
+        monkeypatch.setattr(orchestration, "_ensure_native_terminal_ready", ensure_terminal)
+        monkeypatch.setattr(routes_hooks, "_persist_answer_delivery_notice", persist_notice)
+        helpers._relaunch_last_attempt.pop(session_id, None)
+        runners.live.clear()
+
+        if interrupt_at in {"delivered", "delivery_uncertain"}:
+            assert record.delivery_text is not None
+            await persist_notice(session_id, record.delivery_text, store, status=interrupt_at)
+            # Older deliveries could leave an answered row and a terminal notice.
+            await asyncio.to_thread(store.update_detached_card, elicitation_id, state="answered")
+
+        allow_connect.set()
+        await routes_hooks.restore_detached_cards(store, runner_router=None, app_state=app.state)
+        async with asyncio.timeout(budget(5.0)):
+            while await asyncio.to_thread(store.list_detached_cards):
+                await asyncio.sleep(0.01)
+        assert len(host.launch_frames) == 1
+        assert sum(body.get("type") == "message" for _, body in runners.posts) == 1
+        items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+        expected = (
+            "answer_delivery_uncertain"
+            if interrupt_at in {"accepted", "delivery_uncertain"}
+            else "answer_delivered"
+        )
+        assert any(item.get("code") == expected for item in items)
+
+
+async def test_async_card_generic_restart_after_append_keeps_one_message(
+    client: httpx.AsyncClient, app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import routes_hooks
+
+    store = SqlAlchemyConversationStore(db_uri)
+    runners = _StagedRunners(store)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm, harness="claude-sdk")
+    session_id = session["id"]
+    runners.live.add(session["runner_id"])
+    elicitation_id, resolve_url = await _open_card_for_host_runner(client, session_id)
+    qid = "q" + elicitation_id.removeprefix("elicit_")[:6]
+    answer_content = [
+        {
+            "type": "input_text",
+            "text": f"[System: answers to your question card #{qid}]\nWhich database? → SQLite",
+        }
+    ]
+    appended = asyncio.Event()
+    seed_title = orchestration._seed_missing_title_from_user_message
+
+    def answer_message_ids() -> list[str]:
+        return [
+            item.id
+            for item in store.list_items(session_id, type="message").data
+            if isinstance(item.data, MessageData)
+            and item.data.role == "user"
+            and item.data.content == answer_content
+        ]
+
+    async def pause_after_append(*_args: Any, **_kwargs: Any) -> None:
+        appended.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", runners.get_runner_client)
+    monkeypatch.setattr(orchestration, "_seed_missing_title_from_user_message", pause_after_append)
+    async with runners.client:
+        try:
+            resolved = await client.post(
+                resolve_url, json={"action": "accept", "content": {"Which database?": "SQLite"}}
+            )
+            assert resolved.status_code == 202, resolved.text
+            await asyncio.wait_for(appended.wait(), budget(5.0))
+            [answer_id] = answer_message_ids()
+            assert not any(body.get("type") == "message" for _, body in runners.posts)
+            await orchestration.cancel_detached_elicitation_tasks()
+            monkeypatch.setattr(orchestration, "_seed_missing_title_from_user_message", seed_title)
+
+            await routes_hooks.restore_detached_cards(
+                store, runner_router=None, app_state=app.state
+            )
+            async with asyncio.timeout(budget(5.0)):
+                while await asyncio.to_thread(store.list_detached_cards):
+                    await asyncio.sleep(0.01)
+            assert answer_message_ids() == [answer_id]
+            assert not any(body.get("type") == "message" for _, body in runners.posts)
+        finally:
+            await orchestration.cancel_detached_elicitation_tasks()
+
+
+@pytest.mark.parametrize("archive_timing", ["before-read", "after-read", "undo"])
+async def test_async_card_does_not_launch_if_archived_during_launch_wait(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    archive_timing: str,
+) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers, orchestration
+
+    store = SqlAlchemyConversationStore(db_uri)
+    runners = _StagedRunners(store, confirm_answer=True)
+    monkeypatch.setattr(sessions_module, "_get_runner_client", runners.get_runner_client)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm, harness="claude-native")
+    session_id = session["id"]
+    _, resolve_url = await _open_card_for_host_runner(client, session_id)
+    resolve_harness = helpers._resolve_harness_async
+    preparing_frame = asyncio.Event()
+    resume_launch = asyncio.Event()
+    retried = asyncio.Event()
+    resume_retry = asyncio.Event()
+    archive_during_enqueue = archive_timing != "before-read"
+    send_text = app.state.host_registry.send_text
+
+    def archive_before_enqueue(conn: HostConnection, text: str) -> None:
+        if isinstance(decode_host_frame(text), HostLaunchRunnerFrame):
+            # The launch helper has read its final pre-enqueue snapshot.
+            result = store.update_conversation_with_changes(
+                session_id, archived=True, close_cli_on_archive=True
+            )
+            assert result is not None and result.conversation.archived
+        send_text(conn, text)
+
+    async def pause_frame_preparation(conv: Conversation, **kwargs: Any) -> str | None:
+        # Archive cleanup resolves the updated row through this helper too.
+        if conv.id == session_id and not conv.archived:
+            preparing_frame.set()
+            await resume_launch.wait()
+        return await resolve_harness(conv, **kwargs)
+
+    async def pause_retry(_delay: float) -> None:
+        retried.set()
+        await resume_retry.wait()
+
+    if archive_during_enqueue:
+        monkeypatch.setattr(app.state, "archive_close_coordinator", None)
+        monkeypatch.setattr(
+            sessions_module,
+            "_ARCHIVE_STOP_UNDO_GRACE_S",
+            60.0 if archive_timing == "undo" else 0.0,
+        )
+        monkeypatch.setattr(app.state.host_registry, "send_text", archive_before_enqueue)
+    else:
+        monkeypatch.setattr(helpers, "_resolve_harness_async", pause_frame_preparation)
+    monkeypatch.setattr(orchestration, "_delivery_retry_sleep", pause_retry)
+    async with (
+        runners.client,
+        _HostFrameResponder(comm, runner_status=lambda _: "unknown") as host,
+    ):
+        try:
+            resolved = await client.post(
+                resolve_url, json={"action": "accept", "content": {"Which database?": "SQLite"}}
+            )
+            assert resolved.status_code == 202, resolved.text
+            if not archive_during_enqueue:
+                await asyncio.wait_for(preparing_frame.wait(), budget(5.0))
+                archived = await asyncio.wait_for(
+                    client.patch(f"/v1/sessions/{session_id}", json={"archived": True}),
+                    budget(5.0),
+                )
+                assert archived.status_code == 200, archived.text
+                resume_launch.set()
+            await asyncio.wait_for(retried.wait(), budget(5.0))
+            assert not runners.posts
+            [record] = await asyncio.to_thread(store.list_detached_cards)
+            assert record.state == "answered"
+            if archive_during_enqueue:
+                async with asyncio.timeout(budget(5.0)):
+                    while not host.launch_frames:
+                        await asyncio.sleep(0.01)
+                [frame] = host.launch_frames
+                runner_id = token_bound_runner_id(frame.binding_token)
+                if archive_timing == "undo":
+                    archive_stop = orchestration._pending_archive_stops[session_id]
+                    runners.live.add(runner_id)
+                    undone = await asyncio.wait_for(
+                        client.patch(f"/v1/sessions/{session_id}", json={"archived": False}),
+                        budget(5.0),
+                    )
+                    assert undone.status_code == 200, undone.text
+                    resume_retry.set()
+                    async with asyncio.timeout(budget(5.0)):
+                        await asyncio.gather(archive_stop, return_exceptions=True)
+                        while await asyncio.to_thread(store.list_detached_cards):
+                            await asyncio.sleep(0.01)
+                    assert len(host.launch_frames) == 1
+                    assert runner_id not in host.stopped_runner_ids
+                    assert sum(body.get("type") == "message" for _, body in runners.posts) == 1
+                else:
+                    async with asyncio.timeout(budget(5.0)):
+                        while runner_id not in host.stopped_runner_ids:
+                            await asyncio.sleep(0.01)
+            else:
+                assert not host.launch_frames
+        finally:
+            orchestration._cancel_pending_archive_stop(session_id)
+            await orchestration.cancel_detached_elicitation_tasks()
+
+
+async def test_async_card_stops_runner_if_session_closes_after_launch_enqueue(
+    client: httpx.AsyncClient, app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+
+    store = SqlAlchemyConversationStore(db_uri)
+    runners = _StagedRunners(store, confirm_answer=True)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm, harness="claude-native")
+    session_id = session["id"]
+    _, resolve_url = await _open_card_for_host_runner(client, session_id)
+    registry = app.state.host_registry
+    send_text = registry.send_text
+    retried = asyncio.Event()
+
+    def close_after_enqueue(conn: HostConnection, text: str) -> None:
+        send_text(conn, text)
+        frame = decode_host_frame(text)
+        if isinstance(frame, HostLaunchRunnerFrame):
+            store.set_labels(session_id, {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE})
+            # Make the new runner reachable so the test detects any attempted delivery.
+            runners.live.add(token_bound_runner_id(frame.binding_token))
+
+    async def pause_retry(_delay: float) -> None:
+        retried.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", runners.get_runner_client)
+    monkeypatch.setattr(registry, "send_text", close_after_enqueue)
+    monkeypatch.setattr(orchestration, "_delivery_retry_sleep", pause_retry)
+    async with (
+        runners.client,
+        _HostFrameResponder(comm, runner_status=lambda _: "unknown") as host,
+    ):
+        try:
+            resolved = await client.post(
+                resolve_url, json={"action": "accept", "content": {"Which database?": "SQLite"}}
+            )
+            assert resolved.status_code == 202, resolved.text
+            await asyncio.wait_for(retried.wait(), budget(5.0))
+            [launch] = host.launch_frames
+            assert token_bound_runner_id(launch.binding_token) in host.stopped_runner_ids
+            closed = store.get_conversation(session_id)
+            assert closed is not None and not closed.archived
+            assert closed.labels[CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
+            assert not any(body.get("type") == "message" for _, body in runners.posts)
+        finally:
+            await orchestration.cancel_detached_elicitation_tasks()
 
 
 async def _side_chat_with_exited_source_runner(

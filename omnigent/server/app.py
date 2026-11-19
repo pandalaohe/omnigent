@@ -2446,7 +2446,7 @@ def create_app(
         # answer can find its card. Ahead of the notifier: their parents were
         # already woken once.
         try:
-            await restore_detached_cards(conversation_store, runner_router)
+            await restore_detached_cards(conversation_store, runner_router, app_state=app.state)
         except Exception:
             _logger.exception("Restoring detached cards failed; continuing startup")
         # Wake a blocked sub-agent's immediate parent: hooks
