@@ -19,9 +19,10 @@ import { useTerminalIsDark } from "@/components/theme/useTerminalIsDark";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import {
-  isTerminalClipboardWritePending,
   queueTerminalClipboardWrite,
+  writeExplicitTerminalClipboardText,
 } from "@/lib/terminalClipboardWriter";
+import { useTerminalPaste, type TerminalClipboardAction } from "@/lib/terminalPaste";
 import {
   getOmnigentServerIdentity,
   isDatabricksWorkspace,
@@ -61,6 +62,11 @@ import {
   type TerminalClipboardPromptReason,
 } from "./TerminalClipboardPrompt";
 import { TerminalKeyRow } from "./TerminalKeyRow";
+import {
+  TERMINAL_COPY_BLOCKED_MESSAGE,
+  TerminalCopySheet,
+  TerminalPasteBox,
+} from "./TerminalTouchClipboard";
 import { resolveTerminalKeys, type KeySurface } from "@/lib/terminalKeys";
 import {
   type ConnectionState,
@@ -134,7 +140,6 @@ interface TerminalClipboardRequest {
   epoch: number;
   generation: number;
   text: string;
-  source: "terminal" | "selection";
 }
 
 // Host terminals always use the owner-checked relay, never direct attach.
@@ -336,6 +341,10 @@ export function TerminalView({
   const isDarkRef = useRef(isDark);
   isDarkRef.current = isDark;
   const sessionRef = useRef<TerminalSession | null>(null);
+  const terminalPaste = useTerminalPaste(sessionRef, clipboardScope, active, readOnly);
+  const cancelPaste = terminalPaste.cancel;
+  const [copySheet, setCopySheet] = useState<string | null>(null);
+  useLayoutEffect(() => setCopySheet(null), [clipboardScope, active]);
   const terminalNodeRef = useRef<HTMLDivElement | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const isPhone = useIsPhone();
@@ -430,10 +439,14 @@ export function TerminalView({
   }, []);
 
   // Stable dispatcher: updates local state and notifies the parent.
-  const notifyState = useCallback((next: ConnectionState) => {
-    setState(next);
-    onStateChangeRef.current?.(next);
-  }, []);
+  const notifyState = useCallback(
+    (next: ConnectionState) => {
+      if (next.kind !== "connected") cancelPaste(next.kind === "closed" || next.kind === "error");
+      setState(next);
+      onStateChangeRef.current?.(next);
+    },
+    [cancelPaste],
+  );
 
   const notifyActivity = useCallback(() => {
     // Terminal output: the attach reached a live shell, so a later close is
@@ -475,6 +488,32 @@ export function TerminalView({
     [],
   );
 
+  const isCopyAllowed = useCallback(
+    () =>
+      clipboardMountedRef.current &&
+      clipboardActiveRef.current &&
+      clipboardScopeRef.current.scope === clipboardScope &&
+      clipboardScopeRef.current.epoch === clipboardScopeEpoch &&
+      clipboardConsentRef.current.decision !== "block",
+    [clipboardScope, clipboardScopeEpoch],
+  );
+
+  const copyExplicit = useCallback(
+    (text: string, copyEvent?: ClipboardEvent) => {
+      clipboardRequestGenerationRef.current += 1;
+      setClipboardPrompt(null);
+      const copiedNatively = Boolean(
+        copyEvent?.clipboardData && applyTerminalCopy(copyEvent, text),
+      );
+      void writeExplicitTerminalClipboardText(text, isCopyAllowed, copiedNatively).then(
+        (copied) => {
+          if (!copied && isCopyAllowed()) toast.error("Couldn't copy terminal text");
+        },
+      );
+    },
+    [isCopyAllowed],
+  );
+
   const notifyClipboardRequest = useCallback(
     (text: string, copyEvent?: ClipboardEvent) => {
       if (
@@ -494,36 +533,23 @@ export function TerminalView({
         };
       }
       if (clipboardConsentRef.current.decision === "block") {
-        toast.info("Copying from this terminal is blocked.", {
+        toast.info(TERMINAL_COPY_BLOCKED_MESSAGE, {
           id: "terminal-clipboard-blocked",
           description: "Change this in Settings → General.",
         });
         return;
       }
-      const source = copyEvent ? "selection" : "terminal";
-      if (
-        clipboardConsentRef.current.decision === "allow" &&
-        copyEvent?.clipboardData &&
-        !isTerminalClipboardWritePending()
-      ) {
-        // Keep native copy gestures independent of browser async-clipboard permissions.
-        // If a write is in flight, queue below so it cannot overwrite this selection.
-        setClipboardPrompt(null);
-        clipboardNeedsClickRef.current = false;
-        applyTerminalCopy(copyEvent, text);
+      if (copyEvent) {
+        copyExplicit(text, copyEvent);
         return;
       }
-      if (
-        clipboardConsentRef.current.decision === "allow" &&
-        (copyEvent || !clipboardNeedsClickRef.current)
-      ) {
+      if (clipboardConsentRef.current.decision === "allow" && !clipboardNeedsClickRef.current) {
         setClipboardPrompt(null);
         queueSessionClipboardCopy({
           scope: clipboardScope,
           epoch: clipboardScopeEpoch,
           generation,
           text,
-          source,
           kind: "automatic",
         });
         return;
@@ -534,19 +560,36 @@ export function TerminalView({
         epoch: clipboardScopeEpoch,
         generation,
         text,
-        source,
         reason: clipboardConsentRef.current.decision === "allow" ? "browser" : "consent",
       });
     },
-    [clipboardScope, clipboardScopeEpoch, queueSessionClipboardCopy, readOnly],
+    [clipboardScope, clipboardScopeEpoch, copyExplicit, queueSessionClipboardCopy, readOnly],
   );
+
+  const onClipboardActionRef = useRef<TerminalClipboardAction>(() => {});
+  onClipboardActionRef.current = (op, options) => {
+    if (op !== "copy") {
+      void terminalPaste.paste(op, options);
+      return;
+    }
+    if (!active) return;
+    if (!isCopyAllowed()) {
+      toast.info(TERMINAL_COPY_BLOCKED_MESSAGE, { id: "terminal-clipboard-blocked" });
+      return;
+    }
+    const session = sessionRef.current;
+    if (!session) return;
+    const selection = session.selectedText();
+    if (selection) copyExplicit(selection);
+    else if (gate) setCopySheet(session.bufferText());
+  };
 
   const handleClipboardConsent = useCallback(
     (decision: TerminalClipboardDecision | "retry", remember = false) => {
       const prompt =
         clipboardMountedRef.current &&
         clipboardActiveRef.current &&
-        (!readOnly || clipboardPrompt?.source === "selection") &&
+        !readOnly &&
         clipboardPrompt?.scope === clipboardScope &&
         clipboardPrompt.epoch === clipboardScopeEpoch &&
         clipboardPrompt.generation === clipboardRequestGenerationRef.current
@@ -579,7 +622,6 @@ export function TerminalView({
           epoch: clipboardScopeEpoch,
           generation,
           text: prompt.text,
-          source: prompt.source,
           kind: "user",
         });
       }
@@ -599,7 +641,7 @@ export function TerminalView({
     clipboardPrompt.epoch === clipboardScopeEpoch &&
     clipboardPrompt.generation === clipboardRequestGenerationRef.current &&
     active &&
-    (!readOnly || clipboardPrompt.source === "selection")
+    !readOnly
       ? clipboardPrompt
       : null;
 
@@ -608,9 +650,11 @@ export function TerminalView({
   // arrived in React 19), so without this every remount would abandon
   // the previous session — xterm buffers, observers, and all.
   const disposeActiveSession = useCallback(() => {
+    cancelPaste();
+    setCopySheet(null);
     sessionRef.current?.dispose();
     sessionRef.current = null;
-  }, []);
+  }, [cancelPaste]);
 
   useLayoutEffect(() => {
     mountedRef.current = true;
@@ -731,6 +775,9 @@ export function TerminalView({
           focusOnConnectRef.current && !isPhoneRef.current,
           terminalId === "terminal_codex_main",
           notifyFileLink,
+          (op, options) => {
+            if (!superseded()) onClipboardActionRef.current(op, options);
+          },
         );
         sessionRef.current = terminalSession;
         // Relay-connected with a direct URL on offer: negotiate the
@@ -966,6 +1013,31 @@ export function TerminalView({
           />
         )}
       </div>
+      {terminalPaste.review && (
+        <div className="flex items-center gap-2 border-t bg-background px-3 py-2">
+          <div className="min-w-0 flex-1">
+            <p role="status" className="text-xs text-muted-foreground">
+              {terminalPaste.review.text.split("\n").length} lines
+              {terminalPaste.review.repeatUntil > 0
+                ? " · Tap the paste key again within 3 seconds or use Paste"
+                : " · Review before pasting"}
+            </p>
+            <pre className="overflow-hidden text-ellipsis whitespace-pre text-xs">
+              {terminalPaste.review.text
+                .split("\n", 3)
+                .join("\n")
+                .slice(0, 240)
+                .replace(/\t/g, "⇥")}
+            </pre>
+          </div>
+          <Button type="button" size="xs" variant="outline" onClick={() => cancelPaste()}>
+            Cancel
+          </Button>
+          <Button type="button" size="xs" onClick={terminalPaste.confirm}>
+            Paste
+          </Button>
+        </div>
+      )}
       {hasBar && (
         <TerminalKeyRow
           sessionRef={sessionRef}
@@ -975,6 +1047,18 @@ export function TerminalView({
           identityKey={`${keySurface}:${sessionId ?? hostId}:${terminalId}`}
         />
       )}
+      <TerminalCopySheet
+        key={clipboardScopeEpoch}
+        text={copySheet}
+        isCopyBlocked={() => !isCopyAllowed()}
+        onClose={() => setCopySheet(null)}
+      />
+      <TerminalPasteBox
+        open={terminalPaste.showPasteBox}
+        enabled={state.kind === "connected" && !readOnly}
+        onSend={terminalPaste.pasteFromBox}
+        onClose={() => cancelPaste()}
+      />
     </div>
   );
 }

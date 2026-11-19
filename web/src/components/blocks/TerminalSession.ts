@@ -13,7 +13,13 @@
 
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
-import { type FontWeight, type ITheme, type IWindowsPty, Terminal } from "@xterm/xterm";
+import {
+  type FontWeight,
+  type IBuffer,
+  type ITheme,
+  type IWindowsPty,
+  Terminal,
+} from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { withBasePath } from "@/lib/basePath";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
@@ -25,6 +31,8 @@ import {
 } from "@/lib/mobileAssistantPreferences";
 import type { ShortcutChord } from "@/lib/keyboardShortcutPreferences";
 import {
+  applyCmd,
+  CMD_KEY_MODE,
   isArmedModifier,
   chordForSequence,
   encodeChord,
@@ -33,6 +41,7 @@ import {
   SPLIT_LONE_ESC_MS,
   splitTerminalWrites,
 } from "@/lib/terminalKeys";
+import { HostClipboardConnection, type TerminalClipboardAction } from "@/lib/terminalPaste";
 import { TerminalImeInput } from "./TerminalImeInput";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { terminalSurfaceColors } from "@/lib/terminalPalette";
@@ -422,6 +431,35 @@ export function applyTerminalCopy(
   return true;
 }
 
+/** Newest logical lines offered when copying terminal text by touch. */
+export const TERMINAL_COPY_MAX_LINES = 5000;
+
+/**
+ * Plain text of a terminal buffer for touch copying.
+ *
+ * Rejoins soft-wrapped rows into one logical line, trims trailing blanks, and
+ * reads only the newest `maxLines` lines so a full scrollback stays light.
+ */
+export function terminalBufferText(
+  buffer: Pick<IBuffer, "length" | "getLine">,
+  maxLines = TERMINAL_COPY_MAX_LINES,
+): string {
+  const newestFirst: string[] = [];
+  let logicalLine = "";
+  for (let index = buffer.length - 1; index >= 0 && newestFirst.length < maxLines; index -= 1) {
+    const line = buffer.getLine(index);
+    if (!line) continue;
+    // A row that continues on the next keeps its trailing spaces.
+    const continues = buffer.getLine(index + 1)?.isWrapped === true;
+    const text = continues ? line.translateToString(false) : line.translateToString(true).trimEnd();
+    logicalLine = text + logicalLine;
+    if (line.isWrapped && index > 0) continue;
+    if (newestFirst.length > 0 || logicalLine.trim() !== "") newestFirst.push(logicalLine);
+    logicalLine = "";
+  }
+  return newestFirst.reverse().join("\n");
+}
+
 /** Largest tmux selection accepted for a browser clipboard write. */
 export const TERMINAL_CLIPBOARD_MAX_BYTES = 1024 * 1024;
 /** A tmux copy notification must closely follow input on this attachment. */
@@ -717,6 +755,8 @@ export class TerminalSession {
   private tmuxBacked = false;
   private readonly codexPalette: CodexTerminalPalette | null;
   private readonly onClipboardRequest?: TerminalClipboardListener;
+  private readonly onClipboardAction?: TerminalClipboardAction;
+  private readonly hostClipboard: HostClipboardConnection;
   /** Whether this visible, interactive attach may write the local clipboard. */
   private clipboardEnabled: boolean;
   /**
@@ -786,8 +826,10 @@ export class TerminalSession {
     focusOnConnect = true,
     adaptCodexPalette = false,
     onFileLink?: TerminalFileLinkListener,
+    onClipboardAction?: TerminalClipboardAction,
   ) {
     this.container = container;
+    this.onClipboardAction = onClipboardAction;
     this.codexPalette = adaptCodexPalette ? new CodexTerminalPalette() : null;
     this.clipboardEnabled = clipboardEnabled;
     this.focusOnConnect = focusOnConnect;
@@ -833,6 +875,7 @@ export class TerminalSession {
     }
 
     this.ws = new WebSocket(url);
+    this.hostClipboard = new HostClipboardConnection(this.ws);
     // Default is Blob, which forces an async read per chunk. ArrayBuffer
     // keeps the path synchronous and matches xterm.js's preferred input.
     this.ws.binaryType = "arraybuffer";
@@ -893,6 +936,7 @@ export class TerminalSession {
             onActivity?.();
           }
         } else if (typeof ev.data === "string") {
+          if (this.hostClipboard.receive(ev.data)) return;
           const windowsPty = parseWindowsPtyMessage(ev.data);
           if (windowsPty) {
             // ConPTY's resize/reflow contract differs from a POSIX PTY.
@@ -921,6 +965,7 @@ export class TerminalSession {
     this.ws.addEventListener(
       "close",
       (ev) => {
+        this.hostClipboard.close();
         onState({ kind: "closed", reason: ev.reason || `code ${ev.code}`, code: ev.code });
       },
       { signal },
@@ -929,6 +974,7 @@ export class TerminalSession {
     this.ws.addEventListener(
       "error",
       () => {
+        this.hostClipboard.close();
         onState({ kind: "error" });
       },
       { signal },
@@ -953,6 +999,16 @@ export class TerminalSession {
     this.term.attachCustomKeyEventHandler((e) => {
       if (!this.imeInput.handleKeyEvent(e)) return false;
       if (this.imeInput.isComposing) return true;
+      if (e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "v") {
+        const command = applyCmd({ char: "v" }, CMD_KEY_MODE);
+        if ("clipboard" in command && this.onClipboardAction) {
+          if (e.type === "keydown") {
+            e.preventDefault();
+            if (!e.repeat) this.runClipboardAction(command.clipboard, { enter: false });
+          }
+          return false;
+        }
+      }
       const payload = terminalKeyEventPayload(e);
       if (payload === null) return true;
       // xterm invokes this handler for keydown, keypress, and keyup.
@@ -1158,6 +1214,7 @@ export class TerminalSession {
   private sendBarOutput(output: ReturnType<typeof encodeChord>): void {
     if (!this.imeInput.beforeSoftKey()) return;
     this.consumeStickyModifiers();
+    if ("clipboard" in output) this.runClipboardAction(output.clipboard, { enter: false });
     if (!("bytes" in output)) return;
     const writes = splitTerminalWrites(output.bytes);
     const writeNext = (index: number) => {
@@ -1212,7 +1269,44 @@ export class TerminalSession {
         ? encodeTerminalData(data, this.stickyModifiers, this.term.modes.applicationCursorKeysMode)
         : { bytes: data };
     this.consumeStickyModifiers();
+    if ("clipboard" in result) this.runClipboardAction(result.clipboard, { enter: false });
     return "bytes" in result ? result.bytes : "";
+  }
+
+  runClipboardAction(...args: Parameters<TerminalClipboardAction>): void {
+    this.onClipboardAction?.(...args);
+  }
+
+  selectedText(): string {
+    return this.term.getSelection();
+  }
+
+  bufferText(): string {
+    return terminalBufferText(this.term.buffer.active);
+  }
+
+  canPaste(): boolean {
+    return !this.disposed && this.ws.readyState === WebSocket.OPEN;
+  }
+
+  pastesBracketed(): boolean {
+    return this.term.modes.bracketedPasteMode;
+  }
+
+  paste(text: string, enter: boolean): boolean {
+    if (!this.canPaste() || !this.imeInput.beforeSoftKey()) return false;
+    this.sendingSoftKey = true;
+    try {
+      this.term.paste(text);
+      if (enter) this.term.input("\r", true);
+    } finally {
+      this.sendingSoftKey = false;
+    }
+    return true;
+  }
+
+  readHostClipboard(signal: AbortSignal) {
+    return this.hostClipboard.read(signal);
   }
 
   /** Enable clipboard bridging only for the visible, interactive surface. */
@@ -1266,6 +1360,7 @@ export class TerminalSession {
    */
   dispose(): void {
     if (this.disposed) return;
+    this.hostClipboard.close();
     this.disposed = true;
     this.cancelBarWrites();
     this.listenerCtl.abort();

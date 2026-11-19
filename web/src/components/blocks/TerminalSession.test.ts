@@ -9,6 +9,7 @@
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { TerminalClipboardAction } from "@/lib/terminalPaste";
 import {
   terminalSoftKeyPayload,
   SHIFT_ENTER_CSI_U,
@@ -731,6 +732,7 @@ describe("TerminalSession", () => {
     onClipboardRequest?: (text: string) => void,
     focusOnConnect = true,
     adaptCodexPalette = false,
+    onClipboardAction?: TerminalClipboardAction,
   ) {
     const states: ConnectionState[] = [];
     const container = document.createElement("div");
@@ -748,9 +750,113 @@ describe("TerminalSession", () => {
       onClipboardRequest,
       focusOnConnect,
       adaptCodexPalette,
+      undefined,
+      onClipboardAction,
     );
     return { session, states, container, socket: FakeWebSocket.instances.at(-1)! };
   }
+
+  it("requests paste without Enter for armed, recorded, and hardware Cmd+V", () => {
+    const clipboard = vi.fn();
+    const { session, socket, container } = makeSession(
+      undefined,
+      undefined,
+      true,
+      undefined,
+      true,
+      false,
+      clipboard,
+    );
+    socket.open();
+    socket.sent.length = 0;
+    const term = (session as unknown as { term: Terminal }).term;
+    session.setStickyModifiers({ ctrl: "off", alt: "off", shift: "off", cmd: "once" });
+    term.input("v", true);
+    session.sendBarChord({ code: "KeyV", modifiers: ["meta"] });
+    container.querySelector("textarea")!.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "v",
+        code: "KeyV",
+        metaKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    expect(clipboard.mock.calls).toEqual(
+      Array.from({ length: 3 }, () => ["paste", { enter: false }]),
+    );
+    expect(socket.sent).toEqual([]);
+    session.dispose();
+  });
+
+  it("uses xterm bracketed paste without appending Enter to the lines", async () => {
+    const { session, socket } = makeSession();
+    socket.open();
+    const term = (session as unknown as { term: Terminal }).term;
+    await new Promise<void>((resolve) => {
+      term.write("\x1b[?2004h", resolve);
+    });
+    socket.sent.length = 0;
+    session.setStickyModifiers({ ctrl: "once", alt: "off", shift: "off" });
+    expect(session.paste("a\nb", false)).toBe(true);
+    expect(socket.sent).toEqual([new TextEncoder().encode("\x1b[200~a\rb\x1b[201~")]);
+    session.dispose();
+  });
+
+  it("rejoins wrapped buffer rows into logical lines", async () => {
+    const { session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    term.resize(6, 6);
+    await new Promise<void>((resolve) => {
+      term.write("first\r\nlong wrapped\r\nlast\r\n", resolve);
+    });
+    expect(session.bufferText()).toBe("first\nlong wrapped\nlast");
+    session.dispose();
+  });
+
+  it("matches host replies on their own socket, refuses old hosts, and times out", async () => {
+    vi.useFakeTimers();
+    const first = makeSession();
+    const second = makeSession();
+    const signal = new AbortController().signal;
+    const message = (socket: FakeWebSocket, frame: Record<string, unknown>) =>
+      socket.emit("message", { data: JSON.stringify(frame) });
+    try {
+      for (const { socket } of [first, second]) socket.open();
+      await expect(first.session.readHostClipboard(signal)).resolves.toEqual({
+        error: "The host needs a newer version",
+      });
+      for (const { socket } of [first, second])
+        message(socket, { type: "capabilities", hostClipboard: 1 });
+      const firstRead = first.session.readHostClipboard(signal);
+      const secondRead = second.session.readHostClipboard(signal);
+      const firstRequest = JSON.parse(first.socket.sent.at(-1) as string);
+      const secondRequest = JSON.parse(second.socket.sent.at(-1) as string);
+      expect(firstRequest.type).toBe("host-clipboard-read");
+      message(second.socket, {
+        type: "host-clipboard",
+        id: firstRequest.id,
+        ok: true,
+        text: "wrong",
+      });
+      message(first.socket, { type: "host-clipboard", id: firstRequest.id, ok: true, text: "pwd" });
+      message(second.socket, {
+        type: "host-clipboard",
+        id: secondRequest.id,
+        ok: true,
+        text: "date",
+      });
+      await expect(firstRead).resolves.toEqual({ text: "pwd" });
+      await expect(secondRead).resolves.toEqual({ text: "date" });
+      const unanswered = second.session.readHostClipboard(signal);
+      await vi.advanceTimersByTimeAsync(5000);
+      await expect(unanswered).resolves.toEqual({ error: "The host did not answer" });
+    } finally {
+      first.session.dispose();
+      second.session.dispose();
+      vi.useRealTimers();
+    }
+  });
 
   function testTouch(identifier: number, clientX: number, clientY: number): Touch {
     return { identifier, clientX, clientY } as Touch;

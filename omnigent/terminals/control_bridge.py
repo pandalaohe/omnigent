@@ -58,6 +58,7 @@ from typing import Final
 from fastapi import WebSocket, WebSocketDisconnect
 
 from omnigent.inner.terminal_clipboard import MAX_CLIPBOARD_BYTES
+from omnigent.terminals.host_clipboard import HostClipboard
 from omnigent.terminals.query_replies import tmux_answered_queries
 from omnigent.terminals.ws_common import (
     WS_CLOSE_INTERNAL_ERROR,
@@ -746,6 +747,7 @@ async def bridge_tmux_control_to_websocket(
     # Terminal bytes and clipboard JSON have separate producer tasks but one
     # websocket. Serialize sends so ASGI never sees concurrent send calls.
     ws_send_lock = asyncio.Lock()
+    host_clipboard = HostClipboard(websocket, ws_send_lock, read_only=read_only)
     # Monotonic stamp of the last forwarded browser input; the forwarder reads
     # it to shrink the frame cap right after a keystroke (keeping the echo on
     # xterm's synchronous paint path) and clipboard
@@ -897,6 +899,7 @@ async def bridge_tmux_control_to_websocket(
         """Read browser frames; resize via refresh-client -C, input via -H hex."""
         nonlocal last_client_input_at
         try:
+            await host_clipboard.advertise()
             while True:
                 msg = await websocket.receive()
                 if on_client_interaction is not None:
@@ -910,7 +913,11 @@ async def bridge_tmux_control_to_websocket(
                         ctl = json.loads(text)
                     except (json.JSONDecodeError, ValueError):
                         continue
-                    if isinstance(ctl, dict) and ctl.get("type") == "resize":
+                    if not isinstance(ctl, dict):
+                        continue
+                    if ctl.get("type") == "host-clipboard-read":
+                        await host_clipboard.handle(ctl)
+                    elif ctl.get("type") == "resize":
                         try:
                             cols = int(ctl["cols"])
                             rows = int(ctl["rows"])
@@ -1022,6 +1029,7 @@ async def bridge_tmux_control_to_websocket(
             if not task.done():
                 task.cancel()
         task_results = await asyncio.gather(*bridge_tasks, return_exceptions=True)
+        await host_clipboard.close()
         for result in task_results:
             if isinstance(result, Exception):
                 _logger.warning("control-attach: bridge task failed during teardown: %r", result)

@@ -33,6 +33,7 @@ import {
   writeTerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
 import type { ConnectionState } from "./TerminalSession";
+import type { TerminalClipboardAction } from "@/lib/terminalPaste";
 import {
   TerminalView,
   RECONNECT_BACKOFF_MS,
@@ -87,6 +88,11 @@ const terminalSessionMock = vi.hoisted(() => ({
     adaptCodexPalette: boolean;
     onClipboardRequest?: (text: string, copyEvent?: ClipboardEvent) => void;
     onFileLink?: (uri: string) => boolean;
+    onClipboardAction?: TerminalClipboardAction;
+    canPaste: ReturnType<typeof vi.fn>;
+    pastesBracketed: ReturnType<typeof vi.fn>;
+    readHostClipboard: ReturnType<typeof vi.fn>;
+    paste: ReturnType<typeof vi.fn>;
     onState: (state: ConnectionState) => void;
     onActivity?: () => void;
     dispose: ReturnType<typeof vi.fn>;
@@ -241,6 +247,10 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     focus = vi.fn();
     blur = vi.fn();
     isFocused = vi.fn(() => false);
+    canPaste = vi.fn(() => true);
+    pastesBracketed = vi.fn(() => true);
+    paste = vi.fn(() => true);
+    readHostClipboard = vi.fn();
 
     constructor(
       container: HTMLDivElement,
@@ -254,6 +264,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
       focusOnConnect = true,
       adaptCodexPalette = false,
       onFileLink?: (uri: string) => boolean,
+      onClipboardAction?: TerminalClipboardAction,
     ) {
       terminalSessionMock.instances.push({
         url,
@@ -263,6 +274,11 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         adaptCodexPalette,
         onClipboardRequest,
         onFileLink,
+        onClipboardAction,
+        canPaste: this.canPaste,
+        pastesBracketed: this.pastesBracketed,
+        paste: this.paste,
+        readHostClipboard: this.readHostClipboard,
         onState,
         onActivity,
         dispose: this.dispose,
@@ -642,22 +658,14 @@ describe("terminal clipboard", () => {
     expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
   });
 
-  it("asks before copying browser selections and Copy once does not grant future copies", async () => {
+  it("copies an explicit selection under Ask, leaving program copies subject to consent", async () => {
     await renderClipboardView();
-    const first = await copySelection("browser selection");
-
-    expect(first.setData).not.toHaveBeenCalled();
+    const copied = await copySelection("browser selection");
+    expect(copied.setData).toHaveBeenCalledWith("text/plain", "browser selection");
+    expect(visibleClipboardConsent()).toBeNull();
     expect(clipboardMock.copyText).not.toHaveBeenCalled();
-    expect(visibleClipboardConsent()).toBeInTheDocument();
-    clickConsentButton("Copy once");
-    await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
-    expect(clipboardMock.copyText).toHaveBeenCalledWith("browser selection");
-
-    const next = await copySelection("next browser selection");
-    expect(next.setData).not.toHaveBeenCalled();
-    expect(visibleClipboardConsent()).toBeInTheDocument();
     expect(readTerminalClipboardPreference()).toBe("ask");
-    expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
+    await requestClipboardConsent("program copy");
   });
 
   it("uses the native copy event for allowed selections without requiring the async clipboard API", async () => {
@@ -686,7 +694,7 @@ describe("terminal clipboard", () => {
   });
 
   it.each(["ask", "block"] as const)(
-    "revokes selection copying in a mounted terminal when Settings changes to %s",
+    "applies a change to %s to explicit selections immediately",
     async (decision) => {
       writeTerminalClipboardPreference("allow");
       await renderClipboardView();
@@ -696,51 +704,36 @@ describe("terminal clipboard", () => {
       act(() => writeTerminalClipboardPreference(decision));
       const after = await copySelection("after revocation");
 
-      expect(after.setData).not.toHaveBeenCalled();
+      if (decision === "ask")
+        expect(after.setData).toHaveBeenCalledWith("text/plain", "after revocation");
+      else expect(after.setData).not.toHaveBeenCalled();
       expect(clipboardMock.copyText).not.toHaveBeenCalled();
       expect(terminalSessionMock.instances).toHaveLength(1);
-      if (decision === "ask") expect(visibleClipboardConsent()).toBeInTheDocument();
-      else expect(visibleClipboardConsent()).toBeNull();
+      expect(visibleClipboardConsent()).toBeNull();
     },
   );
 
-  it.each(["succeeds", "needs a retry"] as const)(
-    "orders a newer selection after an in-flight program copy when copying %s",
-    async (outcome) => {
-      writeTerminalClipboardPreference("allow");
-      await renderClipboardView();
-      let finishOldCopy: (() => void) | undefined;
-      clipboardMock.copyText.mockImplementationOnce(
-        () =>
-          new Promise<void>((resolve) => {
-            finishOldCopy = resolve;
-          }),
-      );
-      await requestClipboard("older program copy");
-      if (outcome === "needs a retry") {
-        clipboardMock.copyText.mockRejectedValueOnce(new Error("browser needs a gesture"));
-      }
-      const newer = await copySelection("newer browser selection");
-
-      expect(newer.setData).not.toHaveBeenCalled();
-      expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
-      await act(async () => finishOldCopy?.());
-      expect(clipboardMock.copyText.mock.calls).toEqual([
-        ["older program copy"],
-        ["newer browser selection"],
-      ]);
-      if (outcome === "needs a retry") {
-        await waitFor(() =>
-          expect(visibleClipboardConsent()).toHaveTextContent("Copy needs a click"),
-        );
-        clickConsentButton("Copy now");
-        await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledTimes(3));
-        expect(clipboardMock.copyText).toHaveBeenLastCalledWith("newer browser selection");
-        await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
-        expect(readTerminalClipboardPreference()).toBe("allow");
-      }
-    },
-  );
+  it("restores an explicit selection after an in-flight program copy completes", async () => {
+    writeTerminalClipboardPreference("allow");
+    await renderClipboardView();
+    let finishOldCopy: (() => void) | undefined;
+    clipboardMock.copyText.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishOldCopy = resolve;
+        }),
+    );
+    await requestClipboard("older program copy");
+    const newer = await copySelection("newer browser selection");
+    expect(newer.setData).toHaveBeenCalledWith("text/plain", "newer browser selection");
+    expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
+    await act(async () => finishOldCopy?.());
+    expect(clipboardMock.copyText.mock.calls).toEqual([
+      ["older program copy"],
+      ["newer browser selection"],
+    ]);
+    expect(visibleClipboardConsent()).toBeNull();
+  });
 
   it("lets a native selection copy satisfy a pending browser retry", async () => {
     writeTerminalClipboardPreference("allow");
@@ -800,7 +793,7 @@ describe("terminal clipboard", () => {
           "newer selection",
           terminalSessionMock.instances.length - 1,
         );
-        expect(newer.setData).not.toHaveBeenCalled();
+        expect(newer.setData).toHaveBeenCalledWith("text/plain", "newer selection");
         expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
         expect(clipboard).toBe("before copying");
       } finally {
@@ -827,20 +820,11 @@ describe("terminal clipboard", () => {
 
       const copied = await copySelection("explicit read-only selection");
 
-      if (decision === "allow") {
+      if (decision === "block") expect(copied.setData).not.toHaveBeenCalled();
+      else
         expect(copied.setData).toHaveBeenCalledWith("text/plain", "explicit read-only selection");
-      } else {
-        expect(copied.setData).not.toHaveBeenCalled();
-      }
-      if (decision === "ask") {
-        expect(visibleClipboardConsent()).toBeInTheDocument();
-        clickConsentButton("Copy once");
-        await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
-        expect(clipboardMock.copyText).toHaveBeenCalledWith("explicit read-only selection");
-      } else {
-        expect(visibleClipboardConsent()).toBeNull();
-        expect(clipboardMock.copyText).not.toHaveBeenCalled();
-      }
+      expect(visibleClipboardConsent()).toBeNull();
+      expect(clipboardMock.copyText).not.toHaveBeenCalled();
     },
   );
 
@@ -2309,5 +2293,93 @@ describe("TerminalView phone key rows", () => {
     );
     expect(screen.getByTestId("terminal-key-row")).toBeInTheDocument();
     expect(screen.queryByTestId("terminal-key-row-pager")).toBeNull();
+  });
+});
+
+describe("terminal clipboard paste", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  async function openTerminal(readOnly = false) {
+    const view = render(
+      <TerminalView sessionId="conv_paste" terminalId="terminal_a" readOnly={readOnly} />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const terminal = terminalSessionMock.instances[0];
+    act(() => terminal.onState({ kind: "connected" }));
+    return { terminal, ...view };
+  }
+
+  it.each([true, false])("normalizes a single line with enter=%s", async (enter) => {
+    vi.stubGlobal("navigator", { clipboard: { readText: async () => "mak\x1be\r\n\r\n" } });
+    const { terminal } = await openTerminal();
+    await act(async () =>
+      terminal.onClipboardAction?.("paste", { enter, keyId: enter ? "paste" : undefined }),
+    );
+    expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("make", enter);
+  });
+
+  it.each([true, false])("confirms multiline input with bracketed mode=%s", async (bracketed) => {
+    const readText = vi.fn(async () => "a\r\nb\r\n");
+    vi.stubGlobal("navigator", { clipboard: { readText } });
+    const { terminal } = await openTerminal();
+    terminal.pastesBracketed.mockReturnValue(bracketed);
+    const tap = () => terminal.onClipboardAction?.("paste", { enter: true, keyId: "paste" });
+    await act(async () => tap());
+    expect(screen.getByRole("status")).toHaveTextContent("2 lines");
+    expect(terminal.paste).not.toHaveBeenCalled();
+    await act(async () => tap());
+    expect(readText).toHaveBeenCalledTimes(1);
+    if (!bracketed) {
+      expect(terminal.paste).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+    }
+    expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("a\nb", false);
+  });
+
+  it("uses the paste box when clipboard access fails and reviews tabs", async () => {
+    vi.stubGlobal("navigator", {
+      clipboard: {
+        readText: async () => {
+          throw new Error("denied");
+        },
+      },
+    });
+    const { terminal } = await openTerminal();
+    await act(async () => terminal.onClipboardAction?.("paste", { enter: false }));
+    fireEvent.change(screen.getByLabelText("Text to paste"), { target: { value: "go\there" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send to terminal" }));
+    expect(screen.getByText("go⇥here")).toBeInTheDocument();
+    expect(terminal.paste).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+    expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("go\there", false);
+  });
+
+  it("drops both a queued review and a delayed host reply when the terminal changes", async () => {
+    vi.stubGlobal("navigator", { clipboard: { readText: async () => "a\nb" } });
+    const { terminal, rerender } = await openTerminal();
+    await act(async () => terminal.onClipboardAction?.("paste", { enter: false }));
+    expect(screen.getByRole("status")).toHaveTextContent("2 lines");
+    let reply: (result: { text: string }) => void = () => {};
+    terminal.readHostClipboard.mockReturnValue(
+      new Promise((resolve) => {
+        reply = resolve;
+      }),
+    );
+    act(() => terminal.onClipboardAction?.("pasteHost", { enter: true, keyId: "host" }));
+    expect(screen.queryByText("2 lines", { exact: false })).not.toBeInTheDocument();
+    rerender(<TerminalView sessionId="conv_paste" terminalId="terminal_b" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    const other = terminalSessionMock.instances[1];
+    act(() => other.onState({ kind: "connected" }));
+    await act(async () => reply({ text: "pwd" }));
+    expect(terminal.paste).not.toHaveBeenCalled();
+    expect(other.paste).not.toHaveBeenCalled();
+  });
+
+  it("does not ask a read-only connection to read its host clipboard", async () => {
+    const { terminal } = await openTerminal(true);
+    await act(async () => terminal.onClipboardAction?.("pasteHost", { enter: true }));
+    expect(terminal.readHostClipboard).not.toHaveBeenCalled();
+    expect(terminal.paste).not.toHaveBeenCalled();
   });
 });

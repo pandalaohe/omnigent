@@ -14,6 +14,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
+from omnigent.terminals.host_clipboard import HostClipboard
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_NOT_FOUND,
     _coalesce_limit_after_input,
@@ -72,25 +73,30 @@ async def bridge_conpty_to_websocket(
 ) -> None:
     seed = instance.attach_snapshot()
     last_input: float | None = None
+    send_lock = asyncio.Lock()
+    host_clipboard = HostClipboard(websocket, send_lock, read_only=read_only)
 
     def interaction() -> None:
         if on_client_interaction is not None:
             on_client_interaction()
 
     async def forward() -> None:
-        await websocket.send_json(
-            {
-                "type": "pty_info",
-                "windows_pty": {"backend": "conpty", "build": instance.windows_build},
-            }
-        )
-        if seed.output:
-            await websocket.send_bytes(seed.output)
+        async with send_lock:
+            await websocket.send_json(
+                {
+                    "type": "pty_info",
+                    "windows_pty": {"backend": "conpty", "build": instance.windows_build},
+                }
+            )
+            if seed.output:
+                await websocket.send_bytes(seed.output)
+        await host_clipboard.advertise()
         await run_sync_on_thread(instance.request_repaint)
         await _forward_terminal_to_ws(
             websocket,
             seed.queue,
             max_coalesce_bytes=lambda: _coalesce_limit_after_input(last_input),
+            send_lock=send_lock,
         )
 
     async def receive() -> None:
@@ -100,9 +106,7 @@ async def bridge_conpty_to_websocket(
             if message["type"] == "websocket.disconnect":
                 return
             data, text = message.get("bytes"), message.get("text")
-            if read_only:
-                continue
-            if data:
+            if data and not read_only:
                 interaction()
                 if on_input is not None:
                     on_input()
@@ -124,7 +128,12 @@ async def bridge_conpty_to_websocket(
                     frame = json.loads(text)
                 except (ValueError, TypeError):
                     continue
-                if not isinstance(frame, dict) or frame.get("type") != "resize":
+                if not isinstance(frame, dict):
+                    continue
+                if frame.get("type") == "host-clipboard-read":
+                    await host_clipboard.handle(frame)
+                    continue
+                if read_only or frame.get("type") != "resize":
                     continue
                 cols, rows = frame.get("cols"), frame.get("rows")
                 if not (
@@ -154,6 +163,7 @@ async def bridge_conpty_to_websocket(
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await host_clipboard.close()
         interaction()
         code = (
             1013
