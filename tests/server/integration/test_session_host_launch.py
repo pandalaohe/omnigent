@@ -24,7 +24,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -4975,8 +4975,14 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
 class _HostFrameResponder:
     """Answer host round-trips in the background and record every stop request."""
 
-    def __init__(self, comm: ApplicationCommunicator) -> None:
+    def __init__(
+        self,
+        comm: ApplicationCommunicator,
+        *,
+        runner_status: Callable[[str], str] | None = None,
+    ) -> None:
         self._comm = comm
+        self._runner_status = runner_status
         self.stopped_runner_ids: list[str] = []
         self.launch_frames: list[HostLaunchRunnerFrame] = []
         self._task: asyncio.Task[None] | None = None
@@ -5002,7 +5008,7 @@ class _HostFrameResponder:
                 # Keepalive pings interleave with the frames under test.
                 continue
             if isinstance(frame, HostStatFrame):
-                reply: object = HostStatResultFrame(
+                reply = HostStatResultFrame(
                     request_id=frame.request_id,
                     status="ok",
                     exists=True,
@@ -5016,6 +5022,10 @@ class _HostFrameResponder:
                 self.launch_frames.append(frame)
                 reply = HostLaunchRunnerResultFrame(
                     request_id=frame.request_id, status="launched", runner_id="runner_from_host"
+                )
+            elif isinstance(frame, HostRunnerStatusFrame) and self._runner_status is not None:
+                reply = HostRunnerStatusResultFrame(
+                    request_id=frame.request_id, status=self._runner_status(frame.runner_id)
                 )
             else:
                 continue
@@ -5372,7 +5382,10 @@ async def test_async_card_answer_reaches_host_runner_once(
     verdict = {"action": "accept", "content": {"Which database?": "SQLite"}}
     events_path = f"/v1/sessions/{session_id}/events"
     expected_notice = "answer_delivered" if confirm_answer else "answer_delivery_uncertain"
-    async with runners.client, _HostFrameResponder(comm) as host:
+    async with (
+        runners.client,
+        _HostFrameResponder(comm, runner_status=lambda _: "unknown") as host,
+    ):
         for response in await asyncio.gather(
             client.post(resolve_url, json=verdict), client.post(resolve_url, json=verdict)
         ):
@@ -5413,6 +5426,204 @@ async def test_async_card_answer_reaches_host_runner_once(
             assert len(runners.live) == 1
             posted_paths = [path for path, _ in runners.posts]
             assert posted_paths.index("/v1/sessions") < posted_paths.index(events_path)
+
+
+async def _open_card_for_host_runner(
+    client: httpx.AsyncClient, session_id: str
+) -> tuple[str, str]:
+    opened = await client.post(
+        f"/v1/sessions/{session_id}/async-questions",
+        json={"questions": [{"question": "Which database?"}]},
+    )
+    assert opened.status_code == 200, opened.text
+    elicitation_id = opened.json()["elicitation_id"]
+    return elicitation_id, f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve"
+
+
+async def test_async_card_retries_launch_after_definite_enqueue_failure(
+    client: httpx.AsyncClient, app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    store = SqlAlchemyConversationStore(db_uri)
+    runners = _StagedRunners(store, confirm_answer=True)
+    monkeypatch.setattr(sessions_module, "_get_runner_client", runners.get_runner_client)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", runners.wait_for_runner_client)
+    old_comm = await _connect_host(app)
+    session = await _inline_launch_session(client, old_comm, harness="claude-native")
+    _, resolve_url = await _open_card_for_host_runner(client, session["id"])
+    registry = app.state.host_registry
+    old_host = registry.get(_HOST_ID)
+    send_text = registry.send_text
+    rejected = asyncio.Event()
+    reconnected = asyncio.Event()
+
+    def reject_old_launch(conn: HostConnection, text: str) -> None:
+        if conn is old_host and isinstance(decode_host_frame(text), HostLaunchRunnerFrame):
+            rejected.set()
+            raise ConnectionError("host disconnected before enqueue")
+        send_text(conn, text)
+
+    async def wait_for_reconnect(_delay: float) -> None:
+        await reconnected.wait()
+
+    monkeypatch.setattr(registry, "send_text", reject_old_launch)
+    monkeypatch.setattr(orchestration, "_delivery_retry_sleep", wait_for_reconnect)
+    async with (
+        runners.client,
+        _HostFrameResponder(old_comm, runner_status=lambda _: "unknown") as old_responder,
+    ):
+        resolved = await client.post(
+            resolve_url, json={"action": "accept", "content": {"Which database?": "SQLite"}}
+        )
+        assert resolved.status_code == 202, resolved.text
+        await asyncio.wait_for(rejected.wait(), budget(5.0))
+        await old_comm.send_input({"type": "websocket.disconnect", "code": 1001})
+        await old_comm.wait(timeout=budget(5.0))
+        new_comm = await _connect_host(app)
+        async with _HostFrameResponder(new_comm, runner_status=lambda _: "unknown") as host:
+            reconnected.set()
+            async with asyncio.timeout(budget(5.0)):
+                while await asyncio.to_thread(store.list_detached_cards):
+                    await asyncio.sleep(0.01)
+            assert not old_responder.launch_frames
+            assert len(host.launch_frames) == 1
+            assert sum(body.get("type") == "message" for _, body in runners.posts) == 1
+
+
+@pytest.mark.parametrize(
+    "interrupt_at", ["starting", "accepted", "delivered", "delivery_uncertain"]
+)
+async def test_async_card_restart_joins_startup_or_retires_sent_answer(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt_at: str,
+) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers, orchestration
+    from omnigent.server.routes.sessions import routes_hooks
+
+    store = SqlAlchemyConversationStore(db_uri)
+    runners = _StagedRunners(store, confirm_answer=True)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm, harness="claude-native")
+    session_id = session["id"]
+    elicitation_id, resolve_url = await _open_card_for_host_runner(client, session_id)
+    interrupted = asyncio.Event()
+    allow_connect = asyncio.Event()
+    persist_notice = routes_hooks._persist_answer_delivery_notice
+
+    async def wait_for_connection(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
+        if interrupt_at == "starting":
+            interrupted.set()
+            await allow_connect.wait()
+        return await runners.wait_for_runner_client(*args, **kwargs)
+
+    async def pause_settlement(*args: Any, **kwargs: Any) -> None:
+        if interrupt_at != "starting" and kwargs.get("status") == "delivered":
+            interrupted.set()
+            await asyncio.Future()
+        await persist_notice(*args, **kwargs)
+
+    def runner_status(runner_id: str) -> str:
+        return "unknown" if runner_id == session["runner_id"] else "alive"
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", runners.get_runner_client)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", wait_for_connection)
+    monkeypatch.setattr(routes_hooks, "_persist_answer_delivery_notice", pause_settlement)
+    async with runners.client, _HostFrameResponder(comm, runner_status=runner_status) as host:
+        resolved = await client.post(
+            resolve_url, json={"action": "accept", "content": {"Which database?": "SQLite"}}
+        )
+        assert resolved.status_code == 202, resolved.text
+        await asyncio.wait_for(interrupted.wait(), budget(5.0))
+        assert len(host.launch_frames) == 1
+        assert sum(body.get("type") == "message" for _, body in runners.posts) == int(
+            interrupt_at != "starting"
+        )
+        await orchestration.cancel_detached_elicitation_tasks()
+        monkeypatch.setattr(routes_hooks, "_persist_answer_delivery_notice", persist_notice)
+        helpers._relaunch_last_attempt.pop(session_id, None)
+        runners.live.clear()
+
+        if interrupt_at in {"delivered", "delivery_uncertain"}:
+            [record] = await asyncio.to_thread(store.list_detached_cards)
+            assert record.delivery_text is not None
+            await persist_notice(session_id, record.delivery_text, store, status=interrupt_at)
+            # Older deliveries could leave an answered row and a terminal notice.
+            await asyncio.to_thread(store.update_detached_card, elicitation_id, state="answered")
+
+        allow_connect.set()
+        await routes_hooks.restore_detached_cards(store, runner_router=None, app_state=app.state)
+        async with asyncio.timeout(budget(5.0)):
+            while await asyncio.to_thread(store.list_detached_cards):
+                await asyncio.sleep(0.01)
+        assert len(host.launch_frames) == 1
+        assert sum(body.get("type") == "message" for _, body in runners.posts) == 1
+        items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+        expected = (
+            "answer_delivery_uncertain"
+            if interrupt_at in {"accepted", "delivery_uncertain"}
+            else "answer_delivered"
+        )
+        assert any(item.get("code") == expected for item in items)
+
+
+async def test_async_card_does_not_launch_if_archived_during_launch_wait(
+    client: httpx.AsyncClient, app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers, orchestration
+
+    store = SqlAlchemyConversationStore(db_uri)
+    runners = _StagedRunners(store, confirm_answer=True)
+    monkeypatch.setattr(sessions_module, "_get_runner_client", runners.get_runner_client)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm, harness="claude-native")
+    session_id = session["id"]
+    _, resolve_url = await _open_card_for_host_runner(client, session_id)
+    resolve_harness = helpers._resolve_harness_async
+    preparing_frame = asyncio.Event()
+    resume_launch = asyncio.Event()
+    retried = asyncio.Event()
+
+    async def pause_frame_preparation(conv: Conversation, **kwargs: Any) -> str | None:
+        # Archive cleanup resolves the updated row through this helper too.
+        if conv.id == session_id and not conv.archived:
+            preparing_frame.set()
+            await resume_launch.wait()
+        return await resolve_harness(conv, **kwargs)
+
+    async def pause_retry(_delay: float) -> None:
+        retried.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(helpers, "_resolve_harness_async", pause_frame_preparation)
+    monkeypatch.setattr(orchestration, "_delivery_retry_sleep", pause_retry)
+    async with (
+        runners.client,
+        _HostFrameResponder(comm, runner_status=lambda _: "unknown") as host,
+    ):
+        try:
+            resolved = await client.post(
+                resolve_url, json={"action": "accept", "content": {"Which database?": "SQLite"}}
+            )
+            assert resolved.status_code == 202, resolved.text
+            await asyncio.wait_for(preparing_frame.wait(), budget(5.0))
+            archived = await asyncio.wait_for(
+                client.patch(f"/v1/sessions/{session_id}", json={"archived": True}),
+                budget(5.0),
+            )
+            assert archived.status_code == 200, archived.text
+            resume_launch.set()
+            await asyncio.wait_for(retried.wait(), budget(5.0))
+            assert not host.launch_frames
+            assert not runners.posts
+        finally:
+            await orchestration.cancel_detached_elicitation_tasks()
 
 
 async def _side_chat_with_exited_source_runner(

@@ -312,6 +312,7 @@ from omnigent.server.routes._sessions.helpers import (
     _blocked_on_for,
     _build_new_item,
     _build_policy_engine_from_spec,
+    _can_wake_for_card_answer,
     _canonical_worktree_path,
     _child_session_summary_from_conversation,
     _child_summary_identity,
@@ -816,8 +817,6 @@ async def _persist_answer_delivery_notice(
         "undelivered": f"{subject} could not be delivered; re-ask.",
         "delivery_uncertain": f"{subject} may have arrived. Check the terminal before resending.",
     }[status]
-    notice_key = f"{code}:{reference or text}"
-    stable_id = hashlib.sha256(notice_key.encode()).hexdigest()[:32]
     item = NewConversationItem(
         type="error",
         response_id=generate_task_id(),
@@ -827,7 +826,7 @@ async def _persist_answer_delivery_notice(
             message=message,
             level="info",
         ),
-        stable_id=stable_id,
+        stable_id=_answer_delivery_notice_id(text, status),
     )
     try:
         persisted = await asyncio.to_thread(
@@ -845,6 +844,11 @@ async def _persist_answer_delivery_notice(
         return
     if persisted and not persisted[0].deduplicated:
         _publish_external_conversation_item(session_id, persisted[0])
+
+
+def _answer_delivery_notice_id(text: str, status: str) -> str:
+    notice_key = f"answer_{status}:{_delivery_reference(text) or text}"
+    return hashlib.sha256(notice_key.encode()).hexdigest()[:32]
 
 
 #: Backoff schedule for a verdict that could not be delivered.
@@ -866,7 +870,11 @@ class _NativeDeliveryUncertain(RuntimeError):
 @dataclass
 class _CardAnswerWake:
     app_state: State
+    elicitation_id: str
     attempted: bool = False
+
+    def mark_frame_enqueued(self) -> None:
+        self.attempted = True
 
 
 class _CardDeliveryOptions(TypedDict, total=False):
@@ -7752,6 +7760,7 @@ async def ensure_runner_connected(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     raise_host_refusal: bool = False,
+    card_answer_wake: _CardAnswerWake | None = None,
 ) -> tuple[httpx.AsyncClient | None, Conversation]:
     """
     Bring a wakeable session's runner online for out-of-band resource access.
@@ -7821,11 +7830,15 @@ async def ensure_runner_connected(
     # A resumable managed host whose persisted liveness has gone stale wakes
     # in place; re-read the row and re-resolve, since the wake may have
     # relaunched the runner and rebound the session.
-    if conv.host_id is not None and await _maybe_wake_stale_resumable_managed_sandbox(
-        session_id=session_id,
-        conv=conv,
-        app_state=app_state,
-        conversation_store=conversation_store,
+    if (
+        card_answer_wake is None
+        and conv.host_id is not None
+        and await _maybe_wake_stale_resumable_managed_sandbox(
+            session_id=session_id,
+            conv=conv,
+            app_state=app_state,
+            conversation_store=conversation_store,
+        )
     ):
         conv = await _reread()
         runner_client = await _get_runner_client(
@@ -7850,7 +7863,8 @@ async def ensure_runner_connected(
             # gone) before relaunching — otherwise we'd spawn a second runner
             # and orphan the one still coming up.
             if (
-                conv.runner_id is not None
+                card_answer_wake is None
+                and conv.runner_id is not None
                 and host_registry is not None
                 and _facade._HOST_BOUND_RUNNER_CONNECT_GRACE_S > 0
             ):
@@ -7867,12 +7881,23 @@ async def ensure_runner_connected(
                 )
                 if runner_client is not None:
                     return runner_client, await _reread()
-            launch_attempt = await _launch_runner_on_host(
-                conv,
-                conversation_store,
-                host_registry,
-                host_conn,
-            )
+            if card_answer_wake is None:
+                launch_attempt = await _launch_runner_on_host(
+                    conv, conversation_store, host_registry, host_conn
+                )
+            else:
+                launch_attempt = await _launch_runner_on_host(
+                    conv,
+                    conversation_store,
+                    host_registry,
+                    host_conn,
+                    runner_router=runner_router,
+                    caller="card_answer",
+                    request_id=card_answer_wake.elicitation_id,
+                    on_frame_enqueued=card_answer_wake.mark_frame_enqueued,
+                )
+                if launch_attempt.not_enqueued:
+                    return None, await _reread()
             # A harness-not-configured or workspace-missing refusal means the
             # runner will never appear — don't set relaunched_runner_id or the
             # caller will wait out the full connect timeout for nothing.
@@ -7916,7 +7941,7 @@ async def ensure_runner_connected(
                     )
             if _refusal_code is None:
                 relaunched_runner_id = launch_attempt.runner_id
-        elif await _maybe_relaunch_managed_sandbox(
+        elif card_answer_wake is None and await _maybe_relaunch_managed_sandbox(
             session_id=session_id,
             conv=conv,
             app_state=app_state,
@@ -14058,18 +14083,19 @@ async def _post_system_message(
             session_id,
         )
         return False
+    if card_answer_wake is not None and not _can_wake_for_card_answer(conv):
+        return False
     runner_client = await _get_runner_client(session_id, runner_router)
+    initialize_woken_runner = card_answer_wake is not None and card_answer_wake.attempted
     if runner_client is None and card_answer_wake is not None and not card_answer_wake.attempted:
         app_state = card_answer_wake.app_state
         host_registry = getattr(app_state, "host_registry", None)
         if (
             conv.host_id is not None
-            and not conv.archived
             and session_id not in _intentional_stop_sessions
             and host_registry is not None
             and host_registry.get(conv.host_id) is not None
         ):
-            card_answer_wake.attempted = True
             runner_client, conv = await ensure_runner_connected(
                 session_id=session_id,
                 conv=conv,
@@ -14077,17 +14103,9 @@ async def _post_system_message(
                 conversation_store=conversation_store,
                 runner_router=runner_router,
                 raise_host_refusal=True,
+                card_answer_wake=card_answer_wake,
             )
-            if runner_client is not None:
-                await _ensure_runner_session_initialized(
-                    session_id,
-                    conv,
-                    runner_client,
-                    conversation_store,
-                    initializer=getattr(app_state, "runner_session_initializer", None),
-                    suppress_recovery_turn=True,
-                    trigger="card_answer",
-                )
+            initialize_woken_runner = True
     if runner_client is None:
         # WARNING (not DEBUG): an unbound session is the transient-miss case
         # retried by callers — surface it rather than burying it as routine.
@@ -14096,6 +14114,18 @@ async def _post_system_message(
             session_id,
         )
         return False
+    if card_answer_wake is not None and initialize_woken_runner:
+        if not _can_wake_for_card_answer(conv):
+            return False
+        await _ensure_runner_session_initialized(
+            session_id,
+            conv,
+            runner_client,
+            conversation_store,
+            initializer=getattr(card_answer_wake.app_state, "runner_session_initializer", None),
+            suppress_recovery_turn=True,
+            trigger="card_answer",
+        )
     # Ensure the session's SSE relay is live so the wake turn's output is
     # persisted (parity with post_event).
     _ensure_runner_relay(
@@ -14132,6 +14162,14 @@ async def _post_system_message(
         if agent_store is not None and conv.agent_id
         else None
     )
+    if card_answer_wake is not None:
+        # If the process dies during the forward, recovery treats the answer
+        # as possibly accepted. A definitive failure reopens it below.
+        await asyncio.to_thread(
+            conversation_store.update_detached_card,
+            card_answer_wake.elicitation_id,
+            state="settled",
+        )
     try:
         # None args: a system notice carries no agent/files/artifacts; the runner
         # recomputes has_mcp_servers from the session's cached spec.
@@ -14151,14 +14189,33 @@ async def _post_system_message(
                 else None
             ),
         )
-    except (httpx.HTTPError, HTTPException, OmnigentError):
-        _logger.warning(
-            "system message POST failed for session=%s",
-            session_id,
-            exc_info=True,
-        )
-        return False
-    return dispatch.forwarded
+    except _NativeDeliveryUncertain:
+        raise
+    except Exception as exc:
+        definite_failure = isinstance(exc, (httpx.HTTPError, HTTPException, OmnigentError))
+        ambiguous_transport = isinstance(
+            exc, (_NativeForwardReplyLost, httpx.TransportError)
+        ) and (not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)))
+        if card_answer_wake is not None and (not definite_failure or ambiguous_transport):
+            raise _NativeDeliveryUncertain("The card answer forward did not settle.") from exc
+        if not definite_failure:
+            raise
+        _logger.warning("system message POST failed for session=%s", session_id, exc_info=True)
+        forwarded = False
+    else:
+        forwarded = dispatch.forwarded
+    if not forwarded and card_answer_wake is not None:
+        try:
+            await asyncio.to_thread(
+                conversation_store.update_detached_card,
+                card_answer_wake.elicitation_id,
+                state="answered",
+            )
+        except Exception as exc:
+            raise _NativeDeliveryUncertain(
+                "Could not reopen the card after a failed forward."
+            ) from exc
+    return forwarded
 
 
 async def _wake_parent_for_blocked_child(

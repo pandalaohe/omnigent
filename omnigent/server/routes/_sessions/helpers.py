@@ -7710,12 +7710,20 @@ class _HostLaunchAttempt:
         `omnigent setup` ..."``; ``None`` when there was no error.
     :param acknowledged: Whether the host confirmed ``status="launched"``;
         timeout and lost-connection attempts remain unconfirmed.
+    :param not_enqueued: Whether this attempt stopped before sending a frame.
     """
 
     runner_id: str
     error_code: str | None = None
     error: str | None = None
     acknowledged: bool = False
+    not_enqueued: bool = False
+
+
+def _can_wake_for_card_answer(conv: Conversation) -> bool:
+    from omnigent.util.session_lifecycle import is_session_closed
+
+    return not conv.archived and not is_session_closed(conv.labels, conv.title)
 
 
 async def _launch_runner_on_host(*args: Any, **kwargs: Any) -> _HostLaunchAttempt:
@@ -7946,6 +7954,7 @@ async def _launch_runner_on_host_impl(
     runner_router: RunnerRouter | None = None,
     caller: str = "recovery",
     request_id: str | None = None,
+    on_frame_enqueued: Callable[[], None] | None = None,
 ) -> _HostLaunchAttempt:
     """
     Ask a host to spawn a runner for a session and capture the result.
@@ -7995,6 +8004,8 @@ async def _launch_runner_on_host_impl(
                 error_code="session_not_found",
                 error="session was deleted while its relaunch was in flight",
             )
+        if caller == "card_answer" and not _can_wake_for_card_answer(fresh):
+            return _HostLaunchAttempt(runner_id=fresh.runner_id or "", not_enqueued=True)
         last = _relaunch_last_attempt.get(conv.id)
         # A waiter may already have read the active flight's replacement binding.
         if last is not None and last is not previous_attempt and last.runner_id == fresh.runner_id:
@@ -8034,6 +8045,12 @@ async def _launch_runner_on_host_impl(
                     action="reuse",
                 )
                 return _HostLaunchAttempt(runner_id=fresh.runner_id, acknowledged=True)
+        if caller == "card_answer" and fresh.runner_id:
+            status = await _query_host_runner_status(host_conn, host_registry, fresh.runner_id)
+            # The host joins any queued spawn before replying. A missing reply
+            # can mean that spawn is still pending, including after server restart.
+            if status not in {"dead", "unknown"}:
+                return _HostLaunchAttempt(runner_id=fresh.runner_id)
         attempt = await _launch_runner_on_host_locked(
             fresh,
             conversation_store,
@@ -8042,6 +8059,7 @@ async def _launch_runner_on_host_impl(
             runner_router=router,
             caller=caller,
             request_id=request_id,
+            on_frame_enqueued=on_frame_enqueued,
         )
         # Re-insert so the plain dict's insertion order is newest-last, then
         # evict from the front once past the cap.
@@ -8061,6 +8079,7 @@ async def _launch_runner_on_host_locked(
     runner_router: RunnerRouter | None = None,
     caller: str = "recovery",
     request_id: str | None = None,
+    on_frame_enqueued: Callable[[], None] | None = None,
 ) -> _HostLaunchAttempt:
     """The launch round-trip proper; runs under the conversation's lock."""
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
@@ -8071,6 +8090,10 @@ async def _launch_runner_on_host_locked(
         retained_runner_ids, conversation_store, host_conn.host_id, conv.id
     )
     startup = await host_registry.admit_launch(host_conn, conv.id)
+    if caller == "card_answer":
+        fresh = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        if fresh is None or not _can_wake_for_card_answer(fresh):
+            return _HostLaunchAttempt(runner_id=conv.runner_id or "", not_enqueued=True)
     superseded_runner_id = conv.runner_id
     reap_superseded = await _owns_host_runner(conv, conversation_store)
     binding_token = secrets.token_urlsafe(32)
@@ -8112,7 +8135,12 @@ async def _launch_runner_on_host_locked(
         ),
     )
     with runner_log_scope(conv.id, new_runner_id):
-        if reap_superseded and superseded_runner_id and conv.host_id is not None:
+        if (
+            caller != "card_answer"
+            and reap_superseded
+            and superseded_runner_id
+            and conv.host_id is not None
+        ):
             # The old runner is unbound as of the replace above; reap it so it
             # doesn't idle on the host. A sub-agent's inherited runner stays up
             # for the ancestor that owns it.
@@ -8175,6 +8203,14 @@ async def _launch_runner_on_host_locked(
             )
         )
         for enqueue_attempt in range(2):
+            if caller == "card_answer":
+                fresh = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+                if (
+                    fresh is None
+                    or not _can_wake_for_card_answer(fresh)
+                    or (fresh.runner_id, fresh.host_id) != (new_runner_id, conv.host_id)
+                ):
+                    return _HostLaunchAttempt(runner_id=new_runner_id, not_enqueued=True)
             launch_future: asyncio.Future[HostLaunchResult] = (
                 asyncio.get_running_loop().create_future()
             )
@@ -8206,7 +8242,18 @@ async def _launch_runner_on_host_locked(
                         enqueue_attempt=enqueue_attempt + 1,
                     ),
                 )
-                return _HostLaunchAttempt(runner_id=new_runner_id)
+                return _HostLaunchAttempt(runner_id=new_runner_id, not_enqueued=True)
+            if on_frame_enqueued is not None:
+                on_frame_enqueued()
+            if (
+                caller == "card_answer"
+                and reap_superseded
+                and superseded_runner_id
+                and conv.host_id is not None
+            ):
+                _spawn_superseded_runner_stop(
+                    conv.id, conv.host_id, superseded_runner_id, host_registry, conversation_store
+                )
             break
         try:
             result = await asyncio.wait_for(

@@ -123,6 +123,7 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.orchestration import (
     HarnessTimeoutPolicy,
+    _answer_delivery_notice_id,
     _CardAnswerWake,
     _CardDeliveryOptions,
     _deliver_with_retry,
@@ -672,6 +673,16 @@ async def _write_card_record(write: Callable[..., Any], *args: Any, **kwargs: An
     return True
 
 
+def _has_terminal_answer_notice(
+    card: DetachedCard, text: str, conversation_store: ConversationStore
+) -> bool:
+    return any(
+        conversation_store.get_item(card.session_id, _answer_delivery_notice_id(text, status))
+        is not None
+        for status in ("delivered", "delivery_uncertain")
+    )
+
+
 async def _deliver_card_verdict(
     card: DetachedCard,
     text: str,
@@ -711,7 +722,9 @@ async def _deliver_card_verdict(
             return
         _question_answer_deliveries.add(delivery_key)
         if wake_app_state is not None:
-            delivery_options["card_answer_wake"] = _CardAnswerWake(wake_app_state)
+            delivery_options["card_answer_wake"] = _CardAnswerWake(
+                wake_app_state, card.elicitation_id
+            )
     task = asyncio.current_task()
     lapsed = card.kind == "approval" and card.grant_key is None and card.verdict is not None
     if granted and task is not None:
@@ -720,14 +733,29 @@ async def _deliver_card_verdict(
         while True:
             try:
                 records = await asyncio.to_thread(conversation_store.list_detached_cards)
+                current = next(
+                    (row for row in records if row.elicitation_id == card.elicitation_id), None
+                )
+                if current is None or current.state not in {"answered", "settled"}:
+                    return
+                recorded = accepted_question and await asyncio.to_thread(
+                    _has_terminal_answer_notice, current, text, conversation_store
+                )
             except Exception:
                 _logger.warning("Could not read an owed detached card", exc_info=True)
                 await asyncio.sleep(_CARD_RETRY_INTERVAL_S)
                 continue
-            current = next(
-                (row for row in records if row.elicitation_id == card.elicitation_id), None
-            )
-            if current is None or current.state != "answered":
+            if recorded or (accepted_question and current.state == "settled"):
+                if not recorded:
+                    await _persist_answer_delivery_notice(
+                        card.session_id, text, conversation_store, status="delivery_uncertain"
+                    )
+                while not await _write_card_record(
+                    conversation_store.delete_detached_card, card.elicitation_id
+                ):
+                    await asyncio.sleep(_CARD_RETRY_INTERVAL_S)
+                return
+            if current.state != "answered":
                 return
             remaining = current.expires_at - time.time()
             if remaining <= 0:
@@ -789,6 +817,10 @@ async def _deliver_card_verdict(
                 )
                 await asyncio.sleep(min(_CARD_RETRY_INTERVAL_S, max(remaining, 0)))
                 continue
+            if accepted_question:
+                await _persist_answer_delivery_notice(
+                    card.session_id, text, conversation_store, status="delivered"
+                )
             if result is not None:
                 comment_ids = (result.meta or {}).get("omnigent_comment_ids")
                 if isinstance(comment_ids, list):
@@ -823,7 +855,7 @@ async def _deliver_card_verdict(
                 fields = {}
             while not await _write_card_record(write, *args, **fields):
                 await asyncio.sleep(_CARD_RETRY_INTERVAL_S)
-            if not lapsed:
+            if not lapsed and not accepted_question:
                 await _persist_answer_delivery_notice(
                     card.session_id, text, conversation_store, status="delivered"
                 )
@@ -1177,15 +1209,28 @@ async def restore_detached_cards(
             ElicitationResult.model_validate(card.verdict) if card.verdict is not None else None
         )
         granted = card.grant_key is not None and verdict is not None and verdict.action == "accept"
+        recover_question = (
+            card.kind == "question"
+            and verdict is not None
+            and verdict.action == "accept"
+            and card.state in {"answered", "settled"}
+            and card.delivery_text is not None
+        )
         expired_owed_grant = remaining <= 0 and card.state == "answered" and granted
-        if remaining <= 0 and card.state == "answered" and not granted and card.delivery_text:
+        if (
+            remaining <= 0
+            and card.state == "answered"
+            and not granted
+            and not recover_question
+            and card.delivery_text
+        ):
             await _persist_answer_delivery_notice(
                 card.session_id, card.delivery_text, conversation_store, status="undelivered"
             )
         if (
             conv is None
-            or (remaining <= 0 and not expired_owed_grant)
-            or (card.state == "settled" and not granted)
+            or (remaining <= 0 and not expired_owed_grant and not recover_question)
+            or (card.state == "settled" and not granted and not recover_question)
         ):
             await _write_card_record(conversation_store.delete_detached_card, card.elicitation_id)
             continue
@@ -1211,7 +1256,7 @@ async def restore_detached_cards(
                 source_id=card.elicitation_id,
                 answered_at=(card.verdict or {}).get("answer_stamp", 0),
             )
-        if card.state == "answered" and card.delivery_text is not None:
+        if (card.state == "answered" or recover_question) and card.delivery_text is not None:
             task = asyncio.create_task(
                 _deliver_card_verdict(
                     card,
