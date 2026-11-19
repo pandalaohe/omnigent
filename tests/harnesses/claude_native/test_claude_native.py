@@ -6191,6 +6191,17 @@ async def test_resolve_cold_resume_args_reuses_existing_local_claude_transcript(
                 "message": {"role": "user", "content": "stale local text"},
             }
         )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "user",
+                "uuid": "local-uuid-2",
+                "parentUuid": "local-uuid",
+                "sessionId": "claude-uuid-abc",
+                "cwd": str(tmp_path / "other-workspace"),
+                "message": {"role": "user", "content": "continue after cd"},
+            }
+        )
         + "\n",
         encoding="utf-8",
     )
@@ -6235,7 +6246,7 @@ async def test_resolve_cold_resume_args_reuses_existing_local_claude_transcript(
         args, resolution = await claude_native._resolve_cold_resume_args(client, "conv_abc")
 
     assert args == ("--resume", "claude-uuid-abc")
-    assert resolution.reused_local is True
+    assert resolution.mode == "kept"
     assert item_requests == 0
     assert transcript_path.read_bytes() == original
 
@@ -6296,6 +6307,37 @@ def test_resumable_transcript_accepts_historical_shapes_and_torn_tail(
     assert claude_native._is_resumable_claude_transcript(
         transcript,
         external_session_id=sid,
+    )
+
+
+@pytest.mark.parametrize(
+    ("first_cwd", "later_cwd", "later_sid", "expected"),
+    [
+        pytest.param("project", "other", "sid", True, id="changed-cwd"),
+        pytest.param("other", "project", "sid", False, id="wrong-project"),
+        pytest.param("project", "other", "other-sid", False, id="wrong-session"),
+    ],
+)
+def test_resumable_transcript_checks_launch_project_and_session(
+    tmp_path: Path, first_cwd: str, later_cwd: str, later_sid: str, expected: bool
+) -> None:
+    workspace = Path("/opt/work/project")
+    project = tmp_path / claude_native._sanitize_claude_project_name(str(workspace))
+    transcript = project / "sid.jsonl"
+    original = _write_resumable_local_transcript(
+        transcript, sid="sid", cwd=workspace.with_name(first_cwd), text="start"
+    )
+    later_record = {
+        "type": "user",
+        "sessionId": later_sid,
+        "cwd": str(workspace.with_name(later_cwd)),
+        "message": {"role": "user", "content": "continue"},
+    }
+    transcript.write_bytes(original + (json.dumps(later_record) + "\n").encode())
+
+    assert (
+        claude_native._is_resumable_claude_transcript(transcript, external_session_id="sid")
+        is expected
     )
 
 

@@ -6200,17 +6200,18 @@ def _is_resumable_claude_transcript(
 
     ``--resume`` against an empty or non-JSONL file exits fatally instead of
     starting, which for claude-native (terminal == agent) kills the session.
-    Every complete non-empty line must be a JSON object, native session ids
-    must match, and stored ``cwd`` metadata must agree with the containing
-    Claude project directory. One malformed final line without a newline is
-    tolerated because it is a normal crash artifact. At least one user or
-    assistant message is required.
+    Every complete non-empty line must be a JSON object and native session ids
+    must match. The first recorded ``cwd`` must agree with the containing
+    Claude project directory. Claude Code can record later directory changes.
+    One malformed final line without a newline is tolerated because it is a
+    normal crash artifact. At least one user or assistant message is required.
 
     :param path: Candidate ``<sid>.jsonl`` transcript path.
     :returns: ``True`` when the file exists and holds a JSON-object line.
     """
     try:
         resumable = False
+        project_checked = False
         with path.open("r", encoding="utf-8") as handle:
             lines = handle.readlines()
             for line_number, raw_line in enumerate(lines, start=1):
@@ -6233,10 +6234,10 @@ def _is_resumable_claude_transcript(
                 ):
                     return False
                 cwd = record.get("cwd")
-                if isinstance(cwd, str) and (
-                    _sanitize_claude_project_name(cwd) != path.parent.name
-                ):
-                    return False
+                if not project_checked and isinstance(cwd, str):
+                    if _sanitize_claude_project_name(cwd) != path.parent.name:
+                        return False
+                    project_checked = True
                 if record.get("type") in {"user", "assistant"} and isinstance(
                     record.get("message"), dict
                 ):
