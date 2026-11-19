@@ -15,12 +15,6 @@ def test_startup_release_keeps_unknown_work_and_advances_the_queue(
     chat = chat_session_contract
     artifacts = Path(output_path)
     page.set_viewport_size({"width": width, "height": 900})
-    # Start from a floating spot; a new phone docks the assistant at the edge instead.
-    page.add_init_script(
-        "localStorage.getItem('omnigent:mobile-assistant-device-state') ||"
-        " localStorage.setItem('omnigent:mobile-assistant-device-state',"
-        " JSON.stringify({position: {x: 0.86, y: 0.2}}))"
-    )
     startup = {
         "id": "a" * 32,
         "host_id": chat.host_id,
@@ -137,26 +131,7 @@ def test_startup_release_keeps_unknown_work_and_advances_the_queue(
         )
         expect(page.get_by_text(label, exact=True)).to_be_visible()
         expect(page.get_by_test_id("working-indicator")).to_have_count(0)
-        if state == "operator_released" and width == 390:
-            # The existing control is movable; keep startup layout unchanged.
-            assistant = page.get_by_role("button", name="Open floating assistant", exact=True)
-            box = assistant.bounding_box()
-            assert box is not None
-            page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-            page.mouse.down()
-            page.mouse.move(335, 450, steps=8)
-            page.mouse.up()
-            expect(assistant).to_have_attribute("aria-expanded", "false")
-            page.screenshot(
-                path=str(artifacts / "operator_released-moved-control.png"), full_page=True
-            )
     page.reload()
     chat.wait_for_stream()
     expect(page.get_by_text("Session opened", exact=True)).to_be_visible()
-    if width == 390:
-        restored = page.get_by_role(
-            "button", name="Open floating assistant", exact=True
-        ).bounding_box()
-        assert restored is not None
-        assert abs(restored["y"] + restored["height"] / 2 - 450) < 5
     assert chat.event_posts == []

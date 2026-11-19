@@ -284,6 +284,55 @@ async def test_bridge_metadata_input_resize_and_detach(instance, read_only):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("read_only", [False, True])
+async def test_conpty_host_clipboard_reply_is_not_pty_input(instance, monkeypatch, read_only):
+    from omnigent.terminals import host_clipboard
+
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+
+    async def read_clipboard():
+        read_started.set()
+        await release_read.wait()
+        return "pwd", True
+
+    monkeypatch.setattr(host_clipboard, "read_host_clipboard", read_clipboard)
+    process = _Process()
+    instance._process, instance.running = process, True
+    ws = _WebSocket()
+    bridge = asyncio.create_task(bridge_conpty_to_websocket(ws, instance, read_only=read_only))
+
+    def request(request_id):
+        ws.incoming.put_nowait(
+            {
+                "type": "websocket.receive",
+                "text": json.dumps({"type": "host-clipboard-read", "id": request_id}),
+            }
+        )
+
+    try:
+        capability = {"type": "capabilities", "hostClipboard": 1}
+        await poll_until_async(lambda: capability in ws.frames)
+        request("first")
+        if read_only:
+            refusal = {"type": "host-clipboard", "id": "first", "ok": False, "reason": "read-only"}
+            await poll_until_async(lambda: refusal in ws.frames)
+            assert not read_started.is_set()
+        else:
+            await asyncio.wait_for(read_started.wait(), 3)
+            request("second")
+            busy = {"type": "host-clipboard", "id": "second", "ok": False, "reason": "busy"}
+            await poll_until_async(lambda: busy in ws.frames)
+            release_read.set()
+            reply = {"type": "host-clipboard", "id": "first", "ok": True, "text": "pwd"}
+            await poll_until_async(lambda: reply in ws.frames)
+        assert not process.writes
+    finally:
+        ws.incoming.put_nowait({"type": "websocket.disconnect"})
+        await asyncio.wait_for(bridge, 3)
+
+
+@pytest.mark.asyncio
 async def test_bridge_browser_write_runs_off_the_event_loop_thread(instance):
     """A browser input write must never block the event-loop thread."""
     process = _Process()

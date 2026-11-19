@@ -1,10 +1,8 @@
 import { useSyncExternalStore } from "react";
-import { dispatchArchiveSession, dispatchPollSessions } from "@/hooks/useSessionPollingHotkeys";
-import { dispatchSelectWorkspaceTab } from "@/hooks/useWorkspaceTabHotkeys";
+import type { TerminalKeys, TerminalKeysPreset } from "@/lib/terminalKeys";
 import {
   DEFAULT_SHORTCUT_DEFINITIONS,
   currentShortcutPlatform,
-  resolveShortcutBindings,
   type ShortcutActionId,
   type ShortcutChord,
 } from "@/lib/keyboardShortcutPreferences";
@@ -14,9 +12,7 @@ import {
   normalizeChord,
   normalizeTerminalButtons,
   type TerminalBar,
-  type TerminalBarKey,
   type TerminalKeyRowItem,
-  type TerminalStickyModifiers,
 } from "@/lib/terminalKeyBar";
 import { queueUserPreferencePatch } from "@/lib/userPreferencesSync";
 
@@ -100,11 +96,8 @@ export const MOBILE_ASSISTANT_DIRECT_ACTIONS = {
   openAgents: { label: "Agents" },
   openSideChats: { label: "Side chats" },
 };
-export type MobileAssistantDirectAction =
-  keyof typeof MOBILE_ASSISTANT_DIRECT_ACTIONS | "stopResponse" | "renameSession" | "focusComposer";
 export type MobileAssistantActionId =
   ShortcutActionId | keyof typeof MOBILE_ASSISTANT_DIRECT_ACTIONS;
-export const MOBILE_ASSISTANT_ACTION_EVENT = "omnigent:mobile-assistant-action";
 export const MOBILE_ASSISTANT_ACTION_DEFINITIONS: Record<
   MobileAssistantActionId,
   { label: string; note?: string }
@@ -164,6 +157,9 @@ export interface MobileAssistantPreferences {
   terminalBar?: TerminalBar;
   terminalBarPreset?: TerminalBar;
   terminalLegacyBasis?: string;
+  terminalKeys?: TerminalKeys;
+  terminalKeysPreset?: TerminalKeysPreset;
+  terminalKeyboard?: unknown;
   chatActionsRevision?: 1;
   position?: { x: number; y: number };
   dock?: MobileAssistantDock;
@@ -223,27 +219,6 @@ export const MOBILE_ASSISTANT_MAX_BUTTONS = 10;
 export const MOBILE_ASSISTANT_STORAGE_KEY = "omnigent:mobile-assistant-preferences";
 export const MOBILE_ASSISTANT_DEVICE_STORAGE_KEY = "omnigent:mobile-assistant-device-state";
 export const MOBILE_ASSISTANT_CHANGED_EVENT = "omnigent:mobile-assistant-changed";
-export const TERMINAL_SOFT_KEY_EVENT = "omnigent:terminal-soft-key";
-
-export interface TerminalBarTarget {
-  isCurrent: () => boolean;
-  press: (key: TerminalBarKey, gesture: "tap" | "longPress" | "repeat") => void;
-}
-
-export interface TerminalSoftKeyEventDetail {
-  action: MobileAssistantSoftKey;
-  /** Raw terminal payload for modified key chords or phrase buttons. */
-  data?: string;
-  handled: boolean;
-  preferredTarget?: HTMLElement | null;
-  terminalBarKey?: TerminalBarKey;
-  terminalGesture?: "tap" | "longPress" | "repeat";
-  onTerminalTarget?: (target: TerminalBarTarget) => void;
-  onStickyChanged?: (next: TerminalStickyModifiers) => void;
-  onStickySubscribed?: (unsubscribe: () => void) => void;
-  candidates?: { focused: boolean; ownsPreferredTarget: boolean; send: () => void }[];
-}
-
 const SOFT_KEY_DEFAULTS: Record<MobileAssistantSoftKey, ShortcutChord> = {
   escape: { code: "Escape", modifiers: [] },
   tab: { code: "Tab", modifiers: [] },
@@ -256,66 +231,7 @@ const SOFT_KEY_DEFAULTS: Record<MobileAssistantSoftKey, ShortcutChord> = {
   end: { code: "End", modifiers: [] },
 };
 
-export interface TypableTerminalsSnapshot {
-  count: number;
-  withBar: number;
-}
-
-let nextTypableTerminalId = 1;
-const typableTerminals = new Map<number, boolean>();
-const typableTerminalListeners = new Set<() => void>();
-let typableTerminalsSnapshot: TypableTerminalsSnapshot = { count: 0, withBar: 0 };
-
-function updateTypableTerminalsSnapshot(): void {
-  let withBar = 0;
-  for (const hasBar of typableTerminals.values()) {
-    if (hasBar) withBar += 1;
-  }
-  const count = typableTerminals.size;
-  if (typableTerminalsSnapshot.count === count && typableTerminalsSnapshot.withBar === withBar) {
-    return;
-  }
-  typableTerminalsSnapshot = { count, withBar };
-  for (const listener of typableTerminalListeners) {
-    listener();
-  }
-}
-
-export function registerTypableTerminal(hasBar: boolean): () => void {
-  const id = nextTypableTerminalId++;
-  typableTerminals.set(id, hasBar);
-  updateTypableTerminalsSnapshot();
-  return () => {
-    if (!typableTerminals.delete(id)) return;
-    updateTypableTerminalsSnapshot();
-  };
-}
-
-function subscribeTypableTerminals(listener: () => void): () => void {
-  typableTerminalListeners.add(listener);
-  return () => {
-    typableTerminalListeners.delete(listener);
-  };
-}
-
-function getTypableTerminalsSnapshot(): TypableTerminalsSnapshot {
-  return typableTerminalsSnapshot;
-}
-
-const SERVER_TYPABLE_TERMINALS_SNAPSHOT: TypableTerminalsSnapshot = {
-  count: 0,
-  withBar: 0,
-};
-
-export function useTypableTerminals(): TypableTerminalsSnapshot {
-  return useSyncExternalStore(
-    subscribeTypableTerminals,
-    getTypableTerminalsSnapshot,
-    () => SERVER_TYPABLE_TERMINALS_SNAPSHOT,
-  );
-}
-
-const LEGACY_DEFAULT_BUTTONS: MobileAssistantButton[] = [
+export const LEGACY_DEFAULT_BUTTONS: MobileAssistantButton[] = [
   {
     id: "default-escape",
     label: "Esc",
@@ -685,6 +601,13 @@ export function readMobileAssistantPreferences(): ResolvedMobileAssistantPrefere
         ? { terminalButtons: undefined }
         : {}),
       ...(parsed.terminalBar !== undefined ? { terminalBar: parsed.terminalBar } : {}),
+      ...(parsed.terminalKeys !== undefined ? { terminalKeys: parsed.terminalKeys } : {}),
+      ...(parsed.terminalKeysPreset !== undefined
+        ? { terminalKeysPreset: parsed.terminalKeysPreset }
+        : {}),
+      ...(parsed.terminalKeyboard !== undefined
+        ? { terminalKeyboard: parsed.terminalKeyboard }
+        : {}),
       ...(parsed.terminalBarPreset !== undefined
         ? { terminalBarPreset: parsed.terminalBarPreset }
         : {}),
@@ -726,6 +649,13 @@ export function writeMobileAssistantPreferences(preferences: MobileAssistantPref
         ? { terminalLegacyBasis: preferences.terminalLegacyBasis }
         : {}),
       chatActionsRevision: 1,
+      ...(preferences.terminalKeys !== undefined ? { terminalKeys: preferences.terminalKeys } : {}),
+      ...(preferences.terminalKeysPreset !== undefined
+        ? { terminalKeysPreset: preferences.terminalKeysPreset }
+        : {}),
+      ...(preferences.terminalKeyboard !== undefined
+        ? { terminalKeyboard: preferences.terminalKeyboard }
+        : {}),
       ...(preferences.position ? { position: preferences.position } : {}),
       ...(preferences.dock ? { dock: preferences.dock } : {}),
     };
@@ -770,34 +700,6 @@ export function useMobileAssistantPreferences(): ResolvedMobileAssistantPreferen
   return readMobileAssistantPreferences();
 }
 
-/** Persist only this device's on-screen placement without syncing button data. */
-export function writeMobileAssistantDeviceState(
-  placement: Pick<MobileAssistantPreferences, "position" | "dock">,
-): void {
-  if (typeof window === "undefined") return;
-  try {
-    const current = readMobileAssistantPreferences();
-    const canonical: MobileAssistantPreferences = {
-      ...current,
-      ...(placement.position ? { position: placement.position } : { position: undefined }),
-      ...(placement.dock ? { dock: placement.dock } : { dock: undefined }),
-    };
-    const deviceState = {
-      ...(canonical.position ? { position: canonical.position } : {}),
-      ...(canonical.dock ? { dock: canonical.dock } : {}),
-    };
-    window.localStorage.setItem(MOBILE_ASSISTANT_STORAGE_KEY, JSON.stringify(canonical));
-    if (Object.keys(deviceState).length > 0) {
-      window.localStorage.setItem(MOBILE_ASSISTANT_DEVICE_STORAGE_KEY, JSON.stringify(deviceState));
-    } else {
-      window.localStorage.removeItem(MOBILE_ASSISTANT_DEVICE_STORAGE_KEY);
-    }
-    window.dispatchEvent(new Event(MOBILE_ASSISTANT_CHANGED_EVENT));
-  } catch {
-    // Placement is optional; keep the assistant usable at its default point.
-  }
-}
-
 function codeToKey(code: string): string {
   if (/^Key[A-Z]$/.test(code)) return code.slice(3).toLowerCase();
   if (/^Digit[0-9]$/.test(code)) return code.slice(5);
@@ -820,19 +722,15 @@ function codeToKey(code: string): string {
   return labels[code] ?? code;
 }
 
-function keyboardEventInit(chord: ShortcutChord): KeyboardEventInit {
-  const platform = currentShortcutPlatform();
-  const modifiers = new Set(chord.modifiers);
-  return {
-    key: codeToKey(chord.code),
-    code: chord.code,
-    ctrlKey: modifiers.has("control") || (modifiers.has("primary") && platform !== "macos"),
-    metaKey: modifiers.has("meta") || (modifiers.has("primary") && platform === "macos"),
-    altKey: modifiers.has("alt"),
-    shiftKey: modifiers.has("shift"),
-    bubbles: true,
-    cancelable: true,
-  };
+export function mobileAssistantBindingLabel(binding: MobileAssistantButtonBinding): string {
+  if (binding.kind === "shortcut")
+    return MOBILE_ASSISTANT_ACTION_DEFINITIONS[binding.actionId].label;
+  if (binding.kind === "text") return binding.submit ? `${binding.text} + send` : binding.text;
+  const parts = binding.chord.modifiers.map((modifier) =>
+    modifier === "primary" ? "Primary" : modifier[0].toUpperCase() + modifier.slice(1),
+  );
+  parts.push(codeToKey(binding.chord.code));
+  return parts.join("+");
 }
 
 export function softKeyForChord(chord: ShortcutChord): MobileAssistantSoftKey | null {
@@ -840,55 +738,6 @@ export function softKeyForChord(chord: ShortcutChord): MobileAssistantSoftKey | 
   return (Object.entries(SOFT_KEY_DEFAULTS).find(
     ([, candidate]) => candidate.code === chord.code,
   )?.[0] ?? null) as MobileAssistantSoftKey | null;
-}
-
-export function isDomTargetVisible(
-  element: HTMLElement | null | undefined,
-): element is HTMLElement {
-  if (!element?.isConnected) return false;
-  if (element.closest('[inert], [aria-hidden="true"], [hidden], .invisible')) {
-    return false;
-  }
-  for (let current: HTMLElement | null = element; current; current = current.parentElement) {
-    const style = getComputedStyle(current);
-    if (
-      style.display === "none" ||
-      style.visibility === "hidden" ||
-      style.visibility === "collapse"
-    ) {
-      return false;
-    }
-  }
-  if (typeof element.checkVisibility === "function") {
-    return element.checkVisibility({
-      checkVisibilityCSS: true,
-      visibilityProperty: true,
-      contentVisibilityAuto: true,
-    } as CheckVisibilityOptions);
-  }
-  return true;
-}
-
-function isXtermElement(element: HTMLElement): boolean {
-  return element.classList.contains("xterm-helper-textarea") || Boolean(element.closest(".xterm"));
-}
-
-function isEditableDomInput(element: HTMLElement): boolean {
-  if (isXtermElement(element)) return false;
-  return (
-    element instanceof HTMLInputElement ||
-    element instanceof HTMLTextAreaElement ||
-    element.isContentEditable
-  );
-}
-
-function preferredTarget(preferredDomTarget?: HTMLElement | null): HTMLElement {
-  const activeTarget =
-    document.activeElement instanceof HTMLElement && isDomTargetVisible(document.activeElement)
-      ? document.activeElement
-      : document.body;
-  if (!isDomTargetVisible(preferredDomTarget)) return activeTarget;
-  return preferredDomTarget;
 }
 
 export function terminalDataForChord(
@@ -1026,215 +875,4 @@ export function terminalDataForChord(
     if (char !== null) return hasAlt ? `\x1b${char}` : char;
   }
   return null;
-}
-
-function dispatchToTerminal(
-  payload: Pick<
-    TerminalSoftKeyEventDetail,
-    | "action"
-    | "data"
-    | "terminalBarKey"
-    | "terminalGesture"
-    | "onStickyChanged"
-    | "onStickySubscribed"
-    | "onTerminalTarget"
-  >,
-  target: HTMLElement,
-): boolean {
-  const detail: TerminalSoftKeyEventDetail = {
-    ...payload,
-    handled: false,
-    preferredTarget: target,
-    candidates: [],
-  };
-  window.dispatchEvent(
-    new CustomEvent<TerminalSoftKeyEventDetail>(TERMINAL_SOFT_KEY_EVENT, { detail }),
-  );
-  const ownedTerminal = detail.candidates?.find((candidate) => candidate.ownsPreferredTarget);
-  const focusedTerminal = detail.candidates?.find((candidate) => candidate.focused);
-  // A mobile palette click can move DOM focus to app chrome after the TUI
-  // was active. When exactly one writable terminal is mounted, it remains
-  // the unambiguous target even if neither focus heuristic survived.
-  const targetIsEditable = isEditableDomInput(target);
-  const onlyTerminal =
-    !targetIsEditable && detail.candidates?.length === 1 ? detail.candidates[0] : undefined;
-  const terminal = ownedTerminal ?? focusedTerminal ?? onlyTerminal;
-  if (!detail.handled && terminal) {
-    terminal.send();
-    detail.handled = true;
-  }
-  if (detail.handled) return true;
-  if (!targetIsEditable && (target === document.body || isXtermElement(target))) {
-    const fallbackTerminal = detail.candidates?.[0];
-    if (fallbackTerminal) {
-      fallbackTerminal.send();
-      return true;
-    }
-  }
-  return false;
-}
-
-/** Bind held gestures once, so repeats cannot move to another terminal. */
-export function bindTerminalBarTarget(
-  preferredDomTarget?: HTMLElement | null,
-  callbacks?: Pick<TerminalSoftKeyEventDetail, "onStickyChanged" | "onStickySubscribed">,
-): TerminalBarTarget | null {
-  let target: TerminalBarTarget | null = null;
-  dispatchToTerminal(
-    {
-      action: "enter",
-      ...callbacks,
-      onTerminalTarget: (next) => {
-        target = next;
-      },
-    },
-    preferredTarget(preferredDomTarget),
-  );
-  return target;
-}
-
-/** Dispatch a full terminal-bar key (including text and Shift) to the active terminal. */
-export function dispatchTerminalBarKey(
-  key: TerminalBarKey,
-  preferredDomTarget?: HTMLElement | null,
-  callbacks?: Pick<TerminalSoftKeyEventDetail, "onStickyChanged" | "onStickySubscribed">,
-  gesture: "tap" | "longPress" | "repeat" = "tap",
-): void {
-  dispatchToTerminal(
-    { action: "enter", terminalBarKey: key, terminalGesture: gesture, ...callbacks },
-    preferredTarget(preferredDomTarget),
-  );
-}
-
-function dispatchGlobalShortcutChord(
-  chord: ShortcutChord,
-  preferredDomTarget?: HTMLElement | null,
-): void {
-  const activeElement =
-    document.activeElement instanceof HTMLElement ? document.activeElement : null;
-  if (activeElement && isXtermElement(activeElement)) {
-    activeElement.blur();
-  }
-  const target = preferredTarget(preferredDomTarget);
-  const eventTarget = isXtermElement(target) ? document.body : target;
-  eventTarget.dispatchEvent(new KeyboardEvent("keydown", keyboardEventInit(chord)));
-}
-
-function dispatchChord(chord: ShortcutChord, preferredDomTarget?: HTMLElement | null): void {
-  const target = preferredTarget(preferredDomTarget);
-  const softKey = softKeyForChord(chord);
-  if (softKey) {
-    if (dispatchToTerminal({ action: softKey }, target)) return;
-  } else {
-    const data = terminalDataForChord(chord);
-    if (data !== null && dispatchToTerminal({ action: "enter", data }, target)) return;
-  }
-  target.dispatchEvent(new KeyboardEvent("keydown", keyboardEventInit(chord)));
-}
-
-function insertText(text: string, target: HTMLElement): boolean {
-  if (
-    !isEditableDomInput(target) ||
-    !(target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement)
-  ) {
-    return false;
-  }
-  const start = target.selectionStart ?? target.value.length;
-  const end = target.selectionEnd ?? start;
-  target.setRangeText(text, start, end, "end");
-  target.dispatchEvent(
-    new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }),
-  );
-  target.focus();
-  return true;
-}
-
-export function mobileAssistantBindingLabel(binding: MobileAssistantButtonBinding): string {
-  if (binding.kind === "shortcut")
-    return MOBILE_ASSISTANT_ACTION_DEFINITIONS[binding.actionId].label;
-  if (binding.kind === "text") return binding.submit ? `${binding.text} + send` : binding.text;
-  const parts = binding.chord.modifiers.map((modifier) =>
-    modifier === "primary" ? "Primary" : modifier[0].toUpperCase() + modifier.slice(1),
-  );
-  parts.push(codeToKey(binding.chord.code));
-  return parts.join("+");
-}
-
-const WORKSPACE_TAB_SHORTCUTS: Partial<Record<ShortcutActionId, 1 | 2 | 3 | 4>> = {
-  selectWorkspaceTab1: 1,
-  selectWorkspaceTab2: 2,
-  selectWorkspaceTab3: 3,
-  selectWorkspaceTab4: 4,
-};
-
-export function dispatchMobileAssistantButton(
-  button: MobileAssistantButton,
-  preferredDomTarget?: HTMLElement | null,
-): void {
-  const binding = button.binding;
-  if (binding.kind === "shortcut") {
-    if (
-      binding.actionId in MOBILE_ASSISTANT_DIRECT_ACTIONS ||
-      binding.actionId === "stopResponse" ||
-      binding.actionId === "renameSession" ||
-      binding.actionId === "focusComposer"
-    ) {
-      window.dispatchEvent(
-        new CustomEvent(MOBILE_ASSISTANT_ACTION_EVENT, { detail: { actionId: binding.actionId } }),
-      );
-      return;
-    }
-    if (binding.actionId === "pollSessions") {
-      dispatchPollSessions();
-      return;
-    }
-    if (binding.actionId === "archiveSession") {
-      dispatchArchiveSession();
-      return;
-    }
-    // The switcher needs a held modifier to cycle and release to commit, which
-    // a tap can't express.
-    if (binding.actionId === "recentSessions") return;
-    const actionId = binding.actionId as ShortcutActionId;
-    const tabNumber = WORKSPACE_TAB_SHORTCUTS[actionId];
-    if (tabNumber !== undefined) {
-      dispatchSelectWorkspaceTab(tabNumber);
-      return;
-    }
-    const chord = resolveShortcutBindings(actionId)[0];
-    if (!chord) return;
-    if (DEFAULT_SHORTCUT_DEFINITIONS[actionId].scope === "global") {
-      dispatchGlobalShortcutChord(chord, preferredDomTarget);
-      return;
-    }
-    const target = preferredTarget(preferredDomTarget);
-    if (binding.actionId === "sendMessage" && !isEditableDomInput(target)) {
-      dispatchChord({ code: "Enter", modifiers: [] }, preferredDomTarget);
-      return;
-    }
-    dispatchChord(chord, preferredDomTarget);
-    return;
-  }
-  if (binding.kind === "key") {
-    dispatchChord(binding.chord, preferredDomTarget);
-    return;
-  }
-  const target = preferredTarget(preferredDomTarget);
-  if (insertText(binding.text, target)) {
-    if (binding.submit)
-      window.setTimeout(() => dispatchChord({ code: "Enter", modifiers: [] }, target), 0);
-    return;
-  }
-  if (!dispatchToTerminal({ action: "enter", data: binding.text }, target)) return;
-  if (binding.submit) {
-    dispatchToTerminal({ action: "enter" }, target);
-  }
-}
-
-/** Backward-compatible helper used by older callers and tests. */
-export function dispatchMobileAssistantAction(
-  action: MobileAssistantAction,
-  preferredDomTarget?: HTMLElement | null,
-): void {
-  dispatchMobileAssistantButton(legacyActionToButton(action, 0), preferredDomTarget);
 }

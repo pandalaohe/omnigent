@@ -17,13 +17,10 @@ import { Toaster } from "@/components/ui/sonner";
 import { FileViewerContext, type OpenFileOptions } from "@/shell/FileViewerContext";
 import { toast } from "sonner";
 import { signInForTerminal } from "@/lib/identity";
+import { resolveTerminalKeys, writeTerminalKeyPreferences } from "@/lib/terminalKeys";
 import * as capabilities from "@/lib/capabilities";
 import * as nativeBridge from "@/lib/nativeBridge";
 import {
-  dispatchMobileAssistantAction,
-  dispatchMobileAssistantButton,
-  dispatchTerminalBarKey,
-  bindTerminalBarTarget,
   readMobileAssistantPreferences,
   writeMobileAssistantPreferences,
   type TerminalStickyModifiers,
@@ -36,6 +33,8 @@ import {
   writeTerminalClipboardPreference,
 } from "@/lib/terminalClipboardPreferences";
 import type { ConnectionState } from "./TerminalSession";
+import type { TerminalClipboardAction } from "@/lib/terminalPaste";
+import type { TerminalTouchSelectionOptions } from "@/lib/terminalTouchSelection";
 import {
   TerminalView,
   RECONNECT_BACKOFF_MS,
@@ -90,11 +89,20 @@ const terminalSessionMock = vi.hoisted(() => ({
     adaptCodexPalette: boolean;
     onClipboardRequest?: (text: string, copyEvent?: ClipboardEvent) => void;
     onFileLink?: (uri: string) => boolean;
+    onClipboardAction?: TerminalClipboardAction;
+    canPaste: ReturnType<typeof vi.fn>;
+    pastesBracketed: ReturnType<typeof vi.fn>;
+    readHostClipboard: ReturnType<typeof vi.fn>;
+    paste: ReturnType<typeof vi.fn>;
     onState: (state: ConnectionState) => void;
     onActivity?: () => void;
     dispose: ReturnType<typeof vi.fn>;
     setTheme: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
+    setTouchSelection: ReturnType<
+      typeof vi.fn<(options: TerminalTouchSelectionOptions | null) => void>
+    >;
+    selectedText: ReturnType<typeof vi.fn<() => string>>;
     sendSoftKey: ReturnType<typeof vi.fn>;
     getStickyModifiers: () => TerminalStickyModifiers;
     focus: ReturnType<typeof vi.fn>;
@@ -232,7 +240,12 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     dispose = vi.fn();
     setTheme = vi.fn();
     setClipboardEnabled = vi.fn();
+    setTouchSelection = vi.fn<(options: TerminalTouchSelectionOptions | null) => void>();
+    selectedText = vi.fn(() => "");
+    bufferText = vi.fn(() => "terminal contents");
     sendSoftKey = vi.fn();
+    cancelBarWrites = vi.fn();
+    runBarKey = vi.fn((send: () => void) => send());
     stickyModifiers: TerminalStickyModifiers = { ctrl: "off", alt: "off", shift: "off" };
     setStickyModifiers = vi.fn((next: TerminalStickyModifiers) => {
       this.stickyModifiers = next;
@@ -242,6 +255,10 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     focus = vi.fn();
     blur = vi.fn();
     isFocused = vi.fn(() => false);
+    canPaste = vi.fn(() => true);
+    pastesBracketed = vi.fn(() => true);
+    paste = vi.fn(() => true);
+    readHostClipboard = vi.fn();
 
     constructor(
       container: HTMLDivElement,
@@ -255,6 +272,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
       focusOnConnect = true,
       adaptCodexPalette = false,
       onFileLink?: (uri: string) => boolean,
+      onClipboardAction?: TerminalClipboardAction,
     ) {
       terminalSessionMock.instances.push({
         url,
@@ -264,11 +282,18 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         adaptCodexPalette,
         onClipboardRequest,
         onFileLink,
+        onClipboardAction,
+        canPaste: this.canPaste,
+        pastesBracketed: this.pastesBracketed,
+        paste: this.paste,
+        readHostClipboard: this.readHostClipboard,
         onState,
         onActivity,
         dispose: this.dispose,
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
+        setTouchSelection: this.setTouchSelection,
+        selectedText: this.selectedText,
         sendSoftKey: this.sendSoftKey,
         getStickyModifiers: this.getStickyModifiers,
         focus: this.focus,
@@ -392,62 +417,6 @@ describe("control-mode terminal", () => {
     routing.mockRestore();
     databricks.mockRestore();
   });
-  it("routes a mobile assistant soft key to the active writable terminal", async () => {
-    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
-    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
-    act(() => dispatchMobileAssistantAction("arrowUp"));
-
-    expect(terminalSessionMock.instances[0]?.sendSoftKey).toHaveBeenCalledWith("arrowUp");
-  });
-
-  it("keeps routing to the terminal that owned focus before the assistant button took it", async () => {
-    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
-    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
-    const terminalInput = document.createElement("textarea");
-    terminalSessionMock.instances[0].container.appendChild(terminalInput);
-    terminalInput.focus();
-    const assistantButton = document.createElement("button");
-    document.body.appendChild(assistantButton);
-    assistantButton.focus();
-
-    act(() => dispatchMobileAssistantAction("tab", terminalInput));
-
-    expect(terminalSessionMock.instances[0]?.sendSoftKey).toHaveBeenCalledWith("tab");
-    assistantButton.remove();
-  });
-
-  it("ignores a terminal inside a hidden container and forwards phrase and chord payloads to the visible terminal", async () => {
-    render(
-      <>
-        <div className="invisible opacity-0" aria-hidden="true">
-          <TerminalView sessionId="conv_warm" terminalId="terminal_claude_main" />
-        </div>
-        <TerminalView sessionId="conv_active" terminalId="terminal_claude_main" />
-      </>,
-    );
-    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
-
-    act(() => {
-      dispatchMobileAssistantButton({
-        id: "cp",
-        label: "Cp",
-        binding: { kind: "text", text: "/compact", submit: true },
-      });
-      dispatchMobileAssistantButton({
-        id: "stop",
-        label: "Stop",
-        binding: { kind: "key", chord: { code: "KeyC", modifiers: ["primary"] } },
-      });
-    });
-
-    expect(terminalSessionMock.instances[0]?.sendSoftKey).not.toHaveBeenCalled();
-    expect(terminalSessionMock.instances[1]?.sendSoftKey.mock.calls).toEqual([
-      ["enter", "/compact"],
-      ["enter"],
-      ["enter", "\x03"],
-    ]);
-  });
-
   it.each([
     ["terminal_codex_main", true],
     ["terminal_claude_main", false],
@@ -2172,12 +2141,95 @@ describe("TerminalView phone key rows", () => {
     vi.unstubAllGlobals();
   });
 
+  it.each(["ask", "allow", "block"] as const)(
+    "uses clipboard preference %s for a gesture on a read-only phone attach with key rows off",
+    async (preference) => {
+      stubPhoneViewport(390, 844);
+      act(() => {
+        writeTerminalClipboardPreference(preference);
+        writeMobileAssistantPreferences({
+          ...readMobileAssistantPreferences(),
+          terminalKeysEnabled: false,
+        });
+      });
+      render(
+        <TerminalView keySurface="native" sessionId="conv_abc" terminalId="terminal_a" readOnly />,
+      );
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      const terminal = terminalSessionMock.instances[0];
+      act(() => terminal.onState({ kind: "connected" }));
+      const options = terminal.setTouchSelection.mock.lastCall?.[0];
+      expect(options).toBeTruthy();
+      expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+      await act(async () => options?.copy("selected output"));
+      if (preference === "block") {
+        expect(clipboardMock.copyText).not.toHaveBeenCalled();
+        expect(
+          await screen.findByText("Copy blocked by the terminal clipboard setting"),
+        ).toBeVisible();
+      } else {
+        expect(clipboardMock.copyText).toHaveBeenCalledExactlyOnceWith("selected output");
+        expect(await screen.findByText("Copied", { exact: true })).toBeVisible();
+      }
+      expect(screen.queryByTestId("terminal-clipboard-consent")).toBeNull();
+      act(() => terminal.onState({ kind: "closed", code: 1000, reason: "" }));
+      expect(terminal.setTouchSelection).toHaveBeenLastCalledWith(null);
+      await act(async () => options?.copy("late output"));
+      expect(clipboardMock.copyText).not.toHaveBeenCalledWith("late output");
+    },
+  );
+
+  it("does not restore a mobile copy over a program copy after leaving the phone layout", async () => {
+    stubPhoneViewport(390, 844);
+    act(() => writeTerminalClipboardPreference("allow"));
+    let completeProgramCopy: (() => void) | undefined;
+    clipboardMock.copyText.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          completeProgramCopy = resolve;
+        }),
+    );
+    render(<TerminalView keySurface="shell" sessionId="conv_abc" terminalId="terminal_a" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const terminal = terminalSessionMock.instances[0];
+    act(() => terminal.onState({ kind: "connected" }));
+    act(() => terminal.onClipboardRequest?.("program copy"));
+    const gesture = terminal.setTouchSelection.mock.lastCall?.[0];
+    await act(async () => gesture?.copy("mobile copy"));
+    expect(clipboardMock.copyText.mock.calls).toEqual([["program copy"], ["mobile copy"]]);
+
+    stubPhoneViewport(1280, 844, false);
+    act(() => window.dispatchEvent(new Event("resize")));
+    expect(terminal.setTouchSelection).toHaveBeenLastCalledWith(null);
+    await act(async () => completeProgramCopy?.());
+    expect(clipboardMock.copyText.mock.calls).toEqual([["program copy"], ["mobile copy"]]);
+  });
+
+  it("lets the phone Copy key use the live selection, then the sheet once the selection is cleared", async () => {
+    stubPhoneViewport(390, 844);
+    render(<TerminalView keySurface="shell" sessionId="conv_abc" terminalId="terminal_a" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const terminal = terminalSessionMock.instances[0];
+    act(() => terminal.onState({ kind: "connected" }));
+    terminal.selectedText.mockReturnValueOnce("selected output");
+    await act(async () => terminal.onClipboardAction?.("copy", { enter: false }));
+    expect(clipboardMock.copyText).toHaveBeenCalledExactlyOnceWith("selected output");
+    expect(screen.queryByRole("button", { name: "Copy all" })).toBeNull();
+    act(() => terminal.onClipboardAction?.("copy", { enter: false }));
+    expect(await screen.findByRole("button", { name: "Copy all" })).toBeVisible();
+  });
+
   it("renders key rows on a writable phone terminal, suppresses auto-focus on connect and reveal, and disables keys while reconnecting", async () => {
     stubPhoneViewport(390, 844);
     stubRootRect(390, 788);
 
     const { rerender } = render(
-      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
+      <TerminalView
+        keySurface="shell"
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        active={false}
+      />,
     );
     await act(async () => {});
     expect(terminalSessionMock.instances).toHaveLength(1);
@@ -2185,7 +2237,9 @@ describe("TerminalView phone key rows", () => {
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
 
     // Reveal on phone: key row mounts, session.focus() is not called automatically
-    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
+    rerender(
+      <TerminalView keySurface="shell" sessionId="conv_abc" terminalId="terminal_bash_s1" active />,
+    );
     await act(async () => {});
     expect(terminalSessionMock.instances[0].focus).not.toHaveBeenCalled();
     const keyRow = screen.getByTestId("terminal-key-row");
@@ -2232,13 +2286,23 @@ describe("TerminalView phone key rows", () => {
     const rectSpy = stubRootRect(390, 788);
 
     const { rerender } = render(
-      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly />,
+      <TerminalView
+        keySurface="shell"
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        readOnly
+      />,
     );
     await act(async () => {});
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
 
     rerender(
-      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" showKeyRows={false} />,
+      <TerminalView
+        keySurface="shell"
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        showKeyRows={false}
+      />,
     );
     await act(async () => {});
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
@@ -2246,7 +2310,9 @@ describe("TerminalView phone key rows", () => {
     // Portrait room floor: height 180 < 119 + 108 (227) -> hidden
     rectSpy.mockRestore();
     const tightSpy = stubRootRect(390, 180);
-    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    rerender(
+      <TerminalView keySurface="shell" sessionId="conv_abc" terminalId="terminal_bash_s1" />,
+    );
     await act(async () => {});
     act(() => {
       window.dispatchEvent(new Event("resize"));
@@ -2267,7 +2333,7 @@ describe("TerminalView phone key rows", () => {
     stubPhoneViewport(844, 390);
     stubRootRect(590.8, 180);
 
-    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    render(<TerminalView keySurface="shell" sessionId="conv_abc" terminalId="terminal_bash_s1" />);
     await act(async () => {});
 
     const view = screen.getByTestId("terminal-view");
@@ -2281,7 +2347,31 @@ describe("TerminalView phone key rows", () => {
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
   });
 
-  it("consumes custom order and live switches, and sends fallback wheel keys to the registered session", async () => {
+  it("uses the Native layout and toggle independently of Shell", async () => {
+    stubPhoneViewport(390, 844);
+    stubRootRect(390, 788);
+    const { keys } = resolveTerminalKeys({ ...readMobileAssistantPreferences() });
+    keys.shell.enabled = false;
+    keys.native.top.keys[0].label = "Native key";
+    expect(writeTerminalKeyPreferences({ terminalKeys: keys })).toBe("saved");
+    const { rerender } = render(
+      <TerminalView keySurface="shell" sessionId="conv_abc" terminalId="terminal_bash_s1" />,
+    );
+    await act(async () => {});
+    expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+    rerender(
+      <TerminalView keySurface="native" sessionId="conv_abc" terminalId="terminal_bash_s1" />,
+    );
+    expect(screen.getByRole("button", { name: "Native key" })).toBeInTheDocument();
+    act(() =>
+      writeTerminalKeyPreferences({
+        terminalKeys: { ...keys, native: { ...keys.native, enabled: false } },
+      }),
+    );
+    expect(screen.queryByTestId("terminal-key-row")).toBeNull();
+  });
+
+  it("uses custom order and reacts to live switches", async () => {
     stubPhoneViewport(390, 844);
     stubRootRect(390, 788);
     const initial = readMobileAssistantPreferences();
@@ -2295,7 +2385,7 @@ describe("TerminalView phone key rows", () => {
       ...initial,
       terminalButtons: [customKey, ...initial.terminalButtons!],
     });
-    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    render(<TerminalView keySurface="shell" sessionId="conv_abc" terminalId="terminal_bash_s1" />);
     await act(async () => {});
     act(() => terminalSessionMock.instances[0].onState({ kind: "connected" }));
     expect(
@@ -2315,47 +2405,6 @@ describe("TerminalView phone key rows", () => {
       }),
     );
     expect(screen.queryByTestId("terminal-key-row")).toBeNull();
-    const session = terminalSessionMock.instances[0];
-    act(() => {
-      dispatchTerminalBarKey({
-        id: "ctrl",
-        label: "Ctrl",
-        kind: "modifier",
-        modifier: "ctrl",
-        display: "text",
-        width: 2,
-      });
-      dispatchTerminalBarKey({ ...customKey, display: "text", width: 2 });
-    });
-    expect(session.getStickyModifiers()).toEqual({ ctrl: "once", alt: "off", shift: "off" });
-    expect(session.sendSoftKey).toHaveBeenLastCalledWith("enter", "r", {
-      focus: false,
-      chord: customKey.chord,
-    });
-    session.isFocused.mockReturnValue(true);
-    const keyboard = {
-      id: "keyboard",
-      label: "Keyboard",
-      kind: "action" as const,
-      action: "keyboard" as const,
-      display: "text" as const,
-      width: 2 as const,
-    };
-    // A stale focused textarea must be blurred and refocused within the tap gesture.
-    act(() => dispatchTerminalBarKey(keyboard));
-    expect(session.blur).toHaveBeenCalledOnce();
-    expect(session.focus).toHaveBeenCalledOnce();
-    session.blur.mockClear();
-    session.focus.mockClear();
-    vi.stubGlobal("visualViewport", {
-      height: 500,
-      offsetTop: 0,
-      addEventListener: vi.fn(),
-      removeEventListener: vi.fn(),
-    });
-    act(() => dispatchTerminalBarKey(keyboard));
-    expect(session.blur).toHaveBeenCalledOnce();
-    expect(session.focus).not.toHaveBeenCalled();
     act(() =>
       writeMobileAssistantPreferences({
         ...readMobileAssistantPreferences(),
@@ -2365,32 +2414,103 @@ describe("TerminalView phone key rows", () => {
     expect(screen.getByTestId("terminal-key-row")).toBeInTheDocument();
     expect(screen.queryByTestId("terminal-key-row-pager")).toBeNull();
   });
-  it("invalidates a bound held-gesture target across a disconnect and reconnect", async () => {
-    stubPhoneViewport(390, 844);
-    stubRootRect(390, 788);
-    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
-    await act(async () => {});
-    const session = terminalSessionMock.instances[0];
-    act(() => session.onState({ kind: "connected" }));
-    const target = bindTerminalBarTarget();
-    expect(target?.isCurrent()).toBe(true);
-    const key = {
-      id: "up",
-      label: "Up",
-      kind: "key" as const,
-      chord: { code: "ArrowUp", modifiers: [] },
-      width: 2 as const,
-      display: "text" as const,
-    };
-    act(() => session.onState({ kind: "connecting" }));
-    expect(target?.isCurrent()).toBe(false);
-    act(() => session.onState({ kind: "connected" }));
-    expect(target?.isCurrent()).toBe(false);
-    target?.press(key, "repeat");
-    expect(session.sendSoftKey).not.toHaveBeenCalled();
-    const fresh = bindTerminalBarTarget();
-    expect(fresh?.isCurrent()).toBe(true);
-    fresh?.press(key, "tap");
-    expect(session.sendSoftKey).toHaveBeenCalledOnce();
+});
+
+describe("terminal clipboard paste", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  async function openTerminal(readOnly = false) {
+    const view = render(
+      <TerminalView sessionId="conv_paste" terminalId="terminal_a" readOnly={readOnly} />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const terminal = terminalSessionMock.instances[0];
+    act(() => terminal.onState({ kind: "connected" }));
+    return { terminal, ...view };
+  }
+
+  it.each([true, false])("normalizes a single line with enter=%s", async (enter) => {
+    vi.stubGlobal("navigator", { clipboard: { readText: async () => "mak\x1be\r\n\r\n" } });
+    const { terminal } = await openTerminal();
+    await act(async () =>
+      terminal.onClipboardAction?.("paste", { enter, keyId: enter ? "paste" : undefined }),
+    );
+    expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("make", enter);
+  });
+
+  it("normalizes native paste data without attempting an async clipboard read", async () => {
+    const readText = vi.fn().mockRejectedValue(new Error("denied"));
+    vi.stubGlobal("navigator", { clipboard: { readText } });
+    const { terminal } = await openTerminal();
+    await act(async () =>
+      terminal.onClipboardAction?.("paste", { enter: false }, "a\x1bb\r\n\r\n"),
+    );
+    expect(readText).not.toHaveBeenCalled();
+    expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("ab", false);
+  });
+
+  it.each([true, false])("confirms multiline input with bracketed mode=%s", async (bracketed) => {
+    const readText = vi.fn(async () => "a\r\nb\r\n");
+    vi.stubGlobal("navigator", { clipboard: { readText } });
+    const { terminal } = await openTerminal();
+    terminal.pastesBracketed.mockReturnValue(bracketed);
+    const tap = () => terminal.onClipboardAction?.("paste", { enter: true, keyId: "paste" });
+    await act(async () => tap());
+    expect(screen.getByRole("status")).toHaveTextContent("2 lines");
+    expect(terminal.paste).not.toHaveBeenCalled();
+    await act(async () => tap());
+    expect(readText).toHaveBeenCalledTimes(1);
+    if (!bracketed) {
+      expect(terminal.paste).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+    }
+    expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("a\nb", false);
+  });
+
+  it("uses the paste box when clipboard access fails and reviews tabs", async () => {
+    vi.stubGlobal("navigator", {
+      clipboard: {
+        readText: async () => {
+          throw new Error("denied");
+        },
+      },
+    });
+    const { terminal } = await openTerminal();
+    await act(async () => terminal.onClipboardAction?.("paste", { enter: false }));
+    fireEvent.change(screen.getByLabelText("Text to paste"), { target: { value: "go\there" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send to terminal" }));
+    expect(screen.getByText("go⇥here")).toBeInTheDocument();
+    expect(terminal.paste).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Paste" }));
+    expect(terminal.paste).toHaveBeenCalledExactlyOnceWith("go\there", false);
+  });
+
+  it("drops both a queued review and a delayed host reply when the terminal changes", async () => {
+    vi.stubGlobal("navigator", { clipboard: { readText: async () => "a\nb" } });
+    const { terminal, rerender } = await openTerminal();
+    await act(async () => terminal.onClipboardAction?.("paste", { enter: false }));
+    expect(screen.getByRole("status")).toHaveTextContent("2 lines");
+    let reply: (result: { text: string }) => void = () => {};
+    terminal.readHostClipboard.mockReturnValue(
+      new Promise((resolve) => {
+        reply = resolve;
+      }),
+    );
+    act(() => terminal.onClipboardAction?.("pasteHost", { enter: true, keyId: "host" }));
+    expect(screen.queryByText("2 lines", { exact: false })).not.toBeInTheDocument();
+    rerender(<TerminalView sessionId="conv_paste" terminalId="terminal_b" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    const other = terminalSessionMock.instances[1];
+    act(() => other.onState({ kind: "connected" }));
+    await act(async () => reply({ text: "pwd" }));
+    expect(terminal.paste).not.toHaveBeenCalled();
+    expect(other.paste).not.toHaveBeenCalled();
+  });
+
+  it("does not ask a read-only connection to read its host clipboard", async () => {
+    const { terminal } = await openTerminal(true);
+    await act(async () => terminal.onClipboardAction?.("pasteHost", { enter: true }));
+    expect(terminal.readHostClipboard).not.toHaveBeenCalled();
+    expect(terminal.paste).not.toHaveBeenCalled();
   });
 });

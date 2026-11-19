@@ -1,3 +1,4 @@
+import { TERMINAL_KEY_SURFACE } from "@/lib/terminalKeys";
 // Right-side panel that hosts the xterm.js views for the
 // conversation's open terminals. Triggered from `SessionRail` (or the
 // mobile FAB).
@@ -258,6 +259,7 @@ export function TerminalsPanel({
               <TerminalAgentAccess conversationId={conversationId} terminal={activeTerminal} />
               <Suspense fallback={null}>
                 <TerminalView
+                  keySurface={TERMINAL_KEY_SURFACE.terminalsPanel}
                   {...(activeTerminal.hostId
                     ? { hostId: activeTerminal.hostId }
                     : {

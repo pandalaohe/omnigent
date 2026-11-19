@@ -13,17 +13,39 @@
 
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
-import { type FontWeight, type ITheme, type IWindowsPty, Terminal } from "@xterm/xterm";
+import {
+  type FontWeight,
+  type IBuffer,
+  type ITheme,
+  type IWindowsPty,
+  Terminal,
+} from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { withBasePath } from "@/lib/basePath";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
 import {
   terminalDataForChord,
-  type TerminalSoftKeyEventDetail,
+  type MobileAssistantSoftKey,
   type TerminalStickyState,
   type TerminalStickyModifiers,
 } from "@/lib/mobileAssistantPreferences";
 import type { ShortcutChord } from "@/lib/keyboardShortcutPreferences";
+import {
+  applyTerminalTextModifiers,
+  isArmedModifier,
+  chordForSequence,
+  encodeChord,
+  encodeTerminalData,
+  resolveSend,
+  SPLIT_LONE_ESC_MS,
+  splitTerminalWrites,
+} from "@/lib/terminalKeys";
+import { HostClipboardConnection, type TerminalClipboardAction } from "@/lib/terminalPaste";
+import {
+  TerminalTouchSelection,
+  type SelectionHandle,
+  type TerminalTouchSelectionOptions,
+} from "@/lib/terminalTouchSelection";
 import { TerminalImeInput } from "./TerminalImeInput";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { terminalSurfaceColors } from "@/lib/terminalPalette";
@@ -44,11 +66,11 @@ export type StickyState = TerminalStickyState;
 export type StickyModifiers = TerminalStickyModifiers;
 
 export function terminalSoftKeyPayload(
-  action: TerminalSoftKeyEventDetail["action"],
+  action: MobileAssistantSoftKey,
   applicationCursor: boolean,
 ): string {
   const prefix = applicationCursor ? "\u001bO" : "\u001b[";
-  const payloads: Record<TerminalSoftKeyEventDetail["action"], string> = {
+  const payloads: Record<MobileAssistantSoftKey, string> = {
     escape: "\u001b",
     tab: "\t",
     enter: "\r",
@@ -413,6 +435,35 @@ export function applyTerminalCopy(
   return true;
 }
 
+/** Newest logical lines offered when copying terminal text by touch. */
+export const TERMINAL_COPY_MAX_LINES = 5000;
+
+/**
+ * Plain text of a terminal buffer for touch copying.
+ *
+ * Rejoins soft-wrapped rows into one logical line, trims trailing blanks, and
+ * reads only the newest `maxLines` lines so a full scrollback stays light.
+ */
+export function terminalBufferText(
+  buffer: Pick<IBuffer, "length" | "getLine">,
+  maxLines = TERMINAL_COPY_MAX_LINES,
+): string {
+  const newestFirst: string[] = [];
+  let logicalLine = "";
+  for (let index = buffer.length - 1; index >= 0 && newestFirst.length < maxLines; index -= 1) {
+    const line = buffer.getLine(index);
+    if (!line) continue;
+    // A row that continues on the next keeps its trailing spaces.
+    const continues = buffer.getLine(index + 1)?.isWrapped === true;
+    const text = continues ? line.translateToString(false) : line.translateToString(true).trimEnd();
+    logicalLine = text + logicalLine;
+    if (line.isWrapped && index > 0) continue;
+    if (newestFirst.length > 0 || logicalLine.trim() !== "") newestFirst.push(logicalLine);
+    logicalLine = "";
+  }
+  return newestFirst.reverse().join("\n");
+}
+
 /** Largest tmux selection accepted for a browser clipboard write. */
 export const TERMINAL_CLIPBOARD_MAX_BYTES = 1024 * 1024;
 /** A tmux copy notification must closely follow input on this attachment. */
@@ -641,11 +692,8 @@ export function wheelReportPayload(
  *     scrollback path); ``partial`` — the new carry.
  */
 /**
- * Finger travel (CSS px) before a one-finger touch is treated as a scroll
- * drag. Below this the gesture is left to the browser, so taps and the
- * start of a long-press (text selection) aren't swallowed by jitter; at or
- * beyond it the dominant axis decides — vertical locks into scrolling,
- * horizontal abandons the gesture to the browser.
+ * Finger travel (CSS px) that distinguishes a one-finger drag from a tap or hold.
+ * Past this threshold, the dominant axis decides whether the terminal scrolls.
  */
 export const TOUCH_SCROLL_SLOP_PX = 8;
 
@@ -708,6 +756,8 @@ export class TerminalSession {
   private tmuxBacked = false;
   private readonly codexPalette: CodexTerminalPalette | null;
   private readonly onClipboardRequest?: TerminalClipboardListener;
+  private readonly onClipboardAction?: TerminalClipboardAction;
+  private readonly hostClipboard: HostClipboardConnection;
   /** Whether this visible, interactive attach may write the local clipboard. */
   private clipboardEnabled: boolean;
   /**
@@ -734,16 +784,19 @@ export class TerminalSession {
   private readonly imeInput: TerminalImeInput;
   private stickyModifiers: StickyModifiers = { ctrl: "off", alt: "off", shift: "off" };
   private readonly stickyListeners = new Set<(next: StickyModifiers) => void>();
+  private readonly queuedBarKeys: (() => void)[] = [];
+  private barWriteTimer: ReturnType<typeof setTimeout> | null = null;
   private sendingSoftKey = false;
   private imeAnchor: Detached | null = null;
   /** Start of the tracked one-finger touch, or ``null`` when none is active. */
-  private touchStart: { x: number; y: number } | null = null;
+  private touchStart: { x: number; y: number; canceledMove: boolean } | null = null;
   /** Whether the tracked touch passed the slop gate and owns scrolling. */
   private touchScrolling = false;
   /** Y of the last processed drag step (valid while {@link touchScrolling}). */
   private touchLastY = 0;
   /** Fractional touch lines carried across moves (see {@link touchScrollPayload}). */
   private touchPartialLines = 0;
+  private touchSelection: TerminalTouchSelection | null = null;
 
   /**
    * Construct, attach to the DOM, and open the WebSocket.
@@ -775,8 +828,10 @@ export class TerminalSession {
     focusOnConnect = true,
     adaptCodexPalette = false,
     onFileLink?: TerminalFileLinkListener,
+    onClipboardAction?: TerminalClipboardAction,
   ) {
     this.container = container;
+    this.onClipboardAction = onClipboardAction;
     this.codexPalette = adaptCodexPalette ? new CodexTerminalPalette() : null;
     this.clipboardEnabled = clipboardEnabled;
     this.focusOnConnect = focusOnConnect;
@@ -822,6 +877,7 @@ export class TerminalSession {
     }
 
     this.ws = new WebSocket(url);
+    this.hostClipboard = new HostClipboardConnection(this.ws);
     // Default is Blob, which forces an async read per chunk. ArrayBuffer
     // keeps the path synchronous and matches xterm.js's preferred input.
     this.ws.binaryType = "arraybuffer";
@@ -847,12 +903,37 @@ export class TerminalSession {
       { capture: true, signal },
     );
 
+    container.addEventListener(
+      "paste",
+      (event) => {
+        if (!this.onClipboardAction || !event.clipboardData) return;
+        // The browser already supplied the text. Keep xterm from sending a second copy.
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        this.runClipboardAction(
+          "paste",
+          { enter: false },
+          event.clipboardData.getData("text/plain"),
+        );
+      },
+      { capture: true, signal },
+    );
+
     // Fork-only: xterm never sets touch-action, so a vertical finger drag can
     // start a browser pan before the touchmove listener below can claim it.
     // Declaring pan-x pinch-zoom leaves horizontal navigation and pinch zoom
     // to the browser while reserving vertical panning for the terminal's own
     // touch listeners further down.
     if (this.term.element) this.term.element.style.touchAction = "pan-x pinch-zoom";
+    container.addEventListener(
+      "contextmenu",
+      (event) => {
+        if (!this.touchSelection?.shouldSuppressContextMenu()) return;
+        event.preventDefault();
+        event.stopPropagation();
+      },
+      { capture: true, signal },
+    );
 
     this.ws.addEventListener(
       "open",
@@ -882,6 +963,7 @@ export class TerminalSession {
             onActivity?.();
           }
         } else if (typeof ev.data === "string") {
+          if (this.hostClipboard.receive(ev.data)) return;
           const windowsPty = parseWindowsPtyMessage(ev.data);
           if (windowsPty) {
             // ConPTY's resize/reflow contract differs from a POSIX PTY.
@@ -910,6 +992,8 @@ export class TerminalSession {
     this.ws.addEventListener(
       "close",
       (ev) => {
+        this.touchSelection?.cancel();
+        this.hostClipboard.close();
         onState({ kind: "closed", reason: ev.reason || `code ${ev.code}`, code: ev.code });
       },
       { signal },
@@ -918,6 +1002,8 @@ export class TerminalSession {
     this.ws.addEventListener(
       "error",
       () => {
+        this.touchSelection?.cancel();
+        this.hostClipboard.close();
         onState({ kind: "error" });
       },
       { signal },
@@ -934,7 +1020,8 @@ export class TerminalSession {
     this.imeInput = new TerminalImeInput(this.term);
     this.dataDispose = this.term.onData((d) => {
       if (!this.imeInput.consumeData(d)) {
-        sendInput(this.sendingSoftKey ? d : this.applyStickyModifiers(d));
+        const input = this.sendingSoftKey ? d : this.applyStickyModifiers(d);
+        if (input) sendInput(input);
       }
     });
 
@@ -949,6 +1036,7 @@ export class TerminalSession {
       if (e.type === "keydown") {
         e.preventDefault();
         if (!this.imeInput.beforeSoftKey()) return false;
+        this.touchSelection?.cancel();
         onInput?.();
         this.lastUserInputAt = performance.now();
         if (this.ws.readyState === WebSocket.OPEN) {
@@ -991,30 +1079,37 @@ export class TerminalSession {
       "touchstart",
       (e) => {
         if (e.touches.length !== 1) {
-          this.touchStart = null;
-          this.touchScrolling = false;
+          this.resetTouchScroll();
           return;
         }
-        this.touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+        this.touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY, canceledMove: false };
         this.touchScrolling = false;
         this.touchPartialLines = 0;
+        this.touchSelection?.start(e.touches[0]);
       },
       { signal },
     );
     container.addEventListener(
       "touchmove",
       (e) => {
+        if (this.touchSelection?.move(e)) return;
         if (this.touchStart === null || e.touches.length !== 1) return;
         const touch = e.touches[0];
         if (!this.touchScrolling) {
-          // Slop gate: taps and long-press jitter stay with the browser.
-          // Past the slop, the dominant axis decides — a mostly-horizontal
-          // drag is abandoned so browser gestures/selection still work.
+          // Below slop, the touch can still be a tap or a hold. Past it, the dominant axis wins.
           const dx = Math.abs(touch.clientX - this.touchStart.x);
           const dy = Math.abs(touch.clientY - this.touchStart.y);
-          if (Math.max(dx, dy) < TOUCH_SCROLL_SLOP_PX) return;
+          if (Math.max(dx, dy) < TOUCH_SCROLL_SLOP_PX) {
+            if (this.touchSelection && e.cancelable) {
+              e.preventDefault();
+              this.touchStart.canceledMove = true;
+            }
+            return;
+          }
+          this.touchSelection?.cancelHold();
           if (dx > dy) {
             this.touchStart = null;
+            if (this.touchSelection && e.cancelable) e.preventDefault();
             return;
           }
           // Lock in: the pre-slop travel feeds the first step so the view
@@ -1044,13 +1139,26 @@ export class TerminalSession {
       // Explicitly non-passive so preventDefault() above is honored.
       { passive: false, signal },
     );
-    const endTouch = () => {
-      this.touchStart = null;
-      this.touchScrolling = false;
-      this.touchPartialLines = 0;
-    };
-    container.addEventListener("touchend", endTouch, { signal });
-    container.addEventListener("touchcancel", endTouch, { signal });
+    container.addEventListener(
+      "touchend",
+      (e) => {
+        const start = this.touchStart;
+        const wasTap = start !== null && !this.touchScrolling && e.touches.length === 0;
+        this.touchSelection?.end(e, wasTap);
+        // Canceling a small move can suppress xterm's compatibility mousedown.
+        if (wasTap && start.canceledMove) this.term.focus();
+        this.resetTouchScroll();
+      },
+      { passive: false, signal },
+    );
+    container.addEventListener(
+      "touchcancel",
+      () => {
+        this.touchSelection?.cancel();
+        this.resetTouchScroll();
+      },
+      { signal },
+    );
 
     // ResizeObserver fires on any layout-affecting change (window
     // resize, font load, CSS class change). tmux deduplicates same-
@@ -1074,16 +1182,24 @@ export class TerminalSession {
 
   /** Feed a mobile assistant key or text payload through xterm's normal onData path. */
   sendSoftKey(
-    action: TerminalSoftKeyEventDetail["action"],
+    action: MobileAssistantSoftKey,
     data?: string,
     options?: { focus?: boolean; chord?: ShortcutChord },
   ): void {
     if (!this.imeInput.beforeSoftKey()) return;
     let payload = data;
     if (options?.chord) {
+      if (
+        isArmedModifier(this.stickyModifiers, "cmd") ||
+        isArmedModifier(this.stickyModifiers, "win")
+      ) {
+        this.sendBarChord(options.chord);
+        return;
+      }
       const modifiers = [...options.chord.modifiers];
       if (this.stickyModifiers.ctrl !== "off") modifiers.push("control");
-      if (this.stickyModifiers.alt !== "off") modifiers.push("alt");
+      if (this.stickyModifiers.alt !== "off" || isArmedModifier(this.stickyModifiers, "opt"))
+        modifiers.push("alt");
       if (this.stickyModifiers.shift !== "off") modifiers.push("shift");
       const encoded = terminalDataForChord(
         { ...options.chord, modifiers },
@@ -1112,6 +1228,47 @@ export class TerminalSession {
     }
   }
 
+  runBarKey(send: () => void, repeat: boolean): void {
+    if (this.barWriteTimer === null) send();
+    else if (!repeat) this.queuedBarKeys.push(send);
+  }
+
+  cancelBarWrites(): void {
+    if (this.barWriteTimer !== null) clearTimeout(this.barWriteTimer);
+    this.barWriteTimer = null;
+    this.queuedBarKeys.length = 0;
+  }
+
+  sendBarSequence(send: string, autoEnter: boolean): void {
+    this.sendBarOutput(
+      resolveSend(send, autoEnter, this.stickyModifiers, this.term.modes.applicationCursorKeysMode),
+    );
+  }
+
+  sendBarChord(chord: ShortcutChord): void {
+    this.sendBarOutput(
+      encodeChord(chord, this.stickyModifiers, this.term.modes.applicationCursorKeysMode),
+    );
+  }
+
+  private sendBarOutput(output: ReturnType<typeof encodeChord>): void {
+    if (!this.imeInput.beforeSoftKey()) return;
+    this.consumeStickyModifiers();
+    if ("clipboard" in output) this.runClipboardAction(output.clipboard, { enter: false });
+    if (!("bytes" in output)) return;
+    const writes = splitTerminalWrites(output.bytes);
+    const writeNext = (index: number) => {
+      this.barWriteTimer =
+        index + 1 < writes.length
+          ? setTimeout(() => writeNext(index + 1), SPLIT_LONE_ESC_MS)
+          : null;
+      this.sendSoftKey("enter", writes[index], { focus: false });
+      while (this.barWriteTimer === null && this.queuedBarKeys.length)
+        this.queuedBarKeys.shift()?.();
+    };
+    writeNext(0);
+  }
+
   setStickyModifiers(next: StickyModifiers): void {
     this.stickyModifiers = next;
     for (const listener of this.stickyListeners) listener(next);
@@ -1127,38 +1284,101 @@ export class TerminalSession {
   }
 
   private consumeStickyModifiers(): void {
-    const { ctrl, alt, shift } = this.stickyModifiers;
-    if (ctrl !== "once" && alt !== "once" && shift !== "once") return;
-    this.setStickyModifiers({
-      ctrl: ctrl === "once" ? "off" : ctrl,
-      alt: alt === "once" ? "off" : alt,
-      shift: shift === "once" ? "off" : shift,
-    });
+    const entries = Object.entries(this.stickyModifiers);
+    if (!entries.some(([, state]) => state === "once")) return;
+    this.setStickyModifiers(
+      Object.fromEntries(
+        entries.map(([modifier, state]) => [modifier, state === "once" ? "off" : state]),
+      ) as StickyModifiers,
+    );
   }
 
   private applyStickyModifiers(data: string): string {
-    const { ctrl, alt, shift } = this.stickyModifiers;
     if (
-      (ctrl === "off" && alt === "off" && shift === "off") ||
+      !Object.values(this.stickyModifiers).some((state) => state !== "off") ||
       this.imeInput.isComposing ||
-      data.includes("\x1b") ||
-      data.includes("\x7f")
+      !data
     )
       return data;
-    let result = data;
-    if (data.length === 1 && data.charCodeAt(0) < 128) {
-      const code = data.toUpperCase().charCodeAt(0);
-      if (ctrl !== "off") {
-        if (code >= 64 && code <= 95) result = String.fromCharCode(code & 31);
-        else if (data === " ") result = "\x00";
-        else if (data === "?") result = "\x7f";
-        else if (data === "/") result = "\x1f";
-      }
-      if (shift !== "off" && /^[a-z]$/.test(result)) result = result.toUpperCase();
-      if (alt !== "off") result = `\x1b${result}`;
-    }
+    const hasCommand =
+      isArmedModifier(this.stickyModifiers, "cmd") || isArmedModifier(this.stickyModifiers, "win");
+    const isEscapeOrDelete = data.includes("\x1b") || data.includes("\x7f");
+    if (isEscapeOrDelete && (!hasCommand || !chordForSequence(data))) return data;
+    const isAsciiCharacter = data.length === 1 && data.charCodeAt(0) < 128;
+    const result =
+      hasCommand && (isEscapeOrDelete || Array.from(data).length === 1)
+        ? encodeTerminalData(data, this.stickyModifiers, this.term.modes.applicationCursorKeysMode)
+        : {
+            bytes: isAsciiCharacter ? applyTerminalTextModifiers(data, this.stickyModifiers) : data,
+          };
     this.consumeStickyModifiers();
-    return result;
+    if ("clipboard" in result) this.runClipboardAction(result.clipboard, { enter: false });
+    return "bytes" in result ? result.bytes : "";
+  }
+
+  runClipboardAction(...args: Parameters<TerminalClipboardAction>): void {
+    this.onClipboardAction?.(...args);
+  }
+
+  selectedText(): string {
+    return this.term.getSelection();
+  }
+
+  setTouchSelection(options: TerminalTouchSelectionOptions | null): void {
+    const element = this.term.element;
+    if (this.disposed || !element || Boolean(options) === Boolean(this.touchSelection)) return;
+    this.touchSelection?.dispose();
+    this.resetTouchScroll();
+    this.touchSelection = options
+      ? new TerminalTouchSelection(
+          this.term,
+          this.container,
+          () => this.screenMetrics(),
+          () => this.resetTouchScroll(),
+          options,
+        )
+      : null;
+    element.style.touchAction = options ? "pinch-zoom" : "pan-x pinch-zoom";
+    element.style.setProperty("-webkit-touch-callout", options ? "none" : "");
+    element.style.userSelect = options ? "none" : "";
+  }
+
+  startTouchSelectionHandle(handle: SelectionHandle, event: TouchEvent): (() => void) | undefined {
+    return this.touchSelection?.startHandle(handle, event);
+  }
+
+  private resetTouchScroll(): void {
+    this.touchStart = null;
+    this.touchScrolling = false;
+    this.touchPartialLines = 0;
+  }
+
+  bufferText(): string {
+    return terminalBufferText(this.term.buffer.active);
+  }
+
+  canPaste(): boolean {
+    return !this.disposed && this.ws.readyState === WebSocket.OPEN;
+  }
+
+  pastesBracketed(): boolean {
+    return this.term.modes.bracketedPasteMode;
+  }
+
+  paste(text: string, enter: boolean): boolean {
+    if (!this.canPaste() || !this.imeInput.beforeSoftKey()) return false;
+    this.sendingSoftKey = true;
+    try {
+      this.term.paste(text);
+      if (enter) this.term.input("\r", true);
+    } finally {
+      this.sendingSoftKey = false;
+    }
+    return true;
+  }
+
+  readHostClipboard(signal: AbortSignal) {
+    return this.hostClipboard.read(signal);
   }
 
   /** Enable clipboard bridging only for the visible, interactive surface. */
@@ -1212,7 +1432,10 @@ export class TerminalSession {
    */
   dispose(): void {
     if (this.disposed) return;
+    this.hostClipboard.close();
     this.disposed = true;
+    this.touchSelection?.dispose();
+    this.cancelBarWrites();
     this.listenerCtl.abort();
     this.resizeObserver.disconnect();
     this.imeInput.dispose();
@@ -1293,15 +1516,19 @@ export class TerminalSession {
     // Keep the last real size while hidden; the ResizeObserver re-fits once
     // the surface is laid out again.
     if (!this.hasLayoutBox()) return;
-    try {
+    const fitGrid = () => {
       this.fit.fit();
+      if (this.tmuxBacked) {
+        const cols = Math.max(this.term.cols, MIN_FORWARDED_COLS);
+        const rows = Math.max(this.term.rows, MIN_FORWARDED_ROWS);
+        if (cols !== this.term.cols || rows !== this.term.rows) this.term.resize(cols, rows);
+      }
+    };
+    try {
+      if (this.touchSelection) this.touchSelection.refit(fitGrid);
+      else fitGrid();
     } catch {
       return;
-    }
-    if (this.tmuxBacked) {
-      const cols = Math.max(this.term.cols, MIN_FORWARDED_COLS);
-      const rows = Math.max(this.term.rows, MIN_FORWARDED_ROWS);
-      if (cols !== this.term.cols || rows !== this.term.rows) this.term.resize(cols, rows);
     }
     const { cols, rows } = this.term;
     // Skip a no-op resize: the WS-open handler and the ResizeObserver both

@@ -1,8 +1,10 @@
 import { useSyncExternalStore } from "react";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
+import { KEY_BAR_GATE } from "@/lib/terminalKeys";
 
 const MOBILE_MEDIA_QUERY = "(max-width: 767.98px)";
 const COARSE_MEDIA_QUERY = "(pointer: coarse)";
+const FINE_MEDIA_QUERY = "(any-pointer: fine)";
 
 function subscribe(callback: () => void): () => void {
   if (typeof window === "undefined") return () => {};
@@ -10,13 +12,16 @@ function subscribe(callback: () => void): () => void {
     typeof window.matchMedia === "function" ? window.matchMedia(MOBILE_MEDIA_QUERY) : null;
   const coarse =
     typeof window.matchMedia === "function" ? window.matchMedia(COARSE_MEDIA_QUERY) : null;
+  const fine = window.matchMedia?.(FINE_MEDIA_QUERY);
   maxMd?.addEventListener("change", callback);
   coarse?.addEventListener("change", callback);
+  fine?.addEventListener("change", callback);
   window.addEventListener("resize", callback);
   window.addEventListener("orientationchange", callback);
   return () => {
     maxMd?.removeEventListener("change", callback);
     coarse?.removeEventListener("change", callback);
+    fine?.removeEventListener("change", callback);
     window.removeEventListener("resize", callback);
     window.removeEventListener("orientationchange", callback);
   };
@@ -44,7 +49,7 @@ function getServerSnapshot(): boolean {
 }
 
 /**
- * Reactive phone gate shared by TerminalView's key rows and MobileFloatingAssistant.
+ * Reactive phone layout gate.
  *
  * Keeps phone controls mounted when a phone rotates to landscape (width >= 768
  * with a coarse pointer and short screen side < 768) without showing them on
@@ -52,4 +57,21 @@ function getServerSnapshot(): boolean {
  */
 export function useIsPhone(): boolean {
   return useSyncExternalStore(subscribe, isPhoneViewport, getServerSnapshot);
+}
+
+export function terminalKeyBarGate(mode: typeof KEY_BAR_GATE = KEY_BAR_GATE): boolean {
+  if (mode === "layout") return isPhoneViewport();
+  return (
+    typeof window !== "undefined" &&
+    (isIOSShell() ||
+      isAndroidShell() ||
+      Boolean(
+        window.matchMedia?.(COARSE_MEDIA_QUERY).matches &&
+        !window.matchMedia?.(FINE_MEDIA_QUERY).matches,
+      ))
+  );
+}
+
+export function useTerminalKeyBarGate(): boolean {
+  return useSyncExternalStore(subscribe, terminalKeyBarGate, getServerSnapshot);
 }

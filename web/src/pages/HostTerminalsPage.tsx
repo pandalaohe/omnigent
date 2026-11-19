@@ -1,3 +1,4 @@
+import { TERMINAL_KEY_SURFACE } from "@/lib/terminalKeys";
 import { useState } from "react";
 import { ArrowLeftIcon, ChevronDownIcon, PlusIcon, XIcon } from "lucide-react";
 import { TerminalView } from "@/components/blocks/TerminalView";
@@ -190,6 +191,7 @@ function HostTerminals({ hostId }: { hostId: string }) {
                   className="relative flex min-h-0 flex-col overflow-hidden data-[state=inactive]:hidden"
                 >
                   <TerminalView
+                    keySurface={TERMINAL_KEY_SURFACE.hostTerminals}
                     hostId={hostId}
                     terminalId={terminal.terminal_id}
                     active={activeId === terminal.terminal_id}

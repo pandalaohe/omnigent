@@ -207,7 +207,7 @@ def test_settings_phone_hit_areas_activate_without_stealing_neighbours(
         remove.click()
         expect(platform).to_have_count(0)
 
-        toggle = page.get_by_role("switch", name="Enable mobile floating assistant")
+        toggle = page.get_by_role("switch", name="Enable terminal key rows")
         expect(toggle).to_be_visible(timeout=30_000)
         toggle.scroll_into_view_if_needed()
         box = toggle.bounding_box()
@@ -218,13 +218,6 @@ def test_settings_phone_hit_areas_activate_without_stealing_neighbours(
         expect(toggle).to_have_attribute("aria-checked", "false" if initial == "true" else "true")
         page.mouse.click(cx, cy + 20)
         expect(toggle).to_have_attribute("aria-checked", initial or "false")
-        # The assistant is draggable app chrome; keep it out of the settings
-        # probes, whose targets are the underlying shared controls.
-        if toggle.get_attribute("aria-checked") == "true":
-            toggle.click()
-        expect(page.get_by_test_id("mobile-floating-assistant")).to_have_count(0)
-        # All viewport cases share the test server's user preferences.
-        page.get_by_role("button", name="Restore default buttons", exact=True).click()
 
         # Chat rows deliberately retain 24px icons: their 44px targets must
         # survive the rounded list's overflow clipping and remain independent.

@@ -31,25 +31,18 @@ import { toast } from "sonner";
 import { MinusIcon, PinIcon, MenuIcon, PlusIcon, RotateCcwIcon, SaveIcon } from "lucide-react";
 
 import { SettingRow } from "@/components/SettingsFields";
-import { MobileAssistantButtonContent } from "@/components/MobileFloatingAssistant";
+import { TerminalKeyContent } from "@/components/blocks/TerminalKeyContent";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
-import {
-  USER_PREFERENCES_PATCH_REJECTED_EVENT,
-  collectLocalUserPreferences,
-} from "@/lib/userPreferencesSync";
+import { USER_PREFERENCES_PATCH_REJECTED_EVENT } from "@/lib/userPreferencesSync";
 import {
   MAX_PREFERENCE_ENVELOPE_BYTES,
   MAX_ROW_PAGES,
   ROW_CELLS,
-  canonicalTerminalFields,
   canonicalizeBar,
   defaultTerminalBar,
-  legacyFingerprint,
   packRow,
   moveBarKey,
-  preferencesEnvelopeBytes,
-  projectLegacy,
   resolveTerminalBar,
   validateBar,
   type BarLimitIssue,
@@ -60,12 +53,20 @@ import {
 import {
   MOBILE_ASSISTANT_CHANGED_EVENT,
   readMobileAssistantPreferences,
-  writeMobileAssistantPreferences,
   type ResolvedMobileAssistantPreferences,
 } from "@/lib/mobileAssistantPreferences";
+import {
+  fromBar322,
+  reconcileShell,
+  resolveTerminalKeys,
+  writeTerminalKeyPreferences,
+  type KeySurface,
+} from "@/lib/terminalKeys";
 import { TerminalKeySheet } from "./TerminalKeySheet";
 
 type RowName = "top" | "bottom";
+
+const PREFERENCE_SIZE_ERROR = `Too large to save: preferences are limited to ${MAX_PREFERENCE_ENVELOPE_BYTES / 1024} KiB. Shorten or remove some keys.`;
 
 function createKeyId(): string {
   return `key-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -184,7 +185,7 @@ function SortableKeyTile({
             : "flex h-11 w-full min-w-0 items-center justify-center gap-1 rounded-[7px] border border-border bg-background px-1 font-mono text-[12px] font-semibold text-foreground"
         }
       >
-        <MobileAssistantButtonContent button={barKey} className="size-3.5 shrink-0" />
+        <TerminalKeyContent button={barKey} className="size-3.5 shrink-0" />
         {pinned ? (
           <PinIcon className="absolute right-0.5 top-0.5 size-2 shrink-0" aria-hidden />
         ) : null}
@@ -200,7 +201,7 @@ function PinnedCopy({ barKey }: { barKey: TerminalBarKey }) {
       aria-hidden="true"
       className="flex h-11 min-w-0 items-center justify-center truncate rounded-[7px] border border-dashed border-border bg-muted/30 px-1 font-mono text-[12px] font-semibold text-muted-foreground opacity-60"
     >
-      <MobileAssistantButtonContent button={barKey} className="size-3.5 shrink-0" />
+      <TerminalKeyContent button={barKey} className="size-3.5 shrink-0" />
     </div>
   );
 }
@@ -290,47 +291,29 @@ export function TerminalBarEditor({ preferences }: TerminalBarEditorProps) {
       return false;
     }
     const canonical = canonicalizeBar(candidate);
-    const terminalButtons = projectLegacy(canonical);
-    const terminalSecondRow = canonical.bottom.enabled;
-    const terminalLegacyBasis = legacyFingerprint(terminalButtons, terminalSecondRow);
-    const nextPreferences = {
-      ...readMobileAssistantPreferences(),
-      terminalBar: canonical,
-      terminalButtons,
-      terminalSecondRow,
-      terminalLegacyBasis,
-      ...(options.preset ? { terminalBarPreset: canonicalizeBar(options.preset) } : {}),
-    };
-    const envelope = collectLocalUserPreferences();
-    const bytes = preferencesEnvelopeBytes({
-      version: 1,
-      settings: {
-        ...envelope.settings,
-        mobile_assistant: canonicalTerminalFields({
-          version: 2,
-          enabled: nextPreferences.enabled,
-          buttons: nextPreferences.buttons,
-          terminalButtons,
-          terminalKeysEnabled: nextPreferences.terminalKeysEnabled,
-          terminalSecondRow,
-          terminalBar: canonical,
-          ...(nextPreferences.terminalBarPreset !== undefined
-            ? { terminalBarPreset: nextPreferences.terminalBarPreset }
-            : {}),
-          terminalLegacyBasis,
-          chatActionsRevision: 1,
-        }),
-      },
+    const current = readMobileAssistantPreferences();
+    const { keys, preset } = resolveTerminalKeys({ ...current });
+    const shell = reconcileShell(keys.shell, canonical);
+    const result = writeTerminalKeyPreferences({
+      terminalKeys: { ...keys, shell },
+      ...(options.preset
+        ? {
+            terminalKeysPreset: {
+              ...current.terminalKeysPreset,
+              shell:
+                preset.shell && preset.shell !== "invalid"
+                  ? reconcileShell(preset.shell, options.preset)
+                  : fromBar322(options.preset, shell.enabled),
+            },
+          }
+        : {}),
     });
-    if (bytes > MAX_PREFERENCE_ENVELOPE_BYTES) {
-      lastErrorRef.current = "Too large to sync: remove keys or shorten texts";
-      setRowError({
-        row: "top",
-        message: lastErrorRef.current,
-      });
+    if (result !== "saved") {
+      lastErrorRef.current =
+        result === "too-large" ? PREFERENCE_SIZE_ERROR : "Couldn't save terminal keys";
+      setRowError({ row: "top", message: lastErrorRef.current });
       return false;
     }
-    writeMobileAssistantPreferences(nextPreferences);
     setBar(canonical);
     setSource("stored");
     setRowError(null);
@@ -704,24 +687,49 @@ export function TerminalBarEditor({ preferences }: TerminalBarEditorProps) {
         ? "Saved key layout couldn't be read; showing the default keys. Your next edit replaces it."
         : null;
 
+  const surfaces = resolveTerminalKeys({ ...preferences });
+  const setSurfaceEnabled = (surface: KeySurface, enabled: boolean) => {
+    const { keys } = resolveTerminalKeys({ ...readMobileAssistantPreferences() });
+    const result = writeTerminalKeyPreferences({
+      terminalKeys: { ...keys, [surface]: { ...keys[surface], enabled } },
+    });
+    if (result !== "saved")
+      setRowError({
+        row: "top",
+        message: result === "too-large" ? PREFERENCE_SIZE_ERROR : "Couldn't save terminal keys",
+      });
+  };
+
   return (
     <div className="mt-4 space-y-5 phone:[&_[data-slot=setting-row]]:min-h-11">
       <SettingRow
         label="Terminal key rows"
-        hint="Show keys above the phone keyboard. When the rows are off or cannot fit, the floating assistant uses the first ten terminal keys instead."
+        hint="Show keys above the phone keyboard on the host and session terminal pages."
       >
         <Switch
-          checked={preferences.terminalKeysEnabled}
-          onCheckedChange={(terminalKeysEnabled) =>
-            writeMobileAssistantPreferences({ ...preferences, terminalKeysEnabled })
-          }
+          checked={surfaces.keys.shell.enabled}
+          onCheckedChange={(enabled) => setSurfaceEnabled("shell", enabled)}
           aria-label="Enable terminal key rows"
         />
       </SettingRow>
 
-      {fallbackNotice ? (
+      <SettingRow
+        label="Native terminal key rows"
+        hint="Show keys in a chat's terminal view on a phone."
+      >
+        <Switch
+          checked={surfaces.keys.native.enabled}
+          onCheckedChange={(enabled) => setSurfaceEnabled("native", enabled)}
+          aria-label="Enable native terminal key rows"
+        />
+      </SettingRow>
+
+      {fallbackNotice || surfaces.source === "fallback" ? (
         <div className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-sm">
-          <span>{fallbackNotice}</span>
+          <span>
+            {fallbackNotice ??
+              "Saved terminal key layouts couldn’t be read. Your next edit replaces them."}
+          </span>
           <Button
             type="button"
             variant="outline"

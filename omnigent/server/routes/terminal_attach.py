@@ -109,6 +109,7 @@ from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_NOT_FOUND,
     WS_CLOSE_WRONG_REPLICA,
 )
+from omnigent.util.websocket_logging import websocket_protocol_logger
 
 _logger = logging.getLogger(__name__)
 
@@ -145,6 +146,7 @@ def create_terminal_attach_router(
     :param conversation_store: Conversation store used by permission checks.
     :returns: An :class:`APIRouter` carrying the attach route.
     """
+    websocket_protocol_logger("uvicorn.error")
     router = APIRouter()
 
     async def authorize_elevated_attach(

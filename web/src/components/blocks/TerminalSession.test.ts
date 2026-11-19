@@ -8,7 +8,11 @@
 
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
+import { render } from "@testing-library/react";
+import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { TerminalClipboardAction } from "@/lib/terminalPaste";
+import { TerminalSelectionHandles } from "./TerminalSelectionHandles";
 import {
   terminalSoftKeyPayload,
   SHIFT_ENTER_CSI_U,
@@ -731,6 +735,7 @@ describe("TerminalSession", () => {
     onClipboardRequest?: (text: string) => void,
     focusOnConnect = true,
     adaptCodexPalette = false,
+    onClipboardAction?: TerminalClipboardAction,
   ) {
     const states: ConnectionState[] = [];
     const container = document.createElement("div");
@@ -748,9 +753,140 @@ describe("TerminalSession", () => {
       onClipboardRequest,
       focusOnConnect,
       adaptCodexPalette,
+      undefined,
+      onClipboardAction,
     );
     return { session, states, container, socket: FakeWebSocket.instances.at(-1)! };
   }
+
+  it("requests paste without Enter for armed and recorded Cmd+V", () => {
+    const clipboard = vi.fn();
+    const { session, socket } = makeSession(
+      undefined,
+      undefined,
+      true,
+      undefined,
+      true,
+      false,
+      clipboard,
+    );
+    socket.open();
+    socket.sent.length = 0;
+    const term = (session as unknown as { term: Terminal }).term;
+    session.setStickyModifiers({ ctrl: "off", alt: "off", shift: "off", cmd: "once" });
+    term.input("v", true);
+    session.sendBarChord({ code: "KeyV", modifiers: ["meta"] });
+    expect(clipboard.mock.calls).toEqual(
+      Array.from({ length: 2 }, () => ["paste", { enter: false }]),
+    );
+    expect(socket.sent).toEqual([]);
+    session.dispose();
+  });
+
+  it("keeps physical Cmd+V native and forwards the paste event once without Enter", () => {
+    const clipboard = vi.fn();
+    const { session, socket, container } = makeSession(
+      undefined,
+      undefined,
+      true,
+      undefined,
+      true,
+      false,
+      clipboard,
+    );
+    socket.open();
+    socket.sent.length = 0;
+    const input = container.querySelector("textarea")!;
+    const key = new KeyboardEvent("keydown", {
+      key: "v",
+      code: "KeyV",
+      keyCode: 86,
+      metaKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    expect(input.dispatchEvent(key)).toBe(true);
+    expect(clipboard).not.toHaveBeenCalled();
+
+    const getData = vi.fn(() => "native\r\ntext");
+    const paste = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(paste, "clipboardData", { value: { getData } });
+    input.dispatchEvent(paste);
+
+    expect(getData).toHaveBeenCalledExactlyOnceWith("text/plain");
+    expect(clipboard).toHaveBeenCalledExactlyOnceWith("paste", { enter: false }, "native\r\ntext");
+    expect(socket.sent).toEqual([]);
+    session.dispose();
+  });
+
+  it("uses xterm bracketed paste without appending Enter to the lines", async () => {
+    const { session, socket } = makeSession();
+    socket.open();
+    const term = (session as unknown as { term: Terminal }).term;
+    await new Promise<void>((resolve) => {
+      term.write("\x1b[?2004h", resolve);
+    });
+    socket.sent.length = 0;
+    session.setStickyModifiers({ ctrl: "once", alt: "off", shift: "off" });
+    expect(session.paste("a\nb", false)).toBe(true);
+    expect(socket.sent).toEqual([new TextEncoder().encode("\x1b[200~a\rb\x1b[201~")]);
+    session.dispose();
+  });
+
+  it("rejoins wrapped buffer rows into logical lines", async () => {
+    const { session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    term.resize(6, 6);
+    await new Promise<void>((resolve) => {
+      term.write("first\r\nlong wrapped\r\nlast\r\n", resolve);
+    });
+    expect(session.bufferText()).toBe("first\nlong wrapped\nlast");
+    session.dispose();
+  });
+
+  it("matches host replies on their own socket, refuses old hosts, and times out", async () => {
+    vi.useFakeTimers();
+    const first = makeSession();
+    const second = makeSession();
+    const signal = new AbortController().signal;
+    const message = (socket: FakeWebSocket, frame: Record<string, unknown>) =>
+      socket.emit("message", { data: JSON.stringify(frame) });
+    try {
+      for (const { socket } of [first, second]) socket.open();
+      await expect(first.session.readHostClipboard(signal)).resolves.toEqual({
+        error: "The host needs a newer version",
+      });
+      for (const { socket } of [first, second])
+        message(socket, { type: "capabilities", hostClipboard: 1 });
+      const firstRead = first.session.readHostClipboard(signal);
+      const secondRead = second.session.readHostClipboard(signal);
+      const firstRequest = JSON.parse(first.socket.sent.at(-1) as string);
+      const secondRequest = JSON.parse(second.socket.sent.at(-1) as string);
+      expect(firstRequest.type).toBe("host-clipboard-read");
+      message(second.socket, {
+        type: "host-clipboard",
+        id: firstRequest.id,
+        ok: true,
+        text: "wrong",
+      });
+      message(first.socket, { type: "host-clipboard", id: firstRequest.id, ok: true, text: "pwd" });
+      message(second.socket, {
+        type: "host-clipboard",
+        id: secondRequest.id,
+        ok: true,
+        text: "date",
+      });
+      await expect(firstRead).resolves.toEqual({ text: "pwd" });
+      await expect(secondRead).resolves.toEqual({ text: "date" });
+      const unanswered = second.session.readHostClipboard(signal);
+      await vi.advanceTimersByTimeAsync(5000);
+      await expect(unanswered).resolves.toEqual({ error: "The host did not answer" });
+    } finally {
+      first.session.dispose();
+      second.session.dispose();
+      vi.useRealTimers();
+    }
+  });
 
   function testTouch(identifier: number, clientX: number, clientY: number): Touch {
     return { identifier, clientX, clientY } as Touch;
@@ -939,6 +1075,64 @@ describe("TerminalSession", () => {
       "x",
     ]);
     unsubscribe();
+    session.dispose();
+  });
+
+  it.each([false, true])(
+    "sends one CR frame for a Send key containing only Enter (autoEnter: %s)",
+    (autoEnter) => {
+      const { socket, session } = makeSession();
+      socket.open();
+      socket.sent = [];
+
+      session.sendBarSequence("\\r", autoEnter);
+
+      expect(socket.sent.map((frame) => Array.from(frame as Uint8Array))).toEqual([[0x0d]]);
+      session.dispose();
+    },
+  );
+
+  it("sends Escape and CR from the phone keyboard with Ctrl and Alt armed, then releases both", () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    socket.open();
+    socket.sent = [];
+    session.setStickyModifiers({ ctrl: "once", alt: "once", shift: "off" });
+
+    term.input("\r", true);
+
+    expect(socket.sent.map((frame) => Array.from(frame as Uint8Array))).toEqual([[0x1b, 0x0d]]);
+    expect(session.getStickyModifiers()).toEqual({ ctrl: "off", alt: "off", shift: "off" });
+    session.dispose();
+  });
+
+  it("keeps legacy text literal and gives a Cmd chord the same bytes as an armed Cmd", () => {
+    const { socket, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    socket.open();
+    socket.sent = [];
+    session.setStickyModifiers({ ctrl: "once", alt: "off", shift: "off" });
+    for (const text of ["^C", String.raw`echo a\nb`, "\x03\r", "ls"]) {
+      session.sendSoftKey("enter", text, { focus: false });
+    }
+    expect(session.getStickyModifiers().ctrl).toBe("once");
+    term.input("c", true);
+    session.setStickyModifiers({ ctrl: "off", alt: "off", shift: "off", cmd: "once" });
+    session.sendSoftKey("arrowLeft", undefined, {
+      focus: false,
+      chord: { code: "ArrowLeft", modifiers: [] },
+    });
+    session.sendBarChord({ code: "ArrowLeft", modifiers: ["meta"] });
+    session.sendBarChord({ code: "KeyV", modifiers: ["meta"] });
+    expect(socket.sent.map((frame) => new TextDecoder().decode(frame as Uint8Array))).toEqual([
+      "^C",
+      String.raw`echo a\nb`,
+      "\x03\r",
+      "ls",
+      "\x03",
+      "\x01",
+      "\x01",
+    ]);
     session.dispose();
   });
 
@@ -1299,6 +1493,262 @@ describe("TerminalSession", () => {
     expect(move.defaultPrevented).toBe(false);
     expect(scrollSpy).not.toHaveBeenCalled();
     session.dispose();
+  });
+
+  async function touchSelectionSession(text: string) {
+    const fixture = makeSession();
+    const term = (fixture.session as unknown as { term: Terminal }).term;
+    vi.spyOn(
+      fixture.session as unknown as { screenMetrics: () => WheelScreenMetrics | null },
+      "screenMetrics",
+    ).mockImplementation(() => ({
+      left: 0,
+      top: 0,
+      cellWidth: 8,
+      cellHeight: 16,
+      cols: term.cols,
+      rows: term.rows,
+    }));
+    await new Promise<void>((resolve) => {
+      term.write(text, resolve);
+    });
+    vi.useFakeTimers();
+    const copy = vi.fn();
+    const handles = vi.fn();
+    fixture.session.setTouchSelection({ copy, handles });
+    return { ...fixture, term, copy, handles };
+  }
+
+  it("selects a whole path after a jittered hold, switches drag direction, and copies on release", async () => {
+    const { container, term, session, copy, handles } = await touchSelectionSession(
+      "above\r\n/opt/work/omnigent/fork/wt\r\n中文路径 below",
+    );
+    try {
+      expect(term.element?.style.touchAction).toBe("pinch-zoom");
+      dispatchTouch(container, "touchstart", [testTouch(1, 20, 24)]);
+      dispatchTouch(container, "touchmove", [testTouch(1, 26, 24)]);
+      vi.advanceTimersByTime(499);
+      expect(session.selectedText()).toBe("");
+      vi.advanceTimersByTime(1);
+      expect(session.selectedText()).toBe("/opt/work/omnigent/fork/wt");
+      dispatchTouch(container, "touchmove", [testTouch(1, 4, 8)]);
+      expect(session.selectedText()).toBe("above\n/opt/work/omnigent/fork/wt");
+      dispatchTouch(container, "touchmove", [testTouch(1, 13, 40)]);
+      expect(session.selectedText()).toBe("/opt/work/omnigent/fork/wt\n中");
+      expect(copy).not.toHaveBeenCalled();
+      expect(
+        dispatchTouch(container, "touchend", [], [testTouch(1, 13, 40)]).defaultPrevented,
+      ).toBe(true);
+      expect(copy).toHaveBeenCalledExactlyOnceWith("/opt/work/omnigent/fork/wt\n中");
+      expect(handles).toHaveBeenLastCalledWith({
+        start: expect.any(Object),
+        end: expect.any(Object),
+      });
+
+      dispatchTouch(container, "touchstart", [testTouch(2, 13, 40)]);
+      vi.advanceTimersByTime(500);
+      expect(session.selectedText()).toBe("中文路径");
+      dispatchTouch(container, "touchend", [], [testTouch(2, 13, 40)]);
+      session.setStickyModifiers({ ctrl: "once", alt: "off", shift: "off" });
+      expect(session.selectedText()).toBe("中文路径");
+      session.sendBarChord({ code: "KeyC", modifiers: [] });
+      expect(session.selectedText()).toBe("");
+      expect(handles).toHaveBeenLastCalledWith(null);
+    } finally {
+      session.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves vertical swipes with scroll, drops horizontal swipes, and cancels on pinch or touchcancel", async () => {
+    const { container, term, session, copy, handles } = await touchSelectionSession("example");
+    try {
+      const scroll = vi.spyOn(term, "scrollLines");
+      const origin = testTouch(1, 20, 8);
+      dispatchTouch(container, "touchstart", [origin]);
+      dispatchTouch(container, "touchmove", [testTouch(1, 29, 8)]);
+      vi.advanceTimersByTime(500);
+      expect(scroll).not.toHaveBeenCalled();
+      expect(session.selectedText()).toBe("");
+      dispatchTouch(container, "touchend", [], [origin]);
+
+      dispatchTouch(container, "touchstart", [origin]);
+      dispatchTouch(container, "touchmove", [testTouch(1, 20, 48)]);
+      vi.advanceTimersByTime(500);
+      expect(scroll).toHaveBeenCalledWith(-2);
+      expect(session.selectedText()).toBe("");
+      dispatchTouch(container, "touchend", [], [origin]);
+
+      dispatchTouch(container, "touchstart", [origin]);
+      vi.advanceTimersByTime(500);
+      dispatchTouch(document.body, "touchstart", [origin, testTouch(2, 80, 80)]);
+      dispatchTouch(container, "touchend", [], [origin]);
+      expect(session.selectedText()).toBe("");
+      expect(handles).toHaveBeenLastCalledWith(null);
+
+      dispatchTouch(container, "touchstart", [origin]);
+      vi.advanceTimersByTime(500);
+      dispatchTouch(container, "touchcancel", [], [origin]);
+      expect(session.selectedText()).toBe("");
+      expect(copy).not.toHaveBeenCalled();
+    } finally {
+      session.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([20, 160])("keeps xterm's tap-to-focus path after copying, at x=%d", async (x) => {
+    const { container, term, session, copy } = await touchSelectionSession("example");
+    try {
+      const hold = testTouch(1, 20, 8);
+      dispatchTouch(container, "touchstart", [hold]);
+      vi.advanceTimersByTime(500);
+      dispatchTouch(container, "touchend", [], [hold]);
+      expect(copy).toHaveBeenCalledExactlyOnceWith("example");
+      expect(session.selectedText()).toBe("example");
+      expect(term.textarea).not.toHaveFocus();
+
+      const tap = testTouch(2, x, 8);
+      dispatchTouch(container, "touchstart", [tap]);
+      expect(dispatchTouch(container, "touchend", [], [tap]).defaultPrevented).toBe(false);
+      // jsdom does not synthesize compatibility mouse events after a touch.
+      term.element!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+      expect(term.textarea).toHaveFocus();
+      expect(session.selectedText()).toBe("");
+      expect(copy).toHaveBeenCalledOnce();
+    } finally {
+      session.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels pre-hold jitter on phone layouts while preserving tap focus and pinch", async () => {
+    const { container, term, session, copy } = await touchSelectionSession("example");
+    try {
+      const first = testTouch(1, 20, 8);
+      const jitter = testTouch(1, 26, 8);
+      dispatchTouch(container, "touchstart", [first]);
+      expect(dispatchTouch(container, "touchmove", [jitter]).defaultPrevented).toBe(true);
+      expect(dispatchTouch(container, "touchend", [], [jitter]).defaultPrevented).toBe(false);
+      expect(term.textarea).toHaveFocus();
+      expect(session.selectedText()).toBe("");
+
+      term.blur();
+      dispatchTouch(container, "touchstart", [first]);
+      dispatchTouch(container, "touchmove", [jitter]);
+      const pinch = [jitter, testTouch(2, 80, 80)];
+      expect(dispatchTouch(container, "touchstart", pinch).defaultPrevented).toBe(false);
+      expect(dispatchTouch(container, "touchmove", pinch).defaultPrevented).toBe(false);
+      vi.advanceTimersByTime(500);
+      dispatchTouch(container, "touchend", [], pinch);
+      expect(term.textarea).not.toHaveFocus();
+      expect(copy).not.toHaveBeenCalled();
+
+      session.setTouchSelection(null);
+      dispatchTouch(container, "touchstart", [first]);
+      expect(dispatchTouch(container, "touchmove", [jitter]).defaultPrevented).toBe(false);
+    } finally {
+      session.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels edge scrolling and window listeners when just the dragged handle unmounts", async () => {
+    const { container, term, session, copy, handles } = await touchSelectionSession("example");
+    try {
+      const scroll = vi.spyOn(term, "scrollLines");
+      const hold = testTouch(1, 20, 8);
+      dispatchTouch(container, "touchstart", [hold]);
+      vi.advanceTimersByTime(500);
+      dispatchTouch(container, "touchend", [], [hold]);
+      copy.mockClear();
+
+      const positions = handles.mock.lastCall?.[0];
+      const onStart = session.startTouchSelectionHandle.bind(session);
+      const view = render(createElement(TerminalSelectionHandles, { positions, onStart }));
+      const end = view.getByTestId("terminal-selection-end");
+      const finger = testTouch(2, positions.end.x, positions.end.y);
+      dispatchTouch(end, "touchstart", [finger]);
+      const edge = testTouch(2, finger.clientX, term.rows * 16 - 2);
+      dispatchTouch(end, "touchmove", [edge]);
+      vi.advanceTimersByTime(60);
+      expect(scroll).toHaveBeenCalledExactlyOnceWith(1);
+
+      view.rerender(
+        createElement(TerminalSelectionHandles, {
+          positions: { ...positions, end: null },
+          onStart,
+        }),
+      );
+      expect(end.isConnected).toBe(false);
+      expect(container.isConnected).toBe(true);
+      expect(handles).toHaveBeenLastCalledWith(null);
+      expect(session.selectedText()).toBe("");
+      expect(dispatchTouch(document.body, "touchmove", [edge]).defaultPrevented).toBe(false);
+      dispatchTouch(document.body, "touchend", [], [edge]);
+      vi.advanceTimersByTime(180);
+      expect(scroll).toHaveBeenCalledTimes(1);
+      expect(copy).not.toHaveBeenCalled();
+      view.unmount();
+    } finally {
+      session.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("extends through the scrollback and removes handle drag listeners on cancel or dispose", async () => {
+    const { container, term, session, copy, handles } = await touchSelectionSession(
+      Array.from({ length: 44 }, (_, index) => `line-${index}`).join("\r\n"),
+    );
+    try {
+      const scroll = vi.spyOn(term, "scrollLines");
+      const hold = testTouch(1, 20, 56);
+      dispatchTouch(container, "touchstart", [hold]);
+      vi.advanceTimersByTime(500);
+      dispatchTouch(container, "touchmove", [testTouch(1, 20, 4)]);
+      vi.advanceTimersByTime(180);
+      expect(scroll.mock.calls).toEqual([[-1], [-1], [-1]]);
+      dispatchTouch(container, "touchend", [], [hold]);
+      expect(copy).toHaveBeenCalledOnce();
+
+      const end = handles.mock.lastCall?.[0].end;
+      const handle = testTouch(2, end.x, end.y);
+      session.startTouchSelectionHandle(
+        "end",
+        dispatchTouch(document.body, "touchstart", [handle]) as TouchEvent,
+      );
+      dispatchTouch(document.body, "touchmove", [testTouch(2, end.x, term.rows * 16 - 2)]);
+      vi.advanceTimersByTime(120);
+      expect(scroll.mock.calls.slice(-2)).toEqual([[1], [1]]);
+      dispatchTouch(document.body, "touchend", [], [handle]);
+      expect(copy).toHaveBeenCalledTimes(2);
+
+      const start = handles.mock.lastCall?.[0].start;
+      const startTouch = testTouch(3, start.x, start.y);
+      session.startTouchSelectionHandle(
+        "start",
+        dispatchTouch(document.body, "touchstart", [startTouch]) as TouchEvent,
+      );
+      dispatchTouch(document.body, "touchcancel", [], [startTouch]);
+      expect(handles).toHaveBeenLastCalledWith(null);
+      expect(copy).toHaveBeenCalledTimes(2);
+
+      dispatchTouch(container, "touchstart", [hold]);
+      vi.advanceTimersByTime(500);
+      const newEnd = handles.mock.lastCall?.[0].end;
+      const lastTouch = testTouch(4, newEnd.x, newEnd.y);
+      session.startTouchSelectionHandle(
+        "end",
+        dispatchTouch(document.body, "touchstart", [lastTouch]) as TouchEvent,
+      );
+      session.dispose();
+      dispatchTouch(document.body, "touchend", [], [lastTouch]);
+      expect(handles).toHaveBeenLastCalledWith(null);
+      expect(copy).toHaveBeenCalledTimes(2);
+    } finally {
+      session.dispose();
+      vi.useRealTimers();
+    }
   });
 
   it("does not re-send a resize when the fitted size is unchanged", () => {

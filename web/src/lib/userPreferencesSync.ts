@@ -274,6 +274,9 @@ function mobileSyncValue(value: unknown): unknown | null {
     terminalBar?: unknown;
     terminalBarPreset?: unknown;
     terminalLegacyBasis?: unknown;
+    terminalKeys?: unknown;
+    terminalKeysPreset?: unknown;
+    terminalKeyboard?: unknown;
     chatActionsRevision?: unknown;
   };
   if (raw.version !== 2 || typeof raw.enabled !== "boolean" || !Array.isArray(raw.buttons)) {
@@ -295,7 +298,12 @@ function mobileSyncValue(value: unknown): unknown | null {
     ...(typeof raw.terminalLegacyBasis === "string"
       ? { terminalLegacyBasis: raw.terminalLegacyBasis }
       : {}),
-    ...(raw.chatActionsRevision === 1 ? { chatActionsRevision: 1 } : {}),
+    ...(raw.terminalKeys !== undefined ? { terminalKeys: raw.terminalKeys } : {}),
+    ...(raw.terminalKeysPreset !== undefined ? { terminalKeysPreset: raw.terminalKeysPreset } : {}),
+    ...(raw.terminalKeyboard !== undefined ? { terminalKeyboard: raw.terminalKeyboard } : {}),
+    ...(raw.chatActionsRevision !== undefined
+      ? { chatActionsRevision: raw.chatActionsRevision }
+      : {}),
   });
 }
 

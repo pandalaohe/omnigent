@@ -1,21 +1,4 @@
-import {
-  ArchiveIcon,
-  ArrowDownIcon,
-  ArrowLeftIcon,
-  ArrowRightIcon,
-  ArrowUpIcon,
-  ChevronsDownIcon,
-  ChevronsUpIcon,
-  CommandIcon,
-  CornerDownLeftIcon,
-  DeleteIcon,
-  KeyboardIcon,
-  LockKeyhole,
-  RefreshCwIcon,
-  SquareTerminalIcon,
-  XIcon,
-  type LucideIcon,
-} from "lucide-react";
+import { LockKeyhole } from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -30,17 +13,23 @@ import {
   EMPTY_STICKY_MODIFIERS,
   packRow,
   migrateLegacy,
-  reduceSticky,
   softKeyForChord,
   terminalDataForChord,
   type TerminalBar,
-  type TerminalBarKey,
-  type TerminalBarRow,
-  type TerminalKeyIcon,
   type TerminalKeyRowItem,
   type TerminalStickyModifiers,
   type TerminalStickyState,
 } from "@/lib/mobileAssistantPreferences";
+import {
+  isArmedModifier,
+  availableAction,
+  fromBar322,
+  keySupportsRepeat,
+  specialModifier,
+  type SurfaceKeys,
+  type TerminalKeyRowV2,
+} from "@/lib/terminalKeys";
+import { TerminalKeyContent } from "./TerminalKeyContent";
 import { cn } from "@/lib/utils";
 import { getIOSKeyboardViewportHeight } from "@/lib/nativeBridge";
 import type { StickyModifiers, TerminalSession } from "./TerminalSession";
@@ -52,7 +41,6 @@ export {
 
 export const TERMINAL_REPEAT_DELAY_MS = 400;
 export const TERMINAL_REPEAT_INTERVAL_MS = 80;
-export const TERMINAL_LONG_PRESS_MS = 500;
 export const TERMINAL_DRAG_SLOP_PX = 10;
 export const TERMINAL_SWIPE_THRESHOLD_PX = 36;
 
@@ -62,14 +50,17 @@ export interface TerminalKeyRowProps {
   disabled?: boolean;
   /** Resolved bar. When omitted, legacy items are migrated for compatibility. */
   bar?: TerminalBar;
+  surface?: SurfaceKeys;
   items?: readonly TerminalKeyRowItem[];
   secondRow?: boolean;
   /** Changes when the mounted terminal changes, so sticky state cannot leak across. */
   identityKey?: string;
 }
 
+type RenderKey = TerminalKeyRowV2["keys"][number];
+
 interface ActiveKeyPress {
-  key: TerminalBarKey;
+  key: RenderKey;
   pointerId: number;
   startX: number;
   startY: number;
@@ -85,25 +76,6 @@ interface PagerSwipeStart {
   startX: number;
   startY: number;
 }
-
-const TERMINAL_KEY_ICON_COMPONENTS: Record<TerminalKeyIcon, LucideIcon> = {
-  escape: XIcon,
-  tab: ArrowRightIcon,
-  "arrow-up": ArrowUpIcon,
-  "arrow-down": ArrowDownIcon,
-  "arrow-left": ArrowLeftIcon,
-  "arrow-right": ArrowRightIcon,
-  enter: CornerDownLeftIcon,
-  backspace: DeleteIcon,
-  delete: DeleteIcon,
-  "page-up": ChevronsUpIcon,
-  "page-down": ChevronsDownIcon,
-  keyboard: KeyboardIcon,
-  refresh: RefreshCwIcon,
-  archive: ArchiveIcon,
-  terminal: SquareTerminalIcon,
-  command: CommandIcon,
-};
 
 export function toggleTerminalKeyboard(
   session: TerminalSession | null,
@@ -129,8 +101,7 @@ export function sendTerminalKeyRowItem(
   sticky?: StickyModifiers,
 ): void {
   if (!session) return;
-  const hasSticky =
-    sticky && (sticky.ctrl !== "off" || sticky.alt !== "off" || sticky.shift !== "off");
+  const hasSticky = sticky && Object.values(sticky).some((value) => value !== "off");
   const options = hasSticky ? { focus: false, chord: item.chord } : { focus: false };
   const softKey = softKeyForChord(item.chord);
   if (softKey) {
@@ -143,56 +114,50 @@ export function sendTerminalKeyRowItem(
   }
 }
 
-/**
- * The single path that turns a bar key into bytes or a sticky change. The phone
- * bar and the floating wheel both call this; neither has its own reducer.
- */
-export function pressBarKey(
-  session: TerminalSession | null,
-  key: TerminalBarKey,
-  gesture: "tap" | "longPress" | "repeat",
-  keyboardUp?: boolean,
-): void {
-  if (!session) return;
-  if (key.kind === "modifier") {
-    const next = reduceSticky(session.getStickyModifiers(), {
-      type: gesture === "longPress" ? "longPress" : "tap",
-      mod: key.modifier,
-      tapLocks: key.tapLocks === true,
-    });
-    session.setStickyModifiers(next);
-    return;
+function pressBarKey(session: TerminalSession, key: RenderKey, keyboardUp: boolean): void {
+  const action = availableAction(key);
+  if (!action) return;
+  const sticky = session.getStickyModifiers();
+  switch (action.type) {
+    case "special": {
+      const modifier = specialModifier(key);
+      if (modifier) {
+        session.setStickyModifiers({
+          ...sticky,
+          [modifier]: isArmedModifier(sticky, modifier)
+            ? "off"
+            : action.keepHeld
+              ? "locked"
+              : "once",
+        });
+      } else session.sendBarSequence(action.special === "tab" ? "\\t" : "\\e", false);
+      break;
+    }
+    case "keyboard":
+      toggleTerminalKeyboard(session, keyboardUp);
+      break;
+    case "legacy": {
+      const legacy = action.key;
+      if (legacy.kind === "text") {
+        session.sendSoftKey("enter", `${legacy.text}${legacy.submit ? "\r" : ""}`, {
+          focus: false,
+        });
+      } else {
+        sendTerminalKeyRowItem(session, { id: key.id, label: key.label, ...legacy }, sticky);
+      }
+      break;
+    }
+    case "combo":
+      session.sendBarChord(action.chord);
+      break;
+    case "send":
+      session.sendBarSequence(action.send, action.autoEnter === true);
+      break;
   }
-  if (key.kind === "action") {
-    toggleTerminalKeyboard(session, keyboardUp);
-    return;
-  }
-  if (key.kind === "text") {
-    // Explicit payload: modifiers neither change nor consume it.
-    session.sendSoftKey("enter", `${key.text}${key.submit ? "\r" : ""}`, { focus: false });
-    return;
-  }
-  sendTerminalKeyRowItem(
-    session,
-    { id: key.id, label: key.label, kind: "key", chord: key.chord, repeat: key.repeat },
-    session.getStickyModifiers(),
-  );
 }
 
 function stickyLabel(state: TerminalStickyState): string {
   return state === "off" ? "" : `, ${state === "once" ? "next key" : "locked"}`;
-}
-
-function KeyContent({ item }: { item: TerminalBarKey }) {
-  const Icon =
-    item.display === "icon" && item.icon ? TERMINAL_KEY_ICON_COMPONENTS[item.icon] : null;
-  return Icon ? (
-    <Icon className="size-3.5 shrink-0" aria-hidden="true" />
-  ) : (
-    <span className={Array.from(item.label).length === 1 ? "shrink-0" : "truncate"}>
-      {item.label}
-    </span>
-  );
 }
 
 function PageButton({
@@ -238,12 +203,13 @@ export function TerminalKeyRow({
   keyboardUp,
   disabled = false,
   bar,
+  surface,
   items = DEFAULT_TERMINAL_KEY_ITEMS,
   secondRow = true,
   identityKey,
 }: TerminalKeyRowProps) {
   const session = sessionRef.current;
-  const resolvedBar = bar ?? migrateLegacy(items, secondRow);
+  const resolvedBar = surface ?? fromBar322(bar ?? migrateLegacy(items, secondRow));
   const topPack = packRow(resolvedBar.top);
   const bottomPack = packRow(resolvedBar.bottom);
   const topPageCount = topPack.pages.length;
@@ -330,7 +296,8 @@ export function TerminalKeyRow({
     if (keyboardStartRef.current) keyboardDraggedRef.current = true;
     keyboardStartRef.current = null;
     activePointerIdRef.current = null;
-  }, [stopPress]);
+    session?.cancelBarWrites();
+  }, [session, stopPress]);
 
   useEffect(() => cancelAll, [identityKey, session, cancelAll]);
 
@@ -358,12 +325,14 @@ export function TerminalKeyRow({
   }, [cancelAll, resetSticky]);
 
   const fireKey = useCallback(
-    (key: TerminalBarKey, gesture: "tap" | "longPress" | "repeat") => {
+    (key: RenderKey, gesture: "tap" | "repeat") => {
       if (disabled) return;
       const targetSession = sessionRef.current;
       if (!targetSession) return;
-      pressBarKey(targetSession, key, gesture, keyboardUp);
-      updateSticky(targetSession.getStickyModifiers());
+      targetSession.runBarKey(() => {
+        pressBarKey(targetSession, key, keyboardUp);
+        updateSticky(targetSession.getStickyModifiers());
+      }, gesture === "repeat");
     },
     [disabled, sessionRef, updateSticky, keyboardUp],
   );
@@ -393,7 +362,8 @@ export function TerminalKeyRow({
 
     activePointerIdRef.current = event.pointerId;
     try {
-      if (key?.kind === "action" && buttonEl) buttonEl.setPointerCapture?.(event.pointerId);
+      if (key?.action.type === "keyboard" && buttonEl)
+        buttonEl.setPointerCapture?.(event.pointerId);
       else event.currentTarget.setPointerCapture?.(event.pointerId);
     } catch {
       // Synthetic test events may not register an active pointer id.
@@ -412,7 +382,7 @@ export function TerminalKeyRow({
 
     if (disabled || !buttonEl || buttonEl.disabled || !key) return;
 
-    if (key.kind === "action") {
+    if (key.action.type === "keyboard") {
       keyboardDraggedRef.current = false;
       keyboardStartRef.current = {
         pointerId: event.pointerId,
@@ -433,13 +403,7 @@ export function TerminalKeyRow({
       timeoutId: null,
       intervalId: null,
     };
-    if (key.kind === "modifier") {
-      press.timeoutId = window.setTimeout(() => {
-        if (pressRef.current !== press || press.moved) return;
-        press.consumed = true;
-        fireKey(key, "longPress");
-      }, TERMINAL_LONG_PRESS_MS);
-    } else if (key.kind === "key" && key.repeat) {
+    if (key.repeat && keySupportsRepeat(key)) {
       press.timeoutId = window.setTimeout(() => {
         if (pressRef.current !== press || press.moved) return;
         press.consumed = true;
@@ -500,12 +464,14 @@ export function TerminalKeyRow({
         if (swipe.row === "top") {
           setTopPage((current) => {
             const base = Math.max(0, Math.min(current, topPageCount - 1));
-            return Math.max(0, Math.min(topPageCount - 1, base + (dx < 0 ? 1 : -1)));
+            return dx < 0 ? (base + 1) % topPageCount : (base - 1 + topPageCount) % topPageCount;
           });
         } else {
           setBottomPage((current) => {
             const base = Math.max(0, Math.min(current, bottomPageCount - 1));
-            return Math.max(0, Math.min(bottomPageCount - 1, base + (dx < 0 ? 1 : -1)));
+            return dx < 0
+              ? (base + 1) % bottomPageCount
+              : (base - 1 + bottomPageCount) % bottomPageCount;
           });
         }
         return;
@@ -520,15 +486,12 @@ export function TerminalKeyRow({
   };
 
   const handlePointerCancel = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) {
-      return;
-    }
-    cancelAll();
+    if (event.pointerId === activePointerIdRef.current) cancelAll();
   };
 
-  const handleButtonClick = (key: TerminalBarKey, event: ReactMouseEvent<HTMLButtonElement>) => {
+  const handleButtonClick = (key: RenderKey, event: ReactMouseEvent<HTMLButtonElement>) => {
     if (disabled) return;
-    if (key.kind === "action") {
+    if (key.action.type === "keyboard") {
       if (event.detail !== 0 && keyboardDraggedRef.current) {
         keyboardDraggedRef.current = false;
         return;
@@ -540,9 +503,16 @@ export function TerminalKeyRow({
     if (event.detail === 0) fireKey(key, "tap");
   };
 
-  const renderKey = (key: TerminalBarKey, pinnedCopy = false) => {
-    const isKeyboardAction = key.kind === "action" && key.action === "keyboard";
-    const modifierState = key.kind === "modifier" ? sticky[key.modifier] : "off";
+  const renderKey = (key: RenderKey, pinnedCopy = false) => {
+    const isKeyboardAction = key.action.type === "keyboard";
+    const modifier = specialModifier(key);
+    const modifierState = (modifier && sticky[modifier]) || "off";
+    const available = availableAction(key);
+    const unavailableReason = !available
+      ? "Needs a newer version"
+      : available.type === "clipboard"
+        ? "Not available"
+        : undefined;
     const isActive = (isKeyboardAction && keyboardUp) || modifierState !== "off";
     return (
       <button
@@ -550,13 +520,15 @@ export function TerminalKeyRow({
         type="button"
         data-key-id={key.id}
         data-pinned={pinnedCopy ? "true" : undefined}
-        disabled={disabled}
+        disabled={disabled || !!unavailableReason}
         aria-label={
-          key.kind === "modifier" ? `${key.label}${stickyLabel(modifierState)}` : key.label
+          unavailableReason
+            ? `${key.label}, ${unavailableReason}`
+            : `${key.label}${stickyLabel(modifierState)}`
         }
-        aria-pressed={isKeyboardAction || key.kind === "modifier" ? isActive : undefined}
-        data-sticky-state={key.kind === "modifier" ? modifierState : undefined}
-        title={key.kind === "modifier" ? `${key.label}: ${modifierState}` : undefined}
+        aria-pressed={isKeyboardAction || modifier ? isActive : undefined}
+        data-sticky-state={modifier ? modifierState : undefined}
+        title={unavailableReason ?? (modifier ? `${key.label}: ${modifierState}` : undefined)}
         onClick={(event) => handleButtonClick(key, event)}
         style={{ gridColumn: `span ${key.width}` }}
         className={cn(
@@ -565,10 +537,11 @@ export function TerminalKeyRow({
           isKeyboardAction && isActive && "border-primary/50 bg-primary/15 text-primary",
           modifierState !== "off" &&
             "border-primary-cta bg-primary-cta text-primary-cta-foreground",
+          key.style === "danger" && "text-destructive",
           pinnedCopy && "border-dashed opacity-60",
         )}
       >
-        <KeyContent item={key} />
+        <TerminalKeyContent button={key} />
         {modifierState === "locked" && (
           <LockKeyhole className="ml-0.5 size-3 shrink-0" aria-hidden="true" />
         )}
@@ -577,8 +550,8 @@ export function TerminalKeyRow({
   };
 
   const renderRow = (
-    row: TerminalBarRow,
-    pack: ReturnType<typeof packRow>,
+    row: TerminalKeyRowV2,
+    pack: ReturnType<typeof packRow<RenderKey>>,
     page: number,
     rowName: "top" | "bottom",
   ) => {

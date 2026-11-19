@@ -120,10 +120,6 @@ import { WorktreeDetailsDialog } from "@/components/WorktreeDetailsDialog";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
-import {
-  MOBILE_ASSISTANT_ACTION_EVENT,
-  type MobileAssistantDirectAction,
-} from "@/lib/mobileAssistantPreferences";
 import { MobileHeaderButton } from "./MobileHeaderButton";
 import { SessionMenuHeader } from "./SessionMenuHeader";
 
@@ -300,20 +296,6 @@ export function HeaderConversationMenu({
   useEffect(() => {
     if (!renameOpen) setRenameTitle(conversation.title ?? "");
   }, [conversation.title, renameOpen]);
-
-  useEffect(() => {
-    if (!isMobile || surface !== "header" || !canManage) return;
-    const onAction = (event: Event) => {
-      if (
-        (event as CustomEvent<{ actionId: MobileAssistantDirectAction }>).detail.actionId ===
-        "renameSession"
-      ) {
-        setRenameOpen(true);
-      }
-    };
-    window.addEventListener(MOBILE_ASSISTANT_ACTION_EVENT, onAction);
-    return () => window.removeEventListener(MOBILE_ASSISTANT_ACTION_EVENT, onAction);
-  }, [isMobile, surface, canManage]);
 
   useEffect(() => {
     if (previousConversationId.current === conversation.id) return;

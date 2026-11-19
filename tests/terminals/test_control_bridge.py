@@ -197,6 +197,9 @@ class _FakeWebSocket:
             await asyncio.sleep(self._send_delay_s)
         self.sent_text.append(data)
 
+    async def send_json(self, data: dict[str, object]) -> None:
+        await self.send_text(json.dumps(data))
+
     @property
     def clipboard_messages(self) -> list[str]:
         """Clipboard frames, skipping the list of tmux-answered queries sent first."""
@@ -1348,6 +1351,64 @@ class _SteppedWebSocket(_FakeWebSocket):
 
     async def receive(self) -> dict[str, object]:
         return await self._queue.get()
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_tmux_host_clipboard_stays_on_its_requesting_attach(monkeypatch):
+    from omnigent.terminals import host_clipboard
+
+    clipboard = iter(("first text", "second text"))
+    requested = asyncio.Event()
+    release = asyncio.Event()
+
+    async def read_clipboard():
+        text = next(clipboard)
+        requested.set()
+        await release.wait()
+        return text, True
+
+    monkeypatch.setattr(host_clipboard, "read_host_clipboard", read_clipboard)
+    sock, target = await _new_private_tmux("cat")
+    clients = [_SteppedWebSocket(), _SteppedWebSocket()]
+    tasks = [
+        asyncio.create_task(
+            bridge_tmux_control_to_websocket(
+                ws, socket_path=str(sock), tmux_target=target, read_only=False
+            )
+        )
+        for ws in clients
+    ]
+    try:
+        for index, ws in enumerate(clients):
+            await poll_until_async(
+                lambda ws=ws: any('"hostClipboard"' in frame for frame in ws.sent_text)
+            )
+            requested.clear()
+            ws.feed(
+                {
+                    "type": "websocket.receive",
+                    "text": json.dumps({"type": "host-clipboard-read", "id": str(index)}),
+                }
+            )
+            await asyncio.wait_for(requested.wait(), 3)
+        release.set()
+        for index, (ws, text) in enumerate(
+            zip(clients, ("first text", "second text"), strict=True)
+        ):
+            await poll_until_async(
+                lambda ws=ws: any('"host-clipboard"' in frame for frame in ws.sent_text)
+            )
+            replies = [json.loads(frame) for frame in ws.sent_text if '"host-clipboard"' in frame]
+            assert replies == [
+                {"type": "host-clipboard", "id": str(index), "ok": True, "text": text}
+            ]
+            assert text.encode() not in b"".join(ws.sent)
+    finally:
+        for ws in clients:
+            ws.feed({"type": "websocket.disconnect"})
+        await _kill_and_join(sock, tasks[0])
+        await asyncio.wait_for(tasks[1], 3)
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")

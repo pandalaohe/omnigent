@@ -438,7 +438,7 @@ def test_real_host_phone_bytes(
                 client.delete(f"{collection}/{terminal_id}").raise_for_status()
 
 
-def test_reader_has_chat_wheel_and_no_terminal_keys(
+def test_reader_has_no_writable_terminal_keys(
     request: pytest.FixtureRequest,
     browser: Browser,
     record_property: Callable[[str, object], None],
@@ -462,9 +462,7 @@ def test_reader_has_chat_wheel_and_no_terminal_keys(
     with _phone(browser, request, headers={"X-Forwarded-Email": reader}) as page:
         _open_terminal(page, base_url, session_id, "terminal_tui_main")
         expect(page.get_by_test_id("terminal-key-row")).to_have_count(0)
-        wheel = page.get_by_test_id("mobile-floating-assistant")
-        expect(wheel).to_be_visible()
-        expect(wheel.get_by_role("button", name="Esc", exact=True)).to_have_count(0)
+        expect(page.get_by_test_id("mobile-floating-assistant")).to_have_count(0)
 
 
 def test_agent_can_use_plain_user_shell_without_socket_disclosure(

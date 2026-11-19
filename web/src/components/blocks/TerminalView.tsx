@@ -21,7 +21,9 @@ import { toast } from "sonner";
 import {
   isTerminalClipboardWritePending,
   queueTerminalClipboardWrite,
+  writeExplicitTerminalClipboardText,
 } from "@/lib/terminalClipboardWriter";
+import { useTerminalPaste, type TerminalClipboardAction } from "@/lib/terminalPaste";
 import {
   getOmnigentServerIdentity,
   isDatabricksWorkspace,
@@ -48,24 +50,27 @@ import {
 } from "@/lib/terminals";
 import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
 import { hostTerminalsPath } from "@/hooks/useHostTerminals";
-import { useIsPhone } from "@/hooks/useIsPhone";
+import { useIsPhone, useTerminalKeyBarGate } from "@/hooks/useIsPhone";
 import { useTerminalKeyboardRoom } from "@/hooks/useTerminalKeyboardRoom";
 import {
-  TERMINAL_SOFT_KEY_EVENT,
   EMPTY_STICKY_MODIFIERS,
   barHeightPx,
-  isDomTargetVisible,
-  registerTypableTerminal,
-  resolveTerminalBar,
   useMobileAssistantPreferences,
-  type TerminalSoftKeyEventDetail,
 } from "@/lib/mobileAssistantPreferences";
 import {
   TerminalClipboardPrompt,
   type TerminalClipboardDecision,
   type TerminalClipboardPromptReason,
 } from "./TerminalClipboardPrompt";
-import { TerminalKeyRow, pressBarKey } from "./TerminalKeyRow";
+import { TerminalKeyRow } from "./TerminalKeyRow";
+import { TerminalSelectionHandles } from "./TerminalSelectionHandles";
+import type { SelectionHandles } from "@/lib/terminalTouchSelection";
+import {
+  TERMINAL_COPY_BLOCKED_MESSAGE,
+  TerminalCopySheet,
+  TerminalPasteBox,
+} from "./TerminalTouchClipboard";
+import { resolveTerminalKeys, type KeySurface } from "@/lib/terminalKeys";
 import {
   type ConnectionState,
   type TerminalActivityListener,
@@ -203,6 +208,7 @@ type TerminalViewProps = (
    * unfocused split panes and the desktop workspace rail. Default true.
    */
   showKeyRows?: boolean;
+  keySurface?: KeySurface;
 };
 
 export function TerminalView({
@@ -221,6 +227,7 @@ export function TerminalView({
   focusOnConnect = active,
   reservesBottomSafeArea = true,
   showKeyRows = true,
+  keySurface,
   directAttachUrl,
 }: TerminalViewProps) {
   const openFile = useFileViewer();
@@ -338,6 +345,11 @@ export function TerminalView({
   const isDarkRef = useRef(isDark);
   isDarkRef.current = isDark;
   const sessionRef = useRef<TerminalSession | null>(null);
+  const terminalPaste = useTerminalPaste(sessionRef, clipboardScope, active, readOnly);
+  const cancelPaste = terminalPaste.cancel;
+  const [copySheet, setCopySheet] = useState<string | null>(null);
+  const [selectionHandles, setSelectionHandles] = useState<SelectionHandles | null>(null);
+  useLayoutEffect(() => setCopySheet(null), [clipboardScope, active]);
   const terminalNodeRef = useRef<HTMLDivElement | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const isPhone = useIsPhone();
@@ -360,28 +372,34 @@ export function TerminalView({
             Date.now() - connectedAtRef.current >= RECONNECT_STABLE_MS))));
   const terminalEnded = state.kind === "closed" && !reconnectPending && !willAutoReconnect;
   const keyPreferences = useMobileAssistantPreferences();
-  const resolvedTerminalBar = resolveTerminalBar(
-    keyPreferences as unknown as Record<string, unknown>,
-  );
-  const terminalBar = resolvedTerminalBar.bar;
+  const gate = useTerminalKeyBarGate();
+  const canTouchSelect = gate && keySurface !== undefined && active && state.kind === "connected";
+  const terminalKeys = keySurface
+    ? resolveTerminalKeys({ ...keyPreferences }).keys[keySurface]
+    : undefined;
   const hasTerminalBarKeys =
-    terminalBar.top.keys.length > 0 ||
-    (terminalBar.bottom.enabled && terminalBar.bottom.keys.length > 0);
-  const canShowKeyRows =
-    isPhone &&
+    terminalKeys &&
+    (terminalKeys.top.keys.length > 0 ||
+      (terminalKeys.bottom.enabled && terminalKeys.bottom.keys.length > 0));
+  const canShowKeyRows = Boolean(
+    gate &&
     !readOnly &&
     showKeyRows &&
     active &&
     !terminalEnded &&
-    keyPreferences.terminalKeysEnabled &&
-    hasTerminalBarKeys;
+    terminalKeys?.enabled &&
+    hasTerminalBarKeys,
+  );
   const { overlap, keyboardUp, roomPx, keyRowWidth, paddingBottomPx } = useTerminalKeyboardRoom(
     rootRef,
     canShowKeyRows,
     reservesBottomSafeArea,
   );
-  const barHeight = barHeightPx(terminalBar, keyRowWidth >= 560);
-  const hasBar = canShowKeyRows && roomPx >= barHeight + 108;
+  const barHeight = terminalKeys ? barHeightPx(terminalKeys, keyRowWidth >= 560) : 0;
+  const hasBar =
+    canShowKeyRows &&
+    (terminalKeys?.showRows !== "keyboard" || keyboardUp) &&
+    roomPx >= barHeight + 108;
 
   useEffect(() => {
     const session = sessionRef.current;
@@ -389,18 +407,13 @@ export function TerminalView({
     const onVisibility = () => {
       if (document.visibilityState === "hidden") reset();
     };
-    if (state.kind !== "connected" || !active || readOnly || !isPhone) reset();
+    if (state.kind !== "connected" || !active || readOnly || !gate) reset();
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       document.removeEventListener("visibilitychange", onVisibility);
       reset();
     };
-  }, [state.kind, active, readOnly, sessionId, hostId, terminalId, isPhone]);
-
-  useEffect(() => {
-    if (!active || readOnly || terminalEnded) return;
-    return registerTypableTerminal(hasBar);
-  }, [active, readOnly, terminalEnded, hasBar, state.kind, sessionId, hostId, terminalId]);
+  }, [state.kind, active, readOnly, sessionId, hostId, terminalId, gate]);
 
   // Stable refs so callback prop changes never recreate the WS session.
   const onStateChangeRef = useRef(onStateChange);
@@ -411,60 +424,9 @@ export function TerminalView({
   onInputRef.current = onInput;
   const activeRef = useRef(active);
   activeRef.current = active;
-  const canInputRef = useRef(state.kind === "connected" && !readOnly);
-  canInputRef.current = state.kind === "connected" && !readOnly;
-  const connectionEpochRef = useRef(0);
   const focusOnConnectRef = useRef(focusOnConnect);
   focusOnConnectRef.current = focusOnConnect;
 
-  useEffect(() => {
-    const handleSoftKey = (event: Event) => {
-      const detail = (event as CustomEvent<TerminalSoftKeyEventDetail>).detail;
-      if (detail.handled || !activeRef.current || readOnly || !sessionRef.current) return;
-      const session = sessionRef.current;
-      const node = terminalNodeRef.current;
-      if (!isDomTargetVisible(node)) return;
-      (detail.candidates ??= []).push({
-        focused: Boolean(node?.contains(document.activeElement)),
-        ownsPreferredTarget: Boolean(
-          detail.preferredTarget && node?.contains(detail.preferredTarget),
-        ),
-        send: () => {
-          const epoch = connectionEpochRef.current;
-          const isCurrent = () =>
-            connectionEpochRef.current === epoch &&
-            sessionRef.current === session &&
-            activeRef.current &&
-            canInputRef.current &&
-            document.visibilityState !== "hidden" &&
-            isDomTargetVisible(node);
-          if ((detail.onTerminalTarget || detail.terminalBarKey) && !isCurrent()) return;
-          if (detail.onStickyChanged) {
-            detail.onStickySubscribed?.(session.onStickyConsumed(detail.onStickyChanged));
-          }
-          if (detail.onTerminalTarget) {
-            detail.onTerminalTarget({
-              isCurrent,
-              press: (key, gesture) => {
-                if (isCurrent()) pressBarKey(session, key, gesture);
-              },
-            });
-            detail.onStickyChanged?.(session.getStickyModifiers());
-            return;
-          }
-          const barKey = detail.terminalBarKey;
-          if (barKey) {
-            pressBarKey(session, barKey, detail.terminalGesture ?? "tap");
-          } else if (detail.data !== undefined) {
-            session.sendSoftKey(detail.action, detail.data);
-          } else session.sendSoftKey(detail.action);
-          detail.onStickyChanged?.(session.getStickyModifiers());
-        },
-      });
-    };
-    window.addEventListener(TERMINAL_SOFT_KEY_EVENT, handleSoftKey);
-    return () => window.removeEventListener(TERMINAL_SOFT_KEY_EVENT, handleSoftKey);
-  }, [readOnly]);
   // Bumped by every attach so an in-flight attach can tell it has been
   // superseded — a ref callback can re-run for the *same* node, which
   // leaves no other way to retire the previous attempt's async work.
@@ -483,14 +445,14 @@ export function TerminalView({
   }, []);
 
   // Stable dispatcher: updates local state and notifies the parent.
-  const notifyState = useCallback((next: ConnectionState) => {
-    if (next.kind !== "connected") {
-      connectionEpochRef.current += 1;
-      canInputRef.current = false;
-    }
-    setState(next);
-    onStateChangeRef.current?.(next);
-  }, []);
+  const notifyState = useCallback(
+    (next: ConnectionState) => {
+      if (next.kind !== "connected") cancelPaste(next.kind === "closed" || next.kind === "error");
+      setState(next);
+      onStateChangeRef.current?.(next);
+    },
+    [cancelPaste],
+  );
 
   const notifyActivity = useCallback(() => {
     // Terminal output: the attach reached a live shell, so a later close is
@@ -532,6 +494,58 @@ export function TerminalView({
     [],
   );
 
+  const isCopyAllowed = useCallback(
+    () =>
+      clipboardMountedRef.current &&
+      clipboardActiveRef.current &&
+      clipboardScopeRef.current.scope === clipboardScope &&
+      clipboardScopeRef.current.epoch === clipboardScopeEpoch &&
+      clipboardConsentRef.current.decision !== "block",
+    [clipboardScope, clipboardScopeEpoch],
+  );
+
+  const copyExplicit = useCallback(
+    (text: string, isGestureCurrent?: () => boolean) => {
+      clipboardRequestGenerationRef.current += 1;
+      setClipboardPrompt(null);
+      const isAllowed = () => isCopyAllowed() && (isGestureCurrent?.() ?? true);
+      void writeExplicitTerminalClipboardText(text, isAllowed).then((copied) => {
+        if (!isAllowed()) return;
+        if (copied && isGestureCurrent) toast.success("Copied", { duration: 1500 });
+        if (!copied)
+          toast.error(isGestureCurrent ? "Couldn't copy" : "Couldn't copy terminal text");
+      });
+    },
+    [isCopyAllowed],
+  );
+
+  const copyTouchSelection = useRef<(text: string, isCurrent: () => boolean) => void>(() => {});
+  copyTouchSelection.current = (text, isCurrent) => {
+    if (!isCurrent()) return;
+    if (!isCopyAllowed()) {
+      toast.info("Copy blocked by the terminal clipboard setting", {
+        id: "terminal-clipboard-blocked",
+      });
+      return;
+    }
+    copyExplicit(text, isCurrent);
+  };
+
+  useLayoutEffect(() => {
+    const session = sessionRef.current;
+    if (!canTouchSelect || !session) return;
+    let enabled = true;
+    const isCurrent = () => enabled && sessionRef.current === session && mountedRef.current;
+    session.setTouchSelection({
+      copy: (text) => copyTouchSelection.current(text, isCurrent),
+      handles: setSelectionHandles,
+    });
+    return () => {
+      enabled = false;
+      session.setTouchSelection(null);
+    };
+  }, [canTouchSelect]);
+
   const notifyClipboardRequest = useCallback(
     (text: string, copyEvent?: ClipboardEvent) => {
       if (
@@ -551,7 +565,7 @@ export function TerminalView({
         };
       }
       if (clipboardConsentRef.current.decision === "block") {
-        toast.info("Copying from this terminal is blocked.", {
+        toast.info(TERMINAL_COPY_BLOCKED_MESSAGE, {
           id: "terminal-clipboard-blocked",
           description: "Change this in Settings → General.",
         });
@@ -563,8 +577,7 @@ export function TerminalView({
         copyEvent?.clipboardData &&
         !isTerminalClipboardWritePending()
       ) {
-        // Keep native copy gestures independent of browser async-clipboard permissions.
-        // If a write is in flight, queue below so it cannot overwrite this selection.
+        // A pending write can overwrite a native copy, so queue the selection in that case.
         setClipboardPrompt(null);
         clipboardNeedsClickRef.current = false;
         applyTerminalCopy(copyEvent, text);
@@ -597,6 +610,24 @@ export function TerminalView({
     },
     [clipboardScope, clipboardScopeEpoch, queueSessionClipboardCopy, readOnly],
   );
+
+  const onClipboardActionRef = useRef<TerminalClipboardAction>(() => {});
+  onClipboardActionRef.current = (op, options, nativeText) => {
+    if (op !== "copy") {
+      void terminalPaste.paste(op, options, nativeText);
+      return;
+    }
+    if (!active) return;
+    if (!isCopyAllowed()) {
+      toast.info(TERMINAL_COPY_BLOCKED_MESSAGE, { id: "terminal-clipboard-blocked" });
+      return;
+    }
+    const session = sessionRef.current;
+    if (!session) return;
+    const selection = session.selectedText();
+    if (selection) copyExplicit(selection);
+    else if (gate) setCopySheet(session.bufferText());
+  };
 
   const handleClipboardConsent = useCallback(
     (decision: TerminalClipboardDecision | "retry", remember = false) => {
@@ -665,9 +696,11 @@ export function TerminalView({
   // arrived in React 19), so without this every remount would abandon
   // the previous session — xterm buffers, observers, and all.
   const disposeActiveSession = useCallback(() => {
+    cancelPaste();
+    setCopySheet(null);
     sessionRef.current?.dispose();
     sessionRef.current = null;
-  }, []);
+  }, [cancelPaste]);
 
   useLayoutEffect(() => {
     mountedRef.current = true;
@@ -788,6 +821,9 @@ export function TerminalView({
           focusOnConnectRef.current && !isPhoneRef.current,
           terminalId === "terminal_codex_main",
           notifyFileLink,
+          (...args) => {
+            if (!superseded()) onClipboardActionRef.current(...args);
+          },
         );
         sessionRef.current = terminalSession;
         // Relay-connected with a direct URL on offer: negotiate the
@@ -1006,6 +1042,14 @@ export function TerminalView({
         style={{ backgroundColor: terminalBackground }}
       >
         <div key={connectAttempt} ref={attachSession} className="h-full w-full overflow-hidden" />
+        {canTouchSelect && selectionHandles && (
+          <TerminalSelectionHandles
+            positions={selectionHandles}
+            onStart={(handle, event) =>
+              sessionRef.current?.startTouchSelectionHandle(handle, event)
+            }
+          />
+        )}
         {state.kind !== "connected" && (
           <StatusOverlay
             state={refusedDuringLaunch ? { kind: "connecting" } : state}
@@ -1023,15 +1067,52 @@ export function TerminalView({
           />
         )}
       </div>
+      {terminalPaste.review && (
+        <div className="flex items-center gap-2 border-t bg-background px-3 py-2">
+          <div className="min-w-0 flex-1">
+            <p role="status" className="text-xs text-muted-foreground">
+              {terminalPaste.review.text.split("\n").length} lines
+              {terminalPaste.review.repeatUntil > 0
+                ? " · Tap the paste key again within 3 seconds or use Paste"
+                : " · Review before pasting"}
+            </p>
+            <pre className="overflow-hidden text-ellipsis whitespace-pre text-xs">
+              {terminalPaste.review.text
+                .split("\n", 3)
+                .join("\n")
+                .slice(0, 240)
+                .replace(/\t/g, "⇥")}
+            </pre>
+          </div>
+          <Button type="button" size="xs" variant="outline" onClick={() => cancelPaste()}>
+            Cancel
+          </Button>
+          <Button type="button" size="xs" onClick={terminalPaste.confirm}>
+            Paste
+          </Button>
+        </div>
+      )}
       {hasBar && (
         <TerminalKeyRow
           sessionRef={sessionRef}
           keyboardUp={keyboardUp}
           disabled={state.kind !== "connected"}
-          bar={terminalBar}
-          identityKey={`${sessionId ?? hostId}:${terminalId}`}
+          surface={terminalKeys}
+          identityKey={`${keySurface}:${sessionId ?? hostId}:${terminalId}`}
         />
       )}
+      <TerminalCopySheet
+        key={clipboardScopeEpoch}
+        text={copySheet}
+        isCopyBlocked={() => !isCopyAllowed()}
+        onClose={() => setCopySheet(null)}
+      />
+      <TerminalPasteBox
+        open={terminalPaste.showPasteBox}
+        enabled={state.kind === "connected" && !readOnly}
+        onSend={terminalPaste.pasteFromBox}
+        onClose={() => cancelPaste()}
+      />
     </div>
   );
 }
