@@ -53,6 +53,7 @@ export const MAX_SEND_BYTES = 256;
 const SPECIAL_MODIFIERS = ["ctrl", "shift", "alt", "opt", "cmd", "win"] as const;
 export type SpecialModifier = (typeof SPECIAL_MODIFIERS)[number];
 export type SpecialId = SpecialModifier | "tab" | "esc";
+/** A terminal chord can use a logical character as its code. */
 export type BarChord = ShortcutChord;
 export type ArmedModifiers = TerminalStickyModifiers;
 
@@ -599,7 +600,9 @@ export function applyCmd(
   appCursor = false,
 ): KeyOutput {
   const chord = "chord" in input ? input.chord : undefined;
-  const key = "char" in input ? input.char.toLowerCase() : chord?.code;
+  const character = chord && Array.from(chord.code).length === 1 ? chord.code : undefined;
+  const key =
+    "char" in input ? input.char.toLowerCase() : (character?.toLowerCase() ?? chord?.code);
   if (mode === "mac-meta" || mode === "mac") {
     const hasOtherModifiers = chord?.modifiers.some((modifier) => modifier !== "meta") ?? false;
     // Cmd+V always goes through the clipboard path, even with other modifiers armed.
@@ -617,6 +620,15 @@ export function applyCmd(
   }
   if (mode === "meta" || mode === "mac-meta") {
     if ("char" in input) return { bytes: `\x1b${input.char}` };
+    if (character !== undefined) {
+      return {
+        bytes: applyTerminalTextModifiers(character, {
+          ...EMPTY_STICKY_MODIFIERS,
+          ctrl: input.chord.modifiers.includes("control") ? "once" : "off",
+          alt: "once",
+        }),
+      };
+    }
     const modifiers = new Set(
       input.chord.modifiers.filter((modifier) => modifier !== "meta" && modifier !== "primary"),
     );
@@ -637,7 +649,11 @@ export function encodeChord(chord: BarChord, armed: ArmedModifiers, appCursor: b
   if (isArmedModifier(armed, "ctrl")) modifiers.add("control");
   if (isArmedModifier(armed, "shift")) modifiers.add("shift");
   if (isArmedModifier(armed, "alt") || isArmedModifier(armed, "opt")) modifiers.add("alt");
-  const withArmed = { code: chord.code, modifiers: [...modifiers] };
+  const code =
+    isArmedModifier(armed, "shift") && /^[a-z]$/.test(chord.code)
+      ? chord.code.toUpperCase()
+      : chord.code;
+  const withArmed = { code, modifiers: [...modifiers] };
   if (modifiers.has("meta") || isArmedModifier(armed, "cmd") || isArmedModifier(armed, "win")) {
     return applyCmd(withChord(withArmed), CMD_KEY_MODE, appCursor);
   }

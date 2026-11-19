@@ -105,6 +105,67 @@ describe("MobileAssistantSettings", () => {
     expect(screen.getByRole("button", { name: "Record" })).toBeVisible();
   });
 
+  it("keeps Send Enter after when re-recording a Send key and drops it for a Cmd chord", () => {
+    render(<MobileAssistantSettings />);
+    addKey();
+    fireEvent.change(screen.getByLabelText("Send sequence"), { target: { value: "old text" } });
+    const enterSwitch = screen.getByRole("switch", { name: "Send Enter after" });
+    fireEvent.click(enterSwitch);
+    fireEvent.click(screen.getByRole("button", { name: "Record" }));
+    fireEvent.keyDown(window, { key: "b", code: "KeyB" });
+    expect(enterSwitch).toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(storedKeys().shell.bottom.keys.at(-1)?.action).toEqual({
+      type: "send",
+      send: "b",
+      autoEnter: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^Edit b,/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Record" }));
+    fireEvent.keyDown(window, { key: "v", code: "Period", metaKey: true });
+    expect(screen.getByText("⌘V → Paste")).toBeVisible();
+    expect(screen.queryByRole("switch", { name: "Send Enter after" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(storedKeys().shell.bottom.keys.at(-1)?.action).toEqual({
+      type: "combo",
+      chord: { code: "v", modifiers: ["meta"] },
+    });
+  });
+
+  it("offers only the horizontal moves available at the key's current row position", () => {
+    render(<MobileAssistantSettings />);
+    fireEvent.click(screen.getByRole("button", { name: /^Edit Esc,/ }));
+    expect(screen.queryByRole("button", { name: "Move left" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Move right" }));
+    expect(screen.getByRole("button", { name: "Move left" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    const last = storedKeys().shell.top.keys.at(-1)!;
+    fireEvent.click(
+      screen.getByRole("button", { name: `Edit ${last.label}, ${last.width} cells` }),
+    );
+    expect(screen.queryByRole("button", { name: "Move right" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Move left" })).toBeVisible();
+  });
+
+  it("shows a recovery action without exposing the server's rejection details", () => {
+    render(<MobileAssistantSettings />);
+    fireEvent(
+      window,
+      new CustomEvent(preferencesSync.USER_PREFERENCES_PATCH_REJECTED_EVENT, {
+        detail: {
+          namespace: "mobile_assistant",
+          detail: "Terminal preferences failed the schema check",
+        },
+      }),
+    );
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Couldn't sync the key layout");
+    expect(alert).toHaveTextContent("save your changes again");
+    expect(alert).not.toHaveTextContent("schema check");
+  });
+
   it("captures a Cmd token and saves paste and special-key options", () => {
     render(<MobileAssistantSettings />);
     openNative();

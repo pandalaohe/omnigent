@@ -172,6 +172,12 @@ function isClipboardPress(key: RenderKey, sticky: TerminalStickyModifiers): bool
     return "clipboard" in resolveSend(action.send, action.autoEnter === true, sticky, false);
   }
   if (action?.type === "combo") return "clipboard" in encodeChord(action.chord, sticky, false);
+  if (
+    action?.type === "legacy" &&
+    action.key.kind === "key" &&
+    (isArmedModifier(sticky, "cmd") || isArmedModifier(sticky, "win"))
+  )
+    return "clipboard" in encodeChord(action.key.chord, sticky, false);
   return action?.type === "clipboard";
 }
 
