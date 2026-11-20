@@ -898,6 +898,93 @@ async def test_followup_waits_for_claude_after_the_runner_slot_is_released(
     assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "follow-up"]
 
 
+_RUNNING_TURN_PANE = (
+    "✻ Sautéing… (12s · esc to interrupt)\n\n"
+    "──────────────────────\n❯ \n──────────────────────\n"
+    "  ⏵⏵ accept edits on (shift+tab to cycle)\n"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt_pending", [False, True], ids=["input-open", "question-pending"])
+async def test_followup_goes_into_a_running_turn_whose_input_box_is_open(
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_pending: bool,
+) -> None:
+    """Claude Code queues mid-turn input itself; only a pending question still holds it."""
+    app, harness, _server = _build_app([_DELIVERED, _DELIVERED])
+    sid = uuid.uuid4().hex
+    pending = False
+    held_checks = 0
+    bridge_dir = claude_native_bridge.bridge_dir_for_bridge_id("label-owned-bridge")
+    claude_native_bridge.write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    def question_pending(_bridge_dir: Path) -> bool:
+        nonlocal held_checks
+        if pending:
+            held_checks += 1
+        return pending
+
+    monkeypatch.setattr(claude_native_bridge, "_claude_turn_running", lambda *_: True)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_, **__: _RUNNING_TURN_PANE)
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", question_pending)
+    async with _runner_client(app) as client:
+        await _create_session(client, sid)
+        await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
+        await _until(lambda: len(harness.posted_bodies) == 1 and sid not in app.state.active_turns)
+        pending = prompt_pending
+        reply = await client.post(f"/v1/sessions/{sid}/events", json=_message("follow-up"))
+        assert reply.json()["status"] == ("buffered" if prompt_pending else "accepted")
+        if prompt_pending:
+            # The waiter keeps re-checking the question and holds the message meanwhile.
+            await _until(lambda: held_checks >= 3)
+            assert len(harness.posted_bodies) == 1
+            pending = False
+        await _until(lambda: len(harness.posted_bodies) == 2 and sid not in app.state.active_turns)
+    assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "follow-up"]
+
+
+@pytest.mark.asyncio
+async def test_followup_reaches_a_running_turn_once_its_hidden_input_box_repaints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A box hidden by printed output gets a repaint mid-turn instead of waiting for idle."""
+    app, harness, _server = _build_app([_DELIVERED, _DELIVERED])
+    sid = uuid.uuid4().hex
+    pane = _RUNNING_TURN_PANE
+    repaints = 0
+    bridge_dir = claude_native_bridge.bridge_dir_for_bridge_id("label-owned-bridge")
+    claude_native_bridge.write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    def repaint(*_args: object) -> int:
+        nonlocal pane, repaints
+        repaints += 1
+        pane = _RUNNING_TURN_PANE
+        return 1
+
+    monkeypatch.setattr(claude_native_bridge, "_claude_turn_running", lambda *_: True)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_, **__: pane)
+    monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", repaint)
+    async with _runner_client(app) as client:
+        await _create_session(client, sid)
+        await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
+        await _until(lambda: len(harness.posted_bodies) == 1 and sid not in app.state.active_turns)
+        pane = "✻ Sautéing… (40s · esc to interrupt)\nlauncher: refreshing credentials\n"
+        reply = await client.post(f"/v1/sessions/{sid}/events", json=_message("follow-up"))
+        assert reply.json()["status"] == "buffered"
+        await _until(lambda: len(harness.posted_bodies) == 2 and sid not in app.state.active_turns)
+    assert repaints == 1
+    assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "follow-up"]
+
+
 @pytest.mark.asyncio
 async def test_held_message_is_sent_when_the_queue_drains_prompt_check_fails(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
