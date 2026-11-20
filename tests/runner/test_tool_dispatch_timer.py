@@ -268,6 +268,24 @@ async def test_timer_firing_retries_connect_error_then_succeeds(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", [{"timer_delivery": "dropped"}, {"queued": True}])
+async def test_one_shot_timer_waits_when_handover_holds_its_firing(
+    monkeypatch: pytest.MonkeyPatch, delivery: dict[str, Any]
+) -> None:
+    responder = _RetryResponder(
+        [
+            httpx.Response(202, json={"queued": False, "timer_delivery": "held"}),
+            httpx.Response(202, json=delivery),
+        ]
+    )
+
+    sleeps = await _run_timer_loop(monkeypatch, responder)
+
+    assert responder.posts == 2
+    assert sleeps == [0.0, 2.0]
+
+
+@pytest.mark.asyncio
 async def test_timer_firing_does_not_retry_503(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

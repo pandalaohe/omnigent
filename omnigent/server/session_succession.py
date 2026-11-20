@@ -30,6 +30,7 @@ from uuid import uuid4
 from weakref import WeakValueDictionary
 
 import httpx
+from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.utils import generate_task_id, now_epoch
 from omnigent.db.workspace_cache import WorkspaceScopedCache
@@ -67,6 +68,7 @@ from omnigent.stores.conversation_store import (
     LabelGroupChange,
     SessionSuccession,
 )
+from omnigent.stores.file_store import FileStore
 from omnigent.stores.peer_message_store import PeerMessageStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
@@ -106,6 +108,69 @@ def scheduled_send_lock(session_id: str) -> asyncio.Lock:
     return _scheduled_send_locks.setdefault(session_id, asyncio.Lock())
 
 
+def claude_transfer_lock(session_id: str) -> asyncio.Lock:
+    """Serialize the old pane transfer with a saved answer's delivery attempt."""
+    return _claude_transfer_locks.setdefault(session_id, asyncio.Lock())
+
+
+def claude_transfer_pending(conversation: Conversation) -> bool:
+    return bool(conversation.labels.get(_CLAUDE_TRANSFER_LABEL)) and not bool(
+        conversation.labels.get(SUCCEEDED_BY_LABEL_KEY)
+    )
+
+
+def released_succession_target(
+    store: ConversationStore, session_id: str, *, require_receipt: bool
+) -> str | None:
+    """Resolve a delivery only after every move in its lineage has released."""
+    from omnigent.server.routes.sessions.routes_peer import _SUCCESSOR_MAX_HOPS
+
+    visited: set[str] = set()
+    for _ in range(_SUCCESSOR_MAX_HOPS + 1):
+        if session_id in visited:
+            break
+        visited.add(session_id)
+        conversation = store.get_conversation(session_id)
+        if conversation is None or claude_transfer_pending(conversation):
+            return None
+        successor_id = conversation.labels.get(SUCCEEDED_BY_LABEL_KEY)
+        if not successor_id:
+            return session_id
+        receipt = store.get_succession(session_id, successor_id)
+        if receipt is not None:
+            if receipt.phase not in {"released", "cards_closed", "archived", "done"}:
+                return None
+        elif require_receipt:
+            return None
+        session_id = successor_id
+    return None
+
+
+def copy_succession_file(file_store: FileStore, file_id: str, old_id: str, new_id: str) -> str:
+    """Give the successor a session-scoped reference to an attachment from the source."""
+    source = file_store.get(file_id, session_id=old_id)
+    if source is None:
+        raise OmnigentError(
+            "Attachment not found in the previous session", code=ErrorCode.NOT_FOUND
+        )
+    new_file_id = hashlib.sha256(f"succession-file:{file_id}:{new_id}".encode()).hexdigest()[:32]
+    if file_store.get(new_file_id, session_id=new_id) is None:
+        try:
+            file_store.create(
+                filename=source.filename,
+                bytes=source.bytes,
+                content_type=source.content_type,
+                session_id=new_id,
+                file_id=new_file_id,
+                blob_key=source.blob_key or source.id,
+                source_metadata=source.source_metadata,
+            )
+        except IntegrityError:
+            if file_store.get(new_file_id, session_id=new_id) is None:
+                raise
+    return new_file_id
+
+
 async def commit_succession_move(
     store: ConversationStore,
     old_id: str,
@@ -133,7 +198,9 @@ async def commit_succession_move(
     await asyncio.shield(move())
 
 
-def is_requested_claude_transfer(old: Conversation, new: Conversation, terminal_id: str) -> bool:
+def is_requested_claude_transfer(
+    old: Conversation, new: Conversation, terminal_id: str = _CLAUDE_TERMINAL
+) -> bool:
     """Only the server-prepared, explicitly requested Claude rotation commits on transfer."""
     if terminal_id != _CLAUDE_TERMINAL or new.labels.get(SUCCEEDS_LABEL_KEY) != old.id:
         return False
@@ -216,7 +283,7 @@ async def transfer_requested_claude_terminal(
 ) -> tuple[int, dict[str, Any]]:
     """Transfer the pane and commit the move before acknowledging the transfer."""
     store = conversation_store
-    async with _claude_transfer_locks.setdefault(old_id, asyncio.Lock()):
+    async with claude_transfer_lock(old_id):
         old, new = await asyncio.gather(
             asyncio.to_thread(store.get_conversation, old_id),
             asyncio.to_thread(store.get_conversation, new_id),
@@ -301,7 +368,7 @@ async def _recover_claude_transfers(
 ) -> None:
     intents = await asyncio.to_thread(store.list_label_values, _CLAUDE_TRANSFER_LABEL)
     for old_id, intent in intents.items():
-        async with _claude_transfer_locks.setdefault(old_id, asyncio.Lock()):
+        async with claude_transfer_lock(old_id):
             try:
                 old = await asyncio.to_thread(store.get_conversation, old_id)
                 if old is None or old.labels.get(_CLAUDE_TRANSFER_LABEL) != intent:
@@ -808,6 +875,17 @@ async def _phase_open(
     questions = (
         receipt.questions if receipt.questions is not None else _open_questions(receipt.old_id)
     )
+    if questions:
+        saved_answers = {
+            card.elicitation_id
+            for card in await asyncio.to_thread(conversation_store.list_detached_cards)
+            if card.session_id == receipt.old_id and card.state in {"answered", "settled"}
+        }
+        # An already-saved answer has its own durable delivery. Only still-open
+        # questions belong in the successor's list of cards to re-ask.
+        opening_questions = [q for q in questions if q.get("elicitation_id") not in saved_answers]
+    else:
+        opening_questions = questions
     if receipt.questions is None:
         # The receipt is the only durable copy: the live index entry dies with
         # the process, and the old card is closed a few phases later.
@@ -876,13 +954,13 @@ async def _phase_open(
         handover=handover,
         children=children,
         child_states=child_states,
-        questions=questions,
+        questions=opening_questions,
         dropped=dropped,
         created_at=receipt.created_at,
     )
     payload: dict[str, Any] = {
         "text": text,
-        "waking": bool(handover) or bool(questions),
+        "waking": bool(handover) or bool(opening_questions),
     }
 
     notice = NewConversationItem(

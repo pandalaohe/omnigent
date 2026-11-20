@@ -802,6 +802,7 @@ async def test_answer_survives_retry_window_until_runner_returns(
         conversation_store: Any,
         runner_router: Any,
         confirm_delivery: bool = False,
+        card_answer_wake: orchestration._CardAnswerWake | None = None,
     ) -> bool:
         first_attempt.set()
         if online:

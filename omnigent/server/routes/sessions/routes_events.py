@@ -26,7 +26,6 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRoute
-from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import Headers
 from starlette.types import Message, Receive, Scope, Send
 
@@ -375,6 +374,12 @@ from omnigent.server.session_collab import AGENT_SESSION_HEADER, collab_owner_fo
 from omnigent.server.session_live_state import handoff_count, last_liveness_stamp
 from omnigent.server.session_metadata_logging import log_session_metadata
 from omnigent.server.session_orchestration import require_orchestration_source
+from omnigent.server.session_succession import (
+    claude_transfer_pending,
+    copy_succession_file,
+    is_requested_claude_transfer,
+    released_succession_target,
+)
 from omnigent.server.startup_inputs import StartupDispatch, StartupInputContext
 from omnigent.server.subagent_activity import (
     native_subagent_terminal_status,
@@ -462,6 +467,7 @@ _interrupt_delivery_tasks: WorkspaceScopedCache[str, asyncio.Task[None]] = Works
 # Leading text of the runner's sub-agent wake notice
 # (``omnigent.runner.app._format_subagent_wake_notice``).
 _SUBAGENT_WAKE_PREFIX = "[System: sub-agent"
+_TIMER_WAKE_PREFIX = "[System: timer "
 
 
 async def _deliver_interrupt_once(
@@ -1835,32 +1841,9 @@ def register_events_routes(
         for block in content if isinstance(content, list) else []:
             file_id = block.get("file_id") if isinstance(block, dict) else None
             if isinstance(file_id, str) and file_id and file_store is not None:
-                source = await asyncio.to_thread(file_store.get, file_id, session_id=old_id)
-                if source is None:
-                    raise OmnigentError(
-                        "Attachment not found in the previous session", code=ErrorCode.NOT_FOUND
-                    )
-                new_file_id = hashlib.sha256(
-                    f"succession-file:{file_id}:{new_id}".encode()
-                ).hexdigest()[:32]
-                if await asyncio.to_thread(file_store.get, new_file_id, session_id=new_id) is None:
-                    try:
-                        await asyncio.to_thread(
-                            file_store.create,
-                            filename=source.filename,
-                            bytes=source.bytes,
-                            content_type=source.content_type,
-                            session_id=new_id,
-                            file_id=new_file_id,
-                            blob_key=source.blob_key or source.id,
-                            source_metadata=source.source_metadata,
-                        )
-                    except IntegrityError:
-                        if (
-                            await asyncio.to_thread(file_store.get, new_file_id, session_id=new_id)
-                            is None
-                        ):
-                            raise
+                new_file_id = await asyncio.to_thread(
+                    copy_succession_file, file_store, file_id, old_id, new_id
+                )
                 block = {**block, "file_id": new_file_id}
             copied.append(block)
         return body.model_copy(
@@ -1903,6 +1886,9 @@ def register_events_routes(
         addressed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if addressed is None:
             return session_id
+        if claude_transfer_pending(addressed) and _has_bound_runner_authority(request, addressed):
+            # The completion is already in the runner inbox. Rekey will move it.
+            return None
         successor_id = await asyncio.to_thread(
             resolve_succeeded_by, conversation_store, session_id
         )
@@ -1917,6 +1903,16 @@ def register_events_routes(
         if not authorized:
             return session_id
 
+        direct_id = addressed.labels.get(SUCCEEDED_BY_LABEL_KEY)
+        if direct_id is not None:
+            direct = await asyncio.to_thread(conversation_store.get_conversation, direct_id)
+            if (
+                direct is not None
+                and _has_bound_runner_authority(request, direct)
+                and is_requested_claude_transfer(addressed, direct)
+            ):
+                # This runner's inbox moves with the pane. Release owns its wake.
+                return None
         if addressed.archived:
             from omnigent.server.session_collab import require_session_action_allowed
 
@@ -1930,33 +1926,12 @@ def register_events_routes(
                 target=addressed,
             )
 
-        def _chain_has_pre_release_link() -> bool:
-            current = session_id
-            for _ in range(_SUCCESSOR_MAX_HOPS):
-                if current == successor_id:
-                    return False
-                conv = conversation_store.get_conversation(current)
-                link = (
-                    (conv.labels or {}).get(SUCCEEDED_BY_LABEL_KEY) if conv is not None else None
-                )
-                if not link:
-                    return False
-                receipt = conversation_store.get_succession(current, link)
-                if receipt is not None and receipt.phase in ("moved", "rekeyed", "opened"):
-                    return True
-                current = link
-            return False
-
-        if await asyncio.to_thread(_chain_has_pre_release_link):
-            # Re-key has not released the successor yet: the result this wake
-            # announces is held for it, and its own release wakes it after the
-            # opening exists. Dispatching now would start its turn first.
-            return None
-        return successor_id
+        return await asyncio.to_thread(
+            released_succession_target, conversation_store, session_id, require_receipt=False
+        )
 
     from omnigent.server.routes.sessions.peer_child_turn import classify_child_turn
     from omnigent.server.routes.sessions.routes_peer import (
-        _SUCCESSOR_MAX_HOPS,
         register_peer_routes,
         resolve_succeeded_by,
     )
@@ -2212,6 +2187,29 @@ def register_events_routes(
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
+        pending_transfer = claude_transfer_pending(conv)
+        direct_successor_id = conv.labels.get(SUCCEEDED_BY_LABEL_KEY)
+        observation = body.type.startswith("external_") or body.type in {
+            _SUBAGENT_STATUS_TYPE,
+            SDK_PEER_RECEIPT_EVENT,
+        }
+        if pending_transfer or direct_successor_id:
+            if body.type == "message" and body.data.get("is_meta") is True:
+                content = body.data.get("content")
+                text = _message_text(content) if isinstance(content, list) else None
+                if text is not None and text.startswith(_TIMER_WAKE_PREFIX):
+                    receipt = (
+                        await asyncio.to_thread(
+                            conversation_store.get_succession, session_id, direct_successor_id
+                        )
+                        if direct_successor_id
+                        else None
+                    )
+                    # Keep the firing registered until rekey inventories and cancels it.
+                    held = pending_transfer or (receipt is not None and receipt.phase == "moved")
+                    return {"queued": False, "timer_delivery": "held" if held else "dropped"}
+            if pending_transfer and not observation:
+                raise OmnigentError("Session handover is in progress", code=ErrorCode.CONFLICT)
         if body.type == "message":
             for key in (
                 "auto_retry",
@@ -2336,10 +2334,6 @@ def register_events_routes(
             target_id = await asyncio.to_thread(
                 resolve_succeeded_by, conversation_store, session_id
             )
-            observation = body.type.startswith("external_") or body.type in {
-                _SUBAGENT_STATUS_TYPE,
-                SDK_PEER_RECEIPT_EVENT,
-            }
             if not observation:
                 content = body.data.get("content")
                 text = _message_text(content) if isinstance(content, list) else ""
@@ -2368,6 +2362,14 @@ def register_events_routes(
                         if target_id != session_id
                         else conv.labels[SUCCEEDED_BY_LABEL_KEY]
                     )
+                target_id = await asyncio.to_thread(
+                    released_succession_target,
+                    conversation_store,
+                    session_id,
+                    require_receipt=False,
+                )
+                if target_id is None:
+                    raise OmnigentError("Session handover is in progress", code=ErrorCode.CONFLICT)
                 try:
                     parse_item_data(body.type, {"type": body.type, **body.data})
                 except (ValueError, TypeError) as exc:

@@ -7510,14 +7510,16 @@ async def _timer_loop(
     """
     from omnigent.runner import app as _app
 
+    deferred_fire = False
     try:
         while True:
-            await asyncio.sleep(seconds)
+            await asyncio.sleep(2.0 if deferred_fire else seconds)
             # D5: the session or an ancestor archived ends the schedule
             # before its next wake; the finally below drops the registry
             # entry.
             if await flows.session_lineage_archived(server_client, conversation_id):
                 break
+            deferred_fire = False
             text = f"[System: timer {timer_id} fired]"
             if note:
                 text += f"\nnote: {note!r}"
@@ -7545,6 +7547,17 @@ async def _timer_loop(
                     # httpx does not raise on 4xx/5xx by default; any error
                     # status is a delivery failure below, never a retry.
                     resp.raise_for_status()
+                    if resp.status_code == 202 and resp.headers.get("content-type", "").startswith(
+                        "application/json"
+                    ):
+                        receipt = resp.json()
+                        disposition = (
+                            receipt.get("timer_delivery") if isinstance(receipt, dict) else None
+                        )
+                        if disposition == "dropped":
+                            return
+                        # A held firing was explicitly refused before any delivery.
+                        deferred_fire = disposition == "held"
                 except httpx.ConnectError:
                     # No connection was established, so the firing
                     # certainly did not land and a retry cannot double it.
@@ -7567,7 +7580,7 @@ async def _timer_loop(
                         extra={"session_id": conversation_id},
                     )
                 break
-            if not repeat:
+            if not repeat and not deferred_fire:
                 break
     except asyncio.CancelledError:
         return

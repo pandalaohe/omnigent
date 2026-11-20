@@ -16,7 +16,7 @@ from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
@@ -27,6 +27,7 @@ from fastapi import FastAPI
 
 from omnigent.db.utils import generate_task_id
 from omnigent.entities import MessageData, NewConversationItem, SessionPeerMessage
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import session_succession as succession_module
@@ -41,6 +42,8 @@ from omnigent.server.permission_tiers import (
     ConfirmedPermissionState,
 )
 from omnigent.server.routes import sessions as sessions_facade
+from omnigent.server.routes._sessions import orchestration
+from omnigent.server.routes.sessions import routes_hooks
 from omnigent.server.user_preferences_store import SqlAlchemyUserPreferencesStore
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -54,6 +57,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
     SUCCEEDED_BY_LABEL_KEY,
     SUCCEEDS_LABEL_KEY,
+    DetachedCard,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -512,22 +516,158 @@ async def test_claude_transfer_commits_before_forwarder_can_be_cancelled(
 
     receipt = store.get_succession(old, new)
     assert receipt is not None
-    assert store.get_conversation(old).labels[SUCCEEDED_BY_LABEL_KEY] == new
+    source = store.get_conversation(old)
+    assert source is not None and source.labels[SUCCEEDED_BY_LABEL_KEY] == new
     assert receipt.moved_ids == ([child] if child is not None else [])
     if child is not None:
-        assert store.get_conversation(child).parent_conversation_id == new
+        moved = store.get_conversation(child)
+        assert moved is not None and moved.parent_conversation_id == new
     retried = await client.post(path, json={"target_session_id": new})
     assert retried.status_code == 200, retried.text
     assert transfer_count == 1
-    assert store.get_succession(old, new).id == receipt.id
+    retried_receipt = store.get_succession(old, new)
+    assert retried_receipt is not None and retried_receipt.id == receipt.id
 
     await succession_module.resume_successions_for_runner(
         RUNNER_ID, conversation_store=store, runner_router=None, peer_message_store=None
     )
-    assert store.get_succession(old, new).phase == "done"
-    assert store.get_conversation(old).archived
+    finished = store.get_succession(old, new)
+    assert finished is not None and finished.phase == "done"
+    source = store.get_conversation(old)
+    assert source is not None and source.archived
     assert len(_succession_notices(store, new)) == 1
     wake.assert_awaited_once()
+
+
+async def test_claude_handover_holds_old_wakes_and_delivers_saved_answers_once(
+    client: httpx.AsyncClient,
+    store: SqlAlchemyConversationStore,
+    runners: _FakeRunnerPool,
+    wake: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "example-runner-token"
+    runner_id = token_bound_runner_id(token)
+    old = store.create_conversation(
+        agent_id="a" * 32, runner_id=runner_id, harness_override="claude-native"
+    ).id
+    child = _create(store, parent=old, title="worker", runner_id=runner_id)
+    response = await client.post(
+        f"/v1/sessions/{old}/handover", json={"handover": "Continue.", "rotate": True}
+    )
+    assert response.status_code == 200, response.text
+    response = await client.post(f"/v1/sessions/{old}/successor")
+    assert response.status_code == 200, response.text
+    new = response.json()["id"]
+    store.set_runner_id(new, runner_id)
+    store.set_labels(old, {succession_module._CLAUDE_TRANSFER_LABEL: "prepared-transfer"})
+
+    dispatch = AsyncMock(return_value=True)
+    launch = AsyncMock()
+    monkeypatch.setattr(orchestration, "_post_system_message", dispatch)
+    monkeypatch.setattr(sessions_facade, "_launch_runner_on_host", launch)
+    monkeypatch.setattr(orchestration, "_DELIVER_RETRY_MAX_S", 0.0)
+    monkeypatch.setattr(routes_hooks, "_CARD_RETRY_INTERVAL_S", 0.01)
+
+    async def old_wake(text: str) -> httpx.Response:
+        response = await client.post(
+            f"/v1/sessions/{old}/events",
+            headers={RUNNER_TUNNEL_TOKEN_HEADER: token},
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "is_meta": True,
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            },
+        )
+        assert response.status_code == 202, response.text
+        return response
+
+    def save_answer(elicitation_id: str) -> DetachedCard:
+        now = int(time.time())
+        card = DetachedCard(
+            elicitation_id=elicitation_id,
+            session_id=old,
+            kind="question",
+            state="answered",
+            mirror=False,
+            params={},
+            payload={},
+            grant_key=None,
+            verdict={"action": "accept", "content": {"Which database?": "SQLite"}},
+            delivery_text=f"[System: answers to your question card #{elicitation_id}]",
+            created_at=now,
+            expires_at=now + 60,
+        )
+        store.add_detached_card(card)
+        return card
+
+    async def deliver(card: DetachedCard) -> None:
+        assert card.delivery_text is not None
+        await routes_hooks._deliver_card_verdict(
+            card,
+            card.delivery_text,
+            granted=False,
+            conversation_store=store,
+            runner_router=None,
+        )
+
+    timer_text = "[System: timer timer_one fired]"
+    child_text = "[System: sub-agent worker finished]"
+    assert (await old_wake(timer_text)).json()["timer_delivery"] == "held"
+    assert (await old_wake(child_text)).json() == {"queued": False}
+    before = save_answer(QUESTION_ID)
+    pending_elicitations.record_publish(old, _question_event())
+    waiting = asyncio.Event()
+    persist_notice = routes_hooks._persist_answer_delivery_notice
+
+    async def record_notice(
+        *args: Any,
+        status: Literal["waiting", "delivered", "expired", "undelivered", "delivery_uncertain"],
+    ) -> None:
+        await persist_notice(*args, status=status)
+        if status == "waiting":
+            waiting.set()
+
+    monkeypatch.setattr(routes_hooks, "_persist_answer_delivery_notice", record_notice)
+    runner = runners.for_runner(runner_id)
+    runner.dropped = [{"kind": "timer", "id": "timer_one", "label": "check status"}]
+    async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+        tasks.create_task(deliver(before))
+        await waiting.wait()
+        dispatch.assert_not_awaited()
+        receipt = await succession_module._commit_claude_transfer(
+            store, old, new, "prepared-transfer"
+        )
+        moved = store.get_conversation(child)
+        assert moved is not None and moved.parent_conversation_id == new
+        assert (await old_wake(timer_text)).json()["timer_delivery"] == "held"
+        assert (await old_wake(child_text)).json() == {"queued": False}
+        dispatch.assert_not_awaited()
+        result = await succession_module.advance_succession(
+            receipt.id, conversation_store=store, runner_router=None, peer_message_store=None
+        )
+        assert result.phase == "done"
+        store.set_runner_id(old, None)
+        assert (await old_wake(timer_text)).json()["timer_delivery"] == "dropped"
+        assert (await old_wake(child_text)).json() == {"queued": False}
+        tasks.create_task(deliver(before))  # Concurrent recovery of the same saved answer.
+        after = save_answer("elicit_after")
+        tasks.create_task(deliver(after))
+
+    assert sorted(call.args[:2] for call in dispatch.await_args_list) == sorted(
+        [(new, before.delivery_text), (new, after.delivery_text)]
+    )
+    assert not store.list_detached_cards()
+    assert [path for path, _ in runner.posts].count(f"/v1/sessions/{new}/succession/release") == 1
+    assert wake.await_args is not None
+    opening = wake.await_args.args[1]
+    assert "timer_one" in opening
+    assert "Which database?" not in opening
+    assert not any(path.endswith("/events") for path, _ in runner.posts)
+    launch.assert_not_awaited()
 
 
 @pytest.mark.parametrize("failed", [False, True])
