@@ -20,7 +20,7 @@ import type {
 } from "./blocks";
 import { BlockStream } from "./blockStream";
 import type { StreamEvent } from "./events";
-import { buildBubbles } from "./renderItems";
+import { buildBubbles, createBubbleCache } from "./renderItems";
 import { parseEvent } from "./sse";
 import type { Response } from "./types";
 
@@ -75,6 +75,60 @@ describe("BlockStream — response_start", () => {
 });
 
 describe("BlockStream — block ctx carries response_id and item_id", () => {
+  it("keeps the flushed prefix in one reply when a handover arrives during streaming", () => {
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse() },
+      { type: "text_delta", delta: "第一行\n" },
+      {
+        type: "message_done",
+        itemId: "note",
+        responseId: "resp_note",
+        content: [{ type: "output_text", text: "Continue here." }],
+        isHandoverNote: true,
+      },
+      { type: "text_delta", delta: "第二行" },
+      { type: "response_completed", response: makeResponse() },
+    ]);
+    const noteIndex = blocks.findIndex((block) => block.type === "handover_note");
+    expect(blocks.slice(0, noteIndex)).toContainEqual(
+      expect.objectContaining({ type: "text_chunk", text: "第一行\n" }),
+    );
+
+    const cache = createBubbleCache();
+    const streaming = { responseId: "resp_1", state: "streaming" as const, error: null };
+    const before = buildBubbles(blocks.slice(0, noteIndex + 1), streaming, cache);
+    expect(before).toMatchObject([
+      { kind: "assistant", items: [{ kind: "text", text: "第一行\n", final: false }] },
+      { kind: "handover_note", itemId: "note", text: "Continue here." },
+    ]);
+
+    const completed = { ...streaming, state: "completed" as const };
+    const after = buildBubbles(blocks, completed, cache);
+    expect(after).toMatchObject([
+      { kind: "assistant", items: [{ kind: "text", text: "第一行\n第二行", final: true }] },
+      { kind: "handover_note", itemId: "note", text: "Continue here." },
+    ]);
+    expect(after[0]).toMatchObject({ stableId: "resp_1:live:0" });
+    expect(after).toEqual(buildBubbles(blocks, completed));
+  });
+
+  it("keeps the note between two distinct replies", () => {
+    const blocks = reduce(
+      ["Earlier reply", "Continue here.", "Later reply"].map((text, index) => ({
+        type: "message_done",
+        itemId: `item_${index}`,
+        responseId: `resp_${index}`,
+        content: [{ type: "output_text", text }],
+        ...(index === 1 ? { isHandoverNote: true } : {}),
+      })),
+    );
+    expect(buildBubbles(blocks, null)).toMatchObject([
+      { kind: "assistant", responseId: "resp_0", items: [{ text: "Earlier reply" }] },
+      { kind: "handover_note", text: "Continue here." },
+      { kind: "assistant", responseId: "resp_2", items: [{ text: "Later reply" }] },
+    ]);
+  });
+
   it("keeps an in-flight reply and its tools in the active response when a handover arrives", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse() },

@@ -1832,6 +1832,59 @@ describe("buildBubbles — session-driven trailing tool spinner", () => {
     expect(toolState(bubbles)).toBe("input-available");
   });
 
+  it("settles a pre-handover tool when same-turn narration resumes and folds in its late result", () => {
+    const beforeResult: AnyBlock[] = [
+      ...danglingToolTurn,
+      {
+        type: "handover_note",
+        ctx: ctx({ itemId: "note", responseId: "resp_note" }),
+        text: "Continue here.",
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "narration", responseId: "resp_1" }),
+        fullText: "Continuing after the tool.",
+        hasCodeBlocks: false,
+      },
+    ];
+    const cache = createBubbleCache();
+    const before = buildBubbles(beforeResult, null, cache, [], true);
+    expect(before).toMatchObject([
+      {
+        kind: "assistant",
+        items: [
+          { kind: "tool", state: "no-output", output: null },
+          { kind: "text", text: "Continuing after the tool." },
+        ],
+      },
+      { kind: "handover_note", itemId: "note" },
+    ]);
+
+    const withResult: AnyBlock[] = [
+      ...beforeResult,
+      {
+        type: "tool_result",
+        ctx: ctx({ itemId: "fco_1", responseId: "resp_1" }),
+        name: "",
+        callId: "c1",
+        agentName: "test",
+        output: "late result",
+      },
+    ];
+    const after = buildBubbles(withResult, null, cache, [], true);
+    expect(after).toMatchObject([
+      {
+        kind: "assistant",
+        items: [
+          { kind: "tool", state: "output-available", output: "late result" },
+          { kind: "text", text: "Continuing after the tool." },
+        ],
+      },
+      { kind: "handover_note", itemId: "note" },
+    ]);
+    expect(after).toEqual(buildBubbles(withResult, null, undefined, [], true));
+  });
+
   it("does not spin when the session is idle (dangling tool resolves to no-output)", () => {
     // The idle edge can land before the tool's result block — the tool must
     // settle, not spin forever. This is the property the never-spin tests pin,

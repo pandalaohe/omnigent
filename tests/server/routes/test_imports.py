@@ -109,6 +109,7 @@ async def test_import_session_creates_normal_session_and_blocks_duplicate(
 ) -> None:
     """An import creates one native session and a retry is rejected."""
     agent_id = _seed_claude_agent(db_uri)
+    retry_marker = {"chain_id": "a" * 32, "input_id": "b" * 32, "attempt": 1, "of": 3}
     payload = {
         "source": "claude",
         "external_session_id": "claude-session-1",
@@ -120,6 +121,7 @@ async def test_import_session_creates_normal_session_and_blocks_duplicate(
                 "data": {
                     "role": "user",
                     "content": [{"type": "input_text", "text": "inspect TODO.md"}],
+                    "auto_retry": retry_marker,
                 },
             },
             {
@@ -129,18 +131,13 @@ async def test_import_session_creates_normal_session_and_blocks_duplicate(
                     "role": "assistant",
                     "agent": "claude-native-ui",
                     "content": [{"type": "output_text", "text": "Done."}],
+                    "auto_retry": retry_marker,
+                    "is_handover_note": True,
                 },
             },
         ],
     }
 
-    for imported in payload["items"]:
-        imported["data"]["auto_retry"] = {
-            "chain_id": "a" * 32,
-            "input_id": "b" * 32,
-            "attempt": 1,
-            "of": 3,
-        }
     created = await client.post("/v1/imports", json=payload)
     repeated = await client.post("/v1/imports", json=payload)
 
@@ -162,6 +159,7 @@ async def test_import_session_creates_normal_session_and_blocks_duplicate(
     assert items.status_code == 200
     assert [item["type"] for item in items.json()["data"]] == ["message", "message"]
     assert all("auto_retry" not in item for item in items.json()["data"])
+    assert all("is_handover_note" not in item for item in items.json()["data"])
 
 
 async def test_import_dedupes_against_native_session(

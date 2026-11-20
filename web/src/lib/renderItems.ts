@@ -24,6 +24,7 @@ import type {
   AnyBlock,
   ElicitationBlock,
   ErrorBlock,
+  HandoverNoteBlock,
   MessageContentBlock,
   NativeToolBlock,
   RoutingDecisionBlock,
@@ -306,8 +307,8 @@ const REASONING_BLOCK_TYPES = new Set(["reasoning_start", "reasoning_chunk", "re
  *     ``-1`` when there were no bubbles.
  * :param lastBubbleCount: how many bubbles that region produced — 1 normally,
  *     more when a deferred routing chip widened the region back to the chip
- *     (the pair, plus any bubble rendered between them). Reuse drops exactly
- *     this many bubbles before re-walking the region.
+ *     (the pair, plus any bubble rendered between them), or a reply has
+ *     standalone handover notes. Reuse drops this many bubbles before rewalking.
  * :param supersededChips: block indexes the cached walk dropped as superseded
  *     create-time chips. A chip is only KNOWN superseded once the turn that
  *     repeats it arrives, which is usually after the chip's own bubble was
@@ -736,8 +737,8 @@ function reusablePrefix(
       return null;
     }
   }
-  // Drop every bubble the re-walked region produced — normally just the last
-  // one, but a user message and its deferred routing chip come as a pair.
+  // Drop every bubble the rewalked region produced, including standalone
+  // handover notes or a deferred routing chip.
   const dropped = Math.min(cache.lastBubbleCount, cache.bubbles.length);
   const prefix = cache.bubbles.slice(0, cache.bubbles.length - dropped);
   // A reused assistant bubble whose response is still the active one
@@ -1010,12 +1011,7 @@ function walkBubbles(
     if (b.type === "handover_note") {
       lastBubbleStart = i;
       lastBubbleCount = 1;
-      bubbles.push({
-        kind: "handover_note",
-        itemId: b.ctx.itemId ?? `handover_note_${i}`,
-        responseId: b.ctx.responseId,
-        text: b.text,
-      });
+      bubbles.push(handoverNoteBubble(b, i));
       i += 1;
       continue;
     }
@@ -1071,6 +1067,8 @@ function walkBubbles(
     // A question/plan card is the user's own answer point, so it takes a
     // bubble of its own even under the turn's response id.
     const groupOpenedOnUserInput = isUserInputElicitationBlock(b);
+    const handoverNotes: Bubble[] = [];
+    let followsHandoverNote = false;
     while (i < blocks.length) {
       const cur = blocks[i]!;
       // Break on boundaries that start a new top-level bubble. Include
@@ -1083,7 +1081,6 @@ function walkBubbles(
         isTerminalCommandInput(cur) ||
         cur.type === "compaction" ||
         cur.type === "compaction_loading" ||
-        cur.type === "handover_note" ||
         cur.type === "routing_decision"
       )
         break;
@@ -1095,6 +1092,13 @@ function walkBubbles(
       // breaks: the work before it and the work after the answer are
       // separate stretches, each folding under its own "Worked for".
       if (i > groupStart && (groupOpenedOnUserInput || isUserInputElicitationBlock(cur))) break;
+      if (cur.type === "handover_note") {
+        // Place the note after the current reply so its chunks and tools stay together.
+        handoverNotes.push(handoverNoteBubble(cur, i));
+        followsHandoverNote = true;
+        i += 1;
+        continue;
+      }
       if (isSubagentActivityBlock(cur)) {
         // A notice stays in its turn's bubble until committed work from another
         // response follows it, then opens that response's bubble: a native fold
@@ -1112,14 +1116,18 @@ function walkBubbles(
       // call's card by callId) — don't let a backdated one split the
       // open bubble. Anonymous blocks never carry turn identity.
       const curRid = cur.ctx.responseId;
-      if (cur.type !== "tool_result" && !isAnonymousRid(curRid) && curRid !== groupResponseId) {
-        if (
-          !isAnonymousRid(groupResponseId) &&
-          (isStandaloneSentinelBlock(cur) || groupOpenedOnSentinel)
-        ) {
-          break;
+      if (cur.type !== "tool_result" && !isAnonymousRid(curRid)) {
+        if (curRid !== groupResponseId) {
+          // Preserve transcript order when a different reply follows the note.
+          if (
+            !isAnonymousRid(groupResponseId) &&
+            (followsHandoverNote || isStandaloneSentinelBlock(cur) || groupOpenedOnSentinel)
+          ) {
+            break;
+          }
+          groupResponseId = curRid;
         }
-        groupResponseId = curRid;
+        followsHandoverNote = false;
       }
       i += 1;
     }
@@ -1127,6 +1135,11 @@ function walkBubbles(
     // A group of only tool_results renders nothing itself — skip it so
     // an orphan late output doesn't paint an empty assistant bubble.
     if (groupBlocks.length > 0 && groupBlocks.every((bk) => bk.type === "tool_result")) {
+      if (handoverNotes.length > 0) {
+        lastBubbleStart = groupStart;
+        lastBubbleCount = handoverNotes.length;
+        bubbles.push(...handoverNotes);
+      }
       continue;
     }
     const lifecycle =
@@ -1166,7 +1179,8 @@ function walkBubbles(
     }
 
     lastBubbleStart = groupStart;
-    lastBubbleCount = 1;
+    // Rewalk both the reply and its notes on an append to that same reply.
+    lastBubbleCount = 1 + handoverNotes.length;
     // A notice is stamped when the sub-agent reported, not when this turn worked.
     const workBlocks = groupBlocks.filter((bk) => !isSubagentActivityBlock(bk));
     const workedForS = turnWorkedForS(workBlocks);
@@ -1220,10 +1234,20 @@ function walkBubbles(
         ? { defaultExpanded: true }
         : {}),
     });
+    bubbles.push(...handoverNotes);
     expandNextAssistantResponseId = null;
   }
 
   return { bubbles, lastBubbleStart, lastBubbleCount };
+}
+
+function handoverNoteBubble(b: HandoverNoteBlock, index: number): Bubble {
+  return {
+    kind: "handover_note",
+    itemId: b.ctx.itemId ?? `handover_note_${index}`,
+    responseId: b.ctx.responseId,
+    text: b.text,
+  };
 }
 
 /** Build the standalone chip bubble for a routing-decision block. */
@@ -1559,7 +1583,7 @@ function workBesideNotice(
 ): AnyBlock | undefined {
   for (let k = index + step; k >= floor && k < blocks.length; k += step) {
     const b = blocks[k]!;
-    if (isNoticeTransparent(b)) continue;
+    if (isNoticeTransparent(b) || b.type === "handover_note") continue;
     if (
       !isAssistantSideBlock(b) ||
       isStandaloneSentinelBlock(b) ||
@@ -1602,6 +1626,7 @@ function isAssistantSideBlock(b: AnyBlock): boolean {
     // compaction_loading has its own top-level bubble slot and must not
     // end up in an assistant bubble's item list.
     b.type !== "compaction_loading" &&
+    b.type !== "handover_note" &&
     // routing_decision is a standalone top-level chip, not an assistant item.
     b.type !== "routing_decision" &&
     b.type !== "response_start" &&
@@ -1633,7 +1658,7 @@ function midResponseUserMessageId(blocks: AnyBlock[], index: number): string | n
   for (let previousIndex = index - 1; previousIndex >= 0; previousIndex -= 1) {
     const previous = blocks[previousIndex]!;
     if (isNonRenderingBlock(previous)) return null;
-    if (isSubagentActivityBlock(previous)) continue;
+    if (isSubagentActivityBlock(previous) || previous.type === "handover_note") continue;
     if (previous.type === "user_message" && isSystemUserContent(previous.content)) continue;
     return isAssistantSideBlock(previous) && previous.ctx.responseId === user.ctx.responseId
       ? user.ctx.responseId
