@@ -268,8 +268,8 @@ async def test_tick_two_per_host_rollback_and_restart_scan(queue_env, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_tick_finds_held_children_by_label_once_for_all_hosts(queue_env, monkeypatch):
-    """The label lookup finds what the full sub-agent scan found, read once per tick."""
+async def test_tick_finds_held_children_by_label_for_each_host(queue_env, monkeypatch):
+    """The label lookup finds what the full sub-agent scan found, in id batches, per host."""
     from omnigent.server.session_choice import SLOT_LABEL
 
     e = queue_env
@@ -290,6 +290,8 @@ async def test_tick_finds_held_children_by_label_once_for_all_hosts(queue_env, m
     e.store.update_conversation(archived.id, archived=True)
     other_host = child(e, marker=f"queued@{OTHER}", host=OTHER)
     slot_queued = sub_agent(OTHER, {SLOT_LABEL: f"queued@{OTHER}@pool"})
+    slot_releasing = sub_agent(HOST, {SLOT_LABEL: f"releasing@{HOST}@pool@1"})
+    both = sub_agent(HOST, {LABEL: f"queued@{HOST}", SLOT_LABEL: f"queued@{OTHER}@pool"})
     sub_agent(HOST, {SLOT_LABEL: f"admitted@{HOST}@pool@1"})
     sub_agent(HOST, {LABEL: "released"})
     sub_agent(HOST, {})
@@ -307,6 +309,9 @@ async def test_tick_finds_held_children_by_label_once_for_all_hosts(queue_env, m
         after = page.last_id
     full_scan.sort(key=lambda conv: (conv.created_at, conv.id))
 
+    monkeypatch.setattr("omnigent.server.host_load_queue._ROW_BATCH", 2)
+    loads = Mock(wraps=e.store.get_conversations)
+    monkeypatch.setattr(e.store, "get_conversations", loads)
     found = e.queue._rows()
     assert [conv.id for conv in found] == [conv.id for conv in full_scan]
     assert {conv.id for conv in found} == {
@@ -315,7 +320,14 @@ async def test_tick_finds_held_children_by_label_once_for_all_hosts(queue_env, m
         archived.id,
         other_host.id,
         slot_queued.id,
+        slot_releasing.id,
+        both.id,
     }
+    assert held_host(next(conv for conv in found if conv.id == both.id)) == HOST
+    batches = [call.args[0] for call in loads.call_args_list]
+    assert all(len(batch) <= 2 for batch in batches)
+    loaded = [conversation_id for batch in batches for conversation_id in batch]
+    assert len(loaded) == len(set(loaded))
 
     monkeypatch.setattr(e.store, "list_conversations", Mock(side_effect=AssertionError))
     rows = Mock(wraps=e.queue._rows)
@@ -327,8 +339,85 @@ async def test_tick_finds_held_children_by_label_once_for_all_hosts(queue_env, m
         host_load=lambda *a: {"level": "new_session_hold"},
     )
     await e.queue.tick(hub, e.app)
-    rows.assert_called_once()
-    assert hub.set_queued_children.call_args_list == [((0, HOST, 3),), ((0, OTHER, 2),)]
+    assert rows.call_count == 2
+    assert hub.set_queued_children.call_args_list == [((0, HOST, 5),), ((0, OTHER, 2),)]
+    assert e.queue._tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_tick_reads_each_host_fresh_and_skips_rows_that_lost_their_hold(
+    queue_env, monkeypatch
+):
+    """A hold committed after one host's pass reaches the next host in the same tick."""
+    e = queue_env
+    e.hosts.register(
+        OTHER,
+        FakeWebSocket(),
+        HostHelloFrame(version="test", frame_protocol_version=1, name="other-host"),
+        owner=None,
+        registered_with_managed_token=True,
+    )
+    stale = child(e)
+    kept = child(e)
+    late = []
+
+    def counted(workspace, host, count):
+        if host == HOST:
+            assert e.store.compare_and_set_label(stale.id, LABEL, f"queued@{HOST}", None)
+            late.append(child(e, marker=f"queued@{OTHER}", host=OTHER))
+
+    hub = SimpleNamespace(
+        host_load_keys=lambda: [(0, HOST), (0, OTHER)],
+        set_queued_children=Mock(side_effect=counted),
+        queue_enabled=lambda workspace: False,
+        host_load=lambda *a: {"level": "normal"},
+    )
+    start = AsyncMock()
+    monkeypatch.setattr(e.queue, "_start", start)
+    await e.queue.tick(hub, e.app)
+    await asyncio.gather(*list(e.queue._tasks.values()))
+    assert hub.set_queued_children.call_args_list == [((0, HOST, 2),), ((0, OTHER, 1),)]
+    assert {call.args[1].id for call in start.await_args_list} == {kept.id, late[0].id}
+    assert held_host(e.store.get_conversation(late[0].id)) is None
+
+
+@pytest.mark.asyncio
+async def test_tick_reads_and_counts_each_workspace_separately(queue_env, monkeypatch):
+    """The same host id in two workspaces gets its own read and its own count."""
+    from omnigent.db.db_models import current_workspace_id, workspace_scope
+
+    e = queue_env
+    child(e)
+    with workspace_scope(42):
+        parent = e.store.create_conversation(
+            host_id=HOST, workspace="/opt/work/project", runner_id=RUNNER
+        )
+        for _ in range(2):
+            e.store.create_conversation(
+                parent_conversation_id=parent.id,
+                kind="sub_agent",
+                host_id=HOST,
+                workspace="/opt/work/project",
+                runner_id=RUNNER,
+                labels={LABEL: f"queued@{HOST}"},
+            )
+    read_in = []
+    rows = e.queue._rows
+
+    def scoped_rows():
+        read_in.append(current_workspace_id())
+        return rows()
+
+    monkeypatch.setattr(e.queue, "_rows", scoped_rows)
+    hub = SimpleNamespace(
+        host_load_keys=lambda: [(0, HOST), (42, HOST)],
+        set_queued_children=Mock(),
+        queue_enabled=lambda workspace: True,
+        host_load=lambda *a: {"level": "new_session_hold"},
+    )
+    await e.queue.tick(hub, e.app)
+    assert read_in == [0, 42]
+    assert hub.set_queued_children.call_args_list == [((0, HOST, 1),), ((42, HOST, 2),)]
     assert e.queue._tasks == {}
 
 
