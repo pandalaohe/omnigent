@@ -325,6 +325,10 @@ class AutoRotationNotices:
             )
             response.raise_for_status()
             result = response.json()
+            if result.get("status") == "busy":
+                # Nothing was typed and the runner keeps the request armed; not a spent attempt.
+                retry.attempts -= 1
+                return
             retry.unconfirmed = result.get("status") in {"unconfirmed", "draft_may_remain"}
             retry.draft_may_remain = result.get("status") == "draft_may_remain"
             if not retry.unconfirmed:

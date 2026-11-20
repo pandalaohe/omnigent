@@ -214,6 +214,13 @@ def register_succession_routes(
             )
             if harness not in _ROTATION_NATIVE_HARNESSES:
                 return LabelGroupChange({}, set())
+            if body.get("released") == "true":
+                # Nothing was typed: undo this attempt's claim so a later idle edge can retry.
+                released = rotation_attempt({ATTEMPT_LABEL_KEY: body.get("attempt", "")}, revision)
+                if labels.get(INJECTED_ATTEMPT_LABEL_KEY) == released:
+                    outcome = "released"
+                    return LabelGroupChange({}, {INJECTED_ATTEMPT_LABEL_KEY, DRAFT_LABEL_KEY})
+                return LabelGroupChange({}, set())
             if labels.get(ATTEMPT_LABEL_KEY, "") != body.get("attempt", ""):
                 return LabelGroupChange({}, set())
             attempt = rotation_attempt(labels, revision)
@@ -455,8 +462,14 @@ def register_succession_routes(
             await asyncio.to_thread(
                 conversation_store.mutate_label_group, session_id, "omnigent.", auto_change
             )
+        elif rotate and conversation.labels.get(DRAFT_LABEL_KEY):
+            # An earlier command may remain in the terminal input; a person must check it.
+            rotate = False
+            deferred = "draft_may_remain"
         elif rotate:
             label_updates[ROTATE_REQUESTED_LABEL_KEY] = str(conversation.archive_revision)
+            # A manual request is a new attempt; an earlier attempt's records cannot drop it.
+            label_updates[ATTEMPT_LABEL_KEY] = generate_task_id()
         if not body.auto:
             await asyncio.to_thread(conversation_store.set_labels, session_id, label_updates)
 

@@ -183,6 +183,32 @@ async def test_recovery_rediscovers_bounds_attempts_and_reports_failure(db_uri):
 
 
 @pytest.mark.asyncio
+async def test_busy_recovery_is_not_a_spent_attempt(db_uri):
+    """A busy runner keeps the request armed, so recovery never marks it failed."""
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = due_session(store)
+    store.set_labels(conv.id, {ROTATE_REQUESTED_LABEL_KEY: "0"})
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"status": "busy"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as client:
+        notices = service(store, client, [], ["idle"], [{}])
+        await notices.start(SimpleNamespace())
+        try:
+            for _ in range(8):
+                await notices.tick()
+            assert len(calls) == 4
+            assert store.list_items(conv.id, type="error").data == []
+        finally:
+            await notices.shutdown()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["unconfirmed", "draft_may_remain"])
 async def test_injected_rotation_warns_without_another_retry(db_uri, outcome):
     store = SqlAlchemyConversationStore(db_uri)

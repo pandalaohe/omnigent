@@ -683,3 +683,65 @@ async def test_pi_claim_never_marks_terminal_draft(client, store):
         "omnigent.auto_rotation_state.draft_may_remain"
         not in store.get_conversation(conv.id).labels
     )
+
+
+async def test_manual_request_after_an_injected_attempt_gets_a_fresh_attempt(client, store):
+    """An earlier attempt's injection record cannot drop a later manual request."""
+    from omnigent.server.auto_rotation import ATTEMPT_LABEL_KEY
+
+    session_id = _create(store)
+    url = f"/v1/sessions/{session_id}/handover"
+    claim_url = url + "/injection"
+    body = {"handover": "Same note", "rotate": True}
+    assert (await client.post(url, json=body)).json()["rotate"] is True
+    first = store.get_conversation(session_id).labels[ATTEMPT_LABEL_KEY]
+    claim = {"archive_revision": "0", "attempt": first}
+    assert (await client.post(claim_url, json=claim)).json()["status"] == "claimed"
+    assert (await client.post(claim_url, json=claim | {"input_cleared": "true"})).json()[
+        "status"
+    ] == "unconfirmed"
+    assert (await client.post(claim_url, json=claim)).json()["status"] == "unconfirmed"
+    assert (await client.post(url, json=body)).json()["rotate"] is True
+    second = store.get_conversation(session_id).labels[ATTEMPT_LABEL_KEY]
+    assert second != first
+    claim = {"archive_revision": "0", "attempt": second}
+    assert (await client.post(claim_url, json=claim)).json()["status"] == "claimed"
+
+
+async def test_manual_request_with_a_possible_draft_is_deferred(client, store):
+    """A command that may remain typed needs a person; the request says so instead of rotating."""
+    from omnigent.server.auto_rotation import DRAFT_LABEL_KEY
+
+    session_id = _create(store)
+    store.set_labels(session_id, {DRAFT_LABEL_KEY: "true"})
+    response = await client.post(
+        f"/v1/sessions/{session_id}/handover", json={"handover": "Continue.", "rotate": True}
+    )
+    assert response.json()["rotate"] is False
+    assert response.json()["deferred"] == "draft_may_remain"
+    row = store.get_conversation(session_id)
+    assert ROTATE_REQUESTED_LABEL_KEY not in row.labels
+    assert row.labels[HANDOVER_ITEM_LABEL_KEY] == response.json()["item_id"]
+    assert _rotation_notices(store, session_id) == []
+
+
+async def test_released_claim_lets_the_same_attempt_claim_again(client, store):
+    """A refusal that typed nothing returns its claim; a stale release changes nothing."""
+    from omnigent.server.auto_rotation import DRAFT_LABEL_KEY, INJECTED_ATTEMPT_LABEL_KEY
+
+    session_id = _create(store)
+    store.set_labels(
+        session_id,
+        {ROTATE_REQUESTED_LABEL_KEY: "0", "omnigent.auto_rotation_state.attempt": "busy-round"},
+    )
+    url = f"/v1/sessions/{session_id}/handover/injection"
+    claim = {"archive_revision": "0", "attempt": "busy-round"}
+    assert (await client.post(url, json=claim)).json()["status"] == "claimed"
+    stale = {"archive_revision": "0", "attempt": "other-round", "released": "true"}
+    assert (await client.post(url, json=stale)).json()["status"] == "not_requested"
+    assert store.get_conversation(session_id).labels[DRAFT_LABEL_KEY] == "true"
+    release = claim | {"released": "true"}
+    assert (await client.post(url, json=release)).json()["status"] == "released"
+    labels = store.get_conversation(session_id).labels
+    assert DRAFT_LABEL_KEY not in labels and INJECTED_ATTEMPT_LABEL_KEY not in labels
+    assert (await client.post(url, json=claim)).json()["status"] == "claimed"

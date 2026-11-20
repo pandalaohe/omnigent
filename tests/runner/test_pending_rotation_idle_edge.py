@@ -58,6 +58,8 @@ class _RotationServerClient:
         self.errors: list[dict[str, Any]] = []
         self.labels: dict[str, str] = {}
         self.claims: list[str] = []
+        self.released: list[str] = []
+        self.prompts: list[str] = []
         self.fail_claim = False
         if rotate_label is not None:
             self.labels["omnigent.rotate_requested"] = rotate_label
@@ -95,6 +97,14 @@ class _RotationServerClient:
     async def post(self, url: str, **kwargs: Any) -> httpx.Response:
         if url.endswith("/handover/injection"):
             revision = kwargs["json"]["archive_revision"]
+            if kwargs["json"].get("released") == "true":
+                self.released.append(revision)
+                self.labels.pop(INJECTED_REVISION_LABEL_KEY, None)
+                return httpx.Response(
+                    200,
+                    json={"status": "released"},
+                    request=httpx.Request("POST", f"http://test{url}"),
+                )
             self.claims.append(revision)
             outcome = "claimed"
             if self.labels.get(INJECTED_REVISION_LABEL_KEY) == revision:
@@ -111,6 +121,8 @@ class _RotationServerClient:
             and kwargs.get("json", {}).get("type") == "external_conversation_item"
         ):
             self.errors.append(kwargs["json"]["data"]["item_data"])
+        if url.endswith("/events") and kwargs.get("json", {}).get("type") == "message":
+            self.prompts.append(kwargs["json"]["data"]["content"][0]["text"])
         if url.endswith("/successor"):
             if not self.created:
                 self.created.append({"id": "conv_pi_next"})
@@ -292,7 +304,7 @@ async def test_aborted_injection_is_fenced_and_reports_draft(monkeypatch, draft_
 
 
 @pytest.mark.asyncio
-async def test_terminal_turn_during_label_read_skips_rotation(monkeypatch):
+async def test_terminal_turn_during_label_read_defers_rotation(monkeypatch):
     effects = []
     monkeypatch.setattr(
         claude_native_bridge, "inject_slash_command", lambda *a, **kw: effects.append(kw)
@@ -314,9 +326,12 @@ async def test_terminal_turn_during_label_read_skips_rotation(monkeypatch):
 
         server.get = get
         assert (await client.post(f"/v1/sessions/{CONV_ID}/pending-rotation")).json() == {
-            "status": "not_requested"
+            "status": "busy"
         }
     assert effects == []
+    # Nothing was typed: the claim is returned and the rotation waits for the next idle edge.
+    assert server.released == ["0"]
+    assert runner_app.pop_pending_rotation(CONV_ID) is True
 
 
 @pytest.mark.asyncio
@@ -351,6 +366,59 @@ async def test_idle_edge_clears_session_with_pending_rotation(
 
     assert [command for _bridge_dir, command in injected] == ["/clear"]
     assert runner_app.pop_pending_rotation(CONV_ID) is False
+
+
+async def _settle_rotation_tasks() -> None:
+    """Wait for the idle-edge rotation and any prompt it scheduled."""
+    names = {"_run_pending_rotation", "_prompt"}
+    for _ in range(3):
+        tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if not task.done() and getattr(task.get_coro(), "__name__", None) in names
+        ]
+        if not tasks:
+            return
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("busy_source", ["pane", "turn"])
+async def test_busy_idle_edge_prompts_once_and_retries_next_idle_edge(monkeypatch, busy_source):
+    """A busy session keeps its rotation, hears about it once, and rotates when idle."""
+    effects: list[str] = []
+    busy_pane = [busy_source == "pane"]
+
+    def inject(*args: Any, **kwargs: Any) -> None:
+        effects.append(kwargs["command"])
+        if busy_pane[0]:
+            raise claude_native_bridge.ClaudePaneBusy("busy")
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", inject)
+    server = _RotationServerClient()
+    app = _build_app(server)
+    async with _runner_client(app) as client:
+        await _seed_session(client)
+        runner_app.record_pending_rotation(CONV_ID)
+        if busy_source == "turn":
+            # A queued input started the next turn at the same idle edge.
+            app.state.active_turns[CONV_ID] = None
+        for _ in range(2):
+            await _post_idle(client)
+            await _settle_rotation_tasks()
+        assert effects == (["/clear", "/clear"] if busy_source == "pane" else [])
+        assert server.released == (["0", "0"] if busy_source == "pane" else [])
+        assert len(server.prompts) == 1
+        assert server.prompts[0].startswith("[System: rotation pending]")
+        assert CONV_ID in runner_app._pending_rotations
+        busy_pane[0] = False
+        app.state.active_turns.pop(CONV_ID, None)
+        await _post_idle(client)
+        await _settle_rotation_tasks()
+    assert effects[-1] == "/clear"
+    assert len(effects) == (3 if busy_source == "pane" else 1)
+    assert len(server.prompts) == 1
+    assert CONV_ID not in runner_app._pending_rotations
 
 
 @pytest.mark.asyncio
@@ -792,7 +860,7 @@ async def test_recovery_can_heal_pane_under_rotation_lock(monkeypatch, tmp_path,
         result = await asyncio.wait_for(
             client.post(f"/v1/sessions/{CONV_ID}/pending-rotation"), timeout=2
         )
-        assert result.json() == {"status": "not_requested" if terminal_input else "started"}
+        assert result.json() == {"status": "busy" if terminal_input else "started"}
     assert effects == (["heal"] if terminal_input else ["heal", "/clear"])
 
 

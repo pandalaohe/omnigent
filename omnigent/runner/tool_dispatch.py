@@ -10746,7 +10746,12 @@ async def _session_handover_via_rest(
     result: _JsonObject = {"recorded": True, "item_id": item_id, "rotate": recorded_rotate}
     if "deferred" in payload:
         result["deferred"] = payload["deferred"]
-    if payload.get("deferred"):
+    if payload.get("deferred") == "draft_may_remain":
+        result["note"] = (
+            "Rotation not started: an earlier rotation command may still be in the terminal "
+            "input. Ask the user to inspect and clear the terminal input, then type /clear."
+        )
+    elif payload.get("deferred"):
         result["note"] = (
             f"Rotation deferred ({payload['deferred']}). Keep working; a new notice follows "
             "when the context is low again."
@@ -10755,7 +10760,10 @@ async def _session_handover_via_rest(
         from omnigent.runner.app import record_pending_rotation
 
         record_pending_rotation(conversation_id)
-        result["note"] = "The session will continue in a new session when this turn ends."
+        result["note"] = (
+            "The session will continue in a new session once this turn ends and the session "
+            "is idle; if it is still busy then, a notice asks you to finish up first."
+        )
     return json.dumps(result)
 
 
