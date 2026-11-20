@@ -11,15 +11,18 @@ instead of woken; ``/succession/release`` drains them.
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from collections.abc import Iterator
 from typing import Any
 
+import httpx
 import pytest
 from fastapi import FastAPI
 
 from omnigent.db.utils import generate_task_id
 from omnigent.runner import app as runner_app
-from omnigent.runner import create_runner_app, subagent_work
+from omnigent.runner import create_runner_app, subagent_work, tool_dispatch
 from omnigent.server import session_succession
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.runner.conftest import (
@@ -448,25 +451,206 @@ async def test_lineage_prunes_stale_scope_and_keeps_newer_own_scope(
     assert NEW_SESSION_ID in lifecycle.archive_scope_ids(CHILD_SESSION_ID)
 
 
+class _GatedTimerAsyncio:
+    """Stands in for ``tool_dispatch.asyncio``: each timer sleep waits for one release."""
+
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+        self._releases: asyncio.Queue[None] = asyncio.Queue()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(asyncio, name)
+
+    async def sleep(self, delay: float) -> None:
+        self.delays.append(delay)
+        await self._releases.get()
+
+    def release(self) -> None:
+        self._releases.put_nowait(None)
+
+    async def wait_for_sleeps(self, count: int) -> None:
+        for _ in range(1000):
+            if len(self.delays) >= count:
+                return
+            await asyncio.sleep(0)
+        raise AssertionError(f"timer sleeps {self.delays} never reached {count}")
+
+
+class _TimerServer:
+    """Server stand-in for timer firings: records each event POST's session path."""
+
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, str]] = []
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            text = json.loads(request.content)["data"]["content"][0]["text"]
+            self.posts.append((request.url.path, text))
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404)
+
+    def client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(self._handle), base_url="http://s")
+
+
+async def _set_timer(server_client: httpx.AsyncClient, **args: Any) -> str:
+    output = json.loads(
+        await tool_dispatch._execute_timer_set(
+            args, server_client=server_client, conversation_id=OLD_SESSION_ID
+        )
+    )
+    return output["timer_id"]
+
+
+async def _cancel_timer(session_id: str, timer_id: str) -> str:
+    output = await tool_dispatch._execute_timer_cancel(
+        {"timer_id": timer_id}, conversation_id=session_id
+    )
+    return json.loads(output)["status"]
+
+
 @pytest.mark.asyncio
-async def test_succession_cancels_and_lists_old_timer(
+async def test_succession_moves_timers_with_their_schedule(
+    _clean_succession_state: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One-shot and repeating timers move to the successor as the same running tasks."""
+    runner_app._session_inboxes_ref[NEW_SESSION_ID] = asyncio.Queue()
+    gate = _GatedTimerAsyncio()
+    monkeypatch.setattr(tool_dispatch, "asyncio", gate)
+    timer_server = _TimerServer()
+    app, _server_client = _build_runner()
+    async with timer_server.client() as server_client:
+        one_shot = await _set_timer(server_client, seconds=3600, note="resume")
+        repeating = await _set_timer(server_client, seconds=900, repeat=True, note="check")
+        await gate.wait_for_sleeps(2)
+        tasks = dict(runner_app._session_timers[OLD_SESSION_ID])
+        try:
+            async with _runner_client(app) as client:
+                resp = await _post_succession(client, moved_ids=[])
+
+            assert resp.status_code == 200
+            assert resp.json()["dropped"] == []
+            moved = {item["id"]: item for item in resp.json()["moved_timers"]}
+            due = {timer_id: moved[timer_id].pop("due_at") for timer_id in moved}
+            assert moved[one_shot] == {
+                "kind": "timer",
+                "id": one_shot,
+                "seconds": 3600.0,
+                "repeat": False,
+                "note": "resume",
+            }
+            assert moved[repeating] == {
+                "kind": "timer",
+                "id": repeating,
+                "seconds": 900.0,
+                "repeat": True,
+                "note": "check",
+            }
+            assert abs(due[one_shot] - (time.time() + 3600)) < 60
+            assert runner_app._session_timers.get(OLD_SESSION_ID) in (None, {})
+            assert runner_app._session_timers[NEW_SESSION_ID] == tasks
+            assert not any(task.done() for task in tasks.values())
+            assert await _cancel_timer(OLD_SESSION_ID, one_shot) == "not_found"
+            assert await _cancel_timer(NEW_SESSION_ID, one_shot) == "cancelled"
+            assert await _cancel_timer(NEW_SESSION_ID, repeating) == "cancelled"
+        finally:
+            for task in tasks.values():
+                task.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+    assert timer_server.posts == []
+    assert gate.delays == [3600.0, 900.0]
+    assert not {one_shot, repeating} & runner_app._timer_schedules.keys()
+
+
+@pytest.mark.asyncio
+async def test_moved_repeat_timer_fires_once_per_due_time_on_the_same_cadence(
+    _clean_succession_state: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Before the commit the predecessor gets the firing; after it, only the successor."""
+    runner_app._session_inboxes_ref[NEW_SESSION_ID] = asyncio.Queue()
+    gate = _GatedTimerAsyncio()
+    monkeypatch.setattr(tool_dispatch, "asyncio", gate)
+    timer_server = _TimerServer()
+    app, _server_client = _build_runner()
+    async with timer_server.client() as server_client:
+        timer_id = await _set_timer(server_client, seconds=900, repeat=True, note="check")
+        task = runner_app._session_timers[OLD_SESSION_ID][timer_id]
+        try:
+            await gate.wait_for_sleeps(1)
+            gate.release()
+            await gate.wait_for_sleeps(2)
+            async with _runner_client(app) as client:
+                assert (await _post_succession(client, moved_ids=[])).status_code == 200
+            gate.release()
+            await gate.wait_for_sleeps(3)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    text = f"[System: timer {timer_id} fired]\nnote: 'check'"
+    assert timer_server.posts == [
+        (f"/v1/sessions/{OLD_SESSION_ID}/events", text),
+        (f"/v1/sessions/{NEW_SESSION_ID}/events", text),
+    ]
+    assert gate.delays == [900.0, 900.0, 900.0]
+    assert runner_app._session_timers.get(NEW_SESSION_ID) in (None, {})
+    assert timer_id not in runner_app._timer_schedules
+
+
+@pytest.mark.asyncio
+async def test_refused_succession_keeps_the_timer_on_the_predecessor(
+    _clean_succession_state: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successor not ready yet (409) moves nothing; the predecessor keeps its firing."""
+    runner_app._session_inboxes_ref[OLD_SESSION_ID] = asyncio.Queue()
+    gate = _GatedTimerAsyncio()
+    monkeypatch.setattr(tool_dispatch, "asyncio", gate)
+    timer_server = _TimerServer()
+    app, _server_client = _build_runner()
+    async with timer_server.client() as server_client:
+        timer_id = await _set_timer(server_client, seconds=60, note="resume")
+        task = runner_app._session_timers[OLD_SESSION_ID][timer_id]
+        try:
+            await gate.wait_for_sleeps(1)
+            async with _runner_client(app) as client:
+                assert (await _post_succession(client, moved_ids=[])).status_code == 409
+            assert runner_app._session_timers[OLD_SESSION_ID] == {timer_id: task}
+            gate.release()
+            await asyncio.wait_for(task, timeout=5)
+        finally:
+            task.cancel()
+
+    assert [path for path, _text in timer_server.posts] == [
+        f"/v1/sessions/{OLD_SESSION_ID}/events"
+    ]
+    assert runner_app._session_timers.get(OLD_SESSION_ID) in (None, {})
+    assert runner_app._session_timers.get(NEW_SESSION_ID) in (None, {})
+
+
+@pytest.mark.asyncio
+async def test_move_leaves_flow_runs_and_finished_timers_behind(
     _clean_succession_state: None,
 ) -> None:
-    """A timer on the retired session is cancelled and reported as dropped."""
-    runner_app._session_inboxes_ref[NEW_SESSION_ID] = asyncio.Queue()
-    timer_task = asyncio.create_task(asyncio.sleep(3600), name="timer-timer_a1b2")
-    runner_app.register_timer(OLD_SESSION_ID, "timer_a1b2", timer_task)
-    app, _server_client = _build_runner()
-    async with _runner_client(app) as client:
-        resp = await _post_succession(client, moved_ids=[])
-
-    assert resp.status_code == 200
-    assert resp.json()["dropped"] == [
-        {"kind": "timer", "id": "timer_a1b2", "label": "timer-timer_a1b2"}
-    ]
-    await asyncio.sleep(0)
-    assert timer_task.cancelled()
-    assert runner_app._session_timers.get(OLD_SESSION_ID) in (None, {})
+    """Flow runs share the registry and keep their own cancel-and-drop path."""
+    live = asyncio.create_task(asyncio.sleep(3600))
+    flow = asyncio.create_task(asyncio.sleep(3600))
+    finished = asyncio.create_task(asyncio.sleep(0))
+    await finished
+    runner_app.register_timer(OLD_SESSION_ID, "timer_live", live)
+    runner_app.register_timer(OLD_SESSION_ID, "flow_run", flow)
+    runner_app.register_timer(OLD_SESSION_ID, "timer_done", finished)
+    try:
+        moved = runner_app.move_session_timers(OLD_SESSION_ID, NEW_SESSION_ID, keep={"flow_run"})
+        assert moved == [{"kind": "timer", "id": "timer_live"}]
+        assert runner_app._session_timers[NEW_SESSION_ID] == {"timer_live": live}
+        assert set(runner_app._session_timers[OLD_SESSION_ID]) == {"flow_run", "timer_done"}
+    finally:
+        live.cancel()
+        flow.cancel()
+        await asyncio.gather(live, flow, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -487,7 +671,7 @@ async def test_succession_repeat_is_idempotent(_clean_succession_state: None) ->
 
     assert first.status_code == 200
     assert second.status_code == 200
-    assert second.json() == {"status": "rekeyed", "dropped": []}
+    assert second.json() == {"status": "rekeyed", "dropped": [], "moved_timers": []}
     assert {entry.child_session_id for entry in runner_app.list_subagent_work(NEW_SESSION_ID)} == {
         CHILD_SESSION_ID
     }

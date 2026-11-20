@@ -1954,6 +1954,8 @@ def _harness_error_response_error(response: object) -> dict[str, str]:
 
 # Per-session timer registry. Keyed by session_id → {timer_id → Task}.
 _session_timers: dict[str, dict[str, asyncio.Task[None]]] = {}
+# Schedule of each live ``sys_timer_set`` timer, listed when a handover moves it.
+_timer_schedules: dict[str, _JsonObject] = {}
 
 
 def _has_live_async_tasks(
@@ -1995,6 +1997,64 @@ def unregister_timer(session_id: str, timer_id: str) -> None:
     timers = _session_timers.get(session_id)
     if timers is not None:
         timers.pop(timer_id, None)
+    _timer_schedules.pop(timer_id, None)
+
+
+def record_timer_schedule(
+    timer_id: str, *, seconds: float, repeat: bool, note: str | None
+) -> None:
+    """
+    Record a timer's next firing, for listing it if a handover moves it.
+
+    :param timer_id: Timer identifier, e.g. ``"timer_a1b2..."``.
+    :param seconds: Delay before the next firing; the interval when repeating.
+    :param repeat: Whether the timer repeats.
+    :param note: The note echoed in each firing, or ``None``.
+    """
+    _timer_schedules[timer_id] = {
+        "seconds": seconds,
+        "repeat": repeat,
+        "note": note,
+        "due_at": time.time() + seconds,
+    }
+
+
+def timer_session(timer_id: str, session_id: str) -> str:
+    """
+    Return the session whose registry holds a timer now.
+
+    :param timer_id: Timer identifier.
+    :param session_id: Returned when no registry holds the timer.
+    :returns: The holding session id, e.g. a successor after a handover.
+    """
+    for holder, timers in _session_timers.items():
+        if timer_id in timers:
+            return holder
+    return session_id
+
+
+def move_session_timers(
+    session_id: str, target_session_id: str, *, keep: set[str]
+) -> list[_JsonObject]:
+    """
+    Hand a session's live timers to its successor without restarting them.
+
+    The running task moves as is, so its due time, repeat interval, note and
+    id carry over, and it fires only into the session that holds it.
+
+    :param session_id: The retired session.
+    :param target_session_id: Its successor.
+    :param keep: Registry ids that stay behind (flow runs).
+    :returns: One ``{"kind": "timer", "id", ...schedule}`` entry per moved timer.
+    """
+    timers = _session_timers.get(session_id, {})
+    moved: list[_JsonObject] = []
+    for timer_id, task in list(timers.items()):
+        if timer_id in keep or task.done():
+            continue
+        _session_timers.setdefault(target_session_id, {})[timer_id] = timers.pop(timer_id)
+        moved.append({"kind": "timer", "id": timer_id, **_timer_schedules.get(timer_id, {})})
+    return moved
 
 
 def cancel_timer(session_id: str, timer_id: str) -> bool:
@@ -13923,11 +13983,8 @@ def create_runner_app(
             [flow for flow in flows if isinstance(flow, dict)] if isinstance(flows, list) else []
         )
         flow_ids = {flow["flow_id"] for flow in flow_list if isinstance(flow.get("flow_id"), str)}
-        for timer_id, timer_task in list(_session_timers.get(session_id, {}).items()):
-            if timer_id in flow_ids:
-                continue
-            if cancel_timer(session_id, timer_id):
-                dropped.append({"kind": "timer", "id": timer_id, "label": timer_task.get_name()})
+        # The store move is committed before this call: timers keep firing, in the successor.
+        moved_timers = move_session_timers(session_id, target_session_id, keep=flow_ids)
         for flow in flow_list:
             flow_id = flow.get("flow_id")
             if not isinstance(flow_id, str):
@@ -13954,7 +14011,7 @@ def create_runner_app(
             await retry_runtime.succeed_parent(session_id, target_session_id)
         return JSONResponse(
             status_code=200,
-            content={"status": "rekeyed", "dropped": dropped},
+            content={"status": "rekeyed", "dropped": dropped, "moved_timers": moved_timers},
         )
 
     @app.post("/v1/sessions/{session_id}/succession/release")

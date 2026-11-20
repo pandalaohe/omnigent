@@ -7502,7 +7502,8 @@ async def _timer_loop(
     Background loop: sleep then fire timer notifications.
 
     :param timer_id: Unique timer id, e.g. ``"timer_a1b2..."``.
-    :param conversation_id: Session to fire into.
+    :param conversation_id: Session the timer was set in; it fires into the
+        session holding it, which a handover may change.
     :param seconds: Delay between firings.
     :param repeat: Loop indefinitely when True.
     :param note: Optional note echoed in firing text.
@@ -7512,7 +7513,10 @@ async def _timer_loop(
 
     try:
         while True:
+            _app.record_timer_schedule(timer_id, seconds=seconds, repeat=repeat, note=note)
             await asyncio.sleep(seconds)
+            # A committed handover may have moved this timer to the successor.
+            conversation_id = _app.timer_session(timer_id, conversation_id)
             # D5: the session or an ancestor archived ends the schedule
             # before its next wake; the finally below drops the registry
             # entry.
@@ -7572,7 +7576,7 @@ async def _timer_loop(
     except asyncio.CancelledError:
         return
     finally:
-        _app.unregister_timer(conversation_id, timer_id)
+        _app.unregister_timer(_app.timer_session(timer_id, conversation_id), timer_id)
 
 
 async def _execute_flow_tool(
