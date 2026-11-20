@@ -441,7 +441,27 @@ async def transfer_requested_claude_terminal(
                     and new is not None
                     and new.runner_id == old.runner_id
                 )
-                if exited or rebound:
+                original_terminal: dict[str, Any] = {}
+                if rebound and not exited:
+                    # The move and its confirmation probe may have lost the same tunnel.
+                    original = await _get_runner_client(
+                        old_id,
+                        runner_router,
+                        conversation=replace(old, runner_id=record.runner_id),
+                    )
+                    try:
+                        if original is None:
+                            raise ConnectionError("The original Claude transfer runner is offline")
+                        original_terminal = await _live_terminal(original, record.target)
+                    except (httpx.TransportError, ConnectionError, TimeoutError):
+                        if recovery is not None:
+                            raise
+                if _terminal_instance(original_terminal) == record.instance:
+                    if record.target != new_id:
+                        return 409, conflict
+                    payload = original_terminal
+                    await _save_claude_transfer_result(store, old_id, new_id, payload)
+                elif exited or rebound:
                     await clear_record(record)
                     record = None
                     if recovery is not None or not rebound:
@@ -497,6 +517,20 @@ async def transfer_requested_claude_terminal(
                 or not is_requested_claude_transfer(current_old, current_new)
             ):
                 return 409, conflict
+            if (
+                current_new.runner_id is not None
+                and current_new.runner_id == current_old.runner_id != record.runner_id
+            ):
+                # The successor must route to the runner that owns the confirmed pane.
+                try:
+                    await asyncio.to_thread(
+                        store.replace_runner_id,
+                        new_id,
+                        record.runner_id,
+                        expected_binding=current_new,
+                    )
+                except ValueError as exc:
+                    raise ConnectionError("The successor binding changed during recovery") from exc
             # A prepared successor already opts into retiring an empty source.
             receipt_id = uuid4().hex
             await commit_succession_move(
