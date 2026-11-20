@@ -35,6 +35,7 @@ import {
 } from "./keyboardShortcutPreferences";
 import {
   readMobileAssistantPreferences,
+  toggleMobileMenuPin,
   writeMobileAssistantPreferences,
 } from "./mobileAssistantPreferences";
 
@@ -1420,6 +1421,56 @@ it("hydrates the voice namespace and refreshes it from another device", async ()
 });
 
 describe("phone session menu pins", () => {
+  it("saves only the pin field, leaving a stale terminal cache out of the request", async () => {
+    vi.useFakeTimers();
+    // The account holds a terminal layout this device never hydrated.
+    const serverValue = {
+      version: 2 as const,
+      enabled: true,
+      buttons: [],
+      chatActionsRevision: 1 as const,
+      pinnedMenuItems: ["shells"],
+      terminalKeyboard: { v: 1, bindings: { stale: true } },
+    };
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    await initializeUserPreferencesSync(
+      { version: 1, settings: { mobile_assistant: serverValue } },
+      fetcher,
+      "alice",
+    );
+    // A stale local cache for the terminal fields, as an older device leaves.
+    const cached = readMobileAssistantPreferences();
+    writeMobileAssistantPreferences({
+      ...cached,
+      terminalKeyboard: { v: 1, bindings: { cached: true } },
+    });
+    await vi.advanceTimersByTimeAsync(300);
+    fetcher.mockClear();
+
+    toggleMobileMenuPin("files");
+    await vi.advanceTimersByTimeAsync(251);
+
+    expect(fetcher).toHaveBeenCalledOnce();
+    const sent = JSON.parse(fetcher.mock.calls[0][1].body).value;
+    // Only the field this save owns: the Server merges it into the account's
+    // own terminal layout.
+    expect(Object.keys(sent)).toEqual(["pinnedMenuItems"]);
+    expect(sent.pinnedMenuItems).toEqual(["shells", "files"]);
+    expect(readMobileAssistantPreferences().pinnedMenuItems).toEqual(["shells", "files"]);
+
+    // A later terminal save still goes out whole, and carries the pins this
+    // device now holds.
+    fetcher.mockClear();
+    expect(
+      writeTerminalKeyPreferences({ terminalKeyboard: { v: 1, bindings: { next: true } } }),
+    ).toBe("saved");
+    await vi.advanceTimersByTimeAsync(251);
+    expect(fetcher).toHaveBeenCalledOnce();
+    const terminalSave = JSON.parse(fetcher.mock.calls[0][1].body).value;
+    expect(terminalSave.terminalKeyboard).toEqual({ v: 1, bindings: { next: true } });
+    expect(terminalSave.pinnedMenuItems).toEqual(["shells", "files"]);
+  });
+
   it("carries the pinned rows inside the mobile_assistant namespace", async () => {
     const preferences = readMobileAssistantPreferences();
     writeMobileAssistantPreferences({ ...preferences, pinnedMenuItems: ["shells", "files"] });

@@ -20,7 +20,7 @@ import {
   toggledMobileMenuPins,
   type MobileMenuPinId,
 } from "@/lib/mobileMenuPins";
-import { queueUserPreferencePatch } from "@/lib/userPreferencesSync";
+import { queueUserPreferenceFieldPatch, queueUserPreferencePatch } from "@/lib/userPreferencesSync";
 
 export {
   DEFAULT_TERMINAL_KEY_ITEMS,
@@ -640,54 +640,111 @@ export function readMobileAssistantPreferences(): ResolvedMobileAssistantPrefere
   }
 }
 
-export function writeMobileAssistantPreferences(preferences: MobileAssistantPreferences): void {
-  if (typeof window === "undefined") return;
-  try {
+/**
+ * Fields of the `mobile_assistant` value each writer owns. A writer copies
+ * every other field of the stored value through, so the screens that edit this
+ * one namespace (chat wheel, terminal keys, menu pins) cannot drop each
+ * other's settings.
+ */
+const CHAT_CONTROL_FIELDS = [
+  "version",
+  "enabled",
+  "buttons",
+  "chatActionsRevision",
+  "position",
+  "dock",
+  "pinnedMenuItems",
+] as const;
+
+export function preservedMobileAssistantFields(
+  source: object | undefined,
+  owned: readonly string[],
+): Record<string, unknown> {
+  const preserved: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(source ?? {})) {
+    if (value === undefined || owned.includes(key)) continue;
+    preserved[key] = value;
+  }
+  return preserved;
+}
+
+/** The v2 object as this namespace is stored and synced. */
+function canonicalMobileAssistantPreferences(
+  preferences: MobileAssistantPreferences,
+  source: object | undefined,
+): MobileAssistantPreferences {
+  const canonical: MobileAssistantPreferences = {
     // Persist only the current schema. Older builds stored a circle direction;
     // direct wheel ordering now owns the visual sequence, so that legacy field
     // must not leak back out when an old object is passed through at runtime.
-    const canonical: MobileAssistantPreferences = {
-      version: 2,
-      enabled: preferences.enabled,
-      buttons: preferences.buttons,
-      terminalButtons:
-        preferences.terminalButtons ??
-        (preferences.terminalBar !== undefined ? undefined : defaultTerminalButtons()),
-      terminalKeysEnabled: preferences.terminalKeysEnabled !== false,
-      terminalSecondRow: preferences.terminalSecondRow !== false,
-      ...(preferences.terminalBar !== undefined ? { terminalBar: preferences.terminalBar } : {}),
-      ...(preferences.terminalBarPreset !== undefined
-        ? { terminalBarPreset: preferences.terminalBarPreset }
-        : {}),
-      ...(typeof preferences.terminalLegacyBasis === "string"
-        ? { terminalLegacyBasis: preferences.terminalLegacyBasis }
-        : {}),
-      chatActionsRevision: 1,
-      ...(preferences.terminalKeys !== undefined ? { terminalKeys: preferences.terminalKeys } : {}),
-      ...(preferences.terminalKeysPreset !== undefined
-        ? { terminalKeysPreset: preferences.terminalKeysPreset }
-        : {}),
-      ...(preferences.terminalKeyboard !== undefined
-        ? { terminalKeyboard: preferences.terminalKeyboard }
-        : {}),
-      // Written as a concrete list so an edit elsewhere in this namespace
-      // can't drop the user's pins back to the stock default.
-      pinnedMenuItems: resolveMobileMenuPins(preferences.pinnedMenuItems),
-      ...(preferences.position ? { position: preferences.position } : {}),
-      ...(preferences.dock ? { dock: preferences.dock } : {}),
-    };
-    window.localStorage.setItem(MOBILE_ASSISTANT_STORAGE_KEY, JSON.stringify(canonical));
-    const deviceState = {
-      ...(canonical.position ? { position: canonical.position } : {}),
-      ...(canonical.dock ? { dock: canonical.dock } : {}),
-    };
-    if (Object.keys(deviceState).length > 0) {
-      window.localStorage.setItem(MOBILE_ASSISTANT_DEVICE_STORAGE_KEY, JSON.stringify(deviceState));
-    } else {
-      window.localStorage.removeItem(MOBILE_ASSISTANT_DEVICE_STORAGE_KEY);
-    }
+    ...(preservedMobileAssistantFields(source, CHAT_CONTROL_FIELDS) as object),
+    version: 2,
+    enabled: preferences.enabled,
+    buttons: preferences.buttons,
+    terminalButtons:
+      preferences.terminalButtons ??
+      (preferences.terminalBar !== undefined ? undefined : defaultTerminalButtons()),
+    terminalKeysEnabled: preferences.terminalKeysEnabled !== false,
+    terminalSecondRow: preferences.terminalSecondRow !== false,
+    ...(preferences.terminalBar !== undefined ? { terminalBar: preferences.terminalBar } : {}),
+    ...(preferences.terminalBarPreset !== undefined
+      ? { terminalBarPreset: preferences.terminalBarPreset }
+      : {}),
+    ...(typeof preferences.terminalLegacyBasis === "string"
+      ? { terminalLegacyBasis: preferences.terminalLegacyBasis }
+      : {}),
+    chatActionsRevision: 1,
+    ...(preferences.terminalKeys !== undefined ? { terminalKeys: preferences.terminalKeys } : {}),
+    ...(preferences.terminalKeysPreset !== undefined
+      ? { terminalKeysPreset: preferences.terminalKeysPreset }
+      : {}),
+    ...(preferences.terminalKeyboard !== undefined
+      ? { terminalKeyboard: preferences.terminalKeyboard }
+      : {}),
+    // Written as a concrete list so an edit elsewhere in this namespace
+    // can't drop the user's pins back to the stock default.
+    pinnedMenuItems: resolveMobileMenuPins(preferences.pinnedMenuItems),
+    ...(preferences.position ? { position: preferences.position } : {}),
+    ...(preferences.dock ? { dock: preferences.dock } : {}),
+  };
+  return canonical;
+}
+
+/**
+ * Store the object and queue its save. `sync` names what this write owns:
+ * `all` sends the namespace, while a field name sends only that field, so the
+ * account's sibling fields stay whatever the account holds rather than what
+ * this device cached.
+ */
+function persistMobileAssistantPreferences(
+  canonical: MobileAssistantPreferences,
+  sync: "all" | keyof MobileAssistantPreferences,
+): void {
+  window.localStorage.setItem(MOBILE_ASSISTANT_STORAGE_KEY, JSON.stringify(canonical));
+  const deviceState = {
+    ...(canonical.position ? { position: canonical.position } : {}),
+    ...(canonical.dock ? { dock: canonical.dock } : {}),
+  };
+  if (Object.keys(deviceState).length > 0) {
+    window.localStorage.setItem(MOBILE_ASSISTANT_DEVICE_STORAGE_KEY, JSON.stringify(deviceState));
+  } else {
+    window.localStorage.removeItem(MOBILE_ASSISTANT_DEVICE_STORAGE_KEY);
+  }
+  if (sync === "all") {
     queueUserPreferencePatch("mobile_assistant", canonical);
-    window.dispatchEvent(new Event(MOBILE_ASSISTANT_CHANGED_EVENT));
+  } else {
+    queueUserPreferenceFieldPatch("mobile_assistant", sync, canonical[sync]);
+  }
+  window.dispatchEvent(new Event(MOBILE_ASSISTANT_CHANGED_EVENT));
+}
+
+export function writeMobileAssistantPreferences(preferences: MobileAssistantPreferences): void {
+  if (typeof window === "undefined") return;
+  try {
+    persistMobileAssistantPreferences(
+      canonicalMobileAssistantPreferences(preferences, preferences),
+      "all",
+    );
   } catch {
     // Mobile controls retain their safe defaults when storage is unavailable.
   }
@@ -722,13 +779,33 @@ export function useMobileMenuPins(): MobileMenuPinId[] {
   return resolveMobileMenuPins(useMobileAssistantPreferences().pinnedMenuItems);
 }
 
-/** Pin or unpin one phone session-menu row, keeping the rest of the choices. */
+/**
+ * Pin or unpin one phone session-menu row, keeping the rest of the choices.
+ *
+ * The save carries only `pinnedMenuItems`: the Server merges a namespace object
+ * field by field, so this device's cached terminal layout never overwrites what
+ * another device saved.
+ */
 export function toggleMobileMenuPin(id: MobileMenuPinId): void {
-  const preferences = readMobileAssistantPreferences();
-  writeMobileAssistantPreferences({
-    ...preferences,
-    pinnedMenuItems: toggledMobileMenuPins(resolveMobileMenuPins(preferences.pinnedMenuItems), id),
-  });
+  if (typeof window === "undefined") return;
+  try {
+    const preferences = readMobileAssistantPreferences();
+    persistMobileAssistantPreferences(
+      canonicalMobileAssistantPreferences(
+        {
+          ...preferences,
+          pinnedMenuItems: toggledMobileMenuPins(
+            resolveMobileMenuPins(preferences.pinnedMenuItems),
+            id,
+          ),
+        },
+        preferences,
+      ),
+      "pinnedMenuItems",
+    );
+  } catch {
+    // The menu keeps the stored order when storage is unavailable.
+  }
 }
 
 function codeToKey(code: string): string {

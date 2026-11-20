@@ -15,6 +15,8 @@ import type { ReactNode } from "react";
 
 /** Every row that can be pinned, in the order the menu declares them. */
 export const MOBILE_MENU_PIN_IDS = [
+  "add-nested-agent",
+  "session-pin",
   "share",
   "fork",
   "export",
@@ -95,12 +97,19 @@ export interface PinnableMenuRow {
   /** The row's label, for the toggle's "Pin Shells" / "Unpin Shells" name. */
   label: string;
   render: (withPin: boolean) => ReactNode;
+  /**
+   * A divider belongs under this row where it renders in the body (the leading
+   * "Add nested agent" keeps the rule that separated it from the session
+   * actions). A pinned copy brings no divider: the group has its own.
+   */
+  dividerAfter?: boolean;
 }
 
 export function menuRow(
   id: MobileMenuPinId,
   label: string,
   render: (withPin: boolean) => ReactNode,
+  options: { dividerAfter?: boolean } = {},
 ): PinnableMenuRow {
-  return { id, label, render };
+  return { id, label, render, ...options };
 }

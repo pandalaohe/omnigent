@@ -211,6 +211,12 @@ export function HeaderConversationMenu({
     conversation.status,
   );
   const [menuOpen, setMenuOpen] = useState(initiallyOpen);
+  // A pinned row unmounts from one group and mounts in the other; remember
+  // which control to focus at its new position, then forget it once it took.
+  const [pendingPinFocus, setPendingPinFocus] = useState<string | null>(null);
+  useEffect(() => {
+    if (pendingPinFocus !== null) setPendingPinFocus(null);
+  }, [pendingPinFocus]);
   const healthSessions = useMemo(
     () => (menuOpen ? [{ id: conversation.id }] : []),
     [menuOpen, conversation.id],
@@ -277,7 +283,9 @@ export function HeaderConversationMenu({
   const canAddAgent = !isArchived && info !== "loading" && info.sibling_sessions;
   const addAgentPath = `/?sibling=${encodeURIComponent(conversation.id)}`;
   const label = conversationDisplayLabel(conversation);
-  // Mobile taps need a bigger target than the dense desktop row.
+  // Mobile taps need a bigger target than the dense desktop row. The pin
+  // control's own row height lives in `withPinControl`, so a row this menu did
+  // not build still fits it.
   const itemClass = cn("mobile-touch-target", isMobile && "gap-2.5 px-2.5 py-2");
   // Share and Agent info reach this menu on mobile from the header's legacy
   // Share · Agent info menu, which reported them under these ids. Keep
@@ -478,46 +486,50 @@ export function HeaderConversationMenu({
   useDesktopCommand("fork-session", canFork && !forkDisabledReason ? onFork : null);
   const desktopShortcuts = supportsDesktopCommands();
 
-  const leadingItems = (
-    <>
-      {canAddAgent && (
-        <>
-          <DropdownMenuItem
-            data-testid="add-sibling-session"
-            className={itemClass}
-            aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+A`}
-            onSelect={() => navigate(addAgentPath)}
-          >
-            <PlusIcon className="size-3.5" />
-            Add nested agent
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-        </>
-      )}
-      {/* Chat/Terminal renders its own trailing separator (null on other sessions). */}
-      {viewItems}
-    </>
-  );
-
-  // Session pin/unpin leads the body (it is already at the top, so it is not a
-  // pinned row) and keeps the shortcut hint on desktop.
-  const sessionHeadItems = !isChild && (
-    <DropdownMenuItem
-      data-testid="header-pin-conversation"
-      className={itemClass}
-      disabled={pinSaving}
-      onSelect={togglePin}
-    >
-      {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
-      {isPinned ? "Unpin" : "Pin"}
-      {desktopShortcuts && <CompactShortcutKeys keys={PIN_SESSION_KEYS} className="ml-auto pl-4" />}
-    </DropdownMenuItem>
-  );
-
-  // The menu's own rows, each declared once. A row hands the pin toggle to
-  // whatever slot it wants (none on the desktop kebab), and the same node
-  // renders either in the pinned group or in its usual place.
+  // The menu's own rows, each declared once. The same node renders either in
+  // the pinned group or in its usual place, and the surface draws the pin
+  // control beside whichever copy shows.
   const sessionRows: PinnableMenuRow[] = [
+    ...(canAddAgent
+      ? [
+          menuRow(
+            "add-nested-agent",
+            "Add nested agent",
+            () => (
+              <DropdownMenuItem
+                data-testid="add-sibling-session"
+                className={itemClass}
+                aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+A`}
+                onSelect={() => navigate(addAgentPath)}
+              >
+                <PlusIcon className="size-3.5" />
+                Add nested agent
+              </DropdownMenuItem>
+            ),
+            // The rule that separated the nested-agent action from the session
+            // actions; a pinned copy brings none (the group has its own).
+            { dividerAfter: true },
+          ),
+        ]
+      : []),
+    ...(!isChild
+      ? [
+          menuRow("session-pin", "session", () => (
+            <DropdownMenuItem
+              data-testid="header-pin-conversation"
+              className={itemClass}
+              disabled={pinSaving}
+              onSelect={togglePin}
+            >
+              {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
+              {isPinned ? "Unpin" : "Pin"}
+              {desktopShortcuts && (
+                <CompactShortcutKeys keys={PIN_SESSION_KEYS} className="ml-auto pl-4" />
+              )}
+            </DropdownMenuItem>
+          )),
+        ]
+      : []),
     ...(canShare
       ? [
           menuRow("share", "Share", () => (
@@ -855,7 +867,11 @@ export function HeaderConversationMenu({
             itemId={row.id}
             label={row.label}
             pinned={pinnedSet.has(row.id)}
-            onToggle={() => toggleMobileMenuPin(row.id)}
+            autoFocus={pendingPinFocus === row.id}
+            onToggle={() => {
+              setPendingPinFocus(row.id);
+              toggleMobileMenuPin(row.id);
+            }}
           />
         ) : null,
         row.render(isMobile),
@@ -863,18 +879,25 @@ export function HeaderConversationMenu({
     </Fragment>
   );
   const renderUnpinned = (rows: PinnableMenuRow[]) =>
-    rows.filter((row) => !pinnedSet.has(row.id)).map(renderRow);
+    rows
+      .filter((row) => !pinnedSet.has(row.id))
+      .flatMap((row) => [
+        renderRow(row),
+        ...(row.dividerAfter ? [<DropdownMenuSeparator key={`${row.id}-divider`} />] : []),
+      ]);
 
   const mainItems = (
     <>
-      {leadingItems}
+      {/* Chat/Terminal renders its own trailing separator, and leads because
+          the pinned group sits right after it — or first when a session has
+          no switcher. */}
+      {viewItems}
       {orderedPinnedRows.length > 0 && (
         <>
           {orderedPinnedRows.map(renderRow)}
           <DropdownMenuSeparator />
         </>
       )}
-      {sessionHeadItems}
       {renderUnpinned(sessionRows)}
       {workspaceRows.some((row) => !pinnedSet.has(row.id)) && (
         <>

@@ -4,6 +4,7 @@ import {
   defaultMobileAssistantButtons,
   MOBILE_ASSISTANT_CHANGED_EVENT,
   MOBILE_ASSISTANT_STORAGE_KEY,
+  preservedMobileAssistantFields,
   readMobileAssistantPreferences,
   softKeyForChord,
   terminalDataForChord,
@@ -728,6 +729,27 @@ export function encodeSend(
   return "bytes" in result ? splitTerminalWrites(result.bytes) : [];
 }
 
+/**
+ * The fields a terminal-key save owns. Everything else in the stored
+ * `mobile_assistant` object (the phone menu pins, for one) is copied through,
+ * so saving a key cannot drop another screen's settings.
+ */
+const TERMINAL_KEY_FIELDS = [
+  "version",
+  "enabled",
+  "buttons",
+  "chatActionsRevision",
+  "terminalKeys",
+  "terminalKeysPreset",
+  "terminalKeyboard",
+  "terminalKeysEnabled",
+  "terminalBar",
+  "terminalBarPreset",
+  "terminalButtons",
+  "terminalSecondRow",
+  "terminalLegacyBasis",
+] as const;
+
 export function buildTerminalKeyPreferences(
   fields: TerminalKeyPreferencesFields,
   current: Record<string, unknown>,
@@ -751,6 +773,7 @@ export function buildTerminalKeyPreferences(
       ? { enabled: raw.enabled, buttons: raw.buttons, chatActionsRevision: raw.chatActionsRevision }
       : { enabled: true, buttons: defaultMobileAssistantButtons(), chatActionsRevision: 1 };
   return canonicalTerminalFields({
+    ...preservedMobileAssistantFields(current, TERMINAL_KEY_FIELDS),
     version: 2,
     ...circle,
     terminalKeys: {

@@ -12,9 +12,15 @@ import {
   writeMobileAssistantPreferences,
 } from "./mobileAssistantPreferences";
 import { resolveMobileMenuPins, DEFAULT_MOBILE_MENU_PINS } from "./mobileMenuPins";
+import { writeTerminalKeyPreferences } from "./terminalKeys";
+import type * as UserPreferencesSyncModule from "./userPreferencesSync";
 import { queueUserPreferencePatch } from "./userPreferencesSync";
 
-vi.mock("./userPreferencesSync", () => ({ queueUserPreferencePatch: vi.fn() }));
+vi.mock("./userPreferencesSync", async (importOriginal) => ({
+  ...(await importOriginal<typeof UserPreferencesSyncModule>()),
+  queueUserPreferencePatch: vi.fn(),
+  queueUserPreferenceFieldPatch: vi.fn(),
+}));
 
 describe("mobileAssistantPreferences", () => {
   it("adds Terminals to a legacy custom chat set without losing the tenth button, and respects removal after writing", () => {
@@ -105,6 +111,22 @@ describe("mobileAssistantPreferences", () => {
     expect(resolveMobileMenuPins(readMobileAssistantPreferences().pinnedMenuItems)).toEqual([
       "shells",
     ]);
+  });
+
+  it("keeps the menu pins when a terminal key is saved", () => {
+    writeMobileAssistantPreferences({
+      ...readMobileAssistantPreferences(),
+      pinnedMenuItems: ["files", "session-pin"],
+    });
+
+    expect(writeTerminalKeyPreferences({ terminalKeyboard: { v: 1 } })).toBe("saved");
+
+    // The terminal writer owns the key fields only; the pins ride through both
+    // the stored object and the saved value.
+    expect(readMobileAssistantPreferences().pinnedMenuItems).toEqual(["files", "session-pin"]);
+    expect(JSON.parse(localStorage.getItem(MOBILE_ASSISTANT_STORAGE_KEY)!).pinnedMenuItems).toEqual(
+      ["files", "session-pin"],
+    );
   });
 
   it("ignores the legacy direction field and never writes it back", () => {
