@@ -1418,3 +1418,32 @@ it("hydrates the voice namespace and refreshes it from another device", async ()
   expect(changed).toHaveBeenCalled();
   window.removeEventListener("omnigent:voice-input-changed", changed);
 });
+
+describe("phone session menu pins", () => {
+  it("carries the pinned rows inside the mobile_assistant namespace", async () => {
+    const preferences = readMobileAssistantPreferences();
+    writeMobileAssistantPreferences({ ...preferences, pinnedMenuItems: ["shells", "files"] });
+
+    const settings = collectLocalUserPreferences().settings;
+    expect(settings.mobile_assistant).toMatchObject({ pinnedMenuItems: ["shells", "files"] });
+
+    // Another device's order arrives on the next hydrate.
+    const fetcher = vi.fn().mockResolvedValue(
+      Response.json(
+        {
+          user_id: "alice",
+          preferences: {
+            version: 1,
+            settings: {
+              mobile_assistant: { ...preferences, pinnedMenuItems: ["shells", "files"] },
+            },
+          },
+        },
+        { status: 200 },
+      ),
+    );
+    await initializeUserPreferencesSync({ version: 1, settings: {} }, fetcher, "alice");
+    await refreshUserPreferencesFromServer();
+    expect(readMobileAssistantPreferences().pinnedMenuItems).toEqual(["shells", "files"]);
+  });
+});

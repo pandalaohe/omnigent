@@ -14,6 +14,12 @@ import {
   type TerminalBar,
   type TerminalKeyRowItem,
 } from "@/lib/terminalKeyBar";
+import {
+  normalizeMobileMenuPins,
+  resolveMobileMenuPins,
+  toggledMobileMenuPins,
+  type MobileMenuPinId,
+} from "@/lib/mobileMenuPins";
 import { queueUserPreferencePatch } from "@/lib/userPreferencesSync";
 
 export {
@@ -161,6 +167,11 @@ export interface MobileAssistantPreferences {
   terminalKeysPreset?: TerminalKeysPreset;
   terminalKeyboard?: unknown;
   chatActionsRevision?: 1;
+  /**
+   * Rows pinned to the top of the phone session menu, in pinned order.
+   * Absent until the user edits the set, which keeps the stock default.
+   */
+  pinnedMenuItems?: MobileMenuPinId[];
   position?: { x: number; y: number };
   dock?: MobileAssistantDock;
 }
@@ -608,6 +619,9 @@ export function readMobileAssistantPreferences(): ResolvedMobileAssistantPrefere
       ...(parsed.terminalKeyboard !== undefined
         ? { terminalKeyboard: parsed.terminalKeyboard }
         : {}),
+      ...(Array.isArray(parsed.pinnedMenuItems)
+        ? { pinnedMenuItems: normalizeMobileMenuPins(parsed.pinnedMenuItems) }
+        : {}),
       ...(parsed.terminalBarPreset !== undefined
         ? { terminalBarPreset: parsed.terminalBarPreset }
         : {}),
@@ -656,6 +670,9 @@ export function writeMobileAssistantPreferences(preferences: MobileAssistantPref
       ...(preferences.terminalKeyboard !== undefined
         ? { terminalKeyboard: preferences.terminalKeyboard }
         : {}),
+      // Written as a concrete list so an edit elsewhere in this namespace
+      // can't drop the user's pins back to the stock default.
+      pinnedMenuItems: resolveMobileMenuPins(preferences.pinnedMenuItems),
       ...(preferences.position ? { position: preferences.position } : {}),
       ...(preferences.dock ? { dock: preferences.dock } : {}),
     };
@@ -698,6 +715,20 @@ export function useMobileAssistantPreferences(): ResolvedMobileAssistantPreferen
     () => null,
   );
   return readMobileAssistantPreferences();
+}
+
+/** Rows the phone session menu pins, in pinned order. */
+export function useMobileMenuPins(): MobileMenuPinId[] {
+  return resolveMobileMenuPins(useMobileAssistantPreferences().pinnedMenuItems);
+}
+
+/** Pin or unpin one phone session-menu row, keeping the rest of the choices. */
+export function toggleMobileMenuPin(id: MobileMenuPinId): void {
+  const preferences = readMobileAssistantPreferences();
+  writeMobileAssistantPreferences({
+    ...preferences,
+    pinnedMenuItems: toggledMobileMenuPins(resolveMobileMenuPins(preferences.pinnedMenuItems), id),
+  });
 }
 
 function codeToKey(code: string): string {

@@ -17,6 +17,11 @@ import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { PINNED_LABEL_KEY, PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
 import { toast } from "sonner";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
+import { menuRow } from "@/lib/mobileMenuPins";
+import {
+  MOBILE_ASSISTANT_STORAGE_KEY,
+  readMobileAssistantPreferences,
+} from "@/lib/mobileAssistantPreferences";
 import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 import { useChatStore } from "@/store/chatStore";
@@ -226,6 +231,33 @@ function openMenu() {
   fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
     button: 0,
   });
+}
+
+// Workspace-rail rows as ChatHeader hands them over: each carries the id its
+// pin toggle uses.
+const filesRailRow = menuRow("files", "Files", (pin) => (
+  <DropdownMenuItem data-testid="rail-files">
+    Files
+    {pin()}
+  </DropdownMenuItem>
+));
+const shellsRailRow = menuRow("shells", "Shells", (pin) => (
+  <DropdownMenuItem data-testid="rail-shells">
+    Shells
+    {pin()}
+  </DropdownMenuItem>
+));
+
+/** Store a pin choice the way another device would have left it. */
+function storePins(pinnedMenuItems: string[]) {
+  localStorage.setItem(
+    MOBILE_ASSISTANT_STORAGE_KEY,
+    JSON.stringify({ version: 2, enabled: true, buttons: [], pinnedMenuItems }),
+  );
+}
+
+function menuItemLabels() {
+  return screen.getAllByRole("menuitem").map((item) => item.textContent?.trim());
 }
 
 beforeEach(() => {
@@ -1012,7 +1044,7 @@ describe("HeaderConversationMenu", () => {
     mocks.isMobile = true;
     renderMenu({
       viewItems: <DropdownMenuItem>Terminal</DropdownMenuItem>,
-      workspaceItems: <DropdownMenuItem data-testid="rail-files">Files</DropdownMenuItem>,
+      workspaceItems: [filesRailRow],
     });
     openMenu();
 
@@ -1034,15 +1066,113 @@ describe("HeaderConversationMenu", () => {
     ]);
   });
 
+  it("pins Shells under the Chat/Terminal switch before the user changes anything", () => {
+    mocks.isMobile = true;
+    renderMenu({
+      viewItems: <DropdownMenuItem>Terminal</DropdownMenuItem>,
+      workspaceItems: [filesRailRow, shellsRailRow],
+    });
+    openMenu();
+
+    // The pinned group leads with the stock choice, then a separator and the
+    // rest in today's order, Shells no longer down by Logs.
+    expect(menuItemLabels()).toEqual([
+      "Add nested agent",
+      "Terminal",
+      "Shells",
+      "Pin",
+      "Share",
+      "Fork",
+      "Export",
+      "View instructions",
+      "Worktree details",
+      "Rename",
+      "Mark as unread",
+      "Add to project",
+      "Files",
+      "Archive",
+      "Delete this session",
+    ]);
+    expect(screen.getByTestId("pin-menu-item-shells")).toHaveAttribute(
+      "aria-label",
+      "Unpin Shells",
+    );
+    expect(screen.getByTestId("pin-menu-item-files")).toHaveAttribute("aria-label", "Pin Files");
+  });
+
+  it("moves a row into the pinned group when its toggle is tapped, and back out", () => {
+    mocks.isMobile = true;
+    storePins([]);
+    renderMenu({ workspaceItems: [filesRailRow, shellsRailRow] });
+    openMenu();
+    expect(menuItemLabels().slice(0, 3)).toEqual(["Add nested agent", "Pin", "Share"]);
+
+    fireEvent.click(screen.getByTestId("pin-menu-item-files"));
+    expect(menuItemLabels().slice(0, 4)).toEqual(["Add nested agent", "Files", "Pin", "Share"]);
+    expect(screen.getAllByRole("menuitem", { name: /^Files/ })).toHaveLength(1);
+    expect(screen.getByTestId("pin-menu-item-files")).toHaveAttribute("aria-label", "Unpin Files");
+    expect(readMobileAssistantPreferences().pinnedMenuItems).toEqual(["files"]);
+
+    // Unpinning from the pinned group returns the row to its own place.
+    fireEvent.click(screen.getByTestId("pin-menu-item-files"));
+    expect(menuItemLabels().slice(0, 3)).toEqual(["Add nested agent", "Pin", "Share"]);
+    expect(menuItemLabels().slice(-4, -3)).toEqual(["Files"]);
+    expect(readMobileAssistantPreferences().pinnedMenuItems).toEqual([]);
+  });
+
+  it("keeps the order the rows were pinned in", () => {
+    mocks.isMobile = true;
+    storePins(["shells", "files"]);
+    renderMenu({ workspaceItems: [filesRailRow, shellsRailRow] });
+    openMenu();
+
+    // Pinned order wins over the menu's own order (Files is declared first).
+    expect(menuItemLabels().slice(0, 3)).toEqual(["Add nested agent", "Shells", "Files"]);
+  });
+
+  it("hides a pinned row the current session cannot show", () => {
+    // Peer messages is pinned but this session doesn't offer the row at all.
+    mocks.isMobile = true;
+    storePins(["peer-messages"]);
+    renderMenu({ workspaceItems: [filesRailRow] });
+    openMenu();
+
+    expect(screen.queryByTestId("header-peer-messages")).toBeNull();
+    expect(menuItemLabels().slice(0, 3)).toEqual(["Add nested agent", "Pin", "Share"]);
+  });
+
+  it("leaves the desktop menu in its own order with no pin controls", () => {
+    storePins(["shells"]);
+    renderMenu({ workspaceItems: [filesRailRow, shellsRailRow] });
+    openMenu();
+
+    expect(screen.queryByTestId("pin-menu-item-shells")).toBeNull();
+    expect(menuItemLabels().slice(0, 2)).toEqual(["Add nested agent", "Pin"]);
+    expect(menuItemLabels().indexOf("Shells")).toBeGreaterThan(menuItemLabels().indexOf("Files"));
+  });
+
+  it("pins a row without running its action", () => {
+    mocks.isMobile = true;
+    storePins(["shells"]);
+    const onShare = vi.fn();
+    renderMenu({ onShare, workspaceItems: [shellsRailRow] });
+    openMenu();
+
+    fireEvent.click(screen.getByTestId("pin-menu-item-share"));
+
+    expect(onShare).not.toHaveBeenCalled();
+    // The menu stays open, with Share now leading the pinned group.
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(menuItemLabels().slice(0, 4)).toEqual(["Add nested agent", "Shells", "Share", "Pin"]);
+  });
+
   it("renders no workspace section when there are no entries", () => {
     const view = renderMenu();
     openMenu();
     const baseSeparators = screen.getAllByRole("separator").length;
 
     view.unmount();
-    renderMenu({
-      workspaceItems: <DropdownMenuItem data-testid="rail-files">Files</DropdownMenuItem>,
-    });
+    renderMenu({ workspaceItems: [filesRailRow] });
     openMenu();
     // The entries bring exactly one separator of their own.
     expect(screen.getAllByRole("separator")).toHaveLength(baseSeparators + 1);

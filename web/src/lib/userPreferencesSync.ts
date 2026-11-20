@@ -278,6 +278,7 @@ function mobileSyncValue(value: unknown): unknown | null {
     terminalKeysPreset?: unknown;
     terminalKeyboard?: unknown;
     chatActionsRevision?: unknown;
+    pinnedMenuItems?: unknown;
   };
   if (raw.version !== 2 || typeof raw.enabled !== "boolean" || !Array.isArray(raw.buttons)) {
     return null;
@@ -304,6 +305,7 @@ function mobileSyncValue(value: unknown): unknown | null {
     ...(raw.chatActionsRevision !== undefined
       ? { chatActionsRevision: raw.chatActionsRevision }
       : {}),
+    ...(Array.isArray(raw.pinnedMenuItems) ? { pinnedMenuItems: raw.pinnedMenuItems } : {}),
   });
 }
 

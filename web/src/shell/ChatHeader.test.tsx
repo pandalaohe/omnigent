@@ -1294,6 +1294,31 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     ]);
   });
 
+  it("pins Shells to the top of the phone session menu and drops it from its old place", () => {
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      hasRailContent: true,
+      showFilesPanel: true,
+      mobileMenu: { ...mobileMenu, showShellsTab: true },
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+    const labels = screen.getAllByRole("menuitem").map((item) => item.textContent?.trim());
+    // Shells sits in the pinned group at the top, not only above Archive.
+    expect(labels.slice(0, 2)).toEqual(["Shells", "Pin"]);
+    expect(labels.filter((label) => label === "Shells")).toHaveLength(1);
+    expect(screen.getByTestId("pin-menu-item-shells")).toHaveAttribute(
+      "aria-label",
+      "Unpin Shells",
+    );
+  });
+
   it("routes a rail entry from the kebab to its drawer", () => {
     const onOpenFiles = vi.fn();
     isMobileMock.mockReturnValue(true);

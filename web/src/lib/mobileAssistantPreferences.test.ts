@@ -11,6 +11,7 @@ import {
   terminalDataForChord,
   writeMobileAssistantPreferences,
 } from "./mobileAssistantPreferences";
+import { resolveMobileMenuPins, DEFAULT_MOBILE_MENU_PINS } from "./mobileMenuPins";
 import { queueUserPreferencePatch } from "./userPreferencesSync";
 
 vi.mock("./userPreferencesSync", () => ({ queueUserPreferencePatch: vi.fn() }));
@@ -76,6 +77,34 @@ describe("mobileAssistantPreferences", () => {
         },
       ],
     });
+  });
+
+  it("keeps the chosen menu pins when another mobile setting is saved, and keeps an empty choice empty", () => {
+    localStorage.setItem(
+      MOBILE_ASSISTANT_STORAGE_KEY,
+      JSON.stringify({
+        version: 2,
+        enabled: true,
+        buttons: defaultMobileAssistantButtons(),
+        pinnedMenuItems: ["files", "shells", "retired-row"],
+      }),
+    );
+    const preferences = readMobileAssistantPreferences();
+    expect(preferences.pinnedMenuItems).toEqual(["files", "shells"]);
+
+    writeMobileAssistantPreferences({ ...preferences, enabled: false });
+    expect(readMobileAssistantPreferences().pinnedMenuItems).toEqual(["files", "shells"]);
+
+    // A user who unpinned everything does not fall back to the stock pins.
+    writeMobileAssistantPreferences({ ...preferences, pinnedMenuItems: [] });
+    expect(readMobileAssistantPreferences().pinnedMenuItems).toEqual([]);
+  });
+
+  it("defaults the menu pins to Shells until the user edits them", () => {
+    expect(readMobileAssistantPreferences()).not.toHaveProperty("pinnedMenuItems");
+    expect(resolveMobileMenuPins(readMobileAssistantPreferences().pinnedMenuItems)).toEqual([
+      "shells",
+    ]);
   });
 
   it("ignores the legacy direction field and never writes it back", () => {
@@ -193,7 +222,12 @@ describe("mobileAssistantPreferences", () => {
     expect(localStorage.getItem(MOBILE_ASSISTANT_STORAGE_KEY)).toBe(raw);
     expect(preferences.position).toEqual({ x: 0.2, y: 0.3 });
     writeMobileAssistantPreferences(preferences);
-    expect(readMobileAssistantPreferences()).toEqual(preferences);
+    // The write materialises the stock pin choice: the namespace syncs whole,
+    // so an older device's save must not drop this device's pins back to it.
+    expect(readMobileAssistantPreferences()).toEqual({
+      ...preferences,
+      pinnedMenuItems: [...DEFAULT_MOBILE_MENU_PINS],
+    });
   });
 
   it("uses current defaults for the complete old v1 stock list and preserves explicit empty new sets", () => {
