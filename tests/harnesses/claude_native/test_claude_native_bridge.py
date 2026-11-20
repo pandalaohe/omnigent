@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import errno
+import importlib
 import io
 import itertools
 import json
@@ -10188,6 +10189,14 @@ async def test_session_create_relay_waits_for_created_handle(
     from omnigent.runner import subagent_work, tool_dispatch
     from omnigent.runner.tool_dispatch import execute_tool
 
+    # Load the create path's lazy imports first so a cold run fits the 0.3 s budget.
+    for module_name in (
+        "omnigent.entities.subagent_terminal",
+        "omnigent.sandbox.copy_on_write",
+        "omnigent.server.schemas",
+        "omnigent.server.startup_registration",
+    ):
+        importlib.import_module(module_name)
     monkeypatch.setattr(claude_native_bridge, "_TOOL_CALL_TIMEOUT_S", 0.3)
     monkeypatch.setattr(claude_native_bridge, "_TOOL_RELAY_POST_TIMEOUT_S", 0.4)
     monkeypatch.setattr(tool_dispatch, "_SESSION_CREATE_FINALIZE_TIMEOUT_S", 0.01, raising=False)
