@@ -77,6 +77,7 @@ class _DeliveryRecorder:
         runner_router: Any,
         persist_failure: bool = True,
         image_ids: list[str] | None = None,
+        card_answer_wake: orchestration._CardAnswerWake | None = None,
     ) -> bool:
         self.calls.append((session_id, text))
         self.image_calls.append(image_ids or [])

@@ -375,6 +375,8 @@ from omnigent.server.session_live_state import handoff_count, last_liveness_stam
 from omnigent.server.session_metadata_logging import log_session_metadata
 from omnigent.server.session_orchestration import require_orchestration_source
 from omnigent.server.session_succession import (
+    claude_transfer_fenced,
+    claude_transfer_lock,
     claude_transfer_pending,
     copy_succession_file,
     is_requested_claude_transfer,
@@ -468,6 +470,14 @@ _interrupt_delivery_tasks: WorkspaceScopedCache[str, asyncio.Task[None]] = Works
 # (``omnigent.runner.app._format_subagent_wake_notice``).
 _SUBAGENT_WAKE_PREFIX = "[System: sub-agent"
 _TIMER_WAKE_PREFIX = "[System: timer "
+
+
+def _is_subagent_wake(body: SessionEventInput) -> bool:
+    if body.type != "message" or body.data.get("role", "user") != "user":
+        return False
+    content = body.data.get("content")
+    text = _message_text(content) if isinstance(content, list) else None
+    return text is not None and text.startswith(_SUBAGENT_WAKE_PREFIX)
 
 
 async def _deliver_interrupt_once(
@@ -1877,18 +1887,24 @@ def register_events_routes(
             ``None`` when the redirect applies but the successor has not
             released its held delivery yet (do not dispatch).
         """
-        if body.type != "message" or body.data.get("role", "user") != "user":
-            return session_id
-        content = body.data.get("content")
-        text = _message_text(content) if isinstance(content, list) else None
-        if text is None or not text.startswith(_SUBAGENT_WAKE_PREFIX):
+        if not _is_subagent_wake(body):
             return session_id
         addressed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if addressed is None:
             return session_id
         if claude_transfer_pending(addressed) and _has_bound_runner_authority(request, addressed):
-            # The completion is already in the runner inbox. Rekey will move it.
-            return None
+            # Wait for an active transfer to decide who owns the runner inbox.
+            async with claude_transfer_lock(session_id):
+                addressed = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+            if addressed is None:
+                return session_id
+            if claude_transfer_pending(addressed):
+                # A disconnected runner still owes this wake. Leave it eligible for retry.
+                raise OmnigentError(
+                    "Claude terminal transfer is unconfirmed", code=ErrorCode.RUNNER_UNAVAILABLE
+                )
         successor_id = await asyncio.to_thread(
             resolve_succeeded_by, conversation_store, session_id
         )
@@ -2069,6 +2085,7 @@ def register_events_routes(
         body: SessionEventInput,
         in_flight: contextlib.ExitStack | None = None,
         *,
+        dispatch_scope: contextlib.AsyncExitStack,
         acting_user_id: Any = _ACTING_USER_ID_UNSET,
         require_init_success: bool = False,
         trusted_peer: bool = False,
@@ -2188,28 +2205,45 @@ def register_events_routes(
             ),
         )
         pending_transfer = claude_transfer_pending(conv)
-        direct_successor_id = conv.labels.get(SUCCEEDED_BY_LABEL_KEY)
         observation = body.type.startswith("external_") or body.type in {
             _SUBAGENT_STATUS_TYPE,
             SDK_PEER_RECEIPT_EVENT,
         }
-        if pending_transfer or direct_successor_id:
+
+        async def claude_wake_ack(current: Conversation) -> dict[str, bool | str | None] | None:
+            if not claude_transfer_fenced(current):
+                return None
+            if _is_subagent_wake(body) and _has_bound_runner_authority(request, current):
+                if claude_transfer_pending(current):
+                    raise OmnigentError(
+                        "Claude terminal transfer is unconfirmed",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
+                return {"queued": False}
             if body.type == "message" and body.data.get("is_meta") is True:
                 content = body.data.get("content")
                 text = _message_text(content) if isinstance(content, list) else None
                 if text is not None and text.startswith(_TIMER_WAKE_PREFIX):
+                    successor = current.labels.get(SUCCEEDED_BY_LABEL_KEY)
                     receipt = (
                         await asyncio.to_thread(
-                            conversation_store.get_succession, session_id, direct_successor_id
+                            conversation_store.get_succession, session_id, successor
                         )
-                        if direct_successor_id
+                        if successor
                         else None
                     )
                     # Keep the firing registered until rekey inventories and cancels it.
-                    held = pending_transfer or (receipt is not None and receipt.phase == "moved")
+                    held = claude_transfer_pending(current) or (
+                        receipt is not None and receipt.phase == "moved"
+                    )
                     return {"queued": False, "timer_delivery": "held" if held else "dropped"}
-            if pending_transfer and not observation:
-                raise OmnigentError("Session handover is in progress", code=ErrorCode.CONFLICT)
+            return None
+
+        wake_ack = await claude_wake_ack(conv)
+        if wake_ack is not None:
+            return wake_ack
+        if pending_transfer and not observation:
+            raise OmnigentError("Session handover is in progress", code=ErrorCode.CONFLICT)
         if body.type == "message":
             for key in (
                 "auto_retry",
@@ -2362,14 +2396,18 @@ def register_events_routes(
                         if target_id != session_id
                         else conv.labels[SUCCEEDED_BY_LABEL_KEY]
                     )
-                target_id = await asyncio.to_thread(
-                    released_succession_target,
-                    conversation_store,
-                    session_id,
-                    require_receipt=False,
-                )
-                if target_id is None:
-                    raise OmnigentError("Session handover is in progress", code=ErrorCode.CONFLICT)
+                if claude_transfer_fenced(conv):
+                    target_id = await asyncio.to_thread(
+                        released_succession_target,
+                        conversation_store,
+                        session_id,
+                        require_receipt=True,
+                        requested_only=True,
+                    )
+                    if target_id is None:
+                        raise OmnigentError(
+                            "Session handover is in progress", code=ErrorCode.CONFLICT
+                        )
                 try:
                     parse_item_data(body.type, {"type": body.type, **body.data})
                 except (ValueError, TypeError) as exc:
@@ -5177,6 +5215,25 @@ def register_events_routes(
         # a replacement.
         _runner_needs_session_init = False
         # Item event (message, function_call_output, etc.).
+        runner_client = await _get_runner_client(session_id, runner_router)
+        if (
+            not conv.parent_conversation_id
+            and await asyncio.to_thread(
+                _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+            )
+            == "claude-native"
+        ):
+            # A request may have passed admission before the intent was persisted.
+            # Order its runner launch, pane ensure and dispatch against the move.
+            await dispatch_scope.enter_async_context(claude_transfer_lock(session_id))
+            current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if current is None:
+                raise _session_not_found()
+            wake_ack = await claude_wake_ack(current)
+            if wake_ack is not None:
+                return wake_ack
+            if claude_transfer_fenced(current):
+                raise OmnigentError("Session handover is in progress", code=ErrorCode.CONFLICT)
         if conv.host_id is not None and await _maybe_wake_stale_resumable_managed_sandbox(
             session_id=session_id,
             conv=conv,
@@ -5193,7 +5250,7 @@ def register_events_routes(
                 raise _session_not_found()
             conv = conv_after_wake
             _runner_needs_session_init = True
-        runner_client = await _get_runner_client(session_id, runner_router)
+            runner_client = await _get_runner_client(session_id, runner_router)
         # Managed-launch rendezvous: a ``host_type="managed"`` create
         # returns before the sandbox exists, so the first message (the
         # Web UI auto-sends the composer prompt right after navigate)
@@ -6051,12 +6108,14 @@ def register_events_routes(
 
         async def apply() -> dict[str, bool | str | None]:
             try:
-                with control_dispatch_scope(control_dispatch):
+                async with contextlib.AsyncExitStack() as dispatch_scope:
+                    dispatch_scope.enter_context(control_dispatch_scope(control_dispatch))
                     result = await _post_event_core(
                         request,
                         session_id,
                         body,
                         in_flight,
+                        dispatch_scope=dispatch_scope,
                         acting_user_id=acting_user_id,
                         require_init_success=require_init_success,
                         trusted_peer=trusted_peer,

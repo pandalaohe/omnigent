@@ -514,7 +514,6 @@ from omnigent.stores.conversation_store import (
     RUNNER_LIVENESS_TTL_S,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
-    SUCCEEDED_BY_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
     NativeRecoveryItemSkipped,
@@ -933,6 +932,12 @@ async def _deliver_with_retry(
 
     async def post(target_id: str) -> bool:
         target_options = options.copy()
+        if (
+            target_id == session_id
+            and card_answer_wake is not None
+            and card_answer_wake.app_state is None
+        ):
+            target_options.pop("card_answer_wake", None)
         if target_id != session_id and image_ids:
             from omnigent.runtime import get_file_store
             from omnigent.server.session_succession import copy_succession_file
@@ -973,6 +978,7 @@ async def _deliver_with_retry(
                         conversation_store,
                         session_id,
                         require_receipt=True,
+                        requested_only=True,
                     )
                     delivered = target is not None and await post(target)
         except _NativeDeliveryUncertain:
@@ -14159,9 +14165,9 @@ async def _post_system_message(
             session_id,
         )
         return False
-    from omnigent.server.session_succession import claude_transfer_pending
+    from omnigent.server.session_succession import claude_transfer_fenced
 
-    if claude_transfer_pending(conv) or conv.labels.get(SUCCEEDED_BY_LABEL_KEY):
+    if claude_transfer_fenced(conv):
         return False
     if card_answer_wake is not None and not _can_wake_for_card_answer(conv):
         return False
